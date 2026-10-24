@@ -1204,7 +1204,7 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     for (const [path, inside] of [
       ['a/b', true], ['a/b/x', true], ['a//b/x', true], ['a/b/', true], ['./a/b/x', true], ['a/c/../b/x', true],
       ['a/b/../x', false], ['a/bc/x', false], ['a', false], ['', false],
-    ] as const) assert.equal(inOtherMount(path, ['a/b']), inside, path);
+    ] as const) assert.equal(inOtherMount(path, [{ dir: 'a/b', folds: [false, false] }]), inside, path);
   });
 
   test("a path into the nested directory is read in the outer mount's one spelling: a climb above the root and a separator after the mount's name are refused, and a `..` or a trailing separator names what it reaches", async (t) => {
@@ -1236,7 +1236,7 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     env.writeDisk('top.txt', 'top');
     env.writeDisk('a/b/inner.txt', 'inner');
     const m = await env.open({}, nested(env));
-    const nestedKeys = () => env.store.treeList(TREE).map((e: { path: string }) => e.path).filter((p: string) => inOtherMount(p, ['a/b']));
+    const nestedKeys = () => env.store.treeList(TREE).map((e: { path: string }) => e.path).filter((p: string) => inOtherMount(p, [{ dir: 'a/b', folds: [false, false] }]));
     for (const path of ['work/a//b', 'work/a/b/', 'work/a//b/inner.txt']) {
       const synced = await call(m, 'sync', { path });
       assert.equal(synced.totalSynced, 0, path);

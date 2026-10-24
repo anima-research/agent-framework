@@ -10,13 +10,14 @@ import assert from 'node:assert/strict';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { JsStore } from '@animalabs/chronicle';
 // A namespace, so this file loads where the module lacks inOrder, and only
 // the tests that call it fail there.
 import * as workspaceModule from '../src/modules/workspace/index.js';
+import { filesystemTrustsCtime } from '../src/modules/workspace/observe.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { BranchIntents } from '../src/modules/workspace/branch-intent.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
@@ -107,7 +108,7 @@ function watched(m: WorkspaceModule): string[] {
 }
 
 /** Run `fn` with `node:fs/promises`'s `name`, as the module's imports see it, replaced by what `make` makes of it. */
-async function withFsPromise<T>(name: 'lstat' | 'open' | 'realpath' | 'stat', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+async function withFsPromise<T>(name: 'lstat' | 'open' | 'readdir' | 'realpath' | 'stat', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
   const original = fsp[name]!;
   fsp[name] = make(original);
@@ -1477,7 +1478,7 @@ test("a direct mount whose root moves between a read's parse and its open names 
   assert.match(err.message, /lies in mount "work", nested in mount "ref"/);
 });
 
-test("a direct mount whose root has moved resolves no other mount's root but those configured beneath its path", async (t) => {
+test("a direct mount whose root has moved resolves no other mount's root but those configured on or beneath its path", async (t) => {
   const env = new Env(t);
   // `ref` reaches `a` through `link`, and `x` is configured through a link
   // of its own, elsewhere.
@@ -1535,6 +1536,58 @@ const FOLDS_CASE = (() => {
     rmSync(dir, { recursive: true, force: true });
   }
 })();
+
+/** Whether the temp directory keeps the two Unicode normalization forms of a name apart, as ext4 does. */
+const KEEPS_FORMS_APART = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'workspace-direct-forms-'));
+  try {
+    writeFileSync(join(dir, 'caf\u00e9'), '');
+    return !existsSync(join(dir, 'cafe\u0301'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
+test("a direct root moved beside directories spelled in another case or form places each mount there as a start there does, and says where it only may lie", {
+  skip: FOLDS_CASE || !KEEPS_FORMS_APART ? 'the temp directory folds case or joins the normalization forms, so these spellings name one directory' : false,
+}, async (t) => {
+  const env = new Env(t);
+  // `ref` starts at `a` through `link`. `upper` lies at `CAFE/inner` and
+  // `nfd` at `cafe` with a combining accent then `inner`, each another
+  // directory here than `cafe`'s or `café`'s.
+  const a = join(env.root, 'a');
+  mkdirSync(a);
+  for (const top of ['cafe', 'CAFE', 'caf\u00e9', 'cafe\u0301']) {
+    mkdirSync(join(env.root, top, 'inner'), { recursive: true });
+    writeFileSync(join(env.root, top, 'inner', 'file.txt'), `${top}\n`);
+  }
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link }, [
+    { name: 'upper', path: join(env.root, 'CAFE', 'inner'), mode: 'read-write', watch: 'never' },
+    { name: 'nfd', path: join(env.root, 'cafe\u0301', 'inner'), mode: 'read-write', watch: 'never' },
+  ]];
+  const moved = await env.open(...mounts);
+  const answer = (m: WorkspaceModule) => call(m, 'read', { path: 'ref/inner/file.txt' });
+
+  // Repointed to `cafe`, `CAFE` is another directory: the level holding
+  // both tells case apart, read from `cafe`'s own name, so `inner` is ref's,
+  // where the filesystem's change times are trusted; elsewhere that level
+  // tells nothing, so `inner` may be `upper`'s, as a start there says too.
+  rmSync(link);
+  symlinkSync(join(env.root, 'cafe'), link);
+  const own = await answer(moved);
+  assert.equal(own.success, await filesystemTrustsCtime(env.root), String(own.error));
+  assert.deepEqual(own, await answer(await new Env(t).open(...mounts)));
+
+  // Repointed to `café` with a precomposed accent, `nfd`'s root is in the
+  // other form: a guess, said as one.
+  rmSync(link);
+  symlinkSync(join(env.root, 'caf\u00e9'), link);
+  const guessed = await answer(moved);
+  assert.match(String(guessed.error), /may lie in mount "nfd", nested in mount "ref".*can't tell whether "ref\/inner" is mount "nfd"'s directory/);
+  assert.deepEqual(guessed, await answer(await new Env(t).open(...mounts)));
+});
 
 test("on a disk that folds case, a mount configured beneath a moved direct root, spelled otherwise than disk spells it, is nested as a start there nests it", {
   skip: FOLDS_CASE ? false : "the temp directory tells case apart, so a path spelled in another case reaches nothing: this runs on a disk that folds case, such as macOS's default",
@@ -2579,4 +2632,41 @@ test('inOrder rejects in turn for a work that rejects before its turn, leaving n
   } finally {
     process.off('unhandledRejection', record);
   }
+});
+
+test("a call of a direct mount whose root has moved lists no directory above the roots as they lie now", async (t) => {
+  const env = new Env(t);
+  // `ref` starts at `a` through `link`, with `child` configured beneath its
+  // path at `link/sub`, so at `a/sub`. Repointed to `a/sub/deep`, `child`
+  // lies at `a/sub/deep/sub`, and `a/sub` is above both roots.
+  const a = join(env.root, 'a');
+  mkdirSync(join(a, 'sub', 'deep', 'sub'), { recursive: true });
+  mkdirSync(join(a, 'sub', 'beside'));
+  writeFileSync(join(a, 'sub', 'x.txt'), 'x\n');
+  writeFileSync(join(a, 'sub', 'deep', 'own.txt'), 'own\n');
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const m = await env.open({ path: link }, [{ name: 'child', path: join(link, 'sub'), mode: 'read-write', watch: 'never' }]);
+  rmSync(link);
+  symlinkSync(join(a, 'sub', 'deep'), link);
+  const listed: string[] = [];
+  const looked: string[] = [];
+  await withFsPromise('readdir', (original) => async (...args: any[]) => {
+    listed.push(String(args[0]));
+    return original(...args);
+  }, () => withFsPromise('lstat', (original) => async (...args: any[]) => {
+    looked.push(String(args[0]));
+    return original(...args);
+  }, async () => {
+    assert.equal((await data<{ content: string }>(m, 'read', { path: 'ref/own.txt' })).content, '     1\town');
+  }));
+  const roots = [realpathSync(join(a, 'sub', 'deep')), realpathSync(join(a, 'sub', 'deep', 'sub'))];
+  const within = (path: string) => roots.some((r) => path === r || path.startsWith(r + sep));
+  assert.deepEqual(listed.map((path) => realpathSync(path)).filter((path) => !within(path)), []);
+  // a/sub, above both roots, is read from deep's own name there, and the
+  // moved root, which holds child's, from its listing.
+  assert.ok(looked.map((path) => path.replace(realpathSync(env.root), env.root)).includes(join(a, 'sub', 'DEEP')), JSON.stringify(looked));
+  assert.ok(listed.map((path) => realpathSync(path)).includes(roots[0]!), JSON.stringify(listed));
+  // So child lies where the link leads now, nested in ref at sub.
+  assert.match(String((await call(m, 'write', { path: 'ref/sub/new.md', content: 'x\n' })).error), /lies in mount "child", nested in mount "ref"/);
 });

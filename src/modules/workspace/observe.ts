@@ -69,10 +69,11 @@ export interface MountView {
   /** The mount's `include`: files and links it doesn't cover are outside the mount. Absent, everything is inside. */
   include?: readonly string[];
   /**
-   * Other mounts' directories nested inside this one, mount-relative. Every
+   * Other mounts' directories nested inside this one, mount-relative, each
+   * with how disk compares names at each of its levels (NestedDir). Every
    * pass passes over them, named or not, as another mount's directory.
    */
-  others: readonly string[];
+  others: readonly NestedDir[];
   /**
    * The same mounts, each by its directory, its name, its own include and,
    * where it has one, its real root (NestedMount), for a refusal that names
@@ -85,16 +86,43 @@ export interface MountView {
 }
 
 /**
- * A mount nested in another: its directory in one of its spellings,
- * mount-relative and `/`-separated, its name, its real root, which every
- * spelling shares, and its own include. The real root is the root as
- * realpath resolves it (the nearest existing directory's, where the root
- * isn't made yet) once the module's start has read it, and the root as
- * configured until then. There's none where it's this mount's own or holds
- * it: the mount is nested by its configured path alone, since through its
- * real root it would claim this mount's every path.
+ * Whether the directory holding each level of a path folds case, one per
+ * level, as the module's start read it (ownCaseFolding): from its own entries
+ * within a mount's root, and from the path's own name there above every root.
+ * Null where that told nothing, as for a directory that is empty, holds no
+ * name with a letter a-z or A-Z, or isn't made yet, or above every root a
+ * name with no such letter or not there yet. The comparison counts
+ * null as folding, as it does a level no start has read, so it errs toward
+ * the nested mount, and a text naming that mount says where it erred
+ * (nestedGuess).
  */
-export type NestedMount = { dir: string; name: string; real?: string; include?: readonly string[] };
+export type Folding = readonly (boolean | null)[];
+
+/**
+ * A directory another mount holds inside this one, mount-relative and
+ * `/`-separated, with whether the directory holding each of its segments
+ * folds case (`folds`, Folding): this mount's root for the first, and for
+ * each after it, the directory the segments before it name. A path lies in
+ * the directory where it begins with its segments as disk compares names
+ * (beneathNested). `guessed` where start placed it there only by the
+ * comparison's guess above this mount's root, as for two mounts' roots
+ * configured in spellings it can't tell apart: a path in it is then a guess,
+ * however exactly the rest of the path matches (nestedGuess).
+ */
+export type NestedDir = { dir: string; folds: Folding; guessed?: true };
+
+/**
+ * A mount nested in another: its directory where it's placed there
+ * (NestedDir), its name, its real root, which each of its placements
+ * shares, with how disk compares names at each level of that from the
+ * filesystem's root (`realFolds`, read as `folds` is), and its own include.
+ * The real root is the root as realpath resolves it (the nearest existing
+ * directory's, where the root isn't made yet) once the module's start has
+ * read it, and the root as configured until then. There's none where it's
+ * this mount's own or holds it: the mount is nested by its configured path
+ * alone, since through its real root it would claim this mount's every path.
+ */
+export type NestedMount = NestedDir & { name: string; real?: string; realFolds?: Folding; include?: readonly string[] };
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
 
@@ -275,14 +303,24 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
 }
 
 /**
- * The nested mount whose directory holds `target` (mount-relative), the
- * innermost where nested mounts nest, as #460 picks one; undefined when none
- * does.
+ * The nested mount whose directory holds `target` (mount-relative), as disk
+ * compares names (beneathNested), as `innermost` picks one, a directory being
+ * sure where start placed it surely and the path matches it surely; undefined
+ * when none does.
  */
-export function nestedHolder<N extends { dir: string; name: string }>(target: string, nested: readonly N[]): N | undefined {
-  return nested
-    .filter((n) => target === n.dir || target.startsWith(`${n.dir}/`))
-    .sort((a, b) => b.dir.length - a.dir.length)[0];
+export function nestedHolder<N extends NestedDir & { name: string }>(target: string, nested: readonly N[]): N | undefined {
+  const segments = target.split('/');
+  return innermost(nested.filter((n) => beneathNested(segments, n)), (n) => n.dir.split('/').length, (n) => !n.guessed && surelyBeneath(segments, n.dir.split('/'), n.folds));
+}
+
+/**
+ * Of the nested mounts holding a path, the innermost, as #460 picks one, and
+ * among those at one depth, one the path surely lies in (`sure`), so a
+ * directory it matches exactly names the mount, and decides by its include,
+ * rather than a look-alike only the comparison's guess joins it to.
+ */
+function innermost<T>(holders: readonly T[], depth: (holder: T) => number, sure: (holder: T) => boolean): T | undefined {
+  return [...holders].sort((a, b) => depth(b) - depth(a) || Number(sure(b)) - Number(sure(a)))[0];
 }
 
 /**
@@ -292,8 +330,8 @@ export function nestedHolder<N extends { dir: string; name: string }>(target: st
  * covers. A refusal's code follows the same test (linkReadError's
  * `other_mount`), so the code says no more than the message.
  */
-export function namesHolder(leads: { target: string; directory: boolean }, holder: { dir: string; include?: readonly string[] }): boolean {
-  return namesNestedPlace(leads.target.slice(holder.dir.length + 1), holder.include, leads.directory);
+export function namesHolder(leads: { target: string; directory: boolean }, holder: NestedDir & { include?: readonly string[] }): boolean {
+  return namesNestedPlace(restBeneath(leads.target, holder), holder.include, leads.directory);
 }
 
 /**
@@ -323,7 +361,9 @@ export function namesNestedPlace(rest: string, include: readonly string[] | unde
 export function withinIncludes(view: Pick<MountView, 'include' | 'nested'>, path: string): boolean {
   if (!insideMount(path, view.include)) return false;
   const holder = nestedHolder(path, view.nested ?? []);
-  return holder === undefined || path === holder.dir || namesNestedPlace(path.slice(holder.dir.length + 1), holder.include, false);
+  if (holder === undefined) return true;
+  const rest = restBeneath(path, holder);
+  return rest === '' || namesNestedPlace(rest, holder.include, false);
 }
 
 /**
@@ -401,8 +441,9 @@ export async function coversLanding(view: Pick<MountView, 'include'>, rootReal: 
  * path beneath it exist); for one leading outside the mount, that it does;
  * for one that can't be resolved, nothing more. A target in a nested mount's
  * directory (`nested`) is that mount's: the refusal names the mount and the
- * path to use there in place of the link, and offers no setting, since
- * following the link would only reach into another mount's directory. For a
+ * path to use there in place of the link, with what the workspace can't tell
+ * apart where the comparison guessed (nestedStep), and offers no setting,
+ * since following the link would only reach into another mount's directory. For a
  * directory the walk couldn't ask, which one, and the answer it got. Paths
  * are spelled as the tools take them, from the mount's name. On a mount with
  * an include, an inside target is named only where a tool could name it: a
@@ -421,9 +462,10 @@ export function linkWords(name: string, found: LinkFound, leads: LinkLeads | nul
   const holder = nestedHolder(leads.target, nested);
   if (holder) {
     if (!namesHolder(leads, holder)) return `${link}, which this mount does not follow`;
-    const rest = leads.target.slice(holder.dir.length + 1);
-    return `${link} to ${spell(leads.target)}, which this mount does not follow; it lies in mount "${holder.name}", ` +
-      `nested in mount "${name}": use "${rest ? `${holder.name}/${rest}` : holder.name}" in place of ${spell(found.link)}`;
+    const rest = restBeneath(leads.target, holder);
+    const guess = nestedGuess(name, leads.target.split('/'), holder);
+    return `${link} to ${spell(leads.target)}, which this mount does not follow; it ${guess === undefined ? 'lies' : 'may lie'} in mount ` +
+      `"${holder.name}", nested in mount "${name}": ${nestedStep({ name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name, guess }, { after: ` in place of ${spell(found.link)}` })}`;
   }
   if (!leads.directory && !insideMount(leads.target, include)) return `${link}, which this mount does not follow`;
   // Following it serves only what the include covers where it leads (judgedAt).
@@ -451,30 +493,125 @@ export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested
 }
 
 /**
- * The nested mount whose root holds `real`, a canonical path, the innermost,
- * with the path to use there, the path beneath its root (`rest`) and its
- * include; undefined when none does. A path the lexical checks pass
- * (inOtherMount, the tools' holderOf) reaches another mount's directory this
- * way through a symlink the mount follows, so each check that resolves a
- * path canonically asks this too, and names the mount only where
- * namesNestedPlace says the place is that mount's.
+ * A canonical path's segments, as the nested checks compare them: split at
+ * the separator, where a filesystem root's own separators add no empty
+ * segment past the first, so `/` is [''], `/data` is ['', 'data'], and a
+ * UNC share's root keeps one segment for each of its names.
  */
-export function nestedAtReal(real: string, nested: readonly NestedMount[] = []): { name: string; use: string; rest: string; include?: readonly string[] } | undefined {
-  const holder = nested
-    .flatMap((n) => (n.real !== undefined && contained(n.real, real) ? [{ name: n.name, real: n.real, include: n.include }] : []))
-    .sort((a, b) => b.real.length - a.real.length)[0];
+export function realSegments(path: string): string[] {
+  return path.split(sep).filter((segment, i) => i === 0 || segment !== '');
+}
+
+/**
+ * Where `path`, a canonical path, lies beneath `root`, another, as disk
+ * compares names at each level of `root` (`rootFolds`, one per segment of
+ * `root` as realSegments splits it, read from the filesystem's root): the
+ * segments beneath it, `/`-separated, or undefined where it lies elsewhere,
+ * or is `root` itself (sameRoot).
+ */
+export function beneathRoot(path: string, root: string, rootFolds: Folding): string | undefined {
+  const segments = realSegments(path);
+  const top = realSegments(root);
+  return segments.length > top.length && beginsWith(segments, top, rootFolds) ? segments.slice(top.length).join('/') : undefined;
+}
+
+/** Whether `path`, a canonical path, is `root` as disk compares names at each of its levels (beneathRoot's `rootFolds`). */
+export function sameRoot(path: string, root: string, rootFolds: Folding): boolean {
+  const segments = realSegments(path);
+  const top = realSegments(root);
+  return segments.length === top.length && beginsWith(segments, top, rootFolds);
+}
+
+/**
+ * Whether `path`, a canonical path that sameRoot or beneathRoot places at or
+ * beneath `root`, surely lies there (surelyBeneath), rather than by the
+ * comparison's guess.
+ */
+export function surelyAtRoot(path: string, root: string, rootFolds: Folding): boolean {
+  return surelyBeneath(realSegments(path), realSegments(root), rootFolds);
+}
+
+/**
+ * The nested mount whose real root holds `real`, a canonical path, as
+ * `innermost` picks one, a root being sure where `real` lies surely beneath
+ * it by its levels' folding, whatever start guessed about where it lies in
+ * the outer mount, which a canonical path doesn't pass through; with how many
+ * of `real`'s segments its root takes; undefined when none does. The real root is compared as disk compares names, level by
+ * level from the filesystem's root (beginsWith), since realpath keeps a
+ * spelling it's given where disk folds it on Linux, as from a link's target,
+ * and a canonical path can then name the nested mount's root otherwise than
+ * the root's own. A walk asks only this, to pass over a subdirectory that is
+ * another mount's; each other check asks nestedAtReal.
+ */
+export function nestedRootAtReal(real: string, nested: readonly NestedMount[] = []): { mount: NestedMount; depth: number } | undefined {
+  const segments = realSegments(real);
+  const holders = nested.flatMap((n) => {
+    if (n.real === undefined) return [];
+    const root = realSegments(n.real);
+    const folds = n.realFolds ?? [];
+    return beginsWith(segments, root, folds) ? [{ mount: n, depth: root.length, sure: surelyBeneath(segments, root, folds) }] : [];
+  });
+  return innermost(holders, (h) => h.depth, (h) => h.sure);
+}
+
+/**
+ * The nested mount whose real root holds `real`, a canonical path, the
+ * innermost (nestedRootAtReal), with the path to use there, the path beneath
+ * its root (`rest`) and its include; undefined when none does. A path the
+ * lexical checks pass (inOtherMount, the tools' holderOf) reaches another
+ * mount's directory this way through a symlink the mount follows, so each
+ * check that resolves a path canonically asks this too, and names the mount
+ * only where namesNestedPlace says the place is that mount's. The rest is
+ * read as disk spells it (diskSpelling) beneath that mount's real root,
+ * since realpath keeps the spelling a link's target gives there too: so
+ * that mount's include judges, and the answer names, disk's file. It's read
+ * only where a nested root holds the place. Where the place lies there only
+ * by the comparison's guess (surelyBeneath), `guess` says what a text can
+ * show of it (NestedGuess): given this mount's name and real root (`at`), and
+ * a place beneath that root by its own segments, where it leads by this
+ * mount's paths, with the two spellings where the guess lies beneath the
+ * root, or the placement where the nested root reaches this mount's root
+ * only by a guess; anywhere else null, since what it couldn't tell apart is
+ * a host path, which no message shows.
+ */
+export async function nestedAtReal(real: string, nested: readonly NestedMount[] = [], at?: { name: string; rootReal: string }): Promise<{ name: string; use: string; rest: string; include?: readonly string[]; guess?: NestedGuess } | undefined> {
+  const holder = nestedRootAtReal(real, nested);
   if (!holder) return undefined;
-  const rest = relative(holder.real, real).split(sep).join('/');
-  return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name, rest, include: holder.include };
+  const segments = realSegments(real);
+  const given = segments.slice(holder.depth).join('/');
+  const rest = given === '' ? '' : await diskSpelling(holder.mount.real!, given);
+  const { name, include } = holder.mount;
+  const root = realSegments(holder.mount.real!);
+  const folds = holder.mount.realFolds ?? [];
+  const found = { name, use: rest ? `${name}/${rest}` : name, rest, include };
+  if (surelyBeneath(segments, root, folds)) return found;
+  // Where the place lies beneath this mount's real root (`at`) by its own
+  // segments, a text can show where it leads by this mount's paths. Where the
+  // nested root reaches this mount's root only by a guess, the placement is
+  // one; otherwise the guess lies beneath, and both spellings are this
+  // mount's. Anywhere else they're host paths, which no message shows.
+  if (at === undefined) return { ...found, guess: null };
+  const top = realSegments(at.rootReal);
+  if (segments.length <= top.length || root.length <= top.length || !top.every((t, i) => segments[i] === t)) return { ...found, guess: null };
+  const within = segments.slice(top.length);
+  const below = root.slice(top.length);
+  const guess = guessFor(at.name, within, below, folds.slice(top.length));
+  // Where it leads shows the guessed levels as the guess shows them.
+  const leads = guess === undefined ? [at.name, ...within].join('/') : [guess.given, ...within.slice(below.length)].join('/');
+  // A placement start only guessed at comes first, as in nestedGuess.
+  if (!surelyBeneath(root.slice(0, top.length), top, folds)) return { ...found, guess: { ...placedGuess(at.name, within.slice(0, below.length), guess), leads } };
+  return { ...found, guess: guess === undefined ? null : { ...guess, leads } };
 }
 
 /**
  * Why a mount-relative path that resolves into a nested mount's directory is
- * refused (nestedAtReal): what it leads into, and the path to use in its
- * place. Spelled as the tools take paths, from the mount's name.
+ * refused (nestedAtReal): what it leads into, or may lead into where the
+ * comparison guessed, and the step to take (nestedStep). Spelled as the
+ * tools take paths, from the mount's name.
  */
-export function leadsInto(name: string, rel: string, holder: { name: string; use: string }): string {
-  return `"${rel === '' ? name : `${name}/${rel}`}" leads into mount "${holder.name}", nested in mount "${name}": use "${holder.use}" in its place`;
+export function leadsInto(name: string, rel: string, holder: { name: string; use: string; guess?: NestedGuess }): string {
+  const verb = holder.guess === undefined ? 'leads' : 'may lead';
+  return `"${rel === '' ? name : `${name}/${rel}`}" ${verb} into mount "${holder.name}", nested in mount "${name}": ${nestedStep(holder, { after: ' in its place' })}`;
 }
 
 // ===========================================================================
@@ -488,15 +625,31 @@ const otherCase = (c: string): string => (c === c.toLowerCase() ? c.toUpperCase(
 
 /**
  * The name with each letter's case flipped, where its other case is one
- * letter whose own other case is the letter again, so the flip changes only
- * pairs that any folding disk folds together. `ß`, whose upper case is `SS`,
- * and dotless `ı`, whose upper case `I` lowers to `i`, stay as they are.
+ * letter whose own other case is the letter again, as this runtime's Unicode
+ * tables have it: a pair a disk with an older folding table keeps apart, such
+ * as Georgian `Ა` and `ა`, is flipped too. `ß`, whose upper case is `SS`, and
+ * dotless `ı`, whose upper case `I` lowers to `i`, stay as they are.
  */
 const flippedCase = (name: string): string =>
   [...name].map((c) => {
     const other = otherCase(c);
     return [...other].length === 1 && otherCase(other) === c ? other : c;
   }).join('');
+
+/**
+ * The name with each ASCII letter's case flipped, and nothing else: the
+ * pairs every disk that folds case folds, whatever its folding table's age.
+ * A newer pair, such as Georgian `Ა` and `ა`, can be one a disk that
+ * folds case keeps apart.
+ */
+const flippedAscii = (name: string): string => name.replace(/[A-Za-z]/g, otherCase);
+
+/**
+ * The name with only its first ASCII letter's case flipped, a spelling
+ * neither the name nor flippedAscii's, or null for a name with fewer than
+ * two such letters, where there is no such spelling.
+ */
+const firstFlipped = (name: string): string | null => ((name.match(/[A-Za-z]/g)?.length ?? 0) < 2 ? null : name.replace(/[A-Za-z]/, otherCase));
 
 /** Names compared as NFC in lower case. */
 const folded = (name: string): string => name.normalize('NFC').toLowerCase();
@@ -508,6 +661,22 @@ const folded = (name: string): string => name.normalize('NFC').toLowerCase();
  * the same-file check keeps that from naming another file.
  */
 export const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
+
+/**
+ * Names compared as fully as a disk that folds names may compare them: with
+ * every default-ignorable code point dropped, such as a soft hyphen, a
+ * zero-width joiner or a variation selector, then decomposed (NFD), through
+ * lower, upper and lower case, and decomposed again, in the shape of
+ * Unicode's canonical caseless match. Mapped on the decomposed name, case
+ * joins names whose marks come in another order around a combining
+ * ypogegrammeni (U+0345), whose upper case is a letter. Linux's casefold,
+ * which ext4 and f2fs set per directory, drops those code points, on every
+ * kernel but 6.12 to 6.12.4, where this joins more than the disk does, and
+ * compares names decomposed in full case folding, and HFS+ passes over some
+ * of them too.
+ */
+const foldedFully = (name: string): string =>
+  name.replace(/\p{Default_Ignorable_Code_Point}/gu, '').normalize('NFD').toLowerCase().toUpperCase().toLowerCase().normalize('NFD');
 
 /** What the workspace holds of a mount, as the spelling step reads it (diskSpelling). */
 export interface WorkspaceEntries {
@@ -571,6 +740,102 @@ export async function foldsCase(dir: string): Promise<boolean> {
 }
 
 /**
+ * Whether `dir` folds case as its own entries tell, for the nested-mount
+ * comparison, by its ASCII letters alone, which every disk that folds case
+ * folds (flippedAscii). A name it lists is looked up flipped: the same file
+ * there tells that it folds case, and nothing there that it tells case
+ * apart. The first name it lists whose flipped spelling it doesn't list too
+ * is told so. Where every such name is listed beside its flipped spelling,
+ * each pair is told the same way until one tells case apart, since a
+ * directory that folds case can list both spellings too, as while a name is
+ * renamed in case as it's listed. Null where its own entries tell nothing:
+ * it lists no name with an ASCII letter, as an empty directory doesn't, or
+ * isn't there yet, or can't be listed, or a lookup fails for another reason
+ * than that nothing is there, or the name is gone, or changed, by the time
+ * it's looked up again. Unlike foldsCase, which then reads the directory
+ * holding a mount's root, it reads nothing beside `dir`: the directory
+ * holding it tells this one's folding only where a whole filesystem folds or
+ * doesn't, and ext4's and tmpfs's casefold is set per directory, so an empty
+ * folding directory can sit in one that tells case apart. Where the flipped
+ * spelling finds another file than the name does, as a disk that tells case
+ * apart can hold beside it, the name is looked up once more with only its
+ * first ASCII letter's case flipped (firstFlipped). A file there tells
+ * nothing, since a disk that folds case but numbers a file anew for each
+ * spelling it's looked up by, as a FUSE filesystem may, finds the one file
+ * under every spelling. Where that lookup finds nothing, it tells case apart
+ * on a filesystem whose change times this module trusts
+ * (filesystemTrustsCtime), and tells nothing elsewhere: there a name made
+ * again between the lookups can keep its change time, so the name, gone for
+ * a moment, could make a disk that folds case read as one that tells it
+ * apart. A name with no such spelling tells nothing either. Given `name`, a
+ * name `dir` holds, such as a path's own segment, that name alone is looked
+ * up, in those spellings, and nothing is listed, so nothing else `dir` holds
+ * is read: the flipped spelling finds the same directory where `dir` folds
+ * case, and nothing, or another directory the third spelling doesn't find,
+ * where it tells case apart, the latter only where change times are trusted;
+ * a name with no ASCII letter, or one that isn't there, tells nothing.
+ */
+export async function ownCaseFolding(dir: string, name?: string): Promise<boolean | null> {
+  // A lookup that finds nothing answers null; one that fails otherwise, undefined.
+  const look = (path: string) => lstat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => (error.code === 'ENOENT' ? null : undefined));
+  // The name is looked up on each side of its other spellings, and must be
+  // the same file with the same change time at both, so a name removed,
+  // replaced, made again under the freed inode number or renamed away and
+  // back meanwhile, as an editor's save replaces a file, tells nothing
+  // rather than either answer: on a disk that folds case, another spelling
+  // looked up while the name was gone finds nothing too. So does a hard link
+  // made meanwhile, which changes the file's change time; one in the other
+  // case made before, in a directory that tells case apart, still reads as
+  // folding. A name gone and back with the same inode number and change time
+  // still passes, as a rename away and back, or a remake under the freed
+  // inode number, within one tick of a coarse clock right after its last
+  // change can leave it, or any such absence where change times aren't
+  // trusted; that race is outside the nested-mount guarantee
+  // (MountConfig.include). The third spelling's nothing is gated on trusted
+  // change times below; the flipped spelling's isn't, since that would make
+  // every level on a filesystem outside the list a guess.
+  const unchanged = (a: BigIntStats, b: BigIntStats) => sameFile(a, b) && a.ctimeNs === b.ctimeNs;
+  const told = async (unpaired: string): Promise<boolean | null> => {
+    const before = await look(join(dir, unpaired));
+    const flipped = await look(join(dir, flippedAscii(unpaired)));
+    const other = before && flipped && !sameFile(before, flipped) ? firstFlipped(unpaired) : null;
+    const third = other === null ? null : await look(join(dir, other));
+    const after = await look(join(dir, unpaired));
+    if (!before || !after || !unchanged(before, after) || flipped === undefined) return null;
+    if (flipped === null) return false;
+    if (sameFile(after, flipped)) return true;
+    // Reached only where the flipped spelling found another file, as twins
+    // in case do: nothing at the third spelling tells case apart only where
+    // the change time would have shown the name replaced meanwhile.
+    return other !== null && third === null && (await filesystemTrustsCtime(dir)) ? false : null;
+  };
+  if (name !== undefined) return flippedAscii(name) === name ? null : told(name);
+  let listed: Set<string>;
+  try {
+    listed = new Set(await readdir(dir));
+  } catch {
+    return null;
+  }
+  const unpaired = [...listed].find((n) => !listed.has(flippedAscii(n)));
+  if (unpaired !== undefined) return told(unpaired);
+  // Every name with an ASCII letter is listed beside its flipped spelling,
+  // which a disk that folds case can list too, as while a name is renamed in
+  // case as it's listed. Each pair is told as a name alone is, so two files at
+  // the two spellings tell case apart only as told says, since a disk that
+  // folds case but numbers a file anew for each spelling finds two there
+  // too. A pair told as folding, as two hard links are, says nothing here and
+  // is passed over; the first pair told as telling case apart decides. A
+  // name with no ASCII letter is its own flipped spelling, so it's passed
+  // over unread, as a directory of numbered entries would otherwise cost
+  // lookups for each entry at every start.
+  for (const paired of listed) {
+    if (flippedAscii(paired) === paired) continue;
+    if ((await told(paired)) === false) return false;
+  }
+  return null;
+}
+
+/**
  * A name in simple case folding, letter by letter: each letter as the lower
  * case of its upper case, so `Σ` and a word's last `ς` are both `σ`, `ſ` is
  * `s` and `µ` is `μ`. A letter whose upper case is more than one letter
@@ -617,17 +882,206 @@ function entryName(paths: readonly string[], prefix: string, segment: string): s
 }
 
 /**
- * Whether a path's segments begin with a directory's: exactly, or, with
- * `loosely`, with each segment compared as loosely as listedName compares
- * names (foldedLoosely), as a disk that folds names may compare them. That
- * errs toward the directory: on a disk that tells some of those spellings
- * apart, such as case, or `ß` from `ss`, a distinct directory spelled one of
- * them matches too, and resolveAbsolutePath, the one caller that compares
- * loosely, gives null for a path beneath it.
+ * Whether `given`, a name at one level of a path, is `name`, a nested
+ * mount's directory's name at that level, as a disk may compare them: in
+ * either Unicode normalization form at every level, and in any case where
+ * the directory holding them folds case (`folds`), as fully as a disk that
+ * folds names may compare them (foldedFully). Where it can't tell, it errs
+ * toward the nested mount. So on a disk that keeps the normalization forms
+ * apart, a name in the other form of a nested directory's name is taken for
+ * that mount's directory, and so, at a level that folds case, is any name
+ * foldedFully joins with it that the disk keeps apart, such as `ss` beside a
+ * nested `ß`, `ı` beside a nested `i`, or, on a disk that keeps ignorable
+ * code points, `in\u00adner` beside a nested `inner`. Such a directory, or
+ * file, is no mount's: this mount refuses it, naming the nested mount's
+ * path, and the nested mount, whose directory it isn't, never sees it. That
+ * fails closed, where comparing more strictly than the disk would let this
+ * mount write into the nested mount's directory unseen.
  */
-export function beginsWithDir(segments: readonly string[], dir: readonly string[], loosely: boolean): boolean {
-  if (segments.length < dir.length) return false;
-  return dir.every((d, i) => segments[i] === d || (loosely && foldedLoosely(segments[i]!) === foldedLoosely(d)));
+function sameLevel(given: string, name: string, folds: boolean): boolean {
+  if (given === name) return true;
+  return folds ? foldedFully(given) === foldedFully(name) : given.normalize('NFC') === name.normalize('NFC');
+}
+
+/**
+ * Whether `segments` begin with `dir`'s, compared level by level from the
+ * top (sameLevel), each level as `folds` says, and a level it doesn't say,
+ * or says null for, as folding. Once the levels above one match, they name
+ * one directory on disk, so the next is compared as that directory compares
+ * names. Every nested-mount check makes this one comparison, by a
+ * mount-relative path (beneathNested) or by a canonical one (nestedAtReal).
+ */
+function beginsWith(segments: readonly string[], dir: readonly string[], folds: Folding): boolean {
+  return segments.length >= dir.length && dir.every((d, i) => sameLevel(segments[i]!, d, folds[i] ?? true));
+}
+
+/** Whether a mount-relative path's segments name a nested mount's directory or lie beneath it, as disk compares names (beginsWith). */
+export function beneathNested(segments: readonly string[], nested: NestedDir): boolean {
+  return beginsWith(segments, nested.dir.split('/'), nested.folds);
+}
+
+/**
+ * What a mount-relative path that lies in a nested mount's directory
+ * (beneathNested) names beneath it, '' for the directory itself: by its
+ * segments, since a name the directory's matches as disk compares names can
+ * be another length, as `SS` is beside `ß`.
+ */
+export function restBeneath(path: string, nested: NestedDir): string {
+  return path.split('/').slice(nested.dir.split('/').length).join('/');
+}
+
+/** The name with its ASCII letters in lower case, and nothing else changed. */
+const asciiLower = (name: string): string => name.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+/**
+ * Whether `segments`, which the comparison places beneath `dir` (beginsWith,
+ * by `folds`), surely lie there: each of `dir`'s levels is matched exactly,
+ * or differs only in its ASCII letters' case at a level whose own entries
+ * told it folds. Any other match is where the comparison erred toward the
+ * nested mount: another normalization form; a pair only foldedFully joins,
+ * such as `ss` beside `ß`, or a name beside itself with a default-ignorable
+ * code point inside, which a disk that folds case may keep apart; a case
+ * difference past ASCII, which a disk with an older folding table may keep
+ * apart; or a case difference at a level whose own entries told nothing.
+ */
+function surelyBeneath(segments: readonly string[], dir: readonly string[], folds: Folding): boolean {
+  return segments.length >= dir.length && dir.every((d, i) => segments[i] === d || (folds[i] === true && asciiLower(segments[i]!) === asciiLower(d)));
+}
+
+/**
+ * A name as a text shows it beside another it might be taken for, so the
+ * two can be told apart: each character past ASCII as its code point, such
+ * as `caf\u00e9` beside `cafe\u0301`, and a backslash doubled, so no name's
+ * own text reads as one of those.
+ */
+function shownByCodePoints(name: string): string {
+  return [...name].map((c) => {
+    const code = c.codePointAt(0)!;
+    if (c === '\\') return '\\\\';
+    return code < 0x80 ? c : code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, '0')}`;
+  }).join('');
+}
+
+/**
+ * Where a path lies in a nested mount's directory only by the comparison's
+ * guess (surelyBeneath), what a text naming that mount shows of it. Where it
+ * guessed within the mount: the directory as the path names it (`given`) and as
+ * the nested mount's directory is named (`dir`), each from the mount's name;
+ * the directories holding the levels it guessed at only by a case difference
+ * where their own entries told nothing at start, as start read them (`untold`),
+ * which a start once the nested mount's directory is made settles where a
+ * level lacked only that directory's own name, and a rename settles where a
+ * twin in case kept it telling nothing with the name there; and whether it
+ * guessed at any level by the names themselves (`byName`), which a rename
+ * settles, whatever those levels read. Where start placed the nested mount
+ * there only by a guess, comparing the real roots, the directory as the path
+ * names it (`placed`), or, where the path guessed at it too, both spellings as
+ * that guess shows them (`placed`, `dir`), since what start couldn't tell apart
+ * are host paths. For a link, where it leads (`leads`). Null where a text can
+ * show neither: where a link leads elsewhere, its place is a host path, which
+ * no message shows.
+ */
+export type NestedGuess = { given: string; dir: string; untold: readonly string[]; byName: boolean; leads?: string } | { placed: string; dir?: string; leads?: string } | null;
+
+/**
+ * NestedGuess for `given`, a path's levels beneath mount `mount`'s root, that
+ * the comparison places in a nested mount's directory `dir` by `folds`;
+ * undefined where it surely lies there (surelyBeneath). At a level where the
+ * two names differ and either holds a character past ASCII, both are shown
+ * by their code points (shownByCodePoints).
+ */
+function guessFor(mount: string, given: readonly string[], dir: readonly string[], folds: Folding): Extract<NestedGuess, { given: string }> | undefined {
+  if (surelyBeneath(given, dir, folds)) return undefined;
+  const levels = given.slice(0, dir.length);
+  const plain = (a: string, b: string) => a === b || !/[^\x00-\x7f]/.test(a + b);
+  const shown = (name: string, other: string) => (plain(name, other) ? name : shownByCodePoints(name));
+  const guessed = dir.map((d, i) => levels[i] !== d && !(folds[i] === true && asciiLower(levels[i]!) === asciiLower(d)));
+  const byCase = dir.map((d, i) => guessed[i] && folds[i] !== false && asciiLower(levels[i]!) === asciiLower(d));
+  const shownDir = dir.map((d, i) => shown(d, levels[i]!));
+  return {
+    given: [mount, ...levels.map((g, i) => shown(g, dir[i]!))].join('/'),
+    dir: [mount, ...shownDir].join('/'),
+    untold: dir.flatMap((_d, i) => (byCase[i] ? [[mount, ...shownDir.slice(0, i)].join('/')] : [])),
+    byName: guessed.some((g, i) => g && !byCase[i]),
+  };
+}
+
+/**
+ * For `segments`, a path of mount `mount` that lies in `nested`'s directory
+ * (beneathNested), what a text shows where it lies there only by the
+ * comparison's guess (NestedGuess); undefined where it surely lies there.
+ */
+export function nestedGuess(mount: string, segments: readonly string[], nested: NestedDir): NestedGuess | undefined {
+  const dir = nested.dir.split('/');
+  const guess = guessFor(mount, segments, dir, nested.folds);
+  // A placement start only guessed at comes first: if it's wrong, nothing
+  // the path guessed beneath it matters.
+  return nested.guessed ? placedGuess(mount, segments.slice(0, dir.length), guess) : guess;
+}
+
+/**
+ * A placement start only guessed at (NestedDir.guessed), as a text names it:
+ * the directory as the path spells it (`levels`), or, where the path guessed
+ * at it too, both spellings as that guess shows them (guessFor).
+ */
+function placedGuess(mount: string, levels: readonly string[], guess: ReturnType<typeof guessFor>): Extract<NestedGuess, { placed: string }> {
+  return guess === undefined ? { placed: [mount, ...levels].join('/') } : { placed: guess.given, dir: guess.dir };
+}
+
+/** `paths` as a text names them: each in quotes, and the last two joined by "and". */
+function quotedList(paths: readonly string[]): string {
+  const quoted = paths.map((p) => `"${p}"`);
+  return quoted.length < 2 ? quoted.join('') : `${quoted.slice(0, -1).join(', ')} and ${quoted.at(-1)}`;
+}
+
+/**
+ * The step a text naming nested mount `holder.name` gives: the path to use
+ * there (`use`, with `after` following it), and, where the path lies there
+ * only by the comparison's guess (`guess`), what the workspace can't tell
+ * apart, and a step for each thing the caller may have meant, since the path
+ * to use there may name another file, or nothing. A path the caller named
+ * (`named`) may also be a new file of this mount's, which a path outside the
+ * directory gives a place; a file already there can only be reached once
+ * whoever runs the workspace renames one of the two spellings, or, where the
+ * guess rests on levels that told nothing at start, starts it again once the
+ * nested mount's directory is made, where such a level lacked that
+ * directory's own name, which then tells, read from a listing or by that name
+ * alone (levelFolds). A level can tell nothing with the name there too, as
+ * where every lettered name it holds has a twin in case that tells nothing
+ * (ownCaseFolding), and the text can't tell a directory made since start from
+ * one that was there, so it says to rename one of the two spellings if the
+ * answer comes again after a start that found the directory there.
+ */
+export function nestedStep(holder: { name: string; use: string; guess?: NestedGuess }, opts: { after?: string; named?: boolean } = {}): string {
+  const { guess } = holder;
+  const after = opts.after ?? '';
+  if (guess === undefined) return `use "${holder.use}"${after}`;
+  if (guess === null) {
+    return `this workspace can't tell whether where it leads is that mount's directory. ` +
+      `If you meant that mount's directory, use "${holder.use}"${after}; if not, ask whoever runs this workspace`;
+  }
+  const leads = guess.leads === undefined ? '' : `it leads to "${guess.leads}", and `;
+  if ('placed' in guess) {
+    const check = 'ask whoever runs this workspace to check where the two mounts are configured';
+    const outside = guess.dir === undefined ? `"${guess.placed}"` : `"${guess.placed}" and "${guess.dir}"`;
+    return `${leads}this workspace can't tell whether "${guess.placed}" is mount "${holder.name}"'s directory, since the two mounts' roots are configured in ` +
+      `spellings it can't tell apart. If you meant that mount's directory, use "${holder.use}"${after}. ` +
+      (opts.named ? `If you meant one of this mount's own, for a new file use a path outside ${outside}, and for one already there ${check}` : `If not, ${check}`);
+  }
+  // A guess that rests on the names at any level is settled by a rename, since
+  // the comparison then no longer matches there, whatever the levels that
+  // told nothing read; only one that rests on case alone needs a restart.
+  const untold = guess.byName ? [] : guess.untold;
+  const one = untold.length === 1;
+  const since = untold.length === 0 ? '' : `, since nothing in ${quotedList(untold)} showed at start how ${one ? 'it compares' : 'they compare'} names`;
+  const rename = `rename one of "${guess.given}" and "${guess.dir}"`;
+  const remedy = untold.length === 0 ? rename
+    : `start it again once mount "${holder.name}"'s directory is made, and, if this answer comes again after a start that found that directory there, to ${rename}`;
+  const own = opts.named
+    ? `If you meant one of this mount's own, for a new file use a path outside "${guess.given}" and "${guess.dir}", and for one already there ask whoever runs this workspace to ${remedy}`
+    : `If not, ask whoever runs this workspace to ${remedy}`;
+  return `${leads}this workspace can't tell "${guess.given}" from "${guess.dir}", ` +
+    `mount "${holder.name}"'s directory${since}. If you meant that mount's directory, use "${holder.use}"${after}. ${own}`;
 }
 
 /**
@@ -932,7 +1386,7 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     // mount's, which the mount neither reads nor writes. A place there that
     // mount's include leaves out is no mount's, and holds nothing beneath it,
     // as at any file (namesNestedPlace).
-    const holder = nestedAtReal(real, view.nested);
+    const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });
     if (holder) {
       const directory = holder.include !== undefined && await stat(real).then((info) => info.isDirectory(), () => false);
       return namesNestedPlace(holder.rest, holder.include, directory) ? { kind: 'unobserved', reason: leadsInto(view.name, rel, holder) } : { kind: 'missing' };
@@ -999,7 +1453,7 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
     const childRel = parts.slice(0, i + 1).join('/');
     // Nothing is made in a nested mount's directory, its root included where
     // it isn't made yet, by a path that reaches it through a link.
-    const holder = nestedAtReal(base.at(parts[i]!), view.nested);
+    const holder = await nestedAtReal(base.at(parts[i]!), view.nested, { name: view.name, rootReal });
     if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, childRel, holder) };
     try {
       await mkdir(base.at(parts[i]!));
@@ -1173,7 +1627,7 @@ async function parentPlacement(view: MountView, rootReal: string, relativePath: 
     const found = await linkRefusal(view, rootReal, relativePath, parent, 'parents');
     if (found !== null) return { reason: await linkReason(view, rootReal, found) };
     if (!contained(rootReal, parent)) return { reason: OUTSIDE_PARENT };
-    const holder = nestedAtReal(parent, view.nested);
+    const holder = await nestedAtReal(parent, view.nested, { name: view.name, rootReal });
     if (!holder) return { inside: parent };
     // A place there that the nested mount's include leaves out is no mount's,
     // and holds nothing beneath it, as beneath any file (namesNestedPlace).
@@ -1224,7 +1678,7 @@ export async function observePath(view: MountView, rootReal: string, relativePat
       return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${errno(err) ?? String(err)})` };
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
-    const holder = nestedAtReal(real, view.nested);
+    const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });
     // A place a nested mount's include leaves out is no mount's, so the link
     // leaves this one (namesNestedPlace).
     if (holder) {
@@ -1300,7 +1754,7 @@ async function openContained(
     if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? 'a directory' : 'not a regular file' };
     const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: leaves };
-    const holder = nestedAtReal(real, view.nested);
+    const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });
     // A place a nested mount's include leaves out is no mount's. Reached
     // through a link this mount doesn't follow, the link is what's refused.
     if (holder) return { kind: 'unobserved', reason: namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, relativePath, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED };
@@ -1778,11 +2232,14 @@ export const OTHER_MOUNT = "another mount's directory";
  * path and repeated or trailing separators resolved, links not followed. A
  * stored key such as `a//b/x`, which chronicle accepts, is read as `a/b/x`.
  * A leading `..` that climbs above the mount's root is left as written.
- * Every nested-mount check (a pass's, a walk's, a push's, grep's) asks this.
+ * Each directory is compared as disk compares names (beneathNested), so a
+ * key stored in another spelling, or a directory made in one since the
+ * start, is that mount's too. Every nested-mount check (a pass's, a walk's,
+ * a push's, grep's) asks this.
  */
-export function inOtherMount(relativePath: string, others: readonly string[]): boolean {
-  const lexical = posix.normalize(relativePath).replace(/\/+$/, '');
-  return others.some((dir) => lexical === dir || lexical.startsWith(dir + '/'));
+export function inOtherMount(relativePath: string, others: readonly NestedDir[]): boolean {
+  const segments = posix.normalize(relativePath).replace(/\/+$/, '').split('/');
+  return others.some((dir) => beneathNested(segments, dir));
 }
 
 /**
@@ -1790,7 +2247,7 @@ export function inOtherMount(relativePath: string, others: readonly string[]): b
  * its name: another mount's directory, the ignore list, or an editor's file
  * name. Undefined when none covers it.
  */
-function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly string[]): string | undefined {
+function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly NestedDir[]): string | undefined {
   if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
   if (isIgnored(relativePath, name, patterns)) return IGNORED;
   if (EDITOR_FILE.test(name)) return EDITOR_FILE_REASON;
@@ -1804,7 +2261,7 @@ function passedOverBecause(relativePath: string, name: string, patterns: string[
  * directory is that mount's, whatever else covers a directory above it.
  * Undefined when nothing covers it.
  */
-export function passedOverAt(relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+export function passedOverAt(relativePath: string, patterns: string[], others: readonly NestedDir[]): string | undefined {
   if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
   const segments = relativePath.split('/').filter(Boolean);
   for (let i = 0; i < segments.length; i++) {
@@ -1820,7 +2277,7 @@ export function passedOverAt(relativePath: string, patterns: string[], others: r
  * the mount passes over by design, by its path and name, with the patterns
  * the walk reads there. Undefined when none is.
  */
-export function passedOverBetween(scope: string, relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+export function passedOverBetween(scope: string, relativePath: string, patterns: string[], others: readonly NestedDir[]): string | undefined {
   const segments = relativePath.split('/').filter(Boolean);
   const from = scope === '' ? 0 : scope.split('/').filter(Boolean).length;
   for (let i = from; i < segments.length - 1; i++) {
@@ -2040,9 +2497,13 @@ export async function walkScope(
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       // Another mount's directory is passed over by its real path too, so a
       // walk that reaches one through a link to a directory above it lists
-      // none of that mount's names (nestedAtReal).
+      // none of that mount's names (nestedRootAtReal). So is any other entry
+      // the comparison may take for one, such as a file named like it in the
+      // other normalization form, which a read of it refuses. A link isn't
+      // checked where it lies, since a read through it is judged where it
+      // leads.
       const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others)
-        ?? (entry.isDirectory() && nestedAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
+        ?? (!entry.isSymbolicLink() && nestedRootAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
       if (passedOver !== undefined) {
         others.push([childRel, passedOver]);
         regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });
@@ -2113,10 +2574,10 @@ export async function walkScope(
   };
 
   // Each nested root by which directory it is, read once, when the walk
-  // first descends: a directory the walk reaches through a link spelled
-  // otherwise than disk spells it, as a disk that folds names lets one, has
-  // a real path the check by path doesn't know, and is still another
-  // mount's directory.
+  // first descends: a directory the walk reaches by a path that no
+  // comparison of names places in the nested mount's directory, as through a
+  // bind mount, or on a disk whose folding goes past the comparison's, is
+  // still another mount's directory.
   let nestedRoots: Array<{ dev: string; ino: string }> | undefined;
   const isNestedRoot = async (dir: CheckedDir): Promise<boolean> => {
     if (!view.nested?.length) return false;

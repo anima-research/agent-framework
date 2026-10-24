@@ -58,7 +58,7 @@ export interface MountConfig {
    *   link is read and written where it leads now. Where that root now lies
    *   elsewhere than the last start placed it, each call nests in it, as a
    *   start would now, every mount
-   *   configured beneath its path, where that path leads beneath its root,
+   *   configured on or beneath its path, where that path leads beneath its root,
    *   and every other mount whose root, as that start placed it, lies
    *   beneath where its root lies now, or whose configured path lies
    *   beneath a directory that start found there. A mount configured
@@ -203,27 +203,77 @@ export interface MountConfig {
    * mount's own include covers with no file on its way, and is otherwise
    * refused as leaving the mount. On a mount that doesn't follow links, a
    * link on a path's way is refused, as on any such mount (followSymlinks).
-   * A nested mount's root is placed where disk has it at each start, and its
-   * directory is matched by spelling, so four cases fall outside this, as
-   * for any nested mount, and a fifth on a direct one: on a disk that folds
-   * names, a mount configured
-   * through a link that spells a directory otherwise than disk does isn't
-   * found nested, and this mount holds its files as its own; on such a disk,
-   * a path through a link that spells a nested mount's directory otherwise
-   * than that mount's configured path does, whether the link or the
-   * configured path is the one spelled otherwise than disk, isn't found to
-   * lead there, and this mount reads, lists, searches and writes there as
-   * its own, creating files too, though a walk from its root passes over the
-   * directory; on such a disk, a place in a nested mount's directory that a
-   * link does lead to is judged by that mount's include, and named, in the
-   * spelling the link's target gives, so a refusal can name a file disk
-   * spells outside that include, or leave a covered one unnamed; and a
-   * nested mount whose root moves while running, as `acceptRoot` takes,
-   * stays placed where it was until the next start; and where a direct
-   * mount's root is repointed between a read's parse and its open, a race
-   * left to whoever writes the disk, a mount nested in it by its
-   * directories alone, since its real root holds that root, can have the
-   * read serve a path in its directory.
+   * Every check compares a path with a nested mount's directory as disk
+   * compares names, level by level: in either Unicode normalization form at
+   * every level, and in any case at a level whose directory folds case, as
+   * each start reads it: from that directory's own entries where it lies
+   * within a mount's root, and from the path's own name there alone above
+   * every root, listing nothing. A level that doesn't tell, such as a
+   * directory that is empty, holds no name with a letter a-z or A-Z, or isn't
+   * made yet, or, above every root, one whose name on the path has no such
+   * letter or isn't there yet, counts as folding. Start places each root
+   * the same way, so a mount configured through a link, or in a spelling, other
+   * than disk's is found nested. So a path, a walk or the workspace's history
+   * that names the directory in another spelling disk takes for it reaches that
+   * mount, whether or not the directory is on disk yet, and so does a link
+   * whose target spells it otherwise. Where a link leads into the directory,
+   * the place beneath it is judged by that mount's include, and named, as disk
+   * spells it. A path that names the directory itself keeps what lies beneath
+   * as given, since that is the nested mount's to name. Where the comparison
+   * can't tell apart two names that disk keeps apart, it errs toward the nested
+   * mount, in where start places a mount as in every check: on a disk that
+   * keeps the normalization forms apart, a name in the other form of a nested
+   * mount's directory's name is taken for that directory; so, at a level whose
+   * own entries told nothing at start, is a name in another case; and so, at a
+   * level that folds case or told nothing, is a name the comparison folds with
+   * it that the disk keeps apart, such as `ss` beside a nested `ß`, or one that
+   * differs from it only by a default-ignorable code point, such as a soft
+   * hyphen, on a disk that folds case but keeps those. Such a directory, or
+   * file, is no mount's, and every tool that names it is refused as a path
+   * that may lie in the nested mount, with the two spellings the workspace
+   * can't tell apart, and, for a link, where it leads, when that lies in this
+   * mount. The answer gives a step for each thing the caller may have
+   * meant: that mount's path to use; for a new file of this mount's, a path
+   * outside both spellings; and for one already there, whoever runs the
+   * workspace renaming one of the two spellings, or, where the guess rests on
+   * letters a-z or A-Z differing in case alone beneath directories that told
+   * nothing at start,
+   * starting it again once the nested mount's directory is made, and renaming
+   * one of the two if the answer comes again after a start that found that
+   * directory there, since a level can tell nothing with the directory in it
+   * too, as where its every lettered name has a twin in case that tells
+   * nothing. Where start placed the nested mount only by a guess,
+   * comparing the real roots, as for two mounts' roots configured in spellings
+   * it can't tell apart, a path there is a guess too, however exactly it
+   * matches, and the answer names that directory as the path spells it, with
+   * the nested directory's spelling only in the step for a new file, names no
+   * host path, and asks for the configuration to be checked. Five cases fall
+   * outside this, as for any nested mount, and a sixth on a direct one: a
+   * level's folding is read at each start, and beneath a direct mount whose
+   * root has moved since, at each call there, so one whose folding changes
+   * meanwhile is judged as that read found it; on a disk whose folding goes
+   * past the comparison's, which at a level that folds joins names that differ
+   * only by default-ignorable code points, in normalization form or in case,
+   * in full case folding, as Linux's casefold does, or that folds case for some
+   * names and not others, a name the comparison keeps apart can reach the
+   * directory; a second path to the directory that isn't a link, such as a
+   * bind mount, isn't found to lead there, though a walk passes over it,
+   * knowing each nested root by which directory it is; a nested mount
+   * whose root moves while running, as `acceptRoot` takes, stays placed where
+   * it was until the next start, but for the calls of a direct mount whose
+   * root has moved and on or beneath whose path it's configured, which place
+   * it where it lies; a name a start reads a level's folding by, gone for a
+   * moment and back under the same inode number and change time, as a rename
+   * away and back, or a remake under the freed inode number, within one tick
+   * of a coarse clock right after its last change can leave it, or any such
+   * absence on a filesystem whose change times this module doesn't trust
+   * (filesystemTrustsCtime), can make a level that folds
+   * case read as one that tells it apart, when another spelling of it is
+   * looked up while it's gone; and where a direct mount's root is repointed
+   * between a read's parse and its open, or a write's parse and its staging, a race
+   * left to whoever writes the disk, a mount nested in it by its directories
+   * alone, since its real root holds that root, can have the read serve a
+   * path in its directory, or the write land there.
    *
    * Text the host registers for a path (`registerGeneratedTextFile`) is
    * served there whatever the include says, since it isn't one of the

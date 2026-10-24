@@ -51,7 +51,7 @@ function collect(
   const batches: FsChange[][] = [];
   const watcher = new MountWatcher(config, (changes) => {
     batches.push(changes);
-  }, lifecycle, others);
+  }, lifecycle, others.map((dir) => ({ dir, folds: dir.split('/').map(() => false) })));
   watcher.start();
   return { watcher, batches };
 }
