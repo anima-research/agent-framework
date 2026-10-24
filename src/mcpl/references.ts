@@ -613,6 +613,13 @@ export interface ReferenceRecord {
   verifiedBytes?: number;
   verifiedMimeType?: string;
   digestVerified?: boolean;
+  /** Set when the eager default's fetch of it failed, so the eager default
+   *  doesn't choose it again; fetch_reference still fetches it. A refreshed
+   *  testimony leaves it set, since a server can re-issue a uri at every
+   *  result, and it lasts as long as the record. A record fetched later, by a
+   *  save that landed after the eager pass stopped waiting or by
+   *  fetch_reference, can carry it too: fetchedPath is read first. */
+  eagerFailed?: boolean;
 }
 
 const MAX_RECORDS = 2000;

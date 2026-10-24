@@ -2,7 +2,7 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
 import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
-import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
+import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
   writeFileSync,
@@ -6268,8 +6268,10 @@ export class AgentFramework {
    *    bound, so fetch_reference can fetch it.
    *  - `model`: eagerly fetch the ones inside the autofetch envelope (below
    *    the eager ceiling, connection origin — never worse than the server
-   *    having inlined the bytes). Failures are non-fatal: the stub then says
-   *    fetch_reference instead of a path.
+   *    having inlined the bytes, for a reference whose claim is true; a fetch
+   *    it starts stops reading at the first chunk past that ceiling).
+   *    Failures are non-fatal: the stub then says fetch_reference instead of
+   *    a path, and the eager default doesn't choose that reference again.
    *  - `script`: as `model`, then fetch every reference but a link ("eagerly lazy"): a
    *    script receiving a result is the strongest available signal that the
    *    bytes are wanted (scripts process, they do not browse), so the stub it
@@ -6317,7 +6319,7 @@ export class AgentFramework {
     const MAX_EAGER_PER_RESULT = 8;
     const eligible = live.filter((record) => fetcher.isEagerEligible(record));
     await Promise.all(eligible.slice(0, MAX_EAGER_PER_RESULT).map(async (record) => {
-      const outcome = await fetcher.fetch(record, { timeoutMs: EAGER_FETCH_TIMEOUT_MS });
+      const outcome = await fetcher.fetchEager(record);
       if (!outcome.ok) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
     }));
     if (mode !== 'script') return;

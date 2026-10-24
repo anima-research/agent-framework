@@ -279,9 +279,11 @@ test("an MCPL tool called in process that fails registers none of its result's r
   // A failure keeps only its text, so no stub is made of its references.
   const failed = reference('puppet-failed.pdf');
   let fetches = 0;
+  const fetchFake = async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet-failed.pdf' }; };
   const { result, text } = await puppetCall({ isError: true, content: [{ type: 'text', text: 'look failed' }, failed] }, {
     isEagerEligible: () => true,
-    fetch: async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet-failed.pdf' }; },
+    fetch: fetchFake,
+    fetchEager: fetchFake,
   });
   assert.equal(result.success, false);
   assert.equal(result.error, 'look failed');
@@ -297,9 +299,11 @@ test("an MCPL tool called in process, as the admin puppet calls one, has its res
   // so the stored stub offers the fetch. Nothing is fetched, even a
   // reference the eager default would fetch for a call the agent makes.
   let fetches = 0;
+  const fetchFake = async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet.pdf' }; };
   const text = await puppetLook('puppet.pdf', {
     isEagerEligible: () => true,
-    fetch: async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet.pdf' }; },
+    fetch: fetchFake,
+    fetchEager: fetchFake,
   });
   assert.deepEqual(stubRecords(text).map((record) => record?.serverIds), [['eido']]);
   assert.match(text, /\[ref_[0-9a-z]+_[0-9a-z]+\] application\/pdf[^"]* — fetch with fetch_reference/, text);
