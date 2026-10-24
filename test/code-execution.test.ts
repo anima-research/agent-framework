@@ -2400,7 +2400,7 @@ describe('a round whose run or wait call watches a script that can change its ro
   }) as unknown as ProcessEvent;
   // The refusal of a channel_publish that names no channel, from a script
   // whose start turn is private.
-  const REFUSED = "this script's turn is private and has no inferred channel, so channel_publish requires an explicit channelId";
+  const REFUSED = "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId";
   type ScriptHarness = Awaited<ReturnType<typeof scriptRound>>;
   /** What the script's publish answered, as it passed it to echo. */
   const scriptNote = (h: ScriptHarness): string => {
@@ -2434,6 +2434,8 @@ describe('a round whose run or wait call watches a script that can change its ro
         await h.framework.runUntilIdle();
         if (privateTurn) {
           assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+          // Where to find a channel id, for an agent that may list them.
+          assert.ok(scriptNote(h).includes('; channel_list shows the channel ids; nothing was posted'), scriptNote(h));
           assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
         } else {
           assert.equal(scriptNote(h), 'note:posted');

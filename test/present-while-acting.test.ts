@@ -2888,7 +2888,10 @@ describe('present while acting', () => {
     assert.equal(stream.receivedToolResults.length, 1);
     const options = stream.receivedToolResultOptions[0];
     assert.ok(options?.injectedMessages, 'tool-result resume carried injected messages');
-    assert.equal(options!.injectedMessages!.length, 1);
+    // The interjection names no channel, so it's a private surface's: the
+    // turn is private from this boundary, and the notice that says so rides
+    // the injections after it.
+    assert.equal(options!.injectedMessages!.length, 2);
     const injected = options!.injectedMessages![0]!;
     assert.equal(injected.participant, 'Antra');
     const text = (injected.content as Array<{ type: string; text?: string }>)
@@ -2896,6 +2899,7 @@ describe('present while acting', () => {
       .map((b) => b.text)
       .join('\n');
     assert.equal(text, 'look left!');
+    assert.match(JSON.stringify(options!.injectedMessages![1]!.content), /\[routing\] A message from a private surface came into this turn/);
 
     await framework.stop();
   });

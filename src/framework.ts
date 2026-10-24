@@ -12925,9 +12925,9 @@ export class AgentFramework {
             if (shouldEndTurn || silent) this.privateInputStored.add(agent.name);
             if (!shouldEndTurn) {
               // A silent turn is made private too, so what it reads refuses
-              // its channel_publish that names no channel. It routes no prose,
-              // so it has no locus or pin to lose, and gets no notice.
-              const notice = this.makeTurnPrivate(agent, this.routingOf(agent.name));
+              // its channel_publish that names no channel. Its speech goes
+              // nowhere, so it gets no notice.
+              const notice = this.makeTurnPrivate(agent, this.routingOf(agent.name), silent);
               if (notice && !overBudget && currentState.stream) midTurnInjections.push(notice);
             }
           }
@@ -16797,8 +16797,7 @@ export class AgentFramework {
       );
     }
     if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply or a private think)`);
-    if (privateKept > 0) notes.push(`${privateKept} plain-speech segment(s) kept private (private turn — publish only with an explicit send tool${
-      agent.proseRouting === 'hybrid' ? ' or a >>> envelope' : ''})`);
+    if (privateKept > 0) notes.push(`${privateKept} plain-speech segment(s) kept private (private turn — publish only with ${privateTurnReach(agent)})`);
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
@@ -16824,7 +16823,11 @@ export class AgentFramework {
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}${closedNote}`
-        : agent.proseRouting === 'disabled'
+        // A private turn's plain speech went to no channel, as disabled
+        // mode's does: "nothing" would read as nothing reaching its surface.
+        // One with a draft whose earlier send may have gone out says so, as
+        // any turn does.
+        : agent.proseRouting === 'disabled' || (routing.nonChannelOrigin && !uncertain)
           ? `[delivered] plain speech → no channel — ${suppressedNote}`
           : `[delivered] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
@@ -17243,26 +17246,30 @@ export class AgentFramework {
    * channel and its sticky `>>` or `>>>` destination go, so speech written
    * after the private input doesn't follow a destination chosen before it,
    * and nothing re-pins it: the messages that would have (TurnRouting.arrivals)
-   * are named at its next start instead (noticeChannelMessages). Where its
-   * plain speech had a destination, a durable `[routing]` notice says so
-   * (storePrivateTurnNotice). Returns the notice as stored, for a live
+   * are named at its next start instead (noticeChannelMessages). A turn that
+   * becomes private here is told so once, whatever destination it had, in a
+   * durable `[routing]` notice (storePrivateTurnNotice): an explicit-mode
+   * turn with none would otherwise meet the private input with nothing
+   * saying its words now stay off channels. A silent turn (`silent`), whose
+   * speech goes nowhere, isn't told. Returns the notice as stored, for a live
    * stream to inject with its boundary's other messages, or undefined when
-   * the turn had no destination, as a turn already private or a silent one
-   * has none, or the notice couldn't be stored.
+   * the turn was private already or silent, or the notice couldn't be stored.
    */
   private makeTurnPrivate(
     agent: Agent,
     routing: TurnRouting,
+    silent = false,
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+    const wasPrivate = routing.nonChannelOrigin === true;
     routing.nonChannelOrigin = true;
     this.notePrivateTurn(routing.turnId);
     const had = routing.locus ?? routing.pin;
     delete routing.locus;
     delete routing.pin;
     delete routing.triggerChannel;
-    if (had === undefined) return undefined;
+    if (wasPrivate || silent) return undefined;
     const notice = this.storePrivateTurnNotice(agent);
-    if (notice) console.error(`[routing] ${agent.name}: private input made the turn private (${qualifiedChannelName(had)} -> none)`);
+    if (notice) console.error(`[routing] ${agent.name}: private input made the turn private (${had ? qualifiedChannelName(had) : 'no destination'} -> none)`);
     return notice;
   }
 
@@ -18440,6 +18447,14 @@ export class AgentFramework {
       body = parsed.body;
     } else {
       const sticky = routing.pin;
+      if (!sticky && routing.nonChannelOrigin) {
+        // A private turn's plain speech goes to no channel, so it's kept
+        // private, as in the other modes, not bounced: a bounce holds a
+        // draft to resend, and resending it is the step into a channel the
+        // turn's privacy keeps from being taken by default.
+        this.keepPrivateTurnProse(agent, rawText);
+        return;
+      }
       if (!sticky) {
         this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round);
         return;
@@ -18551,6 +18566,29 @@ export class AgentFramework {
               : 'it was queued in a resend when these words were held',
           };
     return { text: expanded, inheritedRisk };
+  }
+
+  /**
+   * Explicit mode's unprefixed speech in a private turn: kept private, with
+   * no draft held and no `{{unsent}}` offer, and the resident told why and
+   * how to publish, privately, as a bounce's receipt would tell it. No wake:
+   * nothing failed that a resend would fix.
+   */
+  private keepPrivateTurnProse(agent: Agent, text: string): void {
+    const notice =
+      `[prose-routing] Your text (${text.length} chars) was kept private — this turn holds private input, so its ` +
+      `plain speech goes to no channel, and it isn't held as a draft. To publish, use ${privateTurnReach(agent)}.`;
+    console.error(`[prose] ${agent.name}: ${text.length} chars kept private (private turn)`);
+    const target = this.noticeTargetFor(agent.name, 'prose-bounce');
+    if (!target) return;
+    try {
+      // Through framework.addMessage, as a bounce's notice goes: deferred to
+      // the next tool boundary while the turn streams.
+      const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, target);
+      this.emitTrace({ type: 'message:added', messageId: id ?? 'deferred', source: 'prose-bounce' });
+    } catch (err) {
+      console.error('keepPrivateTurnProse: failed to record the notice:', err);
+    }
   }
 
   /**
@@ -19464,6 +19502,12 @@ export class AgentFramework {
       // this turn compiles, so the agent always knows where its voice goes
       // (announce-on-change only — no per-turn chatter, append-only for KV
       // stability).
+      // A stored private message made this start private though no private
+      // wake started it: its resident is told why, every time and in every
+      // mode, since it would take its reply to be the room's. A silent start
+      // has no reply, and reads the mark again at each tick until a start
+      // that can publish spends it, so it isn't told.
+      const toldPrivate = attempt === 0 && privateInput && trigger?.nonChannelOrigin !== true && !trigger?.suppressProse;
       if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
         // None for a turn with no channel (noChannel), unless it's a fork's,
         // and none for a private turn.
@@ -19472,13 +19516,9 @@ export class AgentFramework {
           routing.locus = locus;
           noteTurnChannel(routing, locus);
         }
-        // A stored private message made this start private though no private
-        // wake started it: its resident is told why, every time, since it
-        // would take its reply to be the room's. A silent start never gets
-        // here, since it routes no prose (turnProseRouting is 'disabled').
-        if (attempt === 0 && privateInput && trigger?.nonChannelOrigin !== true) this.storePrivateTurnNotice(agent);
-        else if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
+        if (attempt === 0 && !toldPrivate) this.announceLocusIfChanged(agent.name, locus);
       }
+      if (toldPrivate) this.storePrivateTurnNotice(agent);
     } else {
       // Every other start of the turn keeps its locus: a resume, or a start
       // that continues the open turn. One whose batch holds a private wake,
@@ -23252,8 +23292,9 @@ export class AgentFramework {
       // chose for it, where the private turn's work would be published.
       : toolName === 'channel_publish' && !input.channelId
         && context.startTurnId !== undefined && this.isPrivateTurn(context.startTurnId)
-        ? "this script's turn is private and has no inferred channel, so channel_publish requires an explicit channelId"
-          + `${this.conversationAgentHomes.has(agentName) ? ` (to publish in this conversation's channel, name "${this.forkHomeShown(agentName)}")` : ''}; nothing was posted`
+        ? "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId"
+          + `${this.conversationAgentHomes.has(agentName) ? ` (to publish in this conversation's channel, name "${this.forkHomeShown(agentName)}")` : ''}`
+          + `${this.canAgentUseTool(agentName, 'channel_list') ? '; channel_list shows the channel ids' : ''}; nothing was posted`
       : undefined;
     // A call that reaches the host while a run or wait call watches the
     // script (context.watch) counts toward that call's round (ScriptRound),
@@ -30170,8 +30211,9 @@ export class AgentFramework {
     if (call.name !== 'channel_publish' || !privateTurn) return undefined;
     if ((call.input as { channelId?: unknown } | undefined)?.channelId) return undefined;
     const home = this.forkHomeShown(agentName);
-    return 'This private turn has no inferred channel; channel_publish requires an explicit channelId.'
-      + (home ? ` To publish in this conversation's channel, name "${home}".` : '');
+    return 'This private turn has no default channel; channel_publish requires an explicit channelId.'
+      + (home ? ` To publish in this conversation's channel, name "${home}".` : '')
+      + (this.canAgentUseTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
   }
 
   /** A conversation fork's home channel by the name the agent is shown, the

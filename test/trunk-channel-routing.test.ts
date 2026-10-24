@@ -783,7 +783,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.equal(i.turnRouting.get('scout')?.nonChannelOrigin, true);
     const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
-    assert.ok(texts.some((t) => t.includes('[delivered] nothing') && t.includes('kept private')));
+    assert.ok(texts.some((t) => t.includes('[delivered] plain speech → no channel') && t.includes('kept private')));
     await framework.stop();
   });
 
@@ -804,7 +804,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.equal(i.turnRouting.get('scout')?.locus, undefined);
     const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
-    assert.ok(texts.some((t) => t.includes('[delivered] nothing') && t.includes('kept private')), 'and reached its speech, kept private');
+    assert.ok(texts.some((t) => t.includes('[delivered] plain speech → no channel') && t.includes('kept private')), 'and reached its speech, kept private');
     await framework.stop();
   });
 

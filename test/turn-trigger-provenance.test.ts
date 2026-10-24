@@ -721,6 +721,72 @@ describe('private wins, one way', () => {
     }
   });
 
+  for (const hadDestination of [false, true]) {
+    it(`an explicit-mode turn that ${hadDestination ? 'had' : 'had no'} destination is told it's private when private input comes in, and its plain answer is kept private, with no draft`, async () => {
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => framework!.pushEvent(tuiMessage('for your eyes only, what is the door code?')));
+      const rig = await surfaceRig({ modules: [tool], agent: { proseRouting: 'explicit' } });
+      framework = rig.framework;
+      try {
+        rig.membrane.pushResponse(createMockResponse([
+          ...(hadDestination ? [{ type: 'text', text: `>>${ROOM} on my way` }] : []),
+          { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+        ] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'The door code is 4417.' }]));
+        rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+        await rig.framework.runUntilIdle();
+        assert.deepEqual(rig.routed.map((r) => r.text), hadDestination ? ['on my way'] : [], 'nothing after the private input went out');
+        const texts = rig.texts();
+        assert.equal(texts.filter((t) => t.startsWith(PRIVATE_FROM_HERE)).length, 1, `told once that the turn is private: ${JSON.stringify(texts)}`);
+        assert.ok(texts.includes('[prose-routing] Your text (22 chars) was kept private — this turn holds private input, so its plain ' +
+          "speech goes to no channel, and it isn't held as a draft. To publish, use a >> prefix or an explicit send tool."), JSON.stringify(texts));
+        assert.ok(!texts.some((t) => t.includes('{{unsent}}')), 'no offer to resend it');
+        const drafts = (rig.framework as unknown as { proseDrafts: { open(agent: string): unknown[] } }).proseDrafts.open('scout');
+        assert.deepEqual(drafts, [], 'and no draft held');
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  it("a private turn that takes in more private input is told nothing again", async () => {
+    let framework: AgentFramework | undefined;
+    const tool = robot(() => framework!.pushEvent(tuiMessage('and one more thing')));
+    const rig = await surfaceRig({ modules: [tool] });
+    framework = rig.framework;
+    try {
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'looking into it' },
+        { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+      ] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private turn');
+      await rig.framework.runUntilIdle();
+      assert.ok(privateStart(rig.starts[0]!), 'control: the turn opened private');
+      const wired = rig.streams[0]!.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
+      assert.ok(wired.some((w) => w.includes('and one more thing')), `control: its boundary took in the second message: ${JSON.stringify(wired)}`);
+      assert.deepEqual(rig.texts().filter((t) => t.startsWith(PRIVATE_FROM_HERE)), [], 'it was private already, so nothing says it became so');
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("an explicit-mode room start that a stored operator message makes private is told why", async () => {
+    const rig = await surfaceRig({ agent: { proseRouting: 'explicit' } });
+    try {
+      storeOperatorMessage(rig.framework);
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }]));
+      rig.i.pendingRequests.push(roomWake());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', "the room's start");
+      assert.equal(rig.routings[0]!.nonChannelOrigin, true, 'control: the start is private');
+      assert.equal(rig.texts().filter((t) => t.startsWith(PRIVATE_FROM_HERE)).length, 1, JSON.stringify(rig.texts()));
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a round written before the turn turned private, delivered after it, sets no destination for the turn's later speech", async () => {
     for (const mode of ['hybrid', 'explicit'] as const) {
       const prefix = mode === 'hybrid' ? '>>>' : '>>';
@@ -996,9 +1062,16 @@ describe('private wins, one way', () => {
         results.length = 0;
         internalsOf.dispatchChannelToolCall('scout', { id: `c-${fork}`, name: 'channel_publish', input: { content: 'hello' } });
         assert.equal(results[0]?.success, false, `${fork ? 'a fork' : 'a trunk agent'}: refused without a channelId`);
-        assert.match(results[0]!.error!, /channel_publish requires an explicit channelId/);
+        assert.match(results[0]!.error!, /^This private turn has no default channel; channel_publish requires an explicit channelId\./);
         if (fork) assert.match(results[0]!.error!, new RegExp(`name "${ROOM}"`));
+        assert.match(results[0]!.error!, / channel_list shows the channel ids\.$/, 'where to find a channel id, for an agent that may list them');
       }
+      // An agent that may not call channel_list isn't pointed at it.
+      const canUse = (rig.framework as unknown as { canAgentUseTool(a: string, t: string): boolean }).canAgentUseTool;
+      (rig.framework as unknown as { canAgentUseTool(a: string, t: string): boolean }).canAgentUseTool = (a, t) => t !== 'channel_list' && canUse.call(rig.framework, a, t);
+      results.length = 0;
+      internalsOf.dispatchChannelToolCall('scout', { id: 'c-nolist', name: 'channel_publish', input: { content: 'hello' } });
+      assert.ok(!results[0]!.error!.includes('channel_list'), results[0]!.error);
     } finally {
       await rig.close();
     }

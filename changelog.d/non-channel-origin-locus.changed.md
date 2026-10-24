@@ -13,9 +13,9 @@
   of it: a start that continues it with a private wake or stored private
   input, or a tool boundary that injects a private surface's message, removes
   its locus, its trigger channel and its sticky `>>` or `>>>` destination, and
-  a `[routing]` notice says why. While a turn is private, a `>>>` or `>>`
-  envelope posts its own body where it names but sets no destination for the
-  turn's later speech. What a private turn causes
+  a `[routing]` notice says why, whatever destination the turn had. While a
+  turn is private, a `>>>` or `>>` envelope posts its own body where it names
+  but sets no destination for the turn's later speech. What a private turn causes
   is private too: its budget restart, its tool results' re-inference, a ` !`
   continuation, its auto-continuation (`autoContinue`), a bounce's wake, a
   rewind's retry, a self-wake it arms with `skip_reply`'s `wake_in_seconds`,
@@ -38,16 +38,19 @@
   in that would have moved a channel turn's locus, whether the boundary
   injects it or leaves it to the turn's next start.
 
-  In locus and hybrid modes, a private turn's plain speech is counted in its
-  `[delivered]` receipt as kept private, rather than reported as a failed send.
-  Explicit mode is unchanged: unprefixed prose bounces, as in any turn. In
+  A private turn's plain speech is kept private in every mode. In locus and
+  hybrid modes its `[delivered]` receipt counts it and says the plain speech
+  went to no channel, rather than reporting a failed send. In explicit mode,
+  a private turn's unprefixed speech is no longer bounced and held as a
+  draft to resend: a notice says it was kept private and how to publish. In
   every mode, words a send silenced are held as drafts, as in any turn. Speech
   handlers are told a private turn's speech is private
   (`SpeechContext.nonChannelOrigin`), and the built-in Discord module posts
   none of it and edits its thoughts into no message.
 
   A private turn's `channel_publish` must name its channel: a call without
-  `channelId` is refused, a conversation fork's included. So must a script's
+  `channelId` is refused, a conversation fork's included, and the refusal
+  says `channel_list` shows the channel ids, to an agent that may call it. So must a script's
   whose starting turn is private, as that turn stands at the call, whichever
   turn watches the script then. `channel_publish`'s description says so, so
   every agent's tool list changes once. A private turn's `channel_open`
