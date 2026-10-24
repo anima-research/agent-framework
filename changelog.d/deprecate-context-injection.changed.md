@@ -7,15 +7,20 @@
   prefixes at its old slot (on OpenAI Responses/Codex lanes the first call
   after such a move falls back to a head-only cache hit), and a `beforeUser`
   block placed beside a tool result lands between the tool call and its
-  result. With no user-participant message, context-manager before 0.16
-  drops a `beforeUser` block. A `system` block's text is appended to the
-  system prompt, which comes before every message, so with a prefix cache
-  each new text of it misses the cache for everything after it (#171).
+  result in the compiled messages. With no user-participant message,
+  context-manager 0.16 and later put both blocks at the end, and earlier
+  versions drop a `beforeUser` block. A `system` block's text is appended to
+  the system prompt, which comes before every message, so with a prefix
+  cache each new text of it misses the cache for everything after it (#171).
   Nothing is removed for now, and the deprecation changes nothing about how
-  injections are applied: the host logs one `[deprecated]` line per module or
-  MCPL server the first time its injections are gathered in time for a turn.
-  `Module.gatherContext`, `Module.contextTimeoutMs` and
-  `BeforeInferenceResult.contextInjections` carry `@deprecated`. Durable
-  content belongs in the agent's configured system prompt, which the host's
-  configuration sets; deliver changing state as conversation content (events,
-  push events, tool results) instead.
+  injections are applied: the host logs one `[deprecated]` line the first
+  time a module returns injections, or an MCPL server returns one that passes
+  the feature-set and grant checks. The framework's own `system` injections,
+  a silent heartbeat's `ephemeralSystemPrompt` and the subconscious's standing
+  dispositions, aren't logged. `Module.gatherContext`,
+  `Module.contextTimeoutMs` and `BeforeInferenceResult.contextInjections`
+  carry `@deprecated`. Deliver changing state as conversation content
+  (events, push events, tool results) instead. Durable content belongs in
+  the agent's configured system prompt, which the host's configuration sets
+  and which is fixed once the agent is made, so `system` text that changes
+  at runtime has no replacement.

@@ -1,8 +1,8 @@
 /**
  * Context injection is deprecated (#171). The deprecation changes nothing
- * about how injections are applied, and every source whose injections are
- * gathered in time is named once on stderr. A source that injects nothing,
- * or a module that answers after its timeout, isn't named.
+ * about how injections are applied. Every module that returns injections,
+ * and every MCPL server with an injection that passes the feature-set and
+ * grant checks, is named once on stderr; a source with none isn't.
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -54,56 +54,16 @@ test('a module that injects is still applied and is named once across turns', as
   });
   assert.equal(first.length, 1, 'injection still applied');
   assert.equal(warnings.length, 1, `one warning for three turns, got ${JSON.stringify(warnings)}`);
-  assert.match(warnings[0], /module "hud" returns context injections, and this line changes nothing about how they're applied\./);
-  assert.match(warnings[0], /#171/);
-});
-
-test('a module that answers after its timeout is neither added to the returned injections nor named', async () => {
-  let lateAnswered = false;
-  const late: Module = {
-    ...injectingModule('late', 1),
-    contextTimeoutMs: 50,
-    gatherContext: async () => {
-      await new Promise((r) => setTimeout(r, 120));
-      lateAnswered = true;
-      return [{ namespace: 'late', position: 'afterUser' as const, content: [{ type: 'text' as const, text: 'late #0' }] }];
-    },
-  };
-  const registry = makeRegistry([injectingModule('prompt', 1), late]);
-  const errs: string[] = [];
-  const origErr = console.error;
-  console.error = (...a: unknown[]) => { errs.push(a.map(String).join(' ')); };
-  let returned: unknown[] = [];
-  let warnings: string[] = [];
-  try {
-    warnings = await captureWarnings(async () => {
-      returned = await registry.gatherContext('agent');
-      // Past the late answer: it resolves at 120 ms, its timeout fired at 50.
-      await new Promise((r) => setTimeout(r, 200));
-    });
-  } finally { console.error = origErr; }
-  assert.ok(lateAnswered, 'the late module did answer, after its timeout');
-  assert.deepEqual(returned.map((i) => (i as { namespace: string }).namespace), ['prompt'], 'the late answer is not added after the timeout');
-  assert.equal(warnings.length, 1, `only the module that answered in time is named, got ${JSON.stringify(warnings)}`);
-  assert.match(warnings[0], /module "prompt"/);
-  assert.ok(errs.some((e) => e.includes('[late] gatherContext') && e.includes('timed out after 50ms')), 'the timeout is logged as before');
-});
-
-test('a module whose gatherContext throws before returning a promise fails alone', async () => {
-  const thrower: Module = {
-    ...injectingModule('thrower', 1),
-    gatherContext: (() => { throw new Error('no context today'); }) as Module['gatherContext'],
-  };
-  const registry = makeRegistry([thrower, injectingModule('prompt', 1)]);
-  const errs: string[] = [];
-  const origErr = console.error;
-  console.error = (...a: unknown[]) => { errs.push(a.map(String).join(' ')); };
-  let returned: unknown[] = [];
-  try {
-    await captureWarnings(async () => { returned = await registry.gatherContext('agent'); });
-  } finally { console.error = origErr; }
-  assert.deepEqual(returned.map((i) => (i as { namespace: string }).namespace), ['prompt'], "the other module's injections are returned");
-  assert.ok(errs.some((e) => e.includes('[thrower] gatherContext') && e.includes('no context today')), 'the throw is logged as a rejection is');
+  assert.equal(
+    warnings[0],
+    '[deprecated] module "hud" returns context injections, and this line changes nothing about how they\'re applied. ' +
+      'Context injection is deprecated (anima-research/agent-framework#171). Moving changing state into conversation ' +
+      'content (push events, tool results) is for whoever maintains the module or server named at the start of this ' +
+      "line. Durable system text belongs in the agent's configured system prompt, which whoever configures this host " +
+      'sets; system text that changes at runtime has no replacement. Turning that module or server off removes ' +
+      'its injections along with whatever else it does.',
+    'the whole line an operator reads',
+  );
 });
 
 test('a module whose gatherContext returns nothing is not warned about', async () => {

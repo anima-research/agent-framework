@@ -17,10 +17,14 @@
  *     boundaries an earlier request wrote (OpenAI Responses / Codex), the
  *     first call after such a move falls back to a head-only hit; on
  *     Anthropic the loss is bounded but real. A `beforeUser` block placed
- *     beside a tool result lands between the tool call and its result; an
- *     `afterUser` block lands after the result. With no `user` message,
- *     context-manager before 0.16 drops a `beforeUser` block and puts an
- *     `afterUser` one at the end.
+ *     beside a tool result lands between the tool call and its result in
+ *     the compiled messages; membrane's native formatter then moves the
+ *     result ahead of it, into the same message, and its OpenAI Responses
+ *     formatter sends it between the call and its output. An `afterUser`
+ *     block lands after the result. With no `user` message, context-manager
+ *     0.16 and later put both blocks at the end, `beforeUser` first, and
+ *     earlier versions drop a `beforeUser` block and put an `afterUser` one
+ *     at the end.
  *   - `system`: its text is appended to the system prompt on every request,
  *     never re-anchored, so it can't split a tool call from its result.
  *     Blocks that aren't text can't be carried there. The system prompt
@@ -30,30 +34,28 @@
  * See anima-research/agent-framework#171.
  *
  * Nothing is removed yet, and the deprecation changes nothing about how
- * injections are applied. Hosts log one `[deprecated]` line per module /
- * server whose injections are gathered in time for a turn, so remaining uses
- * are visible before the mechanism is removed.
+ * injections are applied. Hosts log one `[deprecated]` line per module that
+ * returns injections, and per MCPL server with an injection that passes the
+ * feature-set and grant checks, so remaining uses are visible before the
+ * mechanism is removed. The framework's own `system` injections are added
+ * after both and aren't logged: a silent heartbeat's `ephemeralSystemPrompt`,
+ * and the subconscious's standing dispositions.
  *
- * Instead: durable instructions belong in the agent's configured system
- * prompt, which the host's configuration sets; deliver time-varying state
- * as conversation content (push events, tool results) so it is stored once
- * at its own position and stays cache-stable.
+ * Instead: deliver changing state as conversation content (push events,
+ * tool results), so it is stored once at its own position and stays
+ * cache-stable. Durable instructions belong in the agent's configured system
+ * prompt, which the host's configuration sets. That prompt is fixed once the
+ * agent is made, so `system` text that changes at runtime has no
+ * replacement.
  */
 
 export const CONTEXT_INJECTION_DEPRECATION_NOTICE =
-  'Context injection is deprecated (anima-research/agent-framework#171). An injected block is never' +
-  " stored in the conversation, so its record doesn't hold what the model saw. A beforeUser or " +
-  'afterUser block is placed beside the latest user-participant message, tool results included, ' +
-  'on every compile, so it moves each time a newer one takes its place, which breaks prompt-cache ' +
-  'prefixes at its old slot (head-only hits on OpenAI lanes), and a beforeUser block placed beside ' +
-  'a tool result lands between the tool call and its result; with no user-participant message, ' +
-  'context-manager before 0.16 drops a beforeUser block. A system block\'s text is appended to the ' +
-  'system prompt, which comes before every message, so with a prefix cache each new text of it ' +
-  'misses the cache for everything after it. Durable ' +
-  "text belongs in the agent's configured system prompt, which whoever configures this host sets. " +
-  'Moving changing state into conversation content (push events, tool results) is for whoever ' +
-  'maintains the module or server named at the start of this line. Turning that module or server ' +
-  'off removes its injections along with whatever else it does.';
+  'Context injection is deprecated (anima-research/agent-framework#171). Moving changing state ' +
+  'into conversation content (push events, tool results) is for whoever maintains the module or ' +
+  "server named at the start of this line. Durable system text belongs in the agent's configured " +
+  'system prompt, which whoever configures this host sets; system text that changes at runtime ' +
+  'has no replacement. Turning that module or server off removes its injections along with ' +
+  'whatever else it does.';
 
 const warned = new Set<string>();
 

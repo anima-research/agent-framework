@@ -116,15 +116,17 @@ export interface Module {
    * moves each time a newer one takes its place, which breaks prompt-cache
    * prefixes at its old slot (head-only hits on OpenAI lanes), and a
    * `beforeUser` injection placed beside a tool result lands between the tool
-   * call and its result. With no user-participant message, context-manager
-   * before 0.16 drops a `beforeUser` injection. A `system` injection's text is
+   * call and its result in the compiled messages. With no user-participant
+   * message, context-manager 0.16 and later put both at the end, and earlier
+   * versions drop a `beforeUser` injection. A `system` injection's text is
    * appended to the system prompt, which comes before every message, so with
    * a prefix cache each new text of it misses the cache for everything after
-   * it. Do not add new implementations: durable content belongs in the
-   * agent's configured system prompt, which the host's configuration sets,
-   * and changing state belongs in conversation content (events, tool
-   * results). Still called for now; the framework logs one `[deprecated]`
-   * line per module whose injections it gathers in time.
+   * it. Do not add new implementations: changing state belongs in
+   * conversation content (events, tool results), and durable content in the
+   * agent's configured system prompt, which the host's configuration sets;
+   * `system` text that changes at runtime has no replacement. Still
+   * called for now; the framework logs one `[deprecated]` line per module
+   * that returns injections.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 
