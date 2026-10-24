@@ -1156,6 +1156,130 @@ describe('private wins, one way', () => {
     });
   }
 
+  it("a request that continues a turn's work is private exactly when that turn is, as it stands when the request comes", async () => {
+    const asker = {
+      name: 'asker', async start() {}, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false, error: 'none' }; },
+      async onProcess(event: ProcessEvent) {
+        return event.type === 'inference-request' ? { requestInference: [(event as { agentName: string }).agentName] } : {};
+      },
+    };
+    const rig = await surfaceRig({ modules: [asker as never] });
+    try {
+      const internalsOf = rig.framework as unknown as { notePrivateTurn(turnId: number): void };
+      const routing = routingOf(rig.framework);
+      const ask = (callerTurnId?: number) => rig.framework.pushEvent({
+        type: 'inference-request', agentName: 'scout', reason: 'subagent done', source: 'subagent',
+        ...(callerTurnId !== undefined ? { callerTurnId } : {}),
+      } as never);
+      ask(routing.turnId as number);
+      ask();
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the public asks');
+      assert.ok(rig.starts.every((r) => r.nonChannelOrigin !== true), `a public turn's, and one that names none, are public: ${JSON.stringify(rig.starts)}`);
+      // The turn took private input after its work began.
+      internalsOf.notePrivateTurn(routing.turnId as number);
+      const before = rig.starts.length;
+      ask(routing.turnId as number);
+      await rig.until(() => rig.starts.length > before && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private ask');
+      assert.ok(privateStart(rig.starts.at(-1)!), JSON.stringify(rig.starts.at(-1)));
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a turn is recorded private where it turns private: at its open, and when it takes in private input later", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        isPrivateTurn(turnId: number): boolean;
+        makeTurnPrivate(agent: unknown, routing: Routing): unknown;
+      };
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private turn');
+      rig.i.pendingRequests.push(roomWake());
+      await rig.until(() => rig.starts.length >= 2 && rig.framework.getAgent('scout')!.state.status === 'idle', "the room's turn");
+      const [opened, room] = rig.routings as Routing[];
+      assert.equal(internalsOf.isPrivateTurn(opened!.turnId as number), true, 'a turn opened private');
+      assert.equal(internalsOf.isPrivateTurn(room!.turnId as number), false, "control: the room's turn");
+      internalsOf.makeTurnPrivate(rig.framework.getAgent('scout'), room!);
+      assert.equal(internalsOf.isPrivateTurn(room!.turnId as number), true, 'a turn made private later');
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a gate window that holds a request continuing a private turn's work wakes one private turn", async () => {
+    const asker = {
+      name: 'asker', async start() {}, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false, error: 'none' }; },
+      async onProcess(event: ProcessEvent) {
+        return event.type === 'inference-request' ? { requestInference: [(event as { agentName: string }).agentName] } : {};
+      },
+    };
+    const gate = { config: { policies: [{ name: 'both', match: { scope: ['inference-request', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } };
+    const rig = await surfaceRig({ gate, modules: [asker as never] });
+    try {
+      const internalsOf = rig.framework as unknown as { notePrivateTurn(turnId: number): void };
+      const routing = routingOf(rig.framework);
+      internalsOf.notePrivateTurn(routing.turnId as number);
+      const eventGate = (rig.framework as unknown as { eventGate: { evaluate(info: Record<string, unknown>): unknown } }).eventGate;
+      rig.framework.pushEvent({ type: 'inference-request', agentName: 'scout', reason: 'subagent done', source: 'subagent', callerTurnId: routing.turnId } as never);
+      eventGate.evaluate({
+        content: 'over here', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
+        metadata: { author: { id: 'u1' } }, tags: ['chat:addressed'],
+      });
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      assert.equal(rig.starts.length, 1, JSON.stringify(rig.starts));
+      assert.ok(privateStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('a turn id is private once noted, public above the eviction floor, and private when no longer known', async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        notePrivateTurn(turnId: number): void; isPrivateTurn(turnId: number): boolean;
+      };
+      const base = 10_000_000;
+      assert.equal(internalsOf.isPrivateTurn(base + 1), false, 'unnoted, above the floor');
+      internalsOf.notePrivateTurn(base + 1);
+      assert.equal(internalsOf.isPrivateTurn(base + 1), true);
+      // 4096 more private turns evict the first, and the floor rises to it.
+      for (let i = 0; i < 4096; i++) internalsOf.notePrivateTurn(base + 10 + i);
+      assert.equal(internalsOf.isPrivateTurn(base + 1), true, 'evicted: no longer known, so private');
+      assert.equal(internalsOf.isPrivateTurn(base), true, 'below the floor: no longer known');
+      assert.equal(internalsOf.isPrivateTurn(base + 5), false, 'above the floor and never private');
+      assert.equal(internalsOf.isPrivateTurn(base + 10), true, 'still kept');
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a script's wake is private exactly when the turn that started it is, as it stands when the wake comes", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number | undefined): Promise<void>;
+        notePrivateTurn(turnId: number): void;
+      };
+      const routing = routingOf(rig.framework);
+      const woke = async (startTurnId: number | undefined) => {
+        await internalsOf.scriptWake('scout', 's1', '[script s1] Woke you', 's1-wake', startTurnId);
+        const asked = rig.i.pendingRequests.at(-1);
+        rig.i.pendingRequests.length = 0;
+        assert.equal(asked?.reason, 'script:wake');
+        return asked?.nonChannelOrigin === true;
+      };
+      assert.equal(await woke(routing.turnId as number), false, "a channel turn's script wakes a channel turn");
+      assert.equal(await woke(undefined), false, 'a script started in no turn wakes as before');
+      internalsOf.notePrivateTurn(routing.turnId as number);
+      assert.equal(await woke(routing.turnId as number), true, 'its turn has turned private since it started the script');
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a private turn's same-round private think keeps its words as the resident's own choice", async () => {
     const rig = await surfaceRig({ modules: [robot()], agent: { sameRoundThinkTextPolicy: 'private' } });
     try {

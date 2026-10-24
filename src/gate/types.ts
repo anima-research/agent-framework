@@ -234,8 +234,9 @@ export interface GateEventInfo {
   serverId: string;
   channelId: string;
   metadata?: Record<string, unknown>;
-  /** A private surface's message (the framework's isNonChannelSurfaceEvent):
-   *  the window it joins wakes a private turn (wakeProvenance). */
+  /** A private surface's message, or a request that continues a private
+   *  turn's work (the framework's wakesPrivately): the window it joins wakes
+   *  a private turn (wakeProvenance). */
   nonChannelOrigin?: boolean;
   /** Workspace mount name (for workspace:* events). */
   mount?: string;

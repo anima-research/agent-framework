@@ -141,6 +141,17 @@ export interface InferenceRequestEvent {
   reason: string;
   /** Module that requested it */
   source: string;
+  /**
+   * The turn whose work this request continues, such as the turn that
+   * spawned a subagent whose result it is: the `callerTurnId` of the call
+   * that started the work (ToolCall.callerTurnId), echoed back. A module's
+   * response that requests inference for this event wakes a private turn
+   * when that turn is private as it stands when the event is handled, having
+   * taken private input after the call included. An id the framework no
+   * longer knows counts as private. Left out, the wake is a channel's or not
+   * as any other event's is.
+   */
+  callerTurnId?: number;
 }
 
 /**

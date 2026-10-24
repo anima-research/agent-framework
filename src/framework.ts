@@ -1416,6 +1416,9 @@ export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
   return !(typeof channelId === 'string' && channelId.trim().length > 0);
 }
 
+/** How many private turns' ids the framework keeps (privateTurnIds). */
+const PRIVATE_TURNS_KEPT = 4096;
+
 /** A request a quiesce lets through, so a turn already alive can finish:
  *  a continuation of the turn, or a held turn's retry (TURN_RETRY). */
 function passesQuiesce(request: InferenceRequest | undefined): boolean {
@@ -3128,6 +3131,13 @@ export class AgentFramework {
    *  that runs on the same routing, as a resume can, takes it out again
    *  (beginAgentTurn). */
   private settledTurns: WeakSet<TurnRouting> = new WeakSet();
+  /** The ids of recent private turns (TurnRouting.nonChannelOrigin), so a
+   *  wake that continues a turn's work, a script's or a host's, can be judged
+   *  by that turn's privacy as it stands when the wake comes (isPrivateTurn).
+   *  Oldest first, at most PRIVATE_TURNS_KEPT; `privateTurnsFloor` is the
+   *  newest id evicted, past which an id is no longer known. */
+  private privateTurnIds = new Set<number>();
+  private privateTurnsFloor = 0;
   /** Agents whose fresh turn's coalescing assembly is running
    *  (beginAgentTurn): the window in which addMessage honours a write's
    *  bypassDeferralFor naming that agent. */
@@ -13009,8 +13019,9 @@ export class AgentFramework {
           eventType: event.type,
           serverId: source,
           channelId: '',
-          // A private surface's message makes the window it joins private.
-          ...(isNonChannelSurfaceEvent(event) ? { nonChannelOrigin: true } : {}),
+          // A private surface's message makes the window it joins private,
+          // and so does a request that continues a private turn's work.
+          ...(this.wakesPrivately(event) ? { nonChannelOrigin: true } : {}),
         });
         if (!decision.trigger) return;
       }
@@ -13031,7 +13042,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            nonChannelOrigin: isNonChannelSurfaceEvent(event),
+            nonChannelOrigin: this.wakesPrivately(event),
             ...this.readsDeferredFor(added, agentName),
           });
         }
@@ -16754,6 +16765,41 @@ export class AgentFramework {
   }
 
   /**
+   * Whether a module's request for inference on this event wakes a private
+   * turn: a private surface's message (isNonChannelSurfaceEvent), or an
+   * `inference-request` that names a turn private as it stands now
+   * (InferenceRequestEvent.callerTurnId, isPrivateTurn).
+   */
+  private wakesPrivately(event: ProcessEvent): boolean {
+    return isNonChannelSurfaceEvent(event)
+      || (event.type === 'inference-request' && event.callerTurnId !== undefined && this.isPrivateTurn(event.callerTurnId));
+  }
+
+  /** Record a turn as private (privateTurnIds), at each site that makes one
+   *  private: its open, and makeTurnPrivate. */
+  private notePrivateTurn(turnId: number): void {
+    if (this.privateTurnIds.has(turnId)) return;
+    this.privateTurnIds.add(turnId);
+    if (this.privateTurnIds.size <= PRIVATE_TURNS_KEPT) return;
+    const oldest = this.privateTurnIds.values().next().value!;
+    this.privateTurnIds.delete(oldest);
+    this.privateTurnsFloor = Math.max(this.privateTurnsFloor, oldest);
+  }
+
+  /**
+   * Whether the turn with this id is private as it stands now, for a wake
+   * that continues its work: a script's (scriptWake), a script's
+   * channel_publish (scriptToolCall), or a host's `inference-request` that
+   * names it (InferenceRequestEvent.callerTurnId). A turn turns private one
+   * way, so a turn that took private input after the work began counts. An
+   * id no longer known, at or below the newest one evicted from the record,
+   * counts as private: it fails closed.
+   */
+  private isPrivateTurn(turnId: number): boolean {
+    return this.privateTurnIds.has(turnId) || turnId <= this.privateTurnsFloor;
+  }
+
+  /**
    * Make a turn private from here: a start of it took in a private surface's
    * wake, or a request a private turn caused, or read such a surface's
    * message stored since the agent's last start (beginAgentTurn), or one of
@@ -16774,6 +16820,7 @@ export class AgentFramework {
     routing: TurnRouting,
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
     routing.nonChannelOrigin = true;
+    this.notePrivateTurn(routing.turnId);
     const had = routing.locus ?? routing.pin;
     delete routing.locus;
     delete routing.pin;
@@ -18892,6 +18939,7 @@ export class AgentFramework {
 
     if (opensTurn) {
       routing.nonChannelOrigin = trigger?.nonChannelOrigin === true || privateInput;
+      if (routing.nonChannelOrigin) this.notePrivateTurn(routing.turnId);
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, with its server, and none for a heartbeat
       // / no-trigger turn, which falls back to the global default rather
@@ -22159,7 +22207,7 @@ export class AgentFramework {
       {
         tools: (agentName) => this.scriptTools(agentName),
         dispatch: (agentName, toolName, argsJson, context) => this.scriptToolCall(agentName, toolName, argsJson, context),
-        wake: (agentName, scriptId, text, label) => this.scriptWake(agentName, scriptId, text, label),
+        wake: (agentName, scriptId, text, label, startTurnId) => this.scriptWake(agentName, scriptId, text, label, startTurnId),
         // Only the primary agent's scripts outlive a turn, or any agent's
         // when no primary agent is named.
         outlivesTurn: (agentName) => !this.primaryAgentName || agentName === this.primaryAgentName,
@@ -22245,9 +22293,10 @@ export class AgentFramework {
    * gate — the agent armed this wake themselves (wake-through-sleep
    * authority); it enters tagged so gate policies could be taught about it
    * later if that ever needs revisiting. Throws when it can't be delivered,
-   * so the script's wake_agent() says so.
+   * so the script's wake_agent() says so. A script whose start turn
+   * (`startTurnId`) is private by then wakes a private turn (isPrivateTurn).
    */
-  private async scriptWake(agentName: string, scriptId: string, text: string, label: string): Promise<void> {
+  private async scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number | undefined): Promise<void> {
     // A host that has begun to stop wakes no one.
     if (this.stopHasBegun()) throw new Error('this host is stopping');
     // An agent that has gone gets nothing, its drop logged once (noticeTargetFor).
@@ -22276,6 +22325,10 @@ export class AgentFramework {
         source: 'code_execution',
         timestamp: Date.now(),
         ...this.readsDeferredFor(placement, agentName),
+        // What a private turn causes is private too: the script's start
+        // turn, as it stands now, since it may have taken private input
+        // after it started the script.
+        ...(startTurnId !== undefined && this.isPrivateTurn(startTurnId) ? { nonChannelOrigin: true } : {}),
       });
       this.emitTrace({
         type: 'message:added',
@@ -22668,14 +22721,15 @@ export class AgentFramework {
       : this.stopHasBegun() ? 'this host is stopping; nothing was done'
       : !parsed ? `${toolName}'s arguments weren't JSON; nothing was done`
       : input === undefined ? `${toolName}'s arguments must be an object; nothing was done`
-      // A script's channel_publish names its channel. A script runs apart
-      // from the turn that started it, a background one past that turn's
-      // end, so the default, the channel of the latest inbound message, is
-      // one nobody chose for it, and a private turn's script would publish
-      // there.
+      // A script whose start turn is private, as it stands now
+      // (isPrivateTurn), names its channel_publish's channel. It runs apart
+      // from that turn, a background one past the turn's end, so the
+      // default, the channel of the latest inbound message, is one nobody
+      // chose for it, where the private turn's work would be published.
       : toolName === 'channel_publish' && !input.channelId
-        ? "a script's channel_publish needs a channelId, since a script has no channel of its own to default to"
-          + `${this.conversationAgentHomes.has(agentName) ? ` (this conversation's channel is "${this.conversationAgentHomes.get(agentName)}")` : ''}; nothing was posted`
+        && context.startTurnId !== undefined && this.isPrivateTurn(context.startTurnId)
+        ? "this script's turn is private and has no inferred channel, so channel_publish requires an explicit channelId"
+          + `${this.conversationAgentHomes.has(agentName) ? ` (to publish in this conversation's channel, name "${this.conversationAgentHomes.get(agentName)}")` : ''}; nothing was posted`
       : undefined;
     // A call that reaches the host while a run or wait call watches the
     // script (context.watch) counts toward that call's round (ScriptRound),

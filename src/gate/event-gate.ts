@@ -122,8 +122,9 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
-  /** The event is a private surface's message (the framework's
-   *  isNonChannelSurfaceEvent), which makes its window's wake private. */
+  /** The event is a private surface's message, or a request that continues
+   *  a private turn's work (the framework's wakesPrivately), which makes its
+   *  window's wake private. */
   nonChannelOrigin?: boolean;
   /** The event's own identity among what the framework stored at arrival:
    *  a channel message's id, a push event's event id (isNewestEntry). */

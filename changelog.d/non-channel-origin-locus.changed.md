@@ -18,8 +18,11 @@
   envelope posts its own body where it names but sets no destination for the
   turn's later speech. What a private turn causes
   is private too: its budget restart, its tool results' re-inference, a ` !`
-  continuation, its auto-continuation (`autoContinue`), a bounce's wake and a
-  rewind's retry.
+  continuation, its auto-continuation (`autoContinue`), a bounce's wake, a
+  rewind's retry, and the wakes of a script it started (`wake_agent()`, and
+  a script left running reporting its end). A script's wakes go by the turn
+  that started it as that turn stands when the wake comes, so a turn that
+  took in private input after starting the script counts.
 
   In locus and hybrid modes, a private turn's plain speech is counted in its
   `[delivered]` receipt as kept private, rather than reported as a failed send.
@@ -30,7 +33,9 @@
   none of it and edits its thoughts into no message.
 
   A private turn's `channel_publish` must name its channel: a call without
-  `channelId` is refused, a conversation fork's included. Its `channel_open`
+  `channelId` is refused, a conversation fork's included. So must a script's
+  whose starting turn is private, as that turn stands at the call, whichever
+  turn watches the script then. A private turn's `channel_open`
   doesn't move the locus, and says so. Its `.sleep` announcement isn't
   posted. When the model refuses (a refusal stop), a
   private turn's refusal reacts on no message, and its failure record names no
@@ -38,11 +43,6 @@
 
   The `[routing]` notice for speech with no channel now says it stays on the
   surface the agent was addressed from, if any.
-
-- **Scripts:** a script's `channel_publish` must name its channel, whatever
-  turn is open, a conversation fork's included. Before, one without
-  `channelId` went to the channel of the most recent inbound message, and a
-  fork's with an empty `channelId` went to the fork's home channel.
 
 - **Hosts reading `inboundSource`:** a message whose event's
   `metadata.channelId` is only whitespace is now stamped as a surface's
