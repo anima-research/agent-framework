@@ -13,6 +13,7 @@ import {
   INLINE_WITHHELD_TEXT,
   classifyBlock,
   isInlineContradiction,
+  referenceRegistry,
   referenceStubOrNull,
   unknownBlockText,
 } from './references.js';
@@ -41,7 +42,9 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
     case 'image':
       if (isInlineContradiction(block)) {
         // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
+        // closed, withhold the data (checked BEFORE the data branch). Reading
+        // it marks the record its uri has, where its `never` names one
+        // (classifyBlock).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
       if (isFilledString(block.uri) && block.disposition !== undefined) {
@@ -59,6 +62,12 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         } as ContentBlock;
       }
       if (isFilledString(block.uri)) {
+        // A uri whose payload a `never` marked (ReferenceRecord.payloadNever)
+        // isn't handed to the provider, which would fetch it into context:
+        // it's the reference's stub, which says why.
+        if (referenceRegistry.findByUri(block.uri)?.payloadNever) {
+          return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+        }
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },
@@ -69,7 +78,8 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
     case 'audio':
       if (isInlineContradiction(block)) {
         // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
+        // closed, withhold the data (checked BEFORE the data branch), as for
+        // an image (above).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
       if (isFilledString(block.uri) && block.disposition !== undefined) {

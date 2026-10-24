@@ -34,12 +34,14 @@
  * is fetched on demand (the fetch_reference tool, or the code-execution
  * result hook, where a script receiving a result is the strongest available
  * signal that the bytes are wanted). Per-server budgets cap cumulative
- * appetite.
+ * appetite. A fetcher built with `withhold` fetches no payload a `never`
+ * marked (ReferenceRecord.payloadNever), eagerly or on demand, since a
+ * server that said `never` wouldn't have inlined it.
  */
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord, Refusal, ServerAddress } from './references.js';
 import { boundedForLog, describeCause } from './errors.js';
-import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
+import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, PAYLOAD_NEVER, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
 
 export { normalizedOrigin, type Refusal } from './references.js';
 
@@ -241,7 +243,22 @@ export class ReferenceFetcher {
     /** Persist the payload; returns a mount-prefixed path or null when no
      *  writable mount without an include exists. File name is host-generated (§7.3). */
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
+    /** Given, a payload a `never` marked (ReferenceRecord.payloadNever) is
+     *  withheld (withholds): its fetch is refused before anything else, so
+     *  nothing is fetched or kept. A download under way when the mark comes
+     *  stops at its next chunk and keeps nothing, a copy saved for a record
+     *  marked while it was saved is removed (`remove`), and either fetch is
+     *  refused. The framework builds its fetcher with it. RFC-005's
+     *  conformance adapter builds one without it, so its vector 03 still
+     *  fetches and saves a `never` reference (Ada-1017, room-203 #203123). */
+    private readonly withhold?: { remove(path: string): Promise<void> },
   ) {}
+
+  /** Whether this fetcher withholds the record's payload: one a `never`
+   *  marked, where the fetcher was built with `withhold`. */
+  private withholds(record: ReferenceRecord): boolean {
+    return this.withhold !== undefined && record.payloadNever === true;
+  }
 
   /** The server a check (dialServer or dialCheck) chose, with its credential
    *  and limits from the same resolver answer whose address the check read:
@@ -279,7 +296,7 @@ export class ReferenceFetcher {
    *  limit enter: the expiry, the budget and the ceiling were checked when
    *  that fetch began. */
   isEagerEligible(record: ReferenceRecord): boolean {
-    if (record.fetchedPath || record.eagerFailed) return false;
+    if (this.withholds(record) || record.fetchedPath || record.eagerFailed) return false;
     const check = this.inFlight.has(record.refId) ? this.serverFor(record) : this.beforeDial(record);
     if ('refusal' in check) return false;
     return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= this.eagerLimit(check.binding);
@@ -367,11 +384,12 @@ export class ReferenceFetcher {
   }
 
   /** Why a fetch of this record would be refused before dialing, with the
-   *  default ceiling, which a fetch_reference call naming no max_bytes has.
-   *  Null where the fetch would serve a saved copy, join a fetch of it
-   *  already under way, or dial (where it can still fail), the same three
-   *  steps fetch() takes. */
+   *  default ceiling, which a fetch_reference call naming no max_bytes has:
+   *  first a payload it withholds (PAYLOAD_NEVER). Null where the fetch
+   *  would serve a saved copy, join a fetch of it already under way, or dial
+   *  (where it can still fail), the same steps fetch() takes. */
   refusal(record: ReferenceRecord): Refusal | null {
+    if (this.withholds(record)) return PAYLOAD_NEVER;
     if (record.fetchedPath || this.inFlight.has(record.refId)) return null;
     const check = this.beforeDial(record);
     return 'refusal' in check ? check.refusal : null;
@@ -389,18 +407,24 @@ export class ReferenceFetcher {
    *  starter's timeout, so this errs toward not dialing.) A fetch that
    *  succeeds answers every caller waiting on it, whatever its own ceiling. A
    *  save still running when a caller stops waiting goes on, and the record
-   *  is marked fetched when it lands. */
+   *  is marked fetched when it lands. A payload this fetcher withholds is
+   *  refused before a flight is joined or started, at each try, and as each
+   *  caller's wait ends, whatever the flight's own ending. */
   async fetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
     const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
     const timeoutMs = opts?.timeoutMs ?? FETCH_TIMEOUT_MS;
     const deadline = performance.now() + timeoutMs;
     for (;;) {
+      if (this.withholds(record)) return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       if (record.fetchedPath) {
         return { ok: true, path: record.fetchedPath, bytes: record.verifiedBytes,
           mimeType: record.verifiedMimeType, digestVerified: record.digestVerified };
       }
       const flight = this.inFlight.get(record.refId) ?? this.start(record, ceiling, deadline, timeoutMs);
       const ended = await settledBy(flight.ended, deadline);
+      // A mark while it waited: whatever the flight's ending, its advice
+      // (to wait, to try again) no longer holds.
+      if (this.withholds(record)) return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       if (ended === undefined) return tookLonger(timeoutMs);
       const { stoppedBy, atCeiling, ...outcome } = ended;
       if (stoppedBy === 'ceiling') {
@@ -456,6 +480,12 @@ export class ReferenceFetcher {
         // this server read the same total, so none spends what another took.
         const total = (this.totals.get(serverId) ?? 0) + value.byteLength;
         this.totals.set(serverId, total);
+        // A `never` that marked the payload while it downloaded: no more of
+        // it is read, and nothing is kept.
+        if (this.withholds(record)) {
+          controller.abort();
+          return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
+        }
         // The limit nothing lifts first, as before dialing: the host's
         // ceiling, then the budget, then a call's own ceiling.
         if (received > DEFAULT_FETCH_MAX_BYTES) {
@@ -509,6 +539,9 @@ export class ReferenceFetcher {
       // without an include and a failed write, and the hook logs which. A
       // throw is the save's failure too, not the fetch's, so it's logged here.
       const fileName = `${record.refId}.${ext}`;
+      // One that marked it after the last chunk: nothing is saved, so no copy
+      // reaches the workspace or its history.
+      if (this.withholds(record)) return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       let path: string | null;
       try {
         path = await this.saveFile(fileName, data, observedMime);
@@ -519,6 +552,19 @@ export class ReferenceFetcher {
       if (path === null) {
         return fail("it was fetched, but this host couldn't store it in its workspace, so nothing was kept",
           'Calling again is likely to fail the same way; whoever runs this host can see why in its log.');
+      }
+      // One that marked it while the copy was saved: the copy is removed
+      // rather than kept, since no stub has offered its path. A mark after
+      // this point clears the record's path (markPayload), and the copy
+      // stays, as one offered under the earlier word.
+      if (this.withholds(record)) {
+        try {
+          await this.withhold!.remove(path);
+        } catch (e) {
+          console.error(`[refs] couldn't remove ${path}, the copy of ${record.refId}, whose payload a server marked never (RFC-005), `
+            + `so the agent's tools may still open it until it's deleted: ${boundedForLog(describeCause(e))}`);
+        }
+        return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       }
 
       record.fetchedPath = path;

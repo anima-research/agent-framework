@@ -24,7 +24,7 @@ import { join } from 'node:path';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, UNBOUND_REASON, classifyBlock, referenceRegistry } from '../src/mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, PAYLOAD_NEVER, UNBOUND_REASON, classifyBlock, referenceRegistry } from '../src/mcpl/references.js';
 import type { ReferenceRecord, ReferenceTestimony } from '../src/mcpl/references.js';
 import { nonErrorResultText } from '../src/tool-result-history.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -79,7 +79,8 @@ const never = (test: string) => ({ type: 'resource', uri: `https://files.example
  * A module that calls the MCPL peer's tool through ctx.callTool and hands the
  * result on: whole (`whole`), without its structured view (`unstructured`),
  * or a result of its own holding a reference deeper in its blocks (`nested`,
- * and `deep--nested`, a name a server's prefix `fwd--deep` would fit).
+ * and `deep--nested`, a name a server's prefix `fwd--deep` would fit), or
+ * hands on the MCP-only peer's result whole (`plain`).
  * `during` runs while a call is in flight, before its result.
  */
 class Forward implements Module {
@@ -92,14 +93,14 @@ class Forward implements Module {
   async stop(): Promise<void> {}
   async onProcess(): Promise<EventResponse> { return {}; }
   getTools(): ToolDefinition[] {
-    return ['whole', 'unstructured', 'nested', 'deep--nested', 'failing'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
+    return ['whole', 'unstructured', 'nested', 'deep--nested', 'failing', 'plain'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
     this.during();
     if (name === 'nested') return { success: true, data: this.nested, structured: this.nestedStructured };
     if (name === 'failing') return { success: false, isError: true, error: 'the module failed', data: this.nested, structured: { partial: true } };
-    const result = await this.ctx!.callTool({ id: `fwd-${randomUUID()}`, name: 'mcpl--files--attach', input: {} });
+    const result = await this.ctx!.callTool({ id: `fwd-${randomUUID()}`, name: name === 'plain' ? 'mcpl--plain--attach' : 'mcpl--files--attach', input: {} });
     if (name === 'unstructured') {
       const { structured: _structured, ...rest } = result;
       return rest;
@@ -439,17 +440,51 @@ test("a module's structured result, an MCPL peer's it got through ctx.callTool, 
     // peer's: its object, its uri left out where the model's line for it
     // leaves it out, as here, where it carries a signature.
     const expected: unknown[] = [...treated(report!.refId!, big!.refId!, old!.refId!, link!.refId!)];
-    expected.push({ type: 'resource', refId: sealed!.refId!, name: 'sealed.pdf', savedTo: null });
+    expected.push({ type: 'resource', refId: sealed!.refId!, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error });
     assert.deepEqual(object, { content: expected, structuredContent: { attachments: 2 }, isError: false });
     // The one that counts as expired isn't fetched, as the model's lanes'
-    // fetch passes over it (autoFetchReferences).
-    assert.deepEqual(fetched, [uris('module').report, uris('module').big, never('module').uri],
-      'the module\'s references were fetched for the script, but the expired one');
+    // fetch passes over it (autoFetchReferences), nor the `never` one, whose
+    // payload the framework withholds.
+    assert.deepEqual(fetched, [uris('module').report, uris('module').big],
+      'the module\'s references were fetched for the script, but the expired one and the never one');
     // Each came through ctx.callTool, whose arrival bound it to the server
     // that sent it, and the exit adds no other server.
     for (const uri of [uris('module').report, never('module').uri]) {
       assert.deepEqual(referenceRegistry.findByUri(uri)?.serverIds, ['files'], uri);
     }
+  });
+});
+
+test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `never` in its blocks, the record its uri already has, though its references aren't registered", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const uri = `https://files.example.invalid/failure-never/${randomUUID()}.pdf`;
+    const c = classifyBlock({ type: 'resource', uri }) as { testimony: ReferenceTestimony };
+    const record = referenceRegistry.register(c.testimony, 'files');
+    const referenced = `https://files.example.invalid/failure-never/${randomUUID()}-referenced.pdf`;
+    const byReference = referenceRegistry.register((classifyBlock({ type: 'resource', uri: referenced }) as { testimony: ReferenceTestimony }).testimony, 'files');
+    const unregistered = `https://files.example.invalid/failure-never/${randomUUID()}-other.pdf`;
+    answer({
+      content: [
+        { type: 'text', text: 'the attach failed' },
+        { type: 'image', uri, data: 'aGk=', mimeType: 'image/png', disposition: 'never' },
+        // A reference's `never`, which only the failure path's marking reads.
+        { type: 'resource', uri: referenced, disposition: 'never' },
+        { type: 'resource', uri: unregistered, disposition: 'never' },
+      ],
+      isError: true,
+    });
+    await script('fwd--whole');
+    assert.deepEqual([record.payloadNever, byReference.payloadNever], [true, true]);
+    assert.equal(referenceRegistry.findByUri(unregistered), undefined);
+    // An MCP-only peer's blocks aren't references, so its failure marks nothing.
+    const plainUri = `https://files.example.invalid/failure-never/${randomUUID()}-plain.pdf`;
+    const plain = referenceRegistry.register((classifyBlock({ type: 'resource', uri: plainUri }) as { testimony: ReferenceTestimony }).testimony, 'plain');
+    answer({ content: [{ type: 'text', text: 'the plain attach failed' }, { type: 'resource', uri: plainUri, disposition: 'never' }], isError: true });
+    const failed = JSON.parse(await script('fwd--plain')) as { isError: boolean; content: Array<{ text?: string }> };
+    // The call reached the peer, whose failure the script reads.
+    assert.equal(failed.isError, true);
+    assert.ok(JSON.stringify(failed).includes('the plain attach failed'), JSON.stringify(failed));
+    assert.equal(plain.payloadNever, undefined);
   });
 });
 
@@ -476,9 +511,10 @@ test("a module's reference deeper in its blocks reaches a script as the model's 
     assert.ok(!out.includes('never-token') && !out.includes('object-token'), out);
     const object = JSON.parse(out) as { content: [unknown, { value: { attachment: { refId: string } } }] };
     const refId = object.content[1].value.attachment.refId;
-    // A reference the module made itself, bound to no server, says why its
-    // fetch would be refused.
-    const stub = { type: 'resource', refId, name: 'sealed.pdf', savedTo: null, unfetchable: `it's ${UNBOUND_REASON}` };
+    // A reference the module made itself says why its fetch would be
+    // refused: first, that its server marked it never, though it's bound to no
+    // server too.
+    const stub = { type: 'resource', refId, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error };
     assert.deepEqual(object, {
       content: [
         { type: 'text', text: 'one sealed report' },
@@ -525,7 +561,10 @@ test("a server's result reaches a script as its dispatch gave it when its server
 
 test("a module tool's result is treated when a server with a prefix that fits its name connects while its call is in flight", async () => {
   await withPeers(async ({ script, forward, prefixes, fetched }) => {
-    forward.nested = [never('connect')];
+    // Without its `never`, whose payload isn't asked for at all, so the
+    // fetch shows the exit treated it.
+    const { disposition: _never, ...plain } = never('connect');
+    forward.nested = [plain];
     // The prefix arrives as a runtime connect gives it, after the dispatch
     // sent the call to the module.
     forward.during = () => { prefixes.set('fwd--deep', 'files'); };
@@ -545,7 +584,7 @@ test("a module's failed result with structured content reaches a script with its
     assert.ok(!out.includes('never-token'), out);
     const object = JSON.parse(out) as { content: [unknown, { refId: string }]; structuredContent: unknown; isError: boolean };
     assert.deepEqual(object, {
-      content: [{ type: 'text', text: 'partly attached' }, { type: 'resource', refId: object.content[1].refId, name: 'sealed.pdf', savedTo: null, unfetchable: `it's ${UNBOUND_REASON}` }],
+      content: [{ type: 'text', text: 'partly attached' }, { type: 'resource', refId: object.content[1].refId, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error }],
       structuredContent: { partial: true },
       isError: true,
     });
@@ -783,8 +822,8 @@ test("a nested link's uri doesn't turn on the order of the blocks: a reference n
 test("a link's uri reads its record as it stood before the script lane registered anything, through an eviction the treatment's own registrations make", { timeout: 60_000 }, async () => {
   await withPeers(async ({ answer, script, exit }) => {
     for (const route of ['peer', 'module'] as const) {
-      // An earlier result marks the uri never; off the server's origin, so a
-      // link to it with no such claim shows its uri.
+      // An earlier result marks the uri never, its testimony and its payload;
+      // off the server's origin, so a link to it would otherwise show its uri.
       const uri = `https://elsewhere.example.invalid/evicted-${route}/report.csv`;
       answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
       await script('mcpl--files--attach');

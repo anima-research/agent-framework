@@ -59,6 +59,7 @@ import {
 import { toolResultDataToHistoryString, truncateForHistory, type HistoryBlockSpan } from '../src/tool-result-history.js';
 import {
   INLINE_WITHHELD_TEXT,
+  PAYLOAD_NEVER,
   REFERENCE_STUB_MAX_CHARS,
   UNBOUND_REASON,
   buildReferenceStub,
@@ -688,6 +689,51 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(keptRefusal.isError, true);
       assert.match(keptRefusal.content, new RegExp(`index 1 is a reference \\(${kept.refId}, image/png, from`));
       assert.match(keptRefusal.content, /Fetch it with fetch_reference and save the materialized file instead\./);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a reference whose payload a `never` marked refuses with that reason, not fetch_reference's, its copy kept nowhere", async () => {
+    // Bound to their server, as a tool result's references are, so only the
+    // mark tells them apart: one a `never` marked, then delivered plain.
+    const register = (name: string, extra: Record<string, unknown> = {}) => {
+      const c = classifyBlock({ type: 'image', uri: `https://example.invalid/${name}`, mimeType: 'image/png', ...extra });
+      assert.strictEqual(c.kind, 'reference');
+      return referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony, 'vst');
+    };
+    const marked = register('sri-never.png', { disposition: 'never' });
+    register('sri-never.png');
+    const plain = register('sri-never-plain.png');
+    const h = await startTurn({
+      prefix: 'sri-reference-never-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/never.png', index: 0 })],
+        [saveCall('call_save1', { path: 'files/plain.png', index: 1 })],
+        done,
+      ],
+      seedHistory: (framework) => {
+        configureServers(framework, [{ id: 'vst', url: 'wss://example.invalid' }]);
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_cam',
+          toolName: 'mcpl--vst--camera',
+          content: `[${plain.refId}] plain.png — image/png — from tool result — fetch with fetch_reference\n`
+            + `[${marked.refId}] never.png — image/png — from tool result — ${PAYLOAD_NEVER.error}`,
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const refused = await waitForToolResult(h.framework, 'call_save0');
+      assert.strictEqual(refused.isError, true);
+      assert.match(refused.content, new RegExp(`index 0 is a reference \\(${marked.refId}, image/png, from`));
+      assert.ok(refused.content.includes(`It can't be fetched either — ${PAYLOAD_NEVER.error}. ${PAYLOAD_NEVER.remedy}`), refused.content);
+      assert.ok(!refused.content.includes('fetch_reference'), refused.content);
+      assert.strictEqual(await fileBytes(h, 'files/never.png'), null);
+      const pointed = await waitForToolResult(h.framework, 'call_save1');
+      assert.match(pointed.content, /Fetch it with fetch_reference and save the materialized file instead\./);
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
