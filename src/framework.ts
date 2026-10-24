@@ -992,6 +992,71 @@ function resumesLogicalTurn(reason: string | undefined): boolean {
 }
 
 /**
+ * Marks a held turn's retry: the request a provider hold keeps for a turn
+ * whose call failed into it, or whose compile it held with nothing sent.
+ * That turn has begun and not ended: it starts again when the hold releases
+ * (a new start of its open turn, as 0.26.0 started it). So, as a
+ * continuation on its way does (continuesTurn), it keeps its agent's turn
+ * alive meanwhile, passes a quiesce, and goes with an abandon, a stop() or
+ * its agent's removal. A symbol, not a field: hosts build requests too, and
+ * only the framework may say one is a turn's own retry. Spreads and rests
+ * copy it, as every copy of a request the scheduler makes is one.
+ */
+const TURN_RETRY: unique symbol = Symbol('turn-retry');
+/**
+ * The batch a start that carries a turn on (continuesTurn) was merged from,
+ * when the scheduler merged wakes that aren't the turn's into it: every
+ * request it took in, as each was. Until the start takes its turn token it
+ * stands for them all. A scheduler pass that takes it back puts the batch in
+ * its place, each request with its own identity and flags; a quiesce at the
+ * auxiliary park sends the batch back to the scheduler; and a caller's stop
+ * or an abandon that drops the start puts back the batch's wakes, the
+ * requests that don't carry the turn on (dropContinuations), where they run
+ * as a turn of their own, as wakes queued while a turn streams do. Once the
+ * start takes its token the turn reads them, and beginAgentTurn drops the
+ * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
+ */
+const MERGED_BATCH: unique symbol = Symbol('merged-batch');
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[] };
+
+function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
+  return (request as MarkedRequest)[MERGED_BATCH];
+}
+
+/** The wakes of a merged start's batch (MERGED_BATCH): its requests that
+ *  don't carry the turn on. */
+function mergedWakes(request: InferenceRequest): InferenceRequest[] {
+  return (mergedBatch(request) ?? []).filter((r) => !continuesTurn(r));
+}
+
+function isTurnRetry(request: InferenceRequest): boolean {
+  return (request as MarkedRequest)[TURN_RETRY] === true;
+}
+
+/** How to go on sooner than a hold keeping a turn's retry lets the turn go
+ *  on: what surgery's and the puppet's refusals advise. */
+function heldTurnWayOn(statedWait: boolean): string {
+  return 'a quiesce lets a held turn start when its hold ends and finish, so to go on sooner, end it with quiesce ' +
+    'with abandon: true, which ends it once the quiesce\'s wait for the drain runs out (at once on a host ' +
+    'already quiesced)' +
+    (statedWait
+      ? ", or lift a stated wait with release-provider-wait, so the turn tries again once no host's or " +
+        'acceleration hold binds it'
+      : '');
+}
+
+/** A copy of a held turn's trigger, marked as its retry (TURN_RETRY). */
+function asTurnRetry(trigger: InferenceRequest): InferenceRequest {
+  return { ...trigger, [TURN_RETRY]: true } as MarkedRequest;
+}
+
+/** A request that carries its agent's turn on: a continuation of it, or the
+ *  retry a provider hold keeps for it (TURN_RETRY). */
+function continuesTurn(request: InferenceRequest): boolean {
+  return resumesLogicalTurn(request.reason) || isTurnRetry(request);
+}
+
+/**
  * The answers dispatchScriptToolCall's safety timer made, when no result came
  * for a script's call: the tool may still be running, or its result was lost,
  * and the host can't tell which, so the script's runner keeps the call's
@@ -1246,8 +1311,10 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
 
 /** The reason on the inference:aborted that ends a turn whose retry stop()
  *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
- *  the stream couldn't start, or driveStream's, when it failed once started.
- *  Its inference:failed came first, and this says no retry follows it. */
+ *  the stream couldn't start, or driveStream's, when it failed once started;
+ *  or whose failure a provider hold would have kept for its retry once stop()
+ *  had closed admission (endFailureAtStop). Its inference:failed came first,
+ *  and this says no retry follows it. */
 const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
 
 /** The reason on the inference:aborted that ends a turn whose start waited to
@@ -1273,6 +1340,12 @@ interface CheckWindow {
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
+}
+
+/** A request a quiesce lets through, so a turn already alive can finish:
+ *  a continuation of the turn, or a held turn's retry (TURN_RETRY). */
+function passesQuiesce(request: InferenceRequest | undefined): boolean {
+  return request !== undefined && (isTurnContinuation(request.reason) || isTurnRetry(request));
 }
 
 /** Wake sources the framework generates for itself (bounce wakes,
@@ -1624,18 +1697,21 @@ export interface HostModeStatus {
   reason?: string;
   since?: number;
   /** True when no turn is alive: no turn token (the token spans dequeue →
-   * settled teardown, strictly wider than activeStreams) and no continuation
+   * settled teardown, strictly wider than activeStreams), no continuation
    * of a turn on its way to its start (a budget restart's or a tool-result
    * guard's retry, queued, held by a provider hold, parked or in a scheduler
-   * pass), and no wake parked on provider admission. It covers the
+   * pass), no turn whose call failed into a provider hold waiting for the
+   * hold to release its retry (wherever that retry then waits), and no wake
+   * parked on provider admission. It covers the
    * framework's own turns: a caller of the direct Agent API
    * (`Agent.runInference`) owns its turns' timing. */
   drained: boolean;
   activeTurns: number;
   /** The agents with a turn alive, the ones `activeTurns` counts, sorted:
    * each from its turn's dequeue to its settled teardown, so a turn in its
-   * hooks or compile, one finishing its deliveries, or one whose continuation
-   * is on its way to its start, is listed. These are the agents an abandon or
+   * hooks or compile, one finishing its deliveries, one whose continuation
+   * is on its way to its start, or one a provider hold keeps for its retry,
+   * is listed. These are the agents an abandon or
    * a stop() made now would find mid-turn. */
   activeTurnAgents: string[];
   /** Wakes that own provider admission while waiting for an in-flight
@@ -1647,7 +1723,8 @@ export interface HostModeStatus {
   /** Inference requests parked by the quiesce wake gate (while quiesced), or
    * simply queued (while serving — non-zero right after a resume until the
    * scheduler's next pass consumes them). Continuations of a held turn
-   * (budget restart, tool results) are never counted. */
+   * (budget restart, tool results) and a held turn's retry, which a quiesce
+   * lets through, are never counted. */
   gatedRequests: number;
   /** code_execution scripts still running that no call is waiting on: left
    * running after a yield, outside any turn. Quiesce does NOT stop them —
@@ -2421,7 +2498,11 @@ type FrameworkCancelKind = 'turn_ended' | 'budget_restart' | 'quiesce_abandoned'
  *  operator's quiesce abandon or stop() settles it as a stop ends a turn's
  *  start; any other drop ends it as a start dropped before it sends anything.
  *  `why` is said in the line its end logs. */
-type ContinuationDrop = { kind: 'quiesce_abandoned' | 'shutdown' | 'dropped'; why: string };
+type ContinuationDrop =
+  | { kind: 'quiesce_abandoned' | 'shutdown' | 'dropped'; why: string }
+  /** A caller's stop (abortInference) of a turn whose continuation or retry
+   *  is on its way, with the reason it gave. */
+  | { kind: 'caller'; reason?: string; why: string };
 
 /** What opened a channel the agent didn't ask to open
  *  (recordChannelAutoOpenNotice). */
@@ -2908,12 +2989,14 @@ export class AgentFramework {
    * is still the agent's, so a start that ends after a later frame opened
    * one, such as its retry's stream waiting to retry, leaves that one open.
    * An operator's abandon marks the window, and the frame's check collects
-   * the mark, which goes with the window. abortInference() and the abandon
-   * count a turn with no stream only here; a stop made anywhere else, as
-   * while an agent is idle, a turn finishes its last delivery or a provider
-   * hold has parked it, has no check to end it, and the next start drops
-   * it. Keyed by the Agent, so a replacement agent under the same name
-   * never shares one.
+   * the mark, which goes with the window. A stop of a turn with no stream
+   * lands here, or, for a turn whose continuation or retry is on its way (a
+   * provider hold's, a park's, the queue's or a pass's), through
+   * abortInference(), an abandon or stop(), which drop that continuation or
+   * retry (dropContinuations); a stop made anywhere else, as while an agent
+   * is idle or a turn finishes its last delivery, has no check to end it,
+   * and the next start drops it. Keyed by the Agent, so a replacement agent
+   * under the same name never shares one.
    */
   private checkAhead: Map<Agent, CheckWindow> = new Map();
 
@@ -4664,6 +4747,21 @@ export class AgentFramework {
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
       a.readsDeferredWrite === b.readsDeferredWrite;
   }
+  /** Keep `request` among a hold's `held` requests, once by
+   *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
+   *  already held marks that one, so the hold still keeps the turn alive. */
+  private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
+    const same = held.find((r) => this.sameInferenceRequest(r, request));
+    if (!same) {
+      held.push(request);
+      return;
+    }
+    if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    // A merged start's batch (MERGED_BATCH) stays recorded on the request
+    // kept in its place, which then stands for it, as the start did.
+    const batch = mergedBatch(request);
+    if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
+  }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
     try {
@@ -4715,14 +4813,19 @@ export class AgentFramework {
     // failure streak), and the wait applies to the calls that follow it.
     if (!acceleration && !hostHold) {
       return wait !== undefined && isMembraneError(error) && error.retryable === true
-        && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true);
+        && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(trigger)] : [], true);
     }
+    // As in holdForProviderWait: once stop() has closed admission, nothing is
+    // held, and nothing started.
+    if (this.providerAdmissionClosed) return true;
     const now = Date.now();
     const pacing = hostHold ? undefined : this.accelerationCooldownMs(agent.name, error as MembraneError);
     const delayMs = hostHold ? hostHold.holdMs : pacing!.delayMs;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
-    if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
+    // The failed turn's own request, kept as its retry (TURN_RETRY). An
+    // auxiliary call's failure passes no trigger: it holds no turn of its own.
+    if (trigger) this.holdRequest(held, asTurnRetry(trigger));
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(delayMs, MAX_TIMER_DELAY_MS)); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
@@ -4771,7 +4874,7 @@ export class AgentFramework {
     if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number') return undefined;
     if (this.conversationAgentHomes.has(agent.name)) {
       const wait = this.recordProviderWait(agent.name, agent.model, error);
-      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true)
+      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(trigger)] : [], true)
         ? 'held'
         : undefined;
     }
@@ -4921,17 +5024,30 @@ export class AgentFramework {
    * Hold this agent's primary turns for a provider wait on its model. The
    * requests are kept and released together, into one fresh compile, when
    * the wait ends: the same path an acceleration cooldown takes, without
-   * parking auxiliary calls to other models.
+   * parking auxiliary calls to other models. `report`, once the wait is
+   * found to bind, runs before anything is held: a caller that reports its
+   * turn's end there (inference:failed) does so before the hold takes the
+   * turn's retry, as every failure site does.
    */
-  private holdForProviderWait(agent: Agent, wait: ProviderWait, requests: InferenceRequest[], failed = false): boolean {
+  private holdForProviderWait(agent: Agent, wait: ProviderWait, requests: InferenceRequest[], failed = false, report?: () => void): boolean {
     const now = Date.now();
     const until = wait.until ?? Number.POSITIVE_INFINITY;
     if (until <= now) return false;
+    report?.();
+    // stop() has cleared every hold and dropped every turn on its way: a
+    // failure or start reaching here after it holds nothing, so no retry
+    // outlives the stop as a turn still alive. Nothing is started either.
+    if (this.providerAdmissionClosed) return true;
+    // A listener of the report may have released the wait
+    // (releaseProviderWait) before anything was held: nothing binds now, so
+    // the requests start, as the release of an installed hold starts them.
+    if (report && !this.providerWaits?.active(agent.name, wait.model)) {
+      this.pendingRequests.push(...requests);
+      return true;
+    }
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
-    for (const request of requests) {
-      if (!held.some((r) => this.sameInferenceRequest(r, request))) held.push(request);
-    }
+    for (const request of requests) this.holdRequest(held, request);
     // An acceleration or host hold already parks the whole agent; its release
     // re-checks this wait at admission.
     if (existing && existing.waitModel === undefined) return true;
@@ -5536,9 +5652,11 @@ export class AgentFramework {
 
   /**
    * Abort an in-flight inference for an agent. True when there was one to
-   * stop: a stream, or a turn with no stream and one of its checks ahead (its
+   * stop: a stream; a turn with no stream and one of its checks ahead (its
    * hooks or compile, a wait to retry, the tool-result guard's wait), which
-   * ends at that check, before it sends anything more.
+   * ends at that check, before it sends anything more; or a turn whose
+   * continuation or retry is on its way (queued, kept by a provider hold,
+   * parked at admission or in a scheduler pass), which ends here.
    */
   abortInference(agentName: string, reason?: string): boolean {
     const agent = this.agents.get(agentName);
@@ -5566,6 +5684,20 @@ export class AgentFramework {
     if (!result && checkWindow) {
       agent.cancelStream(reason);
       checkWindow.wake?.();
+      return true;
+    }
+    // A turn whose continuation or retry is on its way (a budget restart or
+    // a guard retry, or a failed turn's retry a provider hold keeps:
+    // pendingContinuationAgents) ends here, as a stop of a turn's start ends
+    // one, whether or not the frame that handed it on has let go of its
+    // token yet (that frame ends on its own and settles nothing more): the
+    // continuation or retry is dropped, with one inference:aborted carrying
+    // the stop's reason. Wakes that arrived meanwhile aren't the turn's, and
+    // still run; a hold of such wakes alone keeps no turn, and has nothing to
+    // stop. Every failure site reports inference:failed before a hold takes
+    // the retry, so a listener of it finds nothing held, and reports false.
+    if (!result && this.pendingContinuationAgents().has(agentName)) {
+      this.dropContinuations(agentName, { kind: 'caller', reason, why: 'a stop ended the turn' });
       return true;
     }
     return !!result;
@@ -6526,9 +6658,10 @@ export class AgentFramework {
    * it queues, or a tool-result guard's retry, which its frame starts at
    * once) holds no turn token until its start takes one. Once its turn's
    * frame has let go of its token, its start can wait in the queue, a
-   * provider hold (a retry too, when a wait holds it), a park on admission
-   * or a scheduler pass's hands. Its turn is alive meanwhile. These are the
-   * agents with one on its way. A
+   * provider hold, a park on admission or a scheduler pass's hands. Its turn
+   * is alive meanwhile. So is a turn whose call failed into a provider hold,
+   * which keeps the turn's retry (TURN_RETRY), until that retry starts,
+   * wherever it waits. These are the agents with one on its way. A
    * `tool_results_ready` continuation follows a tool round left waiting with
    * no stream, which only the direct Agent API makes (Agent's
    * runInferenceWithInjections; the framework's own rounds wait with their
@@ -6537,7 +6670,7 @@ export class AgentFramework {
    */
   private pendingContinuationAgents(): Set<string> {
     const agents = new Set<string>();
-    const add = (r: InferenceRequest): void => { if (resumesLogicalTurn(r.reason)) agents.add(r.agentName); };
+    const add = (r: InferenceRequest): void => { if (continuesTurn(r)) agents.add(r.agentName); };
     // Read defensively: a framework built from the prototype, as the
     // operator tests build one, sets none of these.
     for (const r of this.pendingRequests ?? []) add(r);
@@ -6548,7 +6681,7 @@ export class AgentFramework {
   }
 
   /** The agents with a turn alive: holding a turn token, or with a
-   *  continuation of their turn on its way. */
+   *  continuation of their turn, or its retry, on its way. */
   private turnHolders(): Set<string> {
     const holders = this.pendingContinuationAgents();
     for (const name of this.activeTurnTokens.keys()) holders.add(name);
@@ -6557,6 +6690,26 @@ export class AgentFramework {
 
   private hasTurn(agentName: string): boolean {
     return this.activeTurnTokens.has(agentName) || this.pendingContinuationAgents().has(agentName);
+  }
+
+  /** The provider hold keeping `agentName`'s turn for its retry (TURN_RETRY),
+   *  in words naming its end and its reason, and whether a stated wait holds
+   *  it; undefined when no hold keeps one. */
+  private heldTurnRetry(agentName: string): { says: string; statedWait: boolean } | undefined {
+    // Optional, as pendingContinuationAgents reads it: a framework built from
+    // its prototype, as some suites build one, has no map of holds.
+    const hold = this.providerAccelerationCooldowns?.get(agentName);
+    if (!hold?.heldRequests.some(isTurnRetry)) return undefined;
+    // A deadline past what a Date can name (an infinite wait, or a stated
+    // one too long for an instant) is one only a release ends.
+    const end = new Date(hold.until);
+    const until = Number.isNaN(end.getTime()) ? 'until released' : `until ${end.toISOString()}`;
+    return {
+      says: `a provider hold keeps its turn to start again, ${until}: ${hold.reason}`,
+      // release-provider-wait lifts a stated wait's hold, not a host's or an
+      // acceleration cooldown's own pacing.
+      statedWait: hold.waitModel !== undefined || hold.statedWait !== undefined,
+    };
   }
 
   getHostModeStatus(): HostModeStatus {
@@ -6570,7 +6723,7 @@ export class AgentFramework {
       activeTurns: holders.size,
       activeTurnAgents: [...holders].sort(),
       parkedAdmissions,
-      gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
+      gatedRequests: this.pendingRequests.filter((r) => !passesQuiesce(r)).length,
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
       deferredWrites: this.deferredMessages.length,
       ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
@@ -6588,8 +6741,9 @@ export class AgentFramework {
    * Enter quiesce mode: write the deferred-write queue, persist the flag,
    * suppress gate deliveries, pause all MCPL data planes, and wait for
    * in-flight turns to settle (turn-alive is a turn token, which spans
-   * dequeue → settled teardown, or a continuation of the turn on its way to
-   * its start: turnHolders). Idempotent, but for the queue's write, which
+   * dequeue → settled teardown, a continuation of the turn on its way to its
+   * start, or the turn's retry, which a provider hold keeps or which waits
+   * to start: turnHolders). Idempotent, but for the queue's write, which
    * every call makes first: when the queue can't reach disk, because its
    * write fails or it's over the cap, the call rejects with a
    * QuiesceBlockedError and the host's mode as it was, unless it has
@@ -6599,8 +6753,8 @@ export class AgentFramework {
    * On drain timeout the host STAYS quiesced (`drained: false` in the
    * result); with `abandon: true` the undrained streams are cancelled via a
    * dedicated cancel kind that settles the turn without feeding the
-   * inference-failure accounting, and a turn whose continuation hasn't
-   * started ends with the continuation dropped. Drain covers the framework's
+   * inference-failure accounting, and a turn whose continuation or retry
+   * hasn't started ends with it dropped. Drain covers the framework's
    * own turns: a caller of the direct Agent API (`Agent.runInference`) owns
    * its turns' timing.
    */
@@ -6749,7 +6903,7 @@ export class AgentFramework {
     // to the continuation.
     const handedOff = new Set<string>();
     for (const agentName of this.pendingContinuationAgents()) {
-      console.error(`[host-mode] abandoning ${agentName}'s turn before its continuation starts: the continuation is dropped`);
+      console.error(`[host-mode] abandoning ${agentName}'s turn before its continuation or held retry starts: it is dropped`);
       this.dropContinuations(agentName, { kind: 'quiesce_abandoned', why: 'its turn was abandoned' });
       handedOff.add(agentName);
     }
@@ -10382,7 +10536,8 @@ export class AgentFramework {
    * by stop() while it runs.
    *
    * The branch moves under every agent sharing the store, so the switch
-   * reserves the store as a surgery does: every agent must be idle, or it is
+   * reserves the store as a surgery does: every agent must be idle with no
+   * turn alive (no continuation or held retry of one on its way), or it is
    * refused (OperatorActionError 'agent-busy'), and no turn starts until the
    * switch is done.
    */
@@ -10634,9 +10789,21 @@ export class AgentFramework {
       );
     }
     const busy: string[] = [];
+    let heldTurns = false;
+    let statedWaits = false;
     for (const [name, a] of this.agents) {
-      if (a.state.status !== 'idle') busy.push(`${name} is ${a.state.status}`);
-      else if (this.hasTurn(name)) busy.push(`${name} is idle+turn-alive`);
+      if (a.state.status !== 'idle') { busy.push(`${name} is ${a.state.status}`); continue; }
+      if (!this.hasTurn(name)) continue;
+      // A provider hold keeping the turn's retry is named: a quiesce alone
+      // doesn't end that turn.
+      const held = this.heldTurnRetry(name);
+      if (held) {
+        heldTurns = true;
+        if (held.statedWait) statedWaits = true;
+        busy.push(`${name} is idle+turn-alive (${held.says})`);
+      } else {
+        busy.push(`${name} is idle+turn-alive`);
+      }
     }
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
@@ -10644,7 +10811,8 @@ export class AgentFramework {
     if (busy.length > 0) {
       throw new OperatorActionError(
         'agent-busy',
-        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)` +
+          (heldTurns ? `; ${heldTurnWayOn(statedWaits)}` : ''),
       );
     }
     const reserved = new Map<string, number>();
@@ -11578,10 +11746,11 @@ export class AgentFramework {
       // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
       // event queue — without this the loop can exit before they're drained.
       // While quiesced, gate-parked requests are NOT progress and must not
-      // block idle (only a budget restart can still run); identity-equivalent
-      // to `.length > 0` when not quiesced.
+      // block idle; what a quiesce lets through (passesQuiesce: a turn's
+      // continuation, or a held turn's retry) can still run, and is.
+      // Identity-equivalent to `.length > 0` when not quiesced.
       this.pendingRequests.some(
-        (r) => !this.quiesced || isTurnContinuation(r.reason),
+        (r) => !this.quiesced || passesQuiesce(r),
       ) ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
@@ -13267,10 +13436,13 @@ export class AgentFramework {
     // (request dropped as stale, inference policy veto) would otherwise stay
     // registered forever. No turn, no active stream and no pending request =
     // done. A turn holds its token from dequeue, through its hooks and
-    // compile, before its stream registers, so a fork mid-compile is busy.
+    // compile, before its stream registers, so a fork mid-compile is busy;
+    // and a turn is alive while its continuation or a provider hold's retry
+    // of it is on its way (hasTurn), so a closure turn held for its retry
+    // finishes when the hold ends.
     for (const agentName of [...this.closingConversationAgents]) {
       if (
-        !this.activeTurnTokens.has(agentName) &&
+        !this.hasTurn(agentName) &&
         !this.activeStreams.has(agentName) &&
         !this.pendingRequests.some((r) => r.agentName === agentName)
       ) {
@@ -14090,6 +14262,19 @@ export class AgentFramework {
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
     }
+    // A wake of the subject's merged into a start that carries a turn on
+    // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
+    // it back and no pass unpacks it.
+    const unrecord = (r: InferenceRequest): void => {
+      const batch = mergedBatch(r);
+      if (batch?.some((w) => w.coalescingSubject === subject)) {
+        (r as MarkedRequest)[MERGED_BATCH] = batch.filter((w) => w.coalescingSubject !== subject);
+      }
+    };
+    for (const r of this.pendingRequests) unrecord(r);
+    for (const cooldown of this.providerAccelerationCooldowns.values()) cooldown.heldRequests.forEach(unrecord);
+    for (const r of this.parkedContinuations ?? []) unrecord(r);
+    for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
   }
 
   /**
@@ -14470,7 +14655,7 @@ export class AgentFramework {
         });
         console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
         // A continuation among them leaves its turn to end here.
-        if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+        if (requests.some(continuesTurn)) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its agent is gone' });
         }
         continue;
@@ -14482,11 +14667,7 @@ export class AgentFramework {
         // selected now, the turn proceeds (the wait stays recorded).
         const otherModel = providerCooldown.waitModel !== undefined && providerCooldown.waitModel !== agent.model;
         if (!otherModel && (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown))) {
-          for (const req of requests) {
-            if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
-              providerCooldown.heldRequests.push(req);
-            }
-          }
+          for (const req of requests) this.holdRequest(providerCooldown.heldRequests, req);
           const recovery = this.providerAccelerationRecoveries.get(agentName);
           if (recovery) recovery.heldRequests = providerCooldown.heldRequests.length;
           // The timer owns release. Do not hot-poll these requests.
@@ -14500,6 +14681,17 @@ export class AgentFramework {
         if (recovery) recovery.releasedAt = now;
         requests = [...providerCooldown.heldRequests, ...requests];
       }
+      // A start that carries a turn on and came back before it took its
+      // token stands for the batch it was merged from (MERGED_BATCH),
+      // including one a hold released just now. The batch takes its place,
+      // each request as it was, judged one by one from here: a wait holds
+      // them apart, a quiesce parks the wakes while the turn's request
+      // passes, and the read check and the policy decide on them all; the
+      // merge below records the batch anew.
+      if (requests.some((r) => mergedBatch(r) !== undefined)) {
+        requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
+      }
+
       // A provider's stated wait on this agent's primary model, including one
       // recorded before a restart, holds the turn until it passes. An
       // ephemeral run records nothing, its name being single-use, so no wait,
@@ -14534,9 +14726,10 @@ export class AgentFramework {
       // bounds a multi-day maintenance window's accumulation.
       if (this.quiesced) {
         // Continuations of a held turn (budget restart, non-streaming tool
-        // results) pass; everything else parks.
-        const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
-        const parked = requests.filter((r) => !isTurnContinuation(r.reason));
+        // results) pass, and so does a held turn's retry (passesQuiesce), so
+        // a turn alive at the quiesce can finish; everything else parks.
+        const passThrough = requests.filter((r) => passesQuiesce(r));
+        const parked = requests.filter((r) => !passesQuiesce(r));
         // Coalesce per (reason, addressed): every channel wake shares one
         // reason, so keying on reason alone would let an ambient message
         // parked later evict a DM/mention parked earlier — and the
@@ -14646,7 +14839,7 @@ export class AgentFramework {
         // A continuation inherits its predecessor's EventGate liveness and
         // logical turn. If policy drops it, no driveStream remains to end them,
         // so its turn ends here (endContinuedTurn).
-        if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+        if (requests.some(continuesTurn)) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
         this.endPendingPrimary(agentName);
@@ -14724,7 +14917,7 @@ export class AgentFramework {
       // exists only once assembly renders it. Recorded for the whole batch
       // (not inherited from requests[0]), so a requeued trigger stays honest.
       const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
-      await this.startAgentStream(agent, {
+      const merged: InferenceRequest = {
         ...trigger,
         coalescingBatch: batchOnly || undefined,
         coalescingBatchSubjects: batchOnly
@@ -14752,7 +14945,17 @@ export class AgentFramework {
         counterparty: budgetRestart ? undefined : provReq?.counterparty,
         wakeChannelId: budgetRestart ? undefined : provReq?.wakeChannelId,
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
-      });
+      };
+      // A held turn's retry merged with other wakes leaves the start its
+      // turn's retry (TURN_RETRY), whichever request leads the merge: held
+      // again before it takes a token, it keeps the turn alive as before.
+      const start: MarkedRequest = requests.some(isTurnRetry) ? asTurnRetry(merged) : merged;
+      // A start that carries a turn on and took in wakes that don't records
+      // the batch it was merged from (MERGED_BATCH): until it takes its
+      // token it stands for them all.
+      if (continuesTurn(start) && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
+      else delete start[MERGED_BATCH];
+      await this.startAgentStream(agent, start);
     }
   }
 
@@ -17103,7 +17306,7 @@ export class AgentFramework {
         // Do not await inside processInferenceRequests: one slow auxiliary call for
         // this resident must not block events or other residents. Admission stays
         // owned and the continuation receives it after the in-flight call settles.
-        const parkedContinuation = trigger !== undefined && resumesLogicalTurn(trigger.reason);
+        const parkedContinuation = trigger !== undefined && continuesTurn(trigger);
         if (parkedContinuation) this.parkedContinuations.add(trigger);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
           // A continuation dropped while it was parked left the set then, with
@@ -17135,13 +17338,24 @@ export class AgentFramework {
           // park; starting here would bypass it and run a turn against a
           // context the operator believes frozen. Give admission back and
           // requeue — the scheduler re-parks it (coalesced) until resume.
-          // Continuations of a held turn pass, as they do at the gate.
-          if (this.quiesced && !isTurnContinuation(trigger?.reason ?? '')) {
+          // Continuations of a held turn, and a held turn's retry, pass, as
+          // they do at the gate (passesQuiesce).
+          if (this.quiesced && !passesQuiesce(trigger)) {
             this.releasePrimaryProviderGate(agent.name);
             this.pendingRequests.push(trigger ?? {
               agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
             });
             console.error(`[provider-admission] ${agent.name}: host quiesced while parked — wake requeued, not started`);
+            return;
+          }
+          // A start that stands for a merged batch (MERGED_BATCH) goes back
+          // to the scheduler as that batch: its gate lets the turn's request
+          // through alone and parks the wakes until resume.
+          const batch = trigger && mergedBatch(trigger);
+          if (this.quiesced && batch) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(...batch);
+            console.error(`[provider-admission] ${agent.name}: host quiesced while parked — the merged start goes back as its ${batch.length} requests`);
             return;
           }
           await this.startAgentStream(agent, trigger, attempt, true);
@@ -17277,11 +17491,23 @@ export class AgentFramework {
    * caller has ended the turn already.
    */
   private dropContinuations(agentName: string, drop: ContinuationDrop | null): void {
-    const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && resumesLogicalTurn(r.reason);
+    const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && continuesTurn(r);
+    // A caller's stop and an abandon end the turn, not the wakes merged into
+    // a start of it that hasn't taken its token (MERGED_BATCH): they go back
+    // in the queue. A stop() or a disposal ends the agent's work, and puts
+    // nothing back.
+    const putsBack = drop?.kind === 'caller' || drop?.kind === 'quiesce_abandoned';
+    const back: InferenceRequest[] = [];
     let dropped = false;
     const take = (requests: InferenceRequest[]): InferenceRequest[] => {
-      const left = requests.filter((r) => !isContinuation(r));
-      if (left.length < requests.length) dropped = true;
+      const left: InferenceRequest[] = [];
+      for (const r of requests) {
+        if (!isContinuation(r)) left.push(r);
+        else {
+          dropped = true;
+          if (putsBack) back.push(...mergedWakes(r));
+        }
+      }
       return left;
     };
     this.pendingRequests = take(this.pendingRequests);
@@ -17296,6 +17522,7 @@ export class AgentFramework {
       this.parkedContinuations.delete(parked);
       this.releasePrimaryProviderGate(agentName);
       dropped = true;
+      if (putsBack) back.push(...mergedWakes(parked));
     }
     for (const pass of this.passRequests) {
       const requests = pass.get(agentName);
@@ -17304,6 +17531,7 @@ export class AgentFramework {
       requests.length = 0;
       requests.push(...left);
     }
+    this.pendingRequests.push(...back);
     if (!dropped || !drop) return;
     // A primary a provider hold left pending for what it released won't run
     // now, when nothing else of the agent's waits (endPendingPrimary).
@@ -17330,10 +17558,12 @@ export class AgentFramework {
     const startedAt = this.lastInferenceAt.get(agentName)?.startedAt ?? Date.now();
     if (agent && drop.kind !== 'dropped') {
       const routing = this.openLogical.get(agentName) ?? this.routingOf(agentName);
-      this.endStoppedStart(agent, { kind: drop.kind }, routing, startedAt, undefined, false);
+      this.endStoppedStart(agent, drop.kind === 'caller' ? { kind: 'caller', reason: drop.reason } : { kind: drop.kind },
+        routing, startedAt, undefined, false);
     } else {
       const owner = this.activeTurnTokens.get(agentName);
-      this.abortDroppedTurn(agentName, owner ?? -1, drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind, startedAt);
+      this.abortDroppedTurn(agentName, owner ?? -1,
+        drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt);
       this.channelRegistry?.stopTyping();
       if (agent) {
         agent.toolResultGuard.recovering = false;
@@ -17353,6 +17583,34 @@ export class AgentFramework {
       this.readdDrained(this.drainDeferredFor(agentName), 'continuation-drop flush');
       this.ackDeferredWrites();
     }
+  }
+
+  /**
+   * After a failure a provider hold would take: once stop() has closed
+   * admission, the hold installs nothing (holdForProviderWait,
+   * holdProviderAcceleration), so no retry follows the turn's
+   * inference:failed, and the turn ends as a retry a stop cancelled ends, with
+   * an inference:aborted saying so. Nothing is written. True when it ended
+   * the turn.
+   */
+  private endFailureAtStop(agentName: string, turnToken: number, startedAt: number): boolean {
+    if (!this.providerAdmissionClosed) return false;
+    this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt);
+    return true;
+  }
+
+  /**
+   * A turn's start whose failure a provider hold took (or, once stop() has
+   * closed admission, would have: endFailureAtStop) ends here. Its window
+   * closes now, not at the start's finally a few microtasks on: no check of
+   * this start is ahead, and a stop made after the failure's report must
+   * find the held retry (abortInference's drop), not a window nothing will
+   * collect.
+   */
+  private endHeldStart(agent: Agent, checkWindow: CheckWindow, turnToken: number, startedAt: number): void {
+    if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+    this.endFailureAtStop(agent.name, turnToken, startedAt);
+    this.eventGate?.onInferenceEnded(agent.name);
   }
 
   /**
@@ -17585,6 +17843,12 @@ export class AgentFramework {
     if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined) {
       const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, ...retry } = trigger;
       trigger = retry;
+    }
+    // The wakes merged into this start are the turn's now: it reads them,
+    // so a later drop of its retry puts none of them back (MERGED_BATCH).
+    if (trigger && mergedBatch(trigger)) {
+      const { [MERGED_BATCH]: _batch, ...own } = trigger as MarkedRequest;
+      trigger = own;
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
@@ -17881,9 +18145,8 @@ export class AgentFramework {
       // hold the turn as the boundary would rather than send it into the wait.
       if (this.conversationAgentHomes.has(agent.name)) {
         const wait = this.providerWaits?.active(agent.name, agent.model);
-        if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
-          console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
-            `(recorded while the turn compiled); turn held, nothing sent`);
+        // The turn has begun (inference:started), so the hold keeps its retry.
+        if (wait && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(trigger)] : [], false, () => {
           // The stream the compile made won't be sent: it's cancelled, and
           // this start's window closes, before the hold is reported, so a stop
           // made while inference:failed is delivered finds neither, and the
@@ -17894,8 +18157,15 @@ export class AgentFramework {
           if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
           // The turn emitted inference:started before its compile; every turn
           // that does gets one terminal event, which listeners (a typing loop)
-          // rely on, as the failure sites' holds emit inference:failed.
+          // rely on. It's reported before the hold takes the turn's retry, as
+          // at every failure site, so a listener's stop finds nothing held.
           this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: providerWaitText(agent.name, agent.model, wait) });
+        })) {
+          console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
+            `(recorded while the turn compiled); ${this.providerAdmissionClosed ? 'the framework is stopping, so nothing is held'
+              : this.providerAccelerationCooldowns.get(agent.name)?.heldRequests.some(isTurnRetry) ? 'turn held'
+                : 'the wait was released as the failure was reported, so the retry is queued'}, nothing sent`);
+          this.endFailureAtStop(agent.name, turnToken, turnStartedAt);
           this.activeStreams.delete(agent.name);
           this.pendingAssistantBlocks.delete(agent.name);
           this.channelRegistry?.stopTyping();
@@ -17980,14 +18250,16 @@ export class AgentFramework {
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
-        this.eventGate?.onInferenceEnded(agent.name);
+        // (Once stop() has closed admission, nothing is held, and the turn
+        // ends here: endFailureAtStop.)
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt);
         return false;
       }
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
         // A conversation agent held by the provider's stated wait, as a
         // resident is: the hold's release owns the later compile.
-        this.eventGate?.onInferenceEnded(agent.name);
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt);
         return false;
       }
 
@@ -18022,7 +18294,15 @@ export class AgentFramework {
         }
         // The retry re-enters startAgentStream, which replaces this frame's
         // turn token with its own; cleanup belongs to the innermost frame.
-        await this.startAgentStream(agent, trigger, attempt + 1);
+        // The retry is its turn's (TURN_RETRY): this frame has begun the turn,
+        // and once the retry's start is held at the last admission boundary
+        // (a conversation agent's own compression can record a wait during
+        // the policy's delay), this frame lets go of its token. No check of
+        // this start is ahead now, so its window closes first: a stop made
+        // once the retry is held finds the held retry (abortInference's
+        // drop), not a window nothing will collect.
+        if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+        await this.startAgentStream(agent, trigger && asTurnRetry(trigger), attempt + 1);
       } else {
         // Terminal failure with no driveStream: this frame owns teardown.
         // Token-matched (like the finally in driveStream) so a stale frame
@@ -19596,12 +19876,16 @@ export class AgentFramework {
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
 
+            // A hold takes the turn's retry, or, once stop() has closed
+            // admission, the turn ends here (endFailureAtStop).
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
             const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
             if (statedWait === 'held') {
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
@@ -19638,7 +19922,8 @@ export class AgentFramework {
                   }
                   return;
                 }
-                await this.startAgentStream(agent, trigger, attempt + 1);
+                // Marked as its turn's retry, as at the start's failure.
+                await this.startAgentStream(agent, trigger && asTurnRetry(trigger), attempt + 1);
               } else {
                 // The turn ends here, and its inference:failed doesn't say so,
                 // since a retry usually follows one: an inference:aborted
@@ -19959,10 +20244,16 @@ export class AgentFramework {
       const durationMs = Date.now() - startTime;
       // The stream won't go on: the agent stops holding it before the
       // failure is reported, as at the stream's error event, so a stop made
-      // while inference:failed is delivered finds no stream.
+      // while inference:failed is delivered finds no stream. It's reported
+      // once, before a provider hold takes the turn's retry, as at the
+      // stream's error event and at a start's failure: a listener's stop
+      // finds nothing held, and one made after it ends the held turn.
       agent.reset();
+      this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
-        this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        // Once stop() has closed admission, nothing is held, and the turn
+        // ends here (endFailureAtStop).
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
         logStream({ success: false,
           error: `Provider acceleration cooldown: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
@@ -19976,7 +20267,7 @@ export class AgentFramework {
       // says why it ends.
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
-        this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
         logStream({ success: false,
           error: `Provider wait: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
@@ -19984,12 +20275,6 @@ export class AgentFramework {
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
-      this.emitTrace({
-        type: 'inference:failed',
-        agentName: agent.name,
-        error: err.message,
-        stack: err.stack,
-      });
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
@@ -20201,8 +20486,11 @@ export class AgentFramework {
       // frame that ends the turn disposes it, after the flush above, so what
       // was held for the turn's end lands in the fork's store instead of
       // being dropped as addressed to no agent. A frame that hands the turn
-      // to a successor (a guard or budget restart) leaves the fork to it.
-      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
+      // to a successor (a guard or budget restart) leaves the fork to it, and
+      // so does one whose failure a provider hold keeps for its retry: the
+      // turn isn't over (pendingContinuationAgents).
+      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)
+        && !this.pendingContinuationAgents().has(agent.name)) {
         this.disposeConversationAgent(agent.name);
       }
     }
@@ -20296,9 +20584,14 @@ export class AgentFramework {
     }
     if (agent.state.status !== 'idle' || this.hasTurn(agentName)) {
       const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
-      throw new Error(
-        `puppet refused: agent ${agentName} is ${shown} (requires idle — ` +
-        `injecting a turn under an active stream corrupts wire ordering)`,
+      // A turn a provider hold keeps for its retry has no stream: the refusal
+      // names the hold, and how to go on sooner, as surgery's does.
+      const held = agent.state.status === 'idle' ? this.heldTurnRetry(agentName) : undefined;
+      throw new Error(held
+        ? `puppet refused: agent ${agentName} is idle+turn-alive (${held.says}; requires idle); ` +
+          heldTurnWayOn(held.statedWait)
+        : `puppet refused: agent ${agentName} is ${shown} (requires idle — ` +
+          `injecting a turn under an active stream corrupts wire ordering)`,
       );
     }
     const onSurface = this.getToolsForAgent(agentName)
