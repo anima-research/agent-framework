@@ -787,8 +787,9 @@ export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
 /**
  * A uri as a link shows it: cut of what sanitizeLabel cuts (controls and bidi
- * marks, surrounding space, past REFERENCE_LIMITS.uri), and well formed, as
- * every copy is before it's shown, a lone surrogate showing as U+FFFD. A `never` is
+ * marks, surrounding space; a uri past REFERENCE_LIMITS.uri is no reference,
+ * so none is shortened), and well formed, as every copy is before it's
+ * shown, a lone surrogate showing as U+FFFD. A `never` is
  * about what a link shows, so it's found by this text (neverShown): a claim
  * of `never` on a uri withholds every link that shows the same text, two
  * uris that cut alike sharing it. Every other claim is about the record,
@@ -928,9 +929,7 @@ export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, now
   if (!t.fromLink || claimedNever(record, claims)) return null;
   if (unfetchableReason(record, nowMs, claims) === null) return null;
   const uri = shownUri(t.uri);
-  // The whole uri as well as the cut it shows: userinfo whose `@` falls past
-  // the cut still carries a credential, and the cut would show part of it.
-  return uriMayCarryCredential(uri) || uriMayCarryCredential(sanitizeLabel(t.uri, Infinity).toWellFormed()) ? null : uri;
+  return uriMayCarryCredential(uri) ? null : uri;
 }
 
 /**

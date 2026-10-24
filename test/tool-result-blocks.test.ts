@@ -1433,25 +1433,6 @@ describe('one answer for every block of a result', () => {
     assert.ok(toolResultDataToHistoryString([dated, link], undefined, { dataIsContent: true }).includes('inline-never'));
   });
 
-  it("withholds a link's uri whose userinfo falls past where its shown text is cut", () => {
-    // A scheme the fetcher refuses, so the host can't fetch it, and a uri
-    // that can't carry a credential would show. Its userinfo, a long name
-    // alone, runs past the 4,096 characters a link's uri is cut to: cut,
-    // the text parses as a host with no userinfo, so only the whole uri
-    // shows the credential. (Where the cut falls in a password, the text
-    // doesn't parse, which withholds it anyway.)
-    const link = { type: 'resource_link', uri: `postgres://zz-user-${'t'.repeat(4200)}@zz-db.example/long-userinfo`, name: 'a.csv' };
-    const control = { type: 'resource_link', uri: 'postgres://zz-db.example/short-userinfo-control', name: 'a.csv' };
-    assert.ok(toolResultDataToHistoryString([control], undefined, { dataIsContent: true }).includes('short-userinfo-control'));
-    for (const shown of [
-      toolResultDataToHistoryString([link], undefined, { dataIsContent: true }),
-      toolResultDataToHistoryString({ link }),
-      JSON.stringify(shownToScript(link, scriptViewClaims([link], false))),
-    ]) {
-      assert.ok(!shown.includes('zz-user-'), shown.slice(0, 300));
-    }
-  });
-
   it("withholds a never uri from a link whose uri shows as the same text once well formed, a lone surrogate showing as U+FFFD", () => {
     // Each side as the other shows it: a never with the replacement character
     // and a link with a lone surrogate, and the other way round.
