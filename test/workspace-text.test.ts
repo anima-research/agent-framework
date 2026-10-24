@@ -1,9 +1,8 @@
 // The text helpers the workspace's read, grep and edit share: a file's lines as
-// read shows them, numbered lines with a long one cut, a BOM's check, and a
-// string's length as JSON, which a page's budget is counted in.
+// read shows them, numbered lines with a long one cut, and a BOM's check.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fileText, hasBom, jsonLength, numberedLine, safeCut } from '../src/modules/workspace/text.js';
+import { fileText, hasBom, numberedLine, safeCut } from '../src/modules/workspace/text.js';
 
 test('fileText gives the lines read shows, where each starts, and what the text is', () => {
   const lines = (text: string | Buffer) => fileText(Buffer.from(text)).lines;
@@ -69,14 +68,3 @@ test('hasBom finds a UTF-8 byte order mark at the start alone', () => {
   }
 });
 
-test('jsonLength counts a string as JSON.stringify writes it', () => {
-  let mismatches = 0;
-  const check = (value: string) => {
-    if (jsonLength(value) !== JSON.stringify(value).length - 2) mismatches++;
-  };
-  for (let c = 0; c <= 0xffff; c++) check(String.fromCharCode(c));
-  // Escapes and surrogates beside each other: a pair, each half alone, and both in the wrong order.
-  const edges = [0x41, 0x22, 0x5c, 0x0a, 0x1f, 0x7f, 0x2028, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xd83d, 0xde00];
-  for (const a of edges) for (const b of edges) for (const c of edges) check(String.fromCharCode(a, b, c));
-  assert.equal(mismatches, 0);
-});

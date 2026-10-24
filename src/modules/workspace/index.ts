@@ -47,6 +47,7 @@ import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, p
 import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
 import { type FileText, fileText } from './text.js';
 import { DEFAULT_READ_LINE_LIMIT, characterPage, linePage } from './read-page.js';
+import { type GrepAnswer, grepText, textAnswer } from './result-text.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -4404,15 +4405,12 @@ export class WorkspaceModule implements Module {
           change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
         })), () => { committed = true; });
         if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, { refused, modeKept }, maxChars);
-        return {
-          success: true,
-          data: editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
-            path: target.path,
-            plan,
-            notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
-            modeKept: modeKept.get(target.relativePath) ?? null,
-          })), given.length, maxChars),
-        };
+        return editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
+          path: target.path,
+          plan,
+          notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
+          modeKept: modeKept.get(target.relativePath) ?? null,
+        })), given.length, maxChars);
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4795,15 +4793,12 @@ export class WorkspaceModule implements Module {
       }
     }
     this.recordDirectWrite(mount, agentName);
-    return {
-      success: true,
-      data: editReceipt(tool, staged.map(({ target, staged: file }) => ({
-        path: target.path,
-        plan: plans.find((p) => p.target === target)!.plan,
-        notes: [reread(target, 'applied to'), linksNote(target.path, file, tool)].filter((note): note is string => note !== null),
-        modeKept: null,
-      })), editCount, maxChars),
-    };
+    return editReceipt(tool, staged.map(({ target, staged: file }) => ({
+      path: target.path,
+      plan: plans.find((p) => p.target === target)!.plan,
+      notes: [reread(target, 'applied to'), linksNote(target.path, file, tool)].filter((note): note is string => note !== null),
+      modeKept: null,
+    })), editCount, maxChars);
   }
 
   /**
@@ -5432,20 +5427,18 @@ export class WorkspaceModule implements Module {
       incomplete.push(...found.incomplete);
     }
 
-    return {
-      success: true,
-      data: {
-        pattern: input.pattern,
-        results,
-        totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
-        // A pattern written for a CR can't find a CRLF end's, nor one written
-        // for U+FEFF a BOM, which lines as read shows them leave out, so the
-        // answer says why it didn't, and names the files that have them.
-        ...leftOutNote(input.pattern, crlfFiles, bomFiles, this.anyRunsDirect()),
-        ...(skipped.length > 0 ? { skipped } : {}),
-        ...(incomplete.length > 0 ? { incomplete } : {}),
-      },
+    const answer: GrepAnswer = {
+      pattern: input.pattern,
+      results,
+      totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
+      // A pattern written for a CR can't find a CRLF end's, nor one written
+      // for U+FEFF a BOM, which lines as read shows them leave out, so the
+      // answer says why it didn't, and names the files that have them.
+      ...leftOutNote(input.pattern, crlfFiles, bomFiles, this.anyRunsDirect()),
+      ...(skipped.length > 0 ? { skipped } : {}),
+      ...(incomplete.length > 0 ? { incomplete } : {}),
     };
+    return textAnswer(grepText(answer, contextBefore), { ...answer });
   }
 
   /**

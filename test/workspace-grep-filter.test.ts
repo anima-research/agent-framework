@@ -56,7 +56,7 @@ async function opened(t: TestContext, mount: Partial<MountConfig>, more: string[
 async function grepped(m: WorkspaceModule, input: Record<string, unknown>): Promise<string[]> {
   const res = await m.handleToolCall({ id: 't', name: 'grep', input: { pattern: 'needle', ...input } });
   assert.equal(res.success, true, `grep ${JSON.stringify(input)} failed: ${res.error}`);
-  return ((res.data as { results: Array<{ file: string }> }).results).map((r) => r.file).sort();
+  return ((res.structured as { results: Array<{ file: string }> }).results).map((r) => r.file).sort();
 }
 
 /** The files a glob finds, sorted. */
@@ -77,7 +77,7 @@ async function globRefusal(m: WorkspaceModule, input: Record<string, unknown>): 
 /** The error a grep for the needle is refused with. */
 async function refusal(m: WorkspaceModule, input: Record<string, unknown>): Promise<string> {
   const res = await m.handleToolCall({ id: 't', name: 'grep', input: { pattern: 'needle', ...input } });
-  assert.equal(res.success, false, `grep ${JSON.stringify(input)} unexpectedly succeeded: ${JSON.stringify(res.data)}`);
+  assert.equal(res.success, false, `grep ${JSON.stringify(input)} unexpectedly succeeded: ${JSON.stringify(res.structured)}`);
   assert.equal(res.isError, true, 'a refusal is an error the agent sees');
   return String(res.error);
 }
@@ -204,7 +204,7 @@ for (const [kind, mount] of KINDS) {
       ] as const) {
         const res = await m.handleToolCall({ id: 't', name, input });
         assert.equal(res.success, true, `${name} ${JSON.stringify(input)} failed: ${res.error}`);
-        const incomplete = (res.data as { incomplete?: Array<{ path: string; reason: string }> }).incomplete ?? [];
+        const incomplete = ((res.structured ?? res.data) as { incomplete?: Array<{ path: string; reason: string }> }).incomplete ?? [];
         assert.deepEqual(incomplete.map((region) => region.path), ['work/a/b'], name);
         assert.match(incomplete[0]!.reason, /it lies in mount "deep", nested in this one/, name);
       }

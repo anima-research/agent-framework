@@ -155,7 +155,7 @@ class Env {
 async function call(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<any> {
   const res = await m.handleToolCall({ id: 't', name, input });
   assert.equal(res.success, true, `${name} ${JSON.stringify(input)} failed: ${res.error}`);
-  return res.data;
+  return res.structured ?? res.data;
 }
 
 async function refused(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<string> {
@@ -1325,7 +1325,7 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     m.registerGeneratedTextFile('work/generated.md', () => 'generated', 'resident');
     const generated = await m.handleToolCall({ id: 't', name: 'read', callerAgentName: 'resident', input: { path: 'work/generated.md' } });
     assert.equal(generated.success, true, generated.error);
-    assert.match(JSON.stringify(generated.data), /generated/);
+    assert.match(JSON.stringify(generated.structured), /generated/);
   });
 
   test('the path a refusal names works on a mount whose root is configured with a trailing separator', async (t) => {
@@ -2697,21 +2697,33 @@ describe("a file's mode is kept with its bytes", () => {
       env.store.treeSet(TREE, 'a.sh', { blobHash: e.blobHash, size: e.size, mode: 0o100755 });
       const restore = await refuseChmod();
       let done: Record<string, unknown>;
+      // The text the model reads of an edit's receipt.
+      let text = '';
+      const edited = async (name: 'edit' | 'edit_many', input: Record<string, unknown>) => {
+        const result = await m.handleToolCall({ id: 't', name, input });
+        assert.equal(result.success, true, result.error);
+        text = (result.data as Array<{ text: string }>)[0]!.text;
+        return result.structured as Record<string, unknown>;
+      };
       try {
         done = tool === 'write'
           ? await call(m, 'write', { path: 'work/a.sh', content: 'echo a v2\n' })
           : tool === 'edit'
-            ? await call(m, 'edit', { path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' })
+            ? await edited('edit', { path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' })
             : tool === 'edit_many'
               // edit_many gives it in the file's entry.
-              ? ((await call(m, 'edit_many', { edits: [{ path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' }] })).files as Array<Record<string, unknown>>)[0]!
+              ? ((await edited('edit_many', { edits: [{ path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' }] })).files as Array<Record<string, unknown>>)[0]!
               : ((await m.writeBinary('work/a.sh', Buffer.from('echo a v2\n'), 'text/x-sh')).data as Record<string, unknown>);
       } finally {
         restore();
       }
       assert.equal(env.readDisk('a.sh'), 'echo a v2\n');
       assert.equal(modeOf(env, 'a.sh'), 0o644, "disk's mode kept");
-      assert.equal(done.modeKept, "written, its mode left at 0644: the kernel refused the chmod, so the workspace's (0755) isn't given, and a sync takes disk's mode in");
+      const kept = "written, its mode left at 0644: the kernel refused the chmod, so the workspace's (0755) isn't given, and a sync takes disk's mode in";
+      assert.equal(done.modeKept, kept);
+      // The model reads it too: in edit's header, and on edit_many's line for the file.
+      if (tool === 'edit') assert.match(text, new RegExp(`\\nmodeKept: ${kept.replace(/[()]/g, '\\$&')}\\n--- changed ---\\n`));
+      if (tool === 'edit_many') assert.match(text, new RegExp(`\\n--- files ---\\nwork/a\\.sh: size 10, replacements 1, edits 1; modeKept: ${kept.replace(/[()]/g, '\\$&')}\\n`));
       assert.equal(env.events.filter((x) => (x as { type?: string }).type === 'workspace:materialize-failed').length, 0);
     });
   }
@@ -7330,7 +7342,7 @@ describe('on-agent-action', () => {
     env.store.switchBranch(main);
     const limited = await withReadHook(switching, () => m.handleToolCall({ id: 't', name: 'read', input: { path: 'work/a.txt' }, resultMaxChars: 1_000 }));
     assert.equal(limited.success, true, String(limited.error));
-    assert.equal((limited.data as { note?: string }).note, data.note);
+    assert.equal((limited.structured as { note?: string }).note, data.note);
   });
 
   test("a read of a conflict on a read-only mount names only the sync, since nothing writes the workspace's copy there", async (t) => {
@@ -7517,7 +7529,7 @@ describe('on-agent-action', () => {
     writeFileSync(join(env.dir, 'a.txt'), 'A line\n');
     const edit = await m.handleToolCall({ id: 't', name: 'edit', input: { path: 'work/a.txt', oldString: 'A line', newString: 'A edited' } });
     assert.equal(edit.success, true, JSON.stringify(edit));
-    assert.match(JSON.stringify(edit.data), /couldn't be checked against disk \(the mount root is not the directory disk last agreed with/);
+    assert.match(JSON.stringify(edit.structured), /couldn't be checked against disk \(the mount root is not the directory disk last agreed with/);
   });
 
   test('a branch switched away during the root check and back during a read is decided on the branch enumerated', async (t) => {

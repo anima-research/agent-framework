@@ -53,7 +53,7 @@ function setup(t: TestContext, extra: Record<string, string> = {}) {
   const grepFiles = async (input: Record<string, unknown>) => {
     const r = await workspace.handleToolCall({ id: 'r', name: 'grep', input });
     assert.equal(r.success, true, JSON.stringify(r));
-    return ((r.data as { results: Array<{ file: string }> }).results).map((x) => x.file).sort();
+    return ((r.structured as { results: Array<{ file: string }> }).results).map((x) => x.file).sort();
   };
   const refusal = async (name: 'glob' | 'grep', input: Record<string, unknown>) => {
     const r = await workspace.handleToolCall({ id: 'x', name, input });

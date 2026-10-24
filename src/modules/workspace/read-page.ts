@@ -1,12 +1,20 @@
 import type { ToolResult } from '../../types/events.js';
-import { type FileText, MAX_LINE_CHARS, jsonCharLength, jsonLength, numberedLine, safeCut } from './text.js';
+import { answerText, fieldLine, sectionLead, sectionText, textAnswer } from './result-text.js';
+import { type FileText, MAX_LINE_CHARS, numberedLine, safeCut } from './text.js';
 
 /**
- * One page of a read, held to the result limit: the framework gives a
- * success's data as JSON, and what passes the caller's limit doesn't reach it
- * whole. A model's result spills into a file, cut mid-JSON, and a script gets
- * ResultTooLarge in its place. So a page stops before it would pass the limit,
- * and its note says where to continue.
+ * One page of a read, held to the result limit as its text measures it: a
+ * model reads the page's text (result-text.ts), and what passes the caller's
+ * limit doesn't reach it whole. A model's result spills into a file, cut, and
+ * a script gets ResultTooLarge in its place. So a page stops before its text
+ * would pass the limit, and its note says where to continue. A script's
+ * answer carries the page's fields, its content among them, beside its text,
+ * and the limit counts the text alone. A script's limit counts each character
+ * at the six bytes it takes at most in the answer, and no character but a
+ * control character takes more than three, so the text and the fields
+ * together pass what the script takes only on a page of more than half that
+ * limit (about 3.7 million characters at the default 128 MiB of script
+ * memory) holding control characters.
  */
 
 /** How many lines a read shows when it isn't given a limit. */
@@ -36,10 +44,24 @@ const joined = (notes: Array<string | null>): string | undefined => {
   return kept.length > 0 ? kept.join(' ') : undefined;
 };
 
+/** A page's fields: a line page's or a character page's, and its content, numbered lines or raw text. */
+type Page = { path: string; content: string; note?: string } & Record<string, string | number | null | undefined>;
+
+/** A page's text: its fields, one to a line in their order, and then its content under its label. */
+function pageText(page: Page): string {
+  const header = Object.entries(page)
+    .filter((entry): entry is [string, string | number | null] => entry[0] !== 'content' && entry[1] !== undefined)
+    .map(([key, value]) => fieldLine(key, value));
+  return answerText(header, [sectionText('content', page.content)]);
+}
+
+/** A page as read answers it: its text for the model, and its fields for a script. */
+const pageAnswer = (page: Page): ToolResult => textAnswer(pageText(page), page);
+
 /**
  * Lines from `offset` (1-based), at most `limit` of them, each numbered and a
  * long one cut with the offsetChars and limitChars that read the rest. The
- * page is the longest that fits within `maxChars` as JSON; where none fits
+ * page is the longest whose text fits within `maxChars`; where none fits
  * with its first line as a page shows it, that line is cut shorter, at the
  * most the page has room for. Where the page's last line is cut, its note
  * names where that line's rest starts and how long it is, since reading on in
@@ -62,7 +84,7 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
       first > 0 ? `Line ${first + 1} is past the end: the file has ${total} line${total === 1 ? '' : 's'}.` : null,
       ...notes,
     ]);
-    return { success: true, data: { path, totalLines: total, ...(note !== undefined ? { note } : {}), content: '' } };
+    return pageAnswer({ path, totalLines: total, ...(note !== undefined ? { note } : {}), content: '' });
   }
   const last = Math.min(first + limit, total);
   const shown = (i: number, maxLineChars = MAX_LINE_CHARS) =>
@@ -81,12 +103,12 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   const budgetNote = (to: number, rest: number | null) =>
     `Stopped at line ${to} to stay within the ${maxChars}-character result limit (file has ${total}). `
     + (rest === null ? `Continue with offset=${to + 1}.` : `${cutLine(to, rest)}, then continue with offset=${to + 1}.`);
-  const page = (to: number, content: string, note: string | undefined) => ({
+  const page = (to: number, content: string, note: string | undefined): Page => ({
     path, totalLines: total, fromLine: first + 1, toLine: to, ...(note !== undefined ? { note } : {}), content,
   });
   if (maxChars === undefined) {
     const whole = lines.slice(first, last).map((line, k) => numberedLine(line, first + k + 1, Infinity)).join('\n');
-    return { success: true, data: page(last, whole, joined([last < total ? limitNote(last, null) : null, ...notes])) };
+    return pageAnswer(page(last, whole, joined([last < total ? limitNote(last, null) : null, ...notes])));
   }
   // The note of the page that ends at line `to`, its last line shown at most
   // lastMax long: the page that ends where it was asked to, at the file's end
@@ -96,10 +118,10 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
     const endNote = to < total ? limitNote(to, rest) : rest === null ? null : `${cutLine(to, rest)}.`;
     return joined([to === last ? endNote : budgetNote(to, rest), ...notes]);
   };
-  // A page's length as JSON: its fields' and note's, measured with no content,
-  // and its lines', which JSON writes inside the content's quotes.
+  // A page's text's length: its fields' and note's, measured with no content,
+  // and its content's, under the content's label. A page here has a line.
   const lengthAt = (to: number, contentChars: number, note: string | undefined) =>
-    JSON.stringify(page(to, '', note)).length + contentChars;
+    pageText(page(to, '', note)).length + sectionLead('content') + contentChars;
   // The page is the longest that fits. Its length isn't monotone in its
   // lines: the page that ends the file carries no stop note, the one at the
   // line limit a shorter one than a stop, and one whose last line is cut a
@@ -111,14 +133,14 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   for (let i = first; i < last; i++) {
     const line = shown(i);
     shownLines.push(line);
-    // Each line after the first comes after a line feed, which JSON writes as two characters.
-    contentChars += jsonLength(line) + (i > first ? 2 : 0);
+    // Each line after the first comes after a line feed.
+    contentChars += line.length + (i > first ? 1 : 0);
     if (lengthAt(i + 1, contentChars, noteAt(i + 1)) <= maxChars) best = shownLines.length;
     else if (lengthAt(i + 1, contentChars, joined(notes)) > maxChars) break;
   }
   if (best > 0) {
     shownLines.length = best;
-    return { success: true, data: page(first + best, shownLines.join('\n'), noteAt(first + best)) };
+    return pageAnswer(page(first + best, shownLines.join('\n'), noteAt(first + best)));
   }
   // No page fits with its first line as a page shows it: the loop tried that
   // page first, since a read's limit is at least 1, and it is pageWith(top).
@@ -134,7 +156,7 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   // that fits is the one the search finds or, past a dip, at most two cuts
   // further, four code units at most, and those are tried too.
   const pageWith = (chars: number) => page(first + 1, shown(first, chars), noteAt(first + 1, chars));
-  const fitsAt = (chars: number) => JSON.stringify(pageWith(chars)).length <= maxChars;
+  const fitsAt = (chars: number) => pageText(pageWith(chars)).length <= maxChars;
   const top = Math.min(lines[first].length, MAX_LINE_CHARS);
   let fits = 0;
   let over = top;
@@ -145,7 +167,7 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   // The search ends with `fits + 1` measured as too long, or as `top`.
   const found = fits;
   for (let chars = found + 2; chars <= found + 4 && chars < top; chars++) if (fitsAt(chars)) fits = chars;
-  return { success: true, data: pageWith(fits) };
+  return pageAnswer(pageWith(fits));
 }
 
 const splitsPair = (text: string, at: number): boolean =>
@@ -155,8 +177,8 @@ const splitsPair = (text: string, at: number): boolean =>
 
 /**
  * Raw text from `offsetChars`, at most `limitChars` code units (one more to
- * keep a surrogate pair whole), stopped sooner where its data would pass
- * `maxChars` as JSON, if there is one.
+ * keep a surrogate pair whole), stopped sooner where its page's text would
+ * pass `maxChars`, if there is one.
  */
 export function characterPage(path: string, file: FileText, offsetChars: number, limitChars: number, maxChars: number | undefined, extraNotes: string[] = []): ToolResult {
   const text = file.raw;
@@ -172,7 +194,7 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   // asked to: at a cut line's end, for the rest a line page's note names.
   const stoppedNote = (to: number, left: number) =>
     `Stopped at character ${to} to stay within the ${maxChars}-character result limit; read the rest of what you asked for with offsetChars=${to} and limitChars=${left}.`;
-  const page = (to: number, note: string | undefined) => ({
+  const page = (to: number, note: string | undefined): Page => ({
     path,
     totalChars: text.length,
     offsetChars: start,
@@ -181,23 +203,20 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
     content: text.slice(start, to),
   });
   const whole = page(end, joined(notes));
-  if (maxChars === undefined || JSON.stringify(whole).length <= maxChars) return { success: true, data: whole };
+  if (maxChars === undefined || pageText(whole).length <= maxChars) return pageAnswer(whole);
   // As many characters as fit beside the rest of the page, which takes the
-  // most with the largest offset it could stop at and the most left.
-  const overhead = JSON.stringify({ ...page(end, joined([stoppedNote(end, end - start), ...notes])), nextOffsetChars: end, content: '' }).length;
-  // A page moves by whole characters, a surrogate pair at once, so it never
-  // stops inside one.
+  // most with the largest offset it could stop at and the most left. A page
+  // moves by whole characters, a surrogate pair at once, so it never stops
+  // inside one.
+  const overhead = pageText({ ...page(end, joined([stoppedNote(end, end - start), ...notes])), nextOffsetChars: end, content: '' }).length + sectionLead('content');
   const step = (at: number) => (splitsPair(text, at + 1) ? 2 : 1);
-  let to = start;
-  for (let used = overhead; to < end;) {
-    const cost = jsonCharLength(text, to) + (step(to) === 2 ? jsonCharLength(text, to + 1) : 0);
-    if (used + cost > maxChars) break;
-    used += cost;
-    to += step(to);
-  }
+  let to = Math.min(end, start + Math.max(0, maxChars - overhead));
+  if (splitsPair(text, to)) to--;
   // A page always moves on, by one character at least, though a limit too
-  // small for the page's own fields then passes it. Where that reaches the
-  // page's own end, it holds all it was asked for, so it names no stop.
+  // small for the page's own fields and its first character then passes it:
+  // with room for one code unit, a surrogate pair is still taken whole. Where
+  // that reaches the page's own end, it holds all it was asked for, so it
+  // names no stop.
   if (to === start) to = Math.min(end, start + step(start));
-  return { success: true, data: page(to, joined([to < end ? stoppedNote(to, end - to) : null, ...notes])) };
+  return pageAnswer(page(to, joined([to < end ? stoppedNote(to, end - to) : null, ...notes])));
 }

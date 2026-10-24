@@ -447,11 +447,12 @@ export class ModuleRegistry {
    * (with a stderr line), whether the call throws, rejects, or answers with
    * something that isn't an array of objects, or with a `system` entry whose
    * content isn't an array of objects, every block of which the agent's
-   * buildSystemPrompt reads, and one that
-   * answers after its timeout adds nothing. An entry's other fields are the
-   * module's to get right, as before. Each module's budget starts once its
-   * call returns, after its own synchronous work and every earlier module's,
-   * as before.
+   * buildSystemPrompt reads, and one that answers after its timeout adds
+   * nothing. An array returned without a promise is taken as the module's
+   * answer. An entry's other fields are the module's to get right. Each
+   * module's budget starts once its call returns, after its own synchronous
+   * work and every earlier module's; a later module's synchronous work still
+   * counts against it.
    *
    * The per-module budget is `module.contextTimeoutMs` when declared, else the
    * `timeoutMs` default (15s). Modules whose gatherContext does real work —

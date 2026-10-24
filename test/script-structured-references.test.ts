@@ -520,13 +520,24 @@ test("an MCPL peer's structured blocks too deep to convert to JSON reach a scrip
     let deep: unknown = 'bottom';
     for (let i = 0; i < 200_000; i++) deep = [deep];
     answer({ content: [{ type: 'text', text: 'a deep report', deep }], structuredContent: {} });
-    const object = JSON.parse(await script('mcpl--files--attach')) as {
+    // The host's log gets the line the script gets (unconvertibleScriptResult).
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let out = '';
+    try {
+      out = await script('mcpl--files--attach');
+    } finally {
+      console.error = consoleError;
+    }
+    const object = JSON.parse(out) as {
       content: [{ text: string }]; structuredContent: unknown; isError: boolean;
     };
     assert.equal(object.isError, true);
     assert.equal(object.structuredContent, null);
     // The reason is the overflow the guard caught, in both runtimes' words.
     assert.match(object.content[0].text, /^tool 'mcpl--files--attach' returned a result that can't be converted to JSON, so the script can't receive it \(Maximum call stack size exceeded\.?\)\. The call itself completed\.$/);
+    assert.deepEqual(logged.filter((line) => line.startsWith('[code_execution] ')), [`[code_execution] ${object.content[0].text}`]);
     // No failed dispatch: only the script lane's treatment failed, so the
     // trace and the call's terminal read the peer's own answer, a success,
     // as on v0.26.1.
@@ -546,6 +557,49 @@ test("an MCPL peer's structured blocks too deep to convert to JSON reach a scrip
     assert.deepEqual(seen.lifecycle.filter(([method]) => method === 'markDispatchFailure'), []);
     const both = seen.lifecycle.filter(([method]) => method === 'onResult').map(([, , , result]) => result as ToolResult);
     assert.deepEqual(both.map((r) => [r.success, r.isError === true, r.data]), [[true, false, []], [false, true, []]]);
+  });
+});
+
+test("a RangeError from serializing an MCPL peer's blocks, as a result past the runtime's longest string gives, reaches a script as a result it can't convert", async () => {
+  await withPeers(async ({ answer, script, observe }) => {
+    const seen = observe();
+    // A result past the runtime's longest string makes JSON.stringify throw
+    // a RangeError ("Invalid string length" on V8), and a test can't build
+    // one in memory. A toJSON that JSON.stringify calls, and that throws
+    // that error, stands in for it: the throw comes from inside the
+    // serializer, as the real one does, and isn't the overflow's.
+    const tooLong = { toJSON(): never { throw new RangeError('Invalid string length'); } };
+    answer({ content: [{ type: 'text', text: 'a long report', tooLong }], structuredContent: {} });
+    const object = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(object.isError, true);
+    assert.equal(object.content[0].text, "tool 'mcpl--files--attach' returned a result that can't be converted to JSON, so the script can't receive it (Invalid string length). The call itself completed.");
+    assert.deepEqual(seen.outcomes, [{ type: 'tool:completed' }]);
+    assert.deepEqual(seen.lifecycle.filter(([method]) => method === 'markDispatchFailure'), []);
+  });
+});
+
+test("a fault in an MCPL peer's round trip other than a RangeError fails the dispatch, as any fault does, with its own message", async () => {
+  await withPeers(async ({ answer, script, observe }) => {
+    const seen = observe();
+    // Wire JSON has neither, so each stands in for a fault: a getter that
+    // throws when the treatment reads a nested block's type, and a BigInt,
+    // on which JSON.stringify itself throws. Each is a TypeError, not the
+    // RangeError of a result too deep or too long to convert.
+    const faulty = { get type(): string { throw new TypeError('a nested block\'s type could not be read'); } };
+    const faults: Array<[unknown, RegExp]> = [
+      [{ type: 'text', text: 'a report', attachment: faulty }, /a nested block's type could not be read/],
+      [{ type: 'text', text: 'a count', count: BigInt(1) }, /BigInt/],
+    ];
+    for (const [i, [block, message]] of faults.entries()) {
+      answer({ content: [block], structuredContent: {} });
+      const object = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
+      assert.equal(object.isError, true);
+      assert.match(object.content[0].text, message);
+      assert.doesNotMatch(object.content[0].text, /can't be converted to JSON/);
+      assert.equal(seen.lifecycle.filter(([method]) => method === 'markDispatchFailure').length, i + 1);
+      assert.equal(seen.outcomes[i]?.type, 'tool:failed');
+      assert.match(String((seen.outcomes[i] as { error?: unknown }).error), message);
+    }
   });
 });
 

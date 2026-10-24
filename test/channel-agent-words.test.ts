@@ -463,6 +463,8 @@ test("publishForAgent's reason for an inbound-only channel is inbound-only, what
 test('speech that has to open its channel says why the open didn\'t happen, and what helps where it was refused', async () => {
   // A grant can let words out without letting this host open the channel:
   // here channels.publish without channels.lifecycle, for a channel not open.
+  // While the server is up, nothing opens there, so the words go into the
+  // channel as it stands.
   const f = await fixture({ a: ['x'] });
   f.servers.set('a', up(['channels.lifecycle']));
   const failed = async () => {
@@ -470,8 +472,9 @@ test('speech that has to open its channel says why the open didn\'t happen, and 
     assert.equal(await f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' }), null);
     return f.failures.map((failure) => failure.reason);
   };
-  assert.deepEqual(await failed(), ['opening the channel for these words didn\'t complete: this host isn\'t permitted to open or ' +
-    'close the "a" server\'s channels; if you need it, ask whoever runs this host']);
+  assert.deepEqual(await f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' }),
+    { delivered: true, serverId: 'a', channelId: 'x' });
+  assert.deepEqual(f.failures, []);
   f.connecting.add('a');
   assert.deepEqual(await failed(), ['opening the channel for these words didn\'t complete: this host is connecting to the "a" ' +
     'server, so try again in a moment']);
@@ -591,12 +594,12 @@ test('channel_decline says the decline is recorded, and what became of its ackno
   server.sendChannelsClose = async () => ({});
   await f.call('channel_open', { channelId: 'x' });
   assert.equal((await f.call('channel_decline', { channelId: 'x', messageId: 'm3' })).error,
-    'Channel "x" is open, or set to open, so there\'s nothing to decline. If you need it closed, call channel_close.');
+    'Channel "x" is open, so there\'s nothing to decline. If you need it closed, call channel_close.');
   // A server that isn't up has an empty grant until its next exchange, and
   // channel_close closes the channel once it's back, so it's still named.
   f.servers.set('a', down(true));
   assert.equal((await f.call('channel_decline', { channelId: 'x', messageId: 'm4' })).error,
-    'Channel "x" is open, or set to open, so there\'s nothing to decline. If you need it closed, call channel_close.');
+    'Channel "x" is open, so there\'s nothing to decline. If you need it closed, call channel_close.');
 });
 
 test('a decline whose close a later open overtook says that decision stands', async () => {
@@ -789,7 +792,7 @@ test('a decline on a server whose channels this host can\'t open or close says i
   // And another decline is refused, with no pointer to a channel_close that
   // couldn't close it here.
   assert.equal((await f.call('channel_decline', { channelId: 'y', messageId: 'm4' })).error,
-    'Channel "y" is open, or set to open, so there\'s nothing to decline, and this host isn\'t permitted to open or close ' +
+    'Channel "y" is open, so there\'s nothing to decline, and this host isn\'t permitted to open or close ' +
     'the "a" server\'s channels; if you need it closed, ask whoever runs this host.');
 });
 
@@ -1249,7 +1252,7 @@ test('a decline whose registration came back, with only work a removal cancels s
   assert.deepEqual(closes, ['y']);
 });
 
-test('words whose open completed, then met a close decided while later work held them, say the close', async () => {
+test("words whose open completed, then met a machine's close decided while later work held them, say the close", async () => {
   // The open step's wait joins lifecycle work queued after the open, here a
   // backscroll's, so a close decided meanwhile is what the words met. Their
   // own open did complete, so nothing says it didn't.
@@ -1267,7 +1270,10 @@ test('words whose open completed, then met a close decided while later work held
   const backscroll = f.call('channel_open', { channelId: 'x', backscroll: 5 });
   answers.shift()!();
   await sent(1);
-  const closing = f.call('channel_close', { channelId: 'x' });
+  // A machine's close: the agent's own would let the words go into the
+  // channel as it leaves it.
+  const closing = f.registry.handleChannelToolCall('channel_close', { channelId: 'x', source: 'subscription-gc', overrideExplicitOpen: true },
+    { kind: 'module', moduleName: 'subscription-gc' });
   answers.shift()!();
   assert.equal(await speech, null);
   assert.deepEqual(f.failures.map((failure) => failure.reason), ['a decision to close the channel came before these words went out']);

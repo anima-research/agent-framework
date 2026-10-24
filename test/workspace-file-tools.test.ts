@@ -30,7 +30,7 @@ function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: 
   const stored = async (rel: string): Promise<string> => {
     const result = await call('read', { path: `work/${rel}`, offsetChars: 0, limitChars: 100_000 });
     assert.equal(result.success, true, result.error);
-    return (result.data as { content: string }).content;
+    return (result.structured as { content: string }).content;
   };
   return { workspace, store, dir, call, disk, stored };
 }
@@ -500,7 +500,7 @@ test('a write, edit or delete whose store throws after recording it says the cha
   // the workspace made, not a file disk may have deleted.
   const edited = await call('edit', { path: 'work/w.txt', oldString: 'new', newString: 'newer' });
   assert.equal(edited.success, true, edited.error);
-  assert.doesNotMatch(String((edited.data as { note?: string }).note ?? ''), /nothing records/);
+  assert.doesNotMatch(String((edited.structured as { note?: string }).note ?? ''), /nothing records/);
 });
 
 test('on a mount that pushes, a write, edit or delete whose store throws after recording it says its push didn\'t run, and a materialize takes it to disk', async (t) => {
@@ -593,14 +593,14 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
 test('a final line end ends the last line, and an empty file reads as empty', async (t) => {
   const { dir, call } = setup(t);
   writeFileSync(join(dir, 'nl.txt'), 'a\nb\n');
-  assert.deepEqual((await call('read', { path: 'work/nl.txt' })).data, {
+  assert.deepEqual((await call('read', { path: 'work/nl.txt' })).structured, {
     path: 'work/nl.txt', totalLines: 2, fromLine: 1, toLine: 2, content: '     1\ta\n     2\tb',
   });
   writeFileSync(join(dir, 'blank.txt'), 'a\n\n');
-  assert.equal(((await call('read', { path: 'work/blank.txt' })).data as { totalLines: number }).totalLines, 2,
+  assert.equal(((await call('read', { path: 'work/blank.txt' })).structured as { totalLines: number }).totalLines, 2,
     'an empty line before the final line end is a line');
   writeFileSync(join(dir, 'empty.txt'), '');
-  assert.deepEqual((await call('read', { path: 'work/empty.txt' })).data, { path: 'work/empty.txt', totalLines: 0, content: '' });
+  assert.deepEqual((await call('read', { path: 'work/empty.txt' })).structured, { path: 'work/empty.txt', totalLines: 0, content: '' });
 });
 
 test('grep numbers lines as read does: no match on an empty line after the last', async (t) => {
@@ -608,7 +608,7 @@ test('grep numbers lines as read does: no match on an empty line after the last'
   writeFileSync(join(dir, 'g.txt'), 'x\n');
   const result = await call('grep', { pattern: '^$' });
   assert.equal(result.success, true, result.error);
-  assert.deepEqual((result.data as { results: unknown[] }).results, []);
+  assert.deepEqual((result.structured as { results: unknown[] }).results, []);
 });
 
 test('grep matches and shows a CRLF file\'s lines without the CR, as read shows them', async (t) => {
@@ -620,7 +620,7 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   const result = await call('grep', { pattern: '^foo$', contextBefore: 1, contextAfter: 1 });
   assert.equal(result.success, true, result.error);
   type Result = { file: string; lineEndings?: string; matches: unknown[] };
-  const byFile = Object.fromEntries((result.data as { results: Result[] }).results.map((r) => [r.file, r]));
+  const byFile = Object.fromEntries((result.structured as { results: Result[] }).results.map((r) => [r.file, r]));
   assert.deepEqual(byFile['work/crlf.txt'], {
     file: 'work/crlf.txt', state: 'synced', version: 'workspace', lineEndings: 'CRLF',
     matches: [{ line: 2, text: 'foo', context: ['alpha', 'foo', 'omega'] }],
@@ -636,7 +636,7 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   const note = noteFor('1 file searched has CRLF line ends: work/crlf.txt (CRLF)');
   for (const pattern of ['\\r', '\r', 'o[\\r]?$', '\\\\\\r', '\\x0d', '\\x0D', '\\u000d', '\\u000D', '\\cM', '\\cm', '\\015', '[\\x0d]', '\\\r']) {
     const cr = await call('grep', { pattern, path: 'work/crlf.txt' });
-    const data = cr.data as { results: Array<{ matches: unknown[] }>; note?: string };
+    const data = cr.structured as { results: Array<{ matches: unknown[] }>; note?: string };
     assert.equal(data.note, note, JSON.stringify(pattern));
     if (pattern !== 'o[\\r]?$') assert.deepEqual(data.results, [], JSON.stringify(pattern));
   }
@@ -644,11 +644,11 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   // end, get no note.
   for (const [pattern, path] of [['foo', 'work/crlf.txt'], ['\\\\r', 'work/crlf.txt'], ['\\\\x0d', 'work/crlf.txt'], ['\\\\cM', 'work/crlf.txt'],
     ['\\\\u000d', 'work/crlf.txt'], ['\\R', 'work/crlf.txt'], ['\\X0D', 'work/crlf.txt'], ['\\U000D', 'work/crlf.txt'], ['\\CM', 'work/crlf.txt'], ['\\r', 'work/lf.txt']]) {
-    const data = (await call('grep', { pattern, path })).data as object;
+    const data = (await call('grep', { pattern, path })).structured as object;
     assert.equal('note' in data, false, JSON.stringify([pattern, path]));
   }
   writeFileSync(join(dir, 'lone.txt'), 'a\rb\n');
-  const lone = (await call('grep', { pattern: '\\r', path: 'work/lone.txt' })).data as { results: Array<{ matches: unknown[] }> };
+  const lone = (await call('grep', { pattern: '\\r', path: 'work/lone.txt' })).structured as { results: Array<{ matches: unknown[] }> };
   assert.equal('note' in lone, false);
   assert.deepEqual(lone.results[0].matches, [{ line: 1, text: 'a\rb' }]);
   // Any CRLF file searched gives the note, whatever comes after it: here an LF
@@ -659,9 +659,9 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   writeFileSync(join(dir, 'many', 'a.txt'), 'x\n');
   writeFileSync(join(dir, 'many', 'b.txt'), 'x\r\n');
   writeFileSync(join(dir, 'many', 'c.txt'), 'x\n');
-  assert.equal(((await call('grep', { pattern: '\\r', path: 'work/many' })).data as { note?: string }).note,
+  assert.equal(((await call('grep', { pattern: '\\r', path: 'work/many' })).structured as { note?: string }).note,
     noteFor('1 file searched has CRLF line ends: work/many/b.txt (CRLF)'));
-  const globbed = (await call('grep', { pattern: 'x|\\r', path: 'work/many', glob: 'many/a.txt' })).data as { results: Array<{ file: string }> };
+  const globbed = (await call('grep', { pattern: 'x|\\r', path: 'work/many', glob: 'many/a.txt' })).structured as { results: Array<{ file: string }> };
   assert.deepEqual(globbed.results.map((r) => r.file), ['work/many/a.txt']);
   assert.equal('note' in globbed, false);
 });
@@ -674,36 +674,36 @@ test("grep says a BOM isn't part of the first line when a pattern for U+FEFF sea
     + "and a BOM isn't part of the first line. read with offsetChars shows any BOM the workspace's copy has.";
   const note = noteFor('work/bom.txt');
   for (const pattern of ['\\uFEFF', '^\\ufeff', '\uFEFF', '\\\uFEFF']) {
-    const data = (await call('grep', { pattern, path: 'work/bom.txt' })).data as { results: unknown[]; note?: string };
+    const data = (await call('grep', { pattern, path: 'work/bom.txt' })).structured as { results: unknown[]; note?: string };
     assert.equal(data.note, note, JSON.stringify(pattern));
     assert.deepEqual(data.results, [], JSON.stringify(pattern));
   }
   // An escaped backslash names no U+FEFF, nor does \U, an identity escape,
   // and a U+FEFF inside a line, in a file with no BOM, is found with no note.
   for (const pattern of ['\\\\uFEFF', '\\UFEFF']) {
-    assert.equal('note' in ((await call('grep', { pattern, path: 'work/bom.txt' })).data as object), false, JSON.stringify(pattern));
+    assert.equal('note' in ((await call('grep', { pattern, path: 'work/bom.txt' })).structured as object), false, JSON.stringify(pattern));
   }
-  const inner = (await call('grep', { pattern: '\\uFEFF', path: 'work/inner.txt' })).data as { results: Array<{ matches: unknown[] }> };
+  const inner = (await call('grep', { pattern: '\\uFEFF', path: 'work/inner.txt' })).structured as { results: Array<{ matches: unknown[] }> };
   assert.equal('note' in inner, false);
   assert.deepEqual(inner.results[0].matches, [{ line: 1, text: 'a\uFEFFb' }]);
   // A CR pattern over the BOM file, which has no CRLF end, and a U+FEFF
   // pattern over a CRLF file with no BOM, get no note.
   writeFileSync(join(dir, 'crlf.txt'), 'x\r\n');
-  assert.equal('note' in ((await call('grep', { pattern: '\\r', path: 'work/bom.txt' })).data as object), false);
-  assert.equal('note' in ((await call('grep', { pattern: '\\uFEFF', path: 'work/crlf.txt' })).data as object), false);
+  assert.equal('note' in ((await call('grep', { pattern: '\\r', path: 'work/bom.txt' })).structured as object), false);
+  assert.equal('note' in ((await call('grep', { pattern: '\\uFEFF', path: 'work/crlf.txt' })).structured as object), false);
   // Any BOM file searched gives the note, whatever comes after it: a file
   // without one is searched on either side of the BOM file.
   mkdirSync(join(dir, 'boms'));
   writeFileSync(join(dir, 'boms', 'a.txt'), 'x\n');
   writeFileSync(join(dir, 'boms', 'b.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('x\n')]));
   writeFileSync(join(dir, 'boms', 'c.txt'), 'x\n');
-  assert.equal(((await call('grep', { pattern: '\\uFEFF', path: 'work/boms' })).data as { note?: string }).note, noteFor('work/boms/b.txt'));
+  assert.equal(((await call('grep', { pattern: '\\uFEFF', path: 'work/boms' })).structured as { note?: string }).note, noteFor('work/boms/b.txt'));
   // A pattern that names both, over a file with a BOM and CRLF ends, gets both
   // notes, the CR's first.
   writeFileSync(join(dir, 'both.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('x\r\n')]));
   const crNote = "The pattern names a CR, and 1 file searched has CRLF line ends: work/both.txt (CRLF). Lines are matched as read shows them, "
     + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy.";
-  const both = (await call('grep', { pattern: '^\\uFEFF|\\r$', path: 'work/both.txt' })).data as { results: unknown[]; note?: string };
+  const both = (await call('grep', { pattern: '^\\uFEFF|\\r$', path: 'work/both.txt' })).structured as { results: unknown[]; note?: string };
   assert.equal(both.note, `${crNote} ${noteFor('work/both.txt')}`);
   assert.deepEqual(both.results, []);
 });
@@ -725,22 +725,22 @@ test("grep's note on a pattern for a CR or U+FEFF names the files searched that 
     + "read with offsetChars shows every CR in the workspace's copy.";
   // On main, \r$ found these files' lines; here no line keeps a CRLF end's
   // CR, so the note names the files, mixed ends as such, sorted as results are.
-  const cr = (await call('grep', { pattern: '\\r$' })).data as { results: unknown[]; totalMatches: number; note?: string; skipped?: Array<{ file: string }> };
+  const cr = (await call('grep', { pattern: '\\r$' })).structured as { results: unknown[]; totalMatches: number; note?: string; skipped?: Array<{ file: string }> };
   assert.deepEqual([cr.results, cr.totalMatches], [[], 0]);
   assert.deepEqual(cr.skipped?.map((s) => s.file), ['work/big.txt', 'work/blob.bin']);
   assert.equal(cr.note, 'The pattern names a CR, and 3 files searched have CRLF line ends: '
     + `work/both.json (CRLF), work/mixed.cfg (mixed), work/win.bat (CRLF). ${tail}`);
-  const boms = (await call('grep', { pattern: '^\\uFEFF' })).data as { results: unknown[]; note?: string };
+  const boms = (await call('grep', { pattern: '^\\uFEFF' })).structured as { results: unknown[]; note?: string };
   assert.deepEqual(boms.results, []);
   assert.equal(boms.note, 'The pattern names U+FEFF, and 2 files searched start with a BOM: work/bom.txt, work/both.json. '
     + "Lines are matched as read shows them, and a BOM isn't part of the first line. read with offsetChars shows any BOM the workspace's copy has.");
   // Past 20 files the count stays exact, and the rest are found by narrowing.
   mkdirSync(join(dir, 'many'));
   for (let i = 0; i < 23; i++) writeFileSync(join(dir, 'many', `f${String(i).padStart(2, '0')}.txt`), 'x\r\n');
-  const many = (await call('grep', { pattern: '\\r', path: 'work/many' })).data as { note?: string };
+  const many = (await call('grep', { pattern: '\\r', path: 'work/many' })).structured as { note?: string };
   const first20 = Array.from({ length: 20 }, (_, i) => `work/many/f${String(i).padStart(2, '0')}.txt (CRLF)`).join(', ');
   assert.equal(many.note, `The pattern names a CR, and 23 files searched have CRLF line ends: ${first20}, and 3 more; narrow with path or glob. ${tail}`);
-  const narrowed = (await call('grep', { pattern: '\\r', path: 'work/many', glob: 'many/f2*.txt' })).data as { note?: string };
+  const narrowed = (await call('grep', { pattern: '\\r', path: 'work/many', glob: 'many/f2*.txt' })).structured as { note?: string };
   assert.equal(narrowed.note, 'The pattern names a CR, and 3 files searched have CRLF line ends: '
     + `work/many/f20.txt (CRLF), work/many/f21.txt (CRLF), work/many/f22.txt (CRLF). ${tail}`);
 });
@@ -750,7 +750,7 @@ test('text copied from a read or a grep of a CRLF file matches in an edit, and t
   const bom = Buffer.from([0xef, 0xbb, 0xbf]);
   writeFileSync(join(dir, 'w.txt'), Buffer.concat([bom, Buffer.from('one\r\ntwo\r\nthree\r\n')]));
   // Two lines as the read shows them, each without its number and tab.
-  const page = (await call('read', { path: 'work/w.txt' })).data as { content: string };
+  const page = (await call('read', { path: 'work/w.txt' })).structured as { content: string };
   const copied = page.content.split('\n').slice(0, 2).map((line) => line.slice(line.indexOf('\t') + 1)).join('\n');
   assert.equal(copied, 'one\ntwo');
   const edit = await call('edit', { path: 'work/w.txt', oldString: copied, newString: 'ONE\nTWO' });
@@ -758,7 +758,7 @@ test('text copied from a read or a grep of a CRLF file matches in an edit, and t
   assert.deepEqual(disk('w.txt'), Buffer.concat([bom, Buffer.from('ONE\r\nTWO\r\nthree\r\n')]));
   // A grep match's text copies the same way.
   const found = await call('grep', { pattern: '^three$', path: 'work/w.txt' });
-  const text = (found.data as { results: Array<{ matches: Array<{ text: string }> }> }).results[0].matches[0].text;
+  const text = (found.structured as { results: Array<{ matches: Array<{ text: string }> }> }).results[0].matches[0].text;
   const second = await call('edit', { path: 'work/w.txt', oldString: text, newString: 'THREE' });
   assert.equal(second.success, true, second.error);
   assert.deepEqual(disk('w.txt'), Buffer.concat([bom, Buffer.from('ONE\r\nTWO\r\nTHREE\r\n')]));
@@ -769,7 +769,7 @@ test('lines whose own text ends in a CR, copied from a read, edit the lines they
   // Lines 1 and 2 end in a CR before their CRLF end; lines 3 and 4 hold the
   // same text with a CRLF end alone.
   writeFileSync(join(dir, 'cr.txt'), 'x\r\r\ny\r\r\nx\r\ny\r\n');
-  const page = (await call('read', { path: 'work/cr.txt' })).data as { content: string; note: string };
+  const page = (await call('read', { path: 'work/cr.txt' })).structured as { content: string; note: string };
   assert.equal(page.note, 'Line ends are CRLF, shown without the CR, except on 2 lines whose own text ends in a CR, which show both CRs. '
     + 'An edit matches text as read shows it, and keeps the CRLF ends.');
   const copied = page.content.split('\n').slice(0, 2).map((line) => line.slice(line.indexOf('\t') + 1)).join('\n');
@@ -780,7 +780,7 @@ test('lines whose own text ends in a CR, copied from a read, edit the lines they
   // A grep match's text copies the same way.
   writeFileSync(join(dir, 'one.txt'), 'w\r\r\nw\r\n');
   const found = await call('grep', { pattern: '^w', path: 'work/one.txt' });
-  const texts = (found.data as { results: Array<{ matches: Array<{ text: string }> }> }).results[0].matches.map((m) => m.text);
+  const texts = (found.structured as { results: Array<{ matches: Array<{ text: string }> }> }).results[0].matches.map((m) => m.text);
   assert.deepEqual(texts, ['w\r\r', 'w']);
   const second = await call('edit', { path: 'work/one.txt', oldString: texts[0], newString: 'V' });
   assert.equal(second.success, true, second.error);
@@ -800,11 +800,11 @@ test('an offset past the last line answers empty, with the line count and no ran
   const { dir, call } = setup(t);
   writeFileSync(join(dir, 'nl.txt'), 'a\nb\n');
   writeFileSync(join(dir, 'empty.txt'), '');
-  assert.deepEqual((await call('read', { path: 'work/empty.txt', offset: 2 })).data, {
+  assert.deepEqual((await call('read', { path: 'work/empty.txt', offset: 2 })).structured, {
     path: 'work/empty.txt', totalLines: 0, note: 'Line 2 is past the end: the file has 0 lines.', content: '',
   });
   for (const offset of [3, 10]) {
-    assert.deepEqual((await call('read', { path: 'work/nl.txt', offset })).data, {
+    assert.deepEqual((await call('read', { path: 'work/nl.txt', offset })).structured, {
       path: 'work/nl.txt', totalLines: 2, note: `Line ${offset} is past the end: the file has 2 lines.`, content: '',
     });
   }
@@ -822,7 +822,7 @@ test("an edit applies to disk's text when disk changed and the store didn't, and
 
   const edit = await call('edit', { path: 'work/s.txt', oldString: 'line', newString: 'LINE' });
   assert.equal(edit.success, true, edit.error);
-  assert.match((edit.data as { note: string }).note, /^Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit applied to that text\.$/);
+  assert.match((edit.structured as { note: string }).note, /^Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit applied to that text\.$/);
   assert.equal(disk('s.txt')!.toString(), 'v2 LINE from another writer\n');
   assert.equal(await stored('s.txt'), 'v2 LINE from another writer\n');
 
@@ -855,7 +855,7 @@ test('an edit of a draft whose disk copy also changed applies to the draft and n
     + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   const edit = await call('edit', { path: 'work/k.txt', oldString: 'draft', newString: 'draft, edited' });
   assert.equal(edit.success, true, edit.error);
-  assert.equal((edit.data as { note: string }).note,
+  assert.equal((edit.structured as { note: string }).note,
     "The path is in conflict with disk (both-changed): the edit is in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   assert.equal(await stored('k.txt'), 'agent draft, edited\n');
   assert.equal(disk('k.txt')!.toString(), 'another writer\n');
@@ -878,16 +878,16 @@ test("a read shows disk's text when disk changed and the store didn't, and says 
   assert.equal((await call('read', { path: 'work/r.txt' })).success, true);
   writeFileSync(join(dir, 'r.txt'), 'v2 from another writer\n');
   const taken = "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and this read shows that text.";
-  assert.deepEqual((await call('read', { path: 'work/r.txt' })).data, {
+  assert.deepEqual((await call('read', { path: 'work/r.txt' })).structured, {
     path: 'work/r.txt', totalLines: 1, fromLine: 1, toLine: 1, note: taken, content: '     1\tv2 from another writer',
   });
   // That's the workspace's copy now, so the next read has nothing to say.
-  assert.deepEqual((await call('read', { path: 'work/r.txt' })).data, {
+  assert.deepEqual((await call('read', { path: 'work/r.txt' })).structured, {
     path: 'work/r.txt', totalLines: 1, fromLine: 1, toLine: 1, content: '     1\tv2 from another writer',
   });
   // A character page settles and says so too.
   writeFileSync(join(dir, 'r.txt'), 'v3\n');
-  assert.deepEqual((await call('read', { path: 'work/r.txt', offsetChars: 0 })).data, {
+  assert.deepEqual((await call('read', { path: 'work/r.txt', offsetChars: 0 })).structured, {
     path: 'work/r.txt', totalChars: 3, offsetChars: 0, nextOffsetChars: null, note: taken, content: 'v3\n',
   });
 });
@@ -907,7 +907,7 @@ test('a read of a draft whose disk copy also changed shows the draft and names t
   assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
   assert.equal((await call('write', { path: 'work/k.txt', content: 'agent draft\n' })).success, true);
   writeFileSync(join(dir, 'k.txt'), 'another writer\n');
-  assert.deepEqual((await call('read', { path: 'work/k.txt' })).data, {
+  assert.deepEqual((await call('read', { path: 'work/k.txt' })).structured, {
     path: 'work/k.txt', totalLines: 1, fromLine: 1, toLine: 1,
     note: "The path is in conflict with disk (both-changed): this read shows the workspace's copy. "
       + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.",
@@ -922,7 +922,7 @@ test("a read of a draft whose disk copy turned binary says a sync keeps disk's c
   assert.equal((await call('read', { path: 'work/m.txt' })).success, true);
   assert.equal((await call('write', { path: 'work/m.txt', content: 'agent draft\n' })).success, true);
   writeFileSync(join(dir, 'm.txt'), Buffer.from([0, 1, 2, 0, 255, 0]));
-  assert.equal(((await call('read', { path: 'work/m.txt' })).data as { note: string }).note,
+  assert.equal(((await call('read', { path: 'work/m.txt' })).structured as { note: string }).note,
     "The path is in conflict with disk (both-changed): this read shows the workspace's copy. "
       + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   // The workspace can't hold disk's copy, so the sync takes nothing in: the
@@ -940,7 +940,7 @@ test('a read of a draft whose disk copy was deleted says a sync takes the deleti
     assert.equal((await call('read', { path: `work/${name}` })).success, true);
     assert.equal((await call('write', { path: `work/${name}`, content: 'agent draft\n' })).success, true);
     rmSync(join(dir, name));
-    assert.deepEqual((await call('read', { path: `work/${name}` })).data, {
+    assert.deepEqual((await call('read', { path: `work/${name}` })).structured, {
       path: `work/${name}`, totalLines: 1, fromLine: 1, toLine: 1,
       note: "The path is in conflict with disk (deleted-on-disk): this read shows the workspace's copy. "
         + "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk.",
@@ -953,7 +953,7 @@ test('a read of a draft whose disk copy was deleted says a sync takes the deleti
   assert.equal((await call('read', { path: 'work/f.txt' })).success, true);
   assert.equal((await call('write', { path: 'work/f.txt', content: 'agent draft\n' })).success, true);
   writeFileSync(join(dir, 'f.txt'), 'another writer\n');
-  const noteOf = async (path: string) => ((await call('read', { path })).data as { note: string }).note;
+  const noteOf = async (path: string) => ((await call('read', { path })).structured as { note: string }).note;
   assert.match(await noteOf('work/f.txt'), /^The path is in conflict with disk \(both-changed\): .*Sync the path to keep disk's copy and give up the workspace's/);
   rmSync(join(dir, 'f.txt'));
   assert.equal(await noteOf('work/f.txt'),
@@ -973,7 +973,7 @@ test("a read whose disk copy can't be checked says it shows the workspace's copy
   assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
   rmSync(join(dir, 'u.txt'));
   mkdirSync(join(dir, 'u.txt'));
-  assert.deepEqual((await call('read', { path: 'work/u.txt' })).data, {
+  assert.deepEqual((await call('read', { path: 'work/u.txt' })).structured, {
     path: 'work/u.txt', totalLines: 1, fromLine: 1, toLine: 1,
     note: "The path couldn't be checked against disk (a directory), so this read shows the workspace's copy.",
     content: '     1\theld',
@@ -988,7 +988,7 @@ test("a read of a held file whose mount's root is gone says disk couldn't be che
   writeFileSync(join(dir, 'u.txt'), 'held\n');
   assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
   renameSync(dir, join(dir, '..', 'gone'));
-  assert.deepEqual((await call('read', { path: 'work/u.txt' })).data, {
+  assert.deepEqual((await call('read', { path: 'work/u.txt' })).structured, {
     path: 'work/u.txt', totalLines: 1, fromLine: 1, toLine: 1,
     note: "The path couldn't be checked against disk (the mount root is unavailable), so this read shows the workspace's copy.",
     content: '     1\theld',
@@ -1000,7 +1000,7 @@ test("a read of a file disk lacks, with nothing to say whether disk deleted it, 
   // An entry from before the evidence (as three-way's legacyEntry makes it).
   const bytes = Buffer.from('legacy line\n');
   store.treeSet('workspace/work/tree', 'l.txt', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
-  assert.deepEqual((await call('read', { path: 'work/l.txt' })).data, {
+  assert.deepEqual((await call('read', { path: 'work/l.txt' })).structured, {
     path: 'work/l.txt', totalLines: 1, fromLine: 1, toLine: 1,
     note: "Disk has no copy of this file, and nothing records whether it was deleted there, so this read shows the workspace's copy.",
     content: '     1\tlegacy line',
@@ -1106,7 +1106,7 @@ test("an edit whose disk copy can't be checked says it used the workspace's copy
         + `move or remove that directory on disk and materialize again, or write the file under another path. ${used}`);
     } else {
       assert.equal(edit.success, true, edit.error);
-      assert.equal((edit.data as { note: string }).note, used);
+      assert.equal((edit.structured as { note: string }).note, used);
     }
     assert.equal(await stored('u.txt'), 'held, edited\n');
     assert.equal(errorOf(await call('edit', { path: 'work/u.txt', oldString: 'zzz', newString: 'x' })),
@@ -1158,7 +1158,7 @@ test('an edit of a draft whose disk copy also changed, on a mount that pushes, n
   // push meets it, so its answer names none.
   const agreed = await call('edit', { path: 'work/k.txt', oldString: 'agent draft, edited', newString: 'another writer' });
   assert.equal(agreed.success, true, agreed.error);
-  assert.equal((agreed.data as { note?: string }).note, undefined, 'no conflict remains to name');
+  assert.equal((agreed.structured as { note?: string }).note, undefined, 'no conflict remains to name');
   assert.equal(await stored('k.txt'), 'another writer\n');
   assert.equal(disk('k.txt')!.toString(), 'another writer\n');
   const after = await call('materialize', { path: 'work/k.txt' });
@@ -1381,7 +1381,7 @@ for (const autoMaterialize of [false, true]) {
     store.treeSet('workspace/work/tree', 'l.txt', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
     const edit = await call('edit', { path: 'work/l.txt', oldString: 'legacy', newString: 'edited' });
     assert.equal(edit.success, true, edit.error);
-    assert.equal((edit.data as { note?: string }).note,
+    assert.equal((edit.structured as { note?: string }).note,
       "Disk has no copy of this file, and nothing records whether it was deleted there, so the edit applied to the workspace's copy. "
       + (autoMaterialize ? 'Its push put the file back on disk' : 'A materialize of the path puts it back on disk')
       + '; if it was deleted there on purpose, delete it here too.');
@@ -1429,7 +1429,7 @@ test("an edit of a draft whose disk copy was deleted says what a sync and a forc
     + `The path is in conflict with disk (deleted-on-disk): the edit looked in the workspace's copy. ${DELETION_WAYS}`);
   const edit = await call('edit', { path: 'work/f.txt', oldString: 'draft', newString: 'draft, edited' });
   assert.equal(edit.success, true, edit.error);
-  assert.equal((edit.data as { note?: string }).note,
+  assert.equal((edit.structured as { note?: string }).note,
     `The path is in conflict with disk (deleted-on-disk): the edit is in the workspace's copy. ${DELETION_WAYS}`);
   // Each way out does what the note says.
   assert.equal((await call('sync', { path: 'work/s.txt' })).success, true);

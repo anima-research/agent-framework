@@ -162,7 +162,7 @@ function call(m: WorkspaceModule, name: string, input: Record<string, unknown> =
 async function data<T = Record<string, unknown>>(m: WorkspaceModule, name: string, input: Record<string, unknown> = {}): Promise<T> {
   const result = await call(m, name, input);
   assert.equal(result.success, true, `${name} ${JSON.stringify(input)}: ${result.error}`);
-  return result.data as T;
+  return (result.structured ?? result.data) as T;
 }
 
 async function failure(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<string> {
@@ -398,7 +398,7 @@ test("a direct mount's read loads none of a file over the size limit and grep on
   const read = await countingLoads(() => call(m, 'read', { path: 'ref/huge.txt' }));
   assert.deepEqual([read.result.error, read.loaded], [over('ref/huge.txt'), 0]);
   const grep = await countingLoads(() => call(m, 'grep', { pattern: 'y', path: 'ref/huge.txt' }));
-  assert.deepEqual((grep.result.data as { skipped: unknown[] }).skipped, [{ file: 'ref/huge.txt', reason: 'over the size limit (10 bytes)', size: 100_000 }]);
+  assert.deepEqual((grep.result.structured as { skipped: unknown[] }).skipped, [{ file: 'ref/huge.txt', reason: 'over the size limit (10 bytes)', size: 100_000 }]);
   assert.equal(grep.loaded, 8192);
   // Grown past it after its open's fstat: no more than the limit and a byte.
   const grows = join(env.ref, 'grows.txt');
@@ -409,7 +409,7 @@ test("a direct mount's read loads none of a file over the size limit and grep on
   writeFileSync(grows, 'x'.repeat(8));
   const grownGrep = await changedAfterFstat(grows, () => appendFileSync(grows, 'x'.repeat(1000)),
     () => countingLoads(() => call(m, 'grep', { pattern: 'x', path: 'ref/grows.txt' })));
-  assert.deepEqual((grownGrep.result.data as { skipped: unknown[] }).skipped, [{ file: 'ref/grows.txt', reason: 'over the size limit (10 bytes)', size: 1008 }]);
+  assert.deepEqual((grownGrep.result.structured as { skipped: unknown[] }).skipped, [{ file: 'ref/grows.txt', reason: 'over the size limit (10 bytes)', size: 1008 }]);
   assert.ok(grownGrep.loaded <= 11, `loaded ${grownGrep.loaded}`);
 });
 
@@ -419,7 +419,7 @@ test("a direct mount's read and grep say so where reading a file fails", async (
   const m = await env.open();
   const failing = { read: () => async function () { throw Object.assign(new Error('EIO: i/o error, read'), { code: 'EIO' }); } };
   assert.equal((await withFileHandle(failing, () => call(m, 'read', { path: 'ref/a.txt' }))).error, 'Unable to read file: ref/a.txt (EIO)');
-  assert.deepEqual((await withFileHandle(failing, () => call(m, 'grep', { pattern: 'needle' }))).data, {
+  assert.deepEqual((await withFileHandle(failing, () => call(m, 'grep', { pattern: 'needle' }))).structured, {
     pattern: 'needle',
     results: [],
     totalMatches: 0,
@@ -666,7 +666,7 @@ test("a direct mount takes each spelling of a path as a 'chronicle' mount does",
  */
 function alike(result: ToolResult): unknown {
   if (!result.success) return { refused: true };
-  const d = result.data as Record<string, any>;
+  const d = (result.structured ?? result.data) as Record<string, any>;
   if (Array.isArray(d)) return { text: d[0].text.split('\n')[0] };
   return {
     path: d.path,
@@ -1204,7 +1204,7 @@ test("a mount configured beneath a moved direct root is nested beneath a directo
   });
   const fromStart = await answers(started);
   assert.match(fromStart.read.error ?? '', /lies in mount "work", nested in mount "ref"/);
-  assert.equal((fromStart.own.data as { content: string }).content, '     1\tb own');
+  assert.equal((fromStart.own.structured as { content: string }).content, '     1\tb own');
   assert.deepEqual(await answers(moved), fromStart);
 });
 
@@ -1229,7 +1229,7 @@ test("a direct root moved to a directory beneath its own configured path nests n
     nested: await call(m, 'read', { path: 'ref/sub/work/x.txt' }),
   });
   const fromStart = await answers(started);
-  assert.equal((fromStart.own.data as { content: string }).content, '     1\tsub own');
+  assert.equal((fromStart.own.structured as { content: string }).content, '     1\tsub own');
   assert.match(fromStart.nested.error ?? '', /lies in mount "work", nested in mount "ref"/);
   assert.deepEqual(await answers(moved), fromStart);
 });
@@ -1282,7 +1282,7 @@ test("a mount configured at a moved direct root's own path is nested nowhere in 
     disk: await m.readFileFromDisk('ref/sub/f.txt').then(() => 'read', (err: unknown) => (err instanceof WorkspaceReadError ? err.code : String(err))),
   });
   const fromStart = await answers(started);
-  assert.equal((fromStart.read.data as { content: string }).content, '     1\tsub f');
+  assert.equal((fromStart.read.structured as { content: string }).content, '     1\tsub f');
   assert.equal(fromStart.disk, 'read');
   assert.deepEqual(await answers(moved), fromStart);
 });
@@ -2397,7 +2397,10 @@ test("a direct mount's read shows a file's text as a 'chronicle' mount's does: l
     const out: Array<[Record<string, unknown>, number | undefined, Record<string, any>]> = [];
     for (const [input, cap] of reads) {
       const r = await m.handleToolCall({ id: 'read', name: 'read', input, ...(cap !== undefined ? { resultMaxChars: cap } : {}) });
-      out.push([input, cap, r.success ? r.data as Record<string, any> : { error: r.error }]);
+      // Every page a call with a result limit asked for fits it, as its text measures it.
+      const text = r.success ? (r.data as Array<{ text: string }>)[0]!.text : '';
+      if (cap !== undefined) assert.ok(text.length <= cap, `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}: ${text.length}`);
+      out.push([input, cap, r.success ? r.structured as Record<string, any> : { error: r.error }]);
     }
     return out;
   };
@@ -2412,11 +2415,10 @@ test("a direct mount's read shows a file's text as a 'chronicle' mount's does: l
   assert.match(page('bad.txt', 24000).note, /isn't valid UTF-8/);
   assert.equal(page('mixed.txt', 24000).content, '     1\ta\n     2\tb\n     3\tc\r\r\n     4\td');
   assert.equal(page('long.txt', 24000).content, `     1\t${'x'.repeat(2000)} [… read the rest with offsetChars=2000 and limitChars=58000]\n     2\ty`);
-  // Every page a call with a result limit asked for is a page, and fits it.
+  // Every page a call asked for is a page.
   for (const [input, cap, d] of fromDisk) {
     const label = `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}`;
     assert.equal(typeof d.content, 'string', `${label}: ${JSON.stringify(d).slice(0, 200)}`);
-    if (cap !== undefined) assert.ok(JSON.stringify(d).length <= cap, `${label}: ${JSON.stringify(d).length}`);
   }
   assert.ok(page('big.txt', 24000).toLine < 3000);
   assert.equal(page('long.txt', undefined).content.length, '     1\t'.length + 60000 + '\n     2\ty'.length);
