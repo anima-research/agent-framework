@@ -121,9 +121,10 @@ const UNTRACKED_REASONS = new Set(['organization_binding_mismatch', 'end_user_bi
 /**
  * When an agent's unexpected drops call for an operator alert: at the first call that shows any, and again only
  * when a call shows more than the alert last counted. Each call of a stream, and each stream until a strip takes
- * them out, drops the same blocks again, so an unchanged count isn't news. A call that shows none, whether its
- * report is empty or absent, ends the incident, and the next one alerts afresh. It's held in memory, so a restart mid-incident alerts once more, and an
- * agent's removal ends its incident (`forget`).
+ * them out, drops the same blocks again, so an unchanged count isn't news. A call that shows no unexpected drop, its
+ * report empty, absent or naming only expected ones, ends the incident: the blocks it counted no longer drop. The next
+ * one alerts afresh. It's held in memory, so a restart mid-incident alerts once more, and an agent's removal ends its
+ * incident (`forget`).
  */
 export class ThinkingLossIncidents {
   private readonly alerted = new Map<string, number>();

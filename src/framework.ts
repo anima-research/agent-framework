@@ -21069,7 +21069,7 @@ export class AgentFramework {
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             if (thinkingDropped) thinkingDroppedInStream = true;
             // Against the branch's binding record, when the context manager keeps one: a drop it can't account
-            // for tells the operators (noteThinkingLoss), and a call with no report shows none.
+            // for tells the operators (noteThinkingLoss), and a call with no report shows no such drop.
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], thinkingDrops.recordedAfter);
             }
@@ -25427,7 +25427,7 @@ export class AgentFramework {
    * or below it may lose their thinking with no strip having missed, since the context manager recorded nothing they
    * were sent under, and so may any block for a binding the record doesn't track (the account's). Any other drop is
    * one the record doesn't account for: a change ahead of it that the record didn't see. The operators hear of it
-   * once per incident, again only if a call shows more, and the incident ends at a call that shows none
+   * once per incident, again only if a call shows more, and the incident ends at a call that shows no unexpected drop
    * (ThinkingLossIncidents).
    */
   private noteThinkingLoss(agentName: string, placed: readonly PlacedDrop[], recordedAfter: number): void {
@@ -25443,7 +25443,7 @@ export class AgentFramework {
       `${recordedAfter}, ${rounds.length} from the stream's own rounds, ${unplaced.length} that couldn't be placed). ` +
       'The agent loses that reasoning, and without ' +
       'thinkingBinding.dropBlock an account that enforces the binding would have refused the request. It clears at a ' +
-      'call that drops none. If it recurs, look for what changes this agent\'s requests after the compile, such as a ' +
+      'call that drops none of those. If it recurs, look for what changes this agent\'s requests after the compile, such as a ' +
       'membrane request hook',
       { data: {
         blocks: count,

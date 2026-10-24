@@ -2,8 +2,8 @@
  * The operators' alert for thinking the provider dropped that the context manager's binding record doesn't account
  * for. A reply stored at or below the record's start (`thinkingRecordedAfter`) may lose its thinking with no strip
  * having missed, and so may a block for a binding the record doesn't track (the account's); any other drop alerts,
- * once per incident, again only when a call shows more, and the incident ends at a call that shows none, its report
- * empty or absent. Without a record start, nothing alerts.
+ * once per incident, again only when a call shows more, and the incident ends at a call that shows no unexpected drop,
+ * its report empty, absent or naming only expected ones. Without a record start, nothing alerts.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -143,7 +143,7 @@ describe('the operators\' alert on a framework turn', () => {
     const alerts = await turn(-1, (at) => [[dropped(at)], [dropped(at)], [dropped(at)]]);
     assert.equal(alerts.length, 1, 'the same count again isn\'t news');
     assert.match(alerts[0]!.message, /dropped 1 signed thinking block that the context manager's binding record doesn't account for/);
-    assert.match(alerts[0]!.message, /It clears at a call that drops none/);
+    assert.match(alerts[0]!.message, /It clears at a call that drops none of those/);
     assert.equal(alerts[0]!.data?.blocks, 1);
   });
 
@@ -179,9 +179,36 @@ describe('the operators\' alert on a framework turn', () => {
   });
 
   it('stays quiet for a drop for the account\'s binding, wherever it sits', async () => {
-    const account = (at: { message: number; block: number }, reason: string) => entry({ message: at.message, block: at.block, reason } as never);
-    const alerts = await turn(-1, (at) => [[account(at, 'organization_binding_mismatch')], [account(at, 'end_user_binding_mismatch')], []]);
+    // At the stored reply, above the record's start; at the stream's own round; and where it can't be placed: each
+    // would alert for a conversation's mismatch (the tests above).
+    const account = (fields: Partial<ThinkingBindingEntry>, reason: string) => entry({ ...fields, reason } as never);
+    const alerts = await turn(-1, (at) => [
+      [account(at, 'organization_binding_mismatch')],
+      [account({ message: 3, block: 0, round: 0 }, 'end_user_binding_mismatch'), account({ message: 0, block: 0 }, 'organization_binding_mismatch')],
+      [],
+    ]);
     assert.equal(alerts.length, 0, 'the record tracks neither');
+  });
+
+  it('ends a conversation agent\'s incident when the agent is disposed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-thinking-loss-dispose-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(), agents: [], modules: [], syncIntervalMs: 0,
+    });
+    try {
+      await framework.createEphemeralAgent({ name: 'fork', model: 'claude-opus-5-5', systemPrompt: 'Fork.', allowedTools: 'all', proseRouting: 'disabled' } as never);
+      const internal = framework as unknown as {
+        thinkingLossIncidents: { observe(agent: string, count: number): unknown; alerted: Map<string, number> };
+        disposeConversationAgent(name: string): void;
+      };
+      internal.thinkingLossIncidents.observe('fork', 2);
+      assert.ok(internal.thinkingLossIncidents.alerted.has('fork'), 'an open incident');
+      internal.disposeConversationAgent('fork');
+      assert.equal(internal.thinkingLossIncidents.alerted.has('fork'), false);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('stays quiet for a reply at the record\'s start, and where the compile gives no record start', async () => {
