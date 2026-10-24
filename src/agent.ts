@@ -268,10 +268,8 @@ export class Agent {
    *  conversation changed (see AgentConfig.thinkingBinding.dropBlock). */
   private readonly thinkingDropBlock: boolean;
   /** Whether the model binds its signed thinking to the conversation before
-   *  it (see AgentConfig.thinkingBinding.binds). The framework reads it at a
-   *  tool boundary: such an agent with a window size set takes no new stream
-   *  mid-turn for budget alone. */
-  readonly thinkingBinds: boolean;
+   *  it (see AgentConfig.thinkingBinding.binds). */
+  private readonly thinkingBinds: boolean;
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
@@ -425,7 +423,10 @@ export class Agent {
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
-    this.physicalWindowTokens = config.physicalWindowTokens;
+    // A window size that isn't a finite number (a config read from JSON can hold null) is no window, for every rule
+    // that reads it: the projection could never pass one, and the binding's budget rule would skip the budget restart.
+    this.physicalWindowTokens = typeof config.physicalWindowTokens === 'number' && Number.isFinite(config.physicalWindowTokens)
+      ? config.physicalWindowTokens : undefined;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
@@ -1697,8 +1698,11 @@ export class Agent {
     return { noteRequestSent: (rows) => cm.noteRequestSent!(rows, identity, compileId) };
   }
 
-  /** The binding a compile of this agent is told of (bindingCompileOptions), and a preview of its context too: the
-   *  participant whose messages are its replies is its own name. Undefined where the model doesn't bind. */
+  /**
+   * The binding a compile of this agent is told of (bindingCompileOptions), and a preview of its context too: the
+   * participant whose messages are its replies is its own name. Undefined where the model doesn't bind.
+   * @internal For the framework's preview and its budget rule; not a host API.
+   */
   thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }

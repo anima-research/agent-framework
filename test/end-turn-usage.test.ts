@@ -529,8 +529,9 @@ describe('an agent whose model binds its thinking, with its window size set, tak
     ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, false],
     ['binds, with no window size: the budget restart, as before', { thinkingBinding: { binds: true } }, true],
     ['a window size, without binds: the budget restart, as before', { physicalWindowTokens: huge }, true],
-    // A config read from JSON can hold null, which the window projection reads as no window.
+    // A window size that isn't a finite number reads as none: a config read from JSON can hold null.
     ['binds, with a null window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: null as unknown as number }, true],
+    ['binds, with an infinite window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: Infinity }, true],
   ] as const) {
     it(label, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'af-binds-budget-'));

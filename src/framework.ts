@@ -12542,7 +12542,7 @@ export class AgentFramework {
           // reasoning out of the request mid-step. The window projection below still breaks the stream before a
           // request the window can't hold (issue #92).
           const overBudget = currentState.stream
-            && !(agent.thinkingBinds && typeof agent.physicalWindowTokens === 'number')
+            && !(agent.thinkingBindingOption() !== undefined && agent.physicalWindowTokens !== undefined)
             && agent.lastStreamInputTokens > 0
             && agent.lastStreamInputTokens > agent.maxStreamTokens;
 
