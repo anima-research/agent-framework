@@ -1299,7 +1299,8 @@ export interface ChannelIncomingMessageResult {
  * Non-normative; host-defined. See Spec Section 11.5.
  */
 export interface InferenceRoutingPolicy {
-  /** Default model for all inference requests */
+  /** Model for a request no override, byFeature or wildcards entry names a
+   *  model for. Left empty, such a request is refused with -32603. */
   default: string;
 
   /** Model override per feature set name */

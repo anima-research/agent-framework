@@ -489,6 +489,12 @@ export class ApiServer {
     if (!params.participant || !params.content) {
       throw new Error('participant and content are required');
     }
+    // ApiModule stores the message as one text block, which context-manager
+    // refuses unless its text is a string, so content that isn't text is
+    // refused here, where the caller hears it, rather than at dispatch.
+    if (typeof params.content !== 'string') {
+      throw new Error('content must be text');
+    }
 
     // Push api:message event for the ApiModule to handle
     this.framework.pushEvent({

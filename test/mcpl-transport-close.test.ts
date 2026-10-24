@@ -26,6 +26,10 @@ import { McplTransport, StdioTransport, type TransportCloseInfo } from '../src/m
 import { McplRequestError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { AgentFramework } from '../src/framework.js';
+import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
+import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
+import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
 function deferred() {
   let resolve!: () => void;
@@ -412,6 +416,72 @@ test("the framework's mcpl:server-closed trace carries the transport's reason, a
     { code: 4001, signal: null, reason: null },
     { code: null, signal: null, reason: null },
   ]);
+});
+
+test("the framework's close handler withdraws the closed transport's channel confirmations first, before anything else it does", () => {
+  const framework = Object.create(AgentFramework.prototype) as {
+    traceListeners: unknown[];
+    channelRegistry: unknown;
+    featureSetManager: unknown;
+    noteMcplServerClosed(id: string): void;
+    dropMcplToolClasses(id: string): void;
+    onTrace(listener: (event: Record<string, unknown>) => void): void;
+    wireMcplEvents(connection: unknown, config: unknown): void;
+  };
+  framework.traceListeners = [];
+  const order: string[] = [];
+  framework.channelRegistry = { transportClosed: (id: string) => { order.push(`transportClosed ${id}`); } };
+  framework.featureSetManager = { removeServer: (id: string) => { order.push(`removeServer ${id}`); } };
+  framework.noteMcplServerClosed = (id) => { order.push(`noteMcplServerClosed ${id}`); };
+  framework.dropMcplToolClasses = (id) => { order.push(`dropMcplToolClasses ${id}`); };
+  framework.onTrace((event) => { order.push(`trace ${String(event.type)}`); });
+  const connection = Object.assign(new EventEmitter(), { id: 'srv', willReconnect: true });
+  framework.wireMcplEvents(connection, { id: 'srv' });
+  // emit() runs the listener synchronously: what it did is done when emit returns
+  connection.emit('close', null, null);
+  assert.deepEqual(order, [
+    'transportClosed srv', 'removeServer srv', 'noteMcplServerClosed srv', 'dropMcplToolClasses srv',
+    'trace mcpl:server-closed', 'trace module:removed',
+  ]);
+});
+
+test("after a transport closes and reconnects, channel_open asks the server again rather than answering already open", async () => {
+  const sent: string[] = [];
+  const connection = Object.assign(new EventEmitter(), {
+    id: 'srv',
+    transportEpoch: 0,
+    willReconnect: true,
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+    sendChannelsOpen: async (params: { channelId: string }) => {
+      sent.push(`open ${params.channelId} on transport ${connection.transportEpoch}`);
+      return { channel: { id: params.channelId, type: 'test', label: params.channelId, direction: 'bidirectional' as const, address: { value: 'a' } } };
+    },
+    sendChannelsClose: async (params: { channelId: string }) => { sent.push(`close ${params.channelId}`); return { closed: true }; },
+  });
+  const servers = { getServer: (id: string) => (id === 'srv' ? connection : null) } as unknown as McplServerRegistry;
+  const registry = new ChannelRegistry(servers, {} as FeatureSetManager, () => {}, () => {});
+  const framework = Object.create(AgentFramework.prototype) as {
+    traceListeners: unknown[];
+    channelRegistry: ChannelRegistry;
+    wireMcplEvents(connection: unknown, config: unknown): void;
+  };
+  framework.traceListeners = [];
+  framework.channelRegistry = registry;
+  framework.wireMcplEvents(connection, { id: 'srv' });
+  const open = async () => ((await registry.handleChannelToolCall('channel_open', { serverId: 'srv', channelId: 'x' })).data ?? {}) as { status?: string };
+
+  await registry.handleRegister('srv', { channels: [{ id: 'x', type: 'test', label: 'x', direction: 'bidirectional', address: { value: 'a' } }] });
+  assert.equal((await open()).status, 'opened');
+  // The transport drops, and the connection reconnects in place on a new
+  // transport; the server hasn't registered its channels again yet.
+  connection.transportEpoch++;
+  connection.emit('close', null, null, { transport: 'stdio', code: null, signal: null, byHost: false });
+  assert.equal(registry.isChannelOpen({ serverId: 'srv', channelId: 'x' }), false, "the closed transport's confirmation went with it");
+  connection.transportEpoch++;
+  sent.length = 0;
+  assert.notEqual((await open()).status, 'already open');
+  assert.deepEqual(sent, ['open x on transport 2'], 'the open goes to the new transport');
+  assert.equal(registry.isChannelOpen({ serverId: 'srv', channelId: 'x' }), true, "the new transport's receipt confirms it");
 });
 
 test("a server that stops reading its stdin without closing it stays connected, and a request ends at its own timeout", { timeout: 20_000 }, async (t) => {

@@ -46,6 +46,8 @@ function cancelWith(opts: { backlogCap?: number; room?: number; source?: string;
       params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap ?? 20, maxWakes: 3, startedAtSequence: 0 },
       wakeCount: 0,
     }),
+    // The dump names its channel as the resident is shown it: here its id.
+    nameShown: (channel: { channelId: string }) => channel.channelId,
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {

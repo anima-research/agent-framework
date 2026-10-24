@@ -154,9 +154,9 @@ async function run(enabled?: boolean, allowedTools?: string[]) {
   const routed: string[] = [];
   const outgoing: string[] = [];
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:test',
-    routeSpeech: async (_agent: string, speech: string, channelId: string) => {
-      routed.push(speech); return { delivered: true, channelId: 'world:test' };
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+    routeSpeech: async (_agent: string, speech: string, _to: { serverId: string; channelId: string }) => {
+      routed.push(speech); return { delivered: true, serverId: 'stub', channelId: 'world:test' };
     },
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
@@ -234,8 +234,8 @@ describe('tool wrapper prose guard integration', () => {
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [module],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string, channelId: string) => {
-        routed.push(text); return { delivered: true, channelId: 'world:test' };
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string, _to: { serverId: string; channelId: string }) => {
+        routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' };
       },
       sendOutgoingChunk: (_c: string, _a: string, _id: string, _i: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
@@ -254,7 +254,7 @@ describe('tool wrapper prose guard integration', () => {
     const module = new HeartbeatModule(); const membrane = new ToolThenFrameworkRetryMembrane(); const routed: string[] = [];
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [module] });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' }; },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'test:channel' } } as unknown as ProcessEvent); await framework.runUntilIdle();
@@ -273,7 +273,7 @@ describe('tool wrapper prose guard integration', () => {
     ]);
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', maxStreamTokens: 1, toolWrapperProseGuard: true }], modules: [module] });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' }; },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'test:channel' } } as unknown as ProcessEvent); await framework.runUntilIdle();
@@ -293,9 +293,9 @@ describe('tool wrapper prose guard integration', () => {
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [new HeartbeatModule()],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      routeSpeech: async (_agent: string, text: string, channelId: string) => {
-        routed.push(text); return { delivered: true, channelId: 'world:test' };
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      routeSpeech: async (_agent: string, text: string, _to: { serverId: string; channelId: string }) => {
+        routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' };
       },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
@@ -328,7 +328,7 @@ describe('tool wrapper prose guard integration', () => {
       modules: [module],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' }; },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
@@ -496,16 +496,16 @@ describe('tool wrapper prose guard integration', () => {
     const typing: string[] = [];
     const outgoing: Array<[string, string]> = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      startTyping: (channel: string) => typing.push(`start:${channel}`),
-      stopTyping: (channel?: string) => typing.push(`stop:${channel ?? '(all)'}`),
-      routeSpeech: async (_agent: string, text: string, channelId: string) => {
-        return { delivered: true, channelId: 'world:test' };
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      startTyping: (channel: { channelId: string }) => typing.push(`start:${channel.channelId}`),
+      stopTyping: (channel?: { channelId: string }) => typing.push(`stop:${channel?.channelId ?? '(all)'}`),
+      routeSpeech: async (_agent: string, text: string, _to: { serverId: string; channelId: string }) => {
+        return { delivered: true, serverId: 'stub', channelId: 'world:test' };
       },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => outgoing.push(['chunk', delta]),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => outgoing.push(['complete', text]),
-      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
-      resolveProseTarget: () => ({ channelId: 'world:test' }),
+      getDefaultPublishChannel: () => ({ serverId: 'stub', channelId: 'world:test' }), isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      resolveProseTarget: () => ({ serverId: 'stub', channelId: 'world:test' }),
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     const created = await framework.createEphemeralAgent({ name: 'ephemeral-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
@@ -532,16 +532,16 @@ describe('tool wrapper prose guard integration', () => {
       agents: [{ name: 'trunk', model: 'test', systemPrompt: 'sys' }], modules: [],
       conversations: { templateAgent: 'trunk', bind: { channel: 'mention' } },
     });
-    const internals = framework as unknown as { store: Record<PropertyKey, unknown>; createConversationAgent(name: string, channelId: string): Promise<{ name: string }> };
+    const internals = framework as unknown as { store: Record<PropertyKey, unknown>; createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ name: string }> };
     const goodStore = internals.store;
     internals.store = new Proxy(goodStore, { get(target, prop) {
       if (prop === 'getMessages' || prop === 'appendMessage' || prop === 'getStateJson') throw new Error('transient store failure');
       const value = Reflect.get(target, prop);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    await assert.rejects(internals.createConversationAgent('trunk-chan-g1', 'world:chan'), /transient store failure/);
+    await assert.rejects(internals.createConversationAgent('trunk-chan-g1', { serverId: 'stub', channelId: 'world:chan' }), /transient store failure/);
     internals.store = goodStore;
-    const retried = await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
+    const retried = await internals.createConversationAgent('trunk-chan-g1', { serverId: 'stub', channelId: 'world:chan' });
     assert.equal(retried.name, 'trunk-chan-g1');
     await framework.stop();
   });
@@ -553,16 +553,16 @@ describe('tool wrapper prose guard integration', () => {
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [], modules: [] });
     const events: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      startTyping: (channel: string) => events.push(`start:${channel}`),
-      stopTyping: (channel?: string) => events.push(`stop:${channel ?? '(all)'}`),
-      routeSpeech: async (_agent: string, text: string, channelId: string) => {
-        return { delivered: true, channelId: 'world:test' };
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      startTyping: (channel: { channelId: string }) => events.push(`start:${channel.channelId}`),
+      stopTyping: (channel?: { channelId: string }) => events.push(`stop:${channel?.channelId ?? '(all)'}`),
+      routeSpeech: async (_agent: string, text: string, _to: { serverId: string; channelId: string }) => {
+        return { delivered: true, serverId: 'stub', channelId: 'world:test' };
       },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => events.push(`chunk:${delta}`),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => events.push(`complete:${text}`),
-      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
-      resolveProseTarget: () => ({ channelId: 'world:test' }),
+      getDefaultPublishChannel: () => ({ serverId: 'stub', channelId: 'world:test' }), isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      resolveProseTarget: () => ({ serverId: 'stub', channelId: 'world:test' }),
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     const created = await framework.createEphemeralAgent({ name: 'idle-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);

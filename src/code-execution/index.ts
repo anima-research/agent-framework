@@ -1,21 +1,9 @@
 /**
- * Client-side programmatic tool calling (PTC) for the connectome native stack.
- *
- * Mirrors the surface Anthropic's server-side PTC was trained on
- * (code_execution tool + tools exposed as async python functions), but runs
- * the interpreter on the host and dispatches inner tool calls in-process
- * through the framework's own tool routing — intermediate results never
- * enter the model's context; the full trace stays on-box.
+ * Client-side programmatic tool calling (`code_execution`): an agent's
+ * scripts call its other tools in-process through the framework's own tool
+ * routing, so intermediate results never enter the model's context. Each
+ * script runs in a process of its own, in QuickJS compiled to WebAssembly
+ * (engine.ts), and reaches nothing but the agent's tools.
  */
 
-export { PyRunner, buildInjectedTools } from './py-runner.js';
-export type {
-  InjectedTool,
-  ExecResult,
-  PyRunnerOptions,
-  ScriptToolCallHandler,
-  ScriptToolResult,
-  BackgroundExecOptions,
-} from './py-runner.js';
-export { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
 export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './tool-definition.js';

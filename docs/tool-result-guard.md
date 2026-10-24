@@ -159,7 +159,9 @@ exchange, its unsubmitted payload is not admitted to memory.
 Each withheld result's original is written, as the result was stored (its
 text; for a result over the inline cap, its capped text, whose own note names
 the file with the whole output), to a file under the `tool-results/`
-directory of the first writable mount without an include, named
+directory of the first writable mount without an include that isn't
+configured direct (a direct mount's directory is a checkout, whether it runs
+direct or as 'chronicle'), named
 `<date>-withheld-<batch>-<index>-<toolUseId>.txt` with any character outside
 `A-Za-z0-9._-` replaced and the name cut to 80 characters. Its stub names it:
 
@@ -168,7 +170,7 @@ directory of the first writable mount without an include, named
 
 Otherwise the stub names the guard's audit record, for an operator:
 
-- with no writable mount without an include, or once the framework is
+- with no writable mount without an include that isn't configured direct, or once the framework is
   stopping: "Its result is kept in the guard's audit record
   (framework/tool-result-guard), for an operator.";
 - when the write failed: "Writing its result to workspace file … failed, so it
@@ -224,7 +226,7 @@ Two audit records describe it, each with `batchId`, `messageId` and
   `{ toolUseId, path }` is a written file; with `error`, a failed write; with
   `unfinished: true`, a write still under way at the deadline. `{ toolUseId,
   error }` is a write that threw. `{ toolUseId, skipped }` is no write:
-  `no_workspace_file` (no writable mount without an include, or the framework
+  `no_workspace_file` (no writable mount without an include that isn't configured direct, or the framework
   was stopping), `workspace_unanswered` (an earlier write was still under way past its
   deadline), `batch_deadline` (the batch had no time left to start another write), or `branch_changed` (the workspace declined the write before its tree entry was set).
 

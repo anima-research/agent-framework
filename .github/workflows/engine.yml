@@ -1,0 +1,52 @@
+name: Engine
+
+# code_execution's engine module, src/code-execution/quickjs.wasm, is committed beside what it's
+# built from: engine/build.sh, which fetches the pinned quickjs-ng release and applies the patches
+# in engine/patches, and engine/interface.c, built with a pinned toolchain. This rebuilds the
+# module and fails unless the bytes are the committed ones, so the module can't drift from its
+# sources in either direction. It runs only when one of them changes, since the toolchain is a
+# 143 MB download.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'engine/**'
+      - 'src/code-execution/quickjs.wasm'
+      - '.github/workflows/engine.yml'
+  pull_request:
+    paths:
+      - 'engine/**'
+      - 'src/code-execution/quickjs.wasm'
+      - '.github/workflows/engine.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    name: The committed engine module is what its sources build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # binaryen's wasm-opt comes from npm and runs under Node.
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Rebuild the module
+        run: engine/build.sh "$RUNNER_TEMP/quickjs.wasm"
+
+      - name: Compare it with the committed module
+        run: |
+          sha256sum "$RUNNER_TEMP/quickjs.wasm" src/code-execution/quickjs.wasm
+          if ! cmp -s "$RUNNER_TEMP/quickjs.wasm" src/code-execution/quickjs.wasm; then
+            echo "::error::src/code-execution/quickjs.wasm isn't what engine/build.sh builds from these sources. Rebuild it with engine/build.sh and commit it with them."
+            exit 1
+          fi

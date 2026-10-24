@@ -733,7 +733,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   if (binding.family === 'modern') {
     if (timeout !== undefined && !(Number.isInteger(timeout) && timeout >= 1 && timeout <= MAX_TIMER_MS)) {
       problems.push(
-        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${String(timeout)}); every modern call has a deadline`,
+        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${asText(timeout)}); every modern call has a deadline`,
       );
     }
     for (const path of mcplPolicyGrants(config)) {

@@ -17,8 +17,12 @@
  * What gets embedded per message: text blocks verbatim, plus the string
  * arguments of the agent's private-prose tools (think / journal / skip_reply
  * / private_note) labelled `[think] …` — that is the resident's own diary and
- * is exactly what "what did I think about X" should find. tool_result
- * payloads, other tool arguments, thinking blocks and media are skipped.
+ * is exactly what "what did I think about X" should find. The message
+ * argument of the send tools and edit_message, labelled by tool, such as
+ * `[send_message] …`, since with prose routing disabled the resident speaks
+ * through them.
+ * tool_result payloads, other tool arguments, thinking blocks and media are
+ * skipped.
  *
  * Failure posture: the service being down never breaks the module. Sync ticks
  * log and back off; `semantic_search` returns a clean tool error.
@@ -27,6 +31,7 @@
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { safeSlice } from '../../safe-slice.js';
+import { SEND_TOOLS, bareToolName } from '../../send-tools.js';
 
 export interface SemanticIndexConfig {
   /** Base URL of the embed-service, e.g. `http://100.90.161.34:8804`. */
@@ -106,6 +111,12 @@ export interface SearchResponse {
 }
 
 const PRIVATE_PROSE_TOOLS = new Set(['think', 'journal', 'skip_reply', 'private_note']);
+/**
+ * Tools whose message argument is what the resident said: the send tools,
+ * and edit_message, whose argument is the new text of a message it sent.
+ * With prose routing disabled the resident speaks through these.
+ */
+const SPEECH_TOOLS = new Set([...SEND_TOOLS, 'edit_message']);
 
 /**
  * The semantic index service's failure, said of the service alone: it didn't
@@ -271,6 +282,12 @@ export function messageIndexText(msg: StoredMessage, includePrivateTools = true)
       for (const v of Object.values(input)) {
         if (typeof v === 'string' && v.trim().length > 0) parts.push(`[${block.name}] ${v}`);
       }
+    } else if (block.type === 'tool_use' && SPEECH_TOOLS.has(bareToolName(block.name))) {
+      // Only the message: the other arguments are ids, topics and names.
+      // channel_publish still takes `text` from older callers.
+      const input = (block as { input?: { content?: unknown; text?: unknown } }).input ?? {};
+      const v = input.content ?? input.text;
+      if (typeof v === 'string' && v.trim().length > 0) parts.push(`[${bareToolName(block.name)}] ${v}`);
     }
   }
   return parts.join('\n').trim();

@@ -7,7 +7,7 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -162,7 +162,7 @@ function call(m: WorkspaceModule, name: string, input: Record<string, unknown> =
 async function data<T = Record<string, unknown>>(m: WorkspaceModule, name: string, input: Record<string, unknown> = {}): Promise<T> {
   const result = await call(m, name, input);
   assert.equal(result.success, true, `${name} ${JSON.stringify(input)}: ${result.error}`);
-  return result.data as T;
+  return (result.structured ?? result.data) as T;
 }
 
 async function failure(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<string> {
@@ -398,7 +398,7 @@ test("a direct mount's read loads none of a file over the size limit and grep on
   const read = await countingLoads(() => call(m, 'read', { path: 'ref/huge.txt' }));
   assert.deepEqual([read.result.error, read.loaded], [over('ref/huge.txt'), 0]);
   const grep = await countingLoads(() => call(m, 'grep', { pattern: 'y', path: 'ref/huge.txt' }));
-  assert.deepEqual((grep.result.data as { skipped: unknown[] }).skipped, [{ file: 'ref/huge.txt', reason: 'over the size limit (10 bytes)', size: 100_000 }]);
+  assert.deepEqual((grep.result.structured as { skipped: unknown[] }).skipped, [{ file: 'ref/huge.txt', reason: 'over the size limit (10 bytes)', size: 100_000 }]);
   assert.equal(grep.loaded, 8192);
   // Grown past it after its open's fstat: no more than the limit and a byte.
   const grows = join(env.ref, 'grows.txt');
@@ -409,7 +409,7 @@ test("a direct mount's read loads none of a file over the size limit and grep on
   writeFileSync(grows, 'x'.repeat(8));
   const grownGrep = await changedAfterFstat(grows, () => appendFileSync(grows, 'x'.repeat(1000)),
     () => countingLoads(() => call(m, 'grep', { pattern: 'x', path: 'ref/grows.txt' })));
-  assert.deepEqual((grownGrep.result.data as { skipped: unknown[] }).skipped, [{ file: 'ref/grows.txt', reason: 'over the size limit (10 bytes)', size: 1008 }]);
+  assert.deepEqual((grownGrep.result.structured as { skipped: unknown[] }).skipped, [{ file: 'ref/grows.txt', reason: 'over the size limit (10 bytes)', size: 1008 }]);
   assert.ok(grownGrep.loaded <= 11, `loaded ${grownGrep.loaded}`);
 });
 
@@ -419,7 +419,7 @@ test("a direct mount's read and grep say so where reading a file fails", async (
   const m = await env.open();
   const failing = { read: () => async function () { throw Object.assign(new Error('EIO: i/o error, read'), { code: 'EIO' }); } };
   assert.equal((await withFileHandle(failing, () => call(m, 'read', { path: 'ref/a.txt' }))).error, 'Unable to read file: ref/a.txt (EIO)');
-  assert.deepEqual((await withFileHandle(failing, () => call(m, 'grep', { pattern: 'needle' }))).data, {
+  assert.deepEqual((await withFileHandle(failing, () => call(m, 'grep', { pattern: 'needle' }))).structured, {
     pattern: 'needle',
     results: [],
     totalMatches: 0,
@@ -666,7 +666,7 @@ test("a direct mount takes each spelling of a path as a 'chronicle' mount does",
  */
 function alike(result: ToolResult): unknown {
   if (!result.success) return { refused: true };
-  const d = result.data as Record<string, any>;
+  const d = (result.structured ?? result.data) as Record<string, any>;
   if (Array.isArray(d)) return { text: d[0].text.split('\n')[0] };
   return {
     path: d.path,
@@ -1204,7 +1204,7 @@ test("a mount configured beneath a moved direct root is nested beneath a directo
   });
   const fromStart = await answers(started);
   assert.match(fromStart.read.error ?? '', /lies in mount "work", nested in mount "ref"/);
-  assert.equal((fromStart.own.data as { content: string }).content, '     1\tb own');
+  assert.equal((fromStart.own.structured as { content: string }).content, '     1\tb own');
   assert.deepEqual(await answers(moved), fromStart);
 });
 
@@ -1229,7 +1229,7 @@ test("a direct root moved to a directory beneath its own configured path nests n
     nested: await call(m, 'read', { path: 'ref/sub/work/x.txt' }),
   });
   const fromStart = await answers(started);
-  assert.equal((fromStart.own.data as { content: string }).content, '     1\tsub own');
+  assert.equal((fromStart.own.structured as { content: string }).content, '     1\tsub own');
   assert.match(fromStart.nested.error ?? '', /lies in mount "work", nested in mount "ref"/);
   assert.deepEqual(await answers(moved), fromStart);
 });
@@ -1282,7 +1282,7 @@ test("a mount configured at a moved direct root's own path is nested nowhere in 
     disk: await m.readFileFromDisk('ref/sub/f.txt').then(() => 'read', (err: unknown) => (err instanceof WorkspaceReadError ? err.code : String(err))),
   });
   const fromStart = await answers(started);
-  assert.equal((fromStart.read.data as { content: string }).content, '     1\tsub f');
+  assert.equal((fromStart.read.structured as { content: string }).content, '     1\tsub f');
   assert.equal(fromStart.disk, 'read');
   assert.deepEqual(await answers(moved), fromStart);
 });
@@ -1830,8 +1830,6 @@ test('a direct mount whose config sets what would never act there is refused, na
     assert.fail(`accepted ${JSON.stringify(mount)}`);
   };
   const lead = '[workspace] Mount "ref" is direct, which reads disk as it is with no store, watcher or push: ';
-  assert.equal(refused({ mode: 'read-write' }), `${lead}mode must be 'read-only', not "read-write"`);
-  assert.equal(refused({ mode: undefined }), `${lead}mode must be 'read-only' (left out, it's 'read-write')`);
   assert.equal(refused({ watch: 'always' }), `${lead}watch "always" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watch: 'on-agent-action' }), `${lead}watch "on-agent-action" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watchDebounceMs: 100 }), `${lead}watchDebounceMs would tune no watcher (leave it out)`);
@@ -1840,11 +1838,12 @@ test('a direct mount whose config sets what would never act there is refused, na
   assert.equal(refused({ wakeOnChange: ['created'] }), `${lead}wakeOnChange would never wake (leave it out)`);
   assert.equal(refused({ autoMaterialize: true }), `${lead}autoMaterialize would never push (leave it out)`);
   assert.equal(
-    refused({ mode: 'read-write', autoMaterialize: true }),
-    `${lead}mode must be 'read-only', not "read-write"; autoMaterialize would never push (leave it out)`,
+    refused({ mode: 'read-write', watch: 'always', autoMaterialize: true }),
+    `${lead}watch "always" would watch nothing (leave it out, or set 'never'); autoMaterialize would never push (leave it out)`,
   );
-  for (const accepted of [{}, { watch: 'never' as const }, { wakeOnChange: false }, { wakeOnChange: [] }, { autoMaterialize: false }]) {
-    new WorkspaceModule({ mounts: [{ ...base, ...accepted }] });
+  // Either mode is a direct mount's own, and one that names none writes, as any mount does.
+  for (const accepted of [{}, { mode: 'read-write' as const }, { mode: undefined }, { watch: 'never' as const }, { wakeOnChange: false }, { wakeOnChange: [] }, { autoMaterialize: false }]) {
+    new WorkspaceModule({ mounts: [{ ...base, ...accepted } as MountConfig] });
   }
   assert.throws(
     () => new WorkspaceModule({ mounts: [{ ...base, backend: 'disk' as MountConfig['backend'] }] }),
@@ -1893,8 +1892,8 @@ test("a mount the store holds changes on that disk lacks runs as 'chronicle', sa
   const held = await env.open({ walkCap: 1 });
   warned.mock.restore();
   const message = "A mount configured direct runs as 'chronicle' this session. To start it direct, settle each held change, then "
-    + "start it again: sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, materialize it, "
-    + "follow the answer, and restore its direct config. "
+    + "start it again: sync its path to take disk's copy, or materialize it by name, a read-only one configured read-write "
+    + "first, and follow the answer. Meanwhile it takes no writes. "
     + 'Mount "ref" holds 4 changes that disk lacks: "ref/both.ts" (in conflict), "ref/deleted.ts" (deleted in the workspace), '
     + '"ref/dot.img" (in conflict), "ref/drafted.ts" (changed in the workspace).';
   assert.deepEqual(env.alerts, [{ kind: 'workspace-mount-not-direct', agent: 'framework', message, data: { held: { ref: 4 } } }]);
@@ -1960,7 +1959,7 @@ test("the ways out say to sync the path of an intent it can't read, where one is
   const chronicle = await env.openChronicle();
   for (let i = 0; i < 11; i++) await data(chronicle, 'write', { path: `ref/d${String(i).padStart(2, '0')}.ts`, content: `${i}\n` });
   await env.close(chronicle);
-  const sentence = "and restore its direct config. Sync the path of an intent it can't read. Mount \"ref\" holds";
+  const sentence = "Meanwhile it takes no writes. Sync the path of an intent it can't read. Mount \"ref\" holds";
 
   await env.close(await env.open());
   assert.ok(!env.alerts[0]!.message.includes('Sync the path'), env.alerts[0]!.message);
@@ -2075,8 +2074,8 @@ test('mounts configured direct that the store holds changes on are named in one 
   const both = await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
   assert.equal(env.alerts.length, 1);
   assert.equal(env.alerts[0]!.message, "Mounts configured direct run as 'chronicle' this session. To start a mount direct, settle each change "
-    + "held at it, then start it again: sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, "
-    + "materialize it, follow the answer, and restore its direct config. "
+    + "held at it, then start it again: sync its path to take disk's copy, or materialize it by name, a read-only one "
+    + "configured read-write first, and follow the answer. Meanwhile it takes no writes. "
     + 'Mounts "ref" (1 change that disk lacks) and "other" (2 changes that disk lacks) hold: "ref/a.ts" (changed in the workspace), '
     + '"other/b.ts" (changed in the workspace), "other/c.ts" (changed in the workspace).');
   assert.deepEqual(env.alerts[0]!.data, { held: { ref: 1, other: 2 } });
@@ -2275,6 +2274,69 @@ test("a mount configured direct with no ignore list walks by the direct kind's d
   assert.deepEqual(env.store.treeList('workspace/ref/tree').map((e) => e.path).sort(), ['drafted.ts', 'src/a.ts']);
 });
 
+test("a mount configured direct that runs as 'chronicle' is still direct to getMounts, and its agents' saved positions still give the notice", async (t) => {
+  const env = new Env(t);
+  // A direct session's scout position, saved at its stop, on a branch gone since.
+  const direct = await env.open({ mode: 'read-write' });
+  (direct as unknown as { directHeads: Map<string, Map<string, unknown>> }).directHeads.set('ref', new Map([['scout', { branchId: 'zz-a-branch-gone-since', after: 1, notice: null }]]));
+  await env.close(direct);
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+  // Naming no mode, so it's writable.
+  const m = await env.open({ mode: undefined });
+  assert.equal(env.alerts.length, 1, "it runs as 'chronicle'");
+  // Its directory is a checkout either way, so the framework's files pass over it.
+  assert.equal(m.getMounts()[0]?.backend, 'direct');
+  // And status gives its mode as writable, as when it runs direct.
+  const status = (await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!;
+  assert.deepEqual([status.mode, status.backend], ['read-write', 'chronicle']);
+  // And the writes the scout made while it ran direct are on disk.
+  assert.deepEqual(m.headMoveNotice('scout')?.mounts, ['ref']);
+  await env.close(m);
+  // A mode it names is given as named, and a store-backed mount naming none shows none, as on main.
+  const named = await env.open({ mode: 'read-only' });
+  const namedStatus = (await data<Record<string, Record<string, unknown>>>(named, 'status')).ref!;
+  assert.deepEqual([namedStatus.mode, namedStatus.backend], ['read-only', 'chronicle']);
+  await env.close(named);
+  const plain = await env.open({ backend: 'chronicle', mode: undefined, watch: 'never' });
+  assert.equal((await data<Record<string, Record<string, unknown>>>(plain, 'status')).ref!.mode, undefined);
+});
+
+test("a writable mount configured direct that runs as 'chronicle' takes no writes, edits or deletions until what's held is settled, and a materialize naming it settles it", async (t) => {
+  const env = new Env(t);
+  env.file('kept.ts', 'disk\n');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+  const m = await env.open({ mode: undefined });
+  assert.equal(env.alerts.length, 1, "it runs as 'chronicle'");
+  const why = 'Mount "ref" is configured direct, and runs as \'chronicle\' this session because its start found the store holding changes there that disk lacks, '
+    + 'so it takes no writes this session, and calling again is refused the same way. To run it direct again, settle what\'s held '
+    + '(sync each held path to take disk\'s copy, or materialize mount "ref" by name to write the store\'s copies to disk), and the host\'s next start runs it direct';
+  // And getMounts gives it as read-only this session, so a caller choosing where to save passes over it.
+  assert.deepEqual(m.getMounts().map(({ name, mode, backend }) => ({ name, mode, backend })), [{ name: 'ref', mode: 'read-only', backend: 'direct' }]);
+  const pending = async () => (await data<Record<string, { pendingChanges: number }>>(m, 'status')).ref!.pendingChanges;
+  assert.equal(await pending(), 1);
+  assert.equal(await failure(m, 'write', { path: 'ref/new.ts', content: 'x\n' }), why);
+  assert.match(await failure(m, 'edit', { path: 'ref/kept.ts', oldString: 'disk', newString: 'edited' }), new RegExp(`${why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(await failure(m, 'edit_many', { edits: [{ path: 'ref/kept.ts', oldString: 'disk', newString: 'edited' }] }), new RegExp(`${why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.equal(await failure(m, 'delete', { path: 'ref/kept.ts' }), why);
+  assert.deepEqual(await m.writeBinary('ref/dot.img', Buffer.from('img'), 'image/png'), { success: false, isError: true, error: why });
+  // Nothing reached disk or the store, so what's held is as it was.
+  assert.equal(readFileSync(join(env.ref, 'kept.ts'), 'utf8'), 'disk\n');
+  assert.equal(existsSync(join(env.ref, 'new.ts')), false);
+  assert.equal(await pending(), 1);
+  // A materialize naming it writes the store's copy to disk, and the next start runs it direct.
+  await data(m, 'materialize', { mount: 'ref' });
+  assert.equal(readFileSync(join(env.ref, 'drafted.ts'), 'utf8'), 'draft\n');
+  await env.close(m);
+  const direct = await env.open({ mode: undefined });
+  assert.equal(env.alerts.length, 1, 'no new alert: it runs direct');
+  await data(direct, 'write', { path: 'ref/new.ts', content: 'x\n' });
+  assert.equal(readFileSync(join(env.ref, 'new.ts'), 'utf8'), 'x\n');
+});
+
 test("a mount that ran direct takes in what disk changed meanwhile when it runs as 'chronicle' again", async (t) => {
   const env = new Env(t);
   env.file('changed.ts', 'before\n');
@@ -2313,6 +2375,125 @@ test("a direct mount's listings pass over another mount's directory, naming the 
     incomplete: [{ path: 'inner', reason: 'it lies in mount "inner", nested in this one: use "inner"' }],
   });
   assert.match(await failure(m, 'read', { path: 'ref/inner/x.ts' }), /lies in mount "inner", nested in mount "ref"/);
+});
+
+test("a direct mount's read shows a file's text as a 'chronicle' mount's does: lines without a CRLF end's CR, no BOM, a long line cut, and each page held to the call's result limit, with the notes that say so", async (t) => {
+  const env = new Env(t);
+  env.file('crlf.txt', 'one\r\ntwo\r\n');
+  env.file('bom.txt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('first\n')]));
+  env.file('bad.txt', Buffer.from([0x61, 0xff, 0x62, 0x0a]));
+  env.file('mixed.txt', 'a\r\nb\nc\r\r\nd\n');
+  env.file('long.txt', `${'x'.repeat(60000)}\ny\n`);
+  env.file('big.txt', Array.from({ length: 3000 }, (_, i) => `line ${i + 1} of a file with fairly ordinary lines`).join('\n'));
+  // Each file read as a page of lines and as a page of characters, at a
+  // model's limit, at a small one, and with none, as an in-process call makes it.
+  const reads: Array<[Record<string, unknown>, number | undefined]> = [];
+  for (const path of ['crlf.txt', 'bom.txt', 'bad.txt', 'mixed.txt', 'long.txt', 'big.txt']) {
+    for (const cap of [24000, 1000, undefined]) {
+      reads.push([{ path: `ref/${path}` }, cap], [{ path: `ref/${path}`, offsetChars: 0, limitChars: 5000 }, cap]);
+    }
+  }
+  const answers = async (m: WorkspaceModule): Promise<Array<[Record<string, unknown>, number | undefined, Record<string, any>]>> => {
+    const out: Array<[Record<string, unknown>, number | undefined, Record<string, any>]> = [];
+    for (const [input, cap] of reads) {
+      const r = await m.handleToolCall({ id: 'read', name: 'read', input, ...(cap !== undefined ? { resultMaxChars: cap } : {}) });
+      // Every page a call with a result limit asked for fits it, as its text measures it.
+      const text = r.success ? (r.data as Array<{ text: string }>)[0]!.text : '';
+      if (cap !== undefined) assert.ok(text.length <= cap, `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}: ${text.length}`);
+      out.push([input, cap, r.success ? r.structured as Record<string, any> : { error: r.error }]);
+    }
+    return out;
+  };
+  const direct = await env.open();
+  const fromDisk = await answers(direct);
+  const page = (path: string, cap: number | undefined, chars = false) =>
+    fromDisk.find(([input, c]) => input.path === `ref/${path}` && c === cap && ('offsetChars' in input) === chars)![2];
+  assert.equal(page('crlf.txt', 24000).content, '     1\tone\n     2\ttwo');
+  assert.match(page('crlf.txt', 24000).note, /^Line ends are CRLF, shown without the CR\./);
+  assert.equal(page('bom.txt', 24000).content, '     1\tfirst');
+  assert.match(page('bom.txt', 24000).note, /BOM/);
+  assert.match(page('bad.txt', 24000).note, /isn't valid UTF-8/);
+  assert.equal(page('mixed.txt', 24000).content, '     1\ta\n     2\tb\n     3\tc\r\r\n     4\td');
+  assert.equal(page('long.txt', 24000).content, `     1\t${'x'.repeat(2000)} [… read the rest with offsetChars=2000 and limitChars=58000]\n     2\ty`);
+  // Every page a call asked for is a page.
+  for (const [input, cap, d] of fromDisk) {
+    const label = `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}`;
+    assert.equal(typeof d.content, 'string', `${label}: ${JSON.stringify(d).slice(0, 200)}`);
+  }
+  assert.ok(page('big.txt', 24000).toLine < 3000);
+  assert.equal(page('long.txt', undefined).content.length, '     1\t'.length + 60000 + '\n     2\ty'.length);
+  await env.close(direct);
+  // The same answers as a 'chronicle' mount's, whose first read of a file
+  // takes it in with nothing more to say of it.
+  assert.deepEqual(fromDisk, await answers(await env.openChronicle()));
+});
+
+test("a direct mount's grep matches lines as read shows them, as a 'chronicle' mount's grep does, with each file's lineEndings and the notes on a pattern for a CR or U+FEFF", async (t) => {
+  const env = new Env(t);
+  env.file('crlf.txt', 'alpha\r\nfoo\r\nomega\r\n');
+  env.file('mixed.txt', 'foo\r\nbar\n');
+  env.file('lf.txt', 'foo\n');
+  env.file('bom.txt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('foo\n')]));
+  env.file('both.txt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('x\r\n')]));
+  const calls: Array<Record<string, unknown>> = [
+    { pattern: '^foo$' },
+    { pattern: '\\r$', path: 'ref/crlf.txt' },
+    { pattern: '^\\uFEFF', path: 'ref/bom.txt' },
+    { pattern: '^\\uFEFF|\\r$', path: 'ref/both.txt' },
+    { pattern: '\\r', path: 'ref/lf.txt' },
+  ];
+  // A 'chronicle' mount labels each result with its path's state and the
+  // workspace's copy, a direct mount's with disk's file: the rest is the same,
+  // but for where the notes say read shows what lines leave out.
+  const answers = async (m: WorkspaceModule): Promise<Array<[Record<string, unknown>, Array<Record<string, unknown>>, string | null]>> => {
+    const out: Array<[Record<string, unknown>, Array<Record<string, unknown>>, string | null]> = [];
+    for (const input of calls) {
+      const d = await data<{ results: Array<Record<string, unknown>>; note?: string }>(m, 'grep', input);
+      out.push([input, d.results.map(({ state: _state, version: _version, ...rest }) => rest), d.note ?? null]);
+    }
+    return out;
+  };
+  const direct = await env.open();
+  const fromDisk = await answers(direct);
+  const byFile = Object.fromEntries(fromDisk[0]![1].map((r) => [r.file, r]));
+  assert.deepEqual(byFile['ref/crlf.txt'], { file: 'ref/crlf.txt', lineEndings: 'CRLF', matches: [{ line: 2, text: 'foo' }] });
+  assert.equal(byFile['ref/mixed.txt']!.lineEndings, 'mixed');
+  assert.deepEqual(byFile['ref/bom.txt'], { file: 'ref/bom.txt', matches: [{ line: 1, text: 'foo' }] });
+  assert.deepEqual(byFile['ref/lf.txt'], { file: 'ref/lf.txt', matches: [{ line: 1, text: 'foo' }] });
+  // Each note names the files searched that have what it's about.
+  const cr = (file: string) => `The pattern names a CR, and 1 file searched has CRLF line ends: ${file} (CRLF). Lines are matched as read shows them, `
+    + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy";
+  const bom = (file: string) => `The pattern names U+FEFF, and 1 file searched starts with a BOM: ${file}. Lines are matched as read shows them, `
+    + "and a BOM isn't part of the first line. read with offsetChars shows any BOM";
+  // On a host with a direct mount, which keeps no workspace copy, the notes
+  // name disk's file too; on a host with none, the workspace's copy alone.
+  const onDisk = ", or in disk's file on a direct mount.";
+  const notes = (crEnd: string, bomEnd: string) => [
+    `${cr('ref/crlf.txt')}${crEnd}`, `${bom('ref/bom.txt')}${bomEnd}`, `${cr('ref/both.txt')}${crEnd} ${bom('ref/both.txt')}${bomEnd}`, null];
+  assert.deepEqual(fromDisk.slice(1).map(([, results, note]) => [results.length, note]),
+    notes(onDisk, ` in the workspace's copy${onDisk}`).map((n) => [0, n]));
+  await env.close(direct);
+  const fromStore = await answers(await env.openChronicle());
+  assert.deepEqual(fromStore.map(([input, results]) => [input, results]), fromDisk.map(([input, results]) => [input, results]));
+  assert.deepEqual(fromStore.slice(1).map(([, , note]) => note), notes('.', " the workspace's copy has."));
+});
+
+test("on a host with a direct mount, grep's notes name disk's file too where the search was of a 'chronicle' mount beside it", async (t) => {
+  const env = new Env(t);
+  const work = join(env.root, 'work');
+  mkdirSync(work);
+  writeFileSync(join(work, 'crlf.txt'), 'alpha\r\nomega\r\n');
+  writeFileSync(join(work, 'bom.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('foo\n')]));
+  // The tools' descriptions mention direct mounts on this host, and so do
+  // the notes, whichever of its mounts a grep searched.
+  const m = await env.open({}, [{ name: 'work', path: work, mode: 'read-write', watch: 'never' }]);
+  const onDisk = ", or in disk's file on a direct mount.";
+  const cr = await data<{ results: unknown[]; note?: string }>(m, 'grep', { pattern: '\\r$', path: 'work/crlf.txt' });
+  assert.deepEqual(cr.results, []);
+  assert.ok(cr.note?.endsWith(`read with offsetChars shows every CR in the workspace's copy${onDisk}`), cr.note);
+  const bom = await data<{ results: unknown[]; note?: string }>(m, 'grep', { pattern: '^\\uFEFF', path: 'work/bom.txt' });
+  assert.deepEqual(bom.results, []);
+  assert.ok(bom.note?.endsWith(`read with offsetChars shows any BOM in the workspace's copy${onDisk}`), bom.note);
 });
 
 test('inOrder hands each result on in order, at most `width` at once', async () => {

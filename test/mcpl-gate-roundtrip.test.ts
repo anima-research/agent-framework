@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { EventGate } from '../src/gate/event-gate.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { PushHandler } from '../src/mcpl/push-handler.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { GateConfig } from '../src/gate/types.js';
@@ -48,7 +48,7 @@ function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unk
   // §14.5: incoming no longer mints unknown channels — seed what a
   // conforming server's channels/register would have created.
   for (const id of ['zulip:tracker-miner-f', 'zulip:other-channel']) {
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`zulip:${id}`, {
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'zulip', channelId: id }), {
       serverId: 'zulip', descriptor: { id, type: 'zulip', label: id }, open: false,
     });
   }
@@ -337,7 +337,7 @@ describe('ChannelRegistry durable lifecycle', () => {
     assert.deepStrictEqual(server.acks, [{
       channelId: 'discord:g1:c1', messageId: 'm1', intent: 'seen-not-opening', value: '👀',
     }]);
-    assert.strictEqual(registry.isChannelOpen('discord:g1:c1'), false);
+    assert.strictEqual(registry.isChannelOpen({ serverId: 'discord', channelId: 'discord:g1:c1' }), false);
   });
 
   it('requires serverId only when two MCPLs expose the same channel id', async () => {
@@ -364,7 +364,8 @@ describe('ChannelRegistry durable lifecycle', () => {
 
     const ambiguous = await registry.handleChannelToolCall('channel_open', { channelId: 'shared' });
     assert.strictEqual(ambiguous.success, false);
-    assert.match(ambiguous.error ?? '', /^Channel "shared" is on more than one server \("alpha", "beta"\), so nothing ran\./);
+    assert.equal(ambiguous.error, 'Channel "shared" is on more than one server ("alpha:shared", "beta:shared"), so nothing ran. ' +
+      'Call again with channelId set to one of them, or with serverId set to "alpha" or "beta".');
 
     const exact = await registry.handleChannelToolCall('channel_open', {
       channelId: 'shared', serverId: 'beta',

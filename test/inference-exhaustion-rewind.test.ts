@@ -203,8 +203,8 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   assert.ok(errs.some((e) => e.includes('nothing left to shed')));
 });
 
-// Anarchid's review of membrane #56 (M3): from #56 (in membrane 0.5.87, this
-// package's floor) one status table serves every adapter, so `invalid_request` also
+// Anarchid's review of membrane #56 (M3): from #56 (in membrane 0.5.87, below
+// this package's floor) one status table serves every adapter, so `invalid_request` also
 // reaches agent-framework for an Anthropic 404 (a model that doesn't exist),
 // which no shed can fix. With 0.5.86 the raw-fetch Responses adapter already
 // files every status it doesn't list as invalid_request. The breaker runs
@@ -318,7 +318,7 @@ test("a membrane error's type and status reach the gate through the exhausted tr
 });
 
 test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a context_length at 413, and nothing else', () => {
-  // Every membrane error type (0.5.87), the framework's own two, and none.
+  // Every membrane error type (0.6.0), the framework's own two, and none.
   const types = ['invalid_request', 'rate_limit', 'context_length', 'auth', 'server', 'network', 'timeout', 'abort',
     'safety', 'unsupported', 'unknown', 'over_budget', 'context_refusal', undefined];
   const statuses: Array<number | undefined> = [undefined];

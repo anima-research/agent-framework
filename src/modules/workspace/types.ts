@@ -20,24 +20,44 @@ export interface MountConfig {
    * Where the mount's tools get what they read (default: 'chronicle').
    * - 'chronicle': the workspace keeps the mount's files in its store, where
    *   writes and edits land first, and takes in disk's changes under the
-   *   three-way rule as its listings, searches, syncs and scans reach them.
-   *   A read of a path the store doesn't hold takes in a new file there;
-   *   otherwise it reads the store's copy.
-   * - 'direct': for a checkout an agent reads, not one it changes. Every
-   *   read, listing and search is disk's own copy as it is when it runs,
-   *   and none of its files go into the store. No scan or watcher
+   *   three-way rule as `read`, listings, searches, syncs and scans reach
+   *   them. Its tools read the store's copy.
+   * - 'direct': for a checkout, such as a git one, whose history is its
+   *   own. Every read, listing and search is disk's own copy as it is when
+   *   it runs, and none of its files go into the store. No scan or watcher
    *   runs, so no call waits behind one, and `sync`, `materialize` and the
-   *   watch settings have nothing to act on. Only with `mode: 'read-only'`,
-   *   and not with `watch` other than 'never', `watchDebounceMs`,
-   *   `watchRootPollMs`, a `wakeOnChange` that would wake (true, or a
-   *   non-empty list) or `autoMaterialize: true`: each of those would never
-   *   act, and the workspace refuses the mount. Its `ignore`
+   *   watch settings have nothing to act on. Not with `watch` other than
+   *   'never', `watchDebounceMs`, `watchRootPollMs`, a `wakeOnChange` that
+   *   would wake (true, or a non-empty list) or `autoMaterialize: true`:
+   *   each of those would never act, and the workspace refuses the mount.
+   *   Writable, as any mount with no `mode` is, its `write`, `edit`,
+   *   `edit_many` and `delete` land on disk when they answer, or don't
+   *   happen: a file is staged beside itself in `.workspace-staged-<id>` and
+   *   renamed over itself, keeping its mode, so no reader sees half of it;
+   *   an edit is applied to disk's text as it is now, and again on top of a
+   *   change another writer makes meanwhile; and `edit_many` checks every
+   *   edit before writing its files one by one, naming each file's outcome
+   *   if a write fails partway. A file with other hard links gets a file of
+   *   its own at its path, and the others keep the old text; a file this
+   *   process may not write is refused. Nothing is synced, so a power loss
+   *   can lose a write its answer called landed. An undo or other move of
+   *   the store's head leaves the files as they are, and at the agent's next
+   *   start the framework tells it once that writes from turns its history
+   *   no longer holds are still on disk. Where each agent's latest write
+   *   lies is saved at a clean stop, in a record no branch switch rewinds,
+   *   so a restart on another branch still tells it, and after a crash a
+   *   move away from the writes since then isn't told. The framework's own
+   *   files, its
+   *   tool-result spills, saved payloads and fetched references, never go to
+   *   a mount configured direct. Its `ignore`
    *   has a default (see there). Paths, links, its `include`, other mounts'
    *   directories, size limits and the walk cap hold as on a 'chronicle'
-   *   mount. Its tools read beneath whatever directory is at its
-   *   root, with no check against the one a 'chronicle' run of it last
-   *   agreed with. Where that root now lies elsewhere than the last start
-   *   placed it, each call nests in it, as a start would now, every mount
+   *   mount. Its tools read and write beneath whatever directory is at its
+   *   root when each call starts, with no check against the one a
+   *   'chronicle' run of it last agreed with, so a root repointed through a
+   *   link is read and written where it leads now. Where that root now lies
+   *   elsewhere than the last start placed it, each call nests in it, as a
+   *   start would now, every mount
    *   configured beneath its path, where that path leads beneath its root,
    *   and every other mount whose root, as that start placed it, lies
    *   beneath where its root lies now, or whose configured path lies
@@ -52,7 +72,10 @@ export interface MountConfig {
    * them pending, or an intent the workspace can't read, which may hold one
    * of those. They stay in view, and the workspace says so on stderr and
    * through the framework's ops alerts, naming them and the ways to start it
-   * direct. It runs unwatched, and walks by the direct kind's default
+   * direct. Until a start finds none held, it takes no writes, edits or
+   * deletions, so what's held only shrinks: a `sync` of a held path takes
+   * disk's copy, and a `materialize` naming the mount writes the store's.
+   * It runs unwatched, and walks by the direct kind's default
    * ignore list where its config names none; `ls` without a path, and
    * `status`, give its `backend` as 'chronicle' and that list. A mount that
    * ran direct and runs as 'chronicle' again takes in what disk changed
@@ -208,10 +231,10 @@ export interface MountConfig {
    * anything else checks the path, so every spelling that resolves to its
    * registered path reads it, and none writes it. On a disk that folds names,
    * a spelling in another case isn't its path, and reaches whatever file disk
-   * has there. The framework keeps its own files (`tool-results/`, `refs/`,
-   * `background-scripts/`) only in a writable mount without an include, and
-   * what it kept in a mount before the mount had one is outside the mount
-   * once it has one, unless the include covers it.
+   * has there. The framework keeps its own files (`tool-results/`, `refs/`)
+   * only in a writable mount without an include, and what it kept in a mount
+   * before the mount had one is outside the mount once it has one, unless the
+   * include covers it.
    *
    * Left out, the mount holds everything under its path. Given, it's a list
    * of at least one string, each a name, an `*.ext` glob or a `dir/**` glob,
@@ -259,8 +282,12 @@ export interface MountConfig {
    * `glob`, `grep`) take up to it from their scope's start every time:
    * `glob`'s is the directory its pattern's segments before the first
    * wildcard name beneath its `path`, and `grep`'s the deeper of its `path`
-   * and its `glob` filter's directory, as far as disk lists each segment
-   * with that spelling as a directory, not a link. Each directory's listing
+   * and its `glob` filter's directory. For a pattern or filter whose first
+   * segment names the mount, either tool starts at the deeper of its `path`
+   * and the directory the rest names from the mount's root, and walks
+   * nothing where neither holds the other. Either way, the walk descends as
+   * far as disk lists each segment with that spelling as a directory, not a
+   * link. Each directory's listing
    * is read whole, so a deletion is seen wherever the walk lists, whatever
    * it took.
    *
@@ -286,7 +313,8 @@ export interface MountConfig {
   /**
    * If true, writes/edits/deletes via the module's tools materialize to the
    * filesystem immediately (not just into Chronicle tree state). Required for
-   * any mount shared across agents as a communication channel — without it,
+   * any store-backed mount shared across agents as a communication channel (a
+   * direct mount's writes reach disk without it, and it's refused there) — without it,
    * another agent's watcher on the same directory sees nothing. The watcher
    * suppresses its own echoes, so this doesn't cause self-wake loops.
    */

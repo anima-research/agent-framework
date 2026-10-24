@@ -77,10 +77,11 @@ describe('surface provenance through the real scheduler', () => {
     const routed: Array<{ text: string; locus: string | null }> = [];
     i.pendingRequests.push({ agentName: 'scout', reason: 'mcpl:push-event', source: 'feeds', timestamp: Date.now() });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'discord:g:lounge',
-      routeSpeech: async (_agent: string, text: string, locus: string | null) => {
-        routed.push({ text, locus }); return { delivered: true, channelId: locus };
-      }, getDescriptor: () => undefined, getDefaultPublishChannel: () => 'discord:g:lounge',
+      getChannelTools: () => [], resolveLocus: () => ref(LOUNGE),
+      routeSpeech: async (_agent: string, text: string, locus: Ref | null) => {
+        routed.push({ text, locus: locus?.channelId ?? null }); return { delivered: true, serverId: 'discord', channelId: locus?.channelId };
+      }, getDescriptor: () => undefined, getDefaultPublishChannel: () => ref(LOUNGE),
+      channelsNamed: (id: string) => [ref(id)], nameShown: (r: Ref) => r.channelId,
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     framework.pushEvent({ type: 'external-message', source: 'tui', content: 'private question', metadata: {}, triggerInference: true });
     await framework.runUntilIdle();
@@ -273,6 +274,10 @@ describe('Turn trigger provenance', () => {
 // ---------------------------------------------------------------------------
 
 const ROOM = 'discord:g:room';
+const LOUNGE = 'discord:g:lounge';
+/** A channel with its server, as the registry names one. */
+type Ref = { serverId: string; channelId: string };
+const ref = (channelId: string): Ref => ({ serverId: 'discord', channelId });
 const tuiMessage = (content = 'private question') =>
   ({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true }) as never;
 
@@ -317,34 +322,36 @@ async function surfaceRig(opts: {
     return () => { routeGate = undefined; release(); };
   };
   const state = framework as unknown as {
-    turnRouting: Map<string, { nonChannelOrigin?: boolean; triggerChannel?: string; locus?: string; pin?: string }>;
+    turnRouting: Map<string, { nonChannelOrigin?: boolean; triggerChannel?: Ref; locus?: Ref; pin?: Ref }>;
     openLogical: Map<string, unknown>;
     channelRegistry: unknown;
   };
   state.channelRegistry = new Proxy({
     getChannelTools: () => [],
-    resolveLocus: (agentName: string) => state.turnRouting.get(agentName)?.triggerChannel ?? 'discord:g:lounge',
-    routeSpeech: async (_agent: string, text: string, locus: string | null) => {
+    resolveLocus: (agentName: string) => state.turnRouting.get(agentName)?.triggerChannel ?? ref(LOUNGE),
+    routeSpeech: async (_agent: string, text: string, locus: Ref | null) => {
       if (routeGate) await routeGate;
-      routed.push({ text, locus }); return { delivered: true, channelId: locus };
+      routed.push({ text, locus: locus?.channelId ?? null }); return { delivered: true, serverId: 'discord', channelId: locus?.channelId };
     },
     // A named or sticky destination posts through deliverSpeech, which
     // reports the post's outcome, as the real registry does.
-    deliverSpeech: async (_agent: string, text: string, channelId: string) => {
+    deliverSpeech: async (_agent: string, text: string, channel: Ref | string | null) => {
       if (routeGate) await routeGate;
+      const channelId = typeof channel === 'string' ? channel : channel?.channelId ?? null;
       routed.push({ text, locus: channelId });
       return { status: 'delivered', destination: { serverId: 'discord', channelId }, at: Date.now() };
     },
-    resolveProseTarget: (target: string) => ({ channelId: target }),
+    resolveProseTarget: (target: string) => ({ serverId: 'discord', channelId: target }),
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'discord', channelId } }),
-    getDescriptor: () => undefined, getDefaultPublishChannel: () => 'discord:g:lounge',
-    startTyping: (channelId: string) => { typing.push(channelId); },
+    getDescriptor: () => undefined, getDefaultPublishChannel: () => ref(LOUNGE),
+    channelsNamed: (id: string) => [ref(id)], nameShown: (r: Ref) => r.channelId,
+    startTyping: (channel: Ref | string) => { typing.push(typeof channel === 'string' ? channel : channel.channelId); },
   }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
   const i = internals(framework);
   const starts: InferenceRequest[] = [];
   const start = i.startAgentStream.bind(framework);
   // Each start's routing as its stream begins, in order of the starts.
-  const routings: Array<{ nonChannelOrigin?: boolean; triggerChannel?: string; locus?: string; pin?: string }> = [];
+  const routings: Array<{ nonChannelOrigin?: boolean; triggerChannel?: Ref; locus?: Ref; pin?: Ref }> = [];
   i.startAgentStream = async (agent, trigger) => {
     if (trigger) starts.push(trigger);
     const result = await start(agent, trigger);
@@ -522,9 +529,9 @@ describe('private wins, one way', () => {
         // for the non-streaming fallback's tool_results_ready to continue. In
         // hybrid mode an earlier `>>>` set a sticky destination.
         const routing = routingOf(rig.framework);
-        routing.triggerChannel = ROOM;
-        routing.locus = ROOM;
-        if (mode === 'hybrid') routing.pin = 'discord:g:other';
+        routing.triggerChannel = ref(ROOM);
+        routing.locus = ref(ROOM);
+        if (mode === 'hybrid') routing.pin = ref('discord:g:other');
         rig.state.openLogical.set('scout', routing);
         // An addressed message in another channel arrived earlier, which the
         // channel turn would follow at its next start (TurnRouting.arrivals).
@@ -643,8 +650,8 @@ describe('private wins, one way', () => {
         });
         const routing = routingOf(rig.framework);
         if (!opens) {
-          routing.triggerChannel = ROOM;
-          routing.locus = ROOM;
+          routing.triggerChannel = ref(ROOM);
+          routing.locus = ref(ROOM);
           rig.state.openLogical.set('scout', routing);
         }
         rig.i.pendingRequests.push(roomWake());
@@ -753,8 +760,8 @@ describe('private wins, one way', () => {
       const announced = (rig.framework as unknown as { lastAnnouncedLocus: Map<string, string | null> }).lastAnnouncedLocus;
       announced.set('scout', ROOM);
       const routing = routingOf(rig.framework);
-      routing.triggerChannel = ROOM;
-      routing.locus = ROOM;
+      routing.triggerChannel = ref(ROOM);
+      routing.locus = ref(ROOM);
       rig.state.openLogical.set('scout', routing);
       rig.i.pendingRequests.push({ agentName: 'scout', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() }, tuiWake());
       await rig.until(() => rig.starts.length >= 1, 'the continuation');
@@ -773,15 +780,16 @@ describe('private wins, one way', () => {
     for (const privateTurn of [true, false]) {
       const rig = await surfaceRig({ gate: { config: { policies: [], default: 'always' } } });
       const internalsOf = rig.framework as unknown as {
-        dispatchSleepToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+        dispatchSleepToolCall(agentName: string, call: { id: string; name: string; input: unknown; callerTurnId?: number }): void;
         eventGate: { clearSleep(): unknown };
       };
       try {
         const routing = routingOf(rig.framework);
-        routing.locus = ROOM;
+        routing.locus = ref(ROOM);
         if (privateTurn) { delete routing.locus; routing.nonChannelOrigin = true; }
         rig.state.turnRouting.set('scout', routing as never);
-        internalsOf.dispatchSleepToolCall('scout', { id: 's1', name: 'sleep', input: { seconds: 60, message: 'going quiet' } });
+        // The call is the turn's own, made inside it.
+        internalsOf.dispatchSleepToolCall('scout', { id: 's1', name: 'sleep', input: { seconds: 60, message: 'going quiet' }, callerTurnId: (routing as { turnId?: number }).turnId });
         await new Promise((r) => setImmediate(r));
         assert.deepEqual(rig.routed, privateTurn ? [] : [{ text: 'going quiet', locus: ROOM }], JSON.stringify(rig.routed));
       } finally {
@@ -877,8 +885,8 @@ describe('private wins, one way', () => {
       };
       internalsOf.channelRegistry.handleChannelToolCall = () => new Promise((resolve) => { answer = resolve; });
       const routing = routingOf(rig.framework);
-      routing.triggerChannel = ROOM;
-      routing.locus = ROOM;
+      routing.triggerChannel = ref(ROOM);
+      routing.locus = ref(ROOM);
       rig.state.openLogical.set('scout', routing);
       internalsOf.dispatchChannelToolCall('scout', { id: 'o1', name: 'channel_open', input: { channelId: 'discord:g:other' } });
       // Private input comes into the turn while the open is in flight.
@@ -962,6 +970,7 @@ describe('private wins, one way', () => {
       };
       Object.assign(internalsOf.channelRegistry, {
         buildChannelContext: () => ({ incoming: { channelId: 'discord:g:room', messageId: 'm1' } }),
+        incomingFor: () => ({ channel: ref('discord:g:room'), messageId: 'm1' }),
         getChannelServerId: () => 'discord',
       });
       // No MCPL server is configured here: the stub stands in for the one
@@ -1088,6 +1097,7 @@ describe('private wins, one way', () => {
       const internalsOf = rig.framework as unknown as { logFailure(record: Record<string, unknown>): void; channelRegistry: Record<string, unknown> };
       internalsOf.logFailure = (record) => { records.push(record); };
       internalsOf.channelRegistry.buildChannelContext = () => ({ incoming: { channelId: ROOM, messageId: 'm1' } });
+      internalsOf.channelRegistry.incomingFor = () => ({ channel: ref(ROOM), messageId: 'm1' });
       rig.membrane.pushResponse(createMockResponse([], 'refusal'));
       rig.framework.pushEvent(tuiMessage());
       await rig.until(() => rig.starts.length >= 2, "the turn and its rewind's retry");

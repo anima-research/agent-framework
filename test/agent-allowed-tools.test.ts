@@ -9,6 +9,7 @@ import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { scriptCall } from './helpers/script-call.js';
 
 async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolCall) => Promise<ToolResult>, deferModule = false) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-allowed-tools-'));
@@ -166,26 +167,37 @@ test('shared script dispatch enforces the resident list and resolves its real ev
   } finally { await h.close(); }
 });
 
-test('model-issued Python cannot forge unlisted inner generic or builtin calls', async () => {
+test('a model-issued script cannot reach unlisted inner generic or builtin calls, nor can a forged call', async () => {
   const h = await harness({ allowedTools: ['code_execution', 'probe--allowed'] });
   try {
     const before = h.framework.getAgentRuntimeSettings('assistant');
     const [result] = await h.turn([{
       id: 'script', name: 'code_execution', input: { code: [
-        'make = probe__allowed.__globals__["_make_tool_fn"]',
-        'for name, args in [("probe--denied", {}), ("agent_settings", {"action": "update", "same_round_think_text_policy": "private"})]:',
-        '    try:',
-        '        print(await make(name, "forged")(args))',
-        '    except Exception as error:',
-        '        print(str(error))',
-        'print(await probe__allowed())',
+        'const seen = [];',
+        'for (const name of ["probe--denied", "agent_settings"]) {',
+        '  try { await tools[name]({ action: "update", same_round_think_text_policy: "private" }); seen.push("ran " + name); }',
+        '  catch (error) { seen.push(error.message); }',
+        '}',
+        // The host call the prelude closes over isn't the script's to reach.
+        'seen.push("host: " + typeof globalThis.__host, "tools: " + ALL_TOOLS.map((t) => t.name).join());',
+        'await tools["probe--allowed"]({});',
+        'text(seen.join("\\n"));',
       ].join('\n') },
     }]);
     assert.equal(result.toolUseId, 'script');
-    assert.ok(!result.isError);
-    // The model reads the script's ending first, then its output, as text.
-    assert.match(result.content, /^exit code: 0\n/, result.content);
-    assert.equal((result.content.match(/not permitted.*allowedTools/g) ?? []).length, 2);
+    assert.ok(!result.isError, result.content);
+    assert.match(result.content, /^Script s\d+-[0-9a-z]{4} finished\./);
+    assert.equal((result.content.match(/is not one of your tools\..*Nothing was sent\./g) ?? []).length, 2, result.content);
+    assert.match(result.content, /host: undefined\ntools: probe--allowed\n/);
+    // A child that sent such a call anyway is refused by the host's dispatch.
+    for (const name of ['probe--denied', 'agent_settings']) {
+      // Its answer comes through the event loop, which this framework runs by hand.
+      const pending = scriptCall(h.framework, 'assistant', name, { action: 'update', same_round_think_text_policy: 'private' });
+      await h.framework.runUntilIdle();
+      const forged = await pending;
+      assert.equal(forged.refused, true, name);
+      assert.match(forged.refused ? forged.message : '', /not permitted.*allowedTools/);
+    }
     assert.deepEqual(h.effects.map((c) => c.name), ['allowed']);
     assert.deepEqual(h.framework.getAgentRuntimeSettings('assistant'), before);
     assert.deepEqual(h.lifecycle.filter(event => ['probe--denied', 'agent_settings'].includes(event.tool)), []);
@@ -203,32 +215,40 @@ test('unregistered programmatic ephemeral script callers retain their full surfa
   try {
     const pending = h.framework.executeToolCall({
       id: 'ephemeral-script', name: 'code_execution', callerAgentName: 'unregistered-ephemeral',
-      input: { code: 'print(await probe__denied())' },
+      input: { code: 'await tools["probe--denied"]({});' },
     });
-    // The Python subprocess enqueues its inner call after startup.
+    // The script's child sends its inner call after it starts.
     const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 10);
     try {
       const result = await pending;
-      assert.equal(result.success, true);
-      assert.equal((result.structured as { return_code: number }).return_code, 0);
+      assert.equal(result.success, true, result.error);
+      assert.match((result.data as Array<{ text: string }>)[0]!.text, /^Script s\d+-[0-9a-z]{4} finished\./);
       assert.equal(h.effects.length, 1);
     } finally { clearInterval(processing); }
   } finally { await h.close(); }
 });
 
-for (const call of [generic, { id: 'public-script', name: 'code_execution', input: { code: 'print("forbidden")' } }]) {
-  test(`registered public dispatch refuses ${call.name} before effects`, async () => {
+for (const call of [generic, { id: 'public-script', name: 'code_execution', input: { code: 'text("forbidden");' } }]) {
+  test(`a registered agent's programmatic call (executeToolCall) of ${call.name} it may not use is a failure before effects`, async () => {
     const h = await harness({ allowedTools: [] });
     try {
       const result = await h.framework.executeToolCall({ ...call, callerAgentName: 'assistant' });
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error!, /not permitted.*allowedTools/);
+      assert.match(result.error!, /not permitted.*allowedTools, so the call didn't run\./);
+      // Off the dispatcher no RFC-007 call opened, so it isn't a refusal.
+      assert.equal(result.refused, undefined);
       assert.equal(h.effects.length, 0);
       assert.deepEqual(h.lifecycle, []);
-      assert.equal(h.traces.filter((e) => e.callId === call.id && e.type === 'tool:failed').length, 1);
-      // A refused code_execution must not even create an interpreter.
-      assert.equal((h.framework as unknown as { codeExecutionRunners: Map<string, unknown> }).codeExecutionRunners.size, 0);
+      const traced = h.traces.filter((e) => e.callId === call.id && e.type === 'tool:failed');
+      assert.equal(traced.length, 1);
+      // The trace names the call, where it was decided, and why.
+      assert.equal(traced[0]!.tool, call.name);
+      assert.equal(traced[0]!.module, 'framework');
+      assert.match(String(traced[0]!.error), /not permitted.*allowedTools, so the call didn't run\./);
+      // A refused code_execution must not even start a script.
+      const scripts = (h.framework as unknown as { codeExecution: { scripts: { list(agent: string): unknown[] } } }).codeExecution.scripts;
+      assert.deepEqual(scripts.list('assistant'), []);
     } finally { await h.close(); }
   });
 }
@@ -247,8 +267,8 @@ function captureRouting(framework: AgentFramework) {
   const routed: string[] = [];
   const registry: Record<string, unknown> = {
     handleChannelToolCall: async () => ({ success: true, data: 'ok' }),
-    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:commons' }; },
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => null,
+    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:commons' }; },
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }), getDefaultPublishChannel: () => null,
     isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
   };
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
@@ -486,12 +506,14 @@ for (const route of ['model', 'public', 'script'] as const) {
       } else if (route === 'public') {
         const result = await h.framework.executeToolCall({ id: 'utility-denied', name: 'utils', input, callerAgentName: 'assistant' });
         assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
+        assert.equal(result.refused, undefined, 'its utils call has opened, so the utility\'s refusal is a failure');
       } else {
         const pending = h.internal.dispatchScriptToolCall('assistant', 'utils', input);
         const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 5);
         try {
           const result = await pending;
           assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
+          assert.equal(result.refused, undefined, 'its utils call has opened, so the utility\'s refusal is a failure');
         } finally { clearInterval(processing); }
       }
       assert.deepEqual(h.effects, []);
@@ -596,7 +618,7 @@ for (const permitted of [false, true]) {
   });
 }
 
-test('script in flight cannot gain legacy permissions when its ephemeral run disposes', async () => {
+test('a script in flight cannot gain legacy permissions when its ephemeral run disposes: it ends with its agent', async () => {
   let enter!: () => void, release!: () => void;
   const entered = new Promise<void>(resolve => { enter = resolve; });
   const released = new Promise<void>(resolve => { release = resolve; });
@@ -627,21 +649,34 @@ test('script in flight cannot gain legacy permissions when its ephemeral run dis
     h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
     const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
     h.framework.start(); await streamCreated;
-    const script = h.framework.executeToolCall({ id: 'in-flight', name: 'code_execution', callerAgentName: created.agent.name, input: { code: [
-      'await probe__allowed({"phase": "barrier"})',
-      'try:', '    print(await probe__allowed({"phase": "late"}))',
-      'except Exception as error:', '    print(str(error))',
-    ].join('\n') } });
-    await entered;
-    assert.equal(h.framework.getAgent(created.agent.name), created.agent);
-    await run;
-    assert.equal(h.framework.getAgent(created.agent.name), null);
-    release();
-    const result = await script; assert.equal(result.success, true);
-    assert.match((result.structured as { stdout: string }).stdout, /not a running agent.*only while registered/);
-    assert.deepEqual(h.effects.map(call => call.input), [{phase: 'barrier'}]);
-    assert.equal(h.emitter.openCount, 0);
-    assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
+    const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 10);
+    try {
+      const script = h.framework.executeToolCall({ id: 'in-flight', name: 'code_execution', callerAgentName: created.agent.name, input: { code: [
+        'await tools["probe--allowed"]({ phase: "barrier" });',
+        'try { text(JSON.stringify(await tools["probe--allowed"]({ phase: "late" }))); } catch (error) { text(error.message); }',
+      ].join('\n'), yield_time_ms: 600_000 } });
+      await entered;
+      assert.equal(h.framework.getAgent(created.agent.name), created.agent);
+      await run;
+      assert.equal(h.framework.getAgent(created.agent.name), null);
+      // The agent's turn, its last, ended its script, so the late call is never made.
+      const result = await script;
+      assert.equal(result.isError, true, 'a script stopped at its limit is an error');
+      assert.match(result.error ?? '', /^Script s\d+-[0-9a-z]{4} was stopped: its agent's turn ended, and only the primary agent's scripts outlive a turn\./);
+      assert.match(result.error ?? '', /still running when the script ended, so it may or may not take effect: tools\["probe--allowed"\]\(\{"phase":"barrier"\}\)/);
+      release();
+      // And a call a child sent for it anyway is refused: the agent has gone.
+      const late = await scriptCall(h.framework, created.agent.name, 'probe--allowed', { phase: 'late' });
+      assert.equal(late.refused, true);
+      assert.match(late.refused ? late.message : '', /not a running agent.*only while registered/);
+      // The refusal came before any dispatch, so nothing more can land.
+      assert.deepEqual(h.effects.map(call => call.input), [{phase: 'barrier'}]);
+      // The released barrier call closes once its handler returns, leaving nothing open.
+      const waiters = (h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters;
+      for (let i = 0; i < 2_000 && (h.emitter.openCount !== 0 || waiters.size !== 0); i++) await new Promise((r) => setTimeout(r, 5));
+      assert.equal(h.emitter.openCount, 0);
+      assert.equal(waiters.size, 0);
+    } finally { clearInterval(processing); }
   } finally { release(); await h.close(); }
 });
 
@@ -649,10 +684,10 @@ test('disposed conversation fork cannot regain legacy tool permissions', async (
   const h = await harness({ allowedTools: ['probe--allowed'] });
   try {
     const internals = h.framework as unknown as {
-      createConversationAgent(name: string, channel: string): Promise<{name: string}>;
+      createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{name: string}>;
       disposeConversationAgent(name: string): void;
     };
-    const fork = await internals.createConversationAgent('conversation-probe-g1', 'world:probe');
+    const fork = await internals.createConversationAgent('conversation-probe-g1', { serverId: 'stub', channelId: 'world:probe' });
     assert.ok(h.framework.getAgent(fork.name));
     const call = {id: 'fork-permitted', name: 'probe--allowed', input: {}, callerAgentName: fork.name};
     assert.equal((await h.framework.executeToolCall(call)).success, true);
@@ -835,7 +870,7 @@ test('never-run and retired ephemerals report missing registration before utilit
       for (const [name, input] of [['probe--allowed_util', {}], ['utils', { action: 'list' }], ['utils', { action: 'describe', name: 'missing' }]] as const) {
         const result = await h.framework.executeToolCall({ id: `unregistered-${name}`, name, input, callerAgentName: created.agent.name });
         assert.equal(result.success, false); assert.equal(result.isError, true);
-        assert.match(result.error!, /identity-worker.*not a running agent.*only while registered/);
+        assert.match(result.error!, /identity-worker.*not a running agent.*only while registered, so the call didn't run\.$/);
         assert.ok(!result.error!.includes('allowedTools'), 'identity failure must not give allowlist advice');
       }
       assert.equal(h.effects.length, before); assert.deepEqual(h.lifecycle, []); assert.equal(h.emitter.openCount, 0);
@@ -859,8 +894,8 @@ test('ephemeral and conversation fork first surfaces warn once per Agent instanc
       if (!line.startsWith('[deprecated]')) warnings.push(line);
     };
   try {
-    const internals = h.framework as unknown as { createConversationAgent(name: string, channel: string): Promise<{name: string}>; disposeConversationAgent(name: string): void };
-    const fork = await internals.createConversationAgent('utility-fork-g1', 'world:probe');
+    const internals = h.framework as unknown as { createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{name: string}>; disposeConversationAgent(name: string): void };
+    const fork = await internals.createConversationAgent('utility-fork-g1', { serverId: 'stub', channelId: 'world:probe' });
     const created = await h.framework.createEphemeralAgent({ name: 'utility-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['utils'] });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete.' }]);
     h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));

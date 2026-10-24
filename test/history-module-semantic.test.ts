@@ -104,6 +104,28 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(messageIndexText(messages[1]!, false), '');
   });
 
+  it('messageIndexText keeps what the resident sent through a send tool, and only the message', () => {
+    const sent = msg('m9', T0 + 9000, [
+      { type: 'tool_use', id: 'a', name: 'mcpl--slack--reply_message', input: { channelId: 'C123', messageId: '1700.1', content: 'the route moved to venue B at 09:30 ET' } },
+      { type: 'tool_use', id: 'b', name: 'zulip--send_message', input: { type: 'stream', to: 'rook_dev_support', topic: 'routing', content: 'posted in Slack too' } },
+      { type: 'tool_use', id: 'c', name: 'channel_publish', input: { channelId: 'chan-A', text: 'an older caller sends text' } },
+      { type: 'tool_use', id: 'f', name: 'mcpl--slack--send_dm', input: { userId: 'U42', content: 'a word to one person' } },
+      { type: 'tool_use', id: 'd', name: 'mcpl--slack--edit_message', input: { channelId: 'C123', messageId: '1700.2', content: 'venue B, not C' } },
+      { type: 'tool_use', id: 'e', name: 'mcpl--slack--add_reaction', input: { channelId: 'C123', messageId: '1700.1', emoji: 'eyes' } },
+    ] as ContentBlock[]);
+    const expected = [
+      '[reply_message] the route moved to venue B at 09:30 ET',
+      '[send_message] posted in Slack too',
+      '[channel_publish] an older caller sends text',
+      '[send_dm] a word to one person',
+      '[edit_message] venue B, not C',
+    ].join('\n');
+    assert.equal(messageIndexText(sent), expected);
+    // What it wrote to someone isn't a private note, so it is indexed with
+    // private tools left out.
+    assert.equal(messageIndexText(sent, false), expected);
+  });
+
   it('syncs messages and summaries incrementally with cursors, then searches with mapped filters', async () => {
     const mod = new HistoryModule({ semantic: { url: svc.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, syncBatch: 2 } });
     mod.bind(stubCm(messages, summaries));
