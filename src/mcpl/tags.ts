@@ -19,6 +19,42 @@ const CORE_IMPLIES: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * RFC-001 core tags that mark a message as being ABOUT the conversation
+ * rather than part of it: reactions (added or removed), edits and deletions
+ * of an existing message. These are markers, not turns — they must not clear
+ * explicit-send suppression, count as a new conversational round, or
+ * retarget the default publish channel. An edit can also be the first
+ * version of a message the agent sees, and then counts as that message:
+ * isMarkerTagged reads the host's mark for the case the coalescer knows
+ * (`firstView`), for isConversationalInjection and for the channel
+ * registry's publish channel and reply anchor. Tags are
+ * still never authority (§16.6): this set only ever WITHHOLDS default
+ * conversational treatment, it never grants anything.
+ */
+export const NON_CONVERSATIONAL_TAGS: ReadonlySet<string> = new Set([
+  'chat:reaction',
+  'chat:reaction-remove',
+  'chat:edited',
+  'chat:deleted',
+]);
+
+/** True when a (possibly untyped) tag list carries a non-conversational marker tag. */
+export function hasNonConversationalTag(tags: unknown): boolean {
+  return Array.isArray(tags) && tags.some((t) => typeof t === 'string' && NON_CONVERSATIONAL_TAGS.has(t));
+}
+
+/**
+ * True when a message is a marker by its tags. `firstView` is the host's own
+ * mark that the coalescer delivered the message as the agent's first view of
+ * it (a stored message's metadata `firstView`, or in the channel registry the
+ * admission's receipt), never a server's claim: an edit so delivered counts
+ * as the message it replaced, while a reaction or deletion stays a notice.
+ */
+export function isMarkerTagged(tags: unknown, firstView: boolean): boolean {
+  return hasNonConversationalTag(firstView && Array.isArray(tags) ? tags.filter((t) => t !== 'chat:edited') : tags);
+}
+
+/**
  * Expand a raw tag list over the normative core closure, then resolve the
  * §16.2 mutual exclusion: `chat:addressed` and `chat:ambient` cannot both
  * stand after expansion, and addressed wins — a message that is both

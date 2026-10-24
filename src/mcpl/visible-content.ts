@@ -36,8 +36,9 @@ export function isVisiblyEmptyContent(content: readonly unknown[] | null | undef
  * block whose text isn't a string, which only a nonconformant sender writes,
  * so the agent learns that a block was there. It is the host's word, not the
  * sender's, so it never makes content visible (isVisiblyEmptyConversion).
+ * The other blocks the converters can't show have theirs in references.ts.
  */
-export const NON_STRING_TEXT_PLACEHOLDER = "[Text not shown: the server's text block had no string text.]";
+export const NON_STRING_TEXT_PLACEHOLDER = '[Text not shown: a text part arrived without readable text.]';
 
 /** A wire text block whose text isn't a string, which the converter shows as
  *  NON_STRING_TEXT_PLACEHOLDER. */

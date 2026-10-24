@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +18,7 @@ import type {
 } from '../src/index.js';
 import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { createMockResponse, HeldStream, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
 class EphemeralToolModule implements Module {
   readonly name = 'test';
@@ -64,12 +65,16 @@ class EphemeralToolModule implements Module {
 
 /** A tool that, while its call runs, has `duringCall` run: there, a test
  *  addresses the run as the event gate does, through the framework's
- *  addMessage with `forAgent`. */
+ *  addMessage with `forAgent`, or writes as a module does, through its
+ *  context (`ctx`). */
 class DuringCallToolModule implements Module {
   readonly name = 'test';
+  ctx: ModuleContext | null = null;
   duringCall: (() => void) | null = null;
 
-  async start(_ctx: ModuleContext): Promise<void> {}
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+  }
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
@@ -146,6 +151,16 @@ async function runStartedEphemeral(
 // A short one turns that into a "stalled" rejection, which the refusal's
 // pattern doesn't match.
 const STOPPED_RUN_WATCHDOGS = { idleTimeoutMs: 20_000, idlePollMs: 50 };
+
+/** The store throws when asked for this agent's turn checkpoints. */
+function failCheckpointReads(framework: AgentFramework, agentName: string): void {
+  const store = framework.getStore();
+  const treeGet = store.treeGet.bind(store);
+  (store as unknown as { treeGet: typeof treeGet }).treeGet = (treeId, key) => {
+    if (treeId === 'framework/turn-checkpoints/tree' && key === agentName) throw new Error('injected checkpoint store failure');
+    return treeGet(treeId, key);
+  };
+}
 
 async function stopAndRemove(framework: AgentFramework, tempDir: string): Promise<void> {
   await framework.stop();
@@ -410,12 +425,13 @@ describe('runEphemeralToCompletion settle signal', () => {
     return { framework, membrane, residentStreaming, inSlowEvent, push };
   }
 
-  it("a run whose turn stop() refuses ends with the refusal when its startup watchdog fires before stop()'s sweep", { timeout: 60_000 }, async () => {
+  it("a run whose turn stop() refuses ends with the refusal when its startup watchdog fires before stop()'s sweep", { timeout: 60_000 }, async (t) => {
     // stop() waits on a resident's stream until the test releases it, so its
     // sweep comes after that. Meanwhile the loop, finishing a slow event,
-    // takes the run's wake up and refuses its turn, and the run's startup
-    // watchdog fires first. Once stop() has begun, it says why the run ended,
-    // the framework is stopping, and what it saw, but blames no stalled loop.
+    // takes the run's wake up and refuses its turn, and then the run's
+    // startup watchdog fires. Once stop() has begun, it says why the run
+    // ended, the framework is stopping, and what it saw, but blames no
+    // stalled loop.
     const { tempDir, storePath } = tempStorePath('ephemeral-held-stop-startup-');
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
@@ -427,20 +443,45 @@ describe('runEphemeralToCompletion settle signal', () => {
       await residentStreaming;
       push('slow');
       await inSlowEvent;
-      // Well past the slow event's 100 ms, so the loop has taken the wake up
-      // and refused the turn before the watchdog fires.
+      // The run's startup watchdog stays a real 1 s timer, but its callback
+      // waits until the loop has taken the run's wake up, since on a slow host
+      // the loop can still be in the slow event when the timer comes due. The
+      // run sets the watchdog as it starts, before its first await.
+      const realSetTimeout = globalThis.setTimeout;
+      let wakeTaken!: () => void;
+      const taken = new Promise<void>((resolve) => { wakeTaken = resolve; });
+      let watchdogs = 0;
+      const timers = t.mock.method(globalThis, 'setTimeout', ((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        if (ms !== 1_000) return realSetTimeout(callback, ms, ...args);
+        watchdogs += 1;
+        return realSetTimeout(() => { void taken.then(() => callback(...args)); }, ms);
+      }) as unknown as typeof setTimeout);
       const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 1_000 });
+      timers.mock.restore();
+      // A failure below is then reported alone, without the run's own
+      // rejection once stop()'s sweep ends it.
+      void run.catch(() => {});
+      assert.equal(watchdogs, 1, 'the run set its startup watchdog as it started');
+      const pending = () => (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
+      assert.ok(pending().some((request) => request.agentName === agent.name), "the run's wake is queued");
       const stopped = framework.stop();
+      const deadline = performance.now() + 30_000;
+      while (pending().some((request) => request.agentName === agent.name)) {
+        assert.ok(performance.now() < deadline, "the loop didn't take the run's wake up within 30 s");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      wakeTaken();
       // The held stream is released only after this, so the sweep can't have
       // ended the run.
       await assert.rejects(run, /refused: the framework is stopping \(inference not started within 1000ms\)/);
-      const pending = (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
-      assert.ok(!pending.some((request) => request.agentName === agent.name), "the loop took the run's wake up");
       release();
       await stopped;
       assert.equal(membrane.calls.length, 1, "the run's turn sent nothing");
     } finally {
       release();
+      // A check that failed before stop() would leave the framework running
+      // over a store about to be removed.
+      await framework.stop().catch(() => {});
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
@@ -448,7 +489,8 @@ describe('runEphemeralToCompletion settle signal', () => {
   it("a run whose retry stop() cancels ends with the refusal when its idle watchdog fires before stop()'s sweep", { timeout: 60_000 }, async () => {
     // The run's stream can't start, and stop() cancels its retry while it
     // waits on a resident's stream. The run's inference had started, so its
-    // idle watchdog is the one that fires first.
+    // idle watchdog is the one that fires, once the test makes the run look
+    // idle, and before stop()'s sweep.
     const { tempDir, storePath } = tempStorePath('ephemeral-held-stop-idle-');
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
@@ -470,9 +512,12 @@ describe('runEphemeralToCompletion settle signal', () => {
       framework.start();
       push('go');
       await residentStreaming;
-      const run = framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      const run = framework.runEphemeralToCompletion(agent, contextManager, UNREACHED_WATCHDOG);
       await inDelay;
       const stopped = framework.stop();
+      // stop() has closed admission before it returns, so the watchdog's
+      // next poll ends the run as a stop.
+      silenceRun(framework, agent.name);
       // As above: the held stream is released only after this.
       await assert.rejects(run, /refused: the framework is stopping \(no stream-driver activity for \d+s after inference started\)/);
       release();
@@ -616,6 +661,46 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
+  it('a run whose turn checkpoints the store fails to remove still resolves with its speech, and the failure is logged', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-evict-fails-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Plain final answer' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+    });
+    const errors = mock.method(console, 'error', () => {});
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      // The turn's start reads the agent's checkpoints before its stream, so
+      // the store fails from the stream on, and the removal's read is the
+      // next to ask.
+      const streamYielding = membrane.streamYielding.bind(membrane);
+      membrane.streamYielding = (request, options) => {
+        failCheckpointReads(framework, agent.name);
+        return streamYielding(request, options);
+      };
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+
+      assert.deepStrictEqual(result, { speech: 'Plain final answer', toolCallsCount: 0 });
+      assert.strictEqual(framework.getAgent(agent.name), null);
+      const internals = framework as unknown as { activeTurnTokens: Map<string, unknown> };
+      assert.equal(internals.activeTurnTokens.has(agent.name), false, 'the teardown went on past the failure');
+      const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+      assert.ok(
+        lines.some((line) => line.startsWith(`[checkpoints] agent=${agent.name}: removing its turn checkpoints from the store failed`)
+          && line.includes('injected checkpoint store failure')),
+        lines.join('\n'),
+      );
+    } finally {
+      errors.mock.restore();
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
   it('resolves after tool rounds with final speech and dispatched call count', async () => {
     const { tempDir, storePath } = tempStorePath('ephemeral-tools-');
     const membrane = new MockMembrane();
@@ -695,6 +780,106 @@ describe('runEphemeralToCompletion settle signal', () => {
       assert.deepStrictEqual(stored.slice(-3), ['worker: Done.', 'worker: my own words', 'Antra: look left'],
         'held to the turn end, and stored after the run\'s last reply');
     } finally {
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it("a module's write with no target, which a host with no primary sends to its run, is the run's: stored in its namespace, with nothing left queued once it ends", async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-untargeted-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const tools = new DuringCallToolModule();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [tools],
+      syncIntervalMs: 0,
+    });
+    const internals = framework as unknown as { deferredMessages: Array<{ forAgent?: string }> };
+    // While the run's tool call is pending, a module writes with no target,
+    // as its events do. The host has no primary, so the write goes to the
+    // run, its one registered agent, and waits for the run's turn.
+    const returned: string[] = [];
+    tools.duringCall = () => {
+      returned.push(tools.ctx!.addMessage('Antra', [{ type: 'text', text: 'look left' }]));
+    };
+    try {
+      const { agent, contextManager } = await createEphemeral(framework, 'worker');
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+      assert.strictEqual(result.speech, 'Done.');
+      assert.strictEqual(returned.length, 1);
+      assert.match(returned[0]!, /^held:./, "deferred: the run was waiting on its tool, so the module's context answers the held write's handle");
+      assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
+      const stored = contextManager.getAllMessages().map((m) =>
+        `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
+      assert.strictEqual(stored.filter((s) => s === 'Antra: look left').length, 1,
+        `stored once, in the run's namespace:\n${stored.join('\n')}`);
+      assert.deepStrictEqual(internals.deferredMessages, [], 'nothing is left queued');
+    } finally {
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it('a write queued for a run that its store refuses leaves the queue at the run\'s release, logged', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-lost-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const tools = new DuringCallToolModule();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [tools],
+      syncIntervalMs: 0,
+    });
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: undefined, opts?: { forAgent?: string }): string;
+      deferredMessages: Array<{ forAgent?: string }>;
+      deferredWritesPersisted: boolean;
+    };
+    // The queue is persisted, as after a boot that restored one, so its
+    // recovery file is written as it changes.
+    internals.deferredWritesPersisted = true;
+    tools.duringCall = () => {
+      internals.addMessage('worker', [{ type: 'text', text: 'my own words' }], undefined, { forAgent: 'worker' });
+      internals.addMessage('Antra', [{ type: 'text', text: 'look left' }], undefined, { forAgent: 'worker' });
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    try {
+      const { agent, contextManager } = await createEphemeral(framework, 'worker');
+      // The run's store refuses 'look left' each time it's written.
+      const add = contextManager.addMessage.bind(contextManager);
+      (contextManager as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+        if ((args[1] as Array<{ text?: string }>).some((b) => b.text === 'look left')) throw new Error('disk full');
+        return add(...args);
+      };
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+      console.error = error;
+      assert.strictEqual(result.speech, 'Done.');
+      assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
+      const stored = contextManager.getAllMessages().map((m) =>
+        `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
+      assert.deepStrictEqual(stored.slice(-2), ['worker: Done.', 'worker: my own words'], 'what could be stored was');
+      assert.deepStrictEqual(internals.deferredMessages.filter((m) => m.forAgent === 'worker'), [], 'nothing is left queued for the run');
+      const file = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: Array<{ forAgent?: string }> };
+      assert.deepStrictEqual(file.pending.filter((m) => m.forAgent === 'worker'), [], 'the recovery file keeps nothing for it');
+      assert.ok(errors.some((e) => e.includes('[deferred-flush] worker: failed to store a queued write before release (participant=Antra)')
+        && e.includes('disk full')), errors.join('\n'));
+      assert.ok(!errors.some((e) => e.includes('delivery target "worker" is not a registered agent')),
+        `no later flush meets it:\n${errors.join('\n')}`);
+    } finally {
+      console.error = error;
       await stopAndRemove(framework, tempDir);
     }
   });

@@ -59,23 +59,25 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 // ============================================================================
 
 /**
- * Convert MCPL injection content (string shorthand or block array) to membrane ContentBlock[].
+ * Convert MCPL injection content (string shorthand or block array), from the
+ * server `serverId`, to membrane ContentBlock[].
  */
-function convertContent(content: string | McplContentBlock[]): ContentBlock[] {
+function convertContent(content: string | McplContentBlock[], serverId: string): ContentBlock[] {
   if (typeof content === 'string') {
     return [{ type: 'text', text: content }];
   }
-  return content.map((block) => convertBlock(block, 'attachment on context injection'));
+  return content.map((block) => convertBlock(block, 'attachment on context injection', serverId));
 }
 
 /**
- * Convert an MCPL wire-format context injection to a context-manager ContextInjection.
+ * Convert an MCPL wire-format context injection, from the server `serverId`,
+ * to a context-manager ContextInjection.
  */
-function convertMcplInjection(mcplInj: McplContextInjection): ContextInjection {
+function convertMcplInjection(mcplInj: McplContextInjection, serverId: string): ContextInjection {
   return {
     namespace: mcplInj.namespace,
     position: mcplInj.position,
-    content: convertContent(mcplInj.content),
+    content: convertContent(mcplInj.content, serverId),
     metadata: mcplInj.metadata,
   };
 }
@@ -90,6 +92,8 @@ export class HookOrchestrator {
   private _isInHook = false;
   /** Servers already told that an injection's namespace wasn't a string. */
   private readonly namespaceWarned = new Set<string>();
+  /** Server and namespace pairs already told that a system injection held a block that isn't text. */
+  private readonly notShownWarned = new Set<string>();
 
   constructor(registry: McplServerRegistry, featureSetManager: FeatureSetManager) {
     this.registry = registry;
@@ -110,8 +114,17 @@ export class HookOrchestrator {
    *
    * Returns aggregated ContextInjection[] ready for context-manager's compile().
    * Fail-open: servers that time out or error are silently skipped.
+   *
+   * `channelsFor` gives each server its own channel context (§14.4), in
+   * place of `params.channels`: channel ids are unique only within one
+   * server's connection (§14.2), so each server is told only of its own
+   * channels (ChannelRegistry.buildChannelContext). Undefined from it leaves
+   * the field out for that server.
    */
-  async beforeInference(params: BeforeInferenceParams): Promise<ContextInjection[]> {
+  async beforeInference(
+    params: BeforeInferenceParams,
+    channelsFor?: (serverId: string) => BeforeInferenceParams['channels'],
+  ): Promise<ContextInjection[]> {
     // §5.4: the GRANT decides fan-out, not the raw advertisement — which
     // also fixes selection for the recursive §5.1 shape, where
     // `beforeInference: {observe: true, …}` is an object, not `true`. A
@@ -128,7 +141,7 @@ export class HookOrchestrator {
 
     this._isInHook = true;
     try {
-      return await this.fanOutBeforeInference(servers, params);
+      return await this.fanOutBeforeInference(servers, params, channelsFor);
     } finally {
       this._isInHook = false;
     }
@@ -159,17 +172,33 @@ export class HookOrchestrator {
   private async fanOutBeforeInference(
     servers: McplServerConnection[],
     params: BeforeInferenceParams,
+    channelsFor?: (serverId: string) => BeforeInferenceParams['channels'],
   ): Promise<ContextInjection[]> {
     const results = await Promise.allSettled(
-      servers.map((server) => {
+      // Async, so a throw building one server's channel context fails that
+      // server alone, as its timeout or transport error would.
+      servers.map(async (server) => {
+        let base = params;
+        if (channelsFor) {
+          const { channels: _shared, ...rest } = params;
+          let channels: BeforeInferenceParams['channels'];
+          try {
+            channels = channelsFor(server.id);
+          } catch (err) {
+            // A bug, not a server's failure: said, then this server is skipped.
+            console.error(`[beforeInference] the channel context for "${server.id}" couldn't be built, so it isn't called:`, err);
+            throw err;
+          }
+          base = channels ? { ...rest, channels } : rest;
+        }
         // §10.1: a server not granted observe MUST receive
         // `userMessage: null` — the field is ABSENT authority, not merely
         // discouraged — while the hook is still invoked so granted
         // injection positions keep working (write-without-read).
         const perServer: BeforeInferenceParams =
           CapabilityGrant.of(server).has('contextHooks.beforeInference.observe')
-            ? params
-            : { ...params, userMessage: null };
+            ? base
+            : { ...base, userMessage: null };
         return withTimeout(
           server.sendBeforeInference(perServer),
           BEFORE_INFERENCE_TIMEOUT_MS,
@@ -223,7 +252,9 @@ export class HookOrchestrator {
             continue;
           }
           if (typeof mcplInj.namespace !== 'string') this.readNamespace(server.id, mcplInj.namespace);
-          injections.push(convertMcplInjection(mcplInj));
+          const injection = convertMcplInjection(mcplInj, server.id);
+          if (injection.position === 'system') this.noteBlocksNotShown(server.id, mcplInj.namespace, injection.content);
+          injections.push(injection);
         } catch (error) {
           // Such as a null block, content that isn't an array, a null
           // injection, or a namespace that can't be read as text.
@@ -261,6 +292,26 @@ export class HookOrchestrator {
       `[mcpl] ${serverId}: a beforeInference injection's namespace isn't a string, which §10.4 requires, so it keeps the ` +
         `injection to no channel and every agent gets it; where it names a participant, it's read as its text, ${logValue(text)}; ` +
         'this line prints once per server while the host runs',
+    );
+  }
+
+  /**
+   * The system prompt is text, so an agent given a `system` injection reads
+   * a line in place of each of its blocks that isn't text (the agent's
+   * buildSystemPrompt). The server meant those blocks for the model, so its
+   * operator is told, once per server and namespace, as the server's
+   * injections are gathered, whichever agents are given them. The namespace
+   * is read as its text, which readNamespace has checked it has.
+   */
+  private noteBlocksNotShown(serverId: string, namespace: unknown, content: ContentBlock[]): void {
+    if (!content.some((block) => block.type !== 'text')) return;
+    const key = `${serverId}\u0000${String(namespace)}`;
+    if (this.notShownWarned.has(key)) return;
+    this.notShownWarned.add(key);
+    console.error(
+      `[mcpl] ${serverId}: a system injection in namespace ${logValue(namespace)} holds a block that isn't text, ` +
+        "which the system prompt can't carry, so an agent given the injection reads a line in place of each such block; " +
+        'this line prints once per server and namespace while the host runs',
     );
   }
 

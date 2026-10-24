@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import {syncBuiltinESMExports} from 'node:module';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {spawnSync} from 'node:child_process';
 import {mkdtempSync,rmSync,writeFileSync,readFileSync,chmodSync,statSync,existsSync,mkdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -328,6 +329,51 @@ test('a presentation file the host can\'t use: edits refuse it and the catalogue
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
+test('a presentation file holding {} is the empty document, as a missing one is, and a 0-byte file, half a document or a value that isn\'t an object still refuses',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-empty-object-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=presentationTargets('example','workspace--read');
+  for (const empty of ['{}','{ }\n']) {
+   writeFileSync(path,empty);
+   const snapshot=p.resolve(tools);
+   assert.deepEqual(snapshot.diagnostics,[],`${JSON.stringify(empty)} carries no settings, so nothing is said`);
+   assert.deepEqual(snapshot.advertised.map(t=>[t.name,t.description]),[['example','original'],['workspace--read','original']]);
+   assert.equal(p.edit('set_tool_visibility',{name:'example',visible:false},tools).success,true);
+   assert.deepEqual(JSON.parse(readFileSync(path,'utf8')),{version:1,tools:{example:{visible:false}}},'the edit writes the full form');
+  }
+  const refusedAs=(problem:string)=>`Nothing was changed: your tool presentation file can't be used (${problem}), and these tools won't write over it until it's repaired. Ask whoever runs this host to repair it.`;
+  for (const [content,problem] of [
+   ['{"tools":{}}','"version" must be 1, and it\'s missing'],
+   ['{"version":1}','"tools" must be an object of tool names, and it\'s missing'],
+   // Top-level values that aren't objects, for which Object.keys() gives no keys either (or, for null, throws).
+   ...['null','true','1'].map(value=>[value,`its top level is ${value}, not an object like {"version":1,"tools":{}}`]),
+  ]) {
+   writeFileSync(path,content);
+   assert.equal(p.edit('set_tool_visibility',{name:'example',visible:true},tools).error,refusedAs(problem),content);
+   assert.equal(readFileSync(path,'utf8'),content);
+   assert.equal(p.resolve(tools).diagnostics.length,1,content);
+  }
+  // 0 bytes is what a lost file looks like, since an edit's rename never leaves one.
+  writeFileSync(path,'');
+  assert.match(p.edit('set_tool_visibility',{name:'example',visible:true},tools).error!,
+   /^Nothing was changed: your tool presentation file can't be used \(it isn't valid JSON: .+\), and these tools won't write over it/);
+  assert.equal(readFileSync(path,'utf8'),'');
+  assert.equal(p.resolve(tools).diagnostics.length,1);
+
+  // A defaults file reads {} the same way, and still refuses half a document.
+  const web=join(dir,'web.json');
+  const q=new ToolPresentation({path:join(dir,'other.json'),cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
+  const webTools=presentationTargets('web--fetch'), sources=new Map([['web--fetch','MCPL server: web']]);
+  writeFileSync(web,'{}');
+  assert.deepEqual(q.resolve(webTools,sources).diagnostics,[]);
+  assert.equal(q.resolve(webTools,sources).available[0].description,'original');
+  writeFileSync(web,'{"version":1}');
+  assert.deepEqual(q.resolve(webTools,sources).diagnostics,['The description defaults for "MCPL server: web" can\'t be used ("tools" must be an object of tool names, and it\'s missing), '
+   +'so its tools show their installed descriptions, or yours where you set one. Ask whoever runs this host to fix that defaults file.']);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
 test('description defaults that set visibility, are missing or are configured twice are each said, and the rest still apply',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-defaults-problems-'));
  try {
@@ -497,5 +543,25 @@ test('a problem lists at most ten names, then how many more',()=>{
   const sources=new Map(twelve('big--t').map(name=>[name,'MCPL server: big']));
   const defaultsFile=p.resolve(tools,sources).diagnostics[0];
   assert.ok(defaultsFile.includes(`(it sets "visible" for ${listed(twelve('big--t'))}, and a defaults file may set only descriptions`),defaultsFile);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a FIFO at the presentation file is refused at once, not waited on with the process held',{skip:process.platform==='win32'?'no FIFOs':false},()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-fifo-'));
+ try {
+  const path=join(dir,'tools.json');
+  assert.equal(spawnSync('mkfifo',[path]).status,0,'mkfifo');
+  // Read in a child process, bounded: the read is synchronous, so an open that
+  // waits for a writer holds the whole process it runs in.
+  const module=new URL('../src/tool-presentation.js',import.meta.url).href;
+  const script=`const {ToolPresentation}=await import(${JSON.stringify(module)});`
+   +`const s=new ToolPresentation({path:${JSON.stringify(path)},cataloguePath:'board/tools.md'}).resolve([{name:'example',description:'original',inputSchema:{type:'object'}}]);`
+   +'console.log(JSON.stringify({diagnostics:s.diagnostics,description:s.advertised[0].description}));';
+  const child=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:10_000});
+  assert.equal(child.signal,null,`the read waited on the FIFO until the child was stopped (${child.signal})`);
+  assert.equal(child.status,0,child.stderr);
+  const out=JSON.parse(child.stdout);
+  assert.match(out.diagnostics[0],/^Your tool presentation file can't be used \(it isn't a regular file\)/);
+  assert.equal(out.description,'original','the default description stays');
  } finally {rmSync(dir,{recursive:true,force:true});}
 });

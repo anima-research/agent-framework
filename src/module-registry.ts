@@ -4,8 +4,6 @@ import type {
   MessageId,
   MessageMetadata,
   MessageQuery,
-  MessageQueryResult,
-  StoredMessage,
   ContextInjection,
 } from '@animalabs/context-manager';
 import type {
@@ -22,9 +20,14 @@ import type {
   SpeechHandlerOptions,
   ProcessEvent,
   TraceEventListener,
+  ModuleMessage,
+  MessageQueryResult,
 } from './types/index.js';
+import { heldWriteId } from './held-writes.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
+import { logValue } from './mcpl/log-value.js';
+import { toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -100,6 +103,8 @@ export class ModuleRegistry {
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
+  /** Module and namespace pairs already told that a system injection held a block that isn't text. */
+  private notShownWarned = new Set<string>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
@@ -108,7 +113,7 @@ export class ModuleRegistry {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
-  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private getMessageFn: (id: MessageId) => ModuleMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
@@ -132,7 +137,7 @@ export class ModuleRegistry {
       addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
-      getMessage: (id: MessageId) => StoredMessage | null;
+      getMessage: (id: MessageId) => ModuleMessage | null;
       queryMessages: (filter: MessageQuery) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
@@ -225,7 +230,8 @@ export class ModuleRegistry {
 
   /**
    * Set state for a module by name.
-   * Used by the framework to apply stateUpdate from EventResponse atomically.
+   * Used by the framework to apply stateUpdate from EventResponse after its
+   * message changes.
    */
   setModuleState(moduleName: string, state: unknown): void {
     const ctx = this.moduleContexts.get(moduleName);
@@ -297,23 +303,30 @@ export class ModuleRegistry {
    * model. The result is checked and read once, in its JSON form
    * ({@link storableToolResult}).
    */
-  async storableToolCall(call: ToolCall): Promise<ToolResult> {
-    return storableToolResult(call, await this.handleToolCall(call));
+  async storableToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    return storableToolResult(call, await this.handleToolCall(call, options));
   }
 
   /**
    * Handle a tool call by routing to the appropriate module: the module's own
    * result, unchecked, as it returned it, for a caller that uses the result
    * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
-   * calling the registry). A module's throw is answered as an error result.
+   * calling the registry), less a refusal it claims (withoutRefusal). A
+   * module's throw is answered as an error result.
+   * A call whose input isn't an object, or lacks a key the tool's schema
+   * requires, is answered before the module runs, with an error result that
+   * opens "Nothing was done:" and names what to send (toolArgsProblems).
+   * A caller that has already resolved the tool's definition, as the `utils`
+   * tool has a utility's, passes it as `definition`, and it's checked against
+   * that one.
    */
-  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
       return {
         success: false,
-        error: `Invalid tool name format: ${call.name}`,
+        error: `Invalid tool name format: ${call.name}, so nothing was done`,
         isError: true,
       };
     }
@@ -325,21 +338,40 @@ export class ModuleRegistry {
     if (!module) {
       return {
         success: false,
-        error: `Module not found: ${moduleName}`,
+        error: `Module not found: ${moduleName}, so nothing was done`,
         isError: true,
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity)
-    const moduleCall: ToolCall = {
-      id: call.id,
-      name: toolName,
-      input: call.input,
-      callerAgentName: call.callerAgentName,
-    };
+    // The call as it came, with the un-prefixed name: the caller's identity
+    // and everything else the dispatch set on it reach the module.
+    const moduleCall: ToolCall = { ...call, name: toolName };
 
     try {
-      return await module.handleToolCall(moduleCall);
+      // The call against the tool's declared schema, before the module runs:
+      // a missing required argument is refused with what to send, where the
+      // handler would otherwise fail deep inside, or run without it. Values
+      // aren't checked here, since a handler may take more than its schema
+      // can say (toolArgsProblems). The module's own listing runs inside the
+      // try, so its throw is answered like any other. Utilities are listed
+      // only for a name the tools don't have, so a utility listing that
+      // throws or is slow reaches only calls to such names: a utility called
+      // by its own name, and a name the module answers without declaring it.
+      // A caller that passes `definition` lists nothing.
+      const definition = options.definition
+        ?? module.getTools().find((tool) => tool.name === toolName)
+        ?? module.getUtilities?.()?.find((tool) => tool.name === toolName);
+      const problems = toolArgsProblems(call.input, definition?.inputSchema);
+      if (problems.length > 0) {
+        return {
+          success: false,
+          error: `Nothing was done: ${call.name} ${problems.join('; ')}.`,
+          isError: true,
+        };
+      }
+      // A refusal is the dispatcher's to say (RFC-007), so a module's result
+      // can't claim one on this route either.
+      return withoutRefusal(call, await module.handleToolCall(moduleCall));
     } catch (error) {
       return thrownResult(error);
     }
@@ -409,7 +441,13 @@ export class ModuleRegistry {
   /**
    * Gather context injections from all modules before inference.
    * Calls each module's gatherContext() in parallel with a per-module timeout.
-   * Fail-open: timed-out or erroring modules are skipped (with a stderr line).
+   * Fail-open: timed-out or erroring modules are skipped (with a stderr line),
+   * whether the call throws, rejects or answers with something other than an
+   * array, and one that answers after its timeout adds nothing to the list.
+   * An array returned without a promise is taken as the module's answer.
+   * Each module's budget starts once its call returns, after its own
+   * synchronous work and every earlier module's; a later module's
+   * synchronous work still counts against it.
    *
    * The per-module budget is `module.contextTimeoutMs` when declared, else the
    * `timeoutMs` default (15s). Modules whose gatherContext does real work —
@@ -436,11 +474,35 @@ export class ModuleRegistry {
         MAX_CONTEXT_TIMEOUT_MS,
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      // Called here, before its timer is set, so its budget starts after its
+      // synchronous work; a call that throws is skipped as a rejection is,
+      // and one that returns an array without a promise has it taken, rather
+      // than throwing out of this loop and losing every module's.
+      let call: Promise<ContextInjection[]>;
+      try {
+        call = Promise.resolve(module.gatherContext(agentName));
+      } catch (err) {
+        call = Promise.reject(err);
+      }
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => injections.push(...r)),
+        call.then(r => {
+          // An answer after the timeout would still land in the list: before
+          // it's returned, while another module is still awaited, or after,
+          // while the caller may still be reading it.
+          if (timedOut) return;
+          // Anything else would be spread into the list element by element,
+          // as a string's characters.
+          if (!Array.isArray(r)) throw new TypeError(`answered with ${r === null ? 'null' : typeof r}, not an array of injections`);
+          injections.push(...r);
+          this.noteBlocksNotShown(module.name, r);
+        }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
-            () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
+            () => {
+              timedOut = true;
+              rej(new Error(`gatherContext timed out after ${budgetMs}ms`));
+            },
             budgetMs,
           );
         }),
@@ -453,6 +515,28 @@ export class ModuleRegistry {
 
     await Promise.all(promises);
     return injections;
+  }
+
+  /**
+   * The system prompt is text, so an agent given a `system` injection reads
+   * a line in place of each of its blocks that isn't text (the agent's
+   * buildSystemPrompt), though `ContextInjection`'s content may be any
+   * block. The module meant those blocks for the model, so its operator is
+   * told, once per module and namespace, as the module's injections are
+   * gathered, whichever agents are given them.
+   */
+  private noteBlocksNotShown(moduleName: string, injections: ContextInjection[]): void {
+    for (const injection of injections) {
+      if (injection.position !== 'system' || !injection.content.some((block) => block.type !== 'text')) continue;
+      const key = `${moduleName}\u0000${injection.namespace}`;
+      if (this.notShownWarned.has(key)) continue;
+      this.notShownWarned.add(key);
+      console.error(
+        `[${moduleName}] gatherContext: a system injection in namespace ${logValue(injection.namespace)} holds a block that ` +
+          "isn't text, which the system prompt can't carry, so an agent given the injection reads a line in place of each such block; " +
+          'this line prints once per module and namespace while the host runs',
+      );
+    }
   }
 
   /**
@@ -554,7 +638,7 @@ class ModuleContextImpl implements ModuleContext {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
-  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private getMessageFn: (id: MessageId) => ModuleMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
@@ -574,7 +658,7 @@ class ModuleContextImpl implements ModuleContext {
     addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
-    getMessage: (id: MessageId) => StoredMessage | null,
+    getMessage: (id: MessageId) => ModuleMessage | null,
     queryMessages: (filter: MessageQuery) => MessageQueryResult,
     pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
@@ -701,10 +785,13 @@ class ModuleContextImpl implements ModuleContext {
   ): MessageId {
     const id = this.addMessageFn(participant, content, metadata);
 
-    // Track external ID if provided
+    // Track external ID if provided. A write the framework holds keeps '',
+    // as it did before held writes had handles: the map is module state an
+    // earlier release reads back, and a handle is no id to it.
+    // findMessageByExternalId finds the held write by its external id.
     if (metadata?.external) {
       const key = `${metadata.external.source}:${metadata.external.id}`;
-      this.externalIdMap.set(key, id);
+      this.externalIdMap.set(key, heldWriteId(id) === undefined ? id : '');
       // Persist the mapping
       this.persistExternalIdMap();
     }
@@ -730,10 +817,33 @@ class ModuleContextImpl implements ModuleContext {
 
   findMessageByExternalId(source: string, externalId: string): MessageId | null {
     const key = `${source}:${externalId}`;
-    return this.externalIdMap.get(key) ?? null;
+    const entry = this.externalIdMap.get(key);
+    if (entry === undefined) return null;
+    // A stored id answers while the store holds its row, and once the row is
+    // gone the entry goes, as removeMessage drops it. The '' a held write
+    // keeps here (addMessage) names no row, so the message is looked up in
+    // the store by its external id, held rows included, and the first row
+    // found is taken, as context-manager's findByExternalId takes it: a held
+    // row answers by its handle and leaves the entry as it is, and a stored
+    // row's id becomes the entry. With nothing found, '' stays, as earlier
+    // releases kept it: in a module's start(), the writes the last process
+    // held don't show yet, since create() restores them after the modules
+    // start, and a write that shows later finds its entry.
+    if (entry !== '') {
+      if (this.getMessageFn(entry)) return entry;
+      this.externalIdMap.delete(key);
+      this.persistExternalIdMap();
+      return null;
+    }
+    const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
+    if (row?.held) return row.id;
+    if (!row) return null;
+    this.externalIdMap.set(key, row.id);
+    this.persistExternalIdMap();
+    return row.id;
   }
 
-  getMessage(id: MessageId): StoredMessage | null {
+  getMessage(id: MessageId): ModuleMessage | null {
     return this.getMessageFn(id);
   }
 
@@ -816,6 +926,83 @@ class ProcessStateImpl implements ProcessState {
   }
 }
 
+/** The fields ToolResult declares, read by name, so a result class's getters count: endTurn first and the error next, so a failure keeps them. */
+const TOOL_RESULT_FIELDS = ['endTurn', 'error', 'success', 'isError', 'data', 'structured', 'keepWhenWithheld'] as const;
+
+/**
+ * A module's result for an in-process caller: the module's own object, unless
+ * it claims a refusal, which is the dispatcher's to say (RFC-007). Then it's a
+ * copy, less the claim: a plain object of every field ToolResult declares,
+ * read by name, so a result class's getters count, each read once, and every
+ * other own enumerable field, string or symbol, as a spread takes them, so
+ * non-enumerable own fields and inherited undeclared ones are left out. A
+ * result that can't be read, its claim included, is a failure saying so, as
+ * on the stored route (checkedToolResult),
+ * keeping the turn's end and the module's error if those could be read: the
+ * module's call completed, and the claim never reaches the caller.
+ */
+function withoutRefusal(call: ToolCall, result: ToolResult): ToolResult {
+  // Not an object: nothing to claim, and the caller gets it as it came.
+  if (!result || (typeof result !== 'object' && typeof result !== 'function')) return result;
+  const source = result as unknown as Record<PropertyKey, unknown>;
+  const copy: Record<PropertyKey, unknown> = {};
+  // Each field is read once: one whose getter threw isn't asked again.
+  const read = new Set<PropertyKey>();
+  // Defined, not assigned, so a field named __proto__ is a field.
+  const keep = (key: PropertyKey): void => {
+    read.add(key);
+    Object.defineProperty(copy, key, { value: source[key], enumerable: true, writable: true, configurable: true });
+  };
+  const once = (key: string): unknown => {
+    if (key in copy) return copy[key];
+    if (read.has(key)) return undefined;
+    return source[key];
+  };
+  // A failure keeps what could be read of the turn's end and the module's
+  // error, each read on its own, whatever else couldn't be.
+  const unreadable = (error: unknown): ToolResult => {
+    let endTurn: unknown;
+    let own: string | undefined;
+    try {
+      endTurn = once('endTurn');
+    } catch {
+      // Not readable: the failure doesn't end the turn.
+    }
+    try {
+      own = errorText(once('error'));
+    } catch {
+      // An error whose own text can't be read: the failure says only why.
+    }
+    return {
+      success: false,
+      isError: true,
+      error: `Tool '${call.name}' returned a result that couldn't be read (${thrownText(error).split('\n')[0] || 'no reason given'}). ` +
+        `The call itself completed${own ? `, with this error: ${own}` : '.'}`,
+      ...(endTurn ? { endTurn: true } : {}),
+    };
+  };
+  let claim: unknown;
+  try {
+    claim = source.refused;
+  } catch (error) {
+    return unreadable(error);
+  }
+  if (!claim) return result;
+  try {
+    const copied = new Set<PropertyKey>(['refused']);
+    for (const key of TOOL_RESULT_FIELDS) {
+      copied.add(key);
+      if (key in source) keep(key);
+    }
+    for (const key of Reflect.ownKeys(source)) {
+      if (!copied.has(key) && Object.prototype.propertyIsEnumerable.call(source, key)) keep(key);
+    }
+    return copy as unknown as ToolResult;
+  } catch (error) {
+    return unreadable(error);
+  }
+}
+
 /** A result's flags, which consumers read for their truth: booleans here. */
 const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
 
@@ -837,7 +1024,8 @@ const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
  * runs again. It's taken where the framework stores or sends a result
  * ({@link ModuleRegistry.storableToolCall}). A caller that uses the result
  * in process (`ModuleContext.callTool`, `executeToolCall`) gets the module's
- * own result, as the module returned it ({@link ModuleRegistry.handleToolCall}).
+ * own result, as the module returned it, less a refusal it claims
+ * ({@link ModuleRegistry.handleToolCall}).
  * The flags are booleans, read for their truth as consumers read them.
  * `error` is its text form, which is all a consumer reads of it, so an error
  * value JSON can't hold costs nothing. An error that says nothing (null,
@@ -893,6 +1081,9 @@ export function checkedToolResult(call: ToolCall, result: unknown): { result: To
     }
     // The error is kept as its text, which consumers read; its value isn't.
     delete fields.error;
+    // A refusal is the dispatcher's to say, before the call opens (RFC-007):
+    // a module answers after that, so its result can't claim one.
+    delete fields.refused;
     // The flags are kept as their truth, which is all consumers read of them,
     // before anything is serialized, so a flag's own value (a BigInt, a
     // function, an object with a toJSON) neither breaks nor runs anything.

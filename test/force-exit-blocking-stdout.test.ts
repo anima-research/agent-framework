@@ -2,16 +2,23 @@
  * `npm test` loads test/helpers/force-exit-blocking-stdout into the runner,
  * which passes it on to each test file's process, so --test-force-exit
  * can't drop the results still queued on a file's pipe to the runner
- * (agent-framework #294). These tests run a fixture under the runner as
- * `npm test` does and count, in the runner's report, the bytes its test
- * wrote: a run of '~', which nothing else in the report spells, and which
- * the runner may pass on in pieces. Where a run without the helper loses
+ * (agent-framework #294). The first test runs a fixture under the runner
+ * with npm test's options and counts, in the runner's report, the bytes the
+ * fixture's test wrote: a run of '~', which nothing else in the report
+ * spells, and which the runner may pass on in pieces. The runner writes that
+ * report to a file, not to a pipe as in npm test. Node writes a file
+ * synchronously, so whatever the runner has handed to its stdout is in the
+ * file when it exits. Through a pipe, the runner's own forced exit can drop
+ * what is still queued for it, which the helper, acting only in a test
+ * file's process, doesn't prevent. Where a run without the helper loses
  * nothing, as on a Node that carries nodejs/node#64875, there's nothing for
- * the helper to prevent, and they skip.
+ * the helper to prevent, and the first two tests skip.
  */
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -34,10 +41,32 @@ function childEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-/** How many of the fixture's bytes the runner's report holds, run as npm test runs a file, with the helper loaded or not. */
+/**
+ * How many of the fixture's bytes the runner's report holds, run with npm
+ * test's options, with the helper loaded or not. With this fixture the runner
+ * exits 0, so one that fails to start or exits otherwise throws, with the
+ * end of its stderr and its report, rather than reading as a shortfall.
+ */
 function runnerReceived(withHelper: boolean): number {
   const args = [...(withHelper ? ['--import', helper] : []), '--test', '--test-force-exit', '--test-reporter=tap', fixture];
-  return tildes(spawnSync(process.execPath, args, { env: childEnv(), maxBuffer: 4 * BYTES }).stdout.toString());
+  const dir = mkdtempSync(join(tmpdir(), 'af-force-exit-report-'));
+  try {
+    const report = join(dir, 'report.tap');
+    const fd = openSync(report, 'w');
+    const run = (() => {
+      try {
+        return spawnSync(process.execPath, args, { env: childEnv(), stdio: ['ignore', fd, 'pipe'] });
+      } finally {
+        closeSync(fd);
+      }
+    })();
+    if (run.error) throw run.error;
+    const text = readFileSync(report, 'utf8');
+    if (run.status !== 0) throw new Error(`the runner exited with ${run.status ?? run.signal}: ${(String(run.stderr) + text).slice(-2000)}`);
+    return tildes(text);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** Bytes that reach a pipe from a plain process that writes BYTES to stdout and exits at once. */

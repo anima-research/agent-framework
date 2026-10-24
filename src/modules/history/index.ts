@@ -49,7 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { safeSlice } from '../../safe-slice.js';
 
@@ -1614,6 +1614,9 @@ export class HistoryModule implements Module {
       try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
     }
 
+    // A message's or summary's snippet is built here, from the local text.
+    // `snippet` still bounds what a service that keeps text sends with each
+    // hit, since what it sends without one isn't specified here.
     const runSearch = (k: number) => this.semanticClient!.search({
       query: input.query, k,
       ts_from: fromMs === undefined ? undefined : fromMs / 1000,
@@ -1667,7 +1670,10 @@ export class HistoryModule implements Module {
     // /newtopic keeps its id (a new message gets a fresh one) and stays
     // indexed. Check every hit against the CURRENT branch before it goes back
     // to the model — getMessage/getSummary rebuild on branch switch, so an
-    // undone message or a summary minted on another branch answers null.
+    // undone message, or a summary this branch doesn't hold, answers null.
+    // A branch made from an earlier point, as an undo makes one, can mint a
+    // summary id another branch already used, so a summary hit's score,
+    // timestamp and date filtering can still be that other summary's.
     // k is small, so this is at most `limit` local lookups.
     // A message hit whose current text has nothing left to index (edited
     // blank, delete not yet applied) is dropped too, so its stale snippet is
@@ -1679,6 +1685,10 @@ export class HistoryModule implements Module {
     // A message hit's snippet is rebuilt from the CURRENT local text, never
     // the remote copy: an edit not yet synced (or one the index never got)
     // must not leak a passage the edit removed. Only the ranking can be stale.
+    // A summary hit's snippet is rebuilt from the local summary too: a
+    // service that keeps only vectors and ids (no text) still yields one, and
+    // a summary whose id another branch also minted shows this branch's text
+    // in its snippet and chars.
     const currentText = new Map<string, string>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
@@ -1691,7 +1701,19 @@ export class HistoryModule implements Module {
         currentText.set(h.id, text);
         return 'ok';
       }
-      if (sumId !== undefined) return cm.getSummary(sumId) !== null ? 'ok' : 'offBranch';
+      if (sumId !== undefined) {
+        const s = cm.getSummary(sumId);
+        if (!s) return 'offBranch';
+        const text = summaryIndexText(s, this.semanticCfg!);
+        // An empty text here is mostly defensive: context-manager drops a
+        // summary that's empty after trimming when it loads, and refuses to
+        // store one. Short of that, only a maxChars that cuts the text to
+        // nothing gives one. The hit is dropped rather than show the index's
+        // text.
+        if (!text) return 'stale';
+        currentText.set(h.id, text);
+        return 'ok';
+      }
       return 'ok';
     };
     let k = limit;
@@ -1780,7 +1802,7 @@ export class HistoryModule implements Module {
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
           droppedOffBranch,
-          /** Hits for messages whose current text has nothing indexable (edited blank; the index delete is pending). */
+          /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
           droppedStale,
           /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
           searchAgainError,
@@ -2467,7 +2489,9 @@ function codePointBefore(s: string, i: number): string | undefined {
 }
 
 /**
- * First occurrence of `needle` in `text`. With `wholeWord`, an occurrence
+ * First occurrence of `needle` in `text`, as the units of `text` it covers.
+ * Without `caseSensitive`, `needle` is lower case already, and is found in
+ * `text.toLowerCase()`. With `wholeWord`, an occurrence
  * only counts when it isn't glued to a letter/digit/underscore on either
  * side (Unicode-aware, so Cyrillic words work too) — "mission" no longer
  * hits inside "uncommissioned". Word-ness is checked only on the sides
@@ -2476,6 +2500,13 @@ function codePointBefore(s: string, i: number): string | undefined {
  */
 function matchSubstring(text: string, needle: string, caseSensitive: boolean, wholeWord = false): MatchHit | null {
   const haystack = caseSensitive ? text : text.toLowerCase();
+  const hit = firstOccurrence(haystack, needle, wholeWord);
+  // Lowering can lengthen a character, as it does `İ` (one unit to two). Then
+  // the lowered text's units aren't the text's, and the snippet cuts the text.
+  return hit !== null && haystack.length !== text.length ? inTextUnits(text, hit) : hit;
+}
+
+function firstOccurrence(haystack: string, needle: string, wholeWord: boolean): MatchHit | null {
   if (!wholeWord) {
     const index = haystack.indexOf(needle);
     return index === -1 ? null : { index, length: needle.length };
@@ -2491,6 +2522,26 @@ function matchSubstring(text: string, needle: string, caseSensitive: boolean, wh
     }
     from = index + 1;
   }
+}
+
+/**
+ * The units of `text` that a hit in `text.toLowerCase()` covers. Each code
+ * point of `text` takes as many units there as its own lower case has, so a
+ * hit that starts or ends inside a character's lower case takes in the whole
+ * character.
+ */
+function inTextUnits(text: string, hit: MatchHit): MatchHit {
+  const end = hit.index + hit.length;
+  let start = -1;
+  let lowered = 0;
+  let at = 0;
+  while (at < text.length && lowered < end) {
+    const cp = text.codePointAt(at)!;
+    lowered += String.fromCodePoint(cp).toLowerCase().length;
+    if (start === -1 && lowered > hit.index) start = at;
+    at += cp > 0xffff ? 2 : 1;
+  }
+  return { index: start, length: at - start };
 }
 
 // ============================================================================

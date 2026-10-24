@@ -1,42 +1,28 @@
-- A failed open no longer stops the agent's speech. Speech into a closed channel whose open fails,
-  as on a dead transport, is still published. Before, the open that preceded publishing threw, and
-  the speech failed with "locus channel is closed and open failed". A send tool's call was already
-  published before its open. On a server whose grant lacks `channels.lifecycle`, where no channel
-  can open, speech now publishes without trying to open the channel, and records no intent to
-  open it. Before, it recorded that intent, and then failed.
-- A publish that throws, as on a dead transport, is now a failed route. The agent gets the
-  `[discord-send-failed]` marker, and `mcpl:speech-route-failed` is traced. Before, the framework
-  only logged it.
-- A send tool's call into a tuned-out channel no longer ends the tune-out. It used to set the
-  channel's decision to open, which ended the tune-out epoch, and announced "[channels] Now open".
-- The agent's `channel_close` or `channel_decline` of a channel that's already closed is now
-  recorded as its decision, whatever closed it: its default, the retired recipe policy's one-time
-  migration (every channel a server listed at its first registration), a machine, a module, or a
-  log entry whose source couldn't be read. So neither subscription policy, a server's
-  `initiallyOpen` nor the agent's own speech there opens it later, and a decline after a close is
-  the decision on record, as a close after a decline is. Before, the channel kept the record it
-  had. A machine close of a channel nobody decided about,
-  such as connectome-host's `subscription-gc`, still records no decision: the channel keeps its
-  default, so policy can still open it. That now holds for a channel with no record at all, one
-  registered lazily or on a server whose grant lacks `channels.lifecycle`, where a machine close
-  used to record its own source, which policy never lifts (#417). Records written before this
-  change keep their source, so a channel a machine closed before the upgrade still isn't opened by
-  policy.
-- When the agent closes a channel while an open is still on its way, from its speech, a send or a
-  reconcile after a reconnect, the channel is no longer left marked open, and a send no longer
-  announces "[channels] Now open" after the close. The close goes to the server after the open,
-  so the channel ends closed, and the live state now follows the decision.
+- On a server that's up but whose grant lacks `channels.lifecycle`, speech, a draft's resend or a
+  send's open step no longer tries to open a channel that isn't open, since nothing opens there:
+  the words go into the channel as it stands, and a send answers `already-open` or `stays-closed`.
+  Before, speech and resends there were refused, with "… this host isn't permitted to open or close the …
+  server's channels", or with "the channel isn't confirmed open" where a retarget had left it
+  unconfirmed, and a send's open failed and was traced as `mcpl:channel-open-failed`.
+- The latest deliberate close is the one on record: the agent's `channel_close` over its own
+  decline, its `channel_decline` over its own close, and either over a module's close, or a
+  module's close over the agent's, now record themselves. Before, a channel the agent had already
+  declined kept the decline when it closed it, and the reverse. A machine close of a channel with
+  no record at all, one registered lazily or on a server whose grant lacks `channels.lifecycle`,
+  now leaves it the default it had, where it used to record its own source, which policy never
+  lifts (#417). Records written before this change keep their source, so a channel a machine
+  closed before the upgrade still isn't opened by policy.
 - `channel_decline` of a channel decided open that isn't open at the transport, whose open failed
-  or is still on its way, now records the decline, where it was refused as "already open". A
-  decline of such a channel, or of a tuned-out one that isn't open at the transport, also closes
-  the channel at the server, as `channel_close` does, so the server ends closed whatever an open
-  on its way, or one whose reply was lost, did. discord-mcpl, slack-mcpl and zulip_mcp answer a
-  close of a channel they never opened without an error; a close that fails leaves the decline
-  recorded, with `closeError` in its answer.
-- `channel_close`'s description and the "[channels] Now open" notice's last sentence now say that
-  a channel the agent closes stays closed until it opens it with `channel_open`, and that neither
-  speaking there nor policy reopens it.
+  or is still on its way, now records the decline, where it was refused with "… is open, or set to
+  open, so there's nothing to decline". That's the decline the invitation offers as the way to
+  reply without opening a channel. Where its transport may be open, as with an open on its way,
+  the decline closes it through the channel's lifecycle queue, as any decline does. A channel open
+  at the transport is still refused, now with "… is open, so there's nothing to decline".
+- `channel_close`'s description and the "[channels] Now open" and policy notices' last sentence
+  now say that a channel the agent closes stays closed until it opens it with `channel_open`, and
+  that neither speaking there, the subscription policy nor its server's own default opens it
+  again.
 - The closed-channel invitation is no longer added to a direct message (`chat:dm`), all of which
   reaches the agent whether the DM is open or not. Where no single-word target reaches a channel,
   it no longer says to open the channel to reply: it suggests checking whether the server has a
-  send tool that can address the channel.
+  send tool that can address the channel, and says what replying there does.

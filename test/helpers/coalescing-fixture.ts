@@ -18,7 +18,8 @@ export const TS = '2026-09-30T00:00:00Z';
 
 /**
  * How long the fixture's waits run before they fail: send() for a request's
- * reply, answered() for the host's answers, eventually() for its condition.
+ * reply, answered() for the host's answers, eventually() for its condition,
+ * settles() for the work it's given.
  * Each is a hang guard: it turns a wait that never ends into a failure
  * instead of a hung run, and it isn't a check on how fast the host works. So
  * it's set wide, and the same for every wait: a loaded host's stall needn't
@@ -143,6 +144,21 @@ export async function eventually(predicate: () => boolean, what = 'condition'): 
   // The monotonic clock: a wall-clock step must not fail a wait that's on schedule.
   const deadline = performance.now() + REPLY_DEADLINE_MS;
   while (!predicate()) { assert(performance.now() < deadline, `${what} did not settle within ${REPLY_DEADLINE_MS / 1000} s`); await new Promise((r) => setTimeout(r, 10)); }
+}
+
+/**
+ * Awaits `work`, failing with `what` if it hasn't settled within
+ * REPLY_DEADLINE_MS. Without it, a wait that never ends would run until a
+ * test timeout cut it off, which names nothing it waited on; this turns it
+ * into a failure that names what was awaited. When it fires, the work it
+ * waited on keeps running, and the test's close then runs under it.
+ */
+export async function settles<T>(work: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not settle within ${REPLY_DEADLINE_MS / 1000} s`)), REPLY_DEADLINE_MS);
+  });
+  try { return await Promise.race([work, late]); } finally { clearTimeout(timer); }
 }
 
 

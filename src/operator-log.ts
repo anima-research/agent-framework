@@ -119,34 +119,62 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
 }
 
 /**
+ * Facts every surgery marker receipt carries, whatever happened: the
+ * publication scope chosen (`none` unless the operator chose marks), how many
+ * removed addressable Discord messages the choice leaves unmarked (outside its
+ * scope or its authorized refs; whether the chosen ones are scheduled is the
+ * receipt's `status`), and how many authorized refs it did not remove (a
+ * delayed application whose anchor no longer covered them; their marks are
+ * never widened to anything else).
+ */
+export interface SurgeryMarkerFacts {
+  scope: 'none' | 'addressed' | 'all';
+  unmarked: number;
+  notRemoved: number;
+}
+
+/**
  * What a live surgery did about Discord awareness marks, reported apart from
  * the body change itself. A surgery that returns has applied its body change;
  * this says only whether marks were scheduled:
  *
- * - `none` — no marks were scheduled: the change removed no addressable
- *   Discord message, or the awareness outbox is disabled (no
- *   `discordAwarenessOutboxPath` and no `storePath`). It is not proof that
- *   no addressable Discord message was removed: the surgery's `removedRefs`
- *   (`discordRefs` in the operator log) say whether any was.
- * - `queued` — the outbox batch is durably active, and its delivery was
- *   started in the background. If starting it fails (reconciliation reading
- *   or writing the ledger), a `discord-awareness-delivery` ops alert reports
- *   the failure, the batch stays durably active, and the next sync,
- *   reconnect or start delivers it. It is not a delivery claim: per-message
- *   outcomes stay in the outbox ledger.
+ * - `none` — no marks were requested (the default), or none of the removed
+ *   messages fell within the chosen scope and authorized refs. It says
+ *   nothing about whether Discord messages were removed: `unmarked` counts
+ *   the addressable ones left unmarked, the surgery's `removedRefs` list
+ *   every one, and the operator log's `discordRefs` counts them.
+ * - `queued` — one add request per mark is recorded, and delivered when its
+ *   route is up: a pass starts at once unless the host is stopping, and a
+ *   later one (a reconnect, a tools-list change or the next start) takes
+ *   what remains. If a delivery pass fails, the requests stay recorded and
+ *   the `discord-awareness-delivery` ops alert says so. The same alert names
+ *   the marks a pass, or a start, gave up on: refused by Discord for good,
+ *   or after three unconfirmed attempts. It is not a delivery claim: what
+ *   Discord answers is kept in the awareness ledger.
  * - `not-scheduled` — the body change landed, but recording the batch as
- *   active failed, so it was retired from the ledger: none of its marks will
- *   be delivered.
- * - `unresolved` — the ledger could record neither the activation nor the
- *   retirement. `batchId` names a retained batch whose scheduling outcome is
- *   unresolved: any later reconciliation or restart that can read it may
- *   promote and deliver it, and nothing here promises otherwise.
+ *   active failed, or it was never recorded: none of its marks will be
+ *   delivered. `error` says why, and whether the batch was retired or stays
+ *   prepared for a start to retire.
  */
-export type SurgeryMarkerReceipt =
+export type SurgeryMarkerReceipt = SurgeryMarkerFacts & (
   | { status: 'none'; queued: 0 }
   | { status: 'queued'; queued: number; batchId: string }
   | { status: 'not-scheduled'; queued: 0; error: string }
-  | { status: 'unresolved'; queued: 0; batchId: string; error: string };
+);
+
+/** What a surgery would remove and which messages each marks scope covers. */
+export interface SurgeryMarksPreview {
+  messagesRemoved: number;
+  /** Removed messages that carry a Discord address at all. */
+  addressable: number;
+  emoji: string;
+  scopes: Record<'addressed' | 'all', {
+    count: number;
+    channels: Array<{ channelId: string; count: number }>;
+    /** Pass back as `marks.refs` to bind the choice to exactly these. */
+    refs: Array<{ serverId: string; channelId: string; messageId: string }>;
+  }>;
+}
 
 /** Thrown by live surgery methods when a request cannot be honored. `code`
  *  lets surfaces distinguish "agent busy — quiesce first" from bad input. */

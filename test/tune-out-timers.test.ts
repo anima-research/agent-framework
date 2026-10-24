@@ -70,6 +70,8 @@ function harness(
   /** The reason of each inference requested, the subconscious's turns among them. */
   const inferences: string[] = [];
   const registry = {
+    // Each channel's id is unique here, so it's shown by its id.
+    nameShown: (channel: { channelId: string }) => channel.channelId,
     listChannelsRaw: () => (state ? [{ serverId: 'disc', descriptor: { id: '#a' } }] : []),
     getTuneOutState: () => state,
     enterTuneOut: (_s: string, _c: string, params: TuneOutParams) => {
@@ -118,7 +120,7 @@ function harness(
     delays.every((ms) => ms <= ONE_TIMER_MS),
     `no timer longer than one holds (${delays.filter((ms) => !(ms <= ONE_TIMER_MS)).join(', ')})`,
   );
-  /** End the tune-out in the registry alone, as a send into the channel or a close does. */
+  /** End the tune-out in the registry alone, without the coordinator's cancel. */
   const endInRegistry = () => { state = null; };
   const active = () => state !== null;
   /** Make the step's next call throw `thrown`. */
@@ -185,7 +187,7 @@ it("after a cancel, a new tune-out on the channel isn't ended at the old one's e
   h.noTimerPastOne();
 });
 
-it("a tune-out that ends in the registry, as a send or a close ends it, leaves none of its timers to act on the channel's next one", (t) => {
+it("a tune-out that ends in the registry without its cancel leaves none of its timers to act on the channel's next one", (t) => {
   const h = harness(t);
   // A two-day end time (short enough for one timer, so main's single timer
   // shows the same case), the default 1800 s cadence, and a wake coalescing
@@ -519,5 +521,5 @@ it('a thrown value that is not an Error is reported as a string, even one with n
   // String() throws for an object with no prototype.
   h.failNext('addMessage', Object.create(null));
   assert.doesNotThrow(() => t.mock.timers.tick(60_000));
-  assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full', '[object Object]']);
+  assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full', '(a value that could not be read)']);
 });

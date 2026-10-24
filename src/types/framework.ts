@@ -16,6 +16,13 @@ export type { TraceEvent, TraceEventListener } from './trace.js';
 export interface ModuleProcessResponse {
   moduleName: string;
   response: EventResponse;
+  /**
+   * Set when applying the response threw: the operation it threw at, such
+   * as `the edit of <id>`, and the error's message. What the response asked
+   * for before that was applied, that operation may have taken effect in
+   * part or whole, and the rest of it wasn't (EventResponse).
+   */
+  threw?: { at: string; error: string };
 }
 
 /**
@@ -24,8 +31,6 @@ export interface ModuleProcessResponse {
 export interface ProcessLoggingConfig {
   /** Persist process logs to Chronicle (default: false) */
   persist?: boolean;
-  /** Broadcast process:completed trace events (default: false) */
-  broadcast?: boolean;
 }
 
 /**
@@ -33,47 +38,66 @@ export interface ProcessLoggingConfig {
  */
 /**
  * Client-side programmatic tool calling: a synthesized `code_execution` tool
- * that runs model-authored Python on the host, with every framework tool
- * injected as an async function. Mirrors the trained surface of Anthropic's
- * server-side PTC; inner tool results never enter the model context.
+ * that runs model-authored JavaScript in QuickJS compiled to WebAssembly, in a
+ * child process of its own per script, with the agent's tools as async
+ * functions. Mirrors the trained surface of Anthropic's server-side PTC;
+ * inner tool results never enter the model context.
  *
- * Robustness boundary, not a security sandbox (same doctrine as gate.js —
- * the agent already has broader host access through its tools).
+ * A script adds nothing to what its agent's tools allow, provided the host
+ * runtime's WebAssembly engine and the glue around it are right. It claims no
+ * containment beyond that: the child runs as the host's user, with an empty
+ * environment and no operating-system sandbox around it.
  */
 export interface CodeExecutionConfig {
-  /** Master switch — the tool is only synthesized when true. */
+  /** Master switch — only `true` synthesizes the tool. `create()` refuses a
+   *  value that isn't a boolean, a quoted "false" included; `null` or leaving
+   *  it out counts as off. */
   enabled: boolean;
-  /** Python interpreter to spawn (default: 'python3' from PATH). */
-  pythonPath?: string;
-  /**
-   * Per-inner-tool-call timeout; exceeding it raises TimeoutError inside the
-   * script (default 270_000 ms, mirroring the managed runtime's message).
-   */
+  /** How long a run or a wait waits for its script before it yields, unless
+   *  the agent asks otherwise with `yield_time_ms` (default 30_000 ms). */
+  yieldMs?: number;
+  /** The most an agent may ask a run or a wait to wait (default 600_000 ms).
+   *  At least `yieldMs`. */
+  maxYieldMs?: number;
+  /** A script's limit: a script still running this long after it started is
+   *  stopped, as "stopped at its limit" (default 86_400_000 ms, a day). */
+  scriptLifetimeMs?: number;
+  /** Scripts one agent may have running at once, yielded ones included
+   *  (default 3). */
+  maxRunningScripts?: number;
+  /** Script processes the host runs at once, every agent's together
+   *  (default 16). A run past it is refused at once, and nothing runs. */
+  maxScriptChildren?: number;
+  /** How long one of a script's tool calls may go unanswered before the
+   *  script is told it timed out; the tool may still take effect
+   *  (default 270_000 ms). */
   toolCallTimeoutMs?: number;
-  /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
-  scriptTimeoutMs?: number;
-  /**
-   * Longest deadline an agent may ask for on one call with `time_limit_ms`
-   * (default: `scriptTimeoutMs`, so agents can only shorten it until this is
-   * raised). Longer requests are capped, and the result says so.
-   */
-  maxScriptTimeoutMs?: number;
-  /**
-   * Idle interpreter reclaim — script globals are lost after this much
-   * inactivity (default 300_000 ms, mirroring ~5-minute container reclaim).
-   * 0 disables reclaim.
-   */
-  idleReclaimMs?: number;
-  /** Max concurrent background (daemon) scripts per agent (default 3). */
-  maxBackgroundScripts?: number;
-  /** Background script lifetime ceiling, ms (default 86_400_000 = 24h). */
-  backgroundMaxLifetimeMs?: number;
   /** Minimum interval between wake_agent() deliveries, ms (default 60_000).
-   *  Early wakes are delayed, not dropped (backpressure inside the script). */
+   *  Early wakes are delayed, not dropped. */
   wakeMinIntervalMs?: number;
-  /** Max wake_agent() calls per background script (default 100); further
-   *  calls raise RuntimeError inside the script. */
+  /** Max wake_agent() calls per script (default 100); further calls are
+   *  refused in the script. */
   maxWakesPerScript?: number;
+  /**
+   * The WebAssembly memory's maximum for each script, its budget: a whole
+   * number of 64 KiB pages from 4 MiB to 2 GiB (default 128 MiB). A script's
+   * process stays within about its runtime's base plus 2.7 times this, plus
+   * what its calls take as they go out: up to about 200 MiB under Node and
+   * 410 MiB under Bun. The host holds at most about 6 times this, plus 653 MiB,
+   * plus 128 KiB for each wake maxWakesPerScript allows, for a script: about
+   * 1.4 GiB at the defaults.
+   * That's its 16 calls out at once, each with at most 4 MiB of JSON
+   * arguments, timed-out ones whose tools still run included, up to 16 more
+   * waiting as their text for those to end, up to 16 answers until the child
+   * takes them, each at most a third of this, the frame from the child being
+   * read, and its waiting wakes. A tool's
+   * own result, and the one serialization the bridge makes of it to check its
+   * size, are the tool's, beside this. Size a host by both. A call past the 16
+   * the script waits on waits in the script, in this memory. A tool result too large for
+   * it reaches the script as ResultTooLarge; how much fits depends on the
+   * result's shape (see `IsolateSettings.memoryMaxBytes`).
+   */
+  memoryMaxBytes?: number;
 }
 
 /** See `FrameworkConfig.providerHold`. */
@@ -100,9 +124,10 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * IANA zone used only when rendering wall-clock times for the agent.
-   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
-   * then the process zone.
+   * IANA zone of the agent's wall clock: it renders wall-clock times for the
+   * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
+   * counted from local midnight here). Stored/protocol timestamps remain
+   * epoch/UTC. Defaults to AGENT_TIMEZONE, then the process zone.
    */
   timeZone?: string;
 
@@ -110,9 +135,10 @@ export interface FrameworkConfig {
   storePath?: string;
 
   /**
-   * Branch-independent Discord awareness-marker outbox. Defaults to
+   * Branch-independent Discord awareness ledger. Defaults to
    * `<storePath>/recovery/discord-awareness-outbox.json`. Set explicitly when
-   * providing an app-owned `store` without `storePath`; omit to disable.
+   * providing an app-owned `store` without `storePath`; with neither, the
+   * framework has no ledger and refuses a marks choice.
    */
   discordAwarenessOutboxPath?: string;
 
@@ -210,24 +236,29 @@ export interface FrameworkConfig {
 
   /**
    * Client-side programmatic tool calling (`code_execution` tool). Omitted or
-   * `enabled: false` → tool absent, no python is ever spawned.
+   * `enabled: false` → tool absent, and no script's process is ever started. At runtime,
+   * untyped configs may also use `null` or `false` to omit this setting.
+   * Other values that aren't objects are refused at `create()`.
    */
   codeExecution?: CodeExecutionConfig;
 
   /**
    * Durable inline cap (chars) for tool results — successes AND errors — and
-   * background-script wake payloads. Content over the cap is written to a
+   * script wake payloads (wake_agent()). Content over the cap is written to a
    * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
    * name, overwritten on collision, retained until the workspace owner
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview
-   * plus the file reference; with no writable workspace the fallback is
+   * plus the file reference; with no writable mount without an include that
+   * keeps its files in the store (not configured direct), the fallback is
    * explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
    * >= 1000. A resident's own agent_settings value
    * `tool_result_inline_max_chars` (durable, persisted in framework state)
    * takes precedence over this for that agent; the EFFECTIVE cap for every
    * source is min(desired, strategy bound) — desired values above the
    * strategy-derived bound (maxMessageTokens * 4) are hard-clamped to it,
-   * with the clamp reported via agent_settings get.
+   * with the clamp reported via agent_settings get. For an ordinary resident
+   * the bound is the smallest among the agents that read the shared slot,
+   * reported as clamped by `reader-bound` when another reader's sets it.
    */
   toolResultInlineMaxChars?: number;
 
@@ -253,7 +284,17 @@ export interface FrameworkConfig {
    */
   hostToolClasses?: Record<string, string[]>;
 
-  /** Inference routing policy for server-initiated inference (optional). */
+  /**
+   * Inference routing policy for server-initiated inference (optional): the
+   * model an MCPL server's inference/request runs on. Without one, each such
+   * request is refused with -32603 and a message naming this setting; the
+   * framework doesn't choose a model for a server. A server's effective
+   * grant can still list `inferenceRequest` then, since the grant comes from
+   * what the server advertises and `enabledCapabilities`, not from this
+   * policy. A policy that names no model for a request's feature set (no
+   * override, byFeature or wildcards entry that names one, and an empty
+   * `default`) refuses that request the same way, naming the feature set.
+   */
   inferenceRouting?: InferenceRoutingPolicy;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
@@ -411,7 +452,7 @@ export interface InferenceLogEntry {
   requestId: string;
   /** Whether inference succeeded */
   success: boolean;
-  /** Error message if failed */
+  /** Why it didn't succeed: the failure's message, or what stopped it */
   error?: string;
   /** Request data or blob ID if large. A stream the framework ended at a
    *  tool boundary (stopReason 'turn_ended', 'context_budget' or
@@ -422,8 +463,8 @@ export interface InferenceLogEntry {
   durationMs: number;
   /** The stream's usage: its final response's, or, for a stream that ended
    *  without one, the provider rounds it finished before it ended. Exactly
-   *  one entry of a stream carries it, the one its end wrote; a stream whose
-   *  end writes none (a quiesce-abandoned turn, a superseded stream, a
+   *  one entry of a stream carries it, the one its end wrote, a stop's
+   *  included; a stream whose end writes none (a superseded stream, a
    *  disposed agent's stream) gets a failure entry that carries it, when it
    *  had finished a round. One that hadn't has nothing to carry and gets no
    *  entry. */
@@ -441,13 +482,16 @@ export interface InferenceLogEntry {
 }
 
 /**
- * Entry in the process log - records a processed event with all module responses.
+ * Entry in the process log - records a processed event with the module
+ * responses that applied.
  */
 export interface ProcessLogEntry {
   timestamp: number;
   /** The process event that was handled */
   processEvent: ProcessEvent;
-  /** Responses from all modules, or blob ID if large */
+  /** The modules' responses that applied, or blob ID if large. A response
+   *  refused for content context-manager won't store is left out; its stderr
+   *  line and process:response-refused trace name it. */
   responses: ModuleProcessResponse[] | { blobId: string };
 }
 
@@ -457,7 +501,7 @@ export interface ProcessLogEntry {
 export interface ProcessLogQuery {
   /** Filter by process event type */
   eventType?: string;
-  /** Filter by module name (modules that responded) */
+  /** Filter by module name (modules whose responses applied) */
   moduleName?: string;
   /** Max number of logs to return */
   limit?: number;

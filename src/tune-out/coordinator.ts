@@ -18,7 +18,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
-import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
+import type { ChannelRef, ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
 import { armAfter, armAt } from '../deadline-timer.js';
@@ -37,14 +37,44 @@ const WAKE_COALESCE_MS = 2_000;
 /** How long after an end time whose cancel threw the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
 
-/** What a caught value says: an Error's message, or the value as a string. */
-function describeThrown(err: unknown): string {
-  if (err instanceof Error) return err.message;
+/** Ends a backlog line cut to fit in one of the residents' messages. */
+const CUT_MARK = " [cut to fit; the whole message is in the channel's history]";
+
+/**
+ * tune_out's refusal of a channel already tuned out: its settings, then what
+ * its transport is now where the repeat tried to open it again (`transport`,
+ * from the framework's dispatch), then how to change the settings.
+ */
+export function alreadyTunedOutText(shown: string, p: TuneOutParams, transport?: string): string {
+  // A duration so long its end is past what a Date can hold has no time to show.
+  const expires = p.expiresAtMs !== undefined ? new Date(p.expiresAtMs) : undefined;
+  const until = expires && Number.isFinite(expires.getTime())
+    ? `, until ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
+    : '';
+  // A thrown error's words may end without a stop.
+  const now = transport === undefined ? '' : /[.!?]$/.test(transport) ? `${transport} ` : `${transport}. `;
+  return `Nothing changed${transport !== undefined ? ' in the tune-out' : ''}: ${JSON.stringify(shown)} is already `
+    + `tuned out, with cadenceSeconds ${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. `
+    + now
+    + 'To change those, cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call '
+    + 'tune_out again with the new settings.';
+}
+
+/** The first `length` code units of `text`, one fewer where the last would be
+ *  the first half of a surrogate pair. */
+function prefixOf(text: string, length: number): string {
+  const cut = text.slice(0, Math.max(0, length));
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
+/** What a thrown value says, without throwing: an Error's message, or the
+ *  value as text, which String() can't give for an object with no prototype. */
+function thrownReason(error: unknown): string {
   try {
-    return String(err);
+    return error instanceof Error ? error.message : String(error);
   } catch {
-    // A value with no string form, such as an object with no prototype.
-    return Object.prototype.toString.call(err);
+    return '(a value that could not be read)';
   }
 }
 
@@ -64,12 +94,26 @@ export interface TuneOutFrameworkHooks {
   primaryName: () => string | null;
   /** Read the primary's stored messages (shared slot, unfiltered). */
   getStoredMessages: () => StoredMessage[];
+  /**
+   * Messages admitted for the primary but not yet in its store (deferred
+   * while a turn was alive), oldest first. A cancel reads them too, so a
+   * message held mid-turn is in the backlog it belongs to (#232 gap 7).
+   */
+  getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
+  /**
+   * The most characters of text every reader of the residents' shared slot
+   * is shown whole in one message: the smallest of their strategies'
+   * per-message caps (`maxMessageTokens`) at four characters a token, or
+   * undefined when none has such a cap. A cancel's dump is one message in
+   * that slot, so it holds as many backlog lines as fit.
+   */
+  residentMessageChars?: () => number | undefined;
   /** Current chronicle head sequence (window anchor for new epochs). */
   currentSequence: () => number;
   /** Move the subconscious window anchor (never forward past active epochs). */
   setSubconsciousAnchor: (sequence: number) => void;
   /** True when a channel is bound to a conversation-fork agent. */
-  isForkBound: (channelId: string) => boolean;
+  isForkBound: (channel: ChannelRef) => boolean;
   /** Gate privileged-users list (#77: privileged authors wake, like mentions). */
   isPrivilegedAuthor: (authorId: string | null | undefined) => boolean;
   /** speak_in_channel master switch (recipe-side, canary-gated). */
@@ -98,6 +142,15 @@ export class TuneOutCoordinator {
 
   private key(serverId: string, channelId: string): string {
     return `${serverId}\0${channelId}`;
+  }
+
+  /** A channel as the resident and the subconscious are shown it
+   *  (ChannelRegistry.nameShown): its id, or, where another server registers
+   *  the same id, its server-qualified name, which tune_out and
+   *  cancel_tuneout take back; or, for a channel no string picks alone, its
+   *  id and its server. */
+  private shown(serverId: string, channelId: string): string {
+    return this.channelRegistry.nameShown({ serverId, channelId });
   }
 
   /** Restart cadence + expiry timers and re-anchor after a process restart. */
@@ -155,7 +208,7 @@ export class TuneOutCoordinator {
       timer,
       serverId,
       channelId,
-      error: describeThrown(err),
+      error: thrownReason(err),
     });
   }
 
@@ -179,7 +232,7 @@ export class TuneOutCoordinator {
     channelId: string,
     opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
     source: string,
-  ): { ok: true; params: TuneOutParams } | { ok: false; error: string } {
+  ): { ok: true; params: TuneOutParams } | { ok: false; error: string; alreadyTunedOut?: true } {
     if (!this.hooks.subconsciousName()) {
       return {
         ok: false,
@@ -188,31 +241,17 @@ export class TuneOutCoordinator {
           + 'whoever runs this host.',
       };
     }
-    if (this.hooks.isForkBound(channelId)) {
+    if (this.hooks.isForkBound({ serverId, channelId })) {
       return {
         ok: false,
-        error: `Nothing changed: a conversation is bound to ${JSON.stringify(channelId)}, so its messages go to that `
+        error: `Nothing changed: a conversation is bound to ${JSON.stringify(this.shown(serverId, channelId))}, so its messages go to that `
           + "conversation, and tune_out won't divert a channel while one is. Calling tune_out on it again won't change "
           + 'that until the conversation ends, which happens only once the channel has been quiet for a while. Tune '
           + 'out a different channel, or ask whoever runs this host if this one should be diverted.',
       };
     }
     const current = this.channelRegistry.getTuneOutState(serverId, channelId);
-    if (current) {
-      const p = current.params;
-      // A duration so long its end is past what a Date can hold has no time to show.
-      const expires = p.expiresAtMs !== undefined ? new Date(p.expiresAtMs) : undefined;
-      const until = expires && Number.isFinite(expires.getTime())
-        ? `, until ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
-        : '';
-      return {
-        ok: false,
-        error: `Nothing changed: ${JSON.stringify(channelId)} is already tuned out, with cadenceSeconds `
-          + `${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. To change those, `
-          + 'cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call tune_out '
-          + 'again with the new settings.',
-      };
-    }
+    if (current) return { ok: false, error: alreadyTunedOutText(this.shown(serverId, channelId), current.params), alreadyTunedOut: true };
     // A tool's input reaches here as the model wrote it, and the store can't
     // keep a NaN or an Infinity: its append would throw after the registry
     // had marked the channel tuned out. So each option is read as a number
@@ -260,9 +299,9 @@ export class TuneOutCoordinator {
       startedAtSequence: this.hooks.currentSequence(),
       ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
     };
-    // A tune-out can end in the registry without cancel (a send into the
-    // channel or a close sets its state there), leaving its timers armed:
-    // clear them, so none of them acts on this one.
+    // A tune-out that ended in the registry without this coordinator's
+    // cancel would have left its timers armed: clear them, so none of them
+    // acts on this one.
     this.clearTimers(serverId, channelId);
     this.channelRegistry.enterTuneOut(serverId, channelId, params, source);
     this.armExpiry(serverId, channelId, params);
@@ -298,40 +337,113 @@ export class TuneOutCoordinator {
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, 'open', source);
     if (!ended) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
-      return { ok: false, error: this.notTunedOut(channelId, 'you') };
+      return { ok: false, error: this.notTunedOut(this.shown(serverId, channelId), 'you') };
     }
     this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
-    // Backlog: every message stamped with this epoch, oldest first.
+    // Backlog: every message held under this epoch. The stored ones come in
+    // store order, then those still in the deferred queue (held mid-turn,
+    // not yet written), oldest first. That's arrival order, except when a
+    // held message stays queued while a later one is stored: a store write
+    // refused at a turn-start flush leaves it queued, and that turn's
+    // assembly can then store later coalesced messages directly.
     const epochId = ended.params.epochId;
-    const backlog = this.hooks.getStoredMessages().filter(
-      (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
-    );
-    const cap = ended.params.backlogCap;
-    const shown = cap > 0 ? backlog.slice(-cap) : [];
-    const truncated = backlog.length - shown.length;
-
-    const lines = shown.map((m) => {
-      const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
+    const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
+    const held = (this.hooks.getDeferredMessages?.() ?? []).filter(ofEpoch);
+    const backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> = [
+      ...this.hooks.getStoredMessages().filter(ofEpoch),
+      ...held,
+    ];
+    // Whole messages: a cap below one shows none, where slice(-0.5) would
+    // start at 0 and take them all.
+    const cap = Math.floor(ended.params.backlogCap);
+    const authorOf = (m: Pick<StoredMessage, 'participant' | 'metadata'>): string =>
+      (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
+    const lineOf = (m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string => {
       const text = m.content
         .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
-      return `${author}: ${text}`;
-    });
-    const attrs = [
-      `channel="${channelId}"`,
-      `messages=${backlog.length}`,
-      ...(truncated > 0 ? [`truncated=${truncated} (oldest; fetch_history covers the rest)`] : []),
+      return `${authorOf(m)}: ${text}`;
+    };
+    // The channel as the resident and the subconscious are shown it.
+    const name = this.shown(serverId, channelId);
+    const lifecycle = `[Tune-out: ${name} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]`;
+    const render = (lines: string[], truncated: number): string => {
+      const attrs = [
+        `channel="${name}"`,
+        `messages=${backlog.length}`,
+        ...(truncated > 0 ? [`truncated=${truncated} (oldest; fetch_history covers the rest)`] : []),
+      ];
+      return `${lifecycle}\n\n<tuned-out-backlog ${attrs.join(' ')}>\n${lines.join('\n')}\n</tuned-out-backlog>`;
+    };
+
+    // The dump is one message in the residents' shared slot, so each
+    // resident's strategy cuts it as it cuts any message past its per-message
+    // cap: context-manager's AutobiographicalStrategy (which connectome-host's
+    // FrontdeskStrategy extends) and WindowedPassthroughStrategy count a text
+    // block at a token per four characters, rounded up, and keep a message's
+    // first cap × 4 characters. Cut there, the dump would lose its newest
+    // lines, which would still count as shown. So it holds the newest lines
+    // that fit whole in the smallest such room, and those it leaves out, the
+    // oldest, count as truncated along with those above backlogCap, so the
+    // report is told of them. A newest message too long to fit alone is shown
+    // cut to the room left and marked, so the residents still get its head,
+    // as they would from a row of its own. When no line fits, whole or cut,
+    // the dump shows none; if the room is too small for even that, the
+    // residents' strategies cut its frame, the header and tags.
+    let shown = cap > 0 ? backlog.slice(-cap) : [];
+    let lines = shown.map(lineOf);
+    let newestCut = false;
+    const room = this.hooks.residentMessageChars?.();
+    if (room !== undefined && render(lines, backlog.length - shown.length).length > room) {
+      // The dump's length with no line, for the count that showing k lines
+      // leaves out: truncated= takes that count's digits, and goes at 0. With
+      // the newest k lines whole, the dump is that and the lines, with a
+      // newline between each two. While a message is left out, each line kept
+      // makes it longer, and they don't all fit, so the fit keeps lines from
+      // the newest while the next one fits.
+      const frameShowing = (k: number): number => render([], backlog.length - k).length;
+      let used = 0;
+      let kept = 0;
+      while (kept < lines.length) {
+        const next = used + lines[lines.length - 1 - kept]!.length + (kept > 0 ? 1 : 0);
+        if (frameShowing(kept + 1) + next > room) break;
+        used = next;
+        kept++;
+      }
+      // What of the newest line's text fits beside the frame and the mark. A
+      // cut shows some of it or none: a room under one character, or one
+      // that would split a surrogate pair, leaves the head empty.
+      const head = prefixOf(lines.at(-1) ?? '', room - frameShowing(1) - CUT_MARK.length);
+      if (kept === 0 && head !== '') {
+        lines = [head + CUT_MARK];
+        shown = shown.slice(-1);
+        newestCut = true;
+      } else {
+        lines = lines.slice(lines.length - kept);
+        shown = shown.slice(shown.length - kept);
+      }
+    }
+    const truncated = backlog.length - shown.length;
+    // The held messages the dump leaves out, the oldest of them. The
+    // subconscious's report covers what the dump leaves out, but its view
+    // holds stored rows only, so these go to it with its notice below. So does
+    // a held message the dump shows but can't give whole: one whose image or
+    // audio its text lines drop, or the newest, cut to fit.
+    const heldLeftOut = held.slice(0, Math.max(0, held.length - shown.length));
+    const heldForReport = [
+      ...heldLeftOut,
+      ...held.slice(heldLeftOut.length).filter((m) =>
+        m.content.some((b) => b.type !== 'text') || (newestCut && m === shown[0])),
     ];
-    const dump =
-      `<tuned-out-backlog ${attrs.join(' ')}>\n${lines.join('\n')}\n</tuned-out-backlog>`;
 
     // Host-framed system artifacts — never voiced as anyone.
     this.hooks.addMessage(
       'user',
-      [{ type: 'text', text: `[Tune-out: ${channelId} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]\n\n${dump}` }],
+      [{ type: 'text', text: render(lines, truncated) }],
       { system: true, kind: 'tune-out-cancel', channelId, epochId },
     );
     // The subconscious's own words, under its own name, verbatim.
@@ -340,28 +452,49 @@ export class TuneOutCoordinator {
       this.hooks.addMessage(
         subName,
         [{ type: 'text', text: subconsciousNote }],
-        { kind: 'subconscious-note', channelId, epochId },
+        // With its server: a conversational row whose channel the framework
+        // reads (repinChannel), where another server's channel can share the id.
+        { kind: 'subconscious-note', channelId, serverId, epochId },
       );
     }
     const primary = this.hooks.primaryName();
     if (primary) {
       this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
     }
-    // The subconscious gets one cancel turn of its own (unless it initiated
-    // the cancel — its note already carries its words): the issue's cancel
-    // shape is dump + a report from the subconscious, and when the cap
-    // truncated the raw dump, its summary is what covers the tail.
-    if (source !== 'subconscious' && subName) {
+    // The subconscious gets one cancel turn of its own: the issue's cancel
+    // shape is dump + a report from the subconscious, and when the dump left
+    // messages out, its summary is what covers them. The held messages the
+    // dump can't give the resident whole follow the notice, each a row of its
+    // own with its own content, as its view can't have them until they're
+    // stored. A cancel the subconscious makes itself gets the notice and the
+    // turn when some do, since it wrote its note before it could see them,
+    // and when it wrote no note and the dump left any message out, since
+    // nothing else then covers it. Otherwise its note speaks for what it saw.
+    const selfCancel = source === 'subconscious';
+    if (subName && (!selfCancel || heldForReport.length > 0 || (!subconsciousNote && truncated > 0))) {
       const truncNote = truncated > 0
-        ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw.`
+        ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
+        : '';
+      const heldNote = heldForReport.length > 0
+        ? ` Still held at the cancel, so your view may not have them yet: the ${heldForReport.length} message${heldForReport.length === 1 ? '' : 's'} after this one.`
         : '';
       this.hooks.addMessage(
         'user',
-        [{ type: 'text', text: `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}]` }],
+        [{ type: 'text', text: `[Tune-out cancelled: ${this.shown(serverId, channelId)} — ${reason}.${truncNote}${heldNote}]` }],
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
-      this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
+      // Each held message is a row of its own, so a per-message cap cuts each
+      // one on its own, its author's label included, not the batch's newest.
+      for (const m of heldForReport) {
+        this.hooks.addMessage(
+          'user',
+          [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content],
+          { system: true, kind: 'tune-out-cancel-held', channelId },
+          subName,
+        );
+      }
+      this.hooks.requestInference(subName, `tune-out cancelled: ${name}`, 'tune-out');
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
@@ -431,7 +564,7 @@ export class TuneOutCoordinator {
         type: 'tune-out:ack-failed',
         serverId,
         channelId,
-        error: describeThrown(err),
+        error: thrownReason(err),
       });
     }
   }
@@ -529,16 +662,17 @@ export class TuneOutCoordinator {
     if (!subName) return;
     const key = this.key(serverId, channelId);
 
+    const shown = this.shown(serverId, channelId);
     const notice = trigger === 'wake'
-      ? `[Tune-out wake: ${channelId} — ${count} addressed message${count === 1 ? '' : 's'}]`
-      : `[Tune-out cadence: ${channelId} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
+      ? `[Tune-out wake: ${shown} — ${count} addressed message${count === 1 ? '' : 's'}]`
+      : `[Tune-out cadence: ${shown} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
     this.hooks.addMessage(
       'user',
       [{ type: 'text', text: notice }],
       { system: true, kind: `tune-out-${trigger}`, channelId },
       subName,
     );
-    this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out');
+    this.hooks.requestInference(subName, `tune-out ${trigger}: ${shown}`, 'tune-out');
     // Counted from here only once the turn has been asked for, so a turn that
     // throws leaves its messages for the next period's turn.
     this.divertedSinceInvocation.set(key, 0);
@@ -559,6 +693,8 @@ export class TuneOutCoordinator {
    * subconscious's compiles (antra: deliver changes, never let them wash
    * away — it has no long-term memory, so they must not live in window
    * content). Bytes change only when a disposition changes: KV-friendly.
+   * A failed read of the stored map throws, so the compile stops rather than
+   * run without them.
    */
   getDispositionsInjection(): {
     namespace: string;
@@ -580,12 +716,17 @@ export class TuneOutCoordinator {
 
   private readDispositions(): Record<string, string> {
     if (this.dispositionsCache) return this.dispositionsCache;
+    let raw: unknown;
     try {
-      const raw = this.channelRegistry.readCoordinatorState(this.dispositionsStateId);
-      this.dispositionsCache = (raw && typeof raw === 'object') ? raw as Record<string, string> : {};
-    } catch {
-      this.dispositionsCache = {};
+      raw = this.channelRegistry.readCoordinatorState(this.dispositionsStateId);
+    } catch (error) {
+      // A failed read is not an empty map, and nothing is cached, so the next
+      // read asks the store again. Taken as empty, it would compile the
+      // subconscious without its dispositions until a restart, and the next
+      // noteDisposition would write that empty map over the stored one.
+      throw new Error(`the stored dispositions (${this.dispositionsStateId}) could not be read: ${thrownReason(error)}`, { cause: error });
     }
+    this.dispositionsCache = (raw && typeof raw === 'object') ? raw as Record<string, string> : {};
     return this.dispositionsCache;
   }
 
@@ -596,8 +737,14 @@ export class TuneOutCoordinator {
     } else {
       dispositions[key] = text;
     }
+    // Stored before it's cached: a write that fails leaves the cache and the
+    // store as they were, so the note is in effect nowhere.
+    try {
+      this.channelRegistry.writeCoordinatorState(this.dispositionsStateId, dispositions);
+    } catch (error) {
+      throw new Error(`the dispositions (${this.dispositionsStateId}) could not be stored: ${thrownReason(error)}`, { cause: error });
+    }
     this.dispositionsCache = dispositions;
-    this.channelRegistry.writeCoordinatorState(this.dispositionsStateId, dispositions);
   }
 
   // ==========================================================================
@@ -607,6 +754,8 @@ export class TuneOutCoordinator {
   async handleSubconsciousTool(
     name: string,
     input: Record<string, unknown>,
+    /** The calling turn's own channels, for a call made inside it (the framework's callOwnChannels). */
+    own: readonly ChannelRef[] = [],
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     switch (name) {
       case 'deliver_summary': {
@@ -622,19 +771,48 @@ export class TuneOutCoordinator {
         }
         const subName = this.hooks.subconsciousName();
         if (!subName) return { success: false, error: 'subconscious not configured', isError: true };
-        // Verbatim, under its own participant name, into the resident's window.
+        // Verbatim, under its own participant name, into the resident's window,
+        // tagged with the channel the name means and its server, since the
+        // framework reads a conversational row's channel (repinChannel). The
+        // name means what it means to every channel tool: inside the calling
+        // turn, the id of one of the turn's own channels means that channel,
+        // refused where its server no longer registers it or the turn has
+        // channels with that id on two servers (ownChannelFor); otherwise a
+        // name several registered channels answer to is refused with them
+        // (sharedNameRefusalFor). So no row is left for a re-pin to read as
+        // another server's channel. A name no registered channel answers to
+        // is kept as given, with no server, which a re-pin reads by name when
+        // it weighs the row, as it reads any message without its server.
+        const mine = this.channelRegistry.ownChannelFor(channelId, own, 'deliver');
+        if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        const shared = mine ? undefined : this.channelRegistry.sharedNameRefusalFor(channelId, 'nothing was delivered');
+        if (shared) return { success: false, error: shared, isError: true };
+        const [named] = mine ? [mine.channel] : this.channelRegistry.channelsNamed(channelId);
         this.hooks.addMessage(subName, [{ type: 'text', text }], {
           kind: 'subconscious-summary',
-          channelId,
+          ...(named ? { channelId: named.channelId, serverId: named.serverId } : { channelId }),
         });
         return { success: true, data: { delivered: true } };
       }
       case 'cancel_tuneout': {
-        const channelId = String(input.channelId ?? '');
-        const located = this.findByChannel(channelId);
-        if (!located) return { success: false, error: this.notTunedOut(channelId, 'the resident'), isError: true };
+        const name = String(input.channelId ?? '');
+        // The name means what it means to every channel tool, the
+        // resident's tune_out included: inside the calling turn, the id of
+        // one of the turn's own channels means that channel (ownChannelFor);
+        // otherwise a name several registered channels answer to is refused
+        // (channelsNamed), whichever of them is tuned out, never taken to be
+        // the tuned-out one.
+        const mine = this.channelRegistry.ownChannelFor(name, own);
+        if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        const named = mine ? [mine.channel] : this.channelRegistry.channelsNamed(name);
+        const shared = mine ? undefined : this.channelRegistry.sharedNameRefusalFor(name);
+        if (shared) return { success: false, error: shared, isError: true };
+        const channel = named[0];
+        if (!channel || !this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)) {
+          return { success: false, error: this.notTunedOut(name, 'the resident'), isError: true };
+        }
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
-        const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note);
+        const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note);
         return result.ok
           ? { success: true, data: { cancelled: true } }
           : { success: false, error: result.error, isError: true };
@@ -649,7 +827,20 @@ export class TuneOutCoordinator {
             isError: true,
           };
         }
-        this.noteDisposition(key, String(input.text ?? ''));
+        try {
+          this.noteDisposition(key, String(input.text ?? ''));
+        } catch (error) {
+          // For the subconscious first: what became of its note, and that a
+          // later call may land. The store's own reason follows, for an operator.
+          // The note may set, change or remove a disposition, so what stays in
+          // effect is whatever was there before, if anything.
+          return {
+            success: false,
+            isError: true,
+            error: `The change to the disposition ${JSON.stringify(key)} wasn't recorded, so the dispositions stay as they were. ` +
+              `Noting it again may work once the store can be read and written. The store's error: ${thrownReason(error)}`,
+          };
+        }
         return { success: true, data: { noted: key } };
       }
       case 'speak_in_channel': {
@@ -671,7 +862,11 @@ export class TuneOutCoordinator {
         if (!text) {
           return { success: false, error: 'Nothing was posted: speak_in_channel needs the message in "text".', isError: true };
         }
-        return this.channelRegistry.publishForAgent(channelId, text, this.hooks.subconsciousName() ?? 'Subconscious');
+        // Inside the calling turn, the id of one of the turn's own channels
+        // means that channel, as for every channel tool (ownChannelFor).
+        const mine = this.channelRegistry.ownChannelFor(channelId, own, 'publish');
+        if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        return this.channelRegistry.publishForAgent(mine ? mine.channel : channelId, text, this.hooks.subconsciousName() ?? 'Subconscious');
       }
       default:
         return { success: false, error: `unknown subconscious tool: ${name}`, isError: true };
@@ -679,30 +874,24 @@ export class TuneOutCoordinator {
   }
 
   /**
-   * A cancel of a channel that isn't tuned out: which channels are, so the
-   * next call can name one, and how a tune-out ends without one. `backlogTo`
+   * A cancel of a channel that isn't tuned out, by the name the caller gave
+   * or knows it by: which channels are, so the next call can name one, and
+   * how a tune-out ends without one. `backlogTo`
    * names the resident as the message's reader knows it: "you" to the
    * resident, "the resident" to the subconscious. It speaks of connected
    * channels because listActive reads the registered ones: removing a server
    * drops its channels and keeps their tune-outs, so a tune-out there is in
-   * neither this list nor findByChannel's lookup, and the text claims nothing
-   * about it.
+   * neither this list nor the name's lookup (channelsNamed, which reads the
+   * registered channels too), and the text claims nothing about it.
    */
-  private notTunedOut(channelId: string, backlogTo: 'you' | 'the resident'): string {
-    const active = this.listActive().map((e) => JSON.stringify(e.channelId));
+  private notTunedOut(name: string, backlogTo: 'you' | 'the resident'): string {
+    const active = this.listActive().map((e) => JSON.stringify(this.shown(e.serverId, e.channelId)));
     const opening = active.length === 0
       ? 'no connected channel is tuned out now.'
-      : `no connected channel ${JSON.stringify(channelId)} is tuned out. Connected channels tuned out now: `
+      : `no connected channel ${JSON.stringify(name)} is tuned out. Connected channels tuned out now: `
         + `${active.join(', ')}.`;
     return `Nothing was cancelled: ${opening} A tune-out also ends by itself when its duration runs out, or at the `
       + `first wake past its wake budget, and its backlog goes to ${backlogTo} then.`;
-  }
-
-  private findByChannel(channelId: string): { serverId: string } | null {
-    for (const entry of this.listActive()) {
-      if (entry.channelId === channelId) return { serverId: entry.serverId };
-    }
-    return null;
   }
 
   /** Stop all timers (framework shutdown). */

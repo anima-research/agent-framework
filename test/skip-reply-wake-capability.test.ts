@@ -38,10 +38,10 @@ describe('skip_reply wake capability', () => {
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       getChannelTools: () => [],
-      resolveLocus: () => 'channel:test',
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
       routeSpeech: async (_agent: string, text: string) => {
         routed.push(text);
-        return { delivered: true, channelId: 'channel:test' };
+        return { delivered: true, serverId: 'stub', channelId: 'channel:test' };
       },
       handleChannelToolCall: async (_name: string, input: { wake_in_seconds?: number }) => ({
         success: true, endTurn: true,
@@ -124,8 +124,8 @@ describe('skip_reply wake capability', () => {
       agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async () => ({ delivered: true, channelId: 'channel:test' }),
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async () => ({ delivered: true, serverId: 'stub', channelId: 'channel:test' }),
       handleChannelToolCall: async () => ({ success: true, endTurn: true, data: { skipped: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -153,8 +153,8 @@ describe('skip_reply wake capability', () => {
     });
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       handleChannelToolCall: async () => ({ success: true, data: { delivered: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -188,8 +188,8 @@ describe('skip_reply wake capability', () => {
     });
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       handleChannelToolCall: async () => ({ success: true, data: { delivered: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -255,19 +255,32 @@ describe('skip_reply wake capability', () => {
 });
 
 
-describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
-  async function runProbe(wake: unknown) {
+describe('refused wake: no lifecycle events; a wake_in_seconds the host can\'t set is refused, never dropped', () => {
+  // One turn whose first round is a skip_reply carrying `wake` (or, with
+  // `call`, another tool or another input), then a round of plain text.
+  async function runProbe(wake: unknown, gate = false, call?: { name: string; input: unknown }) {
     const dir = mkdtempSync(join(tmpdir(), 'skip-wake-probe-'));
     const membrane = new MockMembrane();
+    const { name, input } = call ?? { name: 'skip_reply', input: { reason: 'later', wake_in_seconds: wake } };
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'same-round text must stay private' },
-      { type: 'tool_use', id: 'wake-1', name: 'skip_reply', input: { reason: 'later', wake_in_seconds: wake } },
+      { type: 'tool_use', id: 'wake-1', name, input },
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'next-round reply' }] as ContentBlock[]));
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
       agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      ...(gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
     });
+    // The seconds the framework asks the gate to wake after, as it asks.
+    const armed: number[] = [];
+    const eventGate = (framework as unknown as {
+      eventGate?: { armSelfWake(agent: string, seconds: number, source?: string): { inMs: number } };
+    }).eventGate;
+    if (eventGate) {
+      const arm = eventGate.armSelfWake.bind(eventGate);
+      eventGate.armSelfWake = (agent, seconds, source) => { armed.push(seconds); return arm(agent, seconds, source); };
+    }
     const lifecycle: ToolLifecycleParams[] = [];
     const observer = {
       id: 'observer',
@@ -278,10 +291,18 @@ describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
       observers: () => [observer], configFor: () => undefined, describe: () => ({ class: [] }),
     });
     const routed: string[] = [];
+    const handled: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
-      handleChannelToolCall: async () => ({ success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } }),
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
+      // What reached the registry: a skip_reply ends the turn, and a send
+      // silences the rest of it.
+      handleChannelToolCall: async (toolName: string) => {
+        handled.push(toolName);
+        return toolName === 'skip_reply'
+          ? { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } }
+          : { success: true, data: { delivered: true } };
+      },
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
     await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
@@ -290,7 +311,8 @@ describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
     const results = membrane.lastStream?.receivedToolResults ?? [];
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
-    return { lifecycle, routed, results };
+    const refusal = results[0]?.[0] as { isError?: boolean; content?: string } | undefined;
+    return { lifecycle, routed, results, armed, refusal, handled };
   }
 
   it('A: a refused positive wake sends no lifecycle events', async () => {
@@ -300,20 +322,103 @@ describe('refused wake: no lifecycle events; zero is an ordinary skip', () => {
     assert.deepEqual(lifecycle.map((p) => `${p.toolCallId}:${p.phase}`), []);
   });
 
-  it('B: wake_in_seconds: 0 remains an ordinary skip', async () => {
-    const { routed, results } = await runProbe(0);
-    assert.deepEqual(routed, []);
-    assert.equal(results.length, 0, 'ordinary skip ends at the tool boundary');
+  it('B: without a gate, wake_in_seconds: 0 is refused like any other value', async () => {
+    const { routed, refusal } = await runProbe(0);
+    assert.equal(refusal?.isError, true);
+    assert.match(refusal?.content ?? '', /this host can't wake you on a timer/);
+    assert.deepEqual(routed, ['next-round reply'], 'the turn went on to its next round');
   });
 
-  it('C: a wake that doesn\'t read as a finite number asks for none, so it\'s an ordinary skip', async () => {
+  it('C: without a gate, a wake_in_seconds that isn\'t a number is refused too, not taken as an ordinary skip', async () => {
     // JSON reads a number literal past a double's range, such as 1e400, as
     // Infinity too, but the store can't hold an Infinity in a tool call's
     // input, so these are strings.
-    for (const wake of ['Infinity', 'soon']) {
-      const { routed, results } = await runProbe(wake);
-      assert.deepEqual(routed, [], `wake_in_seconds: ${String(wake)}`);
-      assert.equal(results.length, 0, `wake_in_seconds: ${String(wake)} ends the turn at the tool boundary`);
+    for (const wake of ['Infinity', 'soon', '']) {
+      const { routed, refusal } = await runProbe(wake);
+      assert.equal(refusal?.isError, true, `wake_in_seconds: ${JSON.stringify(wake)}`);
+      assert.match(refusal?.content ?? '', /this host can't wake you on a timer/, `wake_in_seconds: ${JSON.stringify(wake)}`);
+      assert.deepEqual(routed, ['next-round reply'], `wake_in_seconds: ${JSON.stringify(wake)}`);
     }
+  });
+
+  it('D: null still asks for no wake, as does a call whose whole input is null: ordinary skips', async () => {
+    for (const [label, gate, call] of [
+      ['wake_in_seconds: null, no gate', false, undefined],
+      ['wake_in_seconds: null, with a gate', true, undefined],
+      ['input null, with a gate', true, { name: 'skip_reply', input: null }],
+    ] as const) {
+      const { routed, results, handled, armed } = await runProbe(null, gate, call);
+      assert.deepEqual(handled, ['skip_reply'], `${label}: the call reached the registry's skip_reply`);
+      assert.deepEqual(routed, [], label);
+      assert.equal(results.length, 0, `${label}: an ordinary skip ends at the tool boundary`);
+      assert.deepEqual(armed, [], `${label}: nothing armed`);
+    }
+  });
+
+  it('E: with a gate, a wake_in_seconds that isn\'t a number of seconds is refused, named, and arms nothing', async () => {
+    for (const wake of [0, -5, 0.5, 'soon', '10 minutes', '', true, [5], {}]) {
+      const { routed, refusal, armed, lifecycle } = await runProbe(wake, true);
+      const label = `wake_in_seconds: ${JSON.stringify(wake)}`;
+      assert.equal(refusal?.isError, true, label);
+      assert.equal(
+        refusal?.content,
+        `Your turn didn't end, and no wake was set: wake_in_seconds takes a number of seconds from 1 to 3600, and ${JSON.stringify(wake)} isn't one. Call skip_reply with a number of seconds to come back on your own, or without wake_in_seconds to end the turn and wait for the next message.`,
+        label,
+      );
+      assert.deepEqual(armed, [], `${label} arms nothing`);
+      assert.deepEqual(routed, ['next-round reply'], `${label}: the refused round stays private, and the turn goes on`);
+      assert.deepEqual(lifecycle.map((p) => `${p.toolCallId}:${p.phase}`), [], `${label} sends no lifecycle events`);
+    }
+  });
+
+  it('G: with a gate, a call to another tool that carries wake_in_seconds isn\'t a refused skip_reply', async () => {
+    // A send silences the rest of the turn; read as a refused skip_reply, it
+    // wouldn't, and the next round's reply would go out.
+    const { routed, results, handled, armed } = await runProbe(undefined, true, {
+      name: 'channel_publish', input: { channelId: 'channel:test', content: 'sent', wake_in_seconds: 'soon' },
+    });
+    assert.deepEqual(handled, ['channel_publish']);
+    assert.notEqual((results[0]?.[0] as { isError?: boolean } | undefined)?.isError, true, 'the send isn\'t refused');
+    assert.deepEqual(routed, [], 'the send silences the rest of the turn');
+    assert.deepEqual(armed, []);
+  });
+
+  it('F: with a gate, a number from 1, or a string that reads as one, arms a wake in whole seconds, and over 3600 waits 3600', async () => {
+    for (const [wake, seconds] of [[1, 1], [90.7, 90], ['30', 30], [5000, 3600], ['Infinity', 3600]] as const) {
+      const { routed, results, armed } = await runProbe(wake, true);
+      const label = `wake_in_seconds: ${JSON.stringify(wake)}`;
+      assert.deepEqual(armed, [seconds], label);
+      assert.equal(results.length, 0, `${label} ends the turn at the tool boundary`);
+      assert.deepEqual(routed, [], label);
+    }
+  });
+});
+
+describe('the channel registry\'s skip_reply confirmation names the wake the gate sets', () => {
+  const note = async (wake: unknown) => {
+    const registry = new ChannelRegistry(
+      {} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { eventGatePresent: true },
+    );
+    const input: Record<string, unknown> = { reason: 'later' };
+    if (wake !== undefined) input.wake_in_seconds = wake;
+    const result = await registry.handleChannelToolCall('skip_reply', input, { kind: 'agent', agentName: 'agent' });
+    return (result as { data?: { note?: string } }).data?.note;
+  };
+
+  it('in whole seconds up to 3600, as the gate is set, and none when absent', async () => {
+    // Whole seconds, the seconds the framework arms the gate's timer for.
+    for (const [wake, seconds] of [[60, 60], [90.7, 90], ['30', 30], [1, 1], [5000, 3600], ['Infinity', 3600]] as const) {
+      assert.equal(await note(wake), `Turn ended; nothing sent. Self-wake in ~${seconds}s unless something wakes you first.`, `wake_in_seconds: ${JSON.stringify(wake)}`);
+    }
+    assert.equal(await note(undefined), 'Turn ended; nothing sent.');
+    assert.equal(await note(null), 'Turn ended; nothing sent.');
+  });
+
+  it('a call whose input is null is an ordinary skip, where it used to throw reading wake_in_seconds', async () => {
+    const registry = new ChannelRegistry(
+      {} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { eventGatePresent: true },
+    );
+    const result = await registry.handleChannelToolCall('skip_reply', null, { kind: 'agent', agentName: 'agent' });
+    assert.deepEqual(result, { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } });
   });
 });
