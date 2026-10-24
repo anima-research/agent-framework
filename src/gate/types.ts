@@ -166,7 +166,17 @@ export interface GateConfig {
 export interface GateOptions {
   /** Path to gate.json. Default: derived from storePath. */
   configPath?: string;
-  /** Initial config, seeded to gate.json if the file doesn't exist. */
+  /**
+   * The recipe's gate config. The first start seeds gate.json with it. Each
+   * later start merges it into gate.json against the recipe last applied,
+   * which the gate keeps beside gate.json (`gate.recipe.json`): a rule the
+   * recipe dropped, renamed, moved or redefined follows it, a rule edited at
+   * run time or by hand stays, and so does one no recipe declared. Rules are
+   * merged by name, compared by what they mean and kept as written: a
+   * recipe's rule with no name is never merged, as one with no name was never
+   * added, and where gate.json or the recipe names a rule twice, a start only
+   * adds the rules gate.json lacks. See `recipe-reconcile.ts`.
+   */
   config?: GateConfig;
   /**
    * Path to a JSON file listing user ids that may wake the agent even while
