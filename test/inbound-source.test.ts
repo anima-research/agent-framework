@@ -19,6 +19,7 @@ import {
   // The package's public digest: consumers import it from the root.
   sourceBodyDigest,
   PassthroughStrategy,
+  type ChannelRef,
   type InboundSource,
   type Module,
   type ModuleContext,
@@ -29,7 +30,7 @@ import {
   type ToolCall,
   type ToolResult,
 } from '../src/index.js';
-import { ContextManager } from '@animalabs/context-manager';
+import { ContextManager, MalformedContentError } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { canonicalJson } from '../src/mcpl/inbound-source.js';
@@ -113,6 +114,14 @@ describe('inbound source envelope', () => {
   const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
   const storedWith = (pred: (m: Record<string, unknown>) => boolean) =>
     stored().find((m) => pred((m.metadata ?? {}) as Record<string, unknown>));
+  /** The agent closes ROOM, so an addressed push from it comes with the closed-channel invitation. */
+  const closeRoom = async (): Promise<void> => {
+    const registry = (framework as unknown as {
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<{ success: boolean }>; isChannelOpen(channel: ChannelRef): boolean };
+    }).channelRegistry;
+    assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' })).success, true);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: ROOM }), false);
+  };
 
   it('stamps a channels/incoming message with its registered channel, label, reply edge and acceptance time', async () => {
     const before = Date.now();
@@ -205,7 +214,7 @@ describe('inbound source envelope', () => {
     // appended after ingestion stamped the delivered digest, at storage
     // time, when the channel has closed in between.
     const registry = (framework as unknown as {
-      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(id: string): boolean };
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(channel: ChannelRef): boolean };
     }).channelRegistry;
     const fw = framework as unknown as { pushEvent(e: { type: string }): void };
     const held: Array<{ type: string }> = [];
@@ -214,7 +223,7 @@ describe('inbound source envelope', () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-closed', mode: 'addressed', text: 'hello while open' });
     await waitFor(() => held.length > 0, 'incoming accepted and held');
     await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' });
-    assert.equal(registry.isChannelOpen(ROOM), false);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: ROOM }), false);
     fw.pushEvent = push;
     for (const e of held) push(e);
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-closed'), 'message stored');
@@ -226,15 +235,28 @@ describe('inbound source envelope', () => {
   });
 
   it('on the push lane, the delivered digest excludes host decoration and the stored digest covers it', async () => {
-    command({ op: 'dm', eventId: 'ev-dig', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'dm stored');
+    // A mention pushed from a channel the agent closed: the host appends its invitation.
+    await closeRoom();
+    command({
+      op: 'push', eventId: 'ev-dig', text: 'psst',
+      origin: { source: 'discord', mcplChannelId: ROOM, messageId: 'pm-dig', authorName: 'antra' },
+      tags: ['chat:mention', 'chat:addressed'],
+    });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'push stored');
     const message = storedWith((m) => m.eventId === 'ev-dig')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'psst' }]), 'the adapter body alone');
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored');
-    // The DM's channel is closed, so the host appends its invitation.
     assert.equal(message.content.length, 2);
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the closed-channel invitation decorates the stored copy');
+    // A DM's channel is closed too, but all of a DM reaches the agent, so
+    // nothing decorates it and its two digests agree.
+    command({ op: 'dm', eventId: 'ev-dm', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dm'), 'dm stored');
+    const dm = storedWith((m) => m.eventId === 'ev-dm')!;
+    const dmMeta = dm.metadata as Record<string, unknown>;
+    assert.equal(dmMeta.channelInvitation, undefined, 'no invitation on a DM');
+    assert.equal(dmMeta.storedBodyDigest, dmMeta.sourceBodyDigest);
   });
 
   it('a visibly-empty ordinary push is refused and stores nothing; an accepted push carries the host\'s digests, never the adapter\'s', async () => {
@@ -254,12 +276,17 @@ describe('inbound source envelope', () => {
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
   });
 
-  it('a DM pushed into a closed channel carries the host\'s digests, never the adapter\'s: the delivered body, and the stored copy with its invitation', async () => {
+  it('a mention pushed from a closed channel carries the host\'s digests, never the adapter\'s: the delivered body, and the stored copy with its invitation', async () => {
+    await closeRoom();
     command({
-      op: 'dm', eventId: 'ev-forged', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst again',
-      origin: { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
+      op: 'push', eventId: 'ev-forged', text: 'psst again',
+      origin: {
+        source: 'discord', mcplChannelId: ROOM, messageId: 'pm-forged', authorName: 'antra',
+        sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value',
+      },
+      tags: ['chat:mention', 'chat:addressed'],
     });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-forged'), 'dm stored');
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-forged'), 'push stored');
     const message = storedWith((m) => m.eventId === 'ev-forged')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.channelInvitation, true, 'stored with the closed-channel invitation');
@@ -605,7 +632,8 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close);
     await f.register();
     const forged = { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' };
-    const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
+    const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: ChannelRef): { agentName: string } | undefined; unbind(channel: ChannelRef): void } }).conversationRouter;
+    const chat: ChannelRef = { serverId: 'editor', channelId: 'chat' };
     const check = (text: string, fork: string) => {
       const copy = f.framework.getAgent(fork)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
       assert.ok(copy, `${text} stored in ${fork}`);
@@ -615,13 +643,13 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     };
     // Routed into a fresh fork by the conversation router.
     await f.send('channels/incoming', { messages: [{ ...f.channel('c1', 'routed_original', { initial: true }), metadata: forged }] });
-    const fork = router.getBinding('chat')!.agentName;
+    const fork = router.getBinding(chat)!.agentName;
     check('routed_original', fork);
     // A correction follows the prior delivery into that fork, though the
     // channel is no longer bound to it.
-    router.unbind('chat');
+    router.unbind(chat);
     await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'fork_correction'), metadata: forged }] });
-    assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the correction');
+    assert.equal(router.getBinding(chat), undefined, 'no fresh fork was spawned for the correction');
     check('fork_correction', fork);
   });
 
@@ -729,7 +757,7 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     }
   });
 
-  it('a block the store refuses is refused at write, and a blob_ref is digested as given, which its copy read back does not match', async () => {
+  it('refused content and caller-supplied blob_ref cannot be written; unresolved and resolved reads have distinct digests', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'stored-digest-refused-'));
     try {
       const cm = await ContextManager.open({ path: join(dir, 'store.chronicle'), strategy: new PassthroughStrategy() });
@@ -743,17 +771,19 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
         ] as const) {
           assert.throws(() => cm.addMessage('user', [block] as never), Error, `${what}: refused at write`);
         }
-        // A blob_ref names media the store already holds; it is resolved to
-        // inline media on read, so the copy read back hashes differently.
+        // Only the store may write blob_ref. An unresolved read can expose
+        // one, but callers must resolve it before attempting a new write.
         const held = cm.addMessage('user', [image(png)] as never);
         const ref = cm.getMessageWindow(0, cm.getMessageCount(), { resolveBlobs: false }).messages
           .find((m) => m.id === held)!.content[0] as { type: string };
         assert.equal(ref.type, 'blob_ref');
         const given = [ref];
-        const id = cm.addMessage('user', given as never, { storedBodyDigest: sourceBodyDigest(given) });
-        const back = cm.getMessage(id)!;
+        const before = cm.getMessageCount();
+        assert.throws(() => cm.addMessage('user', given as never), MalformedContentError, 'a raw blob_ref is store-only');
+        assert.equal(cm.getMessageCount(), before, 'refused write adds no record');
+        const back = cm.getMessage(held)!;
         assert.deepEqual(back.content, [image(png)], 'resolved on read');
-        assert.notEqual(sourceBodyDigest(back.content), (back.metadata as Record<string, unknown>).storedBodyDigest, 'the documented mismatch');
+        assert.notEqual(sourceBodyDigest(given), sourceBodyDigest(back.content), 'unresolved refs are not inline content');
       } finally {
         cm.close();
       }

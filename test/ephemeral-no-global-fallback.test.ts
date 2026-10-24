@@ -18,19 +18,22 @@ import { fixture, eventually, settles, TS } from './helpers/coalescing-fixture.j
 import { createMockResponse } from './helpers/mock-membrane.js';
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
+type Ref = { serverId: string; channelId: string };
 type Registry = {
-  getDefaultPublishChannel(): string | null;
+  getDefaultPublishChannel(): Ref | null;
   getDesiredState(serverId: string, channelId: string): string | undefined;
-  resolveLocus(conversationId: string): string | null;
-  buildChannelContext(agentName?: string): { incoming?: { channelId: string }; defaultOutgoing?: { channelId: string } } | undefined;
-  routeSpeech(conversationId: string, text: string, locus: string | null): Promise<unknown>;
-  deliverSpeech(conversationId: string, text: string, locus: string | null, opts?: unknown): Promise<unknown>;
+  resolveLocus(conversationId: string): Ref | null;
+  buildChannelContext(agentName: string | undefined, serverId: string): { incoming?: { channelId: string }; defaultOutgoing?: { channelId: string } } | undefined;
+  routeSpeech(conversationId: string, text: string, locus: Ref | null): Promise<unknown>;
+  deliverSpeech(conversationId: string, text: string, locus: Ref | null, opts?: unknown): Promise<unknown>;
   handleChannelToolCall(toolName: string, input: unknown, origin?: unknown): Promise<{ success: boolean; error?: string }>;
 };
 const registry = (f: Fixture) => (f.framework as unknown as { channelRegistry: Registry }).channelRegistry;
 
 const BUSY = 'discord:g1:busy';
 const SIDE = 'discord:g1:side';
+/** A channel on the fixture's server. */
+const editor = (channelId: string): Ref => ({ serverId: 'editor', channelId });
 const text = (t: string) => createMockResponse([{ type: 'text', text: t }]);
 const publishedText = (f: Fixture) => JSON.stringify(f.published);
 
@@ -50,7 +53,7 @@ async function busyFallback(f: Fixture): Promise<void> {
     }],
   });
   await f.framework.runUntilIdle(); // the resident answers with the fixture's scripted 'ok'
-  assert.equal(registry(f).getDefaultPublishChannel(), BUSY, 'control: busy is the global fallback');
+  assert.deepEqual(registry(f).getDefaultPublishChannel(), editor(BUSY), 'control: busy is the global fallback');
 }
 
 /**
@@ -124,7 +127,7 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
         // Control: a name the framework didn't reserve for a run, with no
         // turn of its own (a resident's heartbeat, say), still resolves the
         // fallback.
-        assert.equal(registry(f).resolveLocus('resident-with-no-turn'), BUSY, 'control: the fallback is kept for others');
+        assert.deepEqual(registry(f).resolveLocus('resident-with-no-turn'), editor(BUSY), 'control: the fallback is kept for others');
       } finally { t.off(); await f.close(); }
     });
   }
@@ -161,12 +164,12 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
       await busyFallback(f);
       for (const name of ['sub-context', '']) {
         await f.framework.createEphemeralAgent({ name, model: 'test', systemPrompt: 'Do the task.', proseRouting: 'locus' });
-        const sub = registry(f).buildChannelContext(name);
+        const sub = registry(f).buildChannelContext(name, 'editor');
         assert.ok(sub, `${JSON.stringify(name)} has a channel context: busy is open`);
         assert.equal(sub.defaultOutgoing, undefined, JSON.stringify(name));
         assert.equal(sub.incoming, undefined, JSON.stringify(name));
       }
-      const resident = registry(f).buildChannelContext('agent');
+      const resident = registry(f).buildChannelContext('agent', 'editor');
       assert.equal(resident?.defaultOutgoing?.channelId, BUSY, 'control');
       assert.equal(resident?.incoming?.channelId, BUSY, 'control');
     } finally { await f.close(); }
@@ -179,10 +182,10 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
       await f.framework.createEphemeralAgent({ name: '', model: 'test', systemPrompt: 'Do the task.', proseRouting: 'locus' });
       // The run's turn opened side: its routing state names it, as
       // channel_open's result leaves it.
-      (f.framework as unknown as { turnRouting: Map<string, { locus?: string }> }).turnRouting.set('', { locus: SIDE });
+      (f.framework as unknown as { turnRouting: Map<string, { locus?: Ref }> }).turnRouting.set('', { locus: editor(SIDE) });
 
-      assert.equal(registry(f).resolveLocus(''), SIDE, 'control: its speech goes to side');
-      assert.equal(registry(f).buildChannelContext('')?.defaultOutgoing?.channelId, SIDE, 'and its channel context says so');
+      assert.deepEqual(registry(f).resolveLocus(''), editor(SIDE), 'control: its speech goes to side');
+      assert.equal(registry(f).buildChannelContext('', 'editor')?.defaultOutgoing?.channelId, SIDE, 'and its channel context says so');
     } finally { await f.close(); }
   });
 
@@ -249,11 +252,11 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
         }],
       });
       await f.framework.runUntilIdle();
-      const fork = (f.framework as unknown as { getConversationRouter(): { getBinding(id: string): { agentName: string } | undefined } })
-        .getConversationRouter().getBinding(BUSY)?.agentName;
+      const fork = (f.framework as unknown as { getConversationRouter(): { getBinding(channel: Ref): { agentName: string } | undefined } })
+        .getConversationRouter().getBinding(editor(BUSY))?.agentName;
       assert.ok(fork, 'a conversation fork was spawned for busy');
 
-      assert.equal(registry(f).buildChannelContext(fork)?.incoming?.channelId, BUSY, 'its channel context still names the latest inbound message');
+      assert.equal(registry(f).buildChannelContext(fork, 'editor')?.incoming?.channelId, BUSY, 'its channel context still names the latest inbound message');
     } finally { await f.close(); }
   });
 

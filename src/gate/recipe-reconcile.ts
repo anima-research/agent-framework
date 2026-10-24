@@ -28,8 +28,13 @@
  * take its order, every other rule stays, and the line names those that differ
  * from the recipe or aren't in it. A rule that differs can be removed, and the
  * next start restores it from the recipe.
+ *
+ * Rules are merged as written, not as the gate reads them, so a field the gate
+ * doesn't read and a rule it leaves out are kept as gate.json holds them, as
+ * the gate's own writes keep them, and a definition is the rule as written. A
+ * rule with no name stays where gate.json holds it, and a recipe's rule with
+ * no name is never merged: the merge keys rules by name.
  */
-import type { GateConfig, GatePolicy } from './types.js';
 
 /** What a start changed, by rule name, for its trace and its log line. */
 export interface RecipeChanges {
@@ -77,16 +82,33 @@ export function canonical(value: unknown): string {
   return JSON.stringify(sortKeys(value));
 }
 
-const same = (a: GatePolicy, b: GatePolicy): boolean => canonical(a) === canonical(b);
+const same = (a: unknown, b: unknown): boolean => canonical(a) === canonical(b);
 
-/** A rule name the config gives more than once, if any: the merge keys rules by name. */
-export function duplicateName(config: GateConfig): string | undefined {
+/** A gate config as written: its rule list and its `default`, each as given. */
+export interface WrittenConfig { rules: readonly unknown[]; default: unknown }
+
+/** A rule's name as written, when it has a usable one. */
+export function ruleName(rule: unknown): string | undefined {
+  if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return undefined;
+  const name = (rule as { name?: unknown }).name;
+  return typeof name === 'string' && name ? name : undefined;
+}
+
+/** A rule name the list gives more than once, if any: the merge keys rules by name. */
+export function duplicateName(rules: readonly unknown[]): string | undefined {
   const seen = new Set<string>();
-  for (const policy of config.policies) {
-    if (seen.has(policy.name)) return policy.name;
-    seen.add(policy.name);
+  for (const rule of rules) {
+    const name = ruleName(rule);
+    if (name === undefined) continue;
+    if (seen.has(name)) return name;
+    seen.add(name);
   }
   return undefined;
+}
+
+/** A `default` as the gate reads one: left out, null or "" is "always". */
+function behaviorOf(value: unknown): unknown {
+  return value === undefined || value === null || value === '' ? 'always' : value;
 }
 
 /** The names in one longest sequence that `a` and `b` share in order. */
@@ -121,83 +143,99 @@ function longestShared(a: string[], b: string[]): Set<string> {
 
 /**
  * Merge `recipe` into `live` against `last`, the recipe last applied (null
- * when there is none). Pure: the caller reads and writes the files. All three
- * are validated configs. Throws when `live` or `recipe` names a rule twice,
- * since the merge keys rules by name.
+ * when there is none), each as written. Pure: the caller reads and writes the
+ * files. Returns the rule list and `default` to write, each as written, and
+ * whether `default` changed. Throws when `live` or `recipe` names a rule
+ * twice, since the merge keys rules by name.
  */
 export function reconcileWithRecipe(
-  live: GateConfig,
-  recipe: GateConfig,
-  last: GateConfig | null,
-): { config: GateConfig; changes: RecipeChanges } {
-  const liveDuplicate = duplicateName(live);
+  live: WrittenConfig,
+  recipe: WrittenConfig,
+  last: WrittenConfig | null,
+): { rules: unknown[]; default: unknown; defaultChanged: boolean; changes: RecipeChanges } {
+  const liveDuplicate = duplicateName(live.rules);
   if (liveDuplicate !== undefined) {
-    throw new Error(`gate.json named the rule "${liveDuplicate}" twice, so the recipe wasn't applied: the merge needs one rule per name`);
+    throw new Error(`gate.json names the rule "${liveDuplicate}" twice`);
   }
-  const recipeDuplicate = duplicateName(recipe);
+  const recipeDuplicate = duplicateName(recipe.rules);
   if (recipeDuplicate !== undefined) {
-    throw new Error(`the recipe named the rule "${recipeDuplicate}" twice, so it wasn't applied: the merge needs one rule per name`);
+    throw new Error(`the recipe names the rule "${recipeDuplicate}" twice`);
   }
 
   const changes: RecipeChanges = {
     added: [], removed: [], updated: [], restored: [], moved: [],
     keptEdited: [], differsFromRecipe: [], outsideRecipe: [], orderKept: false,
   };
-  const byName = (config: GateConfig) => new Map(config.policies.map((p) => [p.name, p]));
-  const inLive = byName(live);
-  const inRecipe = byName(recipe);
-  const inLast = last ? byName(last) : null;
+  // Each rule by its name; a rule with no name by a key no name can be, so
+  // it keeps its place and matches nothing.
+  const keyOf = (rule: unknown, index: number): string => ruleName(rule) ?? `\u0000nameless ${index}`;
+  const byName = (rules: readonly unknown[]) => new Map(rules.flatMap((rule) => {
+    const name = ruleName(rule);
+    return name === undefined ? [] : [[name, rule] as const];
+  }));
+  const inLive = new Map(live.rules.map((rule, index) => [keyOf(rule, index), rule] as const));
+  const inRecipe = byName(recipe.rules);
+  const inLast = last ? byName(last.rules) : null;
 
   // Each rule gate.json keeps, with its definition, and which of them take
   // the recipe's order (`ordered`); the rest keep their places.
-  const definitions = new Map<string, GatePolicy>();
+  const definitions = new Map<string, unknown>();
   const ordered = new Set<string>();
-  for (const policy of live.policies) {
-    const declared = inRecipe.get(policy.name);
-    const before = inLast?.get(policy.name);
-    if (declared && same(policy, declared)) {
+  live.rules.forEach((rule, index) => {
+    const name = keyOf(rule, index);
+    const declared = inRecipe.get(name);
+    const before = inLast?.get(name);
+    if (declared !== undefined && same(rule, declared)) {
       // As the recipe has it: the recipe's, whatever the record says, and
       // nothing to change or name.
-      definitions.set(policy.name, declared);
-      ordered.add(policy.name);
+      definitions.set(name, declared);
+      ordered.add(name);
+    } else if (ruleName(rule) === undefined) {
+      definitions.set(name, rule);
     } else if (!inLast) {
-      definitions.set(policy.name, policy);
-      (declared ? changes.differsFromRecipe : changes.outsideRecipe).push(policy.name);
-    } else if (before) {
-      const edited = !same(policy, before);
-      if (!declared) {
+      definitions.set(name, rule);
+      (declared !== undefined ? changes.differsFromRecipe : changes.outsideRecipe).push(name);
+    } else if (before !== undefined) {
+      const edited = !same(rule, before);
+      if (declared === undefined) {
         if (edited) {
-          definitions.set(policy.name, policy);
-          changes.keptEdited.push(policy.name);
+          definitions.set(name, rule);
+          changes.keptEdited.push(name);
         } else {
-          changes.removed.push(policy.name);
+          changes.removed.push(name);
         }
       } else {
         // Both recipes declare it: it's a recipe rule, so it takes the recipe's order.
-        ordered.add(policy.name);
+        ordered.add(name);
         if (edited) {
-          definitions.set(policy.name, policy);
-          if (!same(declared, before)) changes.keptEdited.push(policy.name);
+          definitions.set(name, rule);
+          if (!same(declared, before)) changes.keptEdited.push(name);
         } else {
-          definitions.set(policy.name, declared);
-          changes.updated.push(policy.name);
+          definitions.set(name, declared);
+          changes.updated.push(name);
         }
       }
     } else {
       // No recipe declared it as it stands: a run-time rule, or one the recipe
       // now declares otherwise.
-      definitions.set(policy.name, policy);
-      if (declared) changes.differsFromRecipe.push(policy.name);
+      definitions.set(name, rule);
+      if (declared !== undefined) changes.differsFromRecipe.push(name);
     }
-  }
+  });
 
-  const liveOrder = live.policies.map((p) => p.name);
-  const recipeOrder = recipe.policies.map((p) => p.name);
+  const liveOrder = live.rules.map(keyOf);
+  const recipeOrder = recipe.rules.flatMap((rule) => {
+    const name = ruleName(rule);
+    return name === undefined ? [] : [name];
+  });
   const staying = liveOrder.filter((name) => definitions.has(name));
 
   // Whether gate.json holds the rules both recipes declare in the last recipe's order.
   const shared = (order: string[]) => order.filter((name) => inLast?.has(name) && inRecipe.has(name) && inLive.has(name));
-  const lastOrder = last ? last.policies.map((p) => p.name) : [];
+  const lastOrder = last ? last.rules.flatMap((rule) => {
+    const name = ruleName(rule);
+    return name === undefined ? [] : [name];
+  }) : [];
   const followsLast = canonical(shared(liveOrder)) === canonical(shared(lastOrder));
 
   let order: string[];
@@ -233,27 +271,31 @@ export function reconcileWithRecipe(
   const stayedInOrder = longestShared(staying.filter((name) => ordered.has(name)), order.filter((name) => ordered.has(name)));
   changes.moved = order.filter((name) => ordered.has(name) && !stayedInOrder.has(name));
 
-  const liveDefault = live.default ?? 'always';
-  const recipeDefault = recipe.default ?? 'always';
+  // `default` as the gate reads it, compared as written once read.
+  const liveDefault = behaviorOf(live.default);
+  const recipeDefault = behaviorOf(recipe.default);
   let defaultBehavior = live.default;
+  let defaultChanged = false;
+  const shownBehavior = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value));
   if (!last) {
-    if (liveDefault !== recipeDefault) changes.defaultDiffers = { kept: liveDefault, recipe: recipeDefault };
+    if (!same(liveDefault, recipeDefault)) changes.defaultDiffers = { kept: shownBehavior(liveDefault), recipe: shownBehavior(recipeDefault) };
   } else {
-    const lastDefault = last.default ?? 'always';
-    if (liveDefault === lastDefault || liveDefault === recipeDefault) {
-      defaultBehavior = recipe.default;
-      if (recipeDefault !== liveDefault) changes.defaultChange = { from: liveDefault, to: recipeDefault };
-    } else if (recipeDefault !== lastDefault) {
-      changes.defaultKept = liveDefault;
+    const lastDefault = behaviorOf(last.default);
+    if (same(liveDefault, lastDefault) || same(liveDefault, recipeDefault)) {
+      if (!same(recipeDefault, liveDefault)) {
+        defaultBehavior = recipe.default;
+        defaultChanged = true;
+        changes.defaultChange = { from: shownBehavior(liveDefault), to: shownBehavior(recipeDefault) };
+      }
+    } else if (!same(recipeDefault, lastDefault)) {
+      changes.defaultKept = shownBehavior(liveDefault);
     }
   }
 
   return {
-    config: {
-      ...live,
-      policies: order.map((name) => definitions.get(name)!),
-      default: defaultBehavior,
-    },
+    rules: order.map((name) => definitions.get(name)),
+    default: defaultBehavior,
+    defaultChanged,
     changes,
   };
 }

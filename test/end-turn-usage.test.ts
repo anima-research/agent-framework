@@ -656,12 +656,12 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
     // cooldown. Its turns aren't an external message's default target, so
     // the turn is started directly.
     const internal = r.framework as unknown as {
-      conversationAgentHomes: Map<string, string>;
+      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
       startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
     };
     r.framework.start();
     try {
-      internal.conversationAgentHomes.set('resident', 'world:zz');
+      internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
       r.framework.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'first' }]);
       await internal.startAgentStream(r.framework.getAgent('resident'),
         { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });

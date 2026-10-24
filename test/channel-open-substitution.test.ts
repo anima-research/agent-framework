@@ -146,7 +146,7 @@ test('a channel admitted open stays closed on a substituted answer, reports it o
   assert.equal(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed').length, 0,
     'the substitution is its own diagnostic, not also a generic reconcile failure');
 
-  const { value: delivery } = await capturingErrors(() => f.registry.routeSpeech('resident', 'hello', 'x'));
+  const { value: delivery } = await capturingErrors(() => f.registry.routeSpeech('resident', 'hello', { serverId: 'test', channelId: 'x' }));
   assert.equal(delivery, null);
   assert.deepEqual(f.published, [], 'nothing is sent into a channel the server would not confirm');
   assert.equal(f.routeFailures.length, 1);
@@ -168,7 +168,7 @@ test('a known-open channel loses its confirmation on a substituted answer, and r
   answerFor = undefined;
   await tick();
   f.calls.length = 0;
-  const delivery = await f.registry.routeSpeech('resident', 'hello', 'x');
+  const delivery = await f.registry.routeSpeech('resident', 'hello', { serverId: 'test', channelId: 'x' });
   assert.equal(delivery?.delivered, true);
   assert.deepEqual(f.calls, [{ kind: 'open', id: 'x' }], 'delivery reopens the channel before sending');
   assert.deepEqual(f.published, ['x']);

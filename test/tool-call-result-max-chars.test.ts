@@ -1,7 +1,9 @@
 /**
  * ToolCall.resultMaxChars: how long a call's result may be and still reach its
  * caller whole. A model's call gets the agent's inline cap as the store applies
- * it, so a result that long is stored whole and one a character longer isn't.
+ * it, so a result that long is stored whole while its round fits the readers'
+ * bound and no save_recent_image in the round counted it by its share, and one
+ * a character longer isn't.
  * A call from a running script gets the longest result that reaches the
  * script whole whatever its characters, from the script's memory (a
  * structured value, a deep nesting or a parse past the memory left can
@@ -27,6 +29,7 @@ import type {
 } from '../src/index.js';
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
+import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 /** The residence's cap, and the strategy's bound beneath it (1000 tokens, 4 characters each). */
@@ -135,10 +138,12 @@ function storedResults(framework: AgentFramework): Map<string, string> {
 }
 
 describe('ToolCall.resultMaxChars', () => {
-  it("a model's call carries the agent's inline cap, under which its result is stored whole", async () => {
+  it("a model's call carries the agent's inline cap, under which its result is stored whole while its round fits the bound", async () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'call_at', name: 'probe--look', input: { over: 0 } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'call_past', name: 'probe--look', input: { over: 1 } },
       { type: 'tool_use', id: 'call_utility', name: 'utils', input: { action: 'run', name: 'probe--peek', args: {} } },
     ], 'tool_use'));
@@ -162,10 +167,13 @@ describe('ToolCall.resultMaxChars', () => {
       assert.equal(caps.get('call_at'), BOUNDED);
       assert.equal(caps.get('call_past'), BOUNDED);
       assert.equal(stored.get('call_at'), 'x'.repeat(BOUNDED), 'a result of resultMaxChars is stored whole');
-      // This framework has no workspace to spill to, so the store keeps the start.
+      // call_past's round, beside the utility's short result, fits the bound,
+      // so each is stored as it would be alone. This framework has no
+      // workspace to spill to, so the store keeps the start: as much as
+      // leaves the notice its room under the bound.
       assert.equal(stored.get('call_past'),
-        `${'x'.repeat(BOUNDED)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
-        'one character more is cut at the cap');
+        `${'x'.repeat(BOUNDED - TOOL_RESULT_NOTICE_ROOM)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
+        'one character more is cut, its notice within the bound');
       // A utility run through the utils tool is stored as that call's result.
       assert.equal(caps.get('call_utility'), BOUNDED);
       assert.equal(probe.calls.find((call) => call.id === 'call_utility')?.name, 'peek');

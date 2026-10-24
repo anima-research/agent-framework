@@ -67,16 +67,6 @@ test('initiallyOpen at first sight registers open with server-bootstrap provenan
   assert.equal(r.getDesiredState('eidoverse', 'world:commons'), 'open');
 });
 
-test("isChannelOpen, given a server, reads only that server's channel, though the registry's key joins the two ids with a colon", () => {
-  const { registry } = makeRegistry();
-  // Server "a" registers channel "b:c": its key is "a:b:c", which is also
-  // what server "a:b" and channel "c" would make.
-  (registry as unknown as { channels: Map<string, unknown> }).channels
-    .set('a:b:c', { serverId: 'a', descriptor: { id: 'b:c', type: 'a', label: '#c' }, open: true });
-  assert.equal(registry.isChannelOpen('b:c', 'a'), true, "a's own channel");
-  assert.equal(registry.isChannelOpen('c', 'a:b'), false, "another server's entry under the same key");
-});
-
 test("desiredStateInLog reads a server's channel's last decision from a store's lifecycle log, by the rule a registry replayed from it reads", () => {
   const dir = mkdtempSync(join(tmpdir(), 'desired-state-in-log-'));
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });

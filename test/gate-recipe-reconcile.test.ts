@@ -26,6 +26,12 @@ const rule = (name: string, pattern: string, behavior: GatePolicy['behavior'] = 
 const catchAll: GatePolicy = { name: 'catch-all', match: { scope: ['external-message'] }, behavior: 'skip' };
 const config = (policies: GatePolicy[], defaultBehavior: GateConfig['default'] = 'skip'): GateConfig => ({ policies, default: defaultBehavior });
 const names = (c: GateConfig): string[] => c.policies.map((p) => p.name);
+/** The merge on configs as written, given and returned as GateConfigs. */
+const reconcile = (live: GateConfig, recipe: GateConfig, last: GateConfig | null): { config: GateConfig; changes: RecipeChanges } => {
+  const written = (c: GateConfig) => ({ rules: c.policies, default: c.default });
+  const merged = reconcileWithRecipe(written(live), written(recipe), last ? written(last) : null);
+  return { config: { ...live, policies: merged.rules as GatePolicy[], default: merged.default as GateConfig['default'] }, changes: merged.changes };
+};
 const patterns = (c: GateConfig): Array<string | null> => c.policies.map((p) => p.match.filter?.pattern ?? null);
 
 describe('reconcileWithRecipe: a start against the recipe last applied', () => {
@@ -33,7 +39,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
 
   it('drops a rule the recipe dropped, and brings a renamed one in at its recipe place, ahead of the catch-all', () => {
     const recipe2 = config([rule('dm', 'dm'), rule('agents', 'sync'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(recipe1, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(recipe1, recipe2, recipe1);
     assert.deepStrictEqual(names(merged), ['dm', 'agents', 'catch-all']);
     assert.deepStrictEqual(changes.removed, ['zoo', 'sync']);
     assert.deepStrictEqual(changes.added, ['agents']);
@@ -42,7 +48,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it("gives an unedited rule the recipe's new definition and order, and keeps a run-time rule in its place", () => {
     const live = config([rule('dm', 'dm'), rule('zoo', 'zoo'), rule('sync', 'sync'), rule('runtime', 'runtime'), catchAll]);
     const recipe2 = config([rule('sync', 'sync'), rule('dm', 'dm-v2', 'defer'), rule('zoo', 'zoo'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(names(merged), ['sync', 'dm', 'zoo', 'runtime', 'catch-all']);
     assert.deepStrictEqual(merged.policies[1], rule('dm', 'dm-v2', 'defer'));
     assert.deepStrictEqual(changes.updated, ['dm']);
@@ -53,7 +59,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it('keeps a rule edited since the last recipe, and names it when the recipe changed or dropped it', () => {
     const live = config([rule('dm', 'dm-edited'), rule('zoo', 'zoo-edited'), rule('sync', 'sync-edited'), catchAll]);
     const recipe2 = config([rule('dm', 'dm'), rule('sync', 'sync-v2'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(patterns(merged), ['dm-edited', 'zoo-edited', 'sync-edited', null]);
     assert.deepStrictEqual(changes.keptEdited, ['zoo', 'sync']);
     assert.deepStrictEqual(changes.removed, []);
@@ -62,7 +68,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it("moves a rule whose definition was edited where the recipe's new order puts it, keeping the edit", () => {
     const live = config([rule('dm', 'dm-edited'), rule('zoo', 'zoo'), rule('sync', 'sync'), catchAll]);
     const recipe2 = config([rule('sync', 'sync'), rule('zoo', 'zoo'), rule('dm', 'dm'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(names(merged), ['sync', 'zoo', 'dm', 'catch-all']);
     assert.deepStrictEqual(merged.policies[2], rule('dm', 'dm-edited'));
     assert.deepStrictEqual(changes.keptEdited, []);
@@ -72,7 +78,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it('takes a rule that already agrees with the new recipe as the recipe\'s, and names nothing', () => {
     // As after a stop between the two writes: gate.json holds the new recipe's rules, the record the old one.
     const recipe2 = config([rule('zoo', 'zoo'), rule('dm', 'dm-v2'), rule('sync', 'sync'), catchAll], 'defer');
-    const { config: merged, changes } = reconcileWithRecipe(recipe2, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(recipe2, recipe2, recipe1);
     assert.deepStrictEqual(merged, recipe2);
     assert.strictEqual(reconcileLine(changes), null);
   });
@@ -80,18 +86,18 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it('names as moved the recipe rule a reorder brought earlier, and never a run-time rule left in place', () => {
     const live = config([rule('dm', 'dm'), rule('runtime', 'runtime'), rule('zoo', 'zoo'), rule('sync', 'sync'), catchAll]);
     const recipe2 = config([rule('zoo', 'zoo'), rule('dm', 'dm'), rule('sync', 'sync'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(names(merged), ['zoo', 'runtime', 'dm', 'sync', 'catch-all']);
     assert.deepStrictEqual(changes.moved, ['zoo']);
   });
 
   it('restores a rule both recipes declare, removed from gate.json since, at its recipe place', () => {
     const live = config([rule('dm', 'dm'), rule('sync', 'sync'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe1, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe1, recipe1);
     assert.deepStrictEqual(names(merged), ['dm', 'zoo', 'sync', 'catch-all']);
     assert.deepStrictEqual(changes.restored, ['zoo']);
     // The removed rule isn't counted as moved, so the recipe's reorder still comes through.
-    const reordered = reconcileWithRecipe(live, config([rule('sync', 'sync'), rule('zoo', 'zoo'), rule('dm', 'dm'), catchAll]), recipe1);
+    const reordered = reconcile(live, config([rule('sync', 'sync'), rule('zoo', 'zoo'), rule('dm', 'dm'), catchAll]), recipe1);
     assert.deepStrictEqual(names(reordered.config), ['sync', 'zoo', 'dm', 'catch-all']);
     assert.strictEqual(reordered.changes.orderKept, false);
     assert.deepStrictEqual(reordered.changes.moved, ['sync']);
@@ -100,17 +106,17 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
 
   it("appends in the recipe's order the rules it brings when none of its rules is left to place them by", () => {
     const live = config([rule('runtime', 'runtime')]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe1, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe1, recipe1);
     assert.deepStrictEqual(names(merged), ['runtime', 'dm', 'zoo', 'sync', 'catch-all']);
     assert.deepStrictEqual(changes.restored, ['dm', 'zoo', 'sync', 'catch-all']);
   });
 
   it("keeps a run-time move, and names it only when it holds back the recipe's own reorder", () => {
     const moved = config([rule('sync', 'sync'), rule('dm', 'dm'), rule('zoo', 'zoo'), catchAll]);
-    const unchanged = reconcileWithRecipe(moved, recipe1, recipe1);
+    const unchanged = reconcile(moved, recipe1, recipe1);
     assert.deepStrictEqual(names(unchanged.config), ['sync', 'dm', 'zoo', 'catch-all']);
     assert.strictEqual(reconcileLine(unchanged.changes), null);
-    const reordered = reconcileWithRecipe(moved, config([rule('zoo', 'zoo'), rule('dm', 'dm'), rule('sync', 'sync'), catchAll]), recipe1);
+    const reordered = reconcile(moved, config([rule('zoo', 'zoo'), rule('dm', 'dm'), rule('sync', 'sync'), catchAll]), recipe1);
     assert.deepStrictEqual(names(reordered.config), ['sync', 'dm', 'zoo', 'catch-all']);
     assert.strictEqual(reordered.changes.orderKept, true);
     assert.deepStrictEqual(reordered.changes.moved, []);
@@ -119,7 +125,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it("lets the recipe's reorder through when the rule moved at run time is one the recipe drops", () => {
     const live = config([rule('zoo', 'zoo'), rule('dm', 'dm'), rule('sync', 'sync'), catchAll]);
     const recipe2 = config([rule('sync', 'sync'), rule('dm', 'dm'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(names(merged), ['sync', 'dm', 'catch-all']);
     assert.deepStrictEqual(changes.removed, ['zoo']);
     assert.strictEqual(changes.orderKept, false);
@@ -128,7 +134,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it('puts a rule new to the recipe before the recipe rule that follows it, when gate.json keeps its own order', () => {
     const live = config([rule('sync', 'sync'), rule('dm', 'dm'), rule('zoo', 'zoo'), catchAll]);
     const recipe2 = config([rule('dm', 'dm'), rule('zoo', 'zoo'), rule('sync', 'sync'), rule('new', 'new'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(names(merged), ['sync', 'dm', 'zoo', 'new', 'catch-all']);
     assert.deepStrictEqual(changes.added, ['new']);
   });
@@ -136,21 +142,21 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it('puts a rule new to the recipe after the recipe rule before it when none follows, ahead of a run-time rule at the end', () => {
     const live = config([...recipe1.policies, rule('runtime', 'runtime')]);
     const recipe2 = config([...recipe1.policies, rule('tail', 'tail')]);
-    const { config: merged } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(names(merged), ['dm', 'zoo', 'sync', 'catch-all', 'tail', 'runtime']);
   });
 
   it("gives an unedited default the recipe's, keeps an edited one, named, and takes one that already agrees", () => {
-    const followed = reconcileWithRecipe(recipe1, config(recipe1.policies, 'always'), recipe1);
+    const followed = reconcile(recipe1, config(recipe1.policies, 'always'), recipe1);
     assert.strictEqual(followed.config.default, 'always');
     assert.deepStrictEqual(followed.changes.defaultChange, { from: 'skip', to: 'always' });
-    const edited = reconcileWithRecipe(config(recipe1.policies, 'defer'), config(recipe1.policies, 'always'), recipe1);
+    const edited = reconcile(config(recipe1.policies, 'defer'), config(recipe1.policies, 'always'), recipe1);
     assert.strictEqual(edited.config.default, 'defer');
     assert.strictEqual(edited.changes.defaultKept, 'defer');
-    const unchangedRecipe = reconcileWithRecipe(config(recipe1.policies, 'defer'), recipe1, recipe1);
+    const unchangedRecipe = reconcile(config(recipe1.policies, 'defer'), recipe1, recipe1);
     assert.strictEqual(unchangedRecipe.config.default, 'defer');
     assert.strictEqual(unchangedRecipe.changes.defaultKept, undefined);
-    const agrees = reconcileWithRecipe(config(recipe1.policies, 'always'), config(recipe1.policies, 'always'), recipe1);
+    const agrees = reconcile(config(recipe1.policies, 'always'), config(recipe1.policies, 'always'), recipe1);
     assert.strictEqual(agrees.config.default, 'always');
     assert.strictEqual(reconcileLine(agrees.changes), null);
   });
@@ -159,7 +165,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
     // `watch` was added at run time; the next recipe declares a `watch` of its own.
     const live = config([rule('dm', 'dm'), rule('watch', 'watch-runtime'), rule('zoo', 'zoo'), rule('sync', 'sync'), catchAll]);
     const recipe2 = config([rule('dm', 'dm'), rule('watch', 'watch-recipe'), rule('zoo', 'zoo'), rule('sync', 'sync'), catchAll]);
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, recipe1);
+    const { config: merged, changes } = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(merged.policies[1], rule('watch', 'watch-runtime'));
     assert.deepStrictEqual(changes.differsFromRecipe, ['watch']);
     assert.deepStrictEqual(changes.added, []);
@@ -168,10 +174,10 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
   it('adopts a run-time rule the recipe now declares as it stands, so a later recipe that drops it removes it', () => {
     const live = config([...recipe1.policies.slice(0, 3), rule('watch', 'watch'), catchAll]);
     const recipe2 = config([...recipe1.policies.slice(0, 3), rule('watch', 'watch'), catchAll]);
-    const adopted = reconcileWithRecipe(live, recipe2, recipe1);
+    const adopted = reconcile(live, recipe2, recipe1);
     assert.deepStrictEqual(adopted.config, live);
     assert.strictEqual(reconcileLine(adopted.changes), null);
-    const dropped = reconcileWithRecipe(adopted.config, recipe1, recipe2);
+    const dropped = reconcile(adopted.config, recipe1, recipe2);
     assert.deepStrictEqual(dropped.changes.removed, ['watch']);
   });
 
@@ -180,7 +186,7 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
     // and the recipe's renamed rule behind the catch-all.
     const live = config([rule('dm', 'dm'), rule('zoo', 'zoo'), rule('sync', 'sync'), rule('runtime', 'runtime'), catchAll, rule('agents', 'agents')]);
     const recipe2 = config([rule('dm', 'dm-v2'), rule('agents', 'agents'), catchAll], 'always');
-    const { config: merged, changes } = reconcileWithRecipe(live, recipe2, null);
+    const { config: merged, changes } = reconcile(live, recipe2, null);
     // The rules it keeps stay in their places, and the recipe's take its order in theirs.
     assert.deepStrictEqual(names(merged), ['dm', 'zoo', 'sync', 'runtime', 'agents', 'catch-all']);
     assert.deepStrictEqual(merged.policies[0], rule('dm', 'dm'));
@@ -197,24 +203,24 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
         + 'kept, not in the recipe: zoo, sync, runtime (a stale one can be removed, and no start brings it back); '
         + "default kept as gate.json has it (skip), though the recipe's is always (set it to the recipe's, and later starts follow the recipe)",
     );
-    const sameDefault = reconcileWithRecipe(live, config(recipe2.policies, 'skip'), null);
+    const sameDefault = reconcile(live, config(recipe2.policies, 'skip'), null);
     assert.strictEqual(sameDefault.changes.defaultDiffers, undefined);
   });
 
   it('refuses gate.json or a recipe that names a rule twice, since it keys rules by name', () => {
     const twice = config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]);
-    assert.throws(() => reconcileWithRecipe(twice, recipe1, recipe1), /^Error: gate\.json named the rule "dm" twice, so the recipe wasn't applied: the merge needs one rule per name$/);
-    assert.throws(() => reconcileWithRecipe(recipe1, twice, recipe1), /^Error: the recipe named the rule "dm" twice, so it wasn't applied: the merge needs one rule per name$/);
+    assert.throws(() => reconcile(twice, recipe1, recipe1), /^Error: gate\.json names the rule "dm" twice$/);
+    assert.throws(() => reconcile(recipe1, twice, recipe1), /^Error: the recipe names the rule "dm" twice$/);
   });
 
   it("reads a rule whose keys come in another order as the same rule", () => {
     const reordered = config(recipe1.policies.map((p) => JSON.parse(JSON.stringify({ behavior: p.behavior, name: p.name, match: p.match })) as GatePolicy));
-    const { changes } = reconcileWithRecipe(reordered, recipe1, recipe1);
+    const { changes } = reconcile(reordered, recipe1, recipe1);
     assert.strictEqual(reconcileLine(changes), null);
   });
 
   it('says nothing when the recipe and gate.json agree with the last recipe', () => {
-    const { config: merged, changes } = reconcileWithRecipe(recipe1, recipe1, recipe1);
+    const { config: merged, changes } = reconcile(recipe1, recipe1, recipe1);
     assert.deepStrictEqual(merged, recipe1);
     assert.strictEqual(reconcileLine(changes), null);
   });
@@ -384,12 +390,8 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.ok(traces.some((t) => t.type === 'gate:config-reconciled'));
     const errors = gate.getStatus().errors;
     assert.strictEqual(errors.length, 1);
-    assert.match(errors[0], /^Failed to seed\/reconcile gate\.json: gate\.json was updated, but recording the recipe in gate\.recipe\.json failed \(.*EISDIR.*\), so the next start merges against the record as this write left it$/);
-    assert.strictEqual(logged[1], `[gate] ${errors[0]}`);
-    assert.deepStrictEqual(
-      traces.filter((t) => t.type === 'gate:config-error').map((t) => t.error),
-      [errors[0]],
-    );
+    assert.match(errors[0], /^At start, recording the recipe in gate\.recipe\.json failed \(.*EISDIR.*\), so the next start merges against the record as this write left it\.$/);
+    assert.ok(logged.includes(`[gate] ${errors[0]}`), JSON.stringify(logged));
   });
 
   it('says nothing was done to gate.json when only recording the recipe fails', () => {
@@ -400,7 +402,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate } = start(recipe2);
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
-    assert.match(gate.getStatus().errors[0], /^Failed to seed\/reconcile gate\.json: recording the recipe in gate\.recipe\.json failed /);
+    assert.match(gate.getStatus().errors[0], /^At start, recording the recipe in gate\.recipe\.json failed /);
   });
 
   it('says gate.json was seeded when recording the recipe then fails at the first start', () => {
@@ -409,7 +411,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate } = start(recipe1);
     gate.dispose();
     assert.deepStrictEqual(onDisk(), recipe1);
-    assert.match(gate.getStatus().errors[0], /^Failed to seed\/reconcile gate\.json: gate\.json was seeded, but recording the recipe in gate\.recipe\.json failed /);
+    assert.match(gate.getStatus().errors[0], /^At start, recording the recipe in gate\.recipe\.json failed /);
   });
 
   it('says when the record does not read, and then removes and redefines nothing', () => {
@@ -422,12 +424,12 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.deepStrictEqual(recorded(), recipe2);
   });
 
-  it("reads a record whose rules don't validate as one that does not read", () => {
+  it('reads a record refused as the starting rules are refused as one that does not read', () => {
     start(recipe1).gate.dispose();
-    writeFileSync(lastRecipePath(configPath), JSON.stringify({ policies: [{ match: {}, behavior: 'always' }] }));
+    writeFileSync(lastRecipePath(configPath), JSON.stringify({ policies: recipe1.policies, default: 'sometimes' }));
     const { gate, logged } = start(recipe2);
     gate.dispose();
-    assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(its rules or default don't validate\)/);
+    assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(it isn't read as the starting rules are\)/);
   });
 
   it('reads a record with no list of policies as one that does not read', () => {
@@ -457,30 +459,30 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), twice);
     assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
-    assert.match(gate.getStatus().errors.join('\n'), /gate\.json named the rule "dm" twice/);
-    // A run-time edit loads and writes gate.json, and the start's failure stays in status.
+    assert.match(gate.getStatus().errors.join('\n'), /At start, gate\.json names the rule "dm" twice, and the merge needs one rule per name, so the recipe wasn't applied: gate\.json is as it was, and nothing was recorded\./);
+    // A run-time edit loads and writes gate.json, and the start's word stays in status.
     gate.addPolicy(rule('watch', 'watch'));
-    assert.match(gate.getStatus().errors.join('\n'), /gate\.json named the rule "dm" twice/);
+    assert.match(gate.getStatus().errors.join('\n'), /At start, gate\.json names the rule "dm" twice/);
   });
 
-  it('refuses at the first start a recipe that names a rule twice, writing nothing', () => {
+  it('seeds gate.json at the first start with a recipe that names a rule twice, as given, and records nothing', () => {
     const twice = config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]);
     const { gate } = start(twice);
     gate.dispose();
-    assert.strictEqual(existsSync(configPath), false);
+    assert.deepStrictEqual(onDisk(), twice);
     assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
-    assert.deepStrictEqual(gate.getStatus().errors, [
-      'Failed to seed/reconcile gate.json: the recipe named the rule "dm" twice, so gate.json wasn\'t seeded and nothing was recorded: '
-        + 'the gate runs on the recipe as given, and a start whose recipe names each rule once seeds it',
-    ]);
+    assert.ok(gate.getStatus().errors.includes(
+      'At start, the recipe names the rule "dm" twice, so it wasn\'t recorded as the recipe last applied: a later start merges the '
+        + 'recipe by name, and applies one that names each rule once.',
+    ), JSON.stringify(gate.getStatus().errors));
   });
 
-  it("refuses at the first start a recipe that doesn't validate, writing nothing", () => {
+  it('seeds nothing and records nothing at the first start with a recipe refused whole', () => {
     const { gate } = start({ policies: [], default: 'sometimes' } as unknown as GateConfig);
     gate.dispose();
     assert.strictEqual(existsSync(configPath), false);
     assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
-    assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: the recipe doesn't validate \(gate\.json "default" must be .*\), so it wasn't applied: the gate runs on the recipe as given$/);
+    assert.match(gate.getStatus().errors.join('\n'), /At start, the host's starting rules weren't used/);
   });
 
   it("leaves gate.json as it is when a later start's recipe doesn't validate, and says it's the recipe", () => {
@@ -489,14 +491,15 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate } = start({ policies: [], default: 'sometimes' } as unknown as GateConfig);
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
-    assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: the recipe doesn't validate \(.*\), so it wasn't applied: the gate runs on gate\.json as it stands$/);
+    assert.match(gate.getStatus().errors.join('\n'), /At start, the host's starting rules weren't used/);
+    assert.deepStrictEqual(recorded(), recipe1, 'the record stays');
   });
 
   it("writes a default-only recipe change to gate.json, and seeds gate.json with the recipe as given", () => {
     start({ policies: recipe1.policies } as GateConfig).gate.dispose();
-    // gate.json holds the recipe as given; the record holds it as the gate reads it.
+    // gate.json and the record each hold the recipe as given.
     assert.strictEqual('default' in onDisk(), false);
-    assert.strictEqual(recorded().default, 'always');
+    assert.strictEqual('default' in recorded(), false);
     start(config(recipe1.policies, 'skip')).gate.dispose();
     assert.strictEqual(onDisk().default, 'skip');
   });
@@ -569,17 +572,9 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), '{ "policies": [ not json');
     assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
-    // One trace for the load, one for the start: gate.json is read once.
-    const errors = traces.filter((t) => t.type === 'gate:config-error').map((t) => String(t.error));
-    assert.strictEqual(errors.length, 2);
-    assert.strictEqual(
-      errors[1],
-      "Failed to seed/reconcile gate.json: it didn't load at this start, so the recipe wasn't applied or recorded: "
-        + "the gate runs on the recipe as given while gate.json doesn't load, and a start at which gate.json loads applies it",
-    );
+    assert.ok(!traces.some((t) => t.type === 'gate:config-reconciled'), 'nothing merged');
     // The gate runs on the recipe as given.
     assert.strictEqual(gate.evaluate(ext('zoo')).policyName, 'zoo');
-    assert.ok(gate.getStatus().errors.includes(errors[1]));
   });
 
   it('runs every probe event, and names the rules none reaches, such as one scoped to external-message', () => {

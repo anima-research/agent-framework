@@ -136,13 +136,17 @@ export interface StandardToolResult {
  * Content that is present but isn't a list of blocks makes it a malformed
  * result, never an empty success. A tool's error result with no words, or
  * only whitespace, reads as `noWords`, which the framework words for its
- * server and tool.
+ * server and tool. A payload stub with no `save` says why nothing could
+ * keep it in `noSave`: no workspace mounted unless the caller words it
+ * otherwise, as the framework does for a host whose only writable mount
+ * is direct.
  */
 export async function normalizeStandardToolResult(
   result: StandardToolResult,
   label: string,
   save: SaveToolPayload | null,
   noWords = 'Tool call failed',
+  noSave = 'no workspace is mounted to save it',
 ): Promise<ToolResult> {
   const malformed = result.content !== undefined && !Array.isArray(result.content);
   const raw: unknown[] = Array.isArray(result.content) ? result.content : [];
@@ -162,7 +166,7 @@ export async function normalizeStandardToolResult(
     const what = `[${kind}${opts.origin ? ` ${bounded(opts.origin, URI_POINTS)}` : ''}: ${bounded(mimeType)}, ${size}`;
     if (!save) {
       lost++;
-      return `${what}. Not retained: ${why}, and no workspace is mounted to save it]`;
+      return `${what}. Not retained: ${why}, and ${noSave}]`;
     }
     const fileName = `${label}-${++saved}.${extensionFor(mimeType)}`;
     const path = await save(fileName, Buffer.from(base64, 'base64'), mimeType).catch((error: unknown) => {

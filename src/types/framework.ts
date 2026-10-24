@@ -16,6 +16,13 @@ export type { TraceEvent, TraceEventListener } from './trace.js';
 export interface ModuleProcessResponse {
   moduleName: string;
   response: EventResponse;
+  /**
+   * Set when applying the response threw: the operation it threw at, such
+   * as `the edit of <id>`, and the error's message. What the response asked
+   * for before that was applied, that operation may have taken effect in
+   * part or whole, and the rest of it wasn't (EventResponse).
+   */
+  threw?: { at: string; error: string };
 }
 
 /**
@@ -117,9 +124,10 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * IANA zone used only when rendering wall-clock times for the agent.
-   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
-   * then the process zone.
+   * IANA zone of the agent's wall clock: it renders wall-clock times for the
+   * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
+   * counted from local midnight here). Stored/protocol timestamps remain
+   * epoch/UTC. Defaults to AGENT_TIMEZONE, then the process zone.
    */
   timeZone?: string;
 
@@ -240,14 +248,17 @@ export interface FrameworkConfig {
    * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
    * name, overwritten on collision, retained until the workspace owner
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview
-   * plus the file reference; with no writable mount without an include, the
-   * fallback is explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
+   * plus the file reference; with no writable mount without an include that
+   * keeps its files in the store (not configured direct), the fallback is
+   * explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
    * >= 1000. A resident's own agent_settings value
    * `tool_result_inline_max_chars` (durable, persisted in framework state)
    * takes precedence over this for that agent; the EFFECTIVE cap for every
    * source is min(desired, strategy bound) — desired values above the
    * strategy-derived bound (maxMessageTokens * 4) are hard-clamped to it,
-   * with the clamp reported via agent_settings get.
+   * with the clamp reported via agent_settings get. For an ordinary resident
+   * the bound is the smallest among the agents that read the shared slot,
+   * reported as clamped by `reader-bound` when another reader's sets it.
    */
   toolResultInlineMaxChars?: number;
 
@@ -273,7 +284,17 @@ export interface FrameworkConfig {
    */
   hostToolClasses?: Record<string, string[]>;
 
-  /** Inference routing policy for server-initiated inference (optional). */
+  /**
+   * Inference routing policy for server-initiated inference (optional): the
+   * model an MCPL server's inference/request runs on. Without one, each such
+   * request is refused with -32603 and a message naming this setting; the
+   * framework doesn't choose a model for a server. A server's effective
+   * grant can still list `inferenceRequest` then, since the grant comes from
+   * what the server advertises and `enabledCapabilities`, not from this
+   * policy. A policy that names no model for a request's feature set (no
+   * override, byFeature or wildcards entry that names one, and an empty
+   * `default`) refuses that request the same way, naming the feature set.
+   */
   inferenceRouting?: InferenceRoutingPolicy;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
@@ -461,13 +482,16 @@ export interface InferenceLogEntry {
 }
 
 /**
- * Entry in the process log - records a processed event with all module responses.
+ * Entry in the process log - records a processed event with the module
+ * responses that applied.
  */
 export interface ProcessLogEntry {
   timestamp: number;
   /** The process event that was handled */
   processEvent: ProcessEvent;
-  /** Responses from all modules, or blob ID if large */
+  /** The modules' responses that applied, or blob ID if large. A response
+   *  refused for content context-manager won't store is left out; its stderr
+   *  line and process:response-refused trace name it. */
   responses: ModuleProcessResponse[] | { blobId: string };
 }
 
@@ -477,7 +501,7 @@ export interface ProcessLogEntry {
 export interface ProcessLogQuery {
   /** Filter by process event type */
   eventType?: string;
-  /** Filter by module name (modules that responded) */
+  /** Filter by module name (modules whose responses applied) */
   moduleName?: string;
   /** Max number of logs to return */
   limit?: number;
