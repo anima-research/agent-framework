@@ -1851,6 +1851,9 @@ describe('save_recent_image selectors: omission, null and the empty string all m
           saveCall('call_every_pos', { path: 'files/every-pos.gif', ref: null, index: 1, count: null }),
           saveCall('call_every_ref', { path: 'files/every-ref.png', ref: ref1, index: null, count: null }),
           saveCall('call_every_range', { path: 'files/range.png', ref: null, index: null, count: 2 }),
+          // ...index 0 beside the nulls, and every selector null: both the newest image.
+          saveCall('call_every_newest', { path: 'files/every-newest.png', ref: null, index: 0, count: null }),
+          saveCall('call_every_unused', { path: 'files/every-unused.png', ref: null, index: null, count: null }),
           // Every-property callers that fill the unused selector with an empty string.
           saveCall('call_empty_pos', { path: 'files/empty-pos.gif', ref: '', index: 1, count: '' }),
           saveCall('call_empty_ref', { path: 'files/empty-ref.png', ref: ref1, index: '', count: '' }),
@@ -1887,6 +1890,8 @@ describe('save_recent_image selectors: omission, null and the empty string all m
       await expectGif('call_sparse_pos', 'files/sparse-pos.gif');
       await expectGif('call_every_pos', 'files/every-pos.gif');
       await expectPng('call_every_ref', 'files/every-ref.png', 0);
+      await expectPng('call_every_newest', 'files/every-newest.png', 0);
+      await expectPng('call_every_unused', 'files/every-unused.png', 0);
       await expectGif('call_digits', 'files/digits.gif');
       await expectGif('call_padded', 'files/padded.gif');
       await expectGif('call_empty_pos', 'files/empty-pos.gif');
@@ -1918,8 +1923,8 @@ describe('save_recent_image selectors: omission, null and the empty string all m
     const HINT = 'pass null, or leave it out, for a selector you are not using';
     const cases: Array<{ id: string; input: Record<string, unknown>; refusal: RegExp; hint?: boolean }> = [
       { id: 'ref_blank', input: { ref: '   ' }, refusal: REF_FORMAT },
-      // A refusal beside another selector in use carries the unused-selector hint;
-      // a refused selector that is the caller's only one doesn't.
+      // A malformed ref beside an index or count in use carries the unused-selector
+      // hint; a ref that is the caller's only selector doesn't.
       { id: 'ref_malformed_with_index', input: { ref: 'img_1', index: 1, count: null }, refusal: REF_FORMAT, hint: true },
       { id: 'ref_malformed_with_count', input: { ref: 'img_1', index: null, count: 2 }, refusal: REF_FORMAT, hint: true },
       { id: 'ref_malformed_with_index_zero', input: { ref: 'img_1', index: 0 }, refusal: REF_FORMAT, hint: true },
@@ -1938,14 +1943,16 @@ describe('save_recent_image selectors: omission, null and the empty string all m
       { id: 'index_fraction', input: { index: 1.5 }, refusal: INDEX },
       // Past the integers a number holds exactly, digits would read as another number.
       { id: 'index_unsafe_digits', input: { index: '9007199254740993' }, refusal: INDEX },
-      { id: 'index_bad_with_count', input: { index: '1.5', count: 2 }, refusal: INDEX, hint: true },
+      { id: 'index_unsafe_number', input: { index: 9007199254740992 }, refusal: INDEX },
+      // An index and a count are one selector: neither refusal invites dropping the other.
+      { id: 'index_bad_with_count', input: { index: '1.5', count: 2 }, refusal: INDEX },
       { id: 'index_bad_beside_empty_count', input: { index: '1.5', count: '' }, refusal: INDEX },
       { id: 'count_true', input: { ref: null, index: null, count: true }, refusal: COUNT },
       { id: 'count_array', input: { count: [2] }, refusal: COUNT },
       { id: 'count_zero', input: { count: 0 }, refusal: COUNT },
       { id: 'count_decimal_text', input: { count: '2.0' }, refusal: COUNT },
       { id: 'count_blank', input: { count: ' ' }, refusal: COUNT },
-      { id: 'count_bad_with_index', input: { index: 0, count: 21 }, refusal: COUNT, hint: true },
+      { id: 'count_bad_with_index', input: { index: 0, count: 21 }, refusal: COUNT },
       { id: 'count_over', input: { count: 21 }, refusal: COUNT },
       { id: 'conflict_count', input: { ref: ref1, count: 2 }, refusal: CONFLICT },
       { id: 'conflict_index', input: { ref: ref1, index: 0, count: null }, refusal: CONFLICT },

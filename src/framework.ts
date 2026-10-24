@@ -30315,17 +30315,18 @@ export class AgentFramework {
         // Any other value is checked, never read as absent: a whitespace or
         // malformed ref, or an index that isn't an integer, is refused rather
         // than turned into a different image than the one the caller named.
-        // The hint goes only where another selector is in use beside the refused
-        // one: when the refused selector is the caller's only one, advice to drop
-        // a selector would read as advice to drop it, and the newest image would
-        // be saved instead of the one it meant.
-        const unusedHint = (inUseBeside: boolean): string =>
-          inUseBeside ? ' (pass null, or leave it out, for a selector you are not using)' : '';
+        // A malformed ref beside an index or count in use says how to leave a
+        // selector unused, since the caller may have meant the positional one, as
+        // the conflict refusal below does for a well-formed ref. No refusal of one
+        // selector on its own says it: a ref alone is the caller's one selector,
+        // and dropping it would save the newest image; an index and a count are
+        // one selector, and dropping either changes which images are saved.
         if (fieldInUse(input.ref)) {
           if (typeof input.ref !== 'string' || !TOOL_IMAGE_REF_RE.test(input.ref)) {
+            const positionalInUse = fieldInUse(input.index) || fieldInUse(input.count);
             throw new Error(
               'save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)' +
-              unusedHint(fieldInUse(input.index) || fieldInUse(input.count)),
+              (positionalInUse ? ' (pass null, or leave it out, for a selector you are not using)' : ''),
             );
           }
           if (fieldInUse(input.index) || fieldInUse(input.count)) {
@@ -30338,12 +30339,12 @@ export class AgentFramework {
         } else {
           index = fieldInUse(input.index) ? integerField(input.index) : 0;
           if (!Number.isInteger(index) || index < 0) {
-            throw new Error(`save_recent_image: \`index\` must be a non-negative integer${unusedHint(fieldInUse(input.count))}`);
+            throw new Error('save_recent_image: `index` must be a non-negative integer');
           }
           count = fieldInUse(input.count) ? integerField(input.count) : 1;
           const MAX_COUNT = 20;
           if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
-            throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}${unusedHint(fieldInUse(input.index))}`);
+            throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}`);
           }
         }
         const lastWanted = index + count - 1;
