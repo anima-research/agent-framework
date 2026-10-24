@@ -365,10 +365,8 @@ const HOST_METADATA_KEYS = [
 ] as const;
 
 /**
- * Metadata key on a script's wake message: the script's start turn
- * (scriptWake). The message is private input when that turn is private as
- * the message is stored or injected (isPrivateInput). A server's copy of the
- * key is dropped (HOST_METADATA_KEYS).
+ * Metadata key on a script's wake message: the script's start turn. The
+ * message is private input while that turn is private (isPrivateInput).
  */
 const CALLER_TURN_KEY = 'callerTurnId';
 
@@ -1039,23 +1037,17 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 /**
- * The channels of the channel messages a wake brings in, each with its
- * server where known: a gate window's (WakeProvenance.channels), and a
- * start's, gathered from its batch (processInferenceRequests). A private
- * turn that takes them in names them to its resident, since its plain
- * speech reaches none of them (noticeChannelMessages). A symbol, as
+ * The channels of the channel messages a wake brings in, so a private turn
+ * that takes the wake can name them (noticeChannelMessages). A symbol, as
  * TURN_RETRY is, so spreads copy it.
  */
 const WAKE_CHANNELS: unique symbol = Symbol('wake-channels');
 /**
- * The turns whose work a request continues, each once: the turn that caused
- * a derived request (derivedTurnRequest, a budget restart, a re-inference),
- * the start turn of a script that wakes, and the turn that armed a self-wake,
- * a sleep or a tune-out cancel. The start that reads the work judges them,
- * as each stands then (processInferenceRequests): one that is private makes
- * the start private, so a turn that turned private after the request was
- * queued counts. Carried wherever wakes merge, as WAKE_CHANNELS is. A
- * symbol, as TURN_RETRY is, so spreads copy it.
+ * The turns whose work a request continues: the turn behind a derived
+ * request, a script's start turn, and the turn that armed a self-wake, a
+ * sleep or a tune-out cancel. The start that reads the request judges them
+ * as they stand then (processInferenceRequests), so a turn that turned
+ * private after the request was queued counts. A symbol, so spreads copy it.
  */
 const CALLER_TURNS: unique symbol = Symbol('caller-turns');
 type WakeChannel = { channelId: string; serverId?: string };
@@ -1066,16 +1058,14 @@ type MarkedRequest = InferenceRequest & {
   [CALLER_TURNS]?: number[];
 };
 
-/** The mark that a request continues the work of `turns` (CALLER_TURNS),
- *  for a request's spread: each defined id once, and nothing when none is. */
+/** The CALLER_TURNS mark for a request's spread: each defined id once. */
 function continuesTurns(...turns: Array<number | undefined>): Partial<MarkedRequest> {
   const ids = [...new Set(turns.filter((t): t is number => t !== undefined))];
   return ids.length > 0 ? { [CALLER_TURNS]: ids } : {};
 }
 
-/** The channels of the channel messages a request brings in
- *  (WAKE_CHANNELS): its own channel, where it's a channel wake, and those
- *  it carries. An auto-continuation's channel is its turn's locus, no
+/** A request's channel messages' channels: its own, and those it carries
+ *  (WAKE_CHANNELS). An auto-continuation's channel is its turn's locus, not a
  *  message's. */
 function wakeChannelsOf(request: InferenceRequest): WakeChannel[] {
   const own: WakeChannel[] = request.channelId && request.reason !== AUTO_CONTINUE_REASON
@@ -1084,9 +1074,7 @@ function wakeChannelsOf(request: InferenceRequest): WakeChannel[] {
   return [...own, ...((request as MarkedRequest)[WAKE_CHANNELS] ?? [])];
 }
 
-/** Add `channels` to the channels `request` carries (WAKE_CHANNELS), each
- *  once: a request that stands for others, a merged start or one kept in a
- *  wake's place, brings in their messages too. */
+/** Add `channels` to those `request` carries (WAKE_CHANNELS), each once. */
 function carryWakeChannels(request: InferenceRequest, channels: readonly WakeChannel[]): void {
   const kept = [...((request as MarkedRequest)[WAKE_CHANNELS] ?? [])];
   for (const c of channels) {
@@ -1100,10 +1088,8 @@ function callerTurnsOf(request: InferenceRequest): number[] {
   return (request as MarkedRequest)[CALLER_TURNS] ?? [];
 }
 
-/** What a request that stands for `others` takes from them: the channels of
- *  their messages (WAKE_CHANNELS) and the turns whose work they continue
- *  (CALLER_TURNS), so the start that takes it names those channels, and is
- *  judged by those turns. */
+/** A request that stands for `others` carries their channels and turns, so
+ *  its start names those channels and is judged by those turns. */
 function carryWakes(request: InferenceRequest, others: readonly InferenceRequest[]): void {
   carryWakeChannels(request, others.flatMap(wakeChannelsOf));
   const turns = [...new Set([...callerTurnsOf(request), ...others.flatMap(callerTurnsOf)])];
@@ -1281,17 +1267,14 @@ interface TurnRouting {
   /** Plain-prose segments the turn suppressed without drafts (proseRouting=disabled, or a round withheld before its scripts returned: ScriptRound.withhold), reported by its receipt. */
   suppressed: number;
   /**
-   * The turn is private: a private surface's wake took part in one of its
-   * starts (a WebUI, a TUI, a CLI, headless, or an API message naming no
-   * channel), or one of its boundaries injected such a surface's message
-   * (makeTurnPrivate). It has no locus from then on, so routing publishes
-   * none of its plain speech, and its channel_publish names its channel
-   * (privatePublishRefusal). Once set, it stays set for the turn.
+   * The turn is private: private input came into it, by a start's wake,
+   * stored input a start read, or a boundary's injection (makeTurnPrivate).
+   * It has no locus from then on, and stays private for the rest of the turn.
    */
   nonChannelOrigin: boolean;
-  /** Plain-speech segments a private turn kept on its surface (suppressPrivateTurnProse), reported by its receipt apart from suppressed and keptPrivate. */
+  /** Plain-speech segments the turn's privacy kept off channels (suppressPrivateTurnProse). */
   privateSuppressed: number;
-  /** The channels whose messages a private turn has named to its resident (noticeChannelMessages), by destination key, so each is named once in the turn. */
+  /** Channels already named to the resident (noticeChannelMessages), by destination key. */
   channelsNamed?: Set<string>;
   /**
    * Drafts held during the turn (src/prose-drafts.ts), which its receipt
@@ -1335,12 +1318,11 @@ interface Arrival {
 }
 
 /**
- * The last TurnRouting.turnId given out. Ids increase, and start from the
- * clock (milliseconds since the epoch, times 1,000), so an id an earlier run
- * of the process gave out is smaller than any a later run gives, as long as
- * the clock hasn't gone back between the two runs and the earlier one gave
- * out fewer than 1,000 ids a millisecond. The record of private turns reads
- * such an id as unknown (privateTurnsFloor).
+ * The last TurnRouting.turnId given out. Ids start from the clock (ms times
+ * 1,000) and only increase, so an earlier run's id, such as on a script report
+ * deferred across a restart, is at or below this run's floor and counts as
+ * private (privateTurnsFloor). That holds while the clock hasn't gone back
+ * and a run gives out fewer than 1,000 ids a millisecond.
  */
 let lastTurnId = Date.now() * 1000;
 
@@ -1500,9 +1482,7 @@ function isTurnContinuation(reason: string): boolean {
  * Whether an event is a private surface's message: an `external-message` or
  * `api:message` (a console, a TUI, a WebUI, an API caller) whose metadata
  * names no channel. Any source counts, so a new surface is private without
- * an allow-list, and a channel id makes the event a channel's. MCPL events
- * are never one. Its wake makes its turn private
- * (InferenceRequest.nonChannelOrigin).
+ * an allow-list. Its wake makes its turn private.
  */
 export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
   if (event.type !== 'external-message' && event.type !== 'api:message') return false;
@@ -1513,8 +1493,7 @@ export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
 /** How many private turns' ids the framework keeps (privateTurnIds). */
 const PRIVATE_TURNS_KEPT = 4096;
 
-/** How a private turn's resident reaches a channel, in its prose mode: what
- *  its routing notices name. */
+/** How a private turn's resident reaches a channel, in its prose mode. */
 function privateTurnReach(agent: Agent): string {
   return agent.proseRouting === 'hybrid'
     ? 'an explicit send tool or a >>> envelope'
@@ -2978,9 +2957,8 @@ export class AgentFramework {
    *  never moves routing: the boundary re-pins the turn's locus by its own
    *  rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
-  /** A private surface's message was stored for the agent since its last
-   *  start's stream began (notePrivateInput): its next start reads it, so
-   *  that start is private (beginAgentTurn). */
+  /** Agents with private input stored since their last start's stream began
+   *  (notePrivateInput): the next start reads it, so it is private. */
   private privateInputStored: Set<string> = new Set();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
@@ -3233,14 +3211,11 @@ export class AgentFramework {
    *  that runs on the same routing, as a resume can, takes it out again
    *  (beginAgentTurn). */
   private settledTurns: WeakSet<TurnRouting> = new WeakSet();
-  /** The ids of recent private turns (TurnRouting.nonChannelOrigin), so a
-   *  wake that continues a turn's work, a script's or a host's, can be judged
-   *  by that turn's privacy as it stands when the wake comes (isPrivateTurn).
-   *  At most PRIVATE_TURNS_KEPT, the highest. */
+  /** The ids of recent private turns, the PRIVATE_TURNS_KEPT highest, for
+   *  judging work that continues a turn (isPrivateTurn). */
   private privateTurnIds = new Set<number>();
-  /** The highest id the record no longer knows: one evicted from it, or one
-   *  given out before this framework was made, by an earlier run of the
-   *  process (lastTurnId) or for another framework in this one. */
+  /** Ids at or below this count as private: evicted from the record, or given
+   *  out before this framework was made (lastTurnId). */
   private privateTurnsFloor = lastTurnId;
   /** Agents whose fresh turn's coalescing assembly is running
    *  (beginAgentTurn): the window in which addMessage honours a write's
@@ -3885,18 +3860,13 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
-            // A window that holds a private surface's message wakes a
-            // private turn, which names no route (wakeProvenance); the
-            // telemetry above still says who and where woke it.
+            // A window that held a private surface's message wakes a private
+            // turn (wakeProvenance).
             ...(provenance?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
-            // The turns whose work it continues: a window's module requests',
-            // or the turn that armed a self-wake or a sleep
-            // (WakeProvenance.callerTurnIds), which its start judges.
+            // The turn that armed a self-wake or a sleep.
             ...continuesTurns(...(provenance?.callerTurnIds ?? [])),
-            // The window's channel messages, which a private turn that takes
-            // this wake names (WAKE_CHANNELS): those this agent holds, by
-            // the rule its route follows (mayTakeGateRoute), since the window
-            // is every agent's.
+            // The window's channels for a private turn to name: those this
+            // agent may take, by its route's rule (mayTakeGateRoute).
             ...((): Partial<MarkedRequest> => {
               const held = (provenance?.channels ?? []).filter((c) => {
                 const channel = framework.channelNamed(c.channelId, c.serverId);
@@ -5081,9 +5051,8 @@ export class AgentFramework {
    *  (it has no single subject), and the write a wake reads. A wake with any
    *  of them can be withdrawn or dropped on its own, and must not stand for
    *  one without. (coalescingBatch is set only beside one of the first two.)
-   *  A private wake never stands for one that isn't, or the hold could drop
-   *  the mark that makes the turn private: a private surface's message and a
-   *  channel's from one source in one millisecond share the rest. */
+   *  A private wake never stands for one that isn't: the hold could drop the
+   *  mark that makes the turn private. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
@@ -5107,8 +5076,7 @@ export class AgentFramework {
     // kept in its place, which then stands for it, as the start did.
     const batch = mergedBatch(request);
     if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
-    // So do the channels of its messages and the turns whose work it
-    // continues (carryWakes).
+    // And what it carries (carryWakes).
     carryWakes(same, [request]);
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
@@ -12906,24 +12874,16 @@ export class AgentFramework {
             : 0;
           const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
 
-          // Private input this boundary injects makes the turn private from
-          // here (makeTurnPrivate): the operator's words, or what a private
-          // turn's work brought back, are in the next round's context, so its
-          // speech must not land in a channel (isPrivateInput). The
-          // framework stamps every message stored for a private surface
-          // (surfaceSourceFor), and only it does. The notice rides
-          // this boundary's injections, as a re-pin's does; a stream that
-          // restarts reads it from the window. A boundary that ends the turn,
-          // or a silent turn's, answers none of it, so it also marks the
-          // agent, as any other store does, and its next start that can
-          // publish is private (notePrivateInput).
+          // Private input injected here makes the turn private from here on,
+          // and its notice rides this boundary's injections (makeTurnPrivate).
+          // A boundary that ends the turn, or a silent turn's, also marks the
+          // agent, so its next start that can publish is private.
           if (midTurnInjections.some((inj) => this.isPrivateInput(inj.metadata))) {
             const silent = this.activeTurnTriggers.get(agent.name)?.suppressProse === true;
             if (shouldEndTurn || silent) this.privateInputStored.add(agent.name);
             if (!shouldEndTurn) {
-              // A silent turn is made private too, so what it reads refuses
-              // its channel_publish that names no channel. Its speech goes
-              // nowhere, so it gets no notice.
+              // A silent turn is made private too, so its channel_publish must
+              // name a channel, but isn't told: its speech goes nowhere.
               const notice = this.makeTurnPrivate(agent, this.routingOf(agent.name), silent);
               if (notice && !overBudget && currentState.stream) midTurnInjections.push(notice);
             }
@@ -12983,8 +12943,7 @@ export class AgentFramework {
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: ChannelRef | undefined;
-            // A private turn moves no locus: it names each channel a message
-            // would have moved it to instead, riding the injections.
+            // A private turn moves no locus: it names those channels instead.
             const unmoved: WakeChannel[] = [];
             for (const inj of midTurnInjections) {
               const channel = this.repinChannel(inj.metadata, routing);
@@ -13049,9 +13008,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-              // It continues its turn's work (CALLER_TURNS): a private
-              // turn's restart is private, so a channel's wake batched with
-              // it gives the turn no channel.
+              // A private turn's restart is private (CALLER_TURNS).
               ...continuesTurns(this.turnRouting?.get(agent.name)?.turnId),
             };
             this.pendingRequests.push(continuation);
@@ -13148,10 +13105,7 @@ export class AgentFramework {
           } else {
             // Non-streaming fallback: schedule re-inference, which continues
             // this stream's logical turn (openLogical), so it carries the
-            // turn's properties, as the budget restart does. Its privacy is
-            // the turn's own, so a re-inference that finds no open turn, as
-            // after a stop() and start, opens a private one for a private
-            // turn's results.
+            // turn's properties and its privacy, as the budget restart does.
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
@@ -14452,9 +14406,8 @@ export class AgentFramework {
    * module's messages in response to an `external-message` (console, TUI) or
    * `api:message` event. An event whose metadata names a channel is not a
    * surface conversation and gets none (never a guessed identity). Read by
-   * isNonChannelSurfaceEvent's rule, so the envelope marks exactly the
-   * messages whose wake makes a turn private, and a boundary that injects
-   * one makes its turn private too.
+   * isNonChannelSurfaceEvent's rule, so it marks exactly the messages whose
+   * wake makes a turn private.
    */
   private surfaceSourceFor(event: ProcessEvent): InboundSource | undefined {
     if (!isNonChannelSurfaceEvent(event)) return undefined;
@@ -15526,9 +15479,7 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
-          // And the channels of its messages and the turns whose work it
-          // continues (carryWakes), which the start that takes the kept one
-          // names and is judged by.
+          // The kept one carries the other's channels and turns (carryWakes).
           if (prev) carryWakes(kept, [kept === request ? prev : request]);
           newestByKey.set(key, kept);
         }
@@ -15692,15 +15643,10 @@ export class AgentFramework {
         this.autoContinueStreaks?.delete(agentName);
       }
       // Private wins, one way: a start whose batch holds a private surface's
-      // wake, or a request that continues the work of a turn private as it
-      // stands now (CALLER_TURNS), is private, whatever else the batch holds,
-      // a continuation of the open turn included. The turns are judged here,
-      // where the work is read, so one that turned private after its request
-      // was queued counts. Its turn
-      // then has no locus, and a channel's wake beside it is answered in no
-      // channel: the operator's words are in the same context, so a reply
-      // published there could carry them. A turn that is private stays so
-      // (startAgentStream).
+      // wake, or a request continuing the work of a turn private as it stands
+      // now, is private, whatever else the batch holds. A channel's wake
+      // beside it gets no reply in its channel, since the operator's words
+      // share the context.
       const turnIsPrivate = requests.some((r) => r.nonChannelOrigin === true
         || callerTurnsOf(r).some((id) => this.isPrivateTurn(id)));
       // Route this turn's auto-published speech to the channel that triggered
@@ -15814,12 +15760,8 @@ export class AgentFramework {
       // token it stands for them all.
       if (continuesTurn(start) && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
-      // The channels of the batch's channel messages, for a private turn's
-      // notice (WAKE_CHANNELS): each channel wake's own, a held turn's retry
-      // naming the message its turn was for, and what each request carries,
-      // a gate window's, a requeued start's, or the wakes one stands for.
-      // So do the turns whose work they continue (CALLER_TURNS), by which a
-      // start held again before its token is judged again.
+      // Gather afresh the batch's channels and the turns its requests
+      // continue, so a start held again is judged again.
       delete start[WAKE_CHANNELS];
       delete start[CALLER_TURNS];
       carryWakes(start, requests);
@@ -15871,12 +15813,9 @@ export class AgentFramework {
   }
 
   /**
-   * A private turn's plain speech, which goes to no channel: counted for the
-   * turn's receipt as kept private, where it would otherwise reach routing
-   * with no locus and be reported as a failed send. It isn't held as a
-   * draft, since nothing failed: the surface the turn answers shows it.
-   * Counted apart from keptPrivate, which is the resident's own choice,
-   * where this is the turn's privacy.
+   * Count a private turn's plain speech for its receipt as kept private,
+   * rather than let it reach routing with no locus and read as a failed send.
+   * Not drafted: nothing failed.
    */
   private suppressPrivateTurnProse(agentName: string, routing: TurnRouting, count: number): void {
     if (count <= 0) return;
@@ -16813,10 +16752,8 @@ export class AgentFramework {
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}${closedNote}`
-        // A private turn's plain speech went to no channel, as disabled
-        // mode's does: "nothing" would read as nothing reaching its surface.
-        // One with a draft whose earlier send may have gone out says so, as
-        // any turn does.
+        // A private turn's speech went to no channel: "nothing" would read as
+        // nothing reaching its surface.
         : agent.proseRouting === 'disabled' || (routing.nonChannelOrigin && !uncertain)
           ? `[delivered] plain speech → no channel — ${suppressedNote}`
           : `[delivered] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
@@ -17172,22 +17109,17 @@ export class AgentFramework {
   }
 
   /**
-   * A round's envelope names a destination its turn's later unprefixed speech
-   * follows (`>>>` in hybrid mode, `>>` in explicit), unless the turn is
-   * private: its plain speech stays on its surface, as its notice tells a
-   * resident whose turn had a destination, so no envelope sets one for it,
-   * one written before the private input and delivered after it on the
-   * speech chain included. The envelope's own words still go where it names.
+   * A round's envelope sets the destination later unprefixed speech follows,
+   * except in a private turn, however late the envelope is delivered. The
+   * envelope's own words still go where it names.
    */
   private pinTurn(round: ProseRound, channel: ChannelRef): void {
     if (round.routing.nonChannelOrigin) return;
     round.routing.pin = channel;
   }
 
-  /** Queue a request that continues the work of the turn `callerTurnId`
-   *  names, if any, such as a tune-out cancel's turn for the resident. It
-   *  carries the turn (CALLER_TURNS), so its start is private when that turn
-   *  is by then, since what a private turn causes is private too. */
+  /** Queue a request continuing the work of turn `callerTurnId`, such as a
+   *  tune-out cancel's turn for the resident (CALLER_TURNS). */
   private requestForTurn(agentName: string, reason: string, source: string, callerTurnId?: number): void {
     this.pendingRequests.push({ agentName, reason, source, timestamp: Date.now(), ...continuesTurns(callerTurnId) });
   }
@@ -17198,10 +17130,9 @@ export class AgentFramework {
     return this.scriptCallStarts.has(call.id) ? this.scriptCallStarts.get(call.id)!.turnId : call.callerTurnId;
   }
 
-  /** Record a turn as private (privateTurnIds), at each site that makes one
-   *  private: its open, and makeTurnPrivate. Past the record's size, the
-   *  lowest id goes, and the floor rises to it: a turn made private late can
-   *  have a lower id than turns recorded before it. */
+  /** Record a turn as private. Past PRIVATE_TURNS_KEPT the lowest id goes and
+   *  the floor rises to it, since a turn can turn private after higher ids
+   *  were recorded. */
   private notePrivateTurn(turnId: number): void {
     if (turnId <= this.privateTurnsFloor || this.privateTurnIds.has(turnId)) return;
     this.privateTurnIds.add(turnId);
@@ -17213,37 +17144,20 @@ export class AgentFramework {
   }
 
   /**
-   * Whether the turn with this id is private as it stands now, for a wake
-   * that continues its work: a script's (scriptWake), a script's
-   * channel_publish (scriptToolCall), or a self-wake, sleep or tune-out
-   * cancel it armed. A turn turns private one
-   * way, so a turn that took private input after the work began counts. An
-   * id the record no longer knows, at or below its floor, counts as private:
-   * it fails closed.
+   * Whether the turn is private as it stands now, for work that continues it.
+   * An id at or below the floor counts as private: it fails closed.
    */
   private isPrivateTurn(turnId: number): boolean {
     return this.privateTurnIds.has(turnId) || turnId <= this.privateTurnsFloor;
   }
 
   /**
-   * Make a turn private from here: a start of it took in a private surface's
-   * wake, or a request that continues a private turn's work, or read such a
-   * surface's message stored since the agent's last start (beginAgentTurn),
-   * or one of its boundaries injected one. Private wins, one way: the operator's words
-   * are in its context now, so none of its plain speech is published for the
-   * rest of the turn: an envelope's own body still goes where it names, but
-   * sets no destination for what follows (pinTurn). Its locus, its trigger
-   * channel and its sticky `>>` or `>>>` destination go, so speech written
-   * after the private input doesn't follow a destination chosen before it,
-   * and nothing re-pins it: the messages that would have (TurnRouting.arrivals)
-   * are named at its next start instead (noticeChannelMessages). A turn that
-   * becomes private here is told so once, whatever destination it had, in a
-   * durable `[routing]` notice (storePrivateTurnNotice): an explicit-mode
-   * turn with none would otherwise meet the private input with nothing
-   * saying its words now stay off channels. A silent turn (`silent`), whose
-   * speech goes nowhere, isn't told. Returns the notice as stored, for a live
-   * stream to inject with its boundary's other messages, or undefined when
-   * the turn was private already or silent, or the notice couldn't be stored.
+   * Make a turn private from here on: private input came into it. Its locus,
+   * trigger channel and sticky destination go, so later speech doesn't
+   * follow a destination chosen before the input, and arrivals are named at
+   * its next start rather than re-pinning it (noticeChannelMessages). It is
+   * told once, whatever destination it had, unless it's `silent`. Returns
+   * the stored notice for a live stream to inject, or undefined.
    */
   private makeTurnPrivate(
     agent: Agent,
@@ -17265,17 +17179,10 @@ export class AgentFramework {
 
   /**
    * The durable `[routing]` notice that a private turn holds messages from
-   * these channels, and that its plain speech reaches none of them: at a
-   * start that took them in (beginAgentTurn), at a live boundary whose
-   * injections would have moved a channel turn's locus to them, and at the
-   * turn's next start for such messages it stored with no live stream to
-   * tell (TurnRouting.arrivals). The resident decides, in the turn that
-   * holds both, whether to answer there. Each channel is named once in the
-   * turn (TurnRouting.channelsNamed). Returns the notice as stored, for a
-   * live stream to inject with its boundary's other messages, or undefined
-   * when every channel was named already or it couldn't be stored. One that
-   * couldn't is logged, and its channels stay unnamed, so a later start or
-   * boundary that takes in their messages names them.
+   * these channels, which its plain speech won't reach, so the resident can
+   * choose to answer there. Each channel is named once per turn; one whose
+   * notice couldn't be stored stays unnamed, to be named later. Returns the
+   * notice as stored, or undefined.
    */
   private noticeChannelMessages(
     agent: Agent,
@@ -17314,13 +17221,9 @@ export class AgentFramework {
   }
 
   /**
-   * The durable `[routing]` notice that a private surface's message came into
-   * the turn, so its plain speech goes to no channel: for a turn that turns
-   * private with a destination (makeTurnPrivate), and for one a stored
-   * private message makes private though a channel's wake opened it
-   * (beginAgentTurn), whose resident would otherwise take its reply to be the
-   * room's. The announce baseline moves to no channel once it's stored, as a
-   * re-pin's does. Returns it as stored, or undefined when it couldn't be.
+   * The durable `[routing]` notice that private input came into the turn, so
+   * its plain speech goes to no channel. The announce baseline moves to no
+   * channel, as a re-pin's does. Returns it as stored, or undefined.
    */
   private storePrivateTurnNotice(
     agent: Agent,
@@ -18438,10 +18341,8 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky && routing.nonChannelOrigin) {
-        // A private turn's plain speech goes to no channel, so it's kept
-        // private, as in the other modes, not bounced: a bounce holds a
-        // draft to resend, and resending it is the step into a channel the
-        // turn's privacy keeps from being taken by default.
+        // A private turn's plain speech is kept private, not bounced: a
+        // bounce holds a draft to resend, a step into a channel by default.
         this.keepPrivateTurnProse(agent, rawText);
         return;
       }
@@ -18559,10 +18460,8 @@ export class AgentFramework {
   }
 
   /**
-   * Explicit mode's unprefixed speech in a private turn: kept private, with
-   * no draft held and no `{{unsent}}` offer, and the resident told why and
-   * how to publish, privately, as a bounce's receipt would tell it. No wake:
-   * nothing failed that a resend would fix.
+   * Explicit mode's unprefixed speech in a private turn: kept private, with no
+   * draft, resend offer or wake, and the resident told how to publish.
    */
   private keepPrivateTurnProse(agent: Agent, text: string): void {
     const notice =
@@ -19398,13 +19297,10 @@ export class AgentFramework {
     //    With no turn open, the start opens one.
     // A new object doesn't clear the previous turn's: prose that turn left
     // queued still reads and writes its own.
-    // A private surface's message stored for the agent since its last start
-    // (notePrivateInput) is read by this one, which is private, as a private
-    // wake in its batch makes it. A silent start is private too, so its
-    // channel_publish names its channel, but it publishes nothing and leaves
-    // the mark to the next start; the mark is spent once a start that can
-    // publish has begun its stream (startAgentStream), so a start that parks
-    // or ends before then leaves it to the next start too.
+    // Private input stored since the agent's last start makes this start
+    // private. A silent start is private too but publishes nothing, so it
+    // leaves the mark for the next start; a start that can publish spends it
+    // once its stream begins (startAgentStream).
     const privateInput = this.privateInputStored.has(agent.name);
     let routing: TurnRouting;
     let opensTurn = false;
@@ -19492,11 +19388,9 @@ export class AgentFramework {
       // this turn compiles, so the agent always knows where its voice goes
       // (announce-on-change only — no per-turn chatter, append-only for KV
       // stability).
-      // A stored private message made this start private though no private
-      // wake started it: its resident is told why, every time and in every
-      // mode, since it would take its reply to be the room's. A silent start
-      // has no reply, and reads the mark again at each tick until a start
-      // that can publish spends it, so it isn't told.
+      // A start made private by stored input alone tells its resident why,
+      // in every mode, since it would take its reply to be the room's. A
+      // silent start has no reply, so isn't told.
       const toldPrivate = attempt === 0 && privateInput && trigger?.nonChannelOrigin !== true && !trigger?.suppressProse;
       if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
         // None for a turn with no channel (noChannel), unless it's a fork's,
@@ -19511,22 +19405,15 @@ export class AgentFramework {
       if (toldPrivate) this.storePrivateTurnNotice(agent);
     } else {
       // Every other start of the turn keeps its locus: a resume, or a start
-      // that continues the open turn. One whose batch holds a private wake,
-      // or a request that continues a private turn's work
-      // (processInferenceRequests), or that reads a private surface's message
-      // stored since the agent's last start, makes the turn private from
-      // here: it loses its locus, and the
-      // agent is told so before this start compiles (makeTurnPrivate), unless
-      // the start is silent, as a silent turn's budget restart is.
+      // that continues the open turn. One that takes in private input makes
+      // the turn private from here (makeTurnPrivate), told unless silent.
       // Otherwise a message no tool boundary of the turn weighed can still
       // move it, as it would have at a boundary (TurnRouting.arrivals).
       if (trigger?.nonChannelOrigin === true || privateInput) this.makeTurnPrivate(agent, routing, trigger?.suppressProse === true);
       // A turn in a mode with a locus reads its arrivals' messages, a turn
       // with no channel (noChannel) included: an addressed message, or a
       // follow-up where the turn sent, gives it its channel, as a re-pin does.
-      // A private turn moves no locus: it names the channels of the arrivals
-      // still in its store instead, those noted before it turned private
-      // included (noticeChannelMessages).
+      // A private turn moves no locus: it names its arrivals' channels instead.
       const locusMode = turnProseRouting === 'locus' || turnProseRouting === 'hybrid';
       if (routing.nonChannelOrigin) {
         const cm = agent.getContextManager();
@@ -19539,16 +19426,12 @@ export class AgentFramework {
         if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
       }
     }
-    // A private turn whose start took in a channel's message says so before
-    // it compiles: its plain speech won't reach that channel, and the
-    // resident chooses whether to answer there. A retry of the start names
-    // nothing the first attempt named (TurnRouting.channelsNamed).
+    // A private turn names the channels whose messages its start took in,
+    // before it compiles.
     const wakeChannels = (trigger as MarkedRequest | undefined)?.[WAKE_CHANNELS];
     if (routing.nonChannelOrigin && wakeChannels) this.noticeChannelMessages(agent, routing, wakeChannels);
-    // A private turn's start routes to no channel and is addressed in none,
-    // whatever requests it took in, so neither its typing nor what its speech
-    // handlers read points at the channel of a wake that joined it. Its
-    // telemetry (counterparty, wakeChannelId) still says who woke it.
+    // A private turn's start routes to no channel and is addressed in none, so
+    // neither its typing nor its speech handlers point at a wake's channel.
     if (trigger && routing.nonChannelOrigin && (trigger.channelId !== undefined || trigger.addressed || trigger.nonChannelOrigin !== true)) {
       trigger = { ...trigger, channelId: undefined, addressed: false, nonChannelOrigin: true };
     }
@@ -21211,9 +21094,8 @@ export class AgentFramework {
 
             // Dispatch speech (and thoughts if any)
             if (!trigger?.suppressProse && (speechContent.length > 0 || thoughts.length > 0)) {
-              // A turn that turned private after its start shows its speech
-              // handlers no channel of the wake that opened it, as a private
-              // start's trigger shows none (beginAgentTurn).
+              // A turn private since its start shows its speech handlers no
+              // wake's channel, as a private start does (beginAgentTurn).
               const shownTrigger = trigger && streamRouting.nonChannelOrigin && trigger.nonChannelOrigin !== true
                 ? { ...trigger, channelId: undefined, channelServerId: undefined, addressed: false, nonChannelOrigin: true }
                 : trigger;
@@ -21325,10 +21207,8 @@ export class AgentFramework {
               // injected message can reset. The legacy/fallback path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
-              // A call the agent's list refuses posted nothing, and nor did a
-              // private turn's channel_publish that names no channel
-              // (privatePublishRefusal), as a live round counts them
-              // (roundCallOf).
+              // A call the agent's list refuses posted nothing, nor did a
+              // private turn's refused channel_publish (roundCallOf).
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => b as unknown as { name?: unknown; input?: unknown })
@@ -22879,10 +22759,8 @@ export class AgentFramework {
         source: 'code_execution',
         timestamp: Date.now(),
         ...this.readsDeferredFor(placement, agentName),
-        // What a private turn causes is private too: it carries the
-        // script's start turn, which its start judges as it stands then,
-        // since that turn may take private input after it started the
-        // script, or after this wake is queued.
+        // It carries the script's start turn, judged when the wake's start
+        // reads it (CALLER_TURNS).
         ...continuesTurns(startTurnId),
       });
       this.emitTrace({
@@ -23276,11 +23154,8 @@ export class AgentFramework {
       : this.stopHasBegun() ? 'this host is stopping; nothing was done'
       : !parsed ? `${toolName}'s arguments weren't JSON; nothing was done`
       : input === undefined ? `${toolName}'s arguments must be an object; nothing was done`
-      // A script whose start turn is private, as it stands now
-      // (isPrivateTurn), names its channel_publish's channel. It runs apart
-      // from that turn, a background one past the turn's end, so the
-      // default, the channel of the latest inbound message, is one nobody
-      // chose for it, where the private turn's work would be published.
+      // A script whose start turn is private now must name its channel: the
+      // default, the latest inbound message's channel, is one nobody chose.
       : toolName === 'channel_publish' && !input.channelId
         && context.startTurnId !== undefined && this.isPrivateTurn(context.startTurnId)
         ? "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId"
@@ -24617,23 +24492,17 @@ export class AgentFramework {
   }
 
   /**
-   * A message stored for the agent outside a tool boundary is private input
-   * (isPrivateInput): the agent's next start is the first
-   * to read it, so that start is private, as a private wake in its batch
-   * makes it, though the message's own wake may still wait in a gate window
-   * (beginAgentTurn). A boundary that injects one makes its live turn
-   * private instead (makeTurnPrivate). Another resident that reads the same
-   * message slot isn't marked: that's R1-1d's, for #256.
+   * Mark the agent when private input is stored outside a tool boundary: its
+   * next start reads it, so that start is private (beginAgentTurn).
    */
   private notePrivateInput(agentName: string, metadata: MessageMetadata | undefined): void {
     if (this.isPrivateInput(metadata)) this.privateInputStored.add(agentName);
   }
 
   /**
-   * Whether a stored message is private input: a private surface's, by the
-   * stamp only the framework writes (surfaceSourceFor), or one that brings
-   * back the work of a turn that is private as it stands now (CALLER_TURN_KEY,
-   * isPrivateTurn).
+   * Whether a stored message is private input: a private surface's
+   * (surfaceSourceFor), or a script's wake message whose start turn is
+   * private now (CALLER_TURN_KEY).
    */
   private isPrivateInput(metadata: MessageMetadata | undefined): boolean {
     if (readInboundSource(metadata)?.kind === 'surface') return true;
@@ -30183,16 +30052,11 @@ export class AgentFramework {
   }
 
   /**
-   * The refusal of a channel_publish that names no channel in a private turn,
-   * or undefined. A private turn publishes only where it names: its default
-   * would be the channel of the latest inbound message, one the resident
-   * can't see and didn't choose, and a fork's home is no different, since the
-   * turn is private wherever the agent speaks. Judged on the call as the
-   * model made it, and on whether the turn it was made in is private
-   * (`privateTurn`): at its dispatch (dispatchChannelToolCall, by the call's
-   * own turn) and in its round's routing (roundCallOf and the fallback's
-   * scan, by the stream's). A script's call is judged by the script's start
-   * turn instead, at the bridge (scriptToolCall).
+   * The refusal of a private turn's channel_publish that names no channel, or
+   * undefined. Its default, the latest inbound message's channel, is one the
+   * resident didn't choose, and a fork's home is no different. Judged at
+   * dispatch by the call's own turn, and in routing by the stream's; a
+   * script's call is judged at the bridge by its start turn (scriptToolCall).
    */
   private privatePublishRefusal(
     agentName: string,
@@ -30207,9 +30071,8 @@ export class AgentFramework {
       + (this.canAgentUseTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
   }
 
-  /** A conversation fork's home channel by the name the agent is shown, the
-   *  form a selector takes, for a refusal to name; undefined for an agent
-   *  with no home. */
+  /** A conversation fork's home channel as the agent is shown it, for a
+   *  refusal to name. */
   private forkHomeShown(agentName: string): string | undefined {
     const home = this.conversationAgentHomes.get(agentName);
     return home && (this.channelRegistry?.nameShown(home) ?? home.channelId);
@@ -30269,11 +30132,8 @@ export class AgentFramework {
     // framework-global state (the open-channel set every agent's channel
     // context is built from), which is not a fork's call to make.
     const home = this.conversationAgentHomes.get(agentName);
-    // Judged on the call as the agent made it, before a fork's default below
-    // fills one in, by the turn it was made in as that turn stands now. A
-    // script's call was judged at the bridge by the script's start turn
-    // (scriptToolCall), whichever turn is live now.
-    // Only a channel_publish is judged (privatePublishRefusal).
+    // Judged on the call as made, before a fork's default fills one in, by
+    // its own turn. A script's call was judged at the bridge instead.
     const madeIn = call.callerTurnId;
     const privateTurn = call.name === 'channel_publish' && !this.scriptCallStarts.has(call.id) && (madeIn !== undefined
       ? this.isPrivateTurn(madeIn)
@@ -30432,10 +30292,8 @@ export class AgentFramework {
             ? { serverId: data.serverId, channelId: data.channelId }
             : asked?.channelId ? this.channelNamed(asked.channelId, asked.serverId) : undefined;
           if (opened && callingTurn) {
-            // A private turn may open a channel for its incoming traffic, but
-            // its plain speech stays private, and the channel isn't its
-            // trigger channel either: opening a channel to read it isn't
-            // choosing to speak there. An explicit send still reaches it.
+            // A private turn may open a channel to read it, but opening isn't
+            // choosing to speak there: its speech stays private.
             const privateTurn = callingTurn.nonChannelOrigin;
             if (!privateTurn) {
               callingTurn.triggerChannel = opened;

@@ -86,9 +86,8 @@ export interface TuneOutFrameworkHooks {
     metadata?: Record<string, unknown>,
     forAgent?: string,
   ) => string;
-  /** Queue an inference request for an agent. `callerTurnId` is the turn
-   *  whose work it continues, as a cancel the resident made names it: the
-   *  framework wakes a private turn when that one is private by then. */
+  /** Queue an inference request for an agent, continuing the work of
+   *  `callerTurnId`, the turn that asked for a cancel. */
   requestInference: (agentName: string, reason: string, source: string, callerTurnId?: number) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;

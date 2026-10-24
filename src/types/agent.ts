@@ -599,10 +599,7 @@ export interface InferenceRequest {
    * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
   /** True when this request is a private surface's (a console, a WebUI, an
-   *  API message naming no channel), or is a start the framework judged
-   *  private: one whose batch held such a request, or continued the work of
-   *  a turn private by then (its restart, a ` !` continuation, a bounce, a
-   *  rewind's retry, a script's wake, a wake the turn armed).
+   *  API message naming no channel), or a start the framework judged private.
    *  A start that takes it in is private, and so is its turn from then on. */
   nonChannelOrigin?: boolean;
 }

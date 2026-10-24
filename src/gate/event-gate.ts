@@ -177,11 +177,8 @@ export interface WakeProvenance {
    *  requests can order by event recency, not by flush order. */
   at?: number;
   /** The registered channel of each of the window's channel messages, each
-   *  once, with its server: what a private turn that takes the wake names,
-   *  since its plain speech reaches none of them (the framework's notice of
-   *  a private turn's channel messages). Not telemetry: it decides what that
-   *  notice names, and a window with no pick for the fields above still
-   *  gives it. */
+   *  once, with its server, for a private turn that takes the wake to name.
+   *  Not telemetry: a window with no pick for the fields above still gives it. */
   channels?: Array<{ channelId: string; serverId?: string }>;
   /** The turn that armed a self-wake or a sleep, whose work the wake
    *  continues. The framework wakes a private turn when it is private as it
@@ -275,12 +272,9 @@ function isMetadataTruthy(value: unknown): boolean {
  * addressed all come from that one event, so they can never disagree.
  *
  * A window that holds a private surface's message is private, whatever else
- * it holds: its one wake is a private turn's, which answers in no channel,
- * and it names no route, so the operator's words never start a turn whose
- * reply is published (private wins, one way). Its channel, author and
- * addressed still say who woke it, as telemetry. So does the list of every
- * channel the window's messages came from (channels), which such a private
- * turn names to its resident.
+ * it holds, and names no route: the operator's words never start a turn
+ * whose reply is published. Its channel, author and addressed stay, as
+ * telemetry.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
@@ -1859,8 +1853,7 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
-  /** The turn that set the sleep, which the sleep's wake carries
-   *  (WakeProvenance.callerTurnIds). In memory with the sleep. */
+  /** The turn that set the sleep, which its wake carries. */
   private sleepTurnId: number | undefined;
   // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
   // armed, though a turn a failed stop() left running can still ask for one.
@@ -3481,8 +3474,7 @@ export class EventGate {
   // =========================================================================
 
   /** Begin (or extend) a sleep window of `seconds`. Returns the wake time.
-   *  `callerTurnId` is the turn that set it, which its wake carries: the
-   *  framework wakes a private turn when that one is private by then. */
+   *  Its wake carries `callerTurnId`, the turn that set it. */
   setSleep(seconds: number, note?: string, agentName?: string, callerTurnId?: number): { until: number } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     this.sleepUntil = this.now() + ms;
@@ -3559,9 +3551,7 @@ export class EventGate {
    * suppression window, unlike sleep. Re-arming replaces the pending timer.
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
-   * `callerTurnId` is the turn that armed it, which its wake carries
-   * (WakeProvenance.callerTurnIds): the framework wakes a private turn when
-   * that one is private by then.
+   * Its wake carries `callerTurnId`, the turn that armed it.
    */
   armSelfWake(agentName: string, seconds: number, source = 'skip_reply', callerTurnId?: number): { inMs: number; armed: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
