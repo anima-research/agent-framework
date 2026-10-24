@@ -352,13 +352,13 @@ function urlMayCarryCredential(u: URL, depth: number): boolean {
  *  reference's (it starts with `/`, or holds `?` or `#`), resolved against
  *  the uri it sits in, less that uri's query and fragment, since a value of
  *  a fragment alone, such as a colour's `#ff0000`, would otherwise bring
- *  back the query it sits in and be read again at each level; else, where
- *  decoding it once more changes it, decoded and read again from the start.
- *  Each read or decode is a level, and a decode is lenient, as the
- *  parameter's own was, so a stray `%` doesn't stop it. A value that is none
- *  of these, such as a word, answers false, so an ordinary value never meets
- *  the relative reading's fail-closed answer; within the bound a decode
- *  alone never withholds, and past it a value that would still decode does. */
+ *  back the query it sits in and be read again at each level, and one that
+ *  doesn't resolve may carry one; else, where decoding it once more changes
+ *  it, decoded and read again from the start. Each read or decode is a
+ *  level, and a decode is lenient, as the parameter's own was, so a stray
+ *  `%` doesn't stop it. A value that is none of these, such as a word,
+ *  answers false; within the bound a decode alone never withholds, and past
+ *  it a value that would still decode does. */
 function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
   let inner: URL | null = null;
   try {
@@ -371,7 +371,11 @@ function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
         base.hash = '';
         inner = new URL(value, base);
       } catch {
-        inner = null;
+        // One that doesn't resolve may carry one, as a uri that doesn't parse
+        // may: its parts can't be read. Only a protocol-relative value whose
+        // authority doesn't parse comes here, so an ordinary value such as
+        // `q=// note` is withheld too.
+        return true;
       }
     }
   }
