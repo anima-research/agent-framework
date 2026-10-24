@@ -1589,3 +1589,42 @@ test("a module skipped between two that finish out of order leaves the others in
   }
   assert.deepEqual(gathered.map((i) => i.namespace), ['first', 'last']);
 });
+
+test("a unit whose later part alone changes is stored again whole", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  agent.getContextManager().addMessage('user', [text('hello')]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('A'), injection('C')]), undefined);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('A'), injection('C')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A', 'C'], 'the premise: the same unit is skipped');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('A'), injection('C2')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A', 'C', 'A', 'C2'], 'its first part unchanged, the unit is stored whole');
+});
+
+test("a write that throws in the middle of a gather leaves the rest unwritten, returned for compile() in the order gathered", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  const opted: ModuleContextInjection = { namespace: 'opted', position: 'afterUser', content: [text('OPTED')], placedEachCompile: true };
+  const gathered: ContextInjection[] = [injection('A', 'a'), injection('B', 'b'), opted, injection('C', 'c')];
+  const original = cm.addMessage.bind(cm);
+  let writes = 0;
+  const consoleError = console.error;
+  console.error = () => {};
+  let left: ContextInjection[] | undefined;
+  try {
+    (cm as unknown as { addMessage: unknown }).addMessage = (...args: Parameters<typeof original>) => {
+      if (++writes === 2) throw new Error('refused before landing');
+      return original(...args);
+    };
+    left = internals(x.framework).storeInjections(agent, gathered);
+  } finally {
+    (cm as unknown as { addMessage: unknown }).addMessage = original;
+    console.error = consoleError;
+  }
+  assert.equal(writes, 2, 'nothing was written after the write that threw');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A']);
+  assert.deepEqual(left?.map((i) => textOf(i)), ['B', 'OPTED', 'C'], 'the rest, in the order gathered');
+});

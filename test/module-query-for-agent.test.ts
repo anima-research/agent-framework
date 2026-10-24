@@ -295,6 +295,29 @@ test("a write held for a busy fork lands at its next start, in that start's requ
   assert.ok(x.reader.ctx!.queryMessages({ participant: 'user' }, { forAgent: fork.name }).messages.some((m) => texts({ messages: [m] })[0] === 'HELD FOR THE FORK'), 'and the row is as written');
 });
 
+test("before its flush, a write held for a busy fork is in the fork's named read and not the primary's, and the primary's held write is in the primary's and not the fork's", async () => {
+  const x = await make(['prime'], { conversations: { templateAgent: 'prime', bind: { channel: 'mention' } } });
+  const fork = await (x.framework as unknown as {
+    createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ name: string }>;
+  }).createConversationAgent('conversation-probe-g2', { serverId: 'stub', channelId: 'world:probe' });
+  const internals = x.framework as unknown as { activeTurnTokens: Map<string, unknown> };
+  internals.activeTurnTokens.set(fork.name, Symbol('turn'));
+  internals.activeTurnTokens.set('prime', Symbol('turn'));
+  try {
+    const forFork = x.reader.ctx!.addMessage('user', [text('HELD FOR THE FORK')], undefined, { forAgent: fork.name });
+    const forPrime = x.reader.ctx!.addMessage('user', [text('HELD FOR THE PRIME')]);
+    assert.match(forFork, /^held:/, 'the premise: held while the fork\'s turn is alive');
+    assert.match(forPrime, /^held:/, 'the premise: held while the primary\'s turn is alive');
+    const read = (forAgent?: string) => x.reader.ctx!.queryMessages({ participant: 'user' }, forAgent === undefined ? undefined : { forAgent })
+      .messages.filter((m) => m.held).map((m) => texts({ messages: [m] })[0]);
+    assert.deepEqual(read(fork.name), ['HELD FOR THE FORK']);
+    assert.deepEqual(read(), ['HELD FOR THE PRIME']);
+  } finally {
+    internals.activeTurnTokens.delete(fork.name);
+    internals.activeTurnTokens.delete('prime');
+  }
+});
+
 const deliver = (input: Record<string, unknown>) =>
   createMockResponse([{ type: 'tool_use', id: 'c1', name: 'courier--deliver', input } as ContentBlock], 'tool_use');
 const primaryTexts = (x: Awaited<ReturnType<typeof make>>) =>
