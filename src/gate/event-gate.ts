@@ -2246,7 +2246,7 @@ export class EventGate {
       });
     }
     if (!appended && (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default }))) {
-      this.recordRecipe(recordPath, starting.given, written ? 'gate.json holds the recipe merged into it' : 'gate.json already agreed with the recipe');
+      this.recordRecipe(recordPath, starting.given, written ? 'gate.json holds the recipe merged into it' : 'the merge left gate.json as it was');
     }
     return { kind: 'none' };
   }

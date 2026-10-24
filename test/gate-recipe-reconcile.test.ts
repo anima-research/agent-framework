@@ -443,7 +443,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate } = start(recipe2);
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
-    assert.match(gate.getStatus().errors[0], /^At start, gate\.json already agreed with the recipe, and the gate runs it, but recording the recipe in gate\.recipe\.json failed /);
+    assert.match(gate.getStatus().errors[0], /^At start, the merge left gate\.json as it was, and the gate runs it, but recording the recipe in gate\.recipe\.json failed /);
   });
 
   it('says gate.json was seeded when recording the recipe then fails at the first start', () => {
