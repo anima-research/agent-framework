@@ -26,6 +26,7 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { goneNames } from './helpers/gone-names.js';
 import { gateToolCalls } from './helpers/gate-tool-calls.js';
 import { forceExpiry } from './helpers/force-expiry.js';
+import type { ChannelRef } from '../src/mcpl/channel-registry.js';
 import { fixture, eventually, TS, ok } from './helpers/coalescing-fixture.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-sleep');
@@ -287,13 +288,13 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
     // so the primary's sleep quiets every conversation of the agent.
     const CH = 'discord:g1:dm';
     const { f, gate, incoming } = await forkFixture(CH);
-    const router = () => (f.framework as unknown as { getConversationRouter(): { getBinding(id: string): { agentName: string } | undefined } }).getConversationRouter();
+    const router = () => (f.framework as unknown as { getConversationRouter(): { getBinding(channel: ChannelRef): { agentName: string } | undefined } }).getConversationRouter();
     try {
       gate.setSleep(3600, 'resting', 'agent');
       const before = f.membrane.calls.length;
       await incoming('m1');
       await f.framework.runUntilIdle();
-      assert.ok(router().getBinding(CH) !== undefined, 'the message reached a conversation fork');
+      assert.ok(router().getBinding({ serverId: 'editor', channelId: CH }) !== undefined, 'the message reached a conversation fork');
       assert.strictEqual(f.membrane.calls.length, before, 'no turn while the primary sleeps');
       assert.ok((gate.getSleepState()?.suppressed ?? 0) >= 1, 'the gate held its wake');
 
