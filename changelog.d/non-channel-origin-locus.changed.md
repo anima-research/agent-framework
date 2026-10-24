@@ -22,11 +22,13 @@
   a `sleep`'s wake, the resident's turn after a tune-out cancel it asked
   for, and the wakes of a script it started (`wake_agent()`, and a script
   left running reporting its end). Such a wake goes by the turn that armed
-  it as that turn stands when the wake comes, so a turn that took in private
-  input after arming it counts. What its work brings back is private input,
-  as a private surface's message is: a script's wake message, and a module's
-  message that names the turn (see Added). A turn that reads it is private,
-  and a tool boundary that injects it makes its turn private from there.
+  it as that turn stands when the wake's start reads it, so a turn that took
+  in private input after arming it counts, even after the wake was queued.
+  What its work brings back can be private input, as a private surface's
+  message is: a script's wake message, and a module's message that names
+  the turn (see Added). If that turn is private when the message is stored
+  or injected, a turn that reads it is private, and a tool boundary that
+  injects it makes its turn private from there.
 
   A private turn that holds a channel's message tells its resident which
   channels' messages it holds and that its plain speech reaches none of

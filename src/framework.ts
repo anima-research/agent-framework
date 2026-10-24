@@ -1046,12 +1046,32 @@ const MERGED_BATCH: unique symbol = Symbol('merged-batch');
  * TURN_RETRY is, so spreads copy it.
  */
 const WAKE_CHANNELS: unique symbol = Symbol('wake-channels');
+/**
+ * The turns whose work a request continues, each once: the turn that caused
+ * a derived request (derivedTurnRequest, a budget restart, a re-inference),
+ * the start turn of a script that wakes, the turn a module's request names
+ * (InferenceRequestEvent.callerTurnId), and the turn that armed a self-wake,
+ * a sleep or a tune-out cancel. The start that reads the work judges them,
+ * as each stands then (processInferenceRequests): one that is private makes
+ * the start private, so a turn that turned private after the request was
+ * queued counts. Carried wherever wakes merge, as WAKE_CHANNELS is. A
+ * symbol, as TURN_RETRY is, so spreads copy it.
+ */
+const CALLER_TURNS: unique symbol = Symbol('caller-turns');
 type WakeChannel = { channelId: string; serverId?: string };
 type MarkedRequest = InferenceRequest & {
   [TURN_RETRY]?: true;
   [MERGED_BATCH]?: InferenceRequest[];
   [WAKE_CHANNELS]?: WakeChannel[];
+  [CALLER_TURNS]?: number[];
 };
+
+/** The mark that a request continues the work of `turns` (CALLER_TURNS),
+ *  for a request's spread: each defined id once, and nothing when none is. */
+function continuesTurns(...turns: Array<number | undefined>): Partial<MarkedRequest> {
+  const ids = [...new Set(turns.filter((t): t is number => t !== undefined))];
+  return ids.length > 0 ? { [CALLER_TURNS]: ids } : {};
+}
 
 /** The channels of the channel messages a request brings in
  *  (WAKE_CHANNELS): its own channel, where it's a channel wake, and those
@@ -1073,6 +1093,21 @@ function carryWakeChannels(request: InferenceRequest, channels: readonly WakeCha
     if (!kept.some((k) => k.channelId === c.channelId && k.serverId === c.serverId)) kept.push(c);
   }
   if (kept.length > 0) (request as MarkedRequest)[WAKE_CHANNELS] = kept;
+}
+
+/** The turns whose work a request continues (CALLER_TURNS). */
+function callerTurnsOf(request: InferenceRequest): number[] {
+  return (request as MarkedRequest)[CALLER_TURNS] ?? [];
+}
+
+/** What a request that stands for `others` takes from them: the channels of
+ *  their messages (WAKE_CHANNELS) and the turns whose work they continue
+ *  (CALLER_TURNS), so the start that takes it names those channels, and is
+ *  judged by those turns. */
+function carryWakes(request: InferenceRequest, others: readonly InferenceRequest[]): void {
+  carryWakeChannels(request, others.flatMap(wakeChannelsOf));
+  const turns = [...new Set([...callerTurnsOf(request), ...others.flatMap(callerTurnsOf)])];
+  if (turns.length > 0) (request as MarkedRequest)[CALLER_TURNS] = turns;
 }
 
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
@@ -3853,11 +3888,11 @@ export class AgentFramework {
             // A window that holds a private surface's message wakes a
             // private turn, which names no route (wakeProvenance); the
             // telemetry above still says who and where woke it.
-            // So does one whose window held a request continuing a private
-            // turn's work, or that a private turn's self-wake or sleep armed,
-            // judged as that turn stands now (WakeProvenance.callerTurnIds).
-            ...(provenance?.nonChannelOrigin || provenance?.callerTurnIds?.some((id) => framework.isPrivateTurn(id))
-              ? { nonChannelOrigin: true } : {}),
+            ...(provenance?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+            // The turns whose work it continues: a window's module requests',
+            // or the turn that armed a self-wake or a sleep
+            // (WakeProvenance.callerTurnIds), which its start judges.
+            ...continuesTurns(...(provenance?.callerTurnIds ?? [])),
             // The window's channel messages, which a private turn that takes
             // this wake names (WAKE_CHANNELS): those this agent holds, by
             // the rule its route follows (mayTakeGateRoute), since the window
@@ -5072,8 +5107,9 @@ export class AgentFramework {
     // kept in its place, which then stands for it, as the start did.
     const batch = mergedBatch(request);
     if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
-    // So do the channels of its messages (WAKE_CHANNELS).
-    carryWakeChannels(same, wakeChannelsOf(request));
+    // So do the channels of its messages and the turns whose work it
+    // continues (carryWakes).
+    carryWakes(same, [request]);
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
@@ -12819,9 +12855,10 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-              // A private turn's restart is private, so a channel's wake
-              // batched with it gives the turn no channel.
-              ...(this.turnRouting?.get(agent.name)?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+              // It continues its turn's work (CALLER_TURNS): a private
+              // turn's restart is private, so a channel's wake batched with
+              // it gives the turn no channel.
+              ...continuesTurns(this.turnRouting?.get(agent.name)?.turnId),
             };
             this.pendingRequests.push(continuation);
             // Context budget exceeded: break the stream, let compile() compress.
@@ -12928,7 +12965,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-              ...(this.turnRouting?.get(agent.name)?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+              ...continuesTurns(this.turnRouting?.get(agent.name)?.turnId),
             });
           }
         }
@@ -13143,7 +13180,11 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            nonChannelOrigin: this.wakesPrivately(event),
+            // A private surface's message wakes a private turn, and so does
+            // a request that continues the work of a turn private by the
+            // time its start reads it (CALLER_TURNS).
+            nonChannelOrigin: isNonChannelSurfaceEvent(event),
+            ...continuesTurns(event.type === 'inference-request' ? event.callerTurnId : undefined),
             ...this.readsDeferredFor(added, agentName),
           });
         }
@@ -15269,9 +15310,10 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
-          // And the channels of its messages (WAKE_CHANNELS), which a
-          // private start that takes the kept one names.
-          if (prev) carryWakeChannels(kept, wakeChannelsOf(kept === request ? prev : request));
+          // And the channels of its messages and the turns whose work it
+          // continues (carryWakes), which the start that takes the kept one
+          // names and is judged by.
+          if (prev) carryWakes(kept, [kept === request ? prev : request]);
           newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
@@ -15434,13 +15476,17 @@ export class AgentFramework {
         this.autoContinueStreaks?.delete(agentName);
       }
       // Private wins, one way: a start whose batch holds a private surface's
-      // wake, or a request a private turn caused, is private, whatever else
-      // the batch holds, a continuation of the open turn included. Its turn
+      // wake, or a request that continues the work of a turn private as it
+      // stands now (CALLER_TURNS), is private, whatever else the batch holds,
+      // a continuation of the open turn included. The turns are judged here,
+      // where the work is read, so one that turned private after its request
+      // was queued counts. Its turn
       // then has no locus, and a channel's wake beside it is answered in no
       // channel: the operator's words are in the same context, so a reply
       // published there could carry them. A turn that is private stays so
       // (startAgentStream).
-      const turnIsPrivate = requests.some((r) => r.nonChannelOrigin === true);
+      const turnIsPrivate = requests.some((r) => r.nonChannelOrigin === true
+        || callerTurnsOf(r).some((id) => this.isPrivateTurn(id)));
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -15556,8 +15602,11 @@ export class AgentFramework {
       // notice (WAKE_CHANNELS): each channel wake's own, a held turn's retry
       // naming the message its turn was for, and what each request carries,
       // a gate window's, a requeued start's, or the wakes one stands for.
+      // So do the turns whose work they continue (CALLER_TURNS), by which a
+      // start held again before its token is judged again.
       delete start[WAKE_CHANNELS];
-      carryWakeChannels(start, requests.flatMap(wakeChannelsOf));
+      delete start[CALLER_TURNS];
+      carryWakes(start, requests);
       await this.startAgentStream(agent, start);
     }
   }
@@ -16874,31 +16923,17 @@ export class AgentFramework {
   }
 
   /** Queue a request that continues the work of the turn `callerTurnId`
-   *  names, if any, such as a tune-out cancel's turn for the resident: it's
-   *  private when that turn is, as it stands now, since what a private turn
-   *  causes is private too. */
+   *  names, if any, such as a tune-out cancel's turn for the resident. It
+   *  carries the turn (CALLER_TURNS), so its start is private when that turn
+   *  is by then, since what a private turn causes is private too. */
   private requestForTurn(agentName: string, reason: string, source: string, callerTurnId?: number): void {
-    this.pendingRequests.push({
-      agentName, reason, source, timestamp: Date.now(),
-      ...(callerTurnId !== undefined && this.isPrivateTurn(callerTurnId) ? { nonChannelOrigin: true } : {}),
-    });
+    this.pendingRequests.push({ agentName, reason, source, timestamp: Date.now(), ...continuesTurns(callerTurnId) });
   }
 
   /** The turn whose work a call continues: a script's call, its script's
    *  start turn (scriptCallStarts); any other, the turn it was made in. */
   private workTurnOf(call: ToolCall): number | undefined {
     return this.scriptCallStarts.has(call.id) ? this.scriptCallStarts.get(call.id)!.turnId : call.callerTurnId;
-  }
-
-  /**
-   * Whether a module's request for inference on this event wakes a private
-   * turn: a private surface's message (isNonChannelSurfaceEvent), or an
-   * `inference-request` that names a turn private as it stands now
-   * (InferenceRequestEvent.callerTurnId, isPrivateTurn).
-   */
-  private wakesPrivately(event: ProcessEvent): boolean {
-    return isNonChannelSurfaceEvent(event)
-      || (event.type === 'inference-request' && event.callerTurnId !== undefined && this.isPrivateTurn(event.callerTurnId));
   }
 
   /** Record a turn as private (privateTurnIds), at each site that makes one
@@ -16930,9 +16965,9 @@ export class AgentFramework {
 
   /**
    * Make a turn private from here: a start of it took in a private surface's
-   * wake, or a request a private turn caused, or read such a surface's
-   * message stored since the agent's last start (beginAgentTurn), or one of
-   * its boundaries injected one. Private wins, one way: the operator's words
+   * wake, or a request that continues a private turn's work, or read such a
+   * surface's message stored since the agent's last start (beginAgentTurn),
+   * or one of its boundaries injected one. Private wins, one way: the operator's words
    * are in its context now, so none of its plain speech is published for the
    * rest of the turn: an envelope's own body still goes where it names, but
    * sets no destination for what follows (pinTurn). Its locus, its trigger
@@ -17528,7 +17563,8 @@ export class AgentFramework {
     // turn that had no channel (noChannel: its wake named one that resolves
     // to none) passes its wake's channel on, so the next has none either,
     // rather than taking the global fallback this one refused. A private
-    // turn has neither, and its wake carries its privacy instead.
+    // turn has neither, and its wake carries the turn instead, by which its
+    // start is judged (CALLER_TURNS).
     const channel = routing.locus
       ? { channelId: routing.locus.channelId, channelServerId: routing.locus.serverId }
       : routing.noChannel && trigger?.channelId
@@ -17625,8 +17661,9 @@ export class AgentFramework {
 
   /**
    * A request a logical turn causes: a ` !` continuation, a bounce's wake, a
-   * rewind's retry. A private turn's carries its privacy, so the turn it
-   * starts is private too (processInferenceRequests).
+   * rewind's retry, an auto-continuation. It carries the turn that caused it
+   * (CALLER_TURNS), so the turn it starts is private when that one is by
+   * then (processInferenceRequests).
    */
   private derivedTurnRequest(
     agentName: string,
@@ -17639,7 +17676,7 @@ export class AgentFramework {
       reason,
       source: 'framework',
       timestamp: Date.now(),
-      ...(cause?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+      ...continuesTurns(cause?.turnId),
     };
   }
 
@@ -19172,9 +19209,10 @@ export class AgentFramework {
     } else {
       // Every other start of the turn keeps its locus: a resume, or a start
       // that continues the open turn. One whose batch holds a private wake,
-      // or a request a private turn caused (processInferenceRequests), or
-      // that reads a private surface's message stored since the agent's last
-      // start, makes the turn private from here: it loses its locus, and the
+      // or a request that continues a private turn's work
+      // (processInferenceRequests), or that reads a private surface's message
+      // stored since the agent's last start, makes the turn private from
+      // here: it loses its locus, and the
       // agent is told so before this start compiles (makeTurnPrivate).
       // Otherwise a message no tool boundary of the turn weighed can still
       // move it, as it would have at a boundary (TurnRouting.arrivals).
@@ -22495,7 +22533,8 @@ export class AgentFramework {
    * authority); it enters tagged so gate policies could be taught about it
    * later if that ever needs revisiting. Throws when it can't be delivered,
    * so the script's wake_agent() says so. A script whose start turn
-   * (`startTurnId`) is private by then wakes a private turn (isPrivateTurn).
+   * (`startTurnId`) is private by the time the wake's start reads it wakes a
+   * private turn (CALLER_TURNS).
    */
   private async scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number | undefined): Promise<void> {
     // A host that has begun to stop wakes no one.
@@ -22529,10 +22568,11 @@ export class AgentFramework {
         source: 'code_execution',
         timestamp: Date.now(),
         ...this.readsDeferredFor(placement, agentName),
-        // What a private turn causes is private too: the script's start
-        // turn, as it stands now, since it may have taken private input
-        // after it started the script.
-        ...(startTurnId !== undefined && this.isPrivateTurn(startTurnId) ? { nonChannelOrigin: true } : {}),
+        // What a private turn causes is private too: it carries the
+        // script's start turn, which its start judges as it stands then,
+        // since that turn may take private input after it started the
+        // script, or after this wake is queued.
+        ...continuesTurns(startTurnId),
       });
       this.emitTrace({
         type: 'message:added',

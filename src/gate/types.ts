@@ -240,7 +240,7 @@ export interface GateEventInfo {
   /** The turn whose work the event continues, a module's inference-request
    *  that names one (InferenceRequestEvent.callerTurnId): the window's wake
    *  carries it (WakeProvenance.callerTurnIds), so the framework judges
-   *  that turn's privacy when the window wakes. */
+   *  that turn's privacy at the start that takes the wake. */
   callerTurnId?: number;
   /** Workspace mount name (for workspace:* events). */
   mount?: string;

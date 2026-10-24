@@ -188,7 +188,7 @@ export interface WakeProvenance {
   /** The turns whose work the wake continues, each once: a window's module
    *  requests' (PendingEvent.callerTurnId), or the turn that armed a
    *  self-wake or a sleep. The framework wakes a private turn when any of
-   *  them is private as it stands when the wake comes. */
+   *  them is private as it stands at the start that takes the wake. */
   callerTurnIds?: number[];
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's

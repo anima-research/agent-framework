@@ -82,6 +82,13 @@ const serverOf = (channelId: string) => (channelId.startsWith('body:') ? 'body' 
 /** A stub channel, with its server. */
 const stub = (channelId: string): ChannelRef => ({ serverId: serverOf(channelId), channelId });
 
+/** The turns whose work a request continues, as the framework marks them (CALLER_TURNS). */
+const callerTurns = (r: object | undefined): number[] => {
+  if (!r) return [];
+  const mark = Object.getOwnPropertySymbols(r).find((k) => k.description === 'caller-turns');
+  return mark ? (r as Record<symbol, number[]>)[mark] : [];
+};
+
 /** Registry stub: two known channels (#alpha guild, laria's DM) + capture. */
 function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'unknown' | 'throw'> = []) {
   const routed: Array<{ text: string; locus: string | null }> = [];
@@ -1351,7 +1358,7 @@ describe('explicit prose routing', () => {
     stubRegistry(framework);
     const agent = framework.getAgent('assistant')!;
     const internals = framework as unknown as {
-      routingOf(name: string): { nonChannelOrigin?: boolean };
+      routingOf(name: string): { nonChannelOrigin?: boolean; turnId: number };
       openLogical: Map<string, unknown>;
       pendingRequests: InferenceRequest[];
       handleProcessEvent(event: ProcessEvent): Promise<void>;
@@ -1359,6 +1366,7 @@ describe('explicit prose routing', () => {
     // A private turn ran the tools, and is no longer open, as after a stop()
     // and start on this instance.
     internals.routingOf('assistant').nonChannelOrigin = true;
+    const turnId = internals.routingOf('assistant').turnId;
     internals.openLogical.delete('assistant');
     const response = createMockResponse([
       { type: 'tool_use', id: 'unstreamed-private', name: 'robot--move', input: { dir: 'north' } },
@@ -1375,7 +1383,7 @@ describe('explicit prose routing', () => {
       } as ProcessEvent);
       const ready = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
       assert.ok(ready, 'control: the fallback scheduled the re-inference');
-      assert.equal(ready!.nonChannelOrigin, true, "it opens a private turn for the private turn's results");
+      assert.deepEqual(callerTurns(ready), [turnId], "it carries the private turn, so its start is private");
     } finally {
       await framework.stop();
     }
@@ -2507,14 +2515,16 @@ describe('explicit prose routing', () => {
     await withHeldHybridCallback('>>>#nowhere Where does this go?', async ({ framework, earlier, next, pending, release }) => {
       // The bouncing envelope is the earlier turn's, a private one; the live
       // turn, when its delivery runs, is a channel's.
-      (earlier as RoutingState & { nonChannelOrigin?: boolean }).nonChannelOrigin = true;
-      (next as RoutingState & { nonChannelOrigin?: boolean }).nonChannelOrigin = false;
+      (earlier as RoutingState & { nonChannelOrigin?: boolean; turnId?: number }).nonChannelOrigin = true;
+      (earlier as RoutingState & { turnId?: number }).turnId = 101;
+      (next as RoutingState & { nonChannelOrigin?: boolean; turnId?: number }).nonChannelOrigin = false;
+      (next as RoutingState & { turnId?: number }).turnId = 102;
       const queued = (framework as unknown as { pendingRequests: Array<{ reason: string; nonChannelOrigin?: boolean }> }).pendingRequests;
       release();
       await within(pending, 'the late envelope');
       const bounce = queued.find((r) => r.reason === 'prose-bounce');
       assert.ok(bounce, `the bounce wakes the agent: ${JSON.stringify(queued)}`);
-      assert.equal(bounce!.nonChannelOrigin, true, "the wake carries the bouncing turn's private origin");
+      assert.deepEqual(callerTurns(bounce), [101], "the wake carries the bouncing turn, for its start to judge");
     });
   });
 
