@@ -21,6 +21,7 @@ const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const signed = (signature: string, tokenEstimate?: number) =>
   ({ type: 'thinking', thinking: '', signature, ...(tokenEstimate !== undefined ? { tokenEstimate } : {}) }) as ContentBlock;
 const toolUse = (id: string) => ({ type: 'tool_use', id, name: 'test--echo', input: {} }) as ContentBlock;
+const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } } as ContentBlock;
 const result = (toolUseId: string, content: string, isError?: boolean) =>
   ({ type: 'tool_result', toolUseId, content, ...(isError !== undefined ? { isError } : {}) }) as ContentBlock;
 
@@ -39,6 +40,9 @@ describe('roundRows', () => {
     ['results', { participant: 'user', content: [result('c1', 'ok')] }],
     ['placeholders', { participant: 'user', content: [result('c1', 'Tool result withheld by the guard. The tool has already executed.', false)] }],
     ['note', { participant: 'user', content: [text('A note.')] }],
+    // A result with an image, as stored and as the next compile renders it after an image limit took the image out.
+    ['results-image', { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'c1', content: [text('A chart.'), image] } as ContentBlock] }],
+    ['results-image-limited', { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'c1', content: [text('A chart.')] } as ContentBlock] }],
     ['gone', null],
   ]);
   const carried = (id: MessageId) => store.get(id) ?? null;
@@ -50,7 +54,8 @@ describe('roundRows', () => {
       { kind: 'reply', id: 'reply-empty', sent: [signed('s'), text(''), toolUse('c1')] },
       { kind: 'results', id: 'results', sent: [{ toolUseId: 'c1', content: 'ok', isError: false }] },
       { kind: 'injected', id: 'note', participant: 'user', sent: [text('A note.')] },
-    ], carried), ['reply', 'reply-empty', 'results', 'note'] as SentRow[]);
+      { kind: 'results', id: 'results-image', sent: [{ toolUseId: 'c1', content: [text('A chart.'), image] as never, isError: false }] },
+    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image'] as SentRow[]);
   });
 
   it('marks a row the next request carries otherwise, or doesn\'t carry, or the store doesn\'t hold', () => {
@@ -62,7 +67,9 @@ describe('roundRows', () => {
       { kind: 'injected', id: 'note', participant: 'Someone', sent: [text('A note.')] },
       { kind: 'injected', id: 'gone', participant: 'user', sent: [text('Gone.')] },
       { kind: 'reply', id: undefined, sent: [text('Unstored.')] },
-    ], carried), [UNSTORED, UNSTORED, UNSTORED, UNSTORED, UNSTORED] as SentRow[]);
+      // The stream was sent the image, and the next compile renders the result without it.
+      { kind: 'results', id: 'results-image-limited', sent: [{ toolUseId: 'c1', content: [text('A chart.'), image] as never, isError: false }] },
+    ], carried), [UNSTORED, UNSTORED, UNSTORED, UNSTORED, UNSTORED, UNSTORED] as SentRow[]);
   });
 });
 
