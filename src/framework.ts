@@ -1,7 +1,7 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ResultClaims, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, lineClaimsBeforeTreatment, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ResultClaims, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -117,6 +117,7 @@ import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   goesNative,
   nonErrorResultText,
+  nonErrorResultTextOrThrow,
   resultClaimsOrThrow,
   scriptViewClaims,
   shownToScript,
@@ -22599,6 +22600,7 @@ export class AgentFramework {
       try {
         lineClaims = resultClaimsOrThrow(result.data, result.dataIsContent);
         claims = showsBlocks ? scriptViewClaims(result.data, false) : lineClaims;
+        if (showsBlocks) lineClaims = lineClaimsBeforeTreatment(lineClaims, claims);
       } catch (err) {
         return failed(err);
       }
@@ -22654,7 +22656,7 @@ export class AgentFramework {
         text = isError
           ? result.error ?? 'tool call failed'
           : result.data === undefined || result.data === null
-            ? nonErrorResultText(result)
+            ? nonErrorResultTextOrThrow(result)
             : toolResultDataToHistoryString(result.data, undefined, {
               dataIsContent: Boolean(result.dataIsContent),
               claims: claims ?? resultClaimsOrThrow(result.data, result.dataIsContent),
@@ -29099,7 +29101,7 @@ export class AgentFramework {
           const read = SCRIPT_VIEW_CLAIMS.get(direct.data);
           if (read && 'error' in read) throw read.error;
           claims = read ? read.claims : scriptViewClaims(direct.data, true);
-          lineClaims = resultClaimsOrThrow(direct.data, true);
+          lineClaims = lineClaimsBeforeTreatment(resultClaimsOrThrow(direct.data, true), claims);
         } catch (err) {
           return unconvertible(err);
         }
@@ -29206,7 +29208,10 @@ export class AgentFramework {
           // references only registered (Ada-1017, room-203 #201013).
           let mode: 'register' | 'model' | 'script' = scriptReads ? 'script' : 'model';
           let claims: ResultClaims | undefined;
-          if (scriptReads && Array.isArray(result.content)) {
+          // Only where the script reads a view of the blocks (reading()'s own
+          // condition): without structured content it reads the model lane's
+          // text, whose fetch reads each block's own claims, as the text does.
+          if (scriptReads && Object.prototype.hasOwnProperty.call(result, 'structuredContent') && Array.isArray(result.content)) {
             try {
               claims = scriptViewClaims(result.content, true);
               SCRIPT_VIEW_CLAIMS.set(result.content, { claims });

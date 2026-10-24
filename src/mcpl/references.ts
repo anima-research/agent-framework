@@ -727,6 +727,31 @@ export interface StubOptions {
  */
 export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
+/**
+ * A uri as a link shows it, cut of what sanitizeLabel cuts. A `never` is
+ * about what a link shows, so it's found by this text (neverShown): a claim
+ * of `never` on a uri withholds every link that shows the same text, two
+ * uris that cut alike sharing it. Every other claim is about the record,
+ * which the fetch reads by its raw uri, so it's kept by the raw uri (Ada-1017,
+ * room-203 #202239).
+ */
+export function shownUri(uri: string): string {
+  return sanitizeLabel(uri, REFERENCE_LIMITS.uri);
+}
+
+const NEVER_SHOWN = new WeakMap<ResultClaims, ReadonlySet<string>>();
+
+/** The texts a link shows (shownUri) for the uris a result's claims mark
+ *  `never`, read once per claims. A ResultClaims isn't changed once made. */
+function neverShown(claims: ResultClaims): ReadonlySet<string> {
+  let shown = NEVER_SHOWN.get(claims);
+  if (!shown) {
+    shown = new Set([...claims].filter(([, c]) => c.never).map(([uri]) => shownUri(uri)));
+    NEVER_SHOWN.set(claims, shown);
+  }
+  return shown;
+}
+
 /** What a result's references say of one uri, read as one. */
 export interface UriClaims {
   /** Whether any of them marks it `disposition: never`. */
@@ -747,15 +772,15 @@ export function resultClaims(testimonies: Iterable<ReferenceTestimony>, nevers: 
   // classifier's contradiction (inlineNeverUri): withheld unconditionally
   // (RFC-005 §5), though the block is no reference. Only its never counts,
   // since its other claims could loosen (Ada-1017, room-203 #201013).
-  for (const uri of nevers) {
-    const c = claims.get(uri);
-    if (c) c.never = true;
-    else claims.set(uri, { never: true, rejected: false, unparseable: false, earliestMs: null });
-  }
+  const entry = (uri: string): UriClaims => {
+    let c = claims.get(uri);
+    if (!c) claims.set(uri, c = { never: false, rejected: false, unparseable: false, earliestMs: null });
+    return c;
+  };
+  for (const uri of nevers) entry(uri).never = true;
   for (const t of testimonies) {
     if (t.fromLink) continue;
-    let c = claims.get(t.uri);
-    if (!c) claims.set(t.uri, c = { never: false, rejected: false, unparseable: false, earliestMs: null });
+    const c = entry(t.uri);
     if (t.disposition === 'never') c.never = true;
     if (t.rejectedFields.includes('expiresAt')) {
       c.rejected = true;
@@ -793,6 +818,28 @@ export function inlineNeverUri(block: unknown, c: BlockClassification = classify
   return b.disposition === 'never' && typeof b.uri === 'string' && b.uri !== '' ? b.uri : null;
 }
 
+/**
+ * The claims the model's line for a result reads (`line`), for a script's
+ * link objects to judge their uri by (referenceBlockForScript's lineClaims),
+ * with, for each uri the script's view claims (`view`) and the line doesn't,
+ * that uri's record's own claims as they stand now, before the treatment:
+ * the line falls back to the record there, and the treatment registers what
+ * it shows as it goes, so a reference nested before a link would otherwise
+ * change what the link reads (an expiry, or a plain reference that clears an
+ * earlier result's never), and the link's uri would turn on the order of
+ * the blocks.
+ */
+export function lineClaimsBeforeTreatment(line: ResultClaims, view: ResultClaims): ResultClaims {
+  const frozen = new Map(line);
+  for (const uri of view.keys()) {
+    if (frozen.has(uri)) continue;
+    const record = referenceRegistry.findByUri(uri);
+    frozen.set(uri, (record ? resultClaims([record.testimony]).get(uri) : undefined)
+      ?? { never: false, rejected: false, unparseable: false, earliestMs: null });
+  }
+  return frozen;
+}
+
 /** The claims a decision about a record reads: its result's for its uri,
  *  where the result's references name it, and otherwise the record's own
  *  testimony. */
@@ -801,9 +848,10 @@ function uriClaims(record: ReferenceRecord, claims?: ResultClaims): UriClaims | 
 }
 
 /** Whether a record's uri is withheld: marked `disposition: never` by its
- *  result's references, or by its own testimony where none of them names
- *  it. */
+ *  result's references, for any uri a link shows as the same text
+ *  (shownUri), or by its own testimony where none of them names it. */
 export function claimedNever(record: ReferenceRecord, claims?: ResultClaims): boolean {
+  if (claims && neverShown(claims).has(shownUri(record.testimony.uri))) return true;
   return uriClaims(record, claims)?.never === true;
 }
 
@@ -834,13 +882,14 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * sanitizeLabel strips gone, so a uri split by a control character is read
  * as it would read: `ht\u0000tps://user:pass@…` parses as a path, and shows
  * as userinfo. A `disposition: "never"` for the uri keeps it out whatever
- * the link says: any reference's in the same result (claims), or, where no
- * reference in the result names the uri, the record's.
+ * the link says: any reference's in the same result (claims), for this uri
+ * or one shown as the same text, or, where no reference in the result names
+ * the uri, the record's.
  */
 export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, nowMs = Date.now(), claims?: ResultClaims): string | null {
   if (!t.fromLink || claimedNever(record, claims)) return null;
   if (unfetchableReason(record, nowMs, claims) === null) return null;
-  const uri = sanitizeLabel(t.uri, REFERENCE_LIMITS.uri);
+  const uri = shownUri(t.uri);
   return uriMayCarryCredential(uri) ? null : uri;
 }
 
@@ -994,7 +1043,8 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
       // and never where the view's claims withhold it: reading more claims
       // can loosen as well as tighten, since an expiry makes a link one the
       // host can't fetch, whose uri the line shows (Ada-1017, room-203
-      // #201013). A script never sees a uri the model's line withholds.
+      // #201013). A script never sees a uri the model's line withholds,
+      // through its blocks; structured content goes as sent, as on main.
       const lineShows = shownLinkUri(t, record, nowMs, lineClaims ?? claims);
       const uri = lineShows !== null && lineClaims !== undefined && claimedNever(record, claims) ? null : lineShows;
       // Why a fetch_reference with this object's refId would be refused, in

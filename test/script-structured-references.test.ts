@@ -45,11 +45,11 @@ const blocks = (test: string) => [
   // A reference whose payload the fetch saves. Its labels carry a bidi
   // override, a bidi mark and a control character.
   { type: 'resource', uri: uris(test).report, name: 'report\u202E.pdf\u0007', mimeType: 'application/pdf\u200F', sizeBytes: 1234,
-    digest: DIGEST, expiresAt: '2026-12-31T00:00:00Z' },
+    digest: DIGEST, expiresAt: '2099-12-31T00:00:00Z' },
   // The same reference again, saying something else about itself.
   { type: 'resource', uri: uris(test).report, name: 'report-copy.pdf' },
   // A reference the fetch doesn't save.
-  { type: 'image', uri: uris(test).big, mimeType: 'image/png', disposition: 'ref', expiresAt: '2027-01-01T00:00:00Z' },
+  { type: 'image', uri: uris(test).big, mimeType: 'image/png', disposition: 'ref', expiresAt: '2099-12-31T00:00:00Z' },
   // Inline data that claims a bulk disposition, and inline data with a uri
   // beside it: withheld.
   { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', disposition: 'ref' },
@@ -67,7 +67,7 @@ const blocks = (test: string) => [
   // A reference that counts as expired: with a bidi override after it, its
   // expiresAt doesn't parse, so it fails closed. It isn't fetched, and the
   // script is told why.
-  { type: 'image', uri: uris(test).old, mimeType: 'image/png', expiresAt: '2027-01-01T00:00:00Z\u202E' },
+  { type: 'image', uri: uris(test).old, mimeType: 'image/png', expiresAt: '2099-12-31T00:00:00Z\u202E' },
 ];
 
 /** A `never` reference, which RFC-005 withholds, with its uri, from every lane the model reads. */
@@ -225,9 +225,9 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
 /** What a script reads for those blocks from an MCPL peer, given each reference's id. */
 const treated = (report: string, big: string, old: string, link: string) => [
   { type: 'resource', refId: report, name: 'report.pdf', mimeType: 'application/pdf', sizeBytes: 1234, digest: DIGEST,
-    expiresAt: '2026-12-31T00:00:00Z', savedTo: SAVED },
+    expiresAt: '2099-12-31T00:00:00Z', savedTo: SAVED },
   { type: 'resource', refId: report, name: 'report-copy.pdf', savedTo: SAVED },
-  { type: 'image', refId: big, mimeType: 'image/png', expiresAt: '2027-01-01T00:00:00Z', savedTo: null },
+  { type: 'image', refId: big, mimeType: 'image/png', expiresAt: '2099-12-31T00:00:00Z', savedTo: null },
   { type: 'text', text: INLINE_WITHHELD_TEXT },
   { type: 'text', text: INLINE_WITHHELD_TEXT },
   { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
@@ -235,7 +235,7 @@ const treated = (report: string, big: string, old: string, link: string) => [
   { type: 'text', text: '[Reference not shown: it arrived without a link.]' },
   { type: 'resource_link', refId: link, name: 'link', savedTo: null },
   { type: 'text', text: 'two attachments' },
-  { type: 'image', refId: old, mimeType: 'image/png', expiresAt: '2027-01-01T00:00:00Z', savedTo: null, expired: EXPIRY_REASON.unparseable,
+  { type: 'image', refId: old, mimeType: 'image/png', expiresAt: '2099-12-31T00:00:00Z', savedTo: null, expired: EXPIRY_REASON.unparseable,
     unfetchable: `the reference is ${EXPIRY_REASON.unparseable}` },
 ];
 
@@ -726,6 +726,111 @@ test("an MCPL peer's script-demand fetch reads the view's claims: a nested expir
   });
 });
 
+test("a nested link's uri doesn't turn on the order of the blocks: a reference nested before it doesn't change what its line reads", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script }) => {
+    // Fetchable, so the line, reading no claim of this result for the uri,
+    // shows no uri. A nested expired reference registered before the link,
+    // as the treatment's own pass registers what it shows, would make the
+    // record unfetchable for the link and show its uri, in one order only.
+    for (const [i, order] of ([['expired', 'link'], ['link', 'expired']] as const).entries()) {
+      const uri = `https://files.example.invalid/block-order-${i}/report.csv`;
+      const fields: Record<string, unknown> = {};
+      for (const name of order) {
+        fields[name] = name === 'link'
+          ? { type: 'resource_link', uri, name: 'report.csv' }
+          : { type: 'resource', uri, name: 'report.csv', expiresAt: '2000-01-01T00:00:00Z' };
+      }
+      const content = [{ type: 'text', text: 'two attachments', ...fields }];
+      answer({ content, structuredContent: {} });
+      const fromPeer = await script('mcpl--files--attach');
+      assert.ok(!fromPeer.includes(`block-order-${i}`), `${order.join(' then ')}: ${fromPeer}`);
+    }
+    // An earlier result's never, which a later result's plain reference,
+    // nested before the link, would clear on the record.
+    const sealedUri = 'https://elsewhere.example.invalid/order-never/report.csv';
+    answer({ content: [{ type: 'resource', uri: sealedUri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+    await script('mcpl--files--attach');
+    const later = [{ type: 'text', text: 'again', plain: { type: 'resource', uri: sealedUri, name: 'report.csv' }, link: { type: 'resource_link', uri: sealedUri, name: 'report.csv' } }];
+    answer({ content: later, structuredContent: {} });
+    const out = await script('mcpl--files--attach');
+    // The view reads the result's plain reference, the latest word, so its
+    // never no longer holds there; the line, which shows neither, reads the
+    // record as it stood, and withholds the uri; so does the script.
+    assert.ok(!out.includes('order-never'), out);
+  });
+});
+
+test("an MCPL peer's result a script reads as text has its demand fetch read each block, as the text does, not a view it never gets", async () => {
+  await withPeers(async ({ answer, script, fetched }) => {
+    // No structured content: the script reads the model lane's text, whose
+    // stubs read the top-level blocks' claims, so a reference nested in a
+    // block's field, which the text doesn't show, stops no fetch.
+    const top = blocks('text-route')[0] as { uri: string };
+    answer({ content: [top, { type: 'text', text: 'an old copy', attachment: { type: 'resource', uri: top.uri, expiresAt: '2000-01-01T00:00:00Z' } }] });
+    const out = await script('mcpl--files--attach');
+    assert.deepEqual(fetched, [top.uri]);
+    assert.ok(out.includes(SAVED), out);
+  });
+});
+
+test("an MCPL peer's view reads the claims its dispatch read for the demand fetch, not a second reading of its blocks", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script, fetched }) => {
+    // A nested reference that says never until the demand fetch has run, as
+    // only a value read twice could: a view that read its claims again would
+    // see none, and show the link's uri.
+    const uri = 'https://elsewhere.example.invalid/read-once/report.csv';
+    const sealed = { type: 'resource', uri, name: 'report.csv', get disposition(): string | undefined { return fetched.length === 0 ? 'never' : undefined; } };
+    answer({
+      content: [blocks('read-once')[0], { type: 'text', text: 'sealed', sealed }, { type: 'resource_link', uri, name: 'report.csv' }],
+      structuredContent: {},
+    });
+    const out = await script('mcpl--files--attach');
+    assert.equal(fetched.length, 1, 'the demand fetch ran between the two readings');
+    assert.ok(!out.includes('read-once/report.csv'), out);
+  });
+});
+
+test("inline data's expiry claims nothing for a link to its uri, which the host can fetch, so the link shows no uri", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script, modelCall }) => {
+    // Fetchable, so only an expiry claimed for the uri would make it a link
+    // the host can't fetch, whose uri shows. Inline data's claims beside its
+    // data count for nothing but never (Ada-1017, room-203 #201013).
+    const uri = 'https://files.example.invalid/inline-expiry/report.csv';
+    const content = () => [
+      { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri, disposition: 'ref', expiresAt: '2000-01-01T00:00:00Z' },
+      { type: 'resource_link', uri, name: 'report.csv' },
+    ];
+    answer({ content: content(), structuredContent: {} });
+    const line = nonErrorResultText(await modelCall('attach'));
+    assert.ok(!line.includes('inline-expiry'), line);
+    answer({ content: content(), structuredContent: {} });
+    const out = await script('mcpl--files--attach');
+    assert.ok(!out.includes('inline-expiry'), out);
+  });
+});
+
+test("an expiry on one uri says nothing of a link to another that shows as the same text, which the host can fetch", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script, modelCall }) => {
+    // Only a `never` is found by the text a link shows; an expiry is about the
+    // record, which the fetch reads by its raw uri (Ada-1017, room-203
+    // #202239). Read by the text, this expiry would make the link one the
+    // host can't fetch, showing its uri and words saying so.
+    const uri = 'https://files.example.invalid/expiry-cut/report.csv';
+    const content = () => [
+      { type: 'resource', uri, name: 'old.csv', expiresAt: '2000-01-01T00:00:00Z' },
+      { type: 'resource_link', uri: 'https://files.example.invalid/expiry-cut/\u200Freport.csv', name: 'report.csv' },
+    ];
+    answer({ content: content(), structuredContent: {} });
+    const line = nonErrorResultText(await modelCall('attach'));
+    assert.ok(!line.includes('expiry-cut'), line);
+    answer({ content: content(), structuredContent: {} });
+    const out = await script('mcpl--files--attach');
+    assert.ok(!out.includes('expiry-cut'), out);
+    const link = (JSON.parse(out) as { content: Array<Record<string, unknown>> }).content[1]!;
+    assert.deepEqual(['uri' in link, 'unfetchable' in link, 'expired' in link, typeof link.refId], [false, false, false, 'string'], out);
+  });
+});
+
 test("an MCPL peer's top-level link, treated once, keeps the record of the uri its result named, whatever sanitizeLabel cut from the uri it shows", async () => {
   await withPeers(async ({ answer, script }) => {
     // Off the server's origin, so its uri is shown, cut of its bidi override.
@@ -814,6 +919,12 @@ test("where the walk of a result's claims stops, a script's text route fails nam
       return { get type(): string { if (!read) { read = true; throw new RangeError('Maximum call stack size exceeded'); } return 'note'; } };
     };
     // No structured content, so the text route; data that isn't content.
+    // No data and an error that can't be read: still a failure, never the
+    // model lane's notice (nonErrorResultTextOrThrow).
+    const noError = { success: true, data: null, get error(): string { throw new Error('zz-unreadable error'); } };
+    const failedRead = JSON.parse(await exit(noError as unknown as ToolResult, 'fwd--whole', false)) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(failedRead.isError, true, JSON.stringify(failedRead));
+    assert.match(failedRead.content[0].text, /^tool 'fwd--whole' returned a result that can't be converted to JSON/);
     for (const data of [{ deep: once() }, [{ deep: once() }]]) {
       const out = JSON.parse(await exit({ success: true, data }, 'fwd--whole', false)) as { content: [{ text: string }]; isError: boolean };
       assert.equal(out.isError, true, JSON.stringify(out));

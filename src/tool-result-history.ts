@@ -299,19 +299,10 @@ export function nonErrorResultText(
   let blocks: [HistoryBlockSpan[], ToolResultBlock[]] | undefined;
   const onBlocks = options?.onBlocks;
   try {
-    // Read inside the try too: the direct Agent API's result is its
-    // caller's own object, whose `data` can be a getter.
-    const data = result.data;
-    if (data === undefined || data === null) {
-      const error = result.error;
-      if (typeof error === 'string' && error) {
-        const text = error.toWellFormed();
-        return maxChars ? truncateForHistory(text, maxChars) : text;
-      }
-    }
-    const text = toolResultDataToHistoryString(data, maxChars, {
+    // The result's own fields are read inside the try too: the direct Agent
+    // API's result is its caller's own object, whose `data` can be a getter.
+    const text = nonErrorResultTextOrThrow(result, maxChars, {
       ...options,
-      dataIsContent: Boolean(result.dataIsContent),
       ...(onBlocks ? { onBlocks: (spans: HistoryBlockSpan[], made: ToolResultBlock[]) => { blocks = [spans, made]; } } : {}),
     });
     if (onBlocks && blocks) onBlocks(blocks[0], blocks[1]);
@@ -326,6 +317,28 @@ export function nonErrorResultText(
     console.error(`[tool-results] ${options?.toolName ? `tool '${options.toolName}'` : 'a tool'}: its result couldn't be read or shown, so the model reads that it was withheld: ${thrownLine(error)}`);
     return maxChars ? truncateForHistory(UNCHECKED_RESULT_TEXT, maxChars) : UNCHECKED_RESULT_TEXT;
   }
+}
+
+/**
+ * nonErrorResultText's text, throwing whatever stops reading or showing the
+ * result, such as a stopped claims walk (historyJson), for a caller that
+ * answers a stop itself: a script's routes, which fail naming the tool
+ * (Ada-1017, room-203 #200374), never the model lane's notice.
+ */
+export function nonErrorResultTextOrThrow(
+  result: { data?: unknown; error?: string; dataIsContent?: boolean },
+  maxChars?: number,
+  options?: HistorySerializeOptions,
+): string {
+  const data = result.data;
+  if (data === undefined || data === null) {
+    const error = result.error;
+    if (typeof error === 'string' && error) {
+      const text = error.toWellFormed();
+      return maxChars ? truncateForHistory(text, maxChars) : text;
+    }
+  }
+  return toolResultDataToHistoryString(data, maxChars, { ...options, dataIsContent: Boolean(result.dataIsContent) });
 }
 
 /** The first line of what was thrown, for a log line. */
@@ -398,7 +411,10 @@ function governedByRfc005(b: Record<string, unknown>): boolean {
   // on the model's lanes and a script's, as main has every link at depth:
   // its fields hold no uri RFC-005 governs, though a value in them, such as
   // an untyped object's `uri`, is data as anywhere else. As a block of a
-  // content array, the classifier reads it, and there it's the marker.
+  // content array on the model's line, the classifier reads it, and there
+  // it's the marker; a script's view of a module's array, which reads every
+  // block here, shows its fields, as module data reached a script on main
+  // (Ada-1017, room-203 #202138).
   // That's the object the script lane makes of a link whose uri it leaves
   // out (referenceBlockForScript), which a script's view, given it again,
   // leaves as it is, as it leaves a reference's stub.
@@ -473,8 +489,8 @@ function claimsInHistory(data: unknown): ResultClaims | null {
   try {
     return claimsInHistoryOrThrow(data);
   } catch {
-    // What the rest of the data claims is unknown: historyJson shows it as
-    // UNCHECKED_RESULT_TEXT, and a withheld result's kept fields keep nothing.
+    // What the rest of the data claims is unknown, so a withheld result's
+    // kept fields keep nothing (keptWhenWithheld).
     return null;
   }
 }
@@ -588,35 +604,38 @@ export function rfc005TextOf(value: unknown): string | null {
 }
 
 /**
- * What a tool result's data shows as where the walk of its claims stops
- * (claimsInHistory), so RFC-005's rules can't be read through it: the tool
- * ran, and its result isn't shown, rather than shown with no claims, where a
- * link could show a uri a reference in the result withholds. The round
- * completes, as a withheld result's kept fields keep nothing then
- * (keptWhenWithheld). The claims walk meets data no JSON can hold, such as
- * a cycle or a BigInt, or data too deep to write, before the render does,
- * so such data shows this too, where the render threw (Desmond-2579's run).
- * nonErrorResultText, the model lane's entry, shows it as well for anything
- * else that stops reading or showing a result (Ada-1017, room-203 #201013).
- * A script never gets it: both of its routes read the claims first and call
- * the serializer directly, and fail naming the tool (#200344, #200374).
+ * What the model's lane shows for a tool result it couldn't read through,
+ * check for references and show (nonErrorResultText, the lane's one catch,
+ * which logs the tool and the error): the tool ran, and its result isn't
+ * shown, rather than shown with fewer claims, where a link could show a uri a
+ * reference in the result withholds, and rather than a throw, which would
+ * leave the round unstored and unsent. Where the walk of its claims stops
+ * (historyJson throws then), the claims walk meets data no JSON can hold,
+ * such as a cycle or a BigInt, or data too deep to write, before the render
+ * does, so such data shows this, where the render threw (Desmond-2579's
+ * run); so does a render that stops after the walk, or a getter that throws
+ * (Ada-1017, room-203 #200344, #201013). The round completes, as a withheld
+ * result's kept fields keep nothing then (keptWhenWithheld). A script never
+ * gets it: its routes read the claims first and call the serializer, or
+ * nonErrorResultTextOrThrow, directly, and fail naming the tool (#200374).
  */
 export const UNCHECKED_RESULT_TEXT =
-  "[Result not shown: the tool ran, but its result couldn't be read through to check it for references, so this host withheld it.]";
+  "[Result not shown: the tool ran, but its result couldn't be read through, checked for references and shown, so this host withheld it.]";
 
 /**
  * JSON of a tool result's data with each value in it shown as history shows
  * it (shownInHistory), at any depth, by the claims `given` or else its own
- * (claimsInHistory). Data that is itself shown as text, such as a bare
- * reference, is that text, and data whose claims can't be read is
- * UNCHECKED_RESULT_TEXT.
+ * (claimsInHistoryOrThrow), throwing where that walk stops. Data that is
+ * itself shown as text, such as a bare reference, is that text.
  */
 function historyJson(data: unknown, given?: ResultClaims): string | undefined {
   // A walk that stopped can't say what the data claims, and showing it with
   // no claims would let a link show a uri a reference withholds, should the
   // render's own walk, with other replacers, get past the same value.
-  const claims = given ?? claimsInHistory(data);
-  if (claims === null) return UNCHECKED_RESULT_TEXT;
+  // Where the walk stops this throws: the model's lane answers with
+  // UNCHECKED_RESULT_TEXT and a log line (nonErrorResultText), a script's
+  // routes with a failure naming the tool.
+  const claims = given ?? claimsInHistoryOrThrow(data);
   const root = shownInHistory(data, claims);
   if (root !== data && typeof root === 'string') return root;
   return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value, claims)) as string | undefined;

@@ -47,7 +47,7 @@ import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coales
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import { checkedToolResult } from '../src/module-registry.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
-import { UNCHECKED_RESULT_TEXT, nonErrorResultText, shownToScript, toolResultDataToHistoryString, truncateForHistory } from '../src/tool-result-history.js';
+import { UNCHECKED_RESULT_TEXT, nonErrorResultText, scriptViewClaims, shownToScript, toolResultDataToHistoryString, truncateForHistory } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
 
@@ -1100,7 +1100,16 @@ describe('one answer for every block of a result', () => {
     // The claims walk meets the cycle before the render does, so the result
     // is the notice where main's serializer threw (Ada-1017, room-203
     // #200374), and nothing past the cycle is registered either way.
-    assert.equal(toolResultDataToHistoryString({ loop, later: { type: 'resource', uri, name: 'past.csv', disposition: 'never' } }), UNCHECKED_RESULT_TEXT);
+    const data = { loop, later: { type: 'resource', uri, name: 'past.csv', disposition: 'never' } };
+    const error = console.error;
+    console.error = () => {};
+    try {
+      assert.equal(nonErrorResultText({ data }), UNCHECKED_RESULT_TEXT);
+    } finally {
+      console.error = error;
+    }
+    // A script's routes take the serializer's own answer: it throws.
+    assert.throws(() => toolResultDataToHistoryString(data), TypeError);
     assert.equal(referenceRegistry.findByUri(uri), undefined);
   });
 
@@ -1415,13 +1424,30 @@ describe('one answer for every block of a result', () => {
     for (const shown of [
       toolResultDataToHistoryString([sealed, link], undefined, { dataIsContent: true }),
       toolResultDataToHistoryString({ sealed, link }),
-      JSON.stringify(shownToScript(link, referencesModule.contentClaims([sealed, link]))),
+      JSON.stringify(shownToScript(link, scriptViewClaims([sealed, link], false))),
     ]) {
       assert.ok(!shown.includes('inline-never'), shown);
     }
     // Only its never counts: an expiry beside its data claims nothing.
     const dated = { ...sealed, disposition: 'ref', expiresAt: '2000-01-01T00:00:00Z' };
     assert.ok(toolResultDataToHistoryString([dated, link], undefined, { dataIsContent: true }).includes('inline-never'));
+  });
+
+  it("withholds a never uri from a link whose uri shows as the same text, its bidi control cut", () => {
+    const uri = 'https://zz-elsewhere.example/cut-never/report.csv';
+    const sealed = { type: 'resource', uri, name: 'report.csv', disposition: 'never' };
+    // The same uri with a right-to-left mark, which sanitizeLabel cuts, so
+    // the link would show exactly the text the never withholds.
+    const link = { type: 'resource_link', uri: 'https://zz-elsewhere.example/cut-never/\u200Freport.csv', name: 'report.csv' };
+    const control = toolResultDataToHistoryString([link], undefined, { dataIsContent: true });
+    assert.ok(control.includes('cut-never/report.csv'), control);
+    for (const shown of [
+      toolResultDataToHistoryString([sealed, link], undefined, { dataIsContent: true }),
+      toolResultDataToHistoryString({ sealed, link }),
+      JSON.stringify(shownToScript(link, scriptViewClaims([sealed, link], false))),
+    ]) {
+      assert.ok(!shown.includes('cut-never'), shown);
+    }
   });
 
   it("shows the model the unchecked notice, with a line naming the tool, for whatever stops reading or showing a result, where the serializer throws for a script", () => {
@@ -1440,6 +1466,14 @@ describe('one answer for every block of a result', () => {
       // direct Agent API can be.
       const result = { get data(): unknown { throw new Error('zz-unreadable data'); } };
       assert.equal(nonErrorResultText(result, undefined, { toolName: 'zz_data' }), UNCHECKED_RESULT_TEXT);
+      const noError = { data: null, get error(): string { throw new Error('zz-unreadable error'); } };
+      assert.equal(nonErrorResultText(noError, undefined, { toolName: 'zz_error' }), UNCHECKED_RESULT_TEXT);
+      const noFlag = { data: [{ type: 'text', text: 'x' }], get dataIsContent(): boolean { throw new Error('zz-unreadable flag'); } };
+      assert.equal(nonErrorResultText(noFlag, undefined, { toolName: 'zz_flag' }), UNCHECKED_RESULT_TEXT);
+      // What's thrown can be a value String() can't read itself; the line
+      // still goes out, saying so.
+      const unprintable = { get data(): unknown { throw Object.create(null); } };
+      assert.equal(nonErrorResultText(unprintable, undefined, { toolName: 'zz_unprintable' }), UNCHECKED_RESULT_TEXT);
       // A render that stops where the claims walk got through: the render
       // registers what it shows, and the claims walk registers nothing.
       const uri = 'https://zz-elsewhere.example/render-stop/report.csv';
@@ -1458,10 +1492,13 @@ describe('one answer for every block of a result', () => {
     } finally {
       console.error = error;
     }
-    assert.equal(logged.length, 3, logged.join('\n'));
+    assert.equal(logged.length, 6, logged.join('\n'));
     assert.match(logged[0]!, /tool 'zz_tool'.*zz-unreadable text/);
     assert.match(logged[1]!, /tool 'zz_data'.*zz-unreadable data/);
-    assert.match(logged[2]!, /tool 'zz_deep'.*Maximum call stack size exceeded/);
+    assert.match(logged[2]!, /tool 'zz_error'.*zz-unreadable error/);
+    assert.match(logged[3]!, /tool 'zz_flag'.*zz-unreadable flag/);
+    assert.match(logged[4]!, /tool 'zz_unprintable'.*a value that can't be read/);
+    assert.match(logged[5]!, /tool 'zz_deep'.*Maximum call stack size exceeded/);
   });
 
   it('shows data whose claims walk stops as the unchecked notice, never with no claims, and a round with it completes, both copies alike', async () => {
@@ -1474,16 +1511,25 @@ describe('one answer for every block of a result', () => {
     };
     // A link beside a never to its uri, which a render with no claims would show.
     const data = () => ({ link: { type: 'resource_link', uri: PLAIN_URI, name: 'report.csv' }, sealed: { type: 'resource', uri: PLAIN_URI, disposition: 'never' }, deep: once() });
-    assert.equal(toolResultDataToHistoryString(data()), UNCHECKED_RESULT_TEXT);
+    assert.throws(() => toolResultDataToHistoryString(data()), RangeError, 'a script\'s routes take the serializer\'s own answer');
     const fw = Object.create(AgentFramework.prototype) as {
       buildStoredToolResultContent(agent: string, calls: unknown[], maxChars: number | undefined): Promise<{ blocks: Array<{ content: unknown }>; spilled: Map<string, unknown> }>;
       toMembraneToolResult(callId: string, result: ToolResult, maxChars: number | undefined, precomputed: unknown): Live;
     };
     Object.assign(fw, { toolImageLedgers: new Map(), writeToolResultFile: async () => null, moduleRegistry: { getAllModules: () => [] } });
     const call = { id: 'zz-unchecked', name: 'zz_tool', input: {}, result: { success: true, data: data() } };
-    const { blocks, spilled } = await fw.buildStoredToolResultContent('zz-agent', [call], 24_000);
-    assert.deepEqual(blocks.map((block) => block.content), [UNCHECKED_RESULT_TEXT]);
-    assert.equal(fw.toMembraneToolResult(call.id, call.result, 24_000, spilled.get(call.id)).content, UNCHECKED_RESULT_TEXT);
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const { blocks, spilled } = await fw.buildStoredToolResultContent('zz-agent', [call], 24_000);
+      assert.deepEqual(blocks.map((block) => block.content), [UNCHECKED_RESULT_TEXT]);
+      assert.equal(fw.toMembraneToolResult(call.id, call.result, 24_000, spilled.get(call.id)).content, UNCHECKED_RESULT_TEXT);
+    } finally {
+      console.error = error;
+    }
+    // The stored copy's builder names the tool in the model lane's log line.
+    assert.ok(logged.some((line) => /tool 'zz_tool'.*Maximum call stack size exceeded/.test(line)), logged.join('\n'));
   });
 
   it("keeps a result's native live copy when its turn's results are stored by their shares of the readers' bound", async () => {
