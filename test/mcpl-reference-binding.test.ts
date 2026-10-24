@@ -150,19 +150,23 @@ test("fetch_reference reaches a push event's reference through its server's own 
     dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
   };
   Object.assign(framework, {
-    mcplServerConfigs: new Map([
-      ['push-srv', { id: 'push-srv', url: wsOrigin }],
-      ['stdio-srv', { id: 'stdio-srv', command: 'stdio-server' }],
-      ['spawned-srv', { id: 'spawned-srv', command: 'stdio-server', url: wsOrigin }],
-      ['ws-command-srv', { id: 'ws-command-srv', transport: 'websocket', command: 'stdio-server', url: wsOrigin }],
-      ['stdio-url-srv', { id: 'stdio-url-srv', transport: 'stdio', url: wsOrigin }],
-      ['ws-http-srv', { id: 'ws-http-srv', transport: 'websocket', url: origin }],
-      ['ws-fragment-srv', { id: 'ws-fragment-srv', url: `${wsOrigin}/mcpl#frag` }],
-    ]),
+    mcplServerConfigs: new Map(),
     getWorkspaceModule: () => ({ writeBinary: async () => ({ success: true }) }),
     firstWritableMountName: () => 'scratch',
     emitTrace: () => {},
   });
+  // Configured as the framework configures a server: its config, which the
+  // fetcher reads, and its address in the reference registry, which the
+  // stub reads.
+  for (const config of [
+    { id: 'push-srv', url: wsOrigin },
+    { id: 'stdio-srv', command: 'stdio-server' },
+    { id: 'spawned-srv', command: 'stdio-server', url: wsOrigin },
+    { id: 'ws-command-srv', transport: 'websocket', command: 'stdio-server', url: wsOrigin },
+    { id: 'stdio-url-srv', transport: 'stdio', url: wsOrigin },
+    { id: 'ws-http-srv', transport: 'websocket', url: origin },
+    { id: 'ws-fragment-srv', url: `${wsOrigin}/mcpl#frag` },
+  ]) (framework as unknown as { setMcplServerConfig(config: unknown): void }).setMcplServerConfig(config);
   // Bounded, so a dispatch that never answers fails the test rather than hanging it.
   const fetchReference = (refId: string): Promise<Answer['result']> => {
     let timer: NodeJS.Timeout | undefined;
@@ -249,6 +253,11 @@ async function puppetCall(answer: unknown, fetcher: unknown): Promise<{ result: 
     },
     getReferenceFetcher: () => fetcher,
   });
+  // eido is dialed on its references' origin, so a stub of one can offer
+  // the fetch: the reference registry records its address, as the
+  // framework does for a server it configures.
+  (framework as unknown as { setMcplServerConfig(config: unknown): void })
+    .setMcplServerConfig({ id: 'eido', url: 'wss://editor.example.invalid' });
   const quiet = console.log;
   console.log = () => {};
   const { result } = await framework.puppetToolCall('princess', 'mcpl--eido--look', {})
@@ -270,9 +279,11 @@ test("an MCPL tool called in process that fails registers none of its result's r
   // A failure keeps only its text, so no stub is made of its references.
   const failed = reference('puppet-failed.pdf');
   let fetches = 0;
+  const fetchFake = async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet-failed.pdf' }; };
   const { result, text } = await puppetCall({ isError: true, content: [{ type: 'text', text: 'look failed' }, failed] }, {
     isEagerEligible: () => true,
-    fetch: async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet-failed.pdf' }; },
+    fetch: fetchFake,
+    fetchEager: fetchFake,
   });
   assert.equal(result.success, false);
   assert.equal(result.error, 'look failed');
@@ -288,9 +299,11 @@ test("an MCPL tool called in process, as the admin puppet calls one, has its res
   // so the stored stub offers the fetch. Nothing is fetched, even a
   // reference the eager default would fetch for a call the agent makes.
   let fetches = 0;
+  const fetchFake = async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet.pdf' }; };
   const text = await puppetLook('puppet.pdf', {
     isEagerEligible: () => true,
-    fetch: async () => { fetches++; return { ok: true, path: 'scratch/refs/puppet.pdf' }; },
+    fetch: fetchFake,
+    fetchEager: fetchFake,
   });
   assert.deepEqual(stubRecords(text).map((record) => record?.serverIds), [['eido']]);
   assert.match(text, /\[ref_[0-9a-z]+_[0-9a-z]+\] application\/pdf[^"]* — fetch with fetch_reference/, text);

@@ -23,6 +23,7 @@ import { fixture as baseFixture, eventually, settles, TS } from './helpers/coale
 const fixture: typeof baseFixture = (options = {}) =>
   baseFixture({ ...options, framework: { speech: { locus: 'latest-inbound' }, ...options.framework } });
 import { createMockResponse } from './helpers/mock-membrane.js';
+import { gateToolCalls } from './helpers/gate-tool-calls.js';
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 type Ref = { serverId: string; channelId: string };
@@ -267,17 +268,18 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
     } finally { await f.close(); }
   });
 
-  it('a subagent\'s sleep announcement is not posted to the latest inbound channel', async () => {
+  it('a subagent\'s sleep is refused, and the gate stays awake', async () => {
     const f = await fixture({ framework: { gate: { config: { default: 'always' } } } as never });
-    const t = speechTraces(f);
+    const calls = gateToolCalls(f.framework);
     try {
       await busyFallback(f);
       await runSubagent(f, 'sub-sleep', 'locus', true,
-        createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 60, message: 'subagent going quiet' } }], 'tool_use'));
+        createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 60 } }], 'tool_use'),
+        text('done'));
 
-      assert.ok(!publishedText(f).includes('subagent going quiet'), `not published: ${publishedText(f)}`);
-      assert.deepEqual(t.seen.filter((x) => x.conversationId === 'sub-sleep'), [], 'neither routed nor counted as a failed route');
-    } finally { t.off(); await f.close(); }
+      assert.deepEqual(calls.refused, ['sleep: Nothing was set: a sleep quiets the whole agent, not one run.']);
+      assert.equal((f.framework as unknown as { eventGate: { getSleepState(): unknown } }).eventGate.getSleepState(), null, 'the gate stays awake');
+    } finally { await f.close(); }
   });
 
   it('a channel the subagent opens itself is still where its prose lands', async () => {

@@ -247,7 +247,7 @@ for (const order of orders) {
     assert.equal(f.registry.getDesiredState('a', 'general'), undefined, "a's channel is another channel");
     // a's general is open, so there's nothing to decline there: the refusal names it apart.
     const open = await f.registry.handleChannelToolCall('channel_decline', { channelId: 'a:general', messageId: 'm2' });
-    assert.match(open.error ?? '', /^Channel "a:general" is open, or set to open, so there's nothing to decline/);
+    assert.match(open.error ?? '', /^Channel "a:general" is open, so there's nothing to decline/);
   });
 
   test(`a >> target names one server's channel by its qualified id, and a shared id or label lists them apart (${registered})`, () => {
@@ -959,7 +959,7 @@ test("a closed-channel invitation offers no >> reply a line reads as private spe
   });
   assert.ok(invite, 'control: an addressed message from a closed channel gets an invitation');
   const text = JSON.stringify(invite);
-  assert.ok(text.includes('Replying with a \\">>\\" prefix isn\'t available here'), text);
+  assert.ok(text.includes('no single-word target reaches this channel unambiguously'), text);
   assert.ok(!text.includes('>>skip_reply'), text);
   // The real registry offers the channel by its server-qualified name, which
   // a >> line reads as a target.

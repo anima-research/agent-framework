@@ -114,6 +114,14 @@ describe('inbound source envelope', () => {
   const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
   const storedWith = (pred: (m: Record<string, unknown>) => boolean) =>
     stored().find((m) => pred((m.metadata ?? {}) as Record<string, unknown>));
+  /** The agent closes ROOM, so an addressed push from it comes with the closed-channel invitation. */
+  const closeRoom = async (): Promise<void> => {
+    const registry = (framework as unknown as {
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<{ success: boolean }>; isChannelOpen(channel: ChannelRef): boolean };
+    }).channelRegistry;
+    assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' })).success, true);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: ROOM }), false);
+  };
 
   it('stamps a channels/incoming message with its registered channel, label, reply edge and acceptance time', async () => {
     const before = Date.now();
@@ -230,15 +238,28 @@ describe('inbound source envelope', () => {
   });
 
   it('on the push lane, the delivered digest excludes host decoration and the stored digest covers it', async () => {
-    command({ op: 'dm', eventId: 'ev-dig', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'dm stored');
+    // A mention pushed from a channel the agent closed: the host appends its invitation.
+    await closeRoom();
+    command({
+      op: 'push', eventId: 'ev-dig', text: 'psst',
+      origin: { source: 'discord', mcplChannelId: ROOM, messageId: 'pm-dig', authorName: 'antra' },
+      tags: ['chat:mention', 'chat:addressed'],
+    });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'push stored');
     const message = storedWith((m) => m.eventId === 'ev-dig')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'psst' }]), 'the adapter body alone');
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored');
-    // The DM's channel is closed, so the host appends its invitation.
     assert.equal(message.content.length, 2);
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the closed-channel invitation decorates the stored copy');
+    // A DM's channel is closed too, but all of a DM reaches the agent, so
+    // nothing decorates it and its two digests agree.
+    command({ op: 'dm', eventId: 'ev-dm', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dm'), 'dm stored');
+    const dm = storedWith((m) => m.eventId === 'ev-dm')!;
+    const dmMeta = dm.metadata as Record<string, unknown>;
+    assert.equal(dmMeta.channelInvitation, undefined, 'no invitation on a DM');
+    assert.equal(dmMeta.storedBodyDigest, dmMeta.sourceBodyDigest);
   });
 
   it('a visibly-empty ordinary push is refused and stores nothing; an accepted push carries the host\'s digests, never the adapter\'s', async () => {
@@ -258,12 +279,17 @@ describe('inbound source envelope', () => {
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
   });
 
-  it('a DM pushed into a closed channel carries the host\'s digests, never the adapter\'s: the delivered body, and the stored copy with its invitation', async () => {
+  it('a mention pushed from a closed channel carries the host\'s digests, never the adapter\'s: the delivered body, and the stored copy with its invitation', async () => {
+    await closeRoom();
     command({
-      op: 'dm', eventId: 'ev-forged', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst again',
-      origin: { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
+      op: 'push', eventId: 'ev-forged', text: 'psst again',
+      origin: {
+        source: 'discord', mcplChannelId: ROOM, messageId: 'pm-forged', authorName: 'antra',
+        sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value',
+      },
+      tags: ['chat:mention', 'chat:addressed'],
     });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-forged'), 'dm stored');
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-forged'), 'push stored');
     const message = storedWith((m) => m.eventId === 'ev-forged')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.channelInvitation, true, 'stored with the closed-channel invitation');
