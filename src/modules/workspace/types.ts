@@ -256,13 +256,16 @@ export interface MountConfig {
    * bind mount, isn't found to lead there, though a walk passes over it,
    * knowing each nested root by which directory it is; a nested mount
    * whose root moves while running, as `acceptRoot` takes, stays placed where
-   * it was until the next start; on a filesystem whose change times this
-   * module doesn't trust (filesystemTrustsCtime), a name a start reads a
-   * level's folding by, removed and made again meanwhile under the same
-   * inode number and change time, can make a level that folds case read as
-   * one that tells it apart, when its spelling in the other case is looked up
-   * while it's gone; and where a direct mount's root is repointed between a
-   * read's parse and its open, or a write's parse and its staging, a race
+   * it was until the next start, but for the calls of a direct mount whose
+   * root has moved and beneath whose path it's configured, which place it
+   * where it lies; a name a start reads a level's folding by, gone for a
+   * moment and back under the same inode number and change time, as a rename
+   * away and back within one tick of a coarse clock right after its last
+   * change can leave it, or a remake on a filesystem whose change times this
+   * module doesn't trust (filesystemTrustsCtime), can make a level that folds
+   * case read as one that tells it apart, when another spelling of it is
+   * looked up while it's gone; and where a direct mount's root is repointed
+   * between a read's parse and its open, or a write's parse and its staging, a race
    * left to whoever writes the disk, a mount nested in it by its directories
    * alone, since its real root holds that root, can have the read serve a
    * path in its directory, or the write land there.

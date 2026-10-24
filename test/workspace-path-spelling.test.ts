@@ -55,6 +55,9 @@ const LONG_S_FOLDING_ONLY = folds.longS ? false
   : 'the temp directory keeps \u017f apart from s, so SOAP reaches nothing where disk has \u017foap';
 const FINAL_SIGMA_FOLDING_ONLY = folds.finalSigma ? false
   : 'the temp directory keeps \u03c2 apart from \u03c3, so \u039f\u0394\u039f\u03a3 reaches nothing where disk has \u03bf\u03b4\u03bf\u03c2';
+// statfs f_types, for withStatfsType: one whose change times are trusted, and one whose aren't.
+const EXT4 = 0xef53;
+const FUSE = 0x65735546;
 const CASE_SENSITIVE_ONLY = folds.case
   ? 'the temp directory folds case, so two names that differ only in case are one name here' : false;
 const CASE_NOT_SHARP_S_ONLY = folds.case && !folds.sharpS ? false
@@ -669,25 +672,34 @@ test('a directory folds case as its own entries tell, and where none tells, noth
   assert.equal(await ownCaseFolding(join(root, 'named', 'later')), null, 'nor one not made yet');
   assert.equal(await ownCaseFolding(join(root, 'named')), folds.case, 'a name with a letter tells');
   if (!folds.case) {
-    // Only a directory that tells case apart can hold a name and its flipped spelling as two files.
+    // Only a directory that tells case apart can hold a name and its flipped
+    // spelling as two files. Each pair is told as a name alone is, so two
+    // files tell case apart only on a filesystem whose change times are
+    // trusted, chosen here, which off Linux none is.
+    const apart = process.platform === 'linux' ? false : null;
+    const trusted = <T>(fn: () => Promise<T>) => withStatfsType(EXT4, fn);
     mkdirSync(join(root, 'pair'));
-    writeFileSync(join(root, 'pair', 'x'), 'one');
-    writeFileSync(join(root, 'pair', 'X'), 'other');
-    assert.equal(await ownCaseFolding(join(root, 'pair')), false, 'a name beside its flipped spelling as another file tells case apart');
+    writeFileSync(join(root, 'pair', 'xa'), 'one');
+    writeFileSync(join(root, 'pair', 'XA'), 'other');
+    assert.equal(await trusted(() => ownCaseFolding(join(root, 'pair'))), apart, 'a name beside its flipped spelling as another file tells case apart');
+    mkdirSync(join(root, 'single'));
+    writeFileSync(join(root, 'single', 'x'), 'one');
+    writeFileSync(join(root, 'single', 'X'), 'other');
+    assert.equal(await trusted(() => ownCaseFolding(join(root, 'single'))), null, 'a name of one letter beside its flipped spelling tells nothing, having no third spelling');
     mkdirSync(join(root, 'linked'));
     writeFileSync(join(root, 'linked', 'y'), 'one');
     linkSync(join(root, 'linked', 'y'), join(root, 'linked', 'Y'));
-    assert.equal(await ownCaseFolding(join(root, 'linked')), null, 'a name beside its flipped spelling as one file, two hard links, tells nothing');
-    writeFileSync(join(root, 'linked', 'x'), 'one');
-    writeFileSync(join(root, 'linked', 'X'), 'other');
+    assert.equal(await trusted(() => ownCaseFolding(join(root, 'linked'))), null, 'a name beside its flipped spelling as one file, two hard links, tells nothing');
+    writeFileSync(join(root, 'linked', 'xa'), 'one');
+    writeFileSync(join(root, 'linked', 'XA'), 'other');
     // Listed with the hard links first, which this disk's own order may not give.
     const original = fs.promises.readdir;
     fs.promises.readdir = ((path: fs.PathLike, ...rest: unknown[]) => (String(path) === join(root, 'linked')
-      ? Promise.resolve(['y', 'Y', 'x', 'X'])
+      ? Promise.resolve(['y', 'Y', 'xa', 'XA'])
       : (original as (...args: unknown[]) => unknown)(path, ...rest))) as typeof fs.promises.readdir;
     syncBuiltinESMExports();
     try {
-      assert.equal(await ownCaseFolding(join(root, 'linked')), false, 'one pair of two files tells case apart, whichever pair is listed first');
+      assert.equal(await trusted(() => ownCaseFolding(join(root, 'linked'))), apart, 'one pair of two files tells case apart, whichever pair is listed first');
     } finally {
       fs.promises.readdir = original;
       syncBuiltinESMExports();
@@ -695,12 +707,36 @@ test('a directory folds case as its own entries tell, and where none tells, noth
     mkdirSync(join(root, 'newer'));
     writeFileSync(join(root, 'newer', '\u1c90'), 'one');
     writeFileSync(join(root, 'newer', '\u10d0'), 'other');
-    assert.equal(await ownCaseFolding(join(root, 'newer')), null, 'a newer case pair as two files tells nothing, since a disk that folds case may keep it apart');
+    assert.equal(await trusted(() => ownCaseFolding(join(root, 'newer'))), null, 'a newer case pair as two files tells nothing, since a disk that folds case may keep it apart');
     mkdirSync(join(root, 'mixed'));
-    writeFileSync(join(root, 'mixed', 'a\u1c90'), 'one');
-    writeFileSync(join(root, 'mixed', 'A\u1c90'), 'other');
-    assert.equal(await ownCaseFolding(join(root, 'mixed')), false, 'names that differ only in an ASCII letter\'s case, as two files, tell case apart');
+    writeFileSync(join(root, 'mixed', 'ab\u1c90'), 'one');
+    writeFileSync(join(root, 'mixed', 'AB\u1c90'), 'other');
+    assert.equal(await trusted(() => ownCaseFolding(join(root, 'mixed'))), apart, 'names that differ only in their ASCII letters\' case, as two files, tell case apart');
   }
+});
+
+test('on a disk that tells case apart, a listing of twins in case is told pair by pair, as a name alone is', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
+  // A disk that folds case can list a name and its flipped spelling too, as
+  // while the name is renamed in case as it's listed. On one that numbers a file
+  // anew for each spelling, the two are two inode numbers though one file,
+  // and the third spelling finds it too: that tells nothing. Twins on a
+  // filesystem whose change times aren't trusted tell nothing either.
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-listed-twins-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'twins'));
+  writeFileSync(join(root, 'twins', 'ab.txt'), 'one');
+  writeFileSync(join(root, 'twins', 'AB.TXT'), 'other');
+  const folding = (original: typeof fs.promises.lstat) => ((path: fs.PathLike, ...rest: unknown[]) => {
+    const lookup = original as (...args: unknown[]) => Promise<unknown>;
+    // Any third spelling, with one letter's case flipped, finds the file, as
+    // a disk that folds case finds it under every spelling.
+    const name = basename(String(path));
+    if (name.toLowerCase() === 'ab.txt' && name !== 'ab.txt' && name !== 'AB.TXT') return lookup(join(root, 'twins', 'ab.txt'), ...rest);
+    return lookup(path, ...rest);
+  }) as typeof fs.promises.lstat;
+  assert.equal(await withStatfsType(EXT4, () => withLstat(folding, () => ownCaseFolding(join(root, 'twins')))), null, 'where every spelling finds a file');
+  assert.equal(await withStatfsType(FUSE, () => ownCaseFolding(join(root, 'twins'))), null, 'twins where change times aren\'t trusted');
+  assert.equal(await withStatfsType(EXT4, () => ownCaseFolding(join(root, 'twins'))), process.platform === 'linux' ? false : null, 'twins where they are');
 });
 
 test('a name removed while start reads a directory\'s folding tells nothing of it', async (t) => {
@@ -869,13 +905,15 @@ async function withLstat<T>(wrap: (original: typeof fs.promises.lstat) => typeof
 }
 
 /**
- * Run `fn` with node:fs/promises' statfs answering `type` for every path, as
- * the module under test sees it, so whether a filesystem's change times are
- * trusted is chosen here rather than by the disk the test runs on.
+ * Run `fn` with node:fs/promises' statfs answering `type` for every path, or
+ * failing with it where it's an error, as the module under test sees it, so
+ * whether a filesystem's change times are trusted is chosen here rather than
+ * by the disk the test runs on.
  */
-async function withStatfsType<T>(type: number, fn: () => Promise<T>): Promise<T> {
+async function withStatfsType<T>(type: number | Error, fn: () => Promise<T>): Promise<T> {
   const original = fs.promises.statfs;
   fs.promises.statfs = (async (path: fs.PathLike, ...rest: unknown[]) => {
+    if (type instanceof Error) throw type;
     const found = await (original as (...args: unknown[]) => Promise<fs.StatsFs>)(path, ...rest);
     return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { type });
   }) as typeof fs.promises.statfs;
@@ -887,8 +925,6 @@ async function withStatfsType<T>(type: number, fn: () => Promise<T>): Promise<T>
     syncBuiltinESMExports();
   }
 }
-const EXT4 = 0xef53;
-const FUSE = 0x65735546;
 
 test('a name replaced while start reads a directory\'s folding tells nothing of it', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-replaced-'));
@@ -974,7 +1010,7 @@ test('where the flipped spelling finds another file than the name does, the name
   assert.equal(await withStatfsType(EXT4, () => withLstat(lookups('nothing'), () => ownCaseFolding(root, 'd'))), null, 'nor from the name alone');
 });
 
-test('nothing at the third spelling tells nothing on a filesystem whose change times aren\'t trusted', async (t) => {
+test('on a filesystem whose change times aren\'t trusted, a third spelling that finds nothing leaves the level a guess', async (t) => {
   // There a name removed and made again between the lookups, under an inode
   // numbered by path and in the same coarse tick, keeps its change time, so
   // the bracket can't tell it was gone, and a disk that folds case would
@@ -994,6 +1030,10 @@ test('nothing at the third spelling tells nothing on a filesystem whose change t
   }) as typeof fs.promises.lstat;
   assert.equal(await withStatfsType(FUSE, () => withLstat(lookups, () => ownCaseFolding(join(root, 'listed')))), null, 'from a listing');
   assert.equal(await withStatfsType(FUSE, () => withLstat(lookups, () => ownCaseFolding(root, 'ab'))), null, 'from the name alone');
+  // A filesystem whose type can't be read is one whose change times aren't trusted.
+  const unread = Object.assign(new Error('EIO: i/o error, statfs'), { code: 'EIO' });
+  assert.equal(await withStatfsType(unread, () => withLstat(lookups, () => ownCaseFolding(join(root, 'listed')))), null, 'from a listing, where statfs fails');
+  assert.equal(await withStatfsType(unread, () => withLstat(lookups, () => ownCaseFolding(root, 'ab'))), null, 'from the name alone, where statfs fails');
 });
 
 test('a name removed while its third spelling is looked up tells nothing of its directory\'s folding', async (t) => {
@@ -1033,19 +1073,24 @@ test('a name re-created or renamed back under the same inode between its first a
   writeFileSync(join(root, 'd', 'ab.txt'), '');
   writeFileSync(join(root, 'other'), '');
   const nothing = () => Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
-  for (const gone of ['AB.TXT', 'Ab.txt']) {
+  // A filesystem whose change times are trusted, so the change time, not
+  // the trust gate, is what keeps each answer from telling case apart.
+  for (const gone of ['AB.TXT', 'Ab.txt', 'nothing']) {
     let named = 0;
-    const answer = await withLstat((original) => (async (path: fs.PathLike, ...rest: unknown[]) => {
+    const answer = await withStatfsType(EXT4, () => withLstat((original) => (async (path: fs.PathLike, ...rest: unknown[]) => {
       const name = basename(String(path));
       const lookup = original as (...args: unknown[]) => Promise<{ ctimeNs: bigint }>;
       if (name === gone) return nothing();
-      if (name === 'AB.TXT') return lookup(join(root, 'other'), ...rest);
+      // With nothing gone, the flipped spelling is a hard link to the name,
+      // made between its lookups, which moves its change time: the same
+      // file at both spellings would otherwise read as folding.
+      if (name === 'AB.TXT') return lookup(join(root, gone === 'nothing' ? 'd/ab.txt' : 'other'), ...rest);
       const found = await lookup(path, ...rest);
       if (name !== 'ab.txt' || ++named < 2) return found;
       return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { ctimeNs: found.ctimeNs + 1n });
-    }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd')));
+    }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd'))));
     assert.equal(named, 2, `${gone}: the name was looked up on each side`);
-    assert.equal(answer, null, `nothing at ${gone}`);
+    assert.equal(answer, null, gone === 'nothing' ? 'a hard link made meanwhile at the flipped spelling' : `nothing at ${gone}`);
   }
 });
 
@@ -1686,6 +1731,8 @@ test('through a link that spells a nested mount\'s directory otherwise than disk
   const { workspace, dir } = await setup(t, (d) => {
     mkdirSync(join(d, 'inner'), { recursive: true });
     writeFileSync(join(d, 'inner', 'x.txt'), 'nested\n');
+    // The outer mount's own file, which a grep through the links finds alone.
+    writeFileSync(join(d, 'own.txt'), 'not nested\n');
     symlinkSync('INNER/x.txt', join(d, 'f.txt'));
     symlinkSync('INNER', join(d, 'k'));
     return [
@@ -1711,7 +1758,7 @@ test('through a link that spells a nested mount\'s directory otherwise than disk
   assert.deepEqual((listed.data as { entries: unknown[] }).entries, []);
   assert.match(JSON.stringify((listed.data as { incomplete: unknown[] }).incomplete), /leads into mount \\"nested\\"/);
   const grepped = await tool('grep', { path: 'outer', pattern: 'nested' });
-  assert.deepEqual((grepped.structured as { results: unknown[] }).results, []);
+  assert.deepEqual((grepped.structured as { results: Array<{ file: string }> }).results.map((r) => r.file), ['outer/own.txt']);
   assert.equal(readFileSync(join(dir, 'inner', 'x.txt'), 'utf8'), 'nested\n');
   assert.deepEqual(readdirSync(join(dir, 'inner')), ['x.txt']);
 });

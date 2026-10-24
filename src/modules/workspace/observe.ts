@@ -742,34 +742,38 @@ export async function foldsCase(dir: string): Promise<boolean> {
 /**
  * Whether `dir` folds case as its own entries tell, for the nested-mount
  * comparison, by its ASCII letters alone, which every disk that folds case
- * folds (flippedAscii): a name it lists whose flipped spelling it doesn't
- * list too, looked up flipped there, finds the same file where it folds
- * case and nothing where it tells case apart; and a name it lists beside its
- * flipped spelling as another file tells case apart, since a directory that
- * folds case can't hold both. Null where its own entries tell nothing: it
- * lists no name with an ASCII letter, as an empty directory doesn't, or
+ * folds (flippedAscii). A name it lists is looked up flipped: the same file
+ * there tells that it folds case, and nothing there that it tells case
+ * apart. The first name it lists whose flipped spelling it doesn't list too
+ * is told so. Where every such name is listed beside its flipped spelling,
+ * each pair is told the same way until one tells case apart, since a
+ * directory that folds case can list both spellings too, as while a name is
+ * renamed in case as it's listed. Null where its own entries tell nothing:
+ * it lists no name with an ASCII letter, as an empty directory doesn't, or
  * isn't there yet, or can't be listed, or a lookup fails for another reason
  * than that nothing is there, or the name is gone, or changed, by the time
- * it's looked up again. foldsCase asks the directory holding it then, which tells this one's
- * folding only where a whole filesystem folds or doesn't: ext4's and
- * tmpfs's casefold is set per directory, so an empty folding directory can
- * sit in one that tells case apart. Where the flipped spelling finds another
- * file than the name does, as a disk that tells case apart can hold beside
- * it, the name is looked up once more with only its first ASCII letter's
- * case flipped (firstFlipped): nothing there tells case apart, and a file
- * there tells nothing, since a disk that folds case but numbers a file anew
- * for each spelling it's looked up by, as a FUSE filesystem may, finds the
- * one file under every spelling. A name with no such spelling tells nothing
- * then either, and nor does nothing there on a filesystem whose change times
- * this module doesn't trust (filesystemTrustsCtime): there the change time
- * that tells a name replaced between the lookups can stay the same, so the
- * name, gone for a moment, could make a disk that folds case read as one that
- * tells it apart. Given `name`, a name `dir` holds, such as a path's own
- * segment, that name alone is looked up, in those spellings, and nothing is
- * listed, so nothing else `dir` holds is read: the flipped spelling finds the
- * same directory where `dir` folds case, and nothing, or another directory
- * the third spelling doesn't find, where it tells case apart; a name with no
- * ASCII letter, or one that isn't there, tells nothing.
+ * it's looked up again. Unlike foldsCase, which then reads the directory
+ * holding a mount's root, it reads nothing beside `dir`: the directory
+ * holding it tells this one's folding only where a whole filesystem folds or
+ * doesn't, and ext4's and tmpfs's casefold is set per directory, so an empty
+ * folding directory can sit in one that tells case apart. Where the flipped
+ * spelling finds another file than the name does, as a disk that tells case
+ * apart can hold beside it, the name is looked up once more with only its
+ * first ASCII letter's case flipped (firstFlipped). A file there tells
+ * nothing, since a disk that folds case but numbers a file anew for each
+ * spelling it's looked up by, as a FUSE filesystem may, finds the one file
+ * under every spelling. Where that lookup finds nothing, it tells case apart
+ * on a filesystem whose change times this module trusts
+ * (filesystemTrustsCtime), and tells nothing elsewhere: there a name made
+ * again between the lookups can keep its change time, so the name, gone for
+ * a moment, could make a disk that folds case read as one that tells it
+ * apart. A name with no such spelling tells nothing either. Given `name`, a
+ * name `dir` holds, such as a path's own segment, that name alone is looked
+ * up, in those spellings, and nothing is listed, so nothing else `dir` holds
+ * is read: the flipped spelling finds the same directory where `dir` folds
+ * case, and nothing, or another directory the third spelling doesn't find,
+ * where it tells case apart, the latter only where change times are trusted;
+ * a name with no ASCII letter, or one that isn't there, tells nothing.
  */
 export async function ownCaseFolding(dir: string, name?: string): Promise<boolean | null> {
   // A lookup that finds nothing answers null; one that fails otherwise, undefined.
@@ -782,7 +786,11 @@ export async function ownCaseFolding(dir: string, name?: string): Promise<boolea
   // looked up while the name was gone finds nothing too. So does a hard link
   // made meanwhile, which changes the file's change time; one in the other
   // case made before, in a directory that tells case apart, still reads as
-  // folding.
+  // folding. A name gone and back with the same inode number and change time
+  // still passes, as a rename away and back within one tick of a coarse
+  // clock can leave it; that race is outside the nested-mount guarantee
+  // (MountConfig.include), and the third spelling's own answer is gated on
+  // trusted change times below.
   const unchanged = (a: BigIntStats, b: BigIntStats) => sameFile(a, b) && a.ctimeNs === b.ctimeNs;
   const told = async (unpaired: string): Promise<boolean | null> => {
     const before = await look(join(dir, unpaired));
@@ -807,15 +815,19 @@ export async function ownCaseFolding(dir: string, name?: string): Promise<boolea
   }
   const unpaired = [...listed].find((n) => !listed.has(flippedAscii(n)));
   if (unpaired !== undefined) return told(unpaired);
-  // Every name with an ASCII letter is listed beside its flipped spelling:
-  // one pair of two files tells case apart, and two hard links don't. A name
-  // with no ASCII letter is its own flipped spelling, so it's passed over
-  // unread, as a directory of numbered entries would otherwise cost two
-  // lookups an entry at every start.
+  // Every name with an ASCII letter is listed beside its flipped spelling,
+  // which a disk that folds case can list too, as while a name is renamed in
+  // case as it's listed. Each pair is told as a name alone is, so two files at
+  // the two spellings tell case apart only as told says, since a disk that
+  // folds case but numbers a file anew for each spelling finds two there
+  // too. A pair told as folding, as two hard links are, says nothing here and
+  // is passed over; the first pair told as telling case apart decides. A
+  // name with no ASCII letter is its own flipped spelling, so it's passed
+  // over unread, as a directory of numbered entries would otherwise cost
+  // lookups for each entry at every start.
   for (const paired of listed) {
     if (flippedAscii(paired) === paired) continue;
-    const [one, other] = await Promise.all([look(join(dir, paired)), look(join(dir, flippedAscii(paired)))]);
-    if (one && other && !sameFile(one, other)) return false;
+    if ((await told(paired)) === false) return false;
   }
   return null;
 }

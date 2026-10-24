@@ -17,6 +17,7 @@ import { JsStore } from '@animalabs/chronicle';
 // A namespace, so this file loads where the module lacks inOrder, and only
 // the tests that call it fail there.
 import * as workspaceModule from '../src/modules/workspace/index.js';
+import { filesystemTrustsCtime } from '../src/modules/workspace/observe.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { BranchIntents } from '../src/modules/workspace/branch-intent.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
@@ -1570,11 +1571,13 @@ test("a direct root moved beside directories spelled in another case or form pla
   const answer = (m: WorkspaceModule) => call(m, 'read', { path: 'ref/inner/file.txt' });
 
   // Repointed to `cafe`, `CAFE` is another directory: the level holding
-  // both tells case apart, read from `cafe`'s own name, so `inner` is ref's.
+  // both tells case apart, read from `cafe`'s own name, so `inner` is ref's,
+  // where the filesystem's change times are trusted; elsewhere that level
+  // tells nothing, so `inner` may be `upper`'s, as a start there says too.
   rmSync(link);
   symlinkSync(join(env.root, 'cafe'), link);
   const own = await answer(moved);
-  assert.equal(own.success, true, String(own.error));
+  assert.equal(own.success, await filesystemTrustsCtime(env.root), String(own.error));
   assert.deepEqual(own, await answer(await new Env(t).open(...mounts)));
 
   // Repointed to `café` with a precomposed accent, `nfd`'s root is in the
