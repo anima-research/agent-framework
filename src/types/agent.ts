@@ -228,15 +228,33 @@ export interface AgentConfig {
     /**
      * Whether this agent's model binds its signed thinking to the
      * conversation before it, as the host knows from its own model records.
-     * Set, each compile the agent sends tells the context manager so
-     * (`thinkingBinding`, with `dropBlock` as set here), with digests of what
-     * the request carries ahead of its messages (`identity`: the system text
-     * with its system-position injections, the tools in the order sent, the
-     * model, and the thinking config, `maxTokens` and `providerParams`). A
-     * context manager that keeps a record of what a branch sent can then
-     * leave out thinking whose earlier conversation changed before the
-     * provider sees it. Default false: compiles are as they were, with
-     * neither.
+     * A context manager that keeps a record of what each branch sent can
+     * then leave out thinking whose earlier conversation changed before the
+     * provider sees it. Set:
+     * - each compile the agent sends tells the context manager so
+     *   (`thinkingBinding`: `binds`, `dropBlock` as set here, and the agent's
+     *   name as the `participant` whose replies are its own), with digests
+     *   of what the request carries ahead of its messages (`identity`: the
+     *   system text with its system-position injections, the tools in the
+     *   order sent, the model, and the thinking config, `maxTokens` and
+     *   `providerParams`);
+     * - each framework stream tells the context manager which stored rows
+     *   its later rounds and its last reply carried as stored
+     *   (`noteRequestSent`), naming the compile it was built from, so their
+     *   thinking is kept at the next compile. The direct API
+     *   (`runInference`) notes nothing, so each of its replies' thinking is
+     *   left out at the compile after it's stored;
+     * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
+     *   starts a new stream mid-turn, since the new stream's compile can take
+     *   the turn's earlier reasoning out of the request;
+     * - where a compile reports where the branch's record began
+     *   (`thinkingRecordedAfter`), a block the provider drops though the
+     *   record says it was sent intact raises the `thinking-binding-loss`
+     *   ops alert, once per incident.
+     * A context manager without such a record ignores the compile options
+     * and has no `noteRequestSent`, so nothing is noted and nothing alerts;
+     * the budget rule above holds either way. Default false: compiles and
+     * streams are as they were.
      */
     binds?: boolean;
   };

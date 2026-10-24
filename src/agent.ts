@@ -1225,12 +1225,10 @@ export class Agent {
    * manager commits what it commits for one, the consumed watermark moves,
    * and a prepared budget change settles. To inspect what the agent would
    * see, use the framework's `previewActivation`, which compiles as a dry
-   * run. Call it only while none of this agent's requests is streaming, and
-   * use `previewActivation` while one is: a context manager that keeps a
-   * thinking-binding record checks each note against the compile that wrote
-   * the record, so after a committing compile mid-stream that stream's notes
-   * vouch for nothing, and its replies go without their thinking at the next
-   * compile. */
+   * run. It isn't told the agent's thinking binding (`thinkingBinding.binds`),
+   * so a context manager that keeps a thinking-binding record neither reads
+   * nor writes the record here, and what it returns keeps thinking whose
+   * earlier conversation changed. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
@@ -1308,9 +1306,13 @@ export class Agent {
 
   /**
    * Run inference and return result with tool calls and speech content.
-   * Updates agent state during execution. Its compile commits, so call it
-   * only while none of this agent's requests is streaming (see
-   * compileContext).
+   * Updates agent state during execution. Its compile commits. With
+   * `thinkingBinding.binds` it also writes the context manager's
+   * thinking-binding record, so then call it only while none of this agent's
+   * requests is streaming: a stream open meanwhile then has its later notes
+   * write nothing, and its replies go without their thinking at the next
+   * compile. Its own reply is never noted, so with `binds` its thinking is
+   * left out at the compile after it's stored.
    */
   async runInference(
     availableTools: ToolDefinition[],
@@ -1323,8 +1325,8 @@ export class Agent {
   /**
    * Run inference with context injections.
    * Same as runInference but passes injections through to compile. Its
-   * compile commits, as runInference's does, so call either only while none
-   * of this agent's requests is streaming (see compileContext).
+   * compile commits, and with `thinkingBinding.binds` writes the
+   * thinking-binding record, as runInference's does (see there).
    */
   async runInferenceWithInjections(
     availableTools: ToolDefinition[],
@@ -1677,17 +1679,6 @@ export class Agent {
     return { ...own, blockBinding: { prefixMismatchBehavior: 'drop_block' } };
   }
 
-  /**
-   * What a compile the agent sends tells the context manager when the model binds its thinking
-   * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
-   * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of its
-   * messages, so a changed one can stand for a first difference where the context manager keeps a
-   * thinking-binding record. The system
-   * text is the one the request will carry, built from the system-position injections given to the compile
-   * as the kv-unified prefix hash builds it; the tools are the ones it will carry, in their order; `request`
-   * covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own thinking config
-   * and `tool_choice`. Nothing without `binds`: the compile is as it was.
-   */
   /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given:
    *  where the agent's model binds its thinking and the context manager can be told (its `noteRequestSent`, from
    *  a release that keeps a thinking-binding record). */
@@ -1710,6 +1701,16 @@ export class Agent {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
+  /**
+   * What a compile the agent sends tells the context manager when the model binds its thinking
+   * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
+   * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of
+   * its messages, so a changed one can stand for a first difference where the context manager keeps a
+   * thinking-binding record. The system text is the one the request will carry, built from the system-position
+   * injections given to the compile as the kv-unified prefix hash builds it; the tools are the ones it will carry, in
+   * their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
+   * thinking config and `tool_choice`. Nothing without `binds`: the compile is as it was.
+   */
   private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
     if (!thinkingBinding) return {};
