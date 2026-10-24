@@ -23,7 +23,7 @@ const reply = (...sequences: number[]): PlacedDrop =>
   ({ kind: 'reply', bodies: sequences.map((sequence, i) => ({ messageId: `m${sequence}-${i}`, sequence })), entry: entry() });
 
 describe('splitThinkingDrops', () => {
-  it('expects a drop only in a reply stored at or below the record\'s start, every shard of it', () => {
+  it('expects a drop in a reply stored at or below the record\'s start, every body of it, and no other of a binding the record tracks', () => {
     const round: PlacedDrop = { kind: 'round', round: 1, entry: entry() };
     const unplaced: PlacedDrop = { kind: 'unplaced', entry: entry() };
     const { expected, unexpected } = splitThinkingDrops([reply(3), reply(5), reply(6), reply(5, 6), round, unplaced], 5);
@@ -92,8 +92,12 @@ const final = (input: number, dropped: ThinkingBindingEntry[] | null) => {
 };
 
 /** One turn of an agent whose stored earlier reply carries a signed block, with the compile's record start set
- *  `relative` to that reply's sequence (or left out), and the stream's calls dropping it as `drops` says. */
-async function turn(relative: number | undefined, drops: (at: { message: number; block: number }) => Array<ThinkingBindingEntry[] | null>) {
+ *  `relative` to that reply's sequence (or left out), and the stream's calls dropping it as `drops` says; `after`
+ *  looks at the framework once the run has ended. */
+async function turn(
+  relative: number | undefined, drops: (at: { message: number; block: number }) => Array<ThinkingBindingEntry[] | null>,
+  after?: (framework: AgentFramework) => void,
+) {
   const dir = mkdtempSync(join(tmpdir(), 'af-thinking-loss-'));
   const membrane = new ScriptedMembrane((at) => {
     const [first = [], second = [], third = []] = drops(at);
@@ -123,6 +127,7 @@ async function turn(relative: number | undefined, drops: (at: { message: number;
       return { ...result, thinkingRecordedAfter: source.bodies[0]!.sequence + relative };
     }) as typeof compile;
     await framework.runEphemeralToCompletion(agent, contextManager);
+    after?.(framework);
     assert.equal(membrane.calls.length, 1, 'one stream');
     return alerts as Array<TraceEvent & { message: string; data?: Record<string, unknown> }>;
   } finally {
@@ -145,6 +150,16 @@ describe('the operators\' alert on a framework turn', () => {
   it('alerts afresh after a call whose report shows none', async () => {
     const alerts = await turn(-1, (at) => [[dropped(at)], [], [dropped(at)]]);
     assert.equal(alerts.length, 2);
+  });
+
+  it('leaves no incident behind for a run\'s agent, which the run\'s end removes', async () => {
+    const open: boolean[] = [];
+    const alerts = await turn(-1, (at) => [[dropped(at)], [dropped(at)], [dropped(at)]], (framework) => {
+      const incidents = (framework as unknown as { thinkingLossIncidents: { alerted: Map<string, number> } }).thinkingLossIncidents;
+      open.push(incidents.alerted.has('worker'));
+    });
+    assert.equal(alerts.length, 1);
+    assert.deepEqual(open, [false], 'the agent\'s per-name state goes with it, its incident included');
   });
 
   it('alerts afresh after a call with no report at all', async () => {

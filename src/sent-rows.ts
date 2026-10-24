@@ -33,11 +33,13 @@ export function asNextRequestCarries(content: readonly ContentBlock[]): ContentB
 }
 
 /**
- * Whether membrane's native formatter sends a block of what a stream sent: it leaves out an exactly empty text block,
- * which the API refuses, unless the block carries a provider-native item (`rawItem`), which goes as that item. It
- * sends whitespace text, behind the participant's name where a multiuser conversation shows names, so a whitespace
- * block the next request's sanitize pass leaves out counts as a difference. Where the adapter's cleanup leaves it out
- * of both, as in an assistant turn, that's a needless strip rather than a row named for bytes the provider didn't see.
+ * Whether a block of what a stream sent counts in the comparison. membrane's native formatter leaves out an exactly
+ * empty text block, which the API refuses. An empty text block carrying a provider-native item (`rawItem`) it sends
+ * as that item where it's a server-tool block it knows, in an assistant turn, and leaves out otherwise; whitespace
+ * text it sends, behind the participant's name where a multiuser conversation shows names. The next request's
+ * sanitize pass leaves both out, so both count as differences. Where membrane, or the adapter's cleanup (whitespace in
+ * an assistant turn), leaves one out of both requests, that's a needless strip rather than a row named for bytes the
+ * provider didn't see.
  */
 function sentBlock(block: ContentBlock): boolean {
   if (block.type !== 'text' || block.text !== '') return true;

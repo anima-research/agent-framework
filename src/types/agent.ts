@@ -248,10 +248,12 @@ export interface AgentConfig {
      * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
      *   starts a new stream mid-turn, since the new stream's compile can take
      *   the turn's earlier reasoning out of the request;
-     * - where a compile reports where the branch's record began
-     *   (`thinkingRecordedAfter`), a block the provider drops that the
-     *   record doesn't account for raises the `thinking-binding-loss` ops
-     *   alert, once per incident and again if a call drops more.
+     * - with `dropBlock` set too, where a compile reports where the branch's
+     *   record began (`thinkingRecordedAfter`), a block the provider drops
+     *   that the record doesn't account for raises the
+     *   `thinking-binding-loss` ops alert, once per incident and again if a
+     *   call drops more. The provider reports drops only on a request that
+     *   carries the drop control; without it, such a block is refused.
      * A context manager without such a record ignores the compile options
      * and has no `noteRequestSent`, so nothing is noted and nothing alerts;
      * the budget rule above holds either way. The record and the notes

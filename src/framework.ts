@@ -13425,8 +13425,8 @@ export class AgentFramework {
       // Both compiles are dry runs: neither is sent, and the template's runs
       // while the template may be mid-stream, where a committing compile
       // would commit fold resolutions and queue the compression its fold plan
-      // calls for (and, with the thinking binding, write the binding record,
-      // so its stream's later notes would write nothing). In context-manager 0.14 a dry run leaves
+      // calls for. These compiles carry no thinking binding, so they'd write
+      // no binding record either way. In context-manager 0.14 a dry run leaves
       // nothing else behind but the release of an expired compression hold
       // (see Agent.compileWithInjections), so the template's request in
       // flight keeps its calibration estimate.
@@ -25394,10 +25394,11 @@ export class AgentFramework {
   }
 
   /**
-   * Every row so far, judged as of now (roundRows), noted. A note the context manager writes nothing for (false: the
-   * stream's compile no longer wrote the branch's record, the branch has none, or its store failed) would write
-   * nothing at any later boundary either, and one that throws is a fault, so either ends the stream's notes, with a
-   * line saying so.
+   * Every row so far, judged as of now (roundRows), noted. A note the context manager writes nothing for (false)
+   * ends the stream's notes, with a line saying so: where the stream's compile no longer wrote the branch's record, or
+   * the branch has none, no later note could write either; where its store failed, a later one might, and stopping
+   * gives that up for this stream's later rounds, whose thinking then goes at the next compile, as it would have
+   * after the failed write. A note that throws is a fault, and ends them too.
    */
   private noteStreamRows(agent: Agent, notes: StreamRequestNotes): void {
     const cm = agent.getContextManager();
@@ -25413,7 +25414,7 @@ export class AgentFramework {
       const rows = roundRows(notes.rounds, (id) => carried.get(id) ?? null);
       if (!notes.note(rows)) {
         notes.stopped = true;
-        console.error(`[thinking-binding] ${agent.name}: the context manager wrote nothing for this stream's note (its compile no longer wrote the branch's binding record, the branch has none, or the store failed), so this stream notes nothing more and its later rounds' thinking is left out at the next compile`);
+        console.error(`[thinking-binding] ${agent.name}: the context manager wrote nothing for this stream's note (its compile no longer wrote the branch's binding record, the branch has none, or the store failed), so this stream notes nothing more, and the thinking of its rounds from here is left out at the next compile`);
       }
     } catch (error) {
       notes.stopped = true;
@@ -25440,7 +25441,7 @@ export class AgentFramework {
       `the provider dropped ${count} signed thinking block${count === 1 ? '' : 's'} that the context manager's ` +
       `binding record doesn't account for (${replies.length} in stored replies after the record began at sequence ` +
       `${recordedAfter}, ${rounds.length} from the stream's own rounds, ${unplaced.length} that couldn't be placed). ` +
-      'Something ahead of them changed that the record didn\'t see, so the agent loses that reasoning, and without ' +
+      'The agent loses that reasoning, and without ' +
       'thinkingBinding.dropBlock an account that enforces the binding would have refused the request. It clears at a ' +
       'call that drops none. If it recurs, look for what changes this agent\'s requests after the compile, such as a ' +
       'membrane request hook',

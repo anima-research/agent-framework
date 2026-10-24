@@ -63,7 +63,9 @@ describe('roundRows', () => {
       { kind: 'injected', id: 'note', participant: 'user', sent: [text('A note.')] },
       { kind: 'results', id: 'results-image', sent: [{ toolUseId: 'c1', content: [text('A chart.'), image] as never, isError: false }] },
       { kind: 'injected', id: 'note-marked', participant: 'user', sent: [text('A note.')] },
-    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked'] as SentRow[]);
+      // A marker on what was sent, in its camelCase form.
+      { kind: 'injected', id: 'note', participant: 'user', sent: [{ ...text('A note.'), cacheControl: { type: 'ephemeral' } } as never] },
+    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked', 'note'] as SentRow[]);
   });
 
   it('marks a row the next request carries otherwise, or doesn\'t carry, or the store doesn\'t hold', () => {
