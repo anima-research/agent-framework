@@ -850,7 +850,8 @@ class McpConfigurationRefusal extends Error {
 
 /** The reply helpers an MCPL connection hands an inbound request's handler. */
 type InboundResponder = {
-  id: string | number;
+  /** The request's id: null for a request that the server sent with id null. */
+  id: string | number | null;
   respond: (result: unknown) => void;
   respondError: (code: number, message: string, data?: unknown) => void;
 };
@@ -28074,7 +28075,7 @@ export class AgentFramework {
     onRequest('inference-request', async (
       params: McplInferenceRequestParams,
       responder?: {
-        id: string | number;
+        id: string | number | null;
         respond: (result: unknown) => void;
         respondError: (code: number, message: string) => void;
         sendChunk?: (chunk: InferenceChunkParams) => void;
