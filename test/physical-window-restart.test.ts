@@ -55,40 +55,19 @@ class QueuedStreamsMembrane extends MockMembrane {
   }
 }
 
-/** A tool whose result is the blocks given: an image, as an MCP image block
- *  or as an embedded resource's image blob, and whatever a test puts beside
- *  it. */
-class ImageToolModule implements Module {
-  readonly name = 'canned';
-  constructor(private readonly blocks: unknown[]) {}
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getTools(): ToolDefinition[] {
-    return [{ name: 'fetch', description: 'image', inputSchema: { type: 'object', properties: {} } }];
-  }
-  async handleToolCall(): Promise<ToolResult> {
-    return { success: true, data: this.blocks, dataIsContent: true };
-  }
-  async onProcess(event: ProcessEvent): Promise<EventResponse> {
-    if (event.type === 'external-message') {
-      return {
-        addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
-        requestInference: true,
-      };
-    }
-    return {};
-  }
-}
-
+/** A tool whose result is the data given: by default a 30,000-character
+ *  blob, or the blocks of a content array, such as an image beside what a
+ *  test puts there. */
 class BlobToolModule implements Module {
   readonly name = 'canned';
+  constructor(private readonly result: Pick<ToolResult, 'data' | 'dataIsContent'> = { data: { blob: 'x'.repeat(30_000) } }) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
-    return { success: true, data: { blob: 'x'.repeat(30_000) } };
+    return { success: true, ...this.result };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
     if (event.type === 'external-message') {
@@ -465,7 +444,7 @@ describe('physical-window mid-turn restart (issue #92)', () => {
           round(null, { inputTokens: 21_000, cacheReadTokens: 300_000, outputTokens: 2_500 }),
         ],
         afterRestart,
-      ], new ImageToolModule(blocks));
+      ], new BlobToolModule({ data: blocks, dataIsContent: true }));
       try {
         assert.ok(t.done, 'the turn should finish');
         assert.strictEqual(t.restarts.length, 1);
