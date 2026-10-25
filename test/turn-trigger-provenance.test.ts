@@ -1220,10 +1220,10 @@ describe('private wins, one way', () => {
       assert.deepEqual(posted, [ROOM], "the outcome is the operator's notice, posted where it was asked");
       return rig.routed.slice(before);
     };
-    const acrossRestart = async (before: (rig: Rig) => Promise<void>, after: (rig: Rig) => Promise<void>, firstRun: { quietSources?: string[] } = {}) => {
+    const acrossRestart = async (before: (rig: Rig) => Promise<void>, after: (rig: Rig) => Promise<void>) => {
       const storeDir = mkdtempSync(join(tmpdir(), 'surface-restart-test-'));
       try {
-        const first = await surfaceRig({ storeDir, ...firstRun });
+        const first = await surfaceRig({ storeDir });
         try { await before(first); } finally { await first.close(); }
         const second = await surfaceRig({ storeDir });
         try { await after(second); } finally { await second.close(); }
@@ -1322,37 +1322,6 @@ describe('private wins, one way', () => {
       });
     }
 
-    it("a channel turn whose checkpoint can't be marked private when it takes in private input keeps its later speech private, and finishes", async () => {
-      let framework: AgentFramework | undefined;
-      let fired = 0;
-      const tool = robot(() => {
-        (framework as unknown as { saveTurnCheckpoints(): void }).saveTurnCheckpoints = () => { fired++; throw new Error('store unavailable'); };
-        framework!.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
-      });
-      const rig = await surfaceRig({ modules: [tool], quietSources: ['console'] });
-      framework = rig.framework;
-      const logged: string[] = [];
-      const consoleError = console.error;
-      console.error = (...parts: unknown[]) => { logged.push(parts.map(String).join(' ')); };
-      try {
-        rig.membrane.pushResponse(createMockResponse([
-          { type: 'text', text: 'on my way' },
-          { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
-        ] as never, 'tool_use'));
-        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about what you asked' }]));
-        rig.i.pendingRequests.push(roomWake());
-        await rig.until(() => rig.starts.length >= 1 && idle(rig) && rig.texts().includes('about what you asked'), 'the turn to finish');
-        await rig.framework.runUntilIdle();
-        assert.ok(fired >= 1, 'control: the mark met the failing store');
-        assert.deepEqual(rig.routed.map((r) => r.text), ['on my way'], 'nothing after the private input reached a channel');
-        assert.ok(logged.some((line) => line.includes('store unavailable') && line.includes('a retake of that turn may read it as public')),
-          `the operator is told: ${JSON.stringify(logged)}`);
-      } finally {
-        console.error = consoleError;
-        await rig.close();
-      }
-    });
-
     it("a nudge after undoing a channel turn and the private turn before it speaks in no channel", async () => {
       const rig = await surfaceRig();
       try {
@@ -1366,31 +1335,47 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge after a redo that brings the channel turn's inputs back speaks as on main, in the fallback channel", async () => {
+    for (const step of ['an undo', 'a redo'] as const) {
+      it(`a nudge after ${step}, following a channel turn, speaks in no channel: the turn it retakes isn't known`, async () => {
+        const rig = await surfaceRig();
+        try {
+          await roomTurn(rig);
+          await roomTurn(rig);
+          assert.ok(rig.framework.undoLastTurn('scout').undone);
+          if (step === 'a redo') assert.ok(rig.framework.redo('scout').redone);
+          assert.deepEqual(await nudge(rig), []);
+        } finally {
+          await rig.close();
+        }
+      });
+    }
+
+    it("a nudge after the operator switches back to a branch that ends on a private exchange speaks in no channel", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
+        const undone = rig.framework.undoLastTurn('scout');
+        assert.ok(undone.undone && undone.fromBranch);
         await roomTurn(rig);
-        assert.ok(rig.framework.undoLastTurn('scout').undone);
-        assert.ok(rig.framework.undoLastTurn('scout').undone);
-        assert.ok(rig.framework.redo('scout').redone);
-        assert.deepEqual((await nudge(rig)).map((r) => r.locus), [LOUNGE]);
+        await rig.framework.switchBranch(undone.fromBranch!);
+        assert.deepEqual(await nudge(rig), []);
       } finally {
         await rig.close();
       }
     });
 
-    it("after a restart, a nudge and an unstick following a private turn speak in no channel", async () => {
-      await acrossRestart(privateTurn, async (rig) => {
+    it("after a restart, a nudge and an unstick following a channel turn speak in no channel: the turn they retake isn't known", async () => {
+      await acrossRestart(roomTurn, async (rig) => {
         assert.deepEqual(await nudge(rig), []);
       });
-      await acrossRestart(privateTurn, async (rig) => {
+      await acrossRestart(roomTurn, async (rig) => {
         assert.deepEqual(await unstick(rig), []);
       });
     });
 
-    it("after a restart, a nudge following a silent heartbeat tick that took in a stored private message speaks in no channel", async () => {
-      await acrossRestart(async (rig) => {
+    it("a nudge after a channel turn and a silent heartbeat tick that took in a stored private message speaks in no channel", async () => {
+      const rig = await surfaceRig({ quietSources: ['console'] });
+      try {
         await roomTurn(rig);
         rig.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
         await rig.until(() => stored(rig).includes('for your eyes only'), 'the private message stored');
@@ -1398,9 +1383,50 @@ describe('private wins, one way', () => {
         rig.i.pendingRequests.push({ agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(), suppressProse: true });
         await rig.until(() => rig.starts.length > starts && idle(rig), 'the silent tick');
         await rig.framework.runUntilIdle();
-      }, async (rig) => {
         assert.deepEqual(await nudge(rig), []);
-      }, { quietSources: ['console'] });
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a nudge parked behind an auxiliary call, while the operator undoes the channel turn before it, speaks in no channel", async () => {
+      const rig = await surfaceRig();
+      try {
+        await roomTurn(rig);
+        const gate = (rig.framework as unknown as {
+          providerGate(name: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> };
+        }).providerGate('scout');
+        gate.auxiliaryInFlight = 1;
+        const before = rig.routed.length;
+        const streams = rig.streams.length;
+        assert.ok(rig.framework.nudgeAgent('scout', 'host-console').ok);
+        await rig.until(() => gate.idleWaiters.length > 0, 'the nudge to park');
+        assert.ok(rig.framework.undoLastTurn('scout').undone, 'the operator undoes while it waits');
+        gate.auxiliaryInFlight = 0;
+        for (const resolve of gate.idleWaiters.splice(0)) resolve();
+        await rig.until(() => rig.streams.length > streams && idle(rig), 'the nudged turn to run');
+        await rig.framework.runUntilIdle();
+        assert.deepEqual(rig.routed.slice(before), []);
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a nudge merged with a channel's wake after a private turn speaks in no channel", async () => {
+      const rig = await surfaceRig();
+      try {
+        await privateTurn(rig);
+        const before = rig.routed.length;
+        const starts = rig.starts.length;
+        rig.i.pendingRequests.push(roomWake());
+        assert.ok(rig.framework.nudgeAgent('scout', 'host-console').ok);
+        await rig.until(() => rig.starts.length > starts && idle(rig), 'the merged turn');
+        await rig.framework.runUntilIdle();
+        assert.equal(rig.starts.length, starts + 1, 'control: one start took both');
+        assert.deepEqual(rig.routed.slice(before), []);
+      } finally {
+        await rig.close();
+      }
     });
   });
 

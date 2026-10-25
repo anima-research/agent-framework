@@ -1502,8 +1502,6 @@ interface TurnCheckpoint {
   sequenceBefore: number;
   branchName: string;
   timestamp: number;
-  private?: true;
-  silent?: true;
 }
 
 type DiscordAwarenessDrainOutcome =
@@ -2906,6 +2904,7 @@ export class AgentFramework {
    *  rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
   private privateInputStored: Set<string> = new Set();
+  private retakeBasis = new Map<string, number>();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
@@ -11075,6 +11074,8 @@ export class AgentFramework {
 
     this.materializeConfigMountAfterBranchSwitch();
 
+    this.retakeBasis.clear();
+
     // Push onto redo stack
     let redoStack = this.redoStacks.get(agentName);
     if (!redoStack) {
@@ -11139,6 +11140,7 @@ export class AgentFramework {
     const currentBranch = this.store.currentBranch();
 
     this.store.switchBranch(branchName);
+    this.retakeBasis.clear();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -11287,6 +11289,7 @@ export class AgentFramework {
     // arrivals during the awaited switch (see surgeryHold).
     const hold = { verb, agentName, since: Date.now() };
     this.surgeryHold = hold;
+    this.retakeBasis.clear();
     // Maintenance calls parked at a provider gate wake, find the hold and are
     // withdrawn, so the wait for running maintenance can't wait on them.
     for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -12073,7 +12076,7 @@ export class AgentFramework {
   // Turn checkpoint internals
   // ==========================================================================
 
-  private recordTurnCheckpoint(agentName: string, silent = false): void {
+  private recordTurnCheckpoint(agentName: string): void {
     const turnIndex = this.turnCounters.get(agentName) ?? 0;
     this.turnCounters.set(agentName, turnIndex + 1);
 
@@ -12083,7 +12086,6 @@ export class AgentFramework {
       sequenceBefore: this.store.currentSequence(),
       branchName: this.store.currentBranch().name,
       timestamp: Date.now(),
-      ...(silent ? { silent: true as const } : {}),
     };
 
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -12097,18 +12099,6 @@ export class AgentFramework {
     this.saveTurnCheckpoints(agentName, checkpoints);
   }
 
-  private markCheckpointPrivate(agentName: string): void {
-    try {
-      const checkpoints = this.getTurnCheckpoints(agentName);
-      const newest = checkpoints.at(-1);
-      if (!newest || newest.private) return;
-      newest.private = true;
-      this.saveTurnCheckpoints(agentName, checkpoints);
-    } catch (err) {
-      console.error(`[routing] ${agentName}: couldn't mark the turn's checkpoint private (${thrownText(err)}); a retake of that turn may read it as public`);
-    }
-  }
-
   private retakeRequest(agentName: string, reason: string): InferenceRequest {
     const request: MarkedRequest = { agentName, reason, source: 'framework', timestamp: Date.now() };
     request[RETAKE] = true;
@@ -12116,10 +12106,8 @@ export class AgentFramework {
   }
 
   private retakeIsPrivate(agentName: string): boolean {
-    const counts = (c: TurnCheckpoint) => !c.silent || c.private === true;
-    const undone = this.redoStacks.get(agentName)?.at(-1)?.checkpoint;
-    const start = undone && counts(undone) ? undone : this.getTurnCheckpoints(agentName).filter(counts).at(-1);
-    return start?.private === true;
+    const turnId = this.retakeBasis.get(agentName);
+    return turnId === undefined || this.isPrivateTurn(turnId);
   }
 
   /**
@@ -12198,6 +12186,7 @@ export class AgentFramework {
   private evictTurnCheckpoints(agentName: string): void {
     this.turnCounters.delete(agentName);
     this.redoStacks.delete(agentName);
+    this.retakeBasis.delete(agentName);
     // Diagnostics maps are also keyed by agent name and never evicted —
     // spawn-and-dispose fleets would grow them for the session's life.
     this.staleWarnAt.delete(agentName);
@@ -15566,8 +15555,7 @@ export class AgentFramework {
         this.autoContinueStreaks?.delete(agentName);
       }
       const turnIsPrivate = requests.some((r) => r.nonChannelOrigin === true
-        || callerTurnsOf(r).some((id) => this.isPrivateTurn(id))
-        || ((r as MarkedRequest)[RETAKE] === true && this.retakeIsPrivate(agentName)));
+        || callerTurnsOf(r).some((id) => this.isPrivateTurn(id)));
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -17054,7 +17042,7 @@ export class AgentFramework {
     delete routing.locus;
     delete routing.pin;
     delete routing.triggerChannel;
-    if (!wasPrivate) this.markCheckpointPrivate(agent.name);
+    if (silent) this.retakeBasis.delete(agent.name);
     if (wasPrivate || silent) return undefined;
     const notice = this.storePrivateTurnNotice(agent);
     if (notice) console.error(`[routing] ${agent.name}: private input made the turn private (${had ? qualifiedChannelName(had) : 'no destination'} -> none)`);
@@ -19115,10 +19103,13 @@ export class AgentFramework {
       trigger = own;
     }
 
+    if (attempt === 0 && trigger && (trigger as MarkedRequest)[RETAKE] && trigger.nonChannelOrigin !== true && this.retakeIsPrivate(agent.name)) {
+      trigger = { ...trigger, channelId: undefined, channelServerId: undefined, addressed: false, nonChannelOrigin: true };
+    }
+
     // Record turn checkpoint before inference (only on first attempt, not retries)
-    const checkpointed = attempt === 0 && trigger?.reason !== 'tool_result_guard_retry';
-    if (checkpointed) {
-      this.recordTurnCheckpoint(agent.name, trigger?.suppressProse === true);
+    if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
+      this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 
@@ -19200,6 +19191,8 @@ export class AgentFramework {
     if (opensTurn) {
       routing.nonChannelOrigin = trigger?.nonChannelOrigin === true || privateInput;
       if (routing.nonChannelOrigin) this.notePrivateTurn(routing.turnId);
+      if (!trigger?.suppressProse) this.retakeBasis.set(agent.name, routing.turnId);
+      else if (routing.nonChannelOrigin) this.retakeBasis.delete(agent.name);
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, with its server, and none for a heartbeat
       // / no-trigger turn, which falls back to the global default rather
@@ -19261,7 +19254,6 @@ export class AgentFramework {
         if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
       }
     }
-    if (checkpointed && routing.nonChannelOrigin) this.markCheckpointPrivate(agent.name);
     const wakeChannels = (trigger as MarkedRequest | undefined)?.[WAKE_CHANNELS];
     if (routing.nonChannelOrigin && wakeChannels && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
       this.noticeChannelMessages(agent, routing, wakeChannels);
