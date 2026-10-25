@@ -7,13 +7,15 @@ import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { carriedBlock, type SentRow } from './sent-rows.js';
 import { injectionsAsStored } from './text-as-stored.js';
+import { scanFromTail } from './stored-removal.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   SYSTEM_CHANGE_PARTICIPANT,
   declarationDifference,
   effectiveDeclaration,
   endsOnUnansweredCalls,
-  endsOnToolCall,
+  changeWriteCheck,
+  type TailRow,
   isSystemChangeMessage,
   lastConversational,
   memoryHeadDeclarations,
@@ -110,6 +112,7 @@ export interface StartStreamResult {
    *  model binds its thinking and the context manager keeps a record it can be told of. */
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
 }
+import { jsonTokenEstimator } from '@animalabs/context-manager';
 import type {
   ContextManager,
   TokenBudget,
@@ -1647,19 +1650,29 @@ export class Agent {
       first = await compile(compiledWith);
     } catch (error) {
       // The changes this agent keeps may be what no longer fits: a compile
-      // refused over budget with change rows kept moves the head to what's
-      // current, taking them, and compiles once more (a forced move by the
-      // budget). If that compile is refused too, the changes weren't the
-      // cause, and the error goes on as before. Never in a dry run.
-      if (!entries || options.dryRun || recorded === null || (error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
-      const current = this.currentHead(availableTools, prospectiveSystemInjections);
+      // refused over budget with change rows of its own kept takes them out
+      // and compiles once more. On the head, whose requests leave them out,
+      // that's the removal settleHead makes after a compile. Under 'entries'
+      // the head moves to what's current, taking them: with a record, a move
+      // forced by the budget; without one, settleHead's adoption. If that
+      // compile is refused too, the error goes on and the move stands: the
+      // rows are gone and the head is current, as after any move. Never in a
+      // dry run.
+      if (options.dryRun || (error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
       const removed = this.removeOwnChanges();
       if (removed === 0) throw error;
-      this.headDeclarations.write(this.name, copyHead(current));
-      this.onHeadEvent?.({ type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' });
-      recorded = current;
-      compiledWith = current;
-      first = await compile(current);
+      if (!entries) {
+        this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });
+      } else {
+        const current = this.currentHead(availableTools, prospectiveSystemInjections);
+        this.headDeclarations.write(this.name, copyHead(current));
+        this.onHeadEvent?.(recorded
+          ? { type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' }
+          : { type: 'head:moved', why: 'adopted', changesRemoved: removed });
+        recorded = current;
+        compiledWith = current;
+      }
+      first = await compile(compiledWith);
     }
     const settled = await this.settleHead(
       first,
@@ -1869,13 +1882,16 @@ export class Agent {
    * store changes). */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
 
-  /** Whether the store, every agent's rows included, ends on a tool call: a
-   * change appended now would stand between the call and its result
-   * (endsOnToolCall), so it waits for the result. */
-  private storeEndsOnToolCall(): boolean {
+  /** Whether a change written now would stand between a call and its
+   * result, which context-manager refuses (changeWriteCheck): read from the
+   * store's tail, every agent's rows included, in blob-free windows, as far
+   * as the rule reads. Then the change waits for the result. */
+  private changeWouldSplitCall(): boolean {
     const cm = this.contextManager as Partial<ContextManager>;
-    if (typeof cm.getAllMessages !== 'function') return false;
-    return endsOnToolCall(cm.getAllMessages() as unknown as readonly { content: readonly ContentBlock[] }[]);
+    if (typeof cm.getMessageCount !== 'function' || typeof cm.getMessageWindow !== 'function') return false;
+    const check = changeWriteCheck();
+    scanFromTail(cm as Pick<ContextManager, 'getMessageCount' | 'getMessageWindow'>, (row) => check.visit(row as unknown as TailRow));
+    return check.splits();
   }
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
@@ -2243,14 +2259,17 @@ export class Agent {
    * committing compile (system-changes.ts). It reads only the agent's own
    * change rows (ownSystemChanges): one a host stored without the agent's
    * metadata is neither folded onto the head nor consolidated. On the head,
-   * what's current goes out, and a record or changes left from an earlier
-   * 'entries' period go.
+   * what's current goes out, and changes left from an earlier 'entries'
+   * period go, and so does its record where the store can read it (one it
+   * can't read stays until a read succeeds).
    * Under 'entries': with no record, the current head is adopted; a
    * replacement of system text moves the head to what's current; a
-   * difference a change can say is declared at the end, unless the context
-   * ends on calls still waiting for their results, which a change mustn't
-   * separate from them; then it waits for the next assembly. A dry run
-   * computes the same and stores nothing.
+   * difference a change can say is declared at the end, unless the agent's
+   * own last calls are still waiting for their results, or a change written
+   * now would stand between any call and its result (changeWouldSplitCall);
+   * then it waits for the next assembly. A dry run computes the same and
+   * stores nothing, except that a dry compile has no `firstChanged`, so it
+   * shows a consolidation only once one is forced, never a free one.
    */
   private async settleHead(
     compiled: CompileResult,
@@ -2282,20 +2301,26 @@ export class Agent {
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, current, 'replaced', dryRun, compile);
     const consolidation = this.consolidation(compiled, own, blocks);
     if (consolidation) return this.moveHead(compiled, compiledWith, current, 'consolidated', dryRun, compile, consolidation);
-    if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.storeEndsOnToolCall()) {
+    if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.changeWouldSplitCall()) {
       return { compiled, head: recorded };
     }
     const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
-    if (!dryRun) {
-      this.contextManager.addMessage(declared.participant, declared.content, systemChangeMetadata(this.name) as never);
-      this.onHeadEvent?.({
-        type: 'head:declared',
-        removed: difference.block.removeTools ?? [],
-        defined: (difference.block.defineTools ?? []).map((tool) => tool.name),
-        addedSystem: difference.block.addSystem?.length ?? 0,
-      });
-    }
-    return { compiled, head: recorded, declared };
+    if (dryRun) return { compiled, head: recorded, declared };
+    this.contextManager.addMessage(declared.participant, declared.content, systemChangeMetadata(this.name) as never);
+    this.onHeadEvent?.({
+      type: 'head:declared',
+      removed: difference.block.removeTools ?? [],
+      defined: (difference.block.defineTools ?? []).map((tool) => tool.name),
+      addedSystem: difference.block.addSystem?.length ?? 0,
+    });
+    // The compile runs again, so the request carries the change as the
+    // compile renders it, and context-manager's last committing compile, which
+    // the next one's `firstChanged` compares with, and its thinking-binding
+    // record both hold it: the next compile then reads the change as already
+    // sent, not as rewritten from there. Refused over budget, its error goes
+    // on with the change stored, and the next assembly's compile, refused with
+    // it kept, takes it into the head.
+    return { compiled: await compile(recorded), head: recorded };
   }
 
   /**
@@ -2322,7 +2347,10 @@ export class Agent {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
       const own = ownSystemChanges(shown, this.name);
-      return { compiled: { ...shown, messages: shown.messages.filter((_, index) => !own.has(index)) }, head: current };
+      const kept = (_: unknown, index: number) => !own.has(index);
+      // Its sources stay index for index with its messages.
+      const provenance = shown.provenance && { ...shown.provenance, messages: shown.provenance.messages.filter(kept) };
+      return { compiled: { ...shown, messages: shown.messages.filter(kept), ...(provenance ? { provenance } : {}) }, head: current };
     }
     const removed = this.removeOwnChanges();
     this.headDeclarations.write(this.name, copyHead(current));
@@ -2334,8 +2362,8 @@ export class Agent {
   /**
    * Whether this compile is where the agent's own changes (`own`, from
    * ownSystemChanges) go into the head, and if so, their price and the input
-   * they reached a share of. Once the changes, priced
-   * from their JSON as context-manager prices them, reach a tenth of the last
+   * they reached a share of. Once the changes, priced from their JSON as
+   * context-manager prices a change (jsonTokenEstimator), reach a tenth of the last
    * response's reported input, at the first committing compile whose
    * `firstChanged` (context-manager's: the first compiled message whose bytes
    * differ from the previous committing compile's) is at or before the first
@@ -2366,7 +2394,7 @@ export class Agent {
     const firstChange = own.values().next().value;
     const inputTokens = this.lastResponseInputTokens;
     if (firstChange === undefined || inputTokens === undefined) return undefined;
-    const changeTokens = blocks.reduce((sum, block) => sum + Math.ceil(JSON.stringify(block).length / 4), 0);
+    const changeTokens = blocks.reduce((sum, block) => sum + jsonTokenEstimator(JSON.stringify(block)), 0);
     if (changeTokens * 10 < inputTokens) return undefined;
     // Read only once consolidation is in question: context-manager compares
     // it when it's read.
@@ -2377,11 +2405,13 @@ export class Agent {
     return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
   }
 
-  /** Remove this agent's change rows from its context: by their metadata,
-   *  which in the residents' shared slot names the agent they declare for,
-   *  and which ownSystemChanges reads in a compile. */
+  /** Remove this agent's change rows from its context: rows holding a
+   *  change, stored with the agent's change metadata, which in the residents'
+   *  shared slot names the agent they declare for, as ownSystemChanges reads
+   *  them in a compile. */
   private removeOwnChanges(): number {
-    const rows = this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: this.name } }).messages;
+    const rows = this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: this.name } }).messages
+      .filter((row) => isSystemChangeMessage(row as { content: readonly ContentBlock[] }));
     for (const row of rows) this.contextManager.removeMessage(row.id);
     return rows.length;
   }

@@ -11,7 +11,7 @@ import type { SystemChangeContent, ToolDefinition } from '@animalabs/membrane';
 import {
   declarationDifference,
   effectiveDeclaration,
-  endsOnToolCall,
+  changeWriteCheck,
   isSystemChangeMessage,
   ownSystemChanges,
   systemChangeMetadata,
@@ -51,20 +51,22 @@ describe('system changes', () => {
         { participant: 'system', content: change('e') },
         { participant: 'system', content: change('f') },
         { participant: 'system', content: change('g') },
+        { participant: 'system', content: change('h') },
       ],
       provenance: {
-        messages: [raw('said'), raw('own'), raw('other'), raw('host'), { kind: 'summary', summaries: [{ id: 's', level: 1 }] }, raw('own', 'host'), raw('own', 'own2'), raw('unread')],
+        messages: [raw('said'), raw('own'), raw('other'), raw('host'), { kind: 'summary', summaries: [{ id: 's', level: 1 }] }, raw('own', 'host'), raw('own', 'own2'), raw('unread'), raw('named')],
       },
       rawBodies: new Map([
         ['said', [row('said', systemChangeMetadata('agent'))]],
         ['own', [row('own', systemChangeMetadata('agent'))]],
         ['own2', [row('own2', { kind: 'system-change', agent: 'agent' })]],
+        ['named', [row('named', { system: true, agent: 'agent' })]],
         ['other', [row('other', systemChangeMetadata('other'))]],
         ['host', [row('host')]],
       ]),
     } as unknown as Parameters<typeof ownSystemChanges>[0];
     assert.deepEqual([...ownSystemChanges(compiled, 'agent')], [1, 6],
-      "a change from the agent's own rows alone: not a message that isn't a change, another agent's, a host's without metadata, a summary, one with a host's row among its sources, or one whose row the compile didn't read");
+      "a change from the agent's own rows alone: not a message that isn't a change, another agent's, a host's without metadata, a summary, one with a host's row among its sources, one whose row the compile didn't read, or one whose row names the agent but isn't marked a change");
     assert.deepEqual([...ownSystemChanges(compiled, 'other')], [2]);
     assert.deepEqual([...ownSystemChanges({ messages: compiled.messages }, 'agent')], [], 'a compile that names no sources has none');
   });
@@ -159,14 +161,33 @@ describe('system changes', () => {
     assert.deepEqual(differenceFrom(head([plain]), [], head([withUndefined])), { kind: 'none' });
   });
 
-  it('finds a tool call at the end past change rows, whoever made it, and none once a message follows it', () => {
-    const call = { content: [{ type: 'tool_use', id: 'c1', name: 'a', input: {} }] } as never;
-    const change = { content: [{ type: 'system_change', defineTools: [tool('b')] }] } as never;
-    const result = { content: [{ type: 'tool_result', toolUseId: 'c1', content: 'ok' }] } as never;
-    assert.equal(endsOnToolCall([call]), true);
-    assert.equal(endsOnToolCall([call, change, change]), true, 'counting back over changes');
-    assert.equal(endsOnToolCall([call, result]), false);
-    assert.equal(endsOnToolCall([call, result, change]), false);
-    assert.equal(endsOnToolCall([]), false);
+  it("says where a change written at the end would split a call from its result, as context-manager 0.22.0's refusal reads the store", () => {
+    type Row = { content: unknown[]; bodyGroupId?: string; shardIndex?: number };
+    const call = (...ids: string[]) => ids.map((id) => ({ type: 'tool_use', id, name: 'a', input: {} }));
+    const result = (...ids: string[]) => ids.map((id) => ({ type: 'tool_result', toolUseId: id, content: 'ok' }));
+    const change = { content: [{ type: 'system_change', defineTools: [tool('b')] }] };
+    const text = (t: string) => ({ content: [{ type: 'text', text: t }] });
+    /** The check, given rows oldest first, read newest first as a tail scan gives them. */
+    const splits = (rows: Row[]) => {
+      const check = changeWriteCheck();
+      for (let i = rows.length - 1; i >= 0; i--) if (check.visit(rows[i] as never)) break;
+      return check.splits();
+    };
+    const cases: Array<[string, Row[], boolean]> = [
+      ['a call last', [text('hi'), { content: call('c1') }], true],
+      ['a call, then changes', [{ content: call('c1') }, change, change], true],
+      ['a call, its result, a change', [{ content: call('c1') }, { content: result('c1') }, change], false],
+      ['parallel calls, one answered', [{ content: call('c1', 'c2') }, { content: result('c1') }], true],
+      ['parallel calls, each answered in a message of its own', [{ content: call('c1', 'c2') }, { content: result('c2') }, { content: result('c1') }], false],
+      ['a cycle its own blocks answer', [{ content: [...call('c1'), ...result('c1')] }], false],
+      ['a cycle that leaves one call open', [{ content: [...call('c1', 'c2'), ...result('c1')] }], true],
+      ['a call on the first shard, text on the last', [text('hi'), { content: call('c1'), bodyGroupId: 'g', shardIndex: 0 }, { content: [{ type: 'text', text: 'more' }], bodyGroupId: 'g', shardIndex: 1 }], true],
+      ['a shard that starts another body', [{ content: call('c1'), bodyGroupId: 'g', shardIndex: 1 }, { content: [{ type: 'text', text: 'again' }], bodyGroupId: 'g', shardIndex: 0 }], false],
+      ['a message of another kind after the call', [{ content: call('c1') }, text('meanwhile')], false],
+      ['an older call, past the nearest one answered', [{ content: call('c0') }, { content: call('c1') }, { content: result('c1') }], false],
+      ['nothing but changes', [change], false],
+      ['nothing', [], false],
+    ];
+    for (const [what, rows, expected] of cases) assert.equal(splits(rows), expected, what);
   });
 });

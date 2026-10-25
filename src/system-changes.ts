@@ -11,7 +11,7 @@
  * part: recognising a change, folding the changes onto the head, and the
  * difference between that and what the agent advertises now.
  */
-import type { CompileResult } from '@animalabs/context-manager';
+import { continuesBody, type CompileResult } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
 
 /** What a request's head declares: its tools, and its system text as blocks,
@@ -73,12 +73,67 @@ export function endsOnUnansweredCalls(
   return false;
 }
 
-/** Whether the last message that isn't a system change holds a tool call,
- *  whoever made it. A change written there, counting back over other changes,
- *  would stand between the call and its result, where a fold can part them;
- *  in a shared slot the call can be another resident's. */
-export function endsOnToolCall(messages: readonly { content: readonly ContentBlock[] }[]): boolean {
-  return lastConversational(messages)?.content.some((block) => block.type === 'tool_use') ?? false;
+/** A stored row as a read of the store's tail gives it: its blocks, and the
+ *  body it's a shard of, if any. */
+export interface TailRow {
+  content: readonly ContentBlock[];
+  bodyGroupId?: string;
+  shardIndex?: number;
+}
+
+/**
+ * Whether a system change written at the end of the store would stand
+ * between a tool call and its result, where a fold can part them, so
+ * context-manager refuses the write. This is context-manager 0.22.0's rule
+ * for it (MessageStore.refuseToolPairSplit): back over change rows and rows
+ * of results, each body read whole across its shards, to the nearest body
+ * that holds a call. The write splits a call of that body when neither the
+ * body's own later blocks (a bundled cycle) nor a result read on the way
+ * answers it. Any other row, or the store's start, ends the walk with
+ * nothing split. In a shared slot the call can be another resident's.
+ *
+ * Give `visit` the stored rows newest first, until it returns true, when
+ * it has decided; then `splits` answers, deciding at the store's start if
+ * the rows ran out first.
+ */
+export function changeWriteCheck(): { visit(row: TailRow): boolean; splits(): boolean } {
+  let body: TailRow[] = [];
+  const answered = new Set<string>();
+  let split: boolean | undefined;
+  // Read the body in hand, in store order: true once the walk ends there.
+  const readBody = (): boolean => {
+    const content = body.flatMap((row) => row.content);
+    body = [];
+    if (content.some((block) => block.type === 'tool_use')) {
+      const open = new Map<string, boolean>();
+      for (const block of content) {
+        if (block.type === 'tool_use') open.set(block.id, true);
+        else if (block.type === 'tool_result' && open.has(block.toolUseId)) open.set(block.toolUseId, false);
+      }
+      split = [...open].some(([id, stillOpen]) => stillOpen && !answered.has(id));
+      return true;
+    }
+    if (content.some(isSystemChangeContent)) return false;
+    const results = content.flatMap((block) => (block.type === 'tool_result' ? [block.toolUseId] : []));
+    if (results.length === 0) {
+      split = false;
+      return true;
+    }
+    for (const id of results) answered.add(id);
+    return false;
+  };
+  return {
+    visit(row) {
+      if (split !== undefined) return true;
+      if (body.length > 0 && !continuesBody(row, body[0]) && readBody()) return true;
+      body.unshift(row);
+      return false;
+    },
+    splits() {
+      if (split === undefined && (body.length === 0 || !readBody())) split = false;
+      return split!;
+    },
+  };
 }
 
 /** A stored change row of another agent's: in the residents' shared slot,
@@ -161,7 +216,7 @@ export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'pro
   compiled.messages.forEach((message, index) => {
     if (!isSystemChangeMessage(message)) return;
     const source = sources?.[index];
-    if (source?.kind !== 'raw' || source.bodies.length === 0) return;
+    if (source?.kind !== 'raw') return;
     const rows = source.bodies.flatMap((body) => compiled.rawBodies?.get(body.messageId) ?? []);
     if (rows.length > 0 && rows.every((row) => isOwnChangeRow(row, agentName))) own.add(index);
   });
