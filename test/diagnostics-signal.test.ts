@@ -12,11 +12,13 @@ import { pathToFileURL } from 'node:url';
 import { AgentFramework, type Module } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
-// Node's test runner arms `--report-signal=SIGUSR2` with report-on-signal ON
-// (measured on Node 25.9; plain node has it off), so this file's real SIGUSR2
-// would write Node diagnostic reports — the full environment, values included —
-// into the cwd on every run under `npm test`. This file's signals are its own
-// to observe, not Node's to report.
+// From Node 24, `node --test` starts each test file with every option's
+// current value in its execArgv, the default `--report-signal=SIGUSR2` among
+// them, and that flag turns report-on-signal on (plain node, and Node 22's
+// runner, leave it off). Node's report handler is then an ordinary SIGUSR2
+// listener, so each dump() below (process.emit, not a real signal) would write
+// a diagnostic report, the whole environment with its values, into the cwd.
+// This file's SIGUSR2 is the framework's to observe, not Node's to report.
 if (process.report) process.report.reportOnSignal = false;
 
 function tempDir(t: import('node:test').TestContext): string {
@@ -132,6 +134,10 @@ test('a SIGUSR2 after every framework has stopped leaves the process running', a
   const index = pathToFileURL(join(import.meta.dirname, '../src/index.js')).href;
   const membrane = pathToFileURL(join(import.meta.dirname, 'helpers/mock-membrane.js')).href;
   writeFileSync(script, `
+    // First statement: NODE_OPTIONS=--report-on-signal would otherwise arm
+    // Node's own report listener here — it writes an environment dump on the
+    // kill below, and keeps the process alive, making this control vacuous.
+    process.report.reportOnSignal = false;
     import { AgentFramework } from ${JSON.stringify(index)};
     import { MockMembrane } from ${JSON.stringify(membrane)};
     const framework = await AgentFramework.create({
