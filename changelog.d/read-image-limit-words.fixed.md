@@ -1,0 +1,1 @@
+- `read_image`'s refusal of an image over 5 MB now says it's over the limit this host sends per image, where it called that a model limit: a route to a model can take a larger image. What it refuses is unchanged.

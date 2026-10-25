@@ -30555,8 +30555,11 @@ export class AgentFramework {
         if (typeof input.path !== 'string' || input.path.length === 0) {
           throw new Error('read_image: `path` (mount-prefixed) is required');
         }
-        // Anthropic rejects images >5MB (and >8000px); guard the hard byte
-        // limit here — resizing is out of scope without an image library.
+        // This host's own limit on an image it sends, for providers that
+        // enforce one; some routes take more. It's the 5 MB the standard MCP
+        // reading also holds an inline image to (NATIVE_IMAGE_MAX_BYTES in
+        // tool-result-normalize.ts). Resizing is out of scope without an
+        // image library.
         const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
         // Prefer the workspace module's own read_image handler when it exists:
         // it reads tree-first with a FILESYSTEM FALLBACK, so binaries that live
@@ -30584,7 +30587,7 @@ export class AgentFramework {
             if (byteLength > MAX_IMAGE_BYTES) {
               throw new Error(
                 `read_image: "${input.path}" is ~${byteLength} bytes — ` +
-                `over the ${MAX_IMAGE_BYTES}-byte model limit`,
+                `over the ${MAX_IMAGE_BYTES}-byte limit this host sends per image`,
               );
             }
           }
@@ -30603,7 +30606,7 @@ export class AgentFramework {
         if (read.data.byteLength > MAX_IMAGE_BYTES) {
           throw new Error(
             `read_image: "${input.path}" is ${read.data.byteLength} bytes — ` +
-            `over the ${MAX_IMAGE_BYTES}-byte model limit`,
+            `over the ${MAX_IMAGE_BYTES}-byte limit this host sends per image`,
           );
         }
         finish({
