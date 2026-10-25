@@ -58,8 +58,8 @@ export interface ActivationRequestOptions {
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
- *  them; context-manager 0.20.1 gives each compile its own, where the
- *  strategy records them, in `CompileResult.renderStats`. */
+ *  them; each compile carries its own, where the strategy records them, in
+ *  `CompileResult.renderStats`. */
 export type RenderStats = NonNullable<ReturnType<ContextManager['getRenderStats']>>;
 
 /** The render stats of the dry compile behind each request a dry run
@@ -1590,9 +1590,7 @@ export class Agent {
       compile,
     );
     let { messages } = settled.compiled;
-    // context-manager 0.20.1's field, read structurally so this compiles
-    // against 0.20.0 too, whose compiles carry none.
-    const { renderStats } = settled.compiled as typeof settled.compiled & { renderStats?: RenderStats };
+    const { renderStats } = settled.compiled;
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400

@@ -2802,9 +2802,7 @@ export class AgentFramework {
    * read-only: a change to them shows in every later read. Null for a request
    * no dry run built, a request that is sent included, and when the agent's
    * strategy records none (of context-manager's own, the autobiographical
-   * strategy and the knowledge strategy built on it do). Null too with
-   * context-manager before 0.20.1, whose compiles carry no render stats: a
-   * host that reads them moves its own context-manager to 0.20.1.
+   * strategy and the knowledge strategy built on it do).
    */
   getRequestCompileStats(request: object): RenderStats | null {
     return dryCompileStatsOf(request);

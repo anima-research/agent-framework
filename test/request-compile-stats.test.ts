@@ -3,13 +3,10 @@
  * it (`getRequestCompileStats`), so a host can show what the next request
  * would hold, by kind, without sending it (connectome-host#425). The stats
  * read back for a request are that compile's, whatever was compiled since.
- * Needs context-manager 0.20.1 or later, whose compiles carry render stats,
- * and is skipped with 0.20.0, which agent-framework's range allows; with
- * 0.20.0, the last test checks that a preview's stats are null instead.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, KnowledgeStrategy, PassthroughStrategy, type CompileResult, type ContextManager } from '@animalabs/context-manager';
@@ -48,13 +45,9 @@ async function make() {
   };
 }
 
-/** A compile's result, with context-manager 0.20.1's `renderStats` read
- *  structurally, as `agent.ts` reads it. */
-type Compiled = CompileResult & { renderStats?: unknown };
-
 /** Every result `cm.compile` returns, in order. */
-function recordResults(cm: ContextManager): Compiled[] {
-  const results: Compiled[] = [];
+function recordResults(cm: ContextManager): CompileResult[] {
+  const results: CompileResult[] = [];
   const original = cm.compile.bind(cm);
   (cm as unknown as { compile: (...args: unknown[]) => Promise<CompileResult> }).compile = async (...args: unknown[]) => {
     const result = await (original as (...a: unknown[]) => Promise<CompileResult>)(...args);
@@ -72,27 +65,7 @@ const say = (cm: ContextManager, participant: string, text: string) => cm.addMes
 const chosen = (s: NonNullable<ReturnType<AgentFramework['getRequestCompileStats']>>) =>
   ({ head: s.head, tail: s.tail, middleRaw: s.middleRaw, summaries: s.summaries, total: s.total });
 
-/** The installed context-manager's version, from its own package.json. */
-function contextManagerVersion(): string {
-  let dir = new URL('.', import.meta.resolve('@animalabs/context-manager'));
-  for (;;) {
-    const file = new URL('package.json', dir);
-    if (existsSync(file)) {
-      const pkg = JSON.parse(readFileSync(file, 'utf8')) as { name?: string; version: string };
-      if (pkg.name === '@animalabs/context-manager') return pkg.version;
-    }
-    const up = new URL('..', dir);
-    if (up.href === dir.href) throw new Error('found no package.json for @animalabs/context-manager');
-    dir = up;
-  }
-}
-
-// 0.20.0 is the one version agent-framework's range allows whose compiles
-// carry no render stats. Every other version runs these tests, so one that
-// stops carrying them fails here rather than being skipped.
-describe('the render stats of the dry compile behind a preview', {
-  skip: contextManagerVersion() === '0.20.0' ? 'needs context-manager 0.20.1, whose compiles carry render stats' : false,
-}, () => {
+describe('the render stats of the dry compile behind a preview', () => {
   it('are the ones the compile that built each request returned, and a later preview or live compile leaves an earlier request\'s alone', async () => {
     const x = await make();
     try {
@@ -188,23 +161,6 @@ describe('the render stats of the dry compile behind a preview', {
       const preview = await x.framework.previewActivation('knowing');
       assert.ok(results[0]!.renderStats, 'setup: the knowledge strategy\'s compile has stats');
       assert.equal(x.framework.getRequestCompileStats(preview), results[0]!.renderStats);
-    } finally { await x.close(); }
-  });
-});
-
-describe('the render stats behind a preview, with context-manager 0.20.0', {
-  skip: contextManagerVersion() === '0.20.0' ? false : 'runs only with context-manager 0.20.0, which CI does not install',
-}, () => {
-  it('are null, since its compiles carry none', async () => {
-    const x = await make();
-    try {
-      const cm = x.framework.getAgent('agent')!.getContextManager();
-      say(cm, 'user', 'something to compile');
-      const results = recordResults(cm);
-      const preview = await x.framework.previewActivation('agent');
-      assert.equal(results.length, 1, 'setup: the preview compiled');
-      assert.equal(results[0]!.renderStats, undefined, 'setup: the compile carries no stats');
-      assert.equal(x.framework.getRequestCompileStats(preview), null);
     } finally { await x.close(); }
   });
 });
