@@ -1444,6 +1444,34 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("a module's or server's `<prefix>--drafts` isn't the framework's drafts tool: beside it after a send, a line is held as any silenced round's is (#701)", async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('Beside the other tool.'), call('m1', 'mail--drafts', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Beside the other tool.', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a `<prefix>--drafts` resend isn't the framework's resend, so it doesn't silence its round", async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('Words for the room.'), call('m1', 'mail--drafts', { action: 'resend', draftIds: ['d-x'], destination: ROOM })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'Words for the room.']]);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('in a turn with a send, a line beside a drafts call the agent may not use is held as before: a refused call counts for nothing (#701)', async () => {
     const h = await harness();
     try {

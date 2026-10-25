@@ -280,7 +280,9 @@ const isSilencingTool = (name: string): boolean => {
  *  send, though inspecting drafts is not). */
 const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
   if (isSilencingTool(call.name)) return true;
-  return bareToolName(call.name) === 'drafts'
+  // The framework's own tool, by the exact name it's dispatched under: a
+  // module's or server's `<prefix>--drafts` is another tool.
+  return call.name === 'drafts'
     && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
 };
 
@@ -20318,7 +20320,7 @@ export class AgentFramework {
               // A refused drafts call manages nothing, so it counts for
               // nothing here either, as a refused send doesn't: its agent may
               // have no other way back to its words than the bounce.
-              const draftsRound = calls.some((c) => c.permitted && bareToolName(c.name) === 'drafts');
+              const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts');
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
