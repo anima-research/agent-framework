@@ -1275,7 +1275,7 @@ interface Arrival {
 }
 
 /** The last TurnRouting.turnId given out: ids increase, and are unique within the process. */
-let lastTurnId = Date.now() * 1000;
+let lastTurnId = 0;
 
 /** Record that a channel has been the turn's trigger or its locus (TurnRouting.wasIn). */
 function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined): void {

@@ -79,11 +79,7 @@
   message a server or module stores is now dropped, since only the framework
   writes that key. The first drop from each server is logged.
 
-- **Turn ids** (`ToolCall.callerTurnId`, `SpeechContext.turnId`) start from
-  the clock (milliseconds since the epoch, times 1,000) instead of 1, so an
-  id an earlier run of the process gave out is smaller than any a later run
-  gives, as long as the clock hasn't gone back between them. They still
-  only increase. A script's wake message deferred across a restart, such as
-  an update's, names its script's start turn from the earlier run, and the
-  next run counts that turn as private, failing closed: a public turn's
-  report deferred that way makes the start that reads it private too.
+- **A script's report deferred across a restart,** such as an update's,
+  counts as private input in the next run whichever turn started the
+  script, since that run can't know the turn: the start that reads it is
+  private, failing closed.
