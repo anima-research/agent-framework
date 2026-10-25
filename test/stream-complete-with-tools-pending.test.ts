@@ -9,6 +9,13 @@
  * before both, never between the round's tool_use and its result. (Before
  * this, the round was stored ahead of the build and its results after it, so
  * such a write landed between them.)
+ *
+ * While the results are built the round is still the agent's pending round,
+ * and the agent is `ready` with every result in. A child derived then is
+ * framed with the round and the results the agent holds: each that came in,
+ * and the error result of each call still running. (Before, framePendingRound
+ * read results only from a round waiting for its tools, so each call was
+ * framed with a note that it was still running.)
  */
 
 import { describe, it } from 'node:test';
@@ -18,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type {
+  Agent,
   ContentBlock,
   EventResponse,
   Module,
@@ -147,13 +155,17 @@ class CannedModule implements Module {
   releaseSlow(): void { this.slowDone.resolve(); }
 }
 
-/** Holds each spill write until `open()`. */
+/** Holds the first spill write, prime's, until `open()`. A later one, such
+ *  as a derived child's own copy of the same result, goes straight through. */
 function holdSpills(workspace: WorkspaceModule): { entered: Promise<void>; written: Promise<void>; open: () => void } {
   const entered = deferred();
   const released = deferred();
   const written = deferred();
   const write = workspace.writeBinary.bind(workspace);
+  let held = false;
   workspace.writeBinary = (async (...args: Parameters<typeof write>) => {
+    if (held) return write(...args);
+    held = true;
     entered.resolve();
     await released.promise;
     try {
@@ -172,51 +184,106 @@ function blocksOf(messages: unknown): string[] {
       b.type === 'text' ? `text:${b.text}` : `${b.type}:${b.id ?? b.toolUseId}`));
 }
 
+/** Each `tool_result` block in a window, by its call id. */
+function toolResultsOf(messages: Array<{ content: ContentBlock[] }>): Map<string, Extract<ContentBlock, { type: 'tool_result' }>> {
+  return new Map(messages
+    .flatMap((m) => m.content)
+    .filter((b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result')
+    .map((b) => [b.toolUseId, b]));
+}
+
+/**
+ * Prime and echo, with prime's first stream completed while `slow` runs and
+ * the spill of `fetch`'s result held: prime's round is pending and its
+ * results are being built. `finish()` lets the spill write go on and `slow`
+ * answer, and waits for both turns to end. `cleanup()` lets go of whatever
+ * is held, stops the framework and removes its store.
+ */
+async function primeCompletedWhileSpillHeld(): Promise<{
+  framework: AgentFramework;
+  prime: Agent;
+  /** Each block in prime's window, in order. */
+  blocks: () => string[];
+  finish: () => Promise<void>;
+  cleanup: () => Promise<void>;
+}> {
+  const tempDir = mkdtempSync(join(tmpdir(), 'complete-with-tools-pending-'));
+  const mountDir = join(tempDir, 'mount');
+  mkdirSync(mountDir, { recursive: true });
+  const completeWhen = deferred();
+  const module = new CannedModule();
+  const workspace = new WorkspaceModule({
+    mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }],
+  });
+  const spills = holdSpills(workspace);
+  const framework = await AgentFramework.create({
+    storePath: join(tempDir, 'store'),
+    membrane: new TwoResidentsMembrane(completeWhen.promise).asMembrane(),
+    agents: [
+      { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' },
+      { name: 'echo', model: 'test-model', systemPrompt: 'You are echo.' },
+    ],
+    modules: [module, workspace as unknown as Module],
+    syncIntervalMs: 0,
+    toolResultInlineMaxChars: 1_000,
+  });
+  workspace.initStore(framework.getStore());
+  const prime = framework.getAgent('prime')!;
+  const echo = framework.getAgent('echo')!;
+  const blocks = (): string[] => blocksOf(prime.getContextManager().queryMessages({}).messages);
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); warn(...args); };
+  const cleanup = async (): Promise<void> => {
+    console.warn = warn;
+    module.releaseSlow();
+    spills.open();
+    await within('stop() in cleanup', framework.stop()).catch(() => {});
+    rmSync(tempDir, { recursive: true, force: true });
+  };
+  try {
+    framework.start();
+    framework.pushEvent({
+      type: 'external-message', source: 'test', content: [{ type: 'text', text: 'fetch both' }],
+      metadata: {}, triggerInference: true,
+    } as unknown as ProcessEvent);
+    await waitFor("fetch's result to be in while slow runs", () => {
+      const state = prime.state;
+      return state.status === 'waiting_for_tools' && state.completed.some((c) => c.id === 'call_fetch');
+    });
+    completeWhen.resolve();
+    await within("the spill of fetch's result to start", spills.entered);
+    assert.ok(warned.some((w) => w.includes("'complete' event fired while agent 'prime' is still waiting_for_tools")),
+      'the stream completed while the round waited for slow');
+  } catch (err) {
+    await cleanup();
+    throw err;
+  }
+  return {
+    framework,
+    prime,
+    blocks,
+    finish: async () => {
+      spills.open();
+      await within('the spill write to finish', spills.written);
+      module.releaseSlow();
+      await waitFor('both turns to end', () =>
+        framework.getHostModeStatus().activeTurns === 0 && prime.state.status === 'idle' && echo.state.status === 'idle');
+    },
+    cleanup,
+  };
+}
+
 describe('a stream that completes while its tools run', () => {
   it("stores the round and its results back to back, and another resident's answer written while a result spills before both", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'complete-with-tools-pending-'));
-    const mountDir = join(tempDir, 'mount');
-    mkdirSync(mountDir, { recursive: true });
-    const completeWhen = deferred();
-    const module = new CannedModule();
-    const workspace = new WorkspaceModule({
-      mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }],
-    });
-    const spills = holdSpills(workspace);
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'store'),
-      membrane: new TwoResidentsMembrane(completeWhen.promise).asMembrane(),
-      agents: [
-        { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' },
-        { name: 'echo', model: 'test-model', systemPrompt: 'You are echo.' },
-      ],
-      modules: [module, workspace as unknown as Module],
-      syncIntervalMs: 0,
-      toolResultInlineMaxChars: 1_000,
-    });
-    workspace.initStore(framework.getStore());
-    const prime = framework.getAgent('prime')!;
-    const echo = framework.getAgent('echo')!;
-    const blocks = (): string[] => blocksOf(prime.getContextManager().queryMessages({}).messages);
-    const warned: string[] = [];
-    const warn = console.warn;
-    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); warn(...args); };
+    const run = await primeCompletedWhileSpillHeld();
+    const { framework, prime, blocks } = run;
     try {
-      framework.start();
-      framework.pushEvent({
-        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'fetch both' }],
-        metadata: {}, triggerInference: true,
-      } as unknown as ProcessEvent);
-      await waitFor("fetch's result to be in while slow runs", () => {
-        const state = prime.state;
-        return state.status === 'waiting_for_tools' && state.completed.some((c) => c.id === 'call_fetch');
-      });
-      completeWhen.resolve();
-      await within("the spill of fetch's result to start", spills.entered);
-      assert.ok(warned.some((w) => w.includes("'complete' event fired while agent 'prime' is still waiting_for_tools")),
-        'the stream completed while the round waited for slow');
-      assert.deepEqual(blocks().filter((b) => b.endsWith(':call_fetch') || b.endsWith(':call_slow')), [],
-        "neither the round nor its results are in the slot while its results are built");
+      // Neither the round nor its results are in the slot yet: the round is
+      // stored once its results are built. That is how this fix keeps the
+      // two adjacent, not the property itself, so it isn't asserted here (a
+      // fix that kept them adjacent another way would be as good). The
+      // property is checked once both turns end.
 
       // Echo's turn runs and stores its answer while prime's spill is held.
       framework.pushEvent({
@@ -225,11 +292,7 @@ describe('a stream that completes while its tools run', () => {
       } as unknown as ProcessEvent);
       await waitFor("echo's answer to be stored", () => blocks().includes('text:echo answers'));
 
-      spills.open();
-      await within('the spill write to finish', spills.written);
-      module.releaseSlow();
-      await waitFor('both turns to end', () =>
-        framework.getHostModeStatus().activeTurns === 0 && prime.state.status === 'idle' && echo.state.status === 'idle');
+      await run.finish();
 
       const all = blocks();
       const round = all.indexOf('text:Fetching both.');
@@ -242,19 +305,54 @@ describe('a stream that completes while its tools run', () => {
       assert.ok(echoed >= 0 && echoed < round,
         "echo's answer, written while the result spilled, is stored where it landed, before the round, not between the round and its results");
 
-      const results = prime.getContextManager().queryMessages({}).messages
-        .flatMap((m) => m.content)
-        .filter((b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result');
-      const slow = results.find((b) => b.toolUseId === 'call_slow');
-      assert.match(String(slow?.content), /Stream completed before tool result was received/, 'slow got the error result');
-      const fetched = results.find((b) => b.toolUseId === 'call_fetch');
-      assert.ok(String(fetched?.content).length < 5_000, "fetch's result was stored spilled, not whole");
+      const results = toolResultsOf(prime.getContextManager().queryMessages({}).messages);
+      assert.match(String(results.get('call_slow')?.content), /Stream completed before tool result was received/, 'slow got the error result');
+      assert.ok(String(results.get('call_fetch')?.content).length < 5_000, "fetch's result was stored spilled, not whole");
     } finally {
-      console.warn = warn;
-      module.releaseSlow();
-      spills.open();
-      await within('stop() in cleanup', framework.stop()).catch(() => {});
-      rmSync(tempDir, { recursive: true, force: true });
+      await run.cleanup();
+    }
+  });
+
+  it('frames the round for a child derived while its results are built with the results prime holds', async () => {
+    const run = await primeCompletedWhileSpillHeld();
+    const { framework, prime } = run;
+    let kid: Awaited<ReturnType<AgentFramework['deriveAgent']>> | undefined;
+    try {
+      assert.equal(prime.state.status, 'ready', 'prime holds every result while they are built');
+      kid = await within('the derive', framework.deriveAgent({ name: 'kid', from: 'prime' }));
+      assert.deepEqual(framework.getPendingAssistantRound('prime')?.map((b) => b.type), ['text', 'tool_use', 'tool_use'],
+        "prime's round is still pending once kid is derived: the derive ran inside the build");
+
+      const messages = kid.contextManager.queryMessages({}).messages;
+      const framed = messages.filter((m) =>
+        (m.metadata as { kind?: string } | undefined)?.kind === 'dendrite-pending-round');
+      assert.deepEqual(framed.map((m) => blocksOf([m])), [
+        ['text:Fetching both.', 'tool_use:call_fetch', 'tool_use:call_slow'],
+        ['tool_result:call_fetch', 'tool_result:call_slow'],
+      ], "kid's branch has prime's round and then its results");
+      assert.equal(messages[messages.indexOf(framed[0]!) + 1], framed[1], 'the results right after the round');
+
+      const results = toolResultsOf(framed);
+      const fetched = results.get('call_fetch')!;
+      assert.notEqual(fetched.isError, true, "fetch's result is no error");
+      assert.match(String(fetched.content), /^x{500}/, "fetch's result as prime received it");
+      assert.ok(String(fetched.content).length < 5_000, 'spilled at the cap, as prime stores it');
+      const slow = results.get('call_slow')!;
+      assert.equal(slow.isError, true, "slow's result is an error");
+      assert.match(String(slow.content), /Stream completed before tool result was received/,
+        "slow's error result, given when the stream completed");
+      assert.ok(!JSON.stringify(messages).includes('[No result yet'),
+        'no call is framed as still running: every result was in');
+
+      await run.finish();
+      assert.equal(toolResultsOf(prime.getContextManager().queryMessages({}).messages).get('call_fetch')?.content,
+        fetched.content, "kid was framed with the same copy of fetch's result that prime stored");
+    } finally {
+      try {
+        kid?.cleanup();
+      } finally {
+        await run.cleanup();
+      }
     }
   });
 });

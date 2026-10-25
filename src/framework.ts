@@ -9677,6 +9677,15 @@ export class AgentFramework {
   /**
    * The parent's in-flight tool round, reproduced on the child's branch so
    * the child sees the call that made it (see `DeriveAgentOptions.pendingRound`).
+   *
+   * The results it carries are the ones the parent holds: while the round
+   * waits for its tools, those `completed` so far; once every result is in,
+   * the `ready` state's `toolResults`. A round stays pending while a boundary
+   * builds its results for storing (the ordinary tool boundary, or a stream
+   * that completed while its tools ran, which gave each call still running
+   * an error result), and the state is `ready` then, so a derive landing in
+   * that build frames the round with its results, never with a note that a
+   * call whose result is in is still running.
    */
   private async framePendingRound(
     parent: Agent,
@@ -9691,7 +9700,9 @@ export class AgentFramework {
     const calls = pending.filter((b): b is Extract<ContentBlock, { type: 'tool_use' }> => b.type === 'tool_use');
     if (calls.length === 0) return;
     const state = parent.state;
-    const completed = state.status === 'waiting_for_tools' ? state.completed : [];
+    const completed = state.status === 'waiting_for_tools'
+      ? state.completed
+      : state.status === 'ready' ? state.toolResults : [];
     const cap = this.resolveToolResultInlineCap(parent).cap;
     const { blocks: received } = await this.buildStoredToolResultContent(options.name, completed, cap);
     const byId = new Map(received.map((b) => [(b as { toolUseId: string }).toolUseId, b]));
