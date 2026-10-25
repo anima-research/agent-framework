@@ -621,7 +621,7 @@ export interface SpeechContext {
   /**
    * True when the turn this speech ends is private: private input took part
    * in it. A handler that would publish its speech or thoughts to a channel
-   * leaves it.
+   * doesn't publish them.
    */
   nonChannelOrigin?: boolean;
 }

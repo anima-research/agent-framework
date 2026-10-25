@@ -25,12 +25,13 @@
   running reporting its end). Each goes by the turn that caused it as that
   turn stands when its start reads it, so a turn that took in private input
   after causing it counts, even after the wake was queued. An operator's
-  `nudge` or `unstick` retakes a turn, and is private when that turn was: the
-  newest turn, across a restart too, or after an `undo` in the same run, the
-  turn whose inputs the undo leaves last. A script's wake message is private
-  input, as a private surface's message is, when the script's start turn is
-  private as the message is stored or injected: a turn that reads it is
-  private, and a tool boundary that injects it makes its turn private from
+  `nudge` or `unstick` retakes a turn, and is private when that turn was, as
+  it stands when the retake starts: the newest turn, across a restart too, or
+  after an `undo` in the same run, the turn whose inputs the undo leaves last.
+  A silent heartbeat tick isn't a turn a retake takes. A script's wake message
+  is private input, as a private surface's message is, when the script's start
+  turn is private as the message is stored or injected: a turn that reads it
+  is private, and a tool boundary that injects it makes its turn private from
   there.
 
   In locus and hybrid mode, a private turn that holds a channel's message

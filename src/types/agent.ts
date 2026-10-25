@@ -274,9 +274,10 @@ export interface AgentConfig {
    * How the agent's PLAIN PROSE (non-tool output) reaches channels.
    * - 'locus' (default): host-inferred — the turn-frozen locus machinery.
    * - 'explicit': the model prefixes prose with a destination
-   *   (`>>#channel` / `>>@person` / `>>skip_reply`); unprefixed prose is never
-   *   delivered — it bounces to a clipboard for a cheap prefixed resend, except
-   *   in a private turn, which keeps it private with no draft.
+   *   (`>>#channel` / `>>@person` / `>>skip_reply`); unprefixed prose goes to
+   *   the turn's sticky destination, which a `>>` sets, and otherwise bounces
+   *   to a clipboard for a cheap prefixed resend, except in a private turn,
+   *   which keeps it private with no draft.
    *   See docs/explicit-prose-routing.md.
    * - 'hybrid': unprefixed prose keeps locus routing; `>>>destination` routes
    *   that publication envelope through the same authorized resolver.

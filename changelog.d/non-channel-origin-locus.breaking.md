@@ -4,12 +4,13 @@
   gets no inferred reply in its channel. That covers one batch, one gate
   debounce window, a private surface's message stored before the start, and
   a private turn that a channel's wake continues or that one of its tool
-  boundaries brings the message into. The turn is private. A `[routing]`
-  notice tells its resident which channels' messages the turn holds, and
-  that its plain speech reaches none of them, so the resident can answer
-  there with an explicit send, or with a `>>` or `>>>` envelope in explicit
-  or hybrid mode. Before, the turn's plain speech went to the channel, with
-  the private input in its context.
+  boundaries brings the message into. The turn is private. In locus and
+  hybrid mode, a `[routing]` notice tells its resident which channels'
+  messages the turn holds, and that its plain speech reaches none of them,
+  so the resident can answer there with an explicit send, or in hybrid mode
+  with a `>>>` envelope. In explicit and disabled mode no channel's message
+  moves where plain speech goes, so none is named. Before, the turn's plain
+  speech went to the channel, with the private input in its context.
   - **Who needs to act:** a host that counts on every addressed channel
     message getting a reply of its own, when its operators talk to the same
     agent through a private surface.

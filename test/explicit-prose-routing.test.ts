@@ -82,12 +82,6 @@ const serverOf = (channelId: string) => (channelId.startsWith('body:') ? 'body' 
 /** A stub channel, with its server. */
 const stub = (channelId: string): ChannelRef => ({ serverId: serverOf(channelId), channelId });
 
-const callerTurns = (r: object | undefined): number[] => {
-  if (!r) return [];
-  const mark = Object.getOwnPropertySymbols(r).find((k) => k.description === 'caller-turns');
-  return mark ? (r as Record<symbol, number[]>)[mark] : [];
-};
-
 /** Registry stub: two known channels (#alpha guild, laria's DM) + capture. */
 function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'unknown' | 'throw'> = []) {
   const routed: Array<{ text: string; locus: string | null }> = [];
@@ -2676,6 +2670,26 @@ describe('explicit prose routing', () => {
       }
     }
   });
+
+  for (const bouncingPrivate of [true, false]) {
+    it(`a late bounce from a ${bouncingPrivate ? 'private turn, landing while a channel turn is live, wakes a turn whose plain words stay private' : 'channel turn, landing while a private turn is live, wakes a turn that speaks as on main'}`, async () => {
+      await withHeldHybridCallback('>>>#nowhere Where does this go?', async ({ framework, routed, earlier, next, pending, release }) => {
+        const internalsOf = framework as unknown as { notePrivateTurn(turnId: number): void };
+        const base = Date.now() * 1000 + 1_000_000_000;
+        const [bouncing, live] = [earlier, next] as Array<RoutingState & { turnId?: number }>;
+        bouncing.turnId = base + 1;
+        live.turnId = base + 2;
+        const privateOne = bouncingPrivate ? bouncing : live;
+        privateOne.nonChannelOrigin = true;
+        internalsOf.notePrivateTurn(privateOne.turnId!);
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary words.' }] as ContentBlock[]));
+        release();
+        await within(pending, 'the late envelope');
+        await framework.runUntilIdle();
+        assert.equal(routed.some((r) => r.text === 'Ordinary words.'), !bouncingPrivate, JSON.stringify(routed));
+      });
+    });
+  }
 
   it("a private turn's bounce wakes a turn whose plain words stay private", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#nowhere Where does this go?' }] as ContentBlock[]));

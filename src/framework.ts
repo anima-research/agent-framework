@@ -1038,12 +1038,14 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const WAKE_CHANNELS: unique symbol = Symbol('wake-channels');
 const CALLER_TURNS: unique symbol = Symbol('caller-turns');
+const RETAKE: unique symbol = Symbol('retake');
 type WakeChannel = { channelId: string; serverId?: string };
 type MarkedRequest = InferenceRequest & {
   [TURN_RETRY]?: true;
   [MERGED_BATCH]?: InferenceRequest[];
   [WAKE_CHANNELS]?: WakeChannel[];
   [CALLER_TURNS]?: number[];
+  [RETAKE]?: true;
 };
 
 function continuesTurns(...turns: Array<number | undefined>): Partial<MarkedRequest> {
@@ -1074,6 +1076,7 @@ function carryWakes(request: InferenceRequest, others: readonly InferenceRequest
   carryWakeChannels(request, others.flatMap(wakeChannelsOf));
   const turns = [...new Set([...callerTurnsOf(request), ...others.flatMap(callerTurnsOf)])];
   if (turns.length > 0) (request as MarkedRequest)[CALLER_TURNS] = turns;
+  if (others.some((o) => (o as MarkedRequest)[RETAKE])) (request as MarkedRequest)[RETAKE] = true;
 }
 
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
@@ -1500,6 +1503,7 @@ interface TurnCheckpoint {
   branchName: string;
   timestamp: number;
   private?: true;
+  silent?: true;
 }
 
 type DiscordAwarenessDrainOutcome =
@@ -12069,7 +12073,7 @@ export class AgentFramework {
   // Turn checkpoint internals
   // ==========================================================================
 
-  private recordTurnCheckpoint(agentName: string): void {
+  private recordTurnCheckpoint(agentName: string, silent = false): void {
     const turnIndex = this.turnCounters.get(agentName) ?? 0;
     this.turnCounters.set(agentName, turnIndex + 1);
 
@@ -12079,6 +12083,7 @@ export class AgentFramework {
       sequenceBefore: this.store.currentSequence(),
       branchName: this.store.currentBranch().name,
       timestamp: Date.now(),
+      ...(silent ? { silent: true as const } : {}),
     };
 
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -12093,22 +12098,27 @@ export class AgentFramework {
   }
 
   private markCheckpointPrivate(agentName: string): void {
-    const checkpoints = this.getTurnCheckpoints(agentName);
-    const newest = checkpoints.at(-1);
-    if (!newest || newest.private) return;
-    newest.private = true;
-    this.saveTurnCheckpoints(agentName, checkpoints);
+    try {
+      const checkpoints = this.getTurnCheckpoints(agentName);
+      const newest = checkpoints.at(-1);
+      if (!newest || newest.private) return;
+      newest.private = true;
+      this.saveTurnCheckpoints(agentName, checkpoints);
+    } catch (err) {
+      console.error(`[routing] ${agentName}: couldn't mark the turn's checkpoint private (${thrownText(err)}); a retake of that turn may read it as public`);
+    }
   }
 
   private retakeRequest(agentName: string, reason: string): InferenceRequest {
-    const start = this.redoStacks.get(agentName)?.at(-1)?.checkpoint ?? this.getTurnCheckpoints(agentName).at(-1);
-    return {
-      agentName,
-      reason,
-      source: 'framework',
-      timestamp: Date.now(),
-      ...(start?.private ? { nonChannelOrigin: true } : {}),
-    };
+    const request: MarkedRequest = { agentName, reason, source: 'framework', timestamp: Date.now() };
+    request[RETAKE] = true;
+    return request;
+  }
+
+  private retakeIsPrivate(agentName: string): boolean {
+    const undone = this.redoStacks.get(agentName)?.at(-1)?.checkpoint;
+    const start = undone && !undone.silent ? undone : this.getTurnCheckpoints(agentName).filter((c) => !c.silent).at(-1);
+    return start?.private === true;
   }
 
   /**
@@ -15555,7 +15565,8 @@ export class AgentFramework {
         this.autoContinueStreaks?.delete(agentName);
       }
       const turnIsPrivate = requests.some((r) => r.nonChannelOrigin === true
-        || callerTurnsOf(r).some((id) => this.isPrivateTurn(id)));
+        || callerTurnsOf(r).some((id) => this.isPrivateTurn(id))
+        || ((r as MarkedRequest)[RETAKE] === true && this.retakeIsPrivate(agentName)));
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -17038,11 +17049,11 @@ export class AgentFramework {
     const wasPrivate = routing.nonChannelOrigin === true;
     routing.nonChannelOrigin = true;
     this.notePrivateTurn(routing.turnId);
-    if (!wasPrivate) this.markCheckpointPrivate(agent.name);
     const had = routing.locus ?? routing.pin;
     delete routing.locus;
     delete routing.pin;
     delete routing.triggerChannel;
+    if (!wasPrivate) this.markCheckpointPrivate(agent.name);
     if (wasPrivate || silent) return undefined;
     const notice = this.storePrivateTurnNotice(agent);
     if (notice) console.error(`[routing] ${agent.name}: private input made the turn private (${had ? qualifiedChannelName(had) : 'no destination'} -> none)`);
@@ -19106,7 +19117,7 @@ export class AgentFramework {
     // Record turn checkpoint before inference (only on first attempt, not retries)
     const checkpointed = attempt === 0 && trigger?.reason !== 'tool_result_guard_retry';
     if (checkpointed) {
-      this.recordTurnCheckpoint(agent.name);
+      this.recordTurnCheckpoint(agent.name, trigger?.suppressProse === true);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 
@@ -29901,11 +29912,6 @@ export class AgentFramework {
    * Dispatch a synthesized channel tool call.
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
-    // Conversation forks act only on their home channel. channel_publish and
-    // channel_close default a missing channelId to home and reject foreign
-    // ones; channel_open is rejected outright — opening channels mutates
-    // framework-global state (the open-channel set every agent's channel
-    // context is built from), which is not a fork's call to make.
     const home = this.conversationAgentHomes.get(agentName);
     const madeIn = call.callerTurnId;
     const privateTurn = call.name === 'channel_publish' && !this.scriptCallStarts.has(call.id) && (madeIn !== undefined
