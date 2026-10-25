@@ -28595,7 +28595,7 @@ export class AgentFramework {
     return this.trackOperatorOperation('mcpl:disconnect', () => this.runDisconnectMcplServer(id));
   }
 
-  private async runDisconnectMcplServer(id: string): Promise<void> {
+  private async runDisconnectMcplServer(id: string, opts: { keepToolsets?: boolean } = {}): Promise<void> {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
@@ -28648,6 +28648,7 @@ export class AgentFramework {
       // from close(), and the transient path deliberately preserves checkpoints.
       this.featureSetManager?.removeServer(id);
       this.checkpointManager?.removeServer(id);
+      if (!opts.keepToolsets) this.toolsetHub?.forget(id);
 
       // Only this server's own claims, as the prefix map holds them rather
       // than as its configuration reads now: a server connected since under
@@ -28757,7 +28758,7 @@ export class AgentFramework {
     this.restartClaims().ids.set(config.id, claim);
     this.restartClaims().prefixes.set(prefix, claim);
     try {
-      await this.runDisconnectMcplServer(id);
+      await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && config.toolHints === true });
       try {
         await this.runConnectMcplServer(config, claim);
       } catch (error) {

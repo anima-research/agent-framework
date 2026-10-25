@@ -120,6 +120,10 @@ export class ToolsetController {
     connection.setReadTap((read, epoch) => this.onRead(connection, read, epoch));
   }
 
+  release(): void {
+    if (this.connection) this.detach(this.connection);
+  }
+
   /** The server's connection is gone for good (disconnected, removed). */
   detach(connection: McplServerConnection): void {
     if (this.connection !== connection) return;
@@ -653,8 +657,11 @@ export class ToolsetHub {
     return this.controllers.get(serverId);
   }
 
-  /** A server's configuration went (removed): forget its controller. */
+  /** A server's configuration went (removed): its controller lets go of the
+   *  connection it holds, and is forgotten, so a server added later under
+   *  the same id starts from nothing. */
   forget(serverId: string): void {
+    this.controllers.get(serverId)?.release();
     this.controllers.delete(serverId);
   }
 

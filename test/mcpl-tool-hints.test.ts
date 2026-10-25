@@ -1577,3 +1577,20 @@ test('an open\'s tool change goes with its result where the agent reads it, and 
     await waitFor(() => notices(host.fw).some((x) => x.includes('[arc/build] B') && x.includes('place(x?: int) — Place a block.')), 'the agent told as a notice');
   } finally { await host.done(); }
 });
+
+test('a restart under the same id with toolHints keeps what the host told: an end told before is not told again', async () => {
+  const t = await setup((msg, _peer, state) => {
+    if (msg.method === 'toolsets/list') state.ended = [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }];
+    return false;
+  });
+  const told = () => notices(t.fw).filter((x) => x.includes('ended: the game is over')).length;
+  try {
+    await waitFor(() => told() === 1, 'the end told');
+    const lists = t.methods().filter((m) => m === 'toolsets/list').length;
+    await t.fw.framework.restartMcplServer('arc');
+    await waitFor(() => t.methods().filter((m) => m === 'toolsets/list').length > lists, 'toolsets/list after the restart');
+    await roundTrip(t);
+    await nextMacrotask();
+    assert.equal(told(), 1, 'told once, across the restart');
+  } finally { await t.done(); }
+});

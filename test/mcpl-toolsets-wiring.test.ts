@@ -358,3 +358,59 @@ test('a capability mask that names none of RFC-014\'s declarations leaves them a
     await server.close();
   }
 });
+
+test('a toolHints server removed while its reconnect is pending leaves no toolset state: a server added again under its id with hints off lists every tool', async () => {
+  const first = await hintingServer({ content: [] });
+  const fw = await connectedTo(first.server, {}, { reconnect: true, reconnectIntervalMs: 50 });
+  const second = await startScriptedServer({ advert: { featureSets: ADVERT.featureSets }, tools: [STATUS, PEEK] });
+  try {
+    assert.ok(!fw.framework.getAllTools().some((t) => t.name === 'arc--peek'), 'a dynamic tool, while hints apply');
+    await first.server.close();
+    await waitFor(() => fw.framework.listMcplServers().some((s) => s.id === 'arc' && !s.connected), 'the connection lost, its reconnect pending');
+    await fw.framework.disconnectMcplServer('arc');
+    await fw.framework.connectMcplServer({ id: 'arc', toolPrefix: 'arc', url: second.url });
+    await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'the new server\'s tools listed');
+    assert.ok(fw.framework.getAllTools().some((t) => t.name === 'arc--peek'), 'peek is listed: no toolset state of the removed server hides it');
+    assert.match(resultText(await callTool(fw.framework, 'toolsets--look', {})), /No MCPL server presents toolsets/);
+  } finally {
+    await fw.stop();
+    await second.close();
+  }
+});
+
+test('a toolHints server whose reconnect is pending, restarted with toolHints off, leaves no toolset state: every tool is listed', async () => {
+  const first = await hintingServer({ content: [] });
+  const fw = await connectedTo(first.server, {}, { reconnect: true, reconnectIntervalMs: 50 });
+  const second = await startScriptedServer({ advert: { featureSets: ADVERT.featureSets }, tools: [STATUS, PEEK] });
+  try {
+    assert.ok(!fw.framework.getAllTools().some((t) => t.name === 'arc--peek'), 'a dynamic tool, while hints apply');
+    await first.server.close();
+    await waitFor(() => fw.framework.listMcplServers().some((s) => s.id === 'arc' && !s.connected), 'the connection lost, its reconnect pending');
+    await fw.framework.restartMcplServer('arc', { id: 'arc', toolPrefix: 'arc', url: second.url, toolHints: false });
+    await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'the restarted server\'s tools listed');
+    assert.ok(fw.framework.getAllTools().some((t) => t.name === 'arc--peek'), 'peek is listed: no toolset state from before the restart hides it');
+    assert.match(resultText(await callTool(fw.framework, 'toolsets--look', {})), /No MCPL server presents toolsets/);
+  } finally {
+    await fw.stop();
+    await second.close();
+  }
+});
+
+test('a toolHints server whose reconnect is pending, restarted under another id, leaves no toolset state under the old one', async () => {
+  const first = await hintingServer({ content: [] });
+  const fw = await connectedTo(first.server, {}, { reconnect: true, reconnectIntervalMs: 50 });
+  const second = await startScriptedServer({ advert: { featureSets: ADVERT.featureSets }, tools: [STATUS, PEEK] });
+  const third = await startScriptedServer({ advert: { featureSets: ADVERT.featureSets }, tools: [STATUS, PEEK] });
+  try {
+    await first.server.close();
+    await waitFor(() => fw.framework.listMcplServers().some((s) => s.id === 'arc' && !s.connected), 'the connection lost, its reconnect pending');
+    await fw.framework.restartMcplServer('arc', { id: 'moved', toolPrefix: 'moved', url: second.url, toolHints: true });
+    await fw.framework.connectMcplServer({ id: 'arc', toolPrefix: 'arc', url: third.url });
+    await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'the server added under the old id listed');
+    assert.ok(fw.framework.getAllTools().some((t) => t.name === 'arc--peek'), 'peek is listed: no toolset state of the moved server hides it');
+  } finally {
+    await fw.stop();
+    await second.close();
+    await third.close();
+  }
+});
