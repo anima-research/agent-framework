@@ -32,6 +32,7 @@
   and which is fixed once the agent is made, so `system` text that changes
   at runtime has no provider-independent replacement (with membrane 0.7 and
   context-manager 0.22 and later, a stored `system_change` block adds system
-  text after the first user turn at or after its place, through membrane's
-  native formatter and an adapter that can send it, such as its Anthropic
-  adapter, to a model that takes mid-conversation system messages).
+  text just before the next assistant turn after its place (or at the end,
+  after a user turn), through membrane's native formatter and an adapter
+  that can send it, such as its Anthropic adapter, to a model that takes
+  mid-conversation system messages).

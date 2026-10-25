@@ -71,9 +71,9 @@
  * agent is made, so `system` text that changes at runtime has no
  * provider-independent replacement. With membrane 0.7 and context-manager
  * 0.22 and later, a stored message holding only a `system_change` block adds
- * its `addSystem` text as a system message at the first point at or after
- * its place that follows a user turn, and leaves the messages before it as
- * they were. Only membrane's native formatter sends one, through an adapter
+ * its `addSystem` text as a system message just before the first assistant
+ * turn after its place, or at the end when a user turn ends the request, and
+ * leaves the messages before it as they were. Only membrane's native formatter sends one, through an adapter
  * that declares it can (of membrane's own, the Anthropic adapter), and
  * membrane refuses the request through any other formatter or adapter. Even
  * there, membrane refuses a request with no such point, as when the change
