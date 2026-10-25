@@ -107,15 +107,23 @@ const push = (peer: ScriptedPeer, eventId: string, text: string, extra: Json = {
 test('toolHints off: the advertisement, tool list and traffic are as before', async () => {
   const t = await setup(() => false, { toolHints: undefined });
   try {
-    const hostMcpl = t.server.peer.hostCaps?.mcpl as Json;
-    assert.ok(!('toolHints' in hostMcpl), 'no toolHints advertised');
-    assert.ok(!('access' in hostMcpl), 'no access advertised');
-    assert.deepEqual(hostMcpl, (t.fw.framework as unknown as { mcplHostCapabilities: Json }).mcplHostCapabilities,
-      'the very capabilities every server is offered');
-    const names = t.fw.framework.getAllTools().map((x) => x.name);
-    for (const tool of ['status', 'play', 'place', 'dig', 'peek']) assert.ok(names.includes(`arc--${tool}`), `arc--${tool} listed as before`);
-    assert.ok(!names.some((n) => n.startsWith('toolsets--')), 'no meta-tools');
-    assert.ok(!t.methods().includes('toolsets/list'), 'no toolsets/list');
+    assert.deepEqual(t.server.peer.hostCaps?.mcpl, {
+      version: '0.5',
+      eventCoalescing: { pushEvents: true, channelsIncoming: true, deferred: true, channelScopedPush: true, retryWindowMs: 3600000 },
+      pushEvents: true,
+      contextHooks: { beforeInference: true },
+      inferenceLifecycle: true,
+      toolLifecycle: { observe: true, inputs: true },
+      inferenceRequest: { streaming: true },
+      channels: { register: true, lifecycle: true, publish: true, incoming: true, streaming: true, acknowledge: true, typing: true },
+      featureSets: true,
+    }, 'the capabilities 0.26.2 offers every server');
+    const arcTools = t.fw.framework.getAllTools().filter((x) => x.name.startsWith('arc--'))
+      .map((x) => ({ name: x.name, description: x.description, inputSchema: x.inputSchema }));
+    assert.deepEqual(arcTools, TOOLS.map((x) => ({ name: `arc--${String(x.name)}`, description: x.description, inputSchema: x.inputSchema })),
+      'every tool listed whole, in the server\'s order, as before');
+    assert.ok(!t.fw.framework.getAllTools().some((x) => x.name.startsWith('toolsets--')), 'no meta-tools');
+    assert.ok(!t.methods().some((m) => String(m).startsWith('toolsets/')), 'no toolsets/* request of any kind');
     // A tools/hints request is a method this host doesn't handle, as before.
     const answer = await t.server.peer.request('tools/hints', { rev: 1, tools: [{ name: 'peek', visible: true }] });
     assert.equal((answer.error as Json).code, -32601);

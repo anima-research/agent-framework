@@ -89,6 +89,7 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
     const text = resultText(opened);
     assert.ok(!opened.isError, text);
     assert.match(text, /\[arcade\/game:g1\] Game g1 \(13\)/);
+    assert.match(text, /board of g1: 0 moves/, 'the server\'s own content for the open');
     assert.match(text, /play\(point: string\) — Play a point on the board\./);
     assert.match(text, /toolsets--close \{server:"arcade", toolset:"game", instance:"g1"\} closes it\./);
     assert.equal(fw.framework.getAllTools().map((t) => t.name).join(','), before, 'the API tool list did not change');
@@ -143,22 +144,31 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
     assert.doesNotMatch(again, /ended: resigned/, 'each ended id is told once');
   });
 
-  it('after a reconnect, an instance the server kept is adopted, not opened again (vector 9)', async () => {
-    const opens = () => srv.received.filter((m) => m === 'toolsets/open').length;
-    const lists = () => srv.received.filter((m) => m === 'toolsets/list').length;
-    const opensBefore = opens();
-    const listsBefore = lists();
+  it('after a reconnect, an instance the server kept is neither opened again nor lost (vector 9)', async () => {
+    const count = (method: string) => srv.received.filter((m) => m === method).length;
+    const opensBefore = count('toolsets/open');
+    const connectsBefore = count('initialize');
+    const listsBefore = count('toolsets/list');
     srv.dropAll();
-    await waitFor(() => (fw.framework.listMcplServers().find((s) => s.id === 'arcade')?.connected ?? false) === false, 'the drop seen', 5000).catch(() => {});
-    await waitFor(() => fw.framework.listMcplServers().find((s) => s.id === 'arcade')?.connected === true, 'reconnected');
-    // Its toolsets/list is read after the policy settles.
-    await waitFor(() => lists() > listsBefore, 'toolsets/list after the reconnect');
-    await new Promise((r) => setTimeout(r, 200));
-    const look = resultText(await callTool(fw.framework, 'toolsets--look', { server: 'arcade' }));
-    assert.match(look, /\[arcade\/game:g1\]/, 'g1 adopted');
-    assert.equal(opens(), opensBefore, 'no toolsets/open was sent across the reconnect');
+    await waitFor(() => count('initialize') > connectsBefore, 'a new connection');
+    await waitFor(() => count('toolsets/list') > listsBefore, 'toolsets/list after the reconnect');
+    await callTool(fw.framework, 'arcade--scores', {});
     const act = await callTool(fw.framework, 'toolsets--act', { tool: 'resign', instance: 'g1', args: {} });
-    assert.ok(!act.isError, resultText(act));
+    assert.ok(!act.isError, `g1 still usable, before any look: ${resultText(act)}`);
+    assert.equal(count('toolsets/open'), opensBefore, 'no toolsets/open was sent across the reconnect');
+  });
+
+  it('an instance the server names is used as given, and opening what is open adopts it (RFC-014 §5.2)', async () => {
+    const opened = resultText(await callTool(fw.framework, 'toolsets--open', { server: 'arcade', toolset: 'game' }));
+    const name = opened.match(/\[arcade\/game:([^\]]+)\]/)?.[1];
+    assert.ok(name, `a named instance: ${opened}`);
+    const played = await callTool(fw.framework, 'toolsets--act', { tool: 'play', instance: name, args: { point: 'C3' } });
+    assert.ok(!played.isError, resultText(played));
+    assert.ok(calls.includes(`${name}:play:{"point":"C3"}`), 'the server played the instance it named');
+    const opensBefore = srv.received.filter((m) => m === 'toolsets/open').length;
+    const again = resultText(await callTool(fw.framework, 'toolsets--open', { server: 'arcade', toolset: 'game', instance: name }));
+    assert.match(again, new RegExp(`\\[arcade/game:${name}\\][^\\n]*\\(already open\\)`));
+    assert.equal(srv.received.filter((m) => m === 'toolsets/open').length, opensBefore + 1, 'one open sent, which the server adopted');
   });
 
   it('close reports what closing meant; a host\'s own close, whose result the agent may not see, is told as a notice too', async () => {
