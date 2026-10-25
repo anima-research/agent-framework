@@ -168,6 +168,36 @@ describe('toolDeclarations in the framework', () => {
     }
   });
 
+  it("raises an operator line for a move forced by the budget, and names no thinking for a model whose `binds` is false", async () => {
+    for (const [binding, clause] of [[{ binds: false }, /: one whole write$/], [undefined, /set aside if its model binds it$/]] as const) {
+      await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
+        const traces: TraceEvent[] = [];
+        framework.onTrace((event) => { traces.push(event); });
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        // Past a fifth with no free compile: the declared change is in the last committing compile, so nothing re-renders it.
+        alpha.noteResponseInput(10);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        const share = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string }[];
+        assert.equal(share.length, 1, `${JSON.stringify(binding)}: forced by its share`);
+        assert.match(share[0]!.message, clause, JSON.stringify(binding));
+      });
+    }
+    await withFramework([resident('alpha')], async (framework) => {
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
+      const alpha = framework.getAgent('alpha')!;
+      // The move the budget forces, as the agent reports it.
+      (alpha as unknown as { onHeadEvent(e: unknown): void }).onHeadEvent({ type: 'head:moved', why: 'consolidated', changesRemoved: 2, forced: 'budget' });
+      const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: Record<string, unknown> }[];
+      assert.equal(alerts.length, 1);
+      assert.match(alerts[0]!.message, /^a compile was refused over budget with 2 system changes kept, so the head took them and the compile ran again: one whole write/);
+      assert.deepEqual(alerts[0]!.data, { forced: 'budget', changesRemoved: 2 });
+    });
+  });
+
   it('leaves out the thinking a replacement of the head sets aside, with `binds: true`, and keeps it past a declared change', async () => {
     const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
     await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
@@ -243,6 +273,33 @@ describe('toolDeclarations in the framework', () => {
         for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
         assert.deepEqual([a.tools, a.messages], [b.tools, b.messages]);
+      });
+    });
+
+    it("gives the child a copy, so a change made in place to what the parent's request carries doesn't reach the child's head", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const { alpha, child } = await forked(framework, {}, { headFrom: 'alpha' }, 'alpha-child');
+        const parentRequest = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        parentRequest.tools![0]!.description = 'changed in place, as a hook might';
+        const request = await child.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools, [tool('a')], "the child's head as copied");
+      });
+    });
+
+    it("reads the parent's head once the child's context is open, the nearest point to the host's copy of the parent's messages", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, { headFrom: 'alpha' });
+        // The parent's head moves while the child's context opens.
+        const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
+        heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
+        const { agent: child } = await pending;
+        child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        const request = await child.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools, [tool('a'), tool('b')], "the parent's head as moved");
+        assert.deepEqual(changesIn(request.messages), [], 'with nothing to declare');
       });
     });
 
@@ -323,6 +380,20 @@ describe('toolDeclarations in the framework', () => {
       const left = alpha.getContextManager().getAllMessages().map((m) => (isChange(m) ? 'change' : (m.content[0] as { text: string }).text));
       assert.ok(left.includes('change'), `the change stayed: ${JSON.stringify(left)}`);
       assert.ok(!left.includes('go on'), 'the newest turn went');
+    });
+  });
+
+  it('passes over a change row a host stored without metadata in the poisoned-history shed, as it does a stamped one', async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      say(alpha, 'alpha', 'a reply');
+      say(alpha, 'user', 'go on');
+      alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('x')] } as ContentBlock]);
+      const internals = framework as unknown as { shedNewestTurn(agent: Agent): unknown };
+      internals.shedNewestTurn(alpha);
+      const left = alpha.getContextManager().getAllMessages().map((m) => (isChange(m) ? 'change' : (m.content[0] as { text: string }).text));
+      assert.deepEqual(left, ['hello', 'a reply', 'change'], 'the newest turn went, and the change stayed');
     });
   });
 
@@ -414,6 +485,50 @@ describe('toolDeclarations in the framework', () => {
         const recorded = JSON.parse(JSON.stringify(internals.headDeclarations.read('alpha')));
         assert.deepEqual(await statesWritten(internals.store, async () => internals.headDeclarations.write('alpha', recorded)), []);
         assert.deepEqual(await statesWritten(internals.store, async () => internals.headDeclarations.write('alpha', { ...recorded, system: ['other'] })), ['framework/head-declarations/alpha']);
+      });
+    });
+
+    it("reads each agent's record once a branch", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const internals = framework as unknown as Internals & { store: { createBranch(n: string, from?: string): unknown; switchBranch(n: string): unknown; currentBranch(): { name: string } } };
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        let reads = 0;
+        const get = internals.store.getStateJson.bind(internals.store);
+        internals.store.getStateJson = (id) => { if (id === 'framework/head-declarations/alpha') reads++; return get(id); };
+        try {
+          internals.headDeclarationCache = null;
+          for (let i = 0; i < 3; i++) await alpha.buildActivationRequest([tool('a')]);
+          assert.equal(reads, 1, 'once on this branch');
+          const main = internals.store.currentBranch().name;
+          internals.store.createBranch('elsewhere', main);
+          internals.store.switchBranch('elsewhere');
+          for (let i = 0; i < 2; i++) internals.headDeclarations.read('alpha');
+          assert.equal(reads, 2, 'and once on another');
+          internals.store.switchBranch(main);
+        } finally {
+          internals.store.getStateJson = get;
+        }
+      });
+    });
+
+    it("reads a branch's own record, though another branch of the same name came before it", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const internals = framework as unknown as Internals & { store: { createBranch(n: string, from?: string): unknown; switchBranch(n: string): unknown; deleteBranch(n: string): void; currentBranch(): { name: string } } };
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        const main = internals.store.currentBranch().name;
+        internals.store.createBranch('trial', main);
+        internals.store.switchBranch('trial');
+        internals.headDeclarations.write('alpha', { tools: [tool('b')], system: ['You are alpha.'] });
+        internals.store.switchBranch(main);
+        internals.store.deleteBranch('trial');
+        internals.store.createBranch('trial', main);
+        internals.store.switchBranch('trial');
+        assert.deepEqual((internals.headDeclarations.read('alpha') as { tools: ToolDefinition[] }).tools, [tool('a')], "the new branch's record, made from main's");
+        internals.store.switchBranch(main);
       });
     });
 

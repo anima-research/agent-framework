@@ -9162,11 +9162,9 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
-    let seedHead: HeadDeclaration | null = null;
-    if (options.headFrom !== undefined) {
-      const parent = this.agents.get(options.headFrom);
-      if (!parent) throw new Error(`createEphemeralAgent: headFrom names no running agent: "${options.headFrom}"`);
-      seedHead = parent.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
+    const parent = options.headFrom === undefined ? undefined : this.agents.get(options.headFrom);
+    if (options.headFrom !== undefined && !parent) {
+      throw new Error(`createEphemeralAgent: headFrom names no running agent: "${options.headFrom}"`);
     }
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
@@ -9189,6 +9187,9 @@ export class AgentFramework {
 
       const agent = new Agent(config, contextManager, this.membrane);
       const heads = memoryHeadDeclarations();
+      // The parent's head as late as it can be read, after the open, since the
+      // host copies the parent's messages once this returns.
+      const seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
       if (seedHead) heads.write(config.name, copyHead(seedHead));
       this.attachHeads(agent, heads);
       this.adoptToolResultGuard(agent);
@@ -10046,7 +10047,7 @@ export class AgentFramework {
 
   /**
    * Shed the newest turn: remove the newest message that isn't a system
-   * message, whoever wrote it, with the rest of its exchange (the tool_use
+   * message or a system change, whoever wrote it, with the rest of its exchange (the tool_use
    * turn paired with a tool result, and the whole of a body stored in
    * shards). It adds no marker; the caller keeps one consolidated marker for
    * the episode (updateRewindMarker). The returned record's descriptor says
@@ -10073,10 +10074,11 @@ export class AgentFramework {
     // `thinking` block — which the API rejects with a 400 ("thinking blocks in
     // the latest assistant message cannot be modified"). We do NOT add a marker
     // here; the caller keeps one consolidated marker (updateRewindMarker).
+    // A system change, stamped or not, isn't a turn either.
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
-      if (meta.system) continue;
+      if (meta.system || isSystemChangeMessage(all[i] as { content: readonly ContentBlock[] })) continue;
       idx = i; break;
     }
     if (idx < 0) return null;
@@ -12335,8 +12337,8 @@ export class AgentFramework {
    *  head, as on 'head', registers none; a state never registered reads as
    *  null. */
   private readonly registeredHeadStates = new Set<string>();
-  /** Each agent whose recorded head couldn't be read, on the branch named,
-   *  so that's said once a branch, though every request on the head asks. */
+  /** Each agent whose recorded head couldn't be read, on the branch by its
+   *  id, so that's said once a branch, though every request on the head asks. */
   private readonly headDeclarationsUnreadable = new Map<string, string>();
 
   private readonly headDeclarations: HeadDeclarationStore = {
@@ -12356,9 +12358,10 @@ export class AgentFramework {
     return id;
   }
 
-  /** The recorded heads read on the current branch, by agent. */
+  /** The recorded heads read on the current branch, by agent. The branch is
+   *  known by its id: a name can be used again by a branch made later. */
   private headsOnBranch(): Map<string, HeadDeclaration | null> {
-    const branch = this.store.currentBranch().name;
+    const branch = this.store.currentBranch().id;
     if (this.headDeclarationCache?.branch !== branch) this.headDeclarationCache = { branch, heads: new Map() };
     return this.headDeclarationCache.heads;
   }
@@ -12389,9 +12392,10 @@ export class AgentFramework {
   /** Record an agent's head, or with null, record none. A write that would
    *  change nothing isn't made. One that can't be stored is logged, not
    *  thrown: the request in hand is right either way. Memory keeps the head
-   *  that request went with, so the process stays consistent; the store
-   *  keeps the old one until a later write lands, and a restart or a branch
-   *  switch, which read the store again, then declares the difference once. */
+   *  that request went with, so the process stays consistent, and a later
+   *  write of that same head is skipped as changing nothing: the store keeps
+   *  the old one until a write of another head lands, or a restart or a
+   *  branch switch reads the store again and declares the difference once. */
   private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): void {
     const recorded = this.readHeadDeclaration(agentName);
     if (recorded !== undefined && JSON.stringify(recorded) === JSON.stringify(head)) return;
@@ -12454,7 +12458,7 @@ export class AgentFramework {
       if (event.type === 'head:moved' && event.forced) {
         const why = event.forced === 'budget'
           ? `a compile was refused over budget with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
-          : `the system changes reached ${event.changeTokens} tokens, a fifth of the last response's ${event.inputTokens}, with no compile that rewrote them already, so the head took them`;
+          : `the system changes reached ${event.changeTokens} tokens, a fifth of the last response's ${event.inputTokens}, and no compile had taken them into the head at no further cost, so the head took them`;
         this.opsAlert('head-consolidated', agent.name,
           `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
           { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });
