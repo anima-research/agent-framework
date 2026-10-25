@@ -45,7 +45,7 @@ const discord = (channelId: string) => ({ serverId: 'discord', channelId });
 /** Reach the private per-turn routing state (its triggering channel) + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
   return framework as unknown as {
-    turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string }; locus?: { serverId: string; channelId: string }; nonChannelOrigin?: boolean }>;
+    turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string } }>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -760,10 +760,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
   it('a WebUI turn after Discord traffic freezes null and keeps prose private', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private WebUI reply' }]));
     const framework = await makeFramework();
-    const i = internals(framework) as ReturnType<typeof internals> & {
-      turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }>;
-      channelRegistry: Record<string, unknown>;
-    };
+    const i = internals(framework) as ReturnType<typeof internals> & { channelRegistry: Record<string, unknown> };
     let resolveCalls = 0;
     let routeCalls = 0;
     i.channelRegistry = new Proxy({
@@ -779,8 +776,6 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     assert.equal(resolveCalls, 0);
     assert.equal(routeCalls, 0);
-    assert.equal(i.turnRouting.get('scout')?.locus, undefined);
-    assert.equal(i.turnRouting.get('scout')?.nonChannelOrigin, true);
     const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
     assert.ok(texts.some((t) => t.includes('[delivered] plain speech → no channel') && t.includes('kept private')));
@@ -790,18 +785,13 @@ describe('Trunk channel routing (item-3 redux)', () => {
   it('a WebUI turn overrides even a resident home channel', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private resident reply' }]));
     const framework = await makeFramework();
-    const i = internals(framework) as ReturnType<typeof internals> & {
-      turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }>;
-      channelRegistry: Record<string, unknown>;
-    };
+    const i = internals(framework) as ReturnType<typeof internals> & { channelRegistry: Record<string, unknown> };
     let resolveCalls = 0;
     i.channelRegistry = new Proxy({ resolveLocus: () => { resolveCalls++; return 'discord:guild:resident-home'; }, routeSpeech: async () => null, getDescriptor: () => undefined, startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [] }, { get: (t,p:string) => p in t ? t[p as keyof typeof t] : () => undefined }) as never;
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> }).startAgentStream(scout, { agentName:'scout', reason:'external-message', source:'tui', timestamp:Date.now(), nonChannelOrigin:true });
     await framework.runUntilIdle();
     assert.equal(resolveCalls, 0);
-    assert.equal(i.turnRouting.get('scout')?.nonChannelOrigin, true, 'control: the private turn ran');
-    assert.equal(i.turnRouting.get('scout')?.locus, undefined);
     const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
     assert.ok(texts.some((t) => t.includes('[delivered] plain speech → no channel') && t.includes('kept private')), 'and reached its speech, kept private');
@@ -883,7 +873,7 @@ describe('Residents read one message slot', () => {
 
   type Internals = {
     addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
-    turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string }; locus?: { serverId: string; channelId: string }; nonChannelOrigin?: boolean }>;
+    turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string } }>;
     activeTurnTokens: Map<string, number>;
     deferredMessages: unknown[];
     channelRegistry: unknown;

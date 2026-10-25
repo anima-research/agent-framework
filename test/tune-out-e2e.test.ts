@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, appendFileSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import type { EventResponse, Module, ProcessEvent, ProcessState } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { appendInTwoParts } from './helpers/command-file.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
@@ -234,4 +235,74 @@ describe('tune-out end to end', () => {
       homes.delete('fork-elsewhere');
     }
   });
+});
+
+/** Stores a surface's message and asks for a turn, as a console's module does. */
+class SurfaceModule implements Module {
+  readonly name = 'surface';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools() { return []; }
+  async handleToolCall() { return { success: false, error: 'no tools' }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
+  }
+}
+
+describe("the resident's turn after its own tune_out cancel", () => {
+  for (const fromPrivate of [true, false]) {
+    it(`speaks ${fromPrivate ? 'in no channel when a private turn cancelled' : 'as on main when a channel turn cancelled'}`, async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'tune-out-cancel-turn-'));
+      const statusPath = join(tempDir, 'status.jsonl');
+      const commandPath = join(tempDir, 'commands.txt');
+      writeFileSync(commandPath, '');
+      const membrane = new MockMembrane();
+      // Each stream that starts with nothing queued gets a reply of its own.
+      const streamYielding = membrane.streamYielding.bind(membrane);
+      let scoutStreams = 0;
+      membrane.streamYielding = (request, options) => {
+        const queue = membrane as unknown as { responses: unknown[]; responseIndex: number };
+        const subconscious = JSON.stringify(request).includes('You are the Subconscious');
+        if (!subconscious) scoutStreams++;
+        if (queue.responseIndex >= queue.responses.length) {
+          membrane.pushResponse(createMockResponse([{ type: 'text', text: subconscious ? 'Nothing more to report.' : `reply ${scoutStreams}` }]));
+        }
+        return streamYielding(request, options);
+      };
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+        subconscious: { enabled: true, systemPrompt: 'You are the Subconscious.' },
+        mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath } }],
+        modules: [new SurfaceModule()],
+      });
+      const publishes = () => existsSync(statusPath)
+        ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string }).filter((e) => e.event === 'publish').length
+        : 0;
+      const idle = () => framework.getAgent('scout')!.state.status === 'idle';
+      try {
+        await framework.start();
+        await waitFor(() => (internals(framework).channelRegistry?.listChannelsRaw().length ?? 0) > 0, 'channel registration');
+        appendFileSync(commandPath, 'addressed m0 hello scout\n');
+        await waitFor(() => scoutStreams >= 1 && idle(), "the channel's first turn");
+        await framework.runUntilIdle();
+        assert.equal(publishes(), 1, 'control: a channel turn speaks in the channel, which a public turn after it would take');
+        membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 't1', name: 'tune_out', input: { channelId: CHANNEL } }] as never, 'tool_use'));
+        membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 't2', name: 'tune_out', input: { channelId: CHANNEL, mode: 'cancel' } }] as never, 'tool_use'));
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+        if (fromPrivate) framework.pushEvent({ type: 'external-message', source: 'tui', content: 'tidy the noisy channel', metadata: {}, triggerInference: true } as never);
+        else appendFileSync(commandPath, 'addressed m1 scout, tidy this channel\n');
+        await waitFor(() => scoutStreams >= 3 && idle(), "the cancel's turn for the resident");
+        await framework.runUntilIdle();
+        const text = JSON.stringify(framework.getAgent('scout')!.getContextManager().getAllMessages());
+        assert.ok(text.includes('cancelled'), `control: the cancel went through: ${text.slice(-2000)}`);
+        assert.equal(publishes(), fromPrivate ? 1 : 3, `the cancelling turn's words and the next turn's: ${readFileSync(statusPath, 'utf8')}`);
+      } finally {
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  }
 });
