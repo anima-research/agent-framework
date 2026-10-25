@@ -13,12 +13,18 @@
  * And the deferred queue an earlier version left: its entries carry no
  * stamp, and are stamped when the queue is restored, so whichever flush
  * stores them stores them stamped, and one a tune-out holds is for nobody.
+ *
+ * And a write that names no agent: it is for every agent that takes
+ * untargeted inbound in the slot it lands in, so the record tells it from a
+ * write for the primary; a process response's messages are for the agents
+ * its inference request names. With one resident, nothing changes.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -51,6 +57,32 @@ class PingModule implements Module {
   }
 }
 
+/**
+ * A surface's module, as an API, TUI or workspace module answers its input:
+ * an `external-message` event's content becomes a message, with the
+ * inference request its metadata names (`ask`). It keeps its context, for a
+ * write of its own.
+ */
+class SurfaceModule implements Module {
+  readonly name = 'surface';
+  ctx!: ModuleContext;
+  async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'no tools' }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    const { content, metadata } = event as unknown as { content: ContentBlock[]; metadata: { ask?: boolean | string[] } };
+    return { addMessages: [{ participant: 'user', content }], ...(metadata.ask !== undefined ? { requestInference: metadata.ask } : {}) };
+  }
+}
+
+/** Input through the surface, asking `ask` to read it. */
+const surfaceInput = (text: string, ask?: boolean | string[]): ProcessEvent => ({
+  type: 'external-message', source: 'test', content: [{ type: 'text', text }],
+  metadata: ask === undefined ? {} : { ask },
+});
+
 const ping = (id: string) => createMockResponse([{ type: 'tool_use', id, name: 'pings--ping', input: {} }], 'tool_use');
 
 let seq = 0;
@@ -68,12 +100,14 @@ describe('the audience stamp (#291)', () => {
   let tempDir: string;
   let membrane: RoutedMembrane;
   let gates: GateModule;
+  let surface: SurfaceModule;
   let frameworks: AgentFramework[];
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'audience-stamp-'));
     membrane = new RoutedMembrane();
     gates = new GateModule();
+    surface = new SurfaceModule();
     frameworks = [];
   });
   afterEach(async () => {
@@ -94,7 +128,7 @@ describe('the audience stamp (#291)', () => {
         // both of those writers are in the slot too.
         ...(i === 0 ? { clock: { intervalMinutes: 10 }, toolResultGuard: true } : {}),
       })),
-      modules: [gates, new PingModule()],
+      modules: [gates, new PingModule(), surface],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
       ...(options.subconscious ? { subconscious: { enabled: true, systemPrompt: 'You notice.' } } : {}),
@@ -191,22 +225,19 @@ describe('the audience stamp (#291)', () => {
     }
   });
 
-  it('compiles are byte for byte what they were: the stamp is metadata only', async () => {
-    const framework = await boot();
-    framework.start();
-    membrane.script('mira', ping('call-1'), say('mira done'));
-    membrane.script('oren', say('oren here'));
-    handlePush(framework, pushEvent('hello both'));
-    await until(() => saidBy(framework, 'mira done') && saidBy(framework, 'oren here'), 'both turns');
-    await framework.runUntilIdle();
-    framework.sendAgentMessage('oren', 'mira', [{ type: 'text', text: 'a note for mira' }], { wake: false });
-    await framework.runUntilIdle();
+  /** Input through the surface, each asking whom it names to read it, each answered before the next. */
+  async function surfaceInputs(framework: AgentFramework, inputs: Array<[text: string, ask?: boolean | string[]]>): Promise<void> {
+    for (const [text, ask] of inputs) {
+      framework.pushEvent(surfaceInput(text, ask));
+      await framework.runUntilIdle();
+    }
+  }
 
+  /** mira's compile against the same rows unstamped, in a store of their own: the stamp is metadata only. */
+  async function assertCompilesAsUnstamped(framework: AgentFramework): Promise<void> {
     const stamped = framework.getAgent('mira')!.getContextManager();
     const rows = stamped.getAllMessages();
     assert.ok(rows.length >= 6 && rows.every((r) => audienceOf(r.metadata) !== undefined), 'every row is stamped');
-
-    // The same rows without the stamp, in a store of their own.
     const store = JsStore.openOrCreate({ path: join(tempDir, 'unstamped.chronicle') });
     try {
       const bare = await ContextManager.open({ store, namespace: 'agents/mira', strategy: new PassthroughStrategy() });
@@ -223,6 +254,43 @@ describe('the audience stamp (#291)', () => {
     } finally {
       store.close();
     }
+  }
+
+  it('compiles are byte for byte what they were: the stamp is metadata only', async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('mira', ping('call-1'), say('mira done'));
+    membrane.script('oren', say('oren here'));
+    handlePush(framework, pushEvent('hello both'));
+    await until(() => saidBy(framework, 'mira done') && saidBy(framework, 'oren here'), 'both turns');
+    await framework.runUntilIdle();
+    framework.sendAgentMessage('oren', 'mira', [{ type: 'text', text: 'a note for mira' }], { wake: false });
+    // Writes that name no agent, and a response's for the agent it asks to read.
+    surface.ctx.addMessage('user', [{ type: 'text', text: 'MODULE-WRITE' }]);
+    await surfaceInputs(framework, [['UNTARGETED'], ['ASKS-OREN', ['oren']]]);
+    await framework.runUntilIdle();
+    await assertCompilesAsUnstamped(framework);
+  });
+
+  it('with one resident, a write that names no agent is stamped for it, as before, and compiles are what they were', async () => {
+    // A single-resident host: the stamp of every write that names no agent
+    // is the resident, the stamp the delivery agent gave it before such a
+    // write was told from one for the primary, whatever the response asks.
+    const framework = await boot({ residents: ['mira'] });
+    framework.start();
+    membrane.script('mira', ping('call-1'), say('mira done'));
+    handlePush(framework, pushEvent('hello'));
+    await until(() => saidBy(framework, 'mira done'), 'mira\'s turn');
+    await framework.runUntilIdle();
+    surface.ctx.addMessage('user', [{ type: 'text', text: 'MODULE-WRITE' }]);
+    await surfaceInputs(framework, [['UNTARGETED'], ['ASKS-EVERYONE', true], ['ASKS-MIRA', ['mira']], ['ASKS-A-STRANGER', ['ghost']]]);
+    for (const text of ['MODULE-WRITE', 'UNTARGETED', 'ASKS-EVERYONE', 'ASKS-MIRA', 'ASKS-A-STRANGER']) {
+      assert.ok(saidBy(framework, text), `${text} is stored`);
+    }
+    const slot = rowsOf(framework, 'mira');
+    assert.deepEqual(slot.filter((r) => !isDeepStrictEqual(r.metadata?.audience, ['mira'])).map((r) => `${r.participant}: ${textOf(r)}`), [],
+      'every row is for mira, as before');
+    await assertCompilesAsUnstamped(framework);
   });
 
   it('a shared fork\'s mail from its parent is for the fork, not its own row, though it presents the parent\'s name as its own', async () => {
@@ -341,11 +409,13 @@ describe('the audience stamp (#291)', () => {
       flushForStart(agent: unknown, occasion: 'turn-start' | 'assembly'): boolean;
     };
     // Restored with the stamp this version queues a write with: for the
-    // agent it is queued for (the primary when it names none), and for
-    // nobody when a tune-out holds it. Nobody's own row.
+    // agent it is queued for; for every resident when it names none, as a
+    // write that names no agent is (this pinned ['mira'], the primary, until
+    // such a write was told from one for the primary); and for nobody when
+    // a tune-out holds it. Nobody's own row.
     assert.deepEqual(
       Object.fromEntries(internals.deferredMessages.map((m) => [m.id, audienceOf(m.metadata)])),
-      { 'old-plain': { audience: ['mira'] }, 'old-held': { audience: [] }, 'old-for-oren': { audience: ['oren'] } },
+      { 'old-plain': { audience: ['mira', 'oren'] }, 'old-held': { audience: [] }, 'old-for-oren': { audience: ['oren'] } },
     );
 
     // A turn start's flush stores what is queued for its agent straight into
@@ -355,7 +425,7 @@ describe('the audience stamp (#291)', () => {
     // meets a restored entry that resume()'s flush couldn't store.
     internals.flushForStart(framework.getAgent('mira')!, 'turn-start');
     const plain = rowNamed(framework, 'OLD-PLAIN');
-    assert.deepEqual(plain?.metadata?.audience, ['mira'], 'for the primary');
+    assert.deepEqual(plain?.metadata?.audience, ['mira', 'oren'], 'for every resident: it names no agent');
     assert.equal(plain?.metadata?.ownRowOf, undefined);
     assert.equal(plain?.metadata?.deferredWriteId, 'old-plain');
     const held = rowNamed(framework, 'OLD-HELD');
@@ -393,7 +463,8 @@ describe('the audience stamp (#291)', () => {
       proto.addMessage = real;
     }
     assert.ok(failed, 'the boot recovery tried the held entry');
-    assert.deepEqual(rowNamed(framework, 'OLD-PLAIN')?.metadata?.audience, ['mira'], 'the boot recovery stored the plain one, for the primary');
+    // For every resident, as a write that names no agent (this pinned ['mira'] before such a write was told from one for the primary).
+    assert.deepEqual(rowNamed(framework, 'OLD-PLAIN')?.metadata?.audience, ['mira', 'oren'], 'the boot recovery stored the plain one, for every resident');
     assert.equal(rowNamed(framework, 'OLD-HELD'), undefined);
     assert.equal(framework.getHostModeStatus().deferredWrites, 1, 'the held one still queued');
 
@@ -424,5 +495,65 @@ describe('the audience stamp (#291)', () => {
     const row = rowNamed(framework, 'UNSTAMPED-HELD');
     assert.deepEqual(row?.metadata?.audience, [], 'for nobody, not [\'mira\']');
     assert.deepEqual(row?.metadata?.tuneOut, { epochId: 'e1' }, 'its hold kept');
+  });
+
+  // A write that names no agent lands in the primary's store, which on a
+  // residents' host is the slot every resident reads, and was stamped for the
+  // primary alone, as a write for the primary is: the record couldn't tell
+  // them apart, and a process response's messages were stamped for the
+  // primary even when its inference request asked another agent to read
+  // them (the reviewers' af1-review probe.mjs (b)).
+  it('a write that names no agent is for every resident, and a process response\'s messages for the agents its inference request names', async () => {
+    const framework = await boot();
+    framework.start();
+    const addMessage = (framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+    }).addMessage.bind(framework);
+
+    surface.ctx.addMessage('user', [{ type: 'text', text: 'MODULE-WRITE' }]);
+    addMessage('user', [{ type: 'text', text: 'NAMES-NO-AGENT' }]);
+    addMessage('user', [{ type: 'text', text: 'FOR-MIRA' }], undefined, { forAgent: 'mira' });
+    await surfaceInputs(framework, [
+      ['UNTARGETED'],
+      ['ASKS-OREN', ['oren']],
+      ['ASKS-EVERYONE', true],
+      ['ASKS-OREN-TWICE-AND-A-STRANGER', ['oren', 'ghost', 'oren']],
+      ['ASKS-A-STRANGER', ['ghost']],
+      ['ASKS-NOBODY', []],
+    ]);
+    const audience = (text: string) => {
+      const row = rowNamed(framework, text);
+      assert.ok(row, `${text} is stored`);
+      assert.equal(row.metadata?.ownRowOf, undefined, `${text} is nobody's own row`);
+      return row.metadata?.audience;
+    };
+
+    // Named no agent: every resident that takes untargeted inbound in the slot, not the primary alone.
+    assert.deepEqual(audience('MODULE-WRITE'), ['mira', 'oren'], 'a module\'s write');
+    assert.deepEqual(audience('NAMES-NO-AGENT'), ['mira', 'oren'], 'a framework write with no forAgent');
+    assert.deepEqual(audience('UNTARGETED'), ['mira', 'oren'], 'a response that asks nobody to read it');
+    assert.deepEqual(audience('ASKS-EVERYONE'), ['mira', 'oren'], 'requestInference: true wakes every resident, and is for every one');
+    assert.deepEqual(audience('ASKS-NOBODY'), ['mira', 'oren'], 'an empty list names no agent');
+    // Named: as named, and so told apart from the writes above.
+    assert.deepEqual(audience('FOR-MIRA'), ['mira'], 'forAgent: the primary, by name');
+    assert.deepEqual(audience('ASKS-OREN'), ['oren'], 'requestInference: [oren] (it was [\'mira\'])');
+    assert.deepEqual(audience('ASKS-OREN-TWICE-AND-A-STRANGER'), ['oren'], 'the registered agents it names, once each');
+    assert.deepEqual(audience('ASKS-A-STRANGER'), ['mira'], 'none of them registered: the agent it is delivered to');
+
+    // Stored in the residents' slot all the same, and oren was woken to read his.
+    assert.deepEqual(rowsOf(framework, 'oren').map((r) => r.id), rowsOf(framework, 'mira').map((r) => r.id));
+    assert.ok(membrane.callsFor('oren').some((call) => JSON.stringify(call.messages).includes('ASKS-OREN')), 'oren read it');
+  });
+
+  it('a write that carries a tune-out\'s hold is for nobody, whomever its response asks to read it', async () => {
+    const framework = await boot();
+    const apply = (framework as unknown as {
+      applyProcessResponse(response: EventResponse, event: ProcessEvent, moduleName: string, surface: undefined, step: { at: string }): Promise<void>;
+    }).applyProcessResponse.bind(framework);
+    await apply({
+      addMessages: [{ participant: 'user', content: [{ type: 'text', text: 'HELD-ASKS-OREN' }], metadata: { tuneOut: { epochId: 'e1' }, channelId: 'c' } }],
+      requestInference: ['oren'],
+    }, surfaceInput('HELD-ASKS-OREN'), 'surface', undefined, { at: '' });
+    assert.deepEqual(rowNamed(framework, 'HELD-ASKS-OREN')?.metadata?.audience, [], 'for nobody: no resident is shown it');
   });
 });

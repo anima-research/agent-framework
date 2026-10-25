@@ -11,11 +11,25 @@
  * framework now writes that on every row it stores:
  *
  * - `metadata.audience` lists the agents the row is meant for, computed when
- *   it is written: the agent a write is delivered to, or, for an admitted
- *   inbound message, the recipients admission delivered it to. A message a
+ *   it is written: the agent a write names (`forAgent`); for an admitted
+ *   inbound message, the recipients admission delivered it to; for a
+ *   module's process response whose inference request names agents, those
+ *   of them registered. A write that names no agent (a module's write, a
+ *   process response that asks every agent or none to read) is for the
+ *   agents that take untargeted inbound and own the slot it lands in: on a
+ *   residents' host every resident, as each reads the shared slot; with one
+ *   resident that resident alone, as before. It falls back to the agent the
+ *   write is delivered to when there are none.
+ *   This is the rule #291's presentation index presents an untargeted row
+ *   in the shared slot by, applied when the row is written, so the record
+ *   tells an untargeted row from one written for the primary. A message a
  *   tune-out holds is meant for none of them, so its list is empty.
  *   Observers of a slot (the subconscious watching the residents' slot) are
- *   a relationship in the registry, not part of the list.
+ *   a relationship in the registry, not part of the list. A target is
+ *   stamped as named even where it doesn't read the slot the row lands in
+ *   (an inbound message or a response naming a worker or a conversation
+ *   fork, stored in the residents' slot): how such a row is presented is
+ *   left to the presentation index.
  * - `metadata.ownRowOf` names the agent whose own row it is: one stored by
  *   that agent's turn or act (its rounds, its tool results, a puppeted
  *   call), or by the framework for that agent's own turn (a clock row, a

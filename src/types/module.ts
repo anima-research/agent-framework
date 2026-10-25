@@ -303,7 +303,10 @@ export interface ModuleContext {
    * id, and which names the stored row once the write lands
    * (ModuleMessage.held). The writes a process held, and keeps across a
    * restart, show to the next process's modules once create() has restored
-   * them, which is after every module's start().
+   * them, which is after every module's start(). The write names no agent,
+   * so its row is stamped (`metadata.audience`, #291) for the agents that
+   * take untargeted inbound in the slot it lands in: every resident on a
+   * residents' host.
    */
   addMessage(
     participant: string,
@@ -524,7 +527,13 @@ export type AgentStatus = 'idle' | 'inferring' | 'streaming' | 'waiting_for_tool
  */
 export interface EventResponse {
   /**
-   * Messages to add to the conversation.
+   * Messages to add to the conversation. Each row says who it is for in
+   * `metadata.audience` (#291): the agents a `requestInference` list names
+   * that are registered (the agent the row is delivered to, when none of
+   * them is); for `true` or no request, as for any write that names no
+   * agent, the agents that take untargeted inbound in the slot it lands in
+   * (every resident on a residents' host). A message that carries a
+   * tune-out's hold is for nobody.
    */
   addMessages?: NewMessage[];
 

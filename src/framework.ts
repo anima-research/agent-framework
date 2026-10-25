@@ -8548,22 +8548,24 @@ export class AgentFramework {
     // released window's flushes store an entry with the metadata it was
     // queued with, straight into the store, so unstamped here it would be
     // stored unstamped after the upgrade, and read as a row stored before
-    // it. It is stamped as addMessage stamps a write it queues: for the
-    // agent it is queued for (its delivery agent when it names none), and
-    // for nobody when it carries a tune-out's hold, since no resident is
-    // shown it (inboundAudience). The entry doesn't say who stored it, so
-    // it isn't taken for anyone's own row: a puppeted pair that version
-    // queued is stamped as for its agent. An entry that has a stamp keeps
-    // it, and so does one with no agent to be for, on a host with none,
-    // where addMessage stores nothing. The queue's next write carries the
-    // stamps; until then each boot stamps the same entries the same way.
+    // it. It is stamped as addMessage stamps a write it queues
+    // (defaultAudience): for nobody when it carries a tune-out's hold,
+    // since no resident is shown it (inboundAudience); for the agent it is
+    // queued for; and, when it names none, as a write that named no agent,
+    // for the agents that take untargeted inbound in its delivery agent's
+    // slot (untargetedAudience). That version, as this one, queued a write
+    // that named an agent, the primary included, naming it, so an entry
+    // that names none was a write that named none. The entry doesn't say
+    // who stored it, so it isn't taken for anyone's own row: a puppeted
+    // pair that version queued is stamped as for its agent. An entry that
+    // has a stamp keeps it, and so does one with no agent to be for, on a
+    // host with none, where addMessage stores nothing. The queue's next
+    // write carries the stamps; until then each boot stamps the same
+    // entries the same way.
     const stamped = (m: (typeof ordered)[number]): typeof m => {
       if (audienceOf(m.metadata)) return m;
-      if (heldFromResidents(m.metadata as Record<string, unknown> | undefined)) {
-        return { ...m, metadata: withAudience(m.metadata, []) };
-      }
-      const target = m.forAgent ?? this.deliveryAgent()?.name;
-      return target === undefined ? m : { ...m, metadata: withAudience(m.metadata, [target]) };
+      const audience = this.defaultAudience(m.forAgent, m.metadata as MessageMetadata | undefined);
+      return audience === undefined ? m : { ...m, metadata: withAudience(m.metadata, audience) };
     };
     const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({ ...stamped(m), seq: i + 1 }));
     this.deferredSeq = Math.max(this.deferredSeq, restored.length);
@@ -15069,6 +15071,13 @@ export class AgentFramework {
     // surface carries where the framework records none.
     const eventChannel = (event as { metadata?: { channelId?: unknown } }).metadata?.channelId;
     const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
+    // Who the messages are for (#291's audience stamp): the agents the
+    // response's inference request names (requestedAudience). A request for
+    // every agent (`true`), or none, leaves them to addMessage, which stamps
+    // a write that names no agent for the agents that take untargeted
+    // inbound in its slot: the agents `true` wakes there. A message that
+    // carries a tune-out's hold is for nobody, whatever the request.
+    const requested = this.requestedAudience(response.requestInference);
     let added: { agent?: string; deferredId?: string } | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
@@ -15080,7 +15089,8 @@ export class AgentFramework {
         }
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
         const placement: { agent?: string; deferredId?: string } = {};
-        const id = this.addMessage(msg.participant, msg.content, metadata, { placement });
+        const audience = requested && !heldFromResidents(metadata) ? requested : undefined;
+        const id = this.addMessage(msg.participant, msg.content, metadata, { placement, ...(audience ? { audience } : {}) });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
       }
@@ -15143,6 +15153,26 @@ export class AgentFramework {
         }
       }
     }
+  }
+
+  /**
+   * Who a module's process response's messages are for when its inference
+   * request names agents (#291's audience stamp): those of them registered
+   * here, once each, in the order named, whether or not the event gate then
+   * lets their wake through; the delivery agent when it names none
+   * registered. The messages are stored where a write that names no agent
+   * is, the delivery agent's store, whoever these are: on a residents' host
+   * the shared slot every resident reads. An agent named here that doesn't
+   * read that slot is stamped all the same, as an inbound message's target
+   * is. Undefined for a request for every agent (`true`), for none, or for
+   * an empty list, which leave the stamp to addMessage (untargetedAudience).
+   */
+  private requestedAudience(requested: EventResponse['requestInference']): string[] | undefined {
+    if (!Array.isArray(requested) || requested.length === 0) return undefined;
+    const named = [...new Set(requested)].filter((name) => this.agents.has(name));
+    if (named.length > 0) return named;
+    const delivery = this.deliveryAgent();
+    return delivery ? [delivery.name] : undefined;
   }
 
   // ==========================================================================
@@ -26156,8 +26186,11 @@ export class AgentFramework {
        * Who the message is for, when that is decided before it gets here:
        * the recipients admission delivered an inbound message to, or none
        * for one a tune-out holds. Stamped on the row as `metadata.audience`
-       * (dendrite/audience.ts). Absent, the row is for its delivery agent,
-       * or for nobody when its metadata carries a tune-out's hold.
+       * (dendrite/audience.ts). Absent, the row is for nobody when its
+       * metadata carries a tune-out's hold; else for `forAgent` when the
+       * write names one; else, a write that names no agent, for the
+       * agents that take untargeted inbound in the slot it lands in
+       * (untargetedAudience): every resident on a residents' host.
        */
       audience?: readonly string[];
     }
@@ -26191,15 +26224,17 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
     // Who the row is for, written on it (#291): what the caller decided, else
-    // the agent it is delivered to, never as anyone's own row. A write that
+    // the agent the write names, never as anyone's own row. A write that
     // carries a tune-out's hold (heldFromResidents) is for nobody, whatever
     // agent's store it lands in, as an inbound message a tune-out holds is
-    // (inboundAudience): no resident is shown it. A stamp the metadata
-    // carried is replaced, as a deferredWriteId is, except on a write from
-    // the queue, which carries the stamp it was queued with.
+    // (inboundAudience): no resident is shown it. A write that names no
+    // agent is for the agents that take untargeted inbound in the slot it
+    // lands in (untargetedAudience), not for the agent it is delivered to,
+    // so the record tells it from a write for the primary. A stamp the
+    // metadata carried is replaced, as a deferredWriteId is, except on a
+    // write from the queue, which carries the stamp it was queued with.
     if (!(opts?.fromQueue && audienceOf(metadata))) {
-      const held = heldFromResidents(metadata as Record<string, unknown> | undefined);
-      metadata = withAudience(metadata, opts?.audience ?? (held ? [] : [agent.name]));
+      metadata = withAudience(metadata, opts?.audience ?? this.defaultAudience(opts?.forAgent, metadata) ?? [agent.name]);
     }
 
     // Defer non-tool_result messages while a tool cycle is mid-flight
@@ -26434,6 +26469,47 @@ export class AgentFramework {
       : this.primaryAgentName
         ? this.agents.get(this.primaryAgentName)
         : this.agents.values().next().value;
+  }
+
+  /**
+   * The audience addMessage stamps a write with when its caller gives none
+   * (#291): nobody for one that carries a tune-out's hold, since no
+   * resident is shown it (inboundAudience); the agent a write names
+   * (`forAgent`); and for a write that names no agent, untargetedAudience
+   * of the agent it is delivered to. Undefined only for that last on a
+   * host with no agent, where addMessage stores nothing. Restore stamps an
+   * entry an earlier version queued by the same rule
+   * (restorePersistedDeferredWrites).
+   */
+  private defaultAudience(forAgent: string | undefined, metadata: MessageMetadata | undefined): string[] | undefined {
+    if (heldFromResidents(metadata as Record<string, unknown> | undefined)) return [];
+    if (forAgent !== undefined) return [forAgent];
+    const delivery = this.deliveryAgent();
+    return delivery ? this.untargetedAudience(delivery) : undefined;
+  }
+
+  /**
+   * Who a write that names no agent is for (#291's audience stamp): the
+   * agents whose role takes untargeted inbound (the registry's
+   * untargetedRecipients) and whose own slot is the slot the write lands
+   * in, its delivery agent's, in registration order. On a residents' host
+   * that is every resident, as every resident reads the shared slot the
+   * row is stored in; with one resident it is that resident, the stamp such
+   * a write had before. The delivery agent alone when there is none: a host
+   * whose only agent is an ephemeral run, or an agent the registry doesn't
+   * place. This is the rule #291's presentation index presents an
+   * untargeted row in the shared slot by, applied when the row is written,
+   * so the record tells an untargeted write from one for the primary,
+   * which is stamped with the primary alone. The slot's observers (the
+   * subconscious) aren't in it: they are a relationship in the registry
+   * (dendrite/audience.ts).
+   */
+  private untargetedAudience(delivery: Agent): string[] {
+    const slot = this.registry.ownSlotOf(delivery.name);
+    const owners = slot
+      ? this.registry.untargetedRecipients().filter((name) => sameSlot(this.registry.ownSlotOf(name), slot))
+      : [];
+    return owners.length > 0 ? owners : [delivery.name];
   }
 
   /** The notes addMessage takes for a message it stored: an arrival for the
@@ -27454,7 +27530,9 @@ export class AgentFramework {
    * the framework holds is answered by its handle (heldHandle) rather than
    * '', so the module can find, read, edit and remove what it wrote before
    * the write lands. The framework's own callers keep the '' they've always
-   * had, which their traces and checks take as a write not stored yet.
+   * had, which their traces and checks take as a write not stored yet. The
+   * write names no agent, so its row is stamped for the agents that take
+   * untargeted inbound in the slot it lands in (untargetedAudience, #291).
    */
   private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata): MessageId {
     const placement: { deferredId?: string } = {};
