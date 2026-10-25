@@ -17042,7 +17042,6 @@ export class AgentFramework {
     delete routing.locus;
     delete routing.pin;
     delete routing.triggerChannel;
-    if (silent) this.retakeBasis.delete(agent.name);
     if (wasPrivate || silent) return undefined;
     const notice = this.storePrivateTurnNotice(agent);
     if (notice) console.error(`[routing] ${agent.name}: private input made the turn private (${had ? qualifiedChannelName(had) : 'no destination'} -> none)`);
@@ -19192,7 +19191,6 @@ export class AgentFramework {
       routing.nonChannelOrigin = trigger?.nonChannelOrigin === true || privateInput;
       if (routing.nonChannelOrigin) this.notePrivateTurn(routing.turnId);
       if (!trigger?.suppressProse) this.retakeBasis.set(agent.name, routing.turnId);
-      else if (routing.nonChannelOrigin) this.retakeBasis.delete(agent.name);
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, with its server, and none for a heartbeat
       // / no-trigger turn, which falls back to the global default rather
