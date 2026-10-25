@@ -22239,14 +22239,15 @@ export class AgentFramework {
   }
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+    // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
+    // denial here is a failure. It's this call's end, so it's traced here.
+    const failed = (failure: ToolResult, traced = failure.error ?? ''): ToolResult => {
+      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: traced });
+      return failure;
+    };
     if (origin.kind === 'agent') {
-      // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
-      // denial here is a failure. It's this call's end, so it's traced here.
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
-      if (failure) {
-        this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: failure.error ?? '' });
-        return failure;
-      }
+      if (failure) return failed(failure);
     }
 
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
@@ -22262,17 +22263,17 @@ export class AgentFramework {
     // where a programmatic call of that tool goes, with its instance.
     if (call.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
       const target = this.resolveToolsetAct(call);
-      if (!target.ok) return { success: false, error: target.error, isError: true };
+      if (!target.ok) return failed({ success: false, error: target.error, isError: true }, this.everyServerRedactor()(target.error));
       if (origin.kind === 'agent') {
         const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
-        if (failure) return failure;
+        if (failure) return failed(failure, this.everyServerRedactor()(failure.error ?? ''));
       }
       return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
     }
 
     // MCPL tools go where the model's own call of the name goes, by the same
     // resolver and with the prefix it matched: to the server whose listing
-    // offers the name, else the longest matching prefix.
+    // has the name, else the longest matching prefix.
     if (this.mcplServerRegistry) {
       const mcpl = this.resolveMcplTool(call.name);
       if (mcpl) return this.executeMcplToolCall(call, mcpl[0], mcpl[1]);
@@ -22366,7 +22367,7 @@ export class AgentFramework {
   private dispatchToolsetAct(agentName: string, call: ToolCall): void {
     const target = this.resolveToolsetAct(call);
     if (!target.ok) {
-      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: target.error });
+      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: this.everyServerRedactor()(target.error) });
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: TOOLSETS_MODULE,
         result: this.refusedResult(agentName, call.id, target.error),
@@ -23934,8 +23935,9 @@ export class AgentFramework {
 
   /**
    * Find the MCPL server for a tool: [serverId, prefix], or null.
-   * The tool listing decides: the server whose tools/list offered the
-   * name, after its tool policy, as of the last tool refresh (a server that
+   * The tool listing decides: the server whose tools/list listed the name
+   * (offered to the model, or an RFC-014 dynamic tool, which dispatch then
+   * refuses by that name), after its tool policy, as of the last tool refresh (a server that
    * closed since keeps its names until the next one). A name the listing
    * doesn't hold (invented by the model, or no longer listed) goes to the
    * longest matching prefix. Prefixes that meet, such as `foo` and
@@ -29923,7 +29925,7 @@ export class AgentFramework {
         'mcpl-tool-duplicate',
         serverId,
         `MCPL server "${serverId}" lists ${one ? 'the tool' : 'the tools'} ${listed} more than once. ` +
-          `The model is offered the first listing of ${one ? 'it' : 'each'}, and the rest are left out. ` +
+          `The first listing of ${one ? 'it' : 'each'} is the one used (offered to the model, or called through toolsets--act for a dynamic tool), and the rest are left out. ` +
           'A server should list each tool once, so this is for its maintainer to change.',
         { data: { tools: repeatedTools } },
       );
@@ -29932,7 +29934,9 @@ export class AgentFramework {
   }
 
   /**
-   * Report operator tool-name patterns that match no model-facing tool:
+   * Report operator tool-name patterns that match no tool name: one the
+   * model is offered, or an RFC-014 dynamic tool's listed name, which its
+   * class rules and lifecycle selectors match as a direct call's would:
    * `toolClassOverrides` keys and each server's `toolLifecycle.observe.tools`
    * / `toolLifecycle.inputs.tools`. These match `<toolPrefix>--<tool>`, and
    * the default prefix is `mcpl--<serverId>`, so a pattern written against
@@ -29981,7 +29985,7 @@ export class AgentFramework {
             && (this.mcplListedServers?.has(id) ?? false),
         };
       });
-      const names = this.modelFacingToolNames();
+      const names = this.patternableToolNames();
 
       for (const entry of pending) {
         const verdict = checkToolPattern(entry.pattern, names, servers);
@@ -30005,9 +30009,10 @@ export class AgentFramework {
 
   /** Every tool name the framework offers to anyone: the shared board plus
    *  each agent's own surface, before presentation visibility (a hidden tool
-   *  is still callable, so classes and lifecycle still apply to it). */
-  private modelFacingToolNames(): Set<string> {
-    const names = new Set(this.getAllTools().map((t) => t.name));
+   *  is still callable, so classes and lifecycle still apply to it), and
+   *  every name an MCPL server lists, a dynamic tool's included. */
+  private patternableToolNames(): Set<string> {
+    const names = new Set([...this.getAllTools().map((t) => t.name), ...(this.mcplToolServers?.keys() ?? [])]);
     for (const agent of this.agents.values()) {
       for (const tool of this.availableToolsForPresentation(agent.name)) names.add(tool.name);
     }

@@ -440,3 +440,68 @@ test('a server-chosen value the toolset host logs is redacted with the server\'s
     await server.close();
   }
 });
+
+test('a class rule naming a dynamic tool counts as matched; one naming no tool is still reported', async () => {
+  const { server } = await hintingServer({ content: [] });
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  let fw: Fw | undefined;
+  try {
+    fw = await connectedTo(server, { toolClassOverrides: { 'arc--peek': ['computer'], 'arc--nosuch': ['computer'] } });
+    await waitFor(() => logged.some((line) => line.includes('arc--nosuch')), 'the unmatched pattern reported');
+    assert.ok(!logged.some((line) => line.includes('arc--peek')), `the dynamic tool's pattern isn't reported: ${logged.filter((l) => l.includes('peek')).join(' | ')}`);
+  } finally {
+    console.error = error;
+    await fw?.stop();
+    await server.close();
+  }
+});
+
+test('a programmatic toolsets--act that is refused is traced as a failed tool call', async () => {
+  const { server } = await hintingServer({ content: [] });
+  const fw = await connectedTo(server);
+  const traces: Array<Record<string, unknown>> = [];
+  fw.framework.onTrace((event) => traces.push(event as unknown as Record<string, unknown>));
+  try {
+    const r = await callTool(fw.framework, 'toolsets--act', { server: 'arc', tool: 'nosuch' });
+    assert.ok(r.isError);
+    const failed = traces.filter((t) => t.type === 'tool:failed' && t.tool === 'toolsets--act');
+    assert.equal(failed.length, 1, 'one tool:failed trace for the act');
+    assert.match(String(failed[0]!.error), /arc has no tool "nosuch"/);
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('a refused act\'s trace carries the server\'s text redacted, from a caller in process and from the model', async () => {
+  const token = 'sekret-token-4417';
+  const pick: Json = { name: 'pick', description: 'Pick one.', inputSchema: { type: 'object', properties: { x: { enum: [token, 'b'] } }, required: ['x'] }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true } };
+  const server = await startScriptedServer({
+    advert: ADVERT,
+    tools: [STATUS, pick],
+    listRev: () => 1,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [{ name: 'pick', visible: true }] } } }); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const fw = await connectedTo(server, {}, { token });
+  const traces: Array<Record<string, unknown>> = [];
+  fw.framework.onTrace((event) => traces.push(event as unknown as Record<string, unknown>));
+  try {
+    const r = await callTool(fw.framework, 'toolsets--act', { server: 'arc', tool: 'pick', args: { x: 'c' } });
+    assert.match(resultText(r), /must be one of/);
+    await modelCalls(fw, [{ type: 'tool_use', id: 'toolu_pick', name: 'toolsets--act', input: { server: 'arc', tool: 'pick', args: { x: 'c' } } }]);
+    const failed = traces.filter((t) => t.type === 'tool:failed' && t.tool === 'toolsets--act').map((t) => String(t.error));
+    assert.equal(failed.length, 2, 'both refusals traced');
+    for (const error of failed) {
+      assert.match(error, /must be one of/);
+      assert.ok(!error.includes(token), `no credential: ${error}`);
+    }
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
