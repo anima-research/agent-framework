@@ -296,6 +296,7 @@ async function surfaceRig(opts: {
   quietSources?: string[];
   unstoredSources?: string[];
   codeExecution?: Record<string, unknown>;
+  otherAgents?: string[];
 } = {}) {
   const tempDir = opts.storeDir ?? mkdtempSync(join(tmpdir(), 'surface-edges-test-'));
   const membrane = new MockMembrane();
@@ -315,7 +316,7 @@ async function surfaceRig(opts: {
       name: 'scout', model: 'test-model', systemPrompt: 'scout',
       ...(opts.maxStreamTokens !== undefined ? { maxStreamTokens: opts.maxStreamTokens } : {}),
       ...opts.agent,
-    }],
+    }, ...(opts.otherAgents ?? []).map((name) => ({ name, model: 'test-model', systemPrompt: name }))],
     modules: [new SurfaceModule(opts.quietSources, opts.unstoredSources), ...(opts.modules ?? [])],
     ...(opts.gate ? { gate: opts.gate } : {}),
     ...(opts.codeExecution ? { codeExecution: { enabled: true, ...opts.codeExecution } } : {}),
@@ -1322,19 +1323,6 @@ describe('private wins, one way', () => {
       });
     }
 
-    it("a nudge after undoing a channel turn and the private turn before it speaks in no channel", async () => {
-      const rig = await surfaceRig();
-      try {
-        await privateTurn(rig);
-        await roomTurn(rig);
-        assert.ok(rig.framework.undoLastTurn('scout').undone);
-        assert.ok(rig.framework.undoLastTurn('scout').undone);
-        assert.deepEqual(await nudge(rig), []);
-      } finally {
-        await rig.close();
-      }
-    });
-
     for (const step of ['an undo', 'a redo'] as const) {
       it(`a nudge after ${step}, following a channel turn, speaks in no channel: the turn it retakes isn't known`, async () => {
         const rig = await surfaceRig();
@@ -1344,6 +1332,9 @@ describe('private wins, one way', () => {
           assert.ok(rig.framework.undoLastTurn('scout').undone);
           if (step === 'a redo') assert.ok(rig.framework.redo('scout').redone);
           assert.deepEqual(await nudge(rig), []);
+          assert.ok(rig.texts().some((t) => t.startsWith('[delivered]') && t.includes('kept private (private turn')), 'the resident is told');
+          await roomTurn(rig);
+          assert.deepEqual((await nudge(rig)).map((r) => r.locus), [LOUNGE], 'a public turn since makes it known again');
         } finally {
           await rig.close();
         }
@@ -1363,6 +1354,51 @@ describe('private wins, one way', () => {
         await rig.close();
       }
     });
+
+    it("a nudge after a rewind shed the channel turn that followed a private exchange speaks in no channel", async () => {
+      const rig = await surfaceRig();
+      try {
+        await privateTurn(rig);
+        await roomTurn(rig);
+        const internalsOf = rig.framework as unknown as { shedNewestTurn(agent: unknown): { removedIds: unknown[] } | null };
+        assert.ok(internalsOf.shedNewestTurn(rig.framework.getAgent('scout')), 'control: the channel turn was shed');
+        assert.deepEqual(await nudge(rig), []);
+      } finally {
+        await rig.close();
+      }
+    });
+
+    for (const step of ['undo', 'redo'] as const) {
+      it(`another agent's ${step} on the shared store leaves this agent's nudge after its channel turn in no channel`, async () => {
+        const rig = await surfaceRig({ otherAgents: ['ranger'] });
+        try {
+          const settled = () => ['scout', 'ranger'].every((name) => rig.framework.getAgent(name)!.state.status === 'idle');
+          const channelTurn = async (agentName: string) => {
+            const starts = rig.starts.length;
+            rig.i.pendingRequests.push({ ...roomWake(), agentName });
+            await rig.until(() => rig.starts.length > starts && settled(), `${agentName}'s channel turn`);
+            await rig.framework.runUntilIdle();
+          };
+          await channelTurn('scout');
+          if (step === 'undo') {
+            await channelTurn('ranger');
+            assert.ok(rig.framework.undoLastTurn('scout').undone);
+          } else {
+            assert.ok(rig.framework.undoLastTurn('scout').undone);
+            await channelTurn('ranger');
+            assert.ok(rig.framework.redo('scout').redone);
+          }
+          const before = rig.routed.length;
+          const starts = rig.starts.length;
+          assert.ok(rig.framework.nudgeAgent('ranger', 'host-console').ok);
+          await rig.until(() => rig.starts.length > starts && settled(), "ranger's nudged turn");
+          await rig.framework.runUntilIdle();
+          assert.deepEqual(rig.routed.slice(before), []);
+        } finally {
+          await rig.close();
+        }
+      });
+    }
 
     it("after a restart, a nudge and an unstick following a channel turn speak in no channel: the turn they retake isn't known", async () => {
       await acrossRestart(roomTurn, async (rig) => {

@@ -10041,6 +10041,7 @@ export class AgentFramework {
     }
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
+    this.retakeBasis.clear();
     return { descriptor, removedIds };
   }
 
