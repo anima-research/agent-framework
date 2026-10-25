@@ -695,6 +695,8 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     'a labeled image': { blocks: [image(png)], changed: false, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true, digest: '828ac28be2d13e7621768ba98ec74d555409d97567f9c05b1a1428e614cf9233' },
+    // One fixture per signature the store sniffs, each labeled as something
+    // else, so a context-manager that stops sniffing one fails here.
     'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e6e7bf5cc2225c979b2063abbe811ba02db8208e49b8315d0cab6565b55631fc' },
     'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true, digest: 'd7b8b855a4e81d88931ebf4a1d91c76c57da9d79572f523e29de1b9d23143fb1' },
     'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e643b5a67e56b99e8c555cd1064bc24ccba134e76a240b99c651934b761a9c72' },
