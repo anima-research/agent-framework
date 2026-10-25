@@ -194,6 +194,18 @@ export interface ToolResult {
    * it reads the result's error text, if any.
    */
   data?: unknown;
+  /**
+   * Whether `data` is a protocol result's content: an array in which every
+   * element is a content block, of a type this host can show or not. The
+   * framework sets it on an MCPL tool's result, and a module that returns a
+   * content array can set it too. When it's set, each element reaches the
+   * model as itself, as a reference's stub, or as a marker saying what it was
+   * and why it isn't shown, never as JSON. When it isn't, an array counts as
+   * content only when every element is a block of one of MCP's types (text,
+   * image, audio, resource, resource_link), and any other array is data,
+   * written as JSON.
+   */
+  dataIsContent?: boolean;
   /** Error message (if failure) */
   error?: string;
   /** Whether this was an error (for LLM) */

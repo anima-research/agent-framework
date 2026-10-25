@@ -1219,7 +1219,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1, 'the primary is told too');
       assert.equal(JSON.stringify(primary.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
         `[channels] Now open: #one (c-1): a message from your fork in missing-channel, named ${fork.name}, into the closed channel opened it, and that fork can't close it. ` +
-        "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again." }]));
+        "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again." }]));
       assert.equal((primary.mock.calls[0]!.arguments[2] as { speaker?: unknown } | undefined)?.speaker, fork.name);
 
       // The advice left out is advice the fork can't take: its channel_close
@@ -1254,7 +1254,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(told.length, 1, 'the primary is told once');
       assert.equal((told[0]!.content[0] as { text: string }).text,
         `[channels] Now open: #home (missing-channel): a message from your fork in missing-channel, named ${fork.name}, into the closed channel opened it; that fork has ended. ` +
-        "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.");
+        "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.");
       assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
     });
 
@@ -1412,7 +1412,7 @@ describe('notices about an agent\'s own action', () => {
         .filter((m) => JSON.stringify(m.content).includes('conversation-gone'));
       assert.deepEqual(told.map((m) => (m.content[0] as { text: string }).text), [
         "[channels] Now open: #four (c-4): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. " +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
         "[channels] Not open: #five (c-5). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
           "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
       ]);
@@ -1484,11 +1484,11 @@ describe('notices about an agent\'s own action', () => {
         .filter((m) => JSON.stringify(m.content).includes('conversation-gone'));
       assert.deepEqual(told.map((m) => (m.content[0] as { text: string }).text), [
         '[channels] Now open: #seven (c-7): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
         '[channels] Now open: #thirteen (c-13): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
         '[channels] Now open: #fourteen (c-14): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
         "[channels] Not open: #twenty-two (srv:c-22). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
           "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
       ]);
@@ -1593,7 +1593,7 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts a body the store shards as one notice, and the same text stored again as a notice of its own', async () => {
-      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       // Shard every notice into one message per block, as a strategy's ingress
@@ -1618,17 +1618,17 @@ describe('notices about an agent\'s own action', () => {
       const stored = cm.getAllMessages().filter((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === 'discord-send-failed');
       assert.deepEqual(stored.map((m) => m.shardIndex), [0, 1, 0, 1, 0, 1], 'each body is stored as two shards');
       assert.equal(stored[2]!.bodyGroupId, stored[0]!.bodyGroupId, 'the same text is stored again under the same group id');
-      assert.deepEqual(state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag), ['first', 'second', 'third']);
+      assert.deepEqual(state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag), ['first', 'second', 'third']);
     });
 
     it('counts as read, across branches, only what an agent\'s window shares with the branch it read up to the point they part', async () => {
-      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag);
 
       const read = notice('read');
       agent.markContextConsumed();
@@ -1648,13 +1648,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread a notice stored on a branch after the agent read past the point where it parts from another', async () => {
-      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag);
 
       notice('before the branch');
       const home = store.currentBranch().name;
@@ -1672,13 +1672,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread what the current branch has from a branch between it and the one the agent read on', async () => {
-      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag);
 
       notice('read at home');
       const home = store.currentBranch().name;
@@ -1699,13 +1699,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread, across a branch made after the agent read, what was stored after its watermark', async () => {
-      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag);
 
       notice('read');
       agent.markContextConsumed();
