@@ -105,7 +105,10 @@ function resultFor(fw: Fw, toolUseId: string): string {
   const results = (fw.membrane.lastStream?.receivedToolResults ?? []).flat() as Array<{ toolUseId: string; content: unknown }>;
   const found = results.find((r) => r.toolUseId === toolUseId);
   assert.ok(found, `a result for ${toolUseId}`);
-  return typeof found.content === 'string' ? found.content : JSON.stringify(found.content);
+  const content = found.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map((b) => (typeof (b as { text?: unknown })?.text === 'string' ? (b as { text: string }).text : JSON.stringify(b))).join('\n');
+  return JSON.stringify(content);
 }
 
 const notices = (fw: Fw) => windowText(fw.framework).filter((x) => x.includes('tool changes:'));
@@ -503,5 +506,151 @@ test('a refused act\'s trace carries the server\'s text redacted, from a caller 
   } finally {
     await fw.stop();
     await server.close();
+  }
+});
+
+test('a model\'s call of a dynamic tool by its listed name, and a model\'s act that can\'t resolve, are each refused, and nothing is sent', async () => {
+  const { server, showPeek } = await hintingServer({ content: [{ type: 'text', text: 'ran' }] });
+  const fw = await connectedTo(server);
+  try {
+    server.peer.notify('tools/hints', showPeek());
+    await waitFor(() => !fw.framework.getAllTools().some((t) => t.name === 'arc--peek'), 'peek is dynamic');
+    await modelCalls(fw, [
+      { type: 'tool_use', id: 'toolu_named', name: 'arc--peek', input: {} },
+      { type: 'tool_use', id: 'toolu_unresolved', name: 'toolsets--act', input: { server: 'arc', tool: 'nosuch', args: {} } },
+    ]);
+    assert.match(resultFor(fw, 'toolu_named'), /There's no tool "arc--peek" in your tool list, so nothing ran: peek is a dynamic tool of arc, called with toolsets--act/);
+    assert.match(resultFor(fw, 'toolu_unresolved'), /arc has no tool "nosuch"/);
+    assert.ok(!server.received.some((m) => m.method === 'tools/call'), 'nothing sent');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('act\'s results arrive as a direct call\'s do: structured content to a script, and a server\'s error to the model', async () => {
+  let rev = 0;
+  const server = await startScriptedServer({
+    advert: { ...ADVERT, featureSets: { ...(ADVERT.featureSets as Json), ...EVENTS } },
+    tools: [STATUS, { ...PEEK, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true } }],
+    listRev: () => rev,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, { open: [], _meta: { 'mcpl/hints': { rev: ++rev, tools: [{ name: 'peek', visible: true }] } } }); return; }
+      if (msg.method === 'tools/call') {
+        const failing = (msg.params as Json).arguments && ((msg.params as Json).arguments as Json).fail === true;
+        peer.reply(msg.id, failing
+          ? { content: [{ type: 'text', text: 'the board is locked' }], isError: true }
+          : { content: [{ type: 'text', text: 'peeked' }], structuredContent: { seen: ['a', 'b'] } });
+        return;
+      }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const fw = await connectedTo(server, { codeExecution: { enabled: true } });
+  try {
+    const code = 'const r = await tools["toolsets--act"]({ server: "arc", tool: "peek", args: {} }); text(JSON.stringify(r.structuredContent));';
+    await modelCalls(fw, [
+      { type: 'tool_use', id: 'toolu_script', name: 'code_execution', input: { code } },
+      { type: 'tool_use', id: 'toolu_error', name: 'toolsets--act', input: { server: 'arc', tool: 'peek', args: { fail: true } } },
+    ]);
+    assert.match(resultFor(fw, 'toolu_script'), /\{"seen":\["a","b"\]\}/);
+    assert.match(resultFor(fw, 'toolu_error'), /the board is locked/);
+    const results = (fw.membrane.lastStream?.receivedToolResults ?? []).flat() as Array<{ toolUseId: string; isError?: boolean }>;
+    assert.equal(results.find((r) => r.toolUseId === 'toolu_error')?.isError, true, 'an error result');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('a dynamic tool keeps its own feature set: through act, each call is sent its own set\'s state', async () => {
+  let n = 0;
+  const calls: Json[] = [];
+  const server = await startScriptedServer({
+    advert: {
+      ...ADVERT,
+      featureSets: {
+        'arc.tools': { description: 'tools', uses: ['tools'], hostState: true },
+        'arc.games': { description: 'games', uses: ['tools'], hostState: true },
+      },
+    },
+    tools: [
+      { ...STATUS, _meta: { featureSet: 'arc.tools' } },
+      { ...PEEK, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true, featureSet: 'arc.games' } },
+    ],
+    listRev: () => 0,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [{ name: 'peek', visible: true }] } } }); return; }
+      if (msg.method === 'tools/call') {
+        n++;
+        calls.push(msg.params as Json);
+        peer.reply(msg.id, { content: [{ type: 'text', text: 'ok' }], state: { checkpoint: `c${n}`, parent: null, data: { n } } });
+        return;
+      }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const fw = await connectedTo(server);
+  try {
+    const use = (id: string, name: string, input: Json) => createMockResponse([{ type: 'tool_use', id, name, input }] as never, 'tool_use');
+    fw.membrane.pushResponse(use('toolu_s1', 'arc--status', {}));
+    fw.membrane.pushResponse(use('toolu_p1', 'toolsets--act', { server: 'arc', tool: 'peek', args: {} }));
+    fw.membrane.pushResponse(use('toolu_p2', 'toolsets--act', { server: 'arc', tool: 'peek', args: {} }));
+    fw.membrane.pushResponse(use('toolu_s2', 'arc--status', {}));
+    fw.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'turn over' }]));
+    fw.framework.pushEvent({ type: 'external-message', source: 'test', content: [{ type: 'text', text: 'go' }], metadata: {}, triggerInference: true } as never);
+    await waitFor(() => calls.length === 4, 'four calls, one after another');
+    assert.deepEqual(calls.map((c) => `${String(c.name)}:${JSON.stringify(c.state ?? null)}`),
+      ['status:null', 'peek:null', 'peek:{"n":2}', 'status:{"n":1}']);
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('a classed dynamic tool called through act is observed with its class and, where the operator grants inputs, its arguments', async () => {
+  const classed = { ...PEEK, inputSchema: { type: 'object', properties: { x: { type: 'integer' } } }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true, 'mcpl/class': ['computer'] } };
+  const server = await startScriptedServer({
+    advert: ADVERT,
+    tools: [STATUS, classed],
+    listRev: () => 0,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [{ name: 'peek', visible: true }] } } }); return; }
+      if (msg.method === 'tools/call') { peer.reply(msg.id, { content: [{ type: 'text', text: 'ran' }] }); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const lifecycle: Json[] = [];
+  let observing = false;
+  const observer = await startScriptedServer({
+    advert: { toolLifecycle: { observe: true, inputs: true }, featureSets: { 'obs.watch': { description: 'watch', uses: ['toolLifecycle.observe', 'toolLifecycle.inputs'] } } },
+    tools: [],
+    on: (msg, peer) => {
+      if (msg.method === 'tools/lifecycle') { lifecycle.push(msg.params as Json); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const fw = await makeFramework([
+    { id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: true },
+    { id: 'obs', toolPrefix: 'obs', url: observer.url, toolLifecycle: { observe: {}, inputs: { classes: ['computer'] } } },
+  ] as McplServerConfig[]);
+  try {
+    await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'static tools listed');
+    for (let tries = 0; !observing && tries < 50; tries++) {
+      const answer = await observer.peer.request('tools/observe', { rules: [{ match: {}, input: true }] });
+      observing = !answer.error;
+      if (!observing) await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(observing, 'the observer filter applied');
+    await modelCalls(fw, [{ type: 'tool_use', id: 'toolu_act', name: 'toolsets--act', input: { server: 'arc', tool: 'peek', args: { x: 3 } } }]);
+    await waitFor(() => lifecycle.some((p) => p.phase === 'started'), 'the call observed');
+    const started = lifecycle.find((p) => p.phase === 'started')!;
+    assert.equal(started.tool, 'arc--peek');
+    assert.deepEqual(started.class, ['computer']);
+    assert.deepEqual(started.input, { x: 3 });
+  } finally {
+    await fw.stop();
+    await server.close();
+    await observer.close();
   }
 });
