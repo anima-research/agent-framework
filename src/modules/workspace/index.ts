@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, includePatternReadable, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, realSegments, restBeneath, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, includePatternReadable, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, realSegments, restBeneath, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -389,7 +389,7 @@ async function linkReadError(
   const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested, mount.config.include)}`;
   const holder = leads?.kind === 'inside' ? nestedHolder(leads.target, nested) : undefined;
   const code = leads?.kind === 'outside' ? 'escape'
-    : leads?.kind === 'inside' && holder && namesHolder(leads, holder) ? 'other_mount'
+    : leads?.kind === 'inside' && holder && namesHolder(leads, nested) ? 'other_mount'
     : relativePath === found.link ? 'symlink' : 'parent_symlink';
   return new WorkspaceReadError(code, reason, 'readlink');
 }
@@ -2852,10 +2852,10 @@ export class WorkspaceModule implements Module {
     // on the place's way as that mount's, so a place beneath anything else
     // there, such as a file the include leaves out, isn't named; one beneath
     // a directory not there yet is.
-    const onItsWay = holder.include === undefined
+    const onItsWay = !holder.judgedByInclude
       || await stat(dirname(real)).then((info) => info.isDirectory(), (err: unknown) => errnoOf(err) === 'ENOENT');
-    const directory = holder.include !== undefined && await stat(real).then((info) => info.isDirectory(), () => false);
-    if (!onItsWay || !namesNestedPlace(holder.rest, holder.include, directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+    const directory = holder.judgedByInclude && await stat(real).then((info) => info.isDirectory(), () => false);
+    if (!onItsWay || !holder.names(directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
     return new NestedMountError(path, mount.config.name, holder, 'leads into');
   }
 
@@ -3380,7 +3380,7 @@ export class WorkspaceModule implements Module {
       // does one reaching a file this mount's own include leaves out
       // (coversLanding).
       const own = holder === undefined && inside && !(await coversLanding({ include: mount.config.include }, realMountRoot, realFilePath, relativePath));
-      if (!inside || own || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
+      if (!inside || own || (holder !== undefined && !holder.names(false))) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');

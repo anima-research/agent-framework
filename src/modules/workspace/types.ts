@@ -213,8 +213,9 @@ export interface MountConfig {
    * directory in any spelling a disk may take for it reaches that mount,
    * whether or not the directory is on disk yet, and so does a link whose
    * target spells it otherwise. Where a link leads into the directory, the
-   * place beneath it is judged by that mount's include, and named, as disk
-   * spells it. A path that names the directory itself keeps what lies
+   * place beneath it is judged by that mount's include, and by the include
+   * of each other nested mount that may hold it, and named, as disk spells
+   * it. A path that names the directory itself keeps what lies
    * beneath as given, since that is the nested mount's to name. Where a disk
    * keeps apart two names the comparison joins, it errs toward the nested
    * mount, in where start places a mount as in every check: a name in
