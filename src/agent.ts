@@ -1649,29 +1649,9 @@ export class Agent {
     try {
       first = await compile(compiledWith);
     } catch (error) {
-      // The changes this agent keeps may be what no longer fits: a compile
-      // refused over budget with change rows of its own kept takes them out
-      // and compiles once more. On the head, whose requests leave them out,
-      // that's the removal settleHead makes after a compile. Under 'entries'
-      // the head moves to what's current, taking them: with a record, a move
-      // forced by the budget; without one, settleHead's adoption. If that
-      // compile is refused too, the error goes on and the move stands: the
-      // rows are gone and the head is current, as after any move. Never in a
-      // dry run.
-      if (options.dryRun || (error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
-      const removed = this.removeOwnChanges();
-      if (removed === 0) throw error;
-      if (!entries) {
-        this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });
-      } else {
-        const current = this.currentHead(availableTools, prospectiveSystemInjections);
-        this.headDeclarations.write(this.name, copyHead(current));
-        this.onHeadEvent?.(recorded
-          ? { type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' }
-          : { type: 'head:moved', why: 'adopted', changesRemoved: removed });
-        recorded = current;
-        compiledWith = current;
-      }
+      if (options.dryRun) throw error;
+      compiledWith = this.takeChangesOverBudget(error, entries, recorded, this.currentHead(availableTools, prospectiveSystemInjections));
+      if (entries) recorded = compiledWith;
       first = await compile(compiledWith);
     }
     const settled = await this.settleHead(
@@ -1887,10 +1867,8 @@ export class Agent {
    * store's tail, every agent's rows included, in blob-free windows, as far
    * as the rule reads. Then the change waits for the result. */
   private changeWouldSplitCall(): boolean {
-    const cm = this.contextManager as Partial<ContextManager>;
-    if (typeof cm.getMessageCount !== 'function' || typeof cm.getMessageWindow !== 'function') return false;
     const check = changeWriteCheck();
-    scanFromTail(cm as Pick<ContextManager, 'getMessageCount' | 'getMessageWindow'>, (row) => check.visit(row as unknown as TailRow));
+    scanFromTail(this.contextManager, (row) => check.visit(row as unknown as TailRow));
     return check.splits();
   }
 
@@ -2317,10 +2295,43 @@ export class Agent {
     // compile renders it, and context-manager's last committing compile, which
     // the next one's `firstChanged` compares with, and its thinking-binding
     // record both hold it: the next compile then reads the change as already
-    // sent, not as rewritten from there. Refused over budget, its error goes
-    // on with the change stored, and the next assembly's compile, refused with
-    // it kept, takes it into the head.
-    return { compiled: await compile(recorded), head: recorded };
+    // sent, not as rewritten from there. The change now counts in the budget,
+    // so this compile can be refused where the first fitted; then the head
+    // takes the changes, this one with them, as at the first compile, and
+    // the compile runs once more for it.
+    try {
+      return { compiled: await compile(recorded), head: recorded };
+    } catch (error) {
+      const moved = this.takeChangesOverBudget(error, true, recorded, current);
+      return { compiled: await compile(moved), head: moved };
+    }
+  }
+
+  /**
+   * The changes this agent keeps may be what no longer fits: after a compile
+   * refused over budget (`error`) with change rows of its own kept, take them
+   * out, and give the head to compile with once more. On the head, whose
+   * requests leave them out, that's the removal settleHead makes after a
+   * compile. Under 'entries' the head moves to `current`, taking them: with
+   * a record, a move forced by the budget; without one, settleHead's
+   * adoption. If that compile is refused too, the error goes on and the move
+   * stands: the rows are gone and the head is current, as after any move.
+   * Any other error, or a refusal with no change row of the agent's kept,
+   * goes on as it was. Never for a dry run.
+   */
+  private takeChangesOverBudget(error: unknown, entries: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
+    if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+    const removed = this.removeOwnChanges();
+    if (removed === 0) throw error;
+    if (!entries) {
+      this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });
+      return current;
+    }
+    this.headDeclarations.write(this.name, copyHead(current));
+    this.onHeadEvent?.(recorded
+      ? { type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' }
+      : { type: 'head:moved', why: 'adopted', changesRemoved: removed });
+    return current;
   }
 
   /**

@@ -665,6 +665,22 @@ describe('toolDeclarations', () => {
       }
     });
 
+    it('takes the changes into the head when the compile after a declared change is refused over budget, and compiles once more', async () => {
+      // The first compile fits; once the change is stored, it doesn't.
+      const rows = [said('user', 'hello')];
+      const context = fakeContext(rows, { overBudget: (r) => r.some((row) => row.participant === 'system') });
+      const heads = memoryHeadDeclarations();
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+      await agent.buildActivationRequest([tool('a')]);
+      const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools, [tool('a'), tool('b')], 'the head took the change just declared');
+      assert.deepEqual(changeRows(rows), []);
+      assert.deepEqual(heads.read('agent')!.tools, [tool('a'), tool('b')]);
+      assert.deepEqual(events.slice(1).map((e) => (e.type === 'head:moved' ? [e.type, e.why, e.changesRemoved, e.forced] : [e.type])),
+        [['head:declared'], ['head:moved', 'consolidated', 1, 'budget']]);
+    });
+
     it("compiles once more after a move forced by the budget for the head that goes out, as kv-unified hashes it", async () => {
       const rows = [said('user', 'hello')];
       let refuse = false;
