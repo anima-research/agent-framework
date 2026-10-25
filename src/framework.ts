@@ -12116,8 +12116,9 @@ export class AgentFramework {
   }
 
   private retakeIsPrivate(agentName: string): boolean {
+    const counts = (c: TurnCheckpoint) => !c.silent || c.private === true;
     const undone = this.redoStacks.get(agentName)?.at(-1)?.checkpoint;
-    const start = undone && !undone.silent ? undone : this.getTurnCheckpoints(agentName).filter((c) => !c.silent).at(-1);
+    const start = undone && counts(undone) ? undone : this.getTurnCheckpoints(agentName).filter(counts).at(-1);
     return start?.private === true;
   }
 

@@ -6,7 +6,6 @@ if (!storePath || !channelId) {
   console.error('usage: private-turn-restart-child <storePath> <channelId>');
   process.exit(2);
 }
-setTimeout(() => { console.error('private-turn-restart-child: never finished'); process.exit(4); }, 30_000);
 
 const membrane = new MockMembrane();
 membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about the build' }]));
@@ -39,7 +38,7 @@ const landed = framework.getAgent('scout')!.getContextManager().getAllMessages()
 internals.pendingRequests.push({
   agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), channelId, addressed: true,
 });
-for (let i = 0; i < 200 && membrane.calls.length === 0; i++) {
+while (membrane.calls.length === 0) {
   await framework.runUntilIdle();
   await new Promise((resolve) => setTimeout(resolve, 10));
 }

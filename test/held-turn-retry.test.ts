@@ -22,6 +22,9 @@ function withStoreDir<T>(fn: (path: string) => Promise<T> | T): Promise<T> {
   return Promise.resolve(fn(join(dir, 'store'))).finally(() => rmSync(dir, { recursive: true, force: true }));
 }
 
+/** An event from this source is stored and wakes nothing. */
+const QUIET_SOURCE = 'zz-quiet';
+
 class InputModule implements Module {
   readonly name = 'input';
   async start(_ctx: ModuleContext): Promise<void> {}
@@ -30,7 +33,10 @@ class InputModule implements Module {
   async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, isError: true, error: 'none' }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
-    return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
+    return {
+      addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }],
+      requestInference: event.source !== QUIET_SOURCE,
+    };
   }
 }
 
@@ -1359,7 +1365,7 @@ test("a merged start that took its token read its wakes: when it fails into a ho
 });
 
 for (const privateTurn of [true, false]) {
-  test(`a held turn's retry ${privateTurn ? 'speaks in no channel when a stored private message made the turn private' : 'speaks as the first turn did when nothing private took part, as on main'}`, async (t) => {
+  test(`a held turn's retry ${privateTurn ? "speaks in no channel when an operator's message stored during the hold makes the turn private" : 'speaks as the first turn did when nothing private came during the hold, as on main'}`, async (t) => {
     await withStoreDir(async (path) => {
       const clock = holdClock(t);
       const wait = 400;
@@ -1370,7 +1376,6 @@ for (const privateTurn of [true, false]) {
       const turns = fw as unknown as {
         channelRegistry: unknown;
         turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string } }>;
-        addMessage(participant: string, content: unknown, metadata: unknown): unknown;
       };
       turns.channelRegistry = new Proxy({
         getChannelTools: () => [],
@@ -1388,15 +1393,18 @@ for (const privateTurn of [true, false]) {
         fw.pushEvent(inChannel('zz-first'));
         await waitFor(fw, () => membrane.primary >= 1, 'the first turn');
         await fw.runUntilIdle();
-        if (privateTurn) {
-          turns.addMessage('user', [{ type: 'text', text: 'zz-operator' }], { inboundSource: { kind: 'surface', surface: 'tui', acceptedAt: Date.now() } });
-        }
         fw.pushEvent(inChannel('zz-second'));
         await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the second turn held');
+        if (privateTurn) {
+          fw.pushEvent({ type: 'external-message', source: QUIET_SOURCE, content: 'zz-operator', metadata: {} });
+          const context = fw.getAgent('resident')!.getContextManager();
+          await waitFor(fw, () => JSON.stringify(context.getAllMessages()).includes('zz-operator'), "the operator's message stored during the hold");
+        }
         await clock.outlast(wait);
         clock.pass(wait);
         await waitFor(fw, () => membrane.primary >= 3, 'the retry after the wait');
         await fw.runUntilIdle();
+        if (privateTurn) assert.match(texts(membrane.calls[2]!), /zz-operator/, "control: the retry read the operator's message");
         const first = routed.find((r) => r.text === 'zz-answer-1');
         assert.ok(first?.locus, `control: the first turn spoke in a channel: ${JSON.stringify(routed)}`);
         assert.deepEqual(routed.filter((r) => r.text === 'zz-answer-3').map((r) => r.locus), privateTurn ? [] : [first!.locus]);

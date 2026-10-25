@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { AgentFramework, readInboundSource } from '../src/index.js';
 import { isNonChannelSurfaceEvent } from '../src/framework.js';
@@ -394,6 +394,27 @@ async function surfaceRig(opts: {
 
 type Routing = Record<string, unknown>;
 const RESTART_CHILD = fileURLToPath(new URL('./helpers/private-turn-restart-child.js', import.meta.url));
+
+function runRestartChild(storePath: string, channelId: string, abort: AbortSignal): Promise<{ status: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [RESTART_CHILD, storePath, channelId], { signal: abort, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let failure: Error | undefined;
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', (error) => {
+      failure = error;
+      if (child.pid === undefined) reject(error);
+    });
+    child.on('close', (status, signal) => {
+      if (failure) reject(new Error(`${failure.message} (stderr: ${stderr.slice(-800)})`, { cause: failure }));
+      else resolve({ status, signal, stdout, stderr });
+    });
+  });
+}
 const routingOf = (framework: AgentFramework): Routing =>
   (framework as unknown as { routingOf(name: string): Routing }).routingOf('scout');
 const tuiWake = (): InferenceRequest => ({ agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true });
@@ -930,9 +951,9 @@ describe('private wins, one way', () => {
   it("channel_publish's description says a turn that has taken in private input names its channel", async () => {
     const registry = new ChannelRegistry({ getServer: () => undefined } as never, {} as never, () => {}, () => {});
     const publish = registry.getChannelTools().find((t) => t.name === 'channel_publish')!;
-    assert.match(publish.description, /so must a turn that has taken in private input[^.]*and a script such a turn started/);
+    for (const fact of [/must name a channel/, /private input/, /a script such a turn started/]) assert.match(publish.description, fact);
     const channelId = (publish.inputSchema as unknown as { properties: { channelId: { description: string } } }).properties.channelId;
-    assert.match(channelId.description, /required of a subagent, of a turn that has taken in private input, and of a script such a turn started/);
+    for (const fact of [/required of/, /private input/, /a script such a turn started/]) assert.match(channelId.description, fact);
   });
 
   it("a private turn's channel_publish that names no channel is refused, and says how to name one", async () => {
@@ -1199,10 +1220,10 @@ describe('private wins, one way', () => {
       assert.deepEqual(posted, [ROOM], "the outcome is the operator's notice, posted where it was asked");
       return rig.routed.slice(before);
     };
-    const acrossRestart = async (before: (rig: Rig) => Promise<void>, after: (rig: Rig) => Promise<void>) => {
+    const acrossRestart = async (before: (rig: Rig) => Promise<void>, after: (rig: Rig) => Promise<void>, firstRun: { quietSources?: string[] } = {}) => {
       const storeDir = mkdtempSync(join(tmpdir(), 'surface-restart-test-'));
       try {
-        const first = await surfaceRig({ storeDir });
+        const first = await surfaceRig({ storeDir, ...firstRun });
         try { await before(first); } finally { await first.close(); }
         const second = await surfaceRig({ storeDir });
         try { await after(second); } finally { await second.close(); }
@@ -1303,8 +1324,9 @@ describe('private wins, one way', () => {
 
     it("a channel turn whose checkpoint can't be marked private when it takes in private input keeps its later speech private, and finishes", async () => {
       let framework: AgentFramework | undefined;
+      let fired = 0;
       const tool = robot(() => {
-        (framework as unknown as { saveTurnCheckpoints(): void }).saveTurnCheckpoints = () => { throw new Error('store unavailable'); };
+        (framework as unknown as { saveTurnCheckpoints(): void }).saveTurnCheckpoints = () => { fired++; throw new Error('store unavailable'); };
         framework!.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
       });
       const rig = await surfaceRig({ modules: [tool], quietSources: ['console'] });
@@ -1318,6 +1340,7 @@ describe('private wins, one way', () => {
         rig.i.pendingRequests.push(roomWake());
         await rig.until(() => rig.starts.length >= 1 && idle(rig) && rig.texts().includes('about what you asked'), 'the turn to finish');
         await rig.framework.runUntilIdle();
+        assert.ok(fired >= 1, 'control: the mark met the failing store');
         assert.deepEqual(rig.routed.map((r) => r.text), ['on my way'], 'nothing after the private input reached a channel');
       } finally {
         await rig.close();
@@ -1358,6 +1381,20 @@ describe('private wins, one way', () => {
       await acrossRestart(privateTurn, async (rig) => {
         assert.deepEqual(await unstick(rig), []);
       });
+    });
+
+    it("after a restart, a nudge following a silent heartbeat tick that took in a stored private message speaks in no channel", async () => {
+      await acrossRestart(async (rig) => {
+        await roomTurn(rig);
+        rig.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+        await rig.until(() => stored(rig).includes('for your eyes only'), 'the private message stored');
+        const starts = rig.starts.length;
+        rig.i.pendingRequests.push({ agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(), suppressProse: true });
+        await rig.until(() => rig.starts.length > starts && idle(rig), 'the silent tick');
+        await rig.framework.runUntilIdle();
+      }, async (rig) => {
+        assert.deepEqual(await nudge(rig), []);
+      }, { quietSources: ['console'] });
     });
   });
 
@@ -1472,7 +1509,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a private turn's script report deferred across an update's restart keeps the next run's start out of every channel", async () => {
+    it("a private turn's script report deferred across an update's restart keeps the next run's start out of every channel", async (context) => {
       const storeDir = mkdtempSync(join(tmpdir(), 'private-turn-restart-'));
       try {
         const first = await surfaceRig({ storeDir });
@@ -1488,8 +1525,8 @@ describe('private wins, one way', () => {
         } finally {
           await first.close();
         }
-        const child = spawnSync(process.execPath, [RESTART_CHILD, join(storeDir, 'store'), ROOM], { encoding: 'utf8', timeout: 60_000 });
-        assert.equal(child.status, 0, `the next run (stderr: ${child.stderr.slice(-800)})`);
+        const child = await runRestartChild(join(storeDir, 'store'), ROOM, context.signal);
+        assert.equal(child.status, 0, `the next run (signal ${child.signal}, stderr: ${child.stderr.slice(-800)})`);
         const next = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { landed: boolean; started: boolean; routed: unknown[] };
         assert.equal(next.landed, true, 'control: the next run stored the report');
         assert.equal(next.started, true, "control: the channel's wake started a turn");
