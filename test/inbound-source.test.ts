@@ -794,7 +794,9 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     }
   });
 
-  it('a body the store refuses still has a digest', () => {
+  it('a body the store refuses still has a digest, and nothing is logged for it', (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
     for (const block of [
       { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } },
       { type: 'image', source: { type: 'base64', data: Buffer.from('<svg/>').toString('base64') } },
@@ -803,6 +805,23 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
       assert.throws(() => blockAsStored(block as never), MalformedContentError, `${block.type}: the store refuses it`);
       assert.match(sourceBodyDigest([block]), /^[0-9a-f]{64}$/, `${block.type}: it has a digest`);
     }
+    assert.deepEqual(logged, []);
+  });
+
+  it('any other error from the store\'s transform still gives the block\'s digest as given, and is logged once', (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    let reads = 0;
+    const block = {
+      type: 'text',
+      get text() {
+        if (reads++ === 0) throw new TypeError('the first read fails');
+        return 'x';
+      },
+    };
+    assert.equal(sourceBodyDigest([block]), sourceBodyDigest([{ type: 'text', text: 'x' }]));
+    assert.equal(logged.length, 1, logged.join('\n'));
+    assert.match(logged[0], /^\[stored-digest-as-given\] error=TypeError: .*the first read fails/);
   });
 
   it('a block the store keeps as given is digested as given', () => {

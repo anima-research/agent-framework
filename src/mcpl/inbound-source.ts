@@ -23,6 +23,7 @@
 
 import { createHash } from 'node:crypto';
 import { blockAsStored } from '@animalabs/context-manager';
+import { logDetail, logValue } from './log-value.js';
 
 /** The MCPL admission lane that accepted an item. Its contract decides what
  *  an `eventId` is worth: `push/event` deduplicates by eventId, and RFC-006
@@ -193,14 +194,23 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * blockAsStored throws for a block the store refuses on write, a
- * caller-supplied `blob_ref` among them. Such a block has no stored form,
- * and whatever is thrown, it is digested as given.
+ * blockAsStored throws a `MalformedContentError` for a block the store
+ * refuses on write, a caller-supplied `blob_ref` among them. Its name, not
+ * its class, marks it, since a host can hold a second copy of
+ * context-manager. Such a block has no stored form, and whatever is thrown,
+ * it is digested as given.
  */
 function storedBlock(block: unknown): unknown {
   try {
     return blockAsStored(block as Parameters<typeof blockAsStored>[0]);
-  } catch {
+  } catch (err) {
+    const { name, message } = (err ?? {}) as { name?: unknown; message?: unknown };
+    if (name !== 'MalformedContentError') {
+      console.error(
+        `[stored-digest-as-given] error=${logValue(typeof name === 'string' ? name : typeof err)}: ` +
+        logDetail(typeof message === 'string' ? message : ''),
+      );
+    }
     return block;
   }
 }
