@@ -131,8 +131,9 @@ export interface Module {
    * (With membrane 0.7 and context-manager 0.22 and later, a stored
    * `system_change` block adds system text from its place in the
    * conversation, through membrane's native formatter and Anthropic adapter
-   * only, and can't replace any.) Still called for now; the framework logs
-   * one `[deprecated]` line per module whose injections it collects.
+   * only, to a model that takes mid-conversation system messages, and can't
+   * replace any.) Still called for now; the framework logs one
+   * `[deprecated]` line per module whose injections it collects.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 

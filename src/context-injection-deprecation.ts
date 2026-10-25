@@ -35,8 +35,9 @@
  * made in, a block that moves, or new text in a `system` block, also means
  * no reply after the point where the request first changed can keep its
  * thinking. As context-manager 0.22's thinking binding describes it, such a
- * provider refuses the request or sets that thinking aside, and where the
- * agent tells context-manager that its model binds, the compile leaves it out
+ * provider refuses the request or sets that thinking aside. With
+ * context-manager 0.22 and later, where the agent tells it that its model
+ * binds (`thinkingBinding.binds`), the compile leaves that thinking out
  * instead.
  *
  * See anima-research/agent-framework#171.
@@ -71,8 +72,11 @@
  * or at the first point after it where the API takes one, and leaves the
  * messages before it as they were. Only membrane's native formatter with its
  * Anthropic adapter sends one, and membrane refuses the request through any
- * other formatter or adapter. It adds text, and can't take back or replace
- * any.
+ * other formatter or adapter. Even there, membrane refuses a request with no
+ * place for it after the change, as when the change follows the final
+ * assistant message, and, as membrane's docs say, the API refuses one to a
+ * model that doesn't take mid-conversation system messages. It adds text,
+ * and can't take back or replace any.
  */
 
 export const CONTEXT_INJECTION_DEPRECATION_NOTICE =

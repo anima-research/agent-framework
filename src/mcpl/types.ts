@@ -848,7 +848,8 @@ export interface BeforeInferenceResult {
    * at runtime has no provider-independent replacement. (With membrane 0.7
    * and context-manager 0.22 and later, a stored `system_change` block adds
    * system text from its place in the conversation, through membrane's
-   * native formatter and Anthropic adapter only, and can't replace any.) The
+   * native formatter and Anthropic adapter only, to a model that takes
+   * mid-conversation system messages, and can't replace any.) The
    * deprecation changes nothing about how hosts apply injections; they log a
    * `[deprecated]` line per server whose injections they collect, and none
    * for a server whose injections the feature-set and grant checks all drop.
