@@ -7,7 +7,8 @@
  * An MCP result has two views, and each consumer gets its own:
  * - **The content array is the server's model-facing view.** Text stays text,
  *   and an inline image stays native when a provider can take it: one of the
- *   types providers accept, within their per-image size. Anything else the
+ *   types providers accept, within the framework's own per-image limit, for
+ *   providers that enforce one (some routes take more). Anything else the
  *   provider format can't carry (audio, binary blobs, other images) is saved
  *   to the workspace, and a bounded stub says where it went. A stub tells the
  *   reader where the payload is; nothing is dropped silently. If a payload
@@ -48,8 +49,9 @@ const STUB_FIELD_POINTS = 200;
 const URI_POINTS = 2048;
 /** The image types providers take inline. Any other image is saved. */
 const NATIVE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-/** The decoded size providers take per inline image: the same 5 MB ceiling
- *  the framework's read_image tool guards. A larger image is saved. */
+/** The framework's own per-image limit on decoded size, for providers that
+ *  enforce one; some routes take more. It's the same 5 MB ceiling the
+ *  framework's read_image tool guards. A larger image is saved. */
 const NATIVE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 
 /** Why a payload isn't shown inline, unless said otherwise. */
@@ -206,7 +208,7 @@ export async function normalizeStandardToolResult(
           // provider may refuse, and with it the whole request.
           blocks.push({ type: 'image', data: block.data.replace(/\s+/g, ''), mimeType: native });
         } else {
-          const why = native ? `over the ${humanSize(NATIVE_IMAGE_MAX_BYTES)} a model takes per image` : UNSUPPORTED;
+          const why = native ? `over the ${humanSize(NATIVE_IMAGE_MAX_BYTES)} this host sends inline per image` : UNSUPPORTED;
           blocks.push({ type: 'text', text: await payloadStub(kind, block.data, mimeType, { why }) });
         }
         break;
