@@ -1331,6 +1331,9 @@ describe('private wins, one way', () => {
       });
       const rig = await surfaceRig({ modules: [tool], quietSources: ['console'] });
       framework = rig.framework;
+      const logged: string[] = [];
+      const consoleError = console.error;
+      console.error = (...parts: unknown[]) => { logged.push(parts.map(String).join(' ')); };
       try {
         rig.membrane.pushResponse(createMockResponse([
           { type: 'text', text: 'on my way' },
@@ -1342,7 +1345,10 @@ describe('private wins, one way', () => {
         await rig.framework.runUntilIdle();
         assert.ok(fired >= 1, 'control: the mark met the failing store');
         assert.deepEqual(rig.routed.map((r) => r.text), ['on my way'], 'nothing after the private input reached a channel');
+        assert.ok(logged.some((line) => line.includes('store unavailable') && line.includes('a retake of that turn may read it as public')),
+          `the operator is told: ${JSON.stringify(logged)}`);
       } finally {
+        console.error = consoleError;
         await rig.close();
       }
     });

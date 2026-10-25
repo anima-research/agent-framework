@@ -2686,7 +2686,9 @@ describe('explicit prose routing', () => {
         release();
         await within(pending, 'the late envelope');
         await framework.runUntilIdle();
-        assert.equal(routed.some((r) => r.text === 'Ordinary words.'), !bouncingPrivate, JSON.stringify(routed));
+        const stored = JSON.stringify(framework.getAgent('assistant')!.getContextManager().getAllMessages());
+        assert.ok(stored.includes('Ordinary words.'), 'control: the bounce woke its follow-up');
+        assert.deepEqual(routed.filter((r) => r.text === 'Ordinary words.').map((r) => r.locus), bouncingPrivate ? [] : ['world:commons']);
       });
     });
   }

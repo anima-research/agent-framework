@@ -14,9 +14,10 @@
   that continues it with a private wake or stored private input, or a tool
   boundary that injects a private surface's message, removes its locus, its
   trigger channel and its sticky `>>` or `>>>` destination, and a `[routing]`
-  notice says why, whatever destination the turn had. While a turn is private,
-  a `>>>` or `>>` envelope posts its own body where it names but sets no
-  destination for the turn's later speech. What a private turn causes is
+  notice says why, whatever destination the turn had, unless the turn is a
+  silent heartbeat tick, which has no speech to place. While a turn is
+  private, a `>>>` or `>>` envelope posts its own body where it names but sets
+  no destination for the turn's later speech. What a private turn causes is
   private too: its budget restart, its tool results' re-inference, a ` !`
   continuation, its auto-continuation (`autoContinue`), a bounce's wake, a
   rewind's retry, a self-wake it arms with `skip_reply`'s `wake_in_seconds`, a
