@@ -7,8 +7,10 @@
  * An MCP result has two views, and each consumer gets its own:
  * - **The content array is the server's model-facing view.** Text stays text,
  *   and an inline image stays native when a provider can take it: one of the
- *   types providers accept, within the framework's own per-image limit, for
- *   providers that enforce one (some routes take more). Anything else the
+ *   types providers accept, within the framework's own per-image limit. That
+ *   limit applies to every image this reading carries, whichever route it goes
+ *   to: it's kept for providers that enforce one, though some routes take
+ *   more. Anything else the
  *   provider format can't carry (audio, binary blobs, other images) is saved
  *   to the workspace, and a bounded stub says where it went. A stub tells the
  *   reader where the payload is; nothing is dropped silently. If a payload
@@ -49,9 +51,13 @@ const STUB_FIELD_POINTS = 200;
 const URI_POINTS = 2048;
 /** The image types providers take inline. Any other image is saved. */
 const NATIVE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-/** The framework's own per-image limit on decoded size, for providers that
- *  enforce one; some routes take more. It's the same 5 MB ceiling the
- *  framework's read_image tool guards. A larger image is saved. */
+/** This reading's per-image limit on decoded size, applied to every image it
+ *  carries, whichever route it goes to: a larger image is shown as a stub, and
+ *  saved to the workspace where it can be (payloadStub). It's kept for
+ *  providers that enforce one, though some routes take more. The framework's
+ *  read_image tool refuses an image past the same 5 MB. The RFC-005 lanes (an
+ *  MCPL peer's or a module's content, and the push lanes) hold an image to no
+ *  such limit. */
 const NATIVE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 
 /** Why a payload isn't shown inline, unless said otherwise. */
