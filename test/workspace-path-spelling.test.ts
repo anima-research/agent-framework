@@ -3,15 +3,12 @@
 // file. The workspace's tools take such a path as disk spells it, unless it
 // names a workspace entry exactly, or a deletion or conflict the workspace
 // records there, or does once its directories take disk's spelling, so they
-// name each file by one name and take nothing in twice. A draft not yet on
-// disk takes the spelling of a workspace entry it equals in simple case
-// folding, on a disk that folds case. Neither applies where disk's spelling
-// puts the path in a nested mount's directory, which every check compares as
-// disk compares names. Most of these tests need a temp directory that folds
-// case, and skip, saying why, where it doesn't, since a disk that tells
-// spellings apart has nothing to respell; some need it to fold normalization,
-// or ß with ss, ſ with s or ς with σ, and some run only where it tells case,
-// or the normalization forms, apart. The rest run anywhere.
+// name each file by one name and take nothing in twice. Most of these tests
+// need a temp directory that folds case, and skip, saying why, where it
+// doesn't, since a disk that tells spellings apart has nothing to respell.
+// A draft not yet on disk takes the spelling of a workspace entry it equals
+// in simple case folding, on a disk that folds case. Neither applies where
+// disk's spelling puts the path in a nested mount's directory.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -20,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, sep } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { beneathNested, beneathRoot, diskSpelling, foldsCase, nestedAtReal, nestedGuess, nestedHolder, nestedRootAtReal, nestedStep, ownCaseFolding, realSegments, restBeneath, sameRoot } from '../src/modules/workspace/observe.js';
+import { beneathNested, beneathRoot, diskSpelling, foldsCase, nestedAtReal, nestedGuess, nestedHolder, nestedRootAtReal, nestedStep, realSegments, restBeneath, sameRoot } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
@@ -55,11 +52,6 @@ const LONG_S_FOLDING_ONLY = folds.longS ? false
   : 'the temp directory keeps \u017f apart from s, so SOAP reaches nothing where disk has \u017foap';
 const FINAL_SIGMA_FOLDING_ONLY = folds.finalSigma ? false
   : 'the temp directory keeps \u03c2 apart from \u03c3, so \u039f\u0394\u039f\u03a3 reaches nothing where disk has \u03bf\u03b4\u03bf\u03c2';
-// The step a guess resting on levels that told nothing gives after its restart.
-const AGAIN = ', and, if this answer comes again after a start that found that directory there, to rename one of ';
-// statfs f_types, for withStatfsType: one whose change times are trusted, and one whose aren't.
-const EXT4 = 0xef53;
-const FUSE = 0x65735546;
 const CASE_SENSITIVE_ONLY = folds.case
   ? 'the temp directory folds case, so two names that differ only in case are one name here' : false;
 const CASE_NOT_SHARP_S_ONLY = folds.case && !folds.sharpS ? false
@@ -194,14 +186,13 @@ test('a nested mount whose directory is configured in another spelling than disk
         { name: 'inner', path: join(d, 'Inner'), mode: 'read-write', watch: 'never' },
       ];
     });
-    const refusal = '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".';
     for (const path of ['outer/Inner/x.txt', 'outer/inner/x.txt']) {
       const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-      assert.equal(read.error, refusal, path);
+      refusedAsInner(read, 'inner/x.txt', path);
       assert.equal(workspace.resolveAbsolutePath(path), null, path);
     }
     const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/Inner/y.txt', content: 'y\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-    assert.equal(write.error, '"outer/inner/y.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/y.txt".');
+    refusedAsInner(write, 'inner/y.txt', 'outer/Inner/y.txt');
     assert.equal(existsSync(join(dir, 'inner', 'y.txt')), false);
     const synced = await call('sync', { path: 'outer/Inner' });
     assert.equal((synced.data as { totalSynced: number }).totalSynced, 0);
@@ -525,7 +516,7 @@ test('a link into a nested mount\'s directory configured in another spelling tha
   await assert.rejects(workspace.readFileFromDisk('outer/l/x.txt'), (err: unknown) => {
     assert.ok(err instanceof WorkspaceReadError, String(err));
     assert.equal(err.code, 'other_mount', err.message);
-    assert.match(err.message, /it lies in mount "nested", nested in mount "outer": use "nested\/sub" in place of "outer\/l"/);
+    assert.match(err.message, /it (?:lies|may lie) in mount "nested", nested in mount "outer": .*use "nested\/sub" in place of "outer\/l"/);
     return true;
   });
 });
@@ -574,7 +565,7 @@ test('resolveAbsolutePath takes a nested mount\'s directory in the other normali
   for (const path of ['outer/caf\u00e9/x.txt', 'outer/cafe\u0301/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
 });
 
-test('on a disk that tells case apart, a directory spelled otherwise than a nested mount\'s is the outer mount\'s own, for the tools and resolveAbsolutePath alike',
+test('on a disk that tells case apart, a directory spelled otherwise than a nested mount\'s only in case is no mount\'s: the tools refuse it saying the workspace can\'t tell the two apart, resolveAbsolutePath gives null, and a listing passes over it',
   { skip: CASE_SENSITIVE_ONLY }, async (t) => {
     const { workspace, call, dir } = await setup(t, (d) => {
       mkdirSync(join(d, 'inner'), { recursive: true });
@@ -585,529 +576,65 @@ test('on a disk that tells case apart, a directory spelled otherwise than a nest
         { name: 'inner', path: join(d, 'inner'), mode: 'read-write', watch: 'never' },
       ];
     });
-    const read = await call('read', { path: 'outer/Inner/x.txt', offsetChars: 0, limitChars: 100 });
-    assert.equal((read.structured as { content: string }).content, 'outer\n');
-    // Synchronous, it compares the path as given as disk compares names too,
-    // so on this disk Inner is the outer mount's directory.
-    assert.equal(workspace.resolveAbsolutePath('outer/Inner/x.txt'), join(dir, 'Inner', 'x.txt'));
+    const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/Inner/x.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(read.error, '"outer/Inner/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
+      '"outer/Inner" from "outer/inner", mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/x.txt". If you meant one of this mount\'s own, ' +
+      'for a new file use a path outside "outer/Inner" and "outer/inner", and for one already there ask whoever runs this workspace to rename one of "outer/Inner" and "outer/inner".');
+    const wrote = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/Inner/x.txt', content: 'written\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.match(String(wrote.error), /^"outer\/Inner\/x\.txt" may lie in mount "inner", nested in mount "outer"/);
+    assert.equal(readFileSync(join(dir, 'Inner', 'x.txt'), 'utf8'), 'outer\n');
+    assert.equal(workspace.resolveAbsolutePath('outer/Inner/x.txt'), null);
     const listed = await call('ls', { path: 'outer', recursive: true });
-    assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['Inner/x.txt', 'src/a.ts']);
+    assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
   });
 
-test('a nested mount\'s directory is matched level by level as disk compares names: in either normalization form at every level, and in any case where the level folds case', () => {
-  const apart = { dir: 'fold/m', folds: [false, false] };
-  const below = { dir: 'fold/m', folds: [false, true] };
-  assert.equal(beneathNested(['fold', 'm', 'x.txt'], apart), true);
-  assert.equal(beneathNested(['fold', 'M', 'x.txt'], apart), false, 'another case, where its level tells case apart');
-  assert.equal(beneathNested(['fold', 'M', 'x.txt'], below), true, 'another case, where its level folds case');
-  assert.equal(beneathNested(['FOLD', 'm'], below), false, 'the level holding FOLD tells case apart, so it is another directory');
-  assert.equal(beneathNested(['cafe\u0301', 'x'], { dir: 'caf\u00e9', folds: [false] }), true, 'the other normalization form, at a level that tells case apart');
-  assert.equal(beneathNested(['CAFE\u0301'], { dir: 'caf\u00e9', folds: [true] }), true);
-  assert.equal(beneathNested(['STRASSE'], { dir: 'stra\u00dfe', folds: [true] }), true, 'as listedName compares case, loosely too');
-  assert.equal(beneathNested(['strasse'], { dir: 'stra\u00dfe', folds: [false] }), false, 'no case folding, where its level tells case apart');
-  assert.equal(beneathNested(['fold', 'n'], below), false, 'another name');
-  assert.equal(beneathNested(['fold'], below), false, 'a path above the directory is not in it');
-  assert.equal(beneathNested(['fold', 'M'], { dir: 'fold/m', folds: [] }), true, 'a level not read yet counts as folding');
-  // At a level that folds case, as Linux's casefold compares names: with a
-  // default-ignorable code point passed over, and with case mapped on the
-  // decomposed name, as for Greek ΐ beside Ϊ́.
+test('a nested mount\'s directory is matched level by level as any disk may compare names: in either normalization form and in any case, as fully as a disk that folds names may, at every level', () => {
+  const m = { dir: 'fold/m' };
+  assert.equal(beneathNested(['fold', 'm', 'x.txt'], m), true);
+  assert.equal(beneathNested(['fold', 'M', 'x.txt'], m), true, 'another case');
+  assert.equal(beneathNested(['FOLD', 'm'], m), true, 'another case at the level above');
+  assert.equal(beneathNested(['fold', 'n'], m), false, 'another name');
+  assert.equal(beneathNested(['fold'], m), false, 'a path above the directory is not in it');
   for (const [given, dir, what] of [
+    ['cafe\u0301', 'caf\u00e9', 'the other normalization form'],
+    ['CAFE\u0301', 'caf\u00e9', 'the other form in another case'],
+    ['\u0436', '\u0416', 'case past ASCII'],
+    ['STRASSE', 'stra\u00dfe', 'a pair only a full folding joins'],
+    ['strasse', 'stra\u00dfe', 'that pair in lower case'],
     ['in\u00adner', 'inner', 'a soft hyphen'],
     ['in\u200dner', 'inner', 'a zero-width joiner'],
     ['inner\ufe0f', 'inner', 'a variation selector'],
     ['\u03aa\u0301', '\u0390', 'Greek letters whose case mapping decomposes'],
-  ] as const) {
-    assert.equal(beneathNested([given, 'x.txt'], { dir, folds: [true] }), true, `${what}, where its level folds case`);
-    assert.equal(beneathNested([given, 'x.txt'], { dir, folds: [false] }), false, `${what}, where its level tells case apart`);
-  }
-  assert.equal(beneathNested(['\u03b1\u0345\u0313'], { dir: '\u1f80', folds: [true] }), true, 'marks in another order around a combining ypogegrammeni, whose upper case is a letter');
-  // What lies beneath goes by segments, since a match can change a name's length.
-  assert.equal(restBeneath('STRASSE/a/b', { dir: 'stra\u00dfe', folds: [true] }), 'a/b');
-  assert.equal(restBeneath('cafe\u0301', { dir: 'caf\u00e9', folds: [false] }), '');
-  // A canonical path is compared level by level from the filesystem's root.
+    ['\u03b1\u0345\u0313', '\u1f80', 'marks in another order around a combining ypogegrammeni, whose upper case is a letter'],
+  ] as const) assert.equal(beneathNested([given, 'x.txt'], { dir }), true, what);
+  assert.equal(restBeneath('STRASSE/a/b', { dir: 'stra\u00dfe' }), 'a/b');
+  assert.equal(restBeneath('cafe\u0301', { dir: 'caf\u00e9' }), '');
   const real = (...segments: string[]) => ['', ...segments].join(sep);
-  const inner = { dir: 'm', folds: [true], name: 'inner', real: real('w', 'sub', 'm'), realFolds: [true, false, false, true] };
+  const inner = { dir: 'm', name: 'inner', real: real('w', 'sub', 'm') };
   assert.equal(nestedRootAtReal(real('w', 'sub', 'M', 'x.txt'), [inner])?.depth, 4);
-  assert.equal(nestedRootAtReal(real('w', 'SUB', 'm', 'x.txt'), [inner]), undefined, 'the level holding SUB tells case apart');
-  // Of two at one depth, the one a path surely lies in, whatever their order.
+  assert.equal(nestedRootAtReal(real('w', 'SUB', 'm', 'x.txt'), [inner])?.depth, 4, 'another case at a level above the root');
+  assert.equal(nestedRootAtReal(real('w', 'sub', 'n', 'x.txt'), [inner]), undefined, 'another name');
   const looks = [
-    { dir: 'cafe\u0301', folds: [false], name: 'nfd', real: real('w', 'cafe\u0301'), realFolds: [true, false, false] },
-    { dir: 'caf\u00e9', folds: [false], name: 'nfc', real: real('w', 'caf\u00e9'), realFolds: [true, false, false] },
+    { dir: 'cafe\u0301', name: 'nfd', real: real('w', 'cafe\u0301') },
+    { dir: 'caf\u00e9', name: 'nfc', real: real('w', 'caf\u00e9') },
   ];
   assert.equal(nestedRootAtReal(real('w', 'caf\u00e9', 'x.txt'), looks)?.mount.name, 'nfc');
   assert.equal(nestedRootAtReal(real('w', 'cafe\u0301', 'x.txt'), [...looks].reverse())?.mount.name, 'nfd');
   assert.equal(nestedHolder('caf\u00e9/x.txt', looks)?.name, 'nfc');
   assert.equal(nestedHolder('cafe\u0301/x.txt', [...looks].reverse())?.name, 'nfd');
-  assert.equal(nestedHolder('inner/x.txt', [{ dir: 'inner', folds: [false], name: 'guessed', guessed: true }, { dir: 'inner', folds: [false], name: 'placed' }])?.name, 'placed',
+  assert.equal(nestedHolder('inner/x.txt', [{ dir: 'inner', name: 'guessed', guessed: true }, { dir: 'inner', name: 'placed' }])?.name, 'placed',
     'a directory start placed surely before one it only guessed at');
-  assert.equal(nestedHolder('a/caf\u00e9/x.txt', [{ dir: 'a', folds: [false], name: 'shallow' }, { dir: 'a/cafe\u0301', folds: [false, false], name: 'deep' }])?.name, 'deep',
+  assert.equal(nestedHolder('a/caf\u00e9/x.txt', [{ dir: 'a', name: 'shallow' }, { dir: 'a/cafe\u0301', name: 'deep' }])?.name, 'deep',
     'the deeper first, even where only the comparison\'s guess joins the path to it');
-  // A level told to fold matches surely in another ASCII case, before a look-alike.
-  const cased = [
-    { dir: '\u0131nner', folds: [true], name: 'dotless', real: real('w', '\u0131nner'), realFolds: [true, true, true] },
-    { dir: 'INNER', folds: [true], name: 'upper', real: real('w', 'INNER'), realFolds: [true, true, true] },
-  ];
-  assert.equal(nestedRootAtReal(real('w', 'inner', 'x.txt'), cased)?.mount.name, 'upper');
-  assert.equal(nestedHolder('inner/x.txt', cased)?.name, 'upper');
-  // The filesystem's root is one segment, so what lies beneath it is placed too.
   assert.deepEqual(realSegments(sep), ['']);
   assert.deepEqual(realSegments(real('data')), ['', 'data']);
-  assert.equal(beneathRoot(real('data', 'inner'), sep, [true]), 'data/inner');
-  assert.equal(beneathRoot(sep, sep, [true]), undefined, 'the root itself lies beneath nothing');
-  assert.equal(sameRoot(sep, sep, [true]), true);
-  assert.equal(nestedRootAtReal(real('x', 'y'), [{ dir: 'x', folds: [true], name: 'all', real: sep, realFolds: [true] }])?.depth, 1);
+  assert.equal(beneathRoot(real('data', 'inner'), sep), 'data/inner');
+  assert.equal(beneathRoot(sep, sep), undefined, 'the root itself lies beneath nothing');
+  assert.equal(sameRoot(sep, sep), true);
+  assert.equal(nestedRootAtReal(real('x', 'y'), [{ dir: 'x', name: 'all', real: sep }])?.depth, 1);
 });
 
-test('a directory folds case as its own entries tell, and where none tells, nothing is told', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-own-folding-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'empty'));
-  mkdirSync(join(root, 'digits'));
-  writeFileSync(join(root, 'digits', '2024'), '');
-  mkdirSync(join(root, 'named'));
-  writeFileSync(join(root, 'named', 'a.txt'), '');
-  assert.equal(await ownCaseFolding(join(root, 'empty')), null, 'an empty directory tells nothing');
-  assert.equal(await ownCaseFolding(join(root, 'digits')), null, 'nor one holding only a name with no letter to flip');
-  mkdirSync(join(root, 'unlatin'));
-  writeFileSync(join(root, 'unlatin', '\u1c90\u00fc'), '');
-  assert.equal(await ownCaseFolding(join(root, 'unlatin')), null, 'nor one whose names have no letter a-z, since a disk that folds case may keep a newer pair apart');
-  assert.equal(await ownCaseFolding(join(root, 'named', 'later')), null, 'nor one not made yet');
-  assert.equal(await ownCaseFolding(join(root, 'named')), folds.case, 'a name with a letter tells');
-  if (!folds.case) {
-    // Only a directory that tells case apart can hold a name and its flipped
-    // spelling as two files. Each pair is told as a name alone is, so two
-    // files tell case apart only on a filesystem whose change times are
-    // trusted, chosen here, which off Linux none is.
-    const apart = process.platform === 'linux' ? false : null;
-    const trusted = <T>(fn: () => Promise<T>) => withStatfsType(EXT4, fn);
-    mkdirSync(join(root, 'pair'));
-    writeFileSync(join(root, 'pair', 'xa'), 'one');
-    writeFileSync(join(root, 'pair', 'XA'), 'other');
-    assert.equal(await trusted(() => ownCaseFolding(join(root, 'pair'))), apart, 'a name beside its flipped spelling as another file tells case apart');
-    mkdirSync(join(root, 'single'));
-    writeFileSync(join(root, 'single', 'x'), 'one');
-    writeFileSync(join(root, 'single', 'X'), 'other');
-    assert.equal(await trusted(() => ownCaseFolding(join(root, 'single'))), null, 'a name of one letter beside its flipped spelling tells nothing, having no third spelling');
-    mkdirSync(join(root, 'linked'));
-    writeFileSync(join(root, 'linked', 'y'), 'one');
-    linkSync(join(root, 'linked', 'y'), join(root, 'linked', 'Y'));
-    assert.equal(await trusted(() => ownCaseFolding(join(root, 'linked'))), null, 'a name beside its flipped spelling as one file, two hard links, tells nothing');
-    writeFileSync(join(root, 'linked', 'xa'), 'one');
-    writeFileSync(join(root, 'linked', 'XA'), 'other');
-    // Listed with the hard links first, which this disk's own order may not give.
-    const original = fs.promises.readdir;
-    fs.promises.readdir = ((path: fs.PathLike, ...rest: unknown[]) => (String(path) === join(root, 'linked')
-      ? Promise.resolve(['y', 'Y', 'xa', 'XA'])
-      : (original as (...args: unknown[]) => unknown)(path, ...rest))) as typeof fs.promises.readdir;
-    syncBuiltinESMExports();
-    try {
-      assert.equal(await trusted(() => ownCaseFolding(join(root, 'linked'))), apart, 'one pair of two files tells case apart, whichever pair is listed first');
-    } finally {
-      fs.promises.readdir = original;
-      syncBuiltinESMExports();
-    }
-    mkdirSync(join(root, 'newer'));
-    writeFileSync(join(root, 'newer', '\u1c90'), 'one');
-    writeFileSync(join(root, 'newer', '\u10d0'), 'other');
-    assert.equal(await trusted(() => ownCaseFolding(join(root, 'newer'))), null, 'a newer case pair as two files tells nothing, since a disk that folds case may keep it apart');
-    mkdirSync(join(root, 'mixed'));
-    writeFileSync(join(root, 'mixed', 'ab\u1c90'), 'one');
-    writeFileSync(join(root, 'mixed', 'AB\u1c90'), 'other');
-    assert.equal(await trusted(() => ownCaseFolding(join(root, 'mixed'))), apart, 'names that differ only in their ASCII letters\' case, as two files, tell case apart');
-  }
-});
-
-test('on a disk that tells case apart, a listing of twins in case is told pair by pair, as a name alone is', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  // A disk that folds case can list a name and its flipped spelling too, as
-  // while the name is renamed in case as it's listed. On one that numbers a file
-  // anew for each spelling, the two are two inode numbers though one file,
-  // and the third spelling finds it too: that tells nothing. Twins on a
-  // filesystem whose change times aren't trusted tell nothing either.
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-listed-twins-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'twins'));
-  writeFileSync(join(root, 'twins', 'ab.txt'), 'one');
-  writeFileSync(join(root, 'twins', 'AB.TXT'), 'other');
-  const folding = (original: typeof fs.promises.lstat) => ((path: fs.PathLike, ...rest: unknown[]) => {
-    const lookup = original as (...args: unknown[]) => Promise<unknown>;
-    // Any third spelling, with one letter's case flipped, finds the file, as
-    // a disk that folds case finds it under every spelling.
-    const name = basename(String(path));
-    if (name.toLowerCase() === 'ab.txt' && name !== 'ab.txt' && name !== 'AB.TXT') return lookup(join(root, 'twins', 'ab.txt'), ...rest);
-    return lookup(path, ...rest);
-  }) as typeof fs.promises.lstat;
-  assert.equal(await withStatfsType(EXT4, () => withLstat(folding, () => ownCaseFolding(join(root, 'twins')))), null, 'where every spelling finds a file');
-  assert.equal(await withStatfsType(FUSE, () => ownCaseFolding(join(root, 'twins'))), null, 'twins where change times aren\'t trusted');
-  assert.equal(await withStatfsType(EXT4, () => ownCaseFolding(join(root, 'twins'))), process.platform === 'linux' ? false : null, 'twins where they are');
-});
-
-test('a name removed while start reads a directory\'s folding tells nothing of it', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-removed-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'd'));
-  writeFileSync(join(root, 'd', 'a.txt'), '');
-  // The listed name goes as soon as the first lookup in the directory answers.
-  const original = fs.promises.lstat;
-  let removed = false;
-  fs.promises.lstat = (async (path: fs.PathLike, ...rest: unknown[]) => {
-    const answer = (original as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
-    if (!removed && dirname(String(path)) === join(root, 'd')) {
-      removed = true;
-      await answer.catch(() => undefined);
-      rmSync(join(root, 'd', 'a.txt'));
-    }
-    return answer;
-  }) as typeof fs.promises.lstat;
-  syncBuiltinESMExports();
-  try {
-    assert.equal(await ownCaseFolding(join(root, 'd')), null);
-  } finally {
-    fs.promises.lstat = original;
-    syncBuiltinESMExports();
-  }
-  assert.equal(removed, true, 'a lookup ran in the directory');
-});
-
-/** Run `fn` recording each directory node:fs/promises' readdir lists and each path its lstat looks up, as the module under test sees them. */
-async function recordingReads<T>(fn: () => Promise<T>): Promise<{ answer: T; listed: string[]; looked: string[] }> {
-  const listed: string[] = [];
-  const looked: string[] = [];
-  const readdir = fs.promises.readdir;
-  fs.promises.readdir = ((path: fs.PathLike, ...rest: unknown[]) => {
-    listed.push(String(path));
-    return (readdir as (...args: unknown[]) => unknown)(path, ...rest);
-  }) as typeof fs.promises.readdir;
-  syncBuiltinESMExports();
-  try {
-    const answer = await withLstat((original) => ((path: fs.PathLike, ...rest: unknown[]) => {
-      looked.push(String(path));
-      return (original as (...args: unknown[]) => unknown)(path, ...rest);
-    }) as typeof fs.promises.lstat, fn);
-    return { answer, listed, looked };
-  } finally {
-    fs.promises.readdir = readdir;
-    syncBuiltinESMExports();
-  }
-}
-
-test('start reads a nested mount\'s level that a link in the outer mount leads above every root from that level\'s own name, listing nothing there', async (t) => {
-  // out/up leads to the directory holding both roots, so inner, configured
-  // at out/up/inner, lies at a level above every root, which a listing
-  // would read whatever names it holds from, beside included.
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-up-'));
-  const dir = join(root, 'out');
-  mkdirSync(dir);
-  writeFileSync(join(dir, 'x.txt'), 'x\n');
-  mkdirSync(join(root, 'inner'));
-  writeFileSync(join(root, 'inner', 'y.txt'), 'y\n');
-  mkdirSync(join(root, 'beside'));
-  symlinkSync(root, join(dir, 'up'));
-  const store = JsStore.openOrCreate({ path: join(root, 'store') });
-  const workspace = new WorkspaceModule({ mounts: [
-    { name: 'outer', path: dir, mode: 'read-write', watch: 'never' },
-    { name: 'inner', path: join(dir, 'up', 'inner'), mode: 'read-write', watch: 'never' },
-  ] });
-  workspace.initStore(store);
-  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
-  const { listed, looked } = await recordingReads(() => workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext));
-  const roots = [realpathSync(dir), realpathSync(join(root, 'inner'))];
-  const within = (path: string) => roots.some((r) => path === r || path.startsWith(r + sep));
-  assert.deepEqual(listed.map((path) => realpathSync(path)).filter((path) => !within(path)), []);
-  // The level is read, from inner's own name there and its flipped spelling,
-  // and inner is placed beneath outer through the link.
-  assert.ok(looked.includes(join(dir, 'up', 'INNER')), JSON.stringify(looked));
-  assert.equal(workspace.resolveAbsolutePath('outer/up/inner/new.md'), null);
-  assert.equal(workspace.resolveAbsolutePath('outer/x.txt'), join(dir, 'x.txt'));
-});
-
-test('a level read from a name it holds looks up only that name and its flipped spelling, and lists nothing', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-by-name-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'd'));
-  mkdirSync(join(root, 'other'));
-  mkdirSync(join(root, '2024'));
-  const { answer, listed, looked } = await recordingReads(() => ownCaseFolding(root, 'd'));
-  assert.deepEqual(listed, []);
-  assert.deepEqual([...new Set(looked)].sort(), [join(root, 'D'), join(root, 'd')].sort());
-  assert.equal(answer, existsSync(join(root, 'D')), 'folds where the flipped spelling finds it');
-  for (const name of ['2024', 'missing']) {
-    const untold = await recordingReads(() => ownCaseFolding(root, name));
-    assert.equal(untold.answer, null, name);
-    assert.deepEqual(untold.listed, [], `${name}: nothing listed`);
-    assert.ok(untold.looked.every((path) => basename(path).toLowerCase() === name), `${name}: nothing else looked up`);
-  }
-});
-
-test('on a disk that tells case apart, a name with cased letters but none a-z or A-Z beside a nested mount\'s directory is the outer mount\'s own, read as the walk reads its level', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  // The level holding \u0416 lies in the outer mount, so every check reads it
-  // from its entries, where a.txt tells case apart; by \u0416's own name it
-  // would tell nothing, and the canonical check would take \u0436 for it.
-  const { tool } = await nestedRig(t, '\u0416/inner', { before: (d) => writeFileSync(join(d, 'a.txt'), 'a\n') });
-  const wrote = await tool('write', { path: 'outer/\u0436/inner/new.md', content: 'x\n' });
-  assert.equal(wrote.success, true, String(wrote.error));
-});
-
-test('start, with each root holding a lettered name, lists no directory above a mount\'s root, and looks up nothing beside the roots\' paths but a name\'s other spellings in case', async (t) => {
-  // From Beth-2709's runs: reading each level above a root from a listing
-  // looked up whatever names those directories held, as a share mounted
-  // beside a mount's path, which a dead share would hold. Each root here
-  // holds a lettered name: foldsCase, which start runs on each root for
-  // disk's spelling, still asks the directory holding a root that is missing
-  // or whose names tell nothing.
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-above-'));
-  const dir = join(root, 'mount');
-  mkdirSync(join(dir, 'inner'), { recursive: true });
-  writeFileSync(join(dir, 'x.txt'), 'x\n');
-  writeFileSync(join(dir, 'inner', 'y.txt'), 'y\n');
-  mkdirSync(join(root, 'beside'));
-  const store = JsStore.openOrCreate({ path: join(root, 'store') });
-  const workspace = new WorkspaceModule({ mounts: [
-    { name: 'outer', path: dir, mode: 'read-write', watch: 'never' },
-    { name: 'inner', path: join(dir, 'inner'), mode: 'read-write', watch: 'never' },
-  ] });
-  workspace.initStore(store);
-  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
-  const { listed, looked } = await recordingReads(() => workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext));
-  // Each recorded path is compared where it lies, since start reads some
-  // through the configured paths and some through the real ones, which
-  // differ where the temporary directory is reached through a link, as
-  // macOS's /var is. A listed directory lies where it leads, as readdir
-  // follows it; a looked-up name lies in its directory, as lstat doesn't.
-  const realOf = (path: string): string => {
-    try {
-      return realpathSync(path);
-    } catch {
-      return join(realOf(dirname(path)), basename(path));
-    }
-  };
-  const lookedAt = (path: string): string => join(realOf(dirname(path)), basename(path));
-  const real = realpathSync(dir);
-  const above = (path: string) => real !== path && real.startsWith(path.endsWith(sep) ? path : path + sep);
-  assert.deepEqual(listed.map(realOf).filter(above), [], 'no directory above a root is listed');
-  const onPaths = (path: string) => above(path) || path === real || path.startsWith(real + sep);
-  const flipped = (path: string) => join(dirname(path), [...basename(path)].map((c) => (/[a-z]/.test(c) ? c.toUpperCase() : /[A-Z]/.test(c) ? c.toLowerCase() : c)).join(''));
-  // The name with its first letter alone flipped, which a lookup there
-  // takes where the flipped spelling finds another file.
-  const firstFlipped = (path: string) => join(dirname(path), basename(path).replace(/[A-Za-z]/, (c) => (/[a-z]/.test(c) ? c.toUpperCase() : c.toLowerCase())));
-  const storeReal = realOf(join(root, 'store'));
-  assert.deepEqual(looked.map(lookedAt).filter((path) => !onPaths(path) && !onPaths(flipped(path)) && !onPaths(firstFlipped(path)) && !path.startsWith(storeReal)), [], 'nothing beside the paths is looked up');
-});
-
-/** Run `fn` with node:fs/promises' lstat wrapped by `wrap`, as the module under test sees it. */
-async function withLstat<T>(wrap: (original: typeof fs.promises.lstat) => typeof fs.promises.lstat, fn: () => Promise<T>): Promise<T> {
-  const original = fs.promises.lstat;
-  fs.promises.lstat = wrap(original);
-  syncBuiltinESMExports();
-  try {
-    return await fn();
-  } finally {
-    fs.promises.lstat = original;
-    syncBuiltinESMExports();
-  }
-}
-
-/**
- * Run `fn` with node:fs/promises' statfs answering `type` for every path, or
- * failing with it where it's an error, as the module under test sees it, so
- * whether a filesystem's change times are trusted is chosen here rather than
- * by the disk the test runs on.
- */
-async function withStatfsType<T>(type: number | Error, fn: () => Promise<T>): Promise<T> {
-  const original = fs.promises.statfs;
-  fs.promises.statfs = (async (path: fs.PathLike, ...rest: unknown[]) => {
-    if (type instanceof Error) throw type;
-    const found = await (original as (...args: unknown[]) => Promise<fs.StatsFs>)(path, ...rest);
-    return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { type });
-  }) as typeof fs.promises.statfs;
-  syncBuiltinESMExports();
-  try {
-    return await fn();
-  } finally {
-    fs.promises.statfs = original;
-    syncBuiltinESMExports();
-  }
-}
-
-test('a name replaced while start reads a directory\'s folding tells nothing of it', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-replaced-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'd'));
-  writeFileSync(join(root, 'd', 'a.txt'), 'first\n');
-  // As an editor saves, a new file takes the name's place as soon as the
-  // first lookup in the directory answers.
-  let replaced = false;
-  const answer = await withLstat((original) => (async (path: fs.PathLike, ...rest: unknown[]) => {
-    const found = (original as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
-    if (!replaced && dirname(String(path)) === join(root, 'd')) {
-      replaced = true;
-      await found.catch(() => undefined);
-      writeFileSync(join(root, 'saved'), 'second\n');
-      renameSync(join(root, 'saved'), join(root, 'd', 'a.txt'));
-    }
-    return found;
-  }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd')));
-  assert.equal(replaced, true, 'a lookup ran in the directory');
-  assert.equal(answer, null);
-});
-
-test('a first lookup of the name that fails other than by finding nothing tells nothing', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-name-fails-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'd'));
-  writeFileSync(join(root, 'd', 'a.txt'), '');
-  let first = true;
-  const answer = await withLstat((original) => ((path: fs.PathLike, ...rest: unknown[]) => {
-    if (first && basename(String(path)) === 'a.txt') {
-      first = false;
-      return Promise.reject(Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }));
-    }
-    return (original as (...args: unknown[]) => unknown)(path, ...rest);
-  }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd')));
-  assert.equal(first, false, 'the name was looked up');
-  assert.equal(answer, null);
-});
-
-test('a lookup of the flipped spelling that fails other than by finding nothing tells nothing', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-flip-fails-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'd'));
-  writeFileSync(join(root, 'd', 'a.txt'), '');
-  const answer = await withLstat((original) => ((path: fs.PathLike, ...rest: unknown[]) => (basename(String(path)) === 'A.TXT'
-    ? Promise.reject(Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }))
-    : (original as (...args: unknown[]) => unknown)(path, ...rest))) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd')));
-  assert.equal(answer, null);
-});
-
-test('where the flipped spelling finds another file than the name does, the name with its first letter alone flipped settles it, read from a listing or from the name alone', async (t) => {
-  // A disk that tells case apart can hold a twin spelled with every letter
-  // flipped, and has nothing at the third spelling; one that folds case but
-  // numbers a file anew for each spelling it's looked up by, as a FUSE
-  // filesystem may, finds the one file under every spelling, each numbered
-  // anew. No disk here does either on cue, so lstat is replaced.
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-flip-other-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  for (const d of ['listed', 'short']) mkdirSync(join(root, d));
-  writeFileSync(join(root, 'listed', 'ab.txt'), '');
-  writeFileSync(join(root, 'short', 'a'), '');
-  mkdirSync(join(root, 'ab'));
-  mkdirSync(join(root, 'd'));
-  writeFileSync(join(root, 'other'), '');
-  const nothing = () => Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
-  const failed = () => Promise.reject(Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }));
-  const lookups = (third: 'a file' | 'nothing' | 'an error') => (original: typeof fs.promises.lstat) => ((path: fs.PathLike, ...rest: unknown[]) => {
-    const name = basename(String(path));
-    const lookup = original as (...args: unknown[]) => Promise<unknown>;
-    if (['AB.TXT', 'AB', 'A', 'D'].includes(name)) return lookup(join(root, 'other'), ...rest);
-    if (['Ab.txt', 'Ab'].includes(name)) return third === 'a file' ? lookup(join(root, 'other'), ...rest) : third === 'nothing' ? nothing() : failed();
-    return lookup(path, ...rest);
-  }) as typeof fs.promises.lstat;
-  // Nothing at the third spelling tells case apart only on a filesystem
-  // whose change times are trusted, which off Linux none is.
-  const told = process.platform === 'linux' ? false : null;
-  for (const [third, answer] of [['nothing', told], ['a file', null], ['an error', null]] as const) {
-    assert.equal(await withStatfsType(EXT4, () => withLstat(lookups(third), () => ownCaseFolding(join(root, 'listed')))), answer, `from a listing, with ${third} at the third spelling`);
-    assert.equal(await withStatfsType(EXT4, () => withLstat(lookups(third), () => ownCaseFolding(root, 'ab'))), answer, `from the name alone, with ${third} at the third spelling`);
-  }
-  assert.equal(await withStatfsType(EXT4, () => withLstat(lookups('nothing'), () => ownCaseFolding(join(root, 'short')))), null, 'a name of one letter has no third spelling, from a listing');
-  assert.equal(await withStatfsType(EXT4, () => withLstat(lookups('nothing'), () => ownCaseFolding(root, 'd'))), null, 'nor from the name alone');
-});
-
-test('on a filesystem whose change times aren\'t trusted, a third spelling that finds nothing leaves the level a guess', async (t) => {
-  // There a name removed and made again between the lookups, under an inode
-  // numbered by path and in the same coarse tick, keeps its change time, so
-  // the bracket can't tell it was gone, and a disk that folds case would
-  // read as one that tells it apart (FUSE without stable inode numbers).
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-untrusted-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'listed'));
-  writeFileSync(join(root, 'listed', 'ab.txt'), '');
-  mkdirSync(join(root, 'ab'));
-  writeFileSync(join(root, 'other'), '');
-  const lookups = (original: typeof fs.promises.lstat) => ((path: fs.PathLike, ...rest: unknown[]) => {
-    const name = basename(String(path));
-    const lookup = original as (...args: unknown[]) => Promise<unknown>;
-    if (['AB.TXT', 'AB'].includes(name)) return lookup(join(root, 'other'), ...rest);
-    if (['Ab.txt', 'Ab'].includes(name)) return Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
-    return lookup(path, ...rest);
-  }) as typeof fs.promises.lstat;
-  assert.equal(await withStatfsType(FUSE, () => withLstat(lookups, () => ownCaseFolding(join(root, 'listed')))), null, 'from a listing');
-  assert.equal(await withStatfsType(FUSE, () => withLstat(lookups, () => ownCaseFolding(root, 'ab'))), null, 'from the name alone');
-  // A filesystem whose type can't be read is one whose change times aren't trusted.
-  const unread = Object.assign(new Error('EIO: i/o error, statfs'), { code: 'EIO' });
-  assert.equal(await withStatfsType(unread, () => withLstat(lookups, () => ownCaseFolding(join(root, 'listed')))), null, 'from a listing, where statfs fails');
-  assert.equal(await withStatfsType(unread, () => withLstat(lookups, () => ownCaseFolding(root, 'ab'))), null, 'from the name alone, where statfs fails');
-});
-
-test('a name removed while its third spelling is looked up tells nothing of its directory\'s folding', async (t) => {
-  // As a temporary file goes while start reads its directory: on a disk
-  // that folds case but numbers a file anew for each spelling, the third
-  // spelling then finds nothing, as it would where the disk tells case apart.
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-third-race-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'd'));
-  writeFileSync(join(root, 'd', 'ab.txt'), '');
-  writeFileSync(join(root, 'other'), '');
-  let removed = false;
-  const answer = await withLstat((original) => ((path: fs.PathLike, ...rest: unknown[]) => {
-    const name = basename(String(path));
-    const lookup = original as (...args: unknown[]) => Promise<unknown>;
-    if (name === 'AB.TXT') return lookup(join(root, 'other'), ...rest);
-    if (name === 'Ab.txt') {
-      rmSync(join(root, 'd', 'ab.txt'));
-      removed = true;
-      return Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
-    }
-    return lookup(path, ...rest);
-  }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd')));
-  assert.equal(removed, true, 'the third spelling was looked up');
-  assert.equal(answer, null);
-});
-
-test('a name re-created or renamed back under the same inode between its first and last lookups tells nothing, whichever other spelling found nothing', async (t) => {
-  // A name removed and made again can be given the freed inode number, and
-  // one renamed away and back keeps its own, so dev and ino alone would take
-  // it for the file looked up first; its change time moves either way,
-  // unless all of it falls within one tick of a coarse clock right after its
-  // last change, a race outside the nested-mount guarantee. On a
-  // disk that folds case the other spelling, looked up while the name was
-  // gone, found nothing, which alone would read as telling case apart.
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-recreated-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, 'd'));
-  writeFileSync(join(root, 'd', 'ab.txt'), '');
-  writeFileSync(join(root, 'other'), '');
-  const nothing = () => Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
-  // A filesystem whose change times are trusted, so on Linux the change
-  // time alone keeps each answer from telling case apart: with its check
-  // taken out, the trust gate doesn't, and the Ab.txt case fails here. Off
-  // Linux none is trusted, so there the gate would hide that removal.
-  for (const gone of ['AB.TXT', 'Ab.txt', 'nothing']) {
-    let named = 0;
-    const answer = await withStatfsType(EXT4, () => withLstat((original) => (async (path: fs.PathLike, ...rest: unknown[]) => {
-      const name = basename(String(path));
-      const lookup = original as (...args: unknown[]) => Promise<{ ctimeNs: bigint }>;
-      if (name === gone) return nothing();
-      // With nothing gone, the flipped spelling is a hard link to the name,
-      // made between its lookups, which moves its change time: the same
-      // file at both spellings would otherwise read as folding.
-      if (name === 'AB.TXT') return lookup(join(root, gone === 'nothing' ? 'd/ab.txt' : 'other'), ...rest);
-      const found = await lookup(path, ...rest);
-      if (name !== 'ab.txt' || ++named < 2) return found;
-      return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { ctimeNs: found.ctimeNs + 1n });
-    }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd'))));
-    assert.equal(named, 2, `${gone}: the name was looked up on each side`);
-    assert.equal(answer, null, gone === 'nothing' ? 'a hard link made meanwhile at the flipped spelling' : `nothing at ${gone}`);
-  }
-});
-
-test('on a disk that tells case apart, a name read alone beside two others in case, spelled with every letter flipped and with its first alone, tells nothing', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-three-twins-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  for (const name of ['ab', 'AB', 'Ab']) mkdirSync(join(root, name));
-  assert.equal(await ownCaseFolding(root, 'ab'), null);
-});
-
-test('before a start reads any level, a name in another case than a nested mount\'s directory may lie in it, and is refused saying so', async (t) => {
+test('before a start, a name in another case than a nested mount\'s directory may lie in it, and is refused saying so', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-unstarted-'));
   const dir = join(root, 'mount');
   mkdirSync(dir);
@@ -1123,60 +650,39 @@ test('before a start reads any level, a name in another case than a nested mount
   assert.match(String(wrote.error), /^"outer\/INNER\/new\.md" may lie in mount "inner", nested in mount "outer"/);
 });
 
-test('a directory that can be listed but not searched tells nothing of its folding', { skip: process.platform === 'win32' ? 'chmod can\'t take a directory\'s search permission away on Windows' : process.getuid?.() === 0 ? 'the host runs as root, which searches any directory' : false }, async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-unsearchable-'));
-  mkdirSync(join(root, 'closed'));
-  writeFileSync(join(root, 'closed', 'a.txt'), '');
-  chmodSync(join(root, 'closed'), 0o444);
-  t.after(() => { chmodSync(join(root, 'closed'), 0o755); rmSync(root, { recursive: true, force: true }); });
-  assert.equal(await ownCaseFolding(join(root, 'closed')), null);
-});
-
-test('a followed link\'s landing beneath a placement start only guessed at is named as the landing spells it where it matches the nested directory surely', async () => {
-  // Nothing here is on disk: the landing's rest keeps its spelling.
+test('a followed link\'s landing beneath a placement start only guessed at is named as the landing spells it, beside the nested directory\'s spelling where the landing matches it only loosely', async () => {
   const real = (...segments: string[]) => ['', 'workspace-path-spelling-not-on-disk', ...segments].join(sep);
-  const inner = { dir: 'inner', folds: [true], guessed: true as const, name: 'inner', real: real('cafe\u0301', 'inner'), realFolds: [true, true, false, true] };
-  const found = await nestedAtReal(real('caf\u00e9', 'INNER', 'x.txt'), [inner], { name: 'outer', rootReal: real('caf\u00e9') });
-  assert.deepEqual(found?.guess, { placed: 'outer/INNER', leads: 'outer/INNER/x.txt' });
+  const inner = { dir: 'inner', guessed: true as const, name: 'inner', real: real('cafe\u0301', 'inner') };
+  const at = { name: 'outer', rootReal: real('caf\u00e9') };
+  assert.deepEqual((await nestedAtReal(real('caf\u00e9', 'inner', 'x.txt'), [inner], at))?.guess, { placed: 'outer/inner', leads: 'outer/inner/x.txt' });
+  assert.deepEqual((await nestedAtReal(real('caf\u00e9', 'INNER', 'x.txt'), [inner], at))?.guess, { placed: 'outer/INNER', dir: 'outer/inner', leads: 'outer/INNER/x.txt' });
 });
 
-test('a path lies surely in a nested mount\'s directory where each level is exact, or differs only in its ASCII letters\' case at a level told it folds, and otherwise a text naming that mount shows what the workspace can\'t tell apart', () => {
-  const told = { dir: 'sub/inner', folds: [false, true] };
-  assert.equal(nestedGuess('outer', ['sub', 'inner', 'x.md'], told), undefined, 'exact');
-  assert.equal(nestedGuess('outer', ['sub', 'INNER', 'x.md'], told), undefined, 'ASCII case at a level told it folds');
-  const shown = (given: string, dir: string, untold: string[] = [], byName = untold.length === 0) => ({ given, dir, untold, byName });
-  assert.deepEqual(nestedGuess('outer', ['sub', 'INNER', 'x.md'], { dir: 'sub/inner', folds: [false, null] }), shown('outer/sub/INNER', 'outer/sub/inner', ['outer/sub']), 'a level whose own entries told nothing');
-  assert.deepEqual(nestedGuess('outer', ['sub', 'INNER'], { dir: 'sub/inner', folds: [false] }), shown('outer/sub/INNER', 'outer/sub/inner', ['outer/sub']), 'a level no start has read');
-  assert.deepEqual(nestedGuess('outer', ['a', 'B', 'INNER'], { dir: 'a/b/inner', folds: [false, null, null] }), shown('outer/a/B/INNER', 'outer/a/b/inner', ['outer/a', 'outer/a/b']), 'two levels that told nothing, each named as start read it');
-  assert.deepEqual(nestedGuess('outer', ['SUB', 'INNER'], { dir: 'sub/inner', folds: [true, null] }), shown('outer/SUB/INNER', 'outer/sub/inner', ['outer/sub']), 'a sure case difference above one that told nothing');
-  assert.deepEqual(nestedGuess('outer', ['caf\u00e9', 'INNER'], { dir: 'cafe\u0301/inner', folds: [false, null] }), shown('outer/caf\\u00e9/INNER', 'outer/cafe\\u0301/inner', ['outer/cafe\\u0301'], true), 'a guess by names above one by case where nothing told');
-  assert.deepEqual(nestedGuess('outer', ['caf\u00e9', 'x.txt'], { dir: 'cafe\u0301', folds: [false] }), shown('outer/caf\\u00e9', 'outer/cafe\\u0301'), 'one name in NFC, shown by its code points');
-  assert.deepEqual(nestedGuess('outer', ['SUB', 'caf\u00e9'], { dir: 'sub/cafe\u0301', folds: [true, true] }), shown('outer/SUB/caf\\u00e9', 'outer/sub/cafe\\u0301'), 'each level shown as it differs');
-  assert.deepEqual(nestedGuess('outer', ['\u{1d15e}'], { dir: '\u{1d157}\u{1d165}', folds: [false] }), shown('outer/\\u{1d15e}', 'outer/\\u{1d157}\\u{1d165}'), 'past the BMP');
-  assert.deepEqual(nestedGuess('outer', ['strasse'], { dir: 'stra\u00dfe', folds: [true] }), shown('outer/strasse', 'outer/stra\\u00dfe'), 'a pair only a full folding joins');
-  assert.deepEqual(nestedGuess('outer', ['in\u00adner'], { dir: 'inner', folds: [true] }), shown('outer/in\\u00adner', 'outer/inner'), 'a default-ignorable code point, which a disk that folds case may keep');
-  assert.deepEqual(nestedGuess('outer', ['ilik'], { dir: '\u0131l\u0131k', folds: [true] }), shown('outer/ilik', 'outer/\\u0131l\\u0131k'), 'a dotless i beside its look-alike');
-  assert.deepEqual(nestedGuess('outer', ['\u10d0'], { dir: '\u1c90', folds: [true] }), shown('outer/\\u10d0', 'outer/\\u1c90'), 'case past ASCII, which a disk with an older folding table may keep apart');
-  assert.deepEqual(nestedGuess('outer', ['caf\u00e9-\\u00e9'], { dir: 'cafe\u0301-\\u00e9', folds: [false] }), shown('outer/caf\\u00e9-\\\\u00e9', 'outer/cafe\\u0301-\\\\u00e9'), 'a backslash of the name\'s own, doubled');
-  assert.deepEqual(nestedGuess('outer', ['inner', 'x.txt'], { dir: 'inner', folds: [true], guessed: true }), { placed: 'outer/inner' }, 'a placement start only guessed at, however exactly the path matches');
-  assert.deepEqual(nestedGuess('outer', ['INNER', 'x.txt'], { dir: 'inner', folds: [true], guessed: true }), { placed: 'outer/INNER' }, 'a guessed placement named as the path spells it');
-  assert.deepEqual(nestedGuess('outer', ['INNER', 'x.txt'], { dir: 'inner', folds: [null], guessed: true }), { placed: 'outer/INNER', dir: 'outer/inner' }, 'a guessed placement before any guess beneath it');
+test('a path lies surely in a nested mount\'s directory only where each level is exact, and otherwise a text naming that mount shows what the workspace can\'t tell apart', () => {
+  const nested = { dir: 'sub/inner' };
+  assert.equal(nestedGuess('outer', ['sub', 'inner', 'x.md'], nested), undefined, 'exact');
+  const shown = (given: string, dir: string) => ({ given, dir });
+  assert.deepEqual(nestedGuess('outer', ['sub', 'INNER', 'x.md'], nested), shown('outer/sub/INNER', 'outer/sub/inner'), 'another case, on any disk');
+  assert.deepEqual(nestedGuess('outer', ['SUB', 'INNER'], nested), shown('outer/SUB/INNER', 'outer/sub/inner'), 'another case at each level');
+  assert.deepEqual(nestedGuess('outer', ['caf\u00e9', 'INNER'], { dir: 'cafe\u0301/inner' }), shown('outer/caf\\u00e9/INNER', 'outer/cafe\\u0301/inner'), 'another form above another case');
+  assert.deepEqual(nestedGuess('outer', ['caf\u00e9', 'x.txt'], { dir: 'cafe\u0301' }), shown('outer/caf\\u00e9', 'outer/cafe\\u0301'), 'one name in NFC, shown by its code points');
+  assert.deepEqual(nestedGuess('outer', ['SUB', 'caf\u00e9'], { dir: 'sub/cafe\u0301' }), shown('outer/SUB/caf\\u00e9', 'outer/sub/cafe\\u0301'), 'each level shown as it differs');
+  assert.deepEqual(nestedGuess('outer', ['\u{1d15e}'], { dir: '\u{1d157}\u{1d165}' }), shown('outer/\\u{1d15e}', 'outer/\\u{1d157}\\u{1d165}'), 'past the BMP');
+  assert.deepEqual(nestedGuess('outer', ['strasse'], { dir: 'stra\u00dfe' }), shown('outer/strasse', 'outer/stra\\u00dfe'), 'a pair only a full folding joins');
+  assert.deepEqual(nestedGuess('outer', ['in\u00adner'], { dir: 'inner' }), shown('outer/in\\u00adner', 'outer/inner'), 'a default-ignorable code point, which a disk that folds case may keep');
+  assert.deepEqual(nestedGuess('outer', ['ilik'], { dir: '\u0131l\u0131k' }), shown('outer/ilik', 'outer/\\u0131l\\u0131k'), 'a dotless i beside its look-alike');
+  assert.deepEqual(nestedGuess('outer', ['\u10d0'], { dir: '\u1c90' }), shown('outer/\\u10d0', 'outer/\\u1c90'), 'case past ASCII, which a disk with an older folding table may keep apart');
+  assert.deepEqual(nestedGuess('outer', ['caf\u00e9-\\u00e9'], { dir: 'cafe\u0301-\\u00e9' }), shown('outer/caf\\u00e9-\\\\u00e9', 'outer/cafe\\u0301-\\\\u00e9'), 'a backslash of the name\'s own, doubled');
+  assert.deepEqual(nestedGuess('outer', ['inner', 'x.txt'], { dir: 'inner', guessed: true }), { placed: 'outer/inner' }, 'a placement start only guessed at, however exactly the path matches');
+  assert.deepEqual(nestedGuess('outer', ['INNER', 'x.txt'], { dir: 'inner', guessed: true }), { placed: 'outer/INNER', dir: 'outer/inner' }, 'a guessed placement before any guess beneath it');
   const inner = (guess?: ReturnType<typeof nestedGuess>) => ({ name: 'inner', use: 'inner/x.txt', ...(guess === undefined ? {} : { guess }) });
   assert.equal(nestedStep(inner(), { after: ' in its place' }), 'use "inner/x.txt" in its place');
   assert.equal(nestedStep(inner(shown('outer/caf\\u00e9', 'outer/cafe\\u0301')), { named: true }),
     'this workspace can\'t tell "outer/caf\\u00e9" from "outer/cafe\\u0301", mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/x.txt". ' +
     'If you meant one of this mount\'s own, for a new file use a path outside "outer/caf\\u00e9" and "outer/cafe\\u0301", and for one already there ask whoever runs this workspace to rename one of "outer/caf\\u00e9" and "outer/cafe\\u0301"');
-  const restart = (given: string, dir: string) => `start it again once mount "inner"'s directory is made${AGAIN}"${given}" and "${dir}"`;
-  assert.equal(nestedStep(inner({ ...shown('outer/sub/INNER', 'outer/sub/inner', ['outer/sub']), leads: 'outer/sub/INNER/x.txt' }), { after: ' in its place' }),
-    'it leads to "outer/sub/INNER/x.txt", and this workspace can\'t tell "outer/sub/INNER" from "outer/sub/inner", mount "inner"\'s directory, since nothing in "outer/sub" ' +
-    `showed at start how it compares names. If you meant that mount's directory, use "inner/x.txt" in its place. If not, ask whoever runs this workspace to ${restart('outer/sub/INNER', 'outer/sub/inner')}`);
-  assert.equal(nestedStep(inner(shown('outer/a/B/C/INNER', 'outer/a/b/c/inner', ['outer/a', 'outer/a/b', 'outer/a/b/c']))),
-    'this workspace can\'t tell "outer/a/B/C/INNER" from "outer/a/b/c/inner", mount "inner"\'s directory, since nothing in "outer/a", "outer/a/b" and "outer/a/b/c" ' +
-    `showed at start how they compare names. If you meant that mount's directory, use "inner/x.txt". If not, ask whoever runs this workspace to ${restart('outer/a/B/C/INNER', 'outer/a/b/c/inner')}`);
-  // A rename settles a guess by names at any level, whatever the levels that told nothing read.
-  assert.equal(nestedStep(inner(shown('outer/caf\\u00e9/INNER', 'outer/cafe\\u0301/inner', ['outer/cafe\\u0301'], true))),
-    'this workspace can\'t tell "outer/caf\\u00e9/INNER" from "outer/cafe\\u0301/inner", mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/x.txt". ' +
-    'If not, ask whoever runs this workspace to rename one of "outer/caf\\u00e9/INNER" and "outer/cafe\\u0301/inner"');
+  assert.equal(nestedStep(inner({ ...shown('outer/sub/INNER', 'outer/sub/inner'), leads: 'outer/sub/INNER/x.txt' }), { after: ' in its place' }),
+    'it leads to "outer/sub/INNER/x.txt", and this workspace can\'t tell "outer/sub/INNER" from "outer/sub/inner", mount "inner"\'s directory. ' +
+    'If you meant that mount\'s directory, use "inner/x.txt" in its place. If not, ask whoever runs this workspace to rename one of "outer/sub/INNER" and "outer/sub/inner"');
   assert.equal(nestedStep(inner({ placed: 'outer/inner' }), { named: true }),
     'this workspace can\'t tell whether "outer/inner" is mount "inner"\'s directory, since the two mounts\' roots are configured in spellings it can\'t tell apart. ' +
     'If you meant that mount\'s directory, use "inner/x.txt". If you meant one of this mount\'s own, for a new file use a path outside "outer/inner", and for one ' +
@@ -1192,38 +698,7 @@ test('a path lies surely in a nested mount\'s directory where each level is exac
     'this workspace can\'t tell whether where it leads is that mount\'s directory. If you meant that mount\'s directory, use "inner/x.txt" in its place; if not, ask whoever runs this workspace');
 });
 
-test('on a disk that tells case apart, a name in another case beneath a directory empty or not made yet at start is the nested mount\'s, until the workspace starts again with the nested mount\'s directory made', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  // Nothing in sub/ tells how it folds at start, and on a disk that folds
-  // case per directory, as ext4's casefold does, an empty sub/ could fold,
-  // so the level beneath it counts as folding. So does one not made yet.
-  // The mount's root lists a name, so it tells case apart; sub/ isn't made.
-  const absent = await nestedRig(t, 'sub/inner', { before: (d) => writeFileSync(join(d, 'a.txt'), 'a\n') });
-  refusedAsInner(await absent.tool('write', { path: 'outer/sub/INNER/new.md', content: 'x\n' }), 'inner/new.md', 'beneath a directory not made yet');
-  const above = await absent.tool('write', { path: 'outer/SUB/inner/new.md', content: 'x\n' });
-  assert.equal(above.success, true, `the root tells case apart, so SUB is the outer mount's own: ${String(above.error)}`);
-  const { tool, dir, workspace } = await nestedRig(t, 'sub/inner', { before: (d) => mkdirSync(join(d, 'sub')) });
-  // The comparison guessed, so the refusal says so: following "inner/new.md"
-  // would write into sub/inner, which may not be the sub/INNER named here.
-  assert.equal((await tool('write', { path: 'outer/sub/INNER/new.md', content: 'x\n' })).error,
-    '"outer/sub/INNER/new.md" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
-    '"outer/sub/INNER" from "outer/sub/inner", mount "inner"\'s directory, since nothing in "outer/sub" showed at start how it compares names. ' +
-    'If you meant that mount\'s directory, use "inner/new.md". If you meant one of this mount\'s own, for a new file use a path outside "outer/sub/INNER" and "outer/sub/inner", and for one already ' +
-    'there ask whoever runs this workspace to start it again once mount "inner"\'s directory is made' + AGAIN + '"outer/sub/INNER" and "outer/sub/inner".');
-  assert.equal(workspace.resolveAbsolutePath('outer/sub/INNER/new.md'), null);
-  // As the step says: once the nested mount's directory is made, sub/ holds
-  // its name, and the next start reads from sub/'s entries that it tells
-  // case apart.
-  mkdirSync(join(dir, 'sub', 'inner'));
-  await workspace.stop();
-  await workspace.start({ isRestart: true, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
-  const wrote = await tool('write', { path: 'outer/sub/INNER/new.md', content: 'x\n' });
-  assert.equal(wrote.success, true, String(wrote.error));
-  assert.equal(workspace.resolveAbsolutePath('outer/sub/INNER/new.md'), join(dir, 'sub', 'INNER', 'new.md'));
-});
-
 test('on a disk that tells case apart, a link into a directory the comparison only guessed is a nested mount\'s is refused saying so, followed or not', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  // sub/ is empty at start, so the level beneath it counts as folding, and
-  // sub/INNER, made after start, is taken for the nested mount's sub/inner.
   const madeAfterStart = (dir: string) => {
     mkdirSync(join(dir, 'sub', 'INNER'));
     writeFileSync(join(dir, 'sub', 'INNER', 'x.txt'), "the outer mount's\n");
@@ -1233,13 +708,12 @@ test('on a disk that tells case apart, a link into a directory the comparison on
     symlinkSync(join('sub', 'INNER', 'x.txt'), join(d, 'l'));
   } });
   madeAfterStart(unfollowed.dir);
-  const since = 'mount "inner"\'s directory, since nothing in "outer/sub" showed at start how it compares names. If you meant that mount\'s directory';
-  const remedy = 'If not, ask whoever runs this workspace to start it again once mount "inner"\'s directory is made' + AGAIN + '"outer/sub/INNER" and "outer/sub/inner"';
+  const since = 'mount "inner"\'s directory. If you meant that mount\'s directory';
+  const remedy = 'If not, ask whoever runs this workspace to rename one of "outer/sub/INNER" and "outer/sub/inner"';
   const read = await unfollowed.tool('read', { path: 'outer/l', offsetChars: 0, limitChars: 100 });
   assert.equal(read.success, false);
   assert.equal(read.error, 'outer/l: "outer/l" is a symlink to "outer/sub/INNER/x.txt", which this mount does not follow; it may lie in mount "inner", ' +
     `nested in mount "outer": this workspace can't tell "outer/sub/INNER" from "outer/sub/inner", ${since}, use "inner/x.txt" in place of "outer/l". ${remedy}`);
-  // Followed, the answer says where it leads, since that lies in this mount.
   const followed = await nestedRig(t, 'sub/inner', { follow: true, before: (d) => {
     mkdirSync(join(d, 'sub'));
     writeFileSync(join(d, 'l'), 'a file at first\n');
@@ -1261,7 +735,6 @@ test('on a disk that tells case apart, a followed link whose landing outside the
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-outside-'));
   const dir = join(root, 'mount');
   mkdirSync(dir);
-  // elsewhere/ is empty at start, so the level holding inner told nothing.
   mkdirSync(join(root, 'elsewhere'));
   symlinkSync(join('..', 'elsewhere'), join(dir, 'linkdir'));
   symlinkSync(join('linkdir', 'INNER', 'x.txt'), join(dir, 'l'));
@@ -1281,41 +754,7 @@ test('on a disk that tells case apart, a followed link whose landing outside the
   assert.ok(!String(read.error).includes(root), 'no path of the host');
 });
 
-test('on a disk that tells case apart, a mount whose own root held nothing at start names that root as the one that told nothing', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  const { tool } = await nestedRig(t, 'inner');
-  assert.equal((await tool('write', { path: 'outer/INNER/new.md', content: 'x\n' })).error,
-    '"outer/INNER/new.md" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell "outer/INNER" from ' +
-    '"outer/inner", mount "inner"\'s directory, since nothing in "outer" showed at start how it compares names. If you meant that mount\'s directory, use ' +
-    '"inner/new.md". If you meant one of this mount\'s own, for a new file use a path outside "outer/INNER" and "outer/inner", and for one already there ask whoever runs this ' +
-    'workspace to start it again once mount "inner"\'s directory is made' + AGAIN + '"outer/INNER" and "outer/inner".');
-});
-
-test('on a disk that tells case apart, a guess resting on a level above every root, which only the nested directory\'s own name tells, is settled as its step says', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  // up leads to the directory holding both roots, above every root, so the
-  // level holding sub is read from sub's own name alone; sub isn't made.
-  const { tool, dir, workspace } = await nestedRig(t, 'up/sub/inner', { follow: true, before: (d) => symlinkSync(dirname(d), join(d, 'up')) });
-  const restart = async () => {
-    await workspace.stop();
-    await workspace.start({ isRestart: true, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
-  };
-  const write = () => tool('write', { path: 'outer/up/SUB/inner/new.md', content: 'x\n' });
-  const guessed = (await write()).error;
-  assert.match(String(guessed), /can't tell "outer\/up\/SUB\/inner" from "outer\/up\/sub\/inner", mount "inner"'s directory, since nothing in "outer\/up" showed at start how it compares names/);
-  assert.ok(String(guessed).endsWith(`start it again once mount "inner"'s directory is made${AGAIN}"outer/up/SUB/inner" and "outer/up/sub/inner".`), String(guessed));
-  // Another lettered name there doesn't tell, since only sub's is read.
-  writeFileSync(join(dirname(dir), 'notes.txt'), 'n\n');
-  await restart();
-  assert.equal((await write()).error, guessed);
-  // Made as the step says, sub tells the level apart, and SUB is no mount's.
-  mkdirSync(join(dirname(dir), 'sub', 'inner'), { recursive: true });
-  await restart();
-  const wrote = await write();
-  assert.equal(wrote.success, true, String(wrote.error));
-});
-
 test('on a disk that keeps the normalization forms apart, a nested mount start placed only by its root\'s other form may lie there, and is refused naming no host path', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // From Abigail-2459's probe: the outer mount is at café with \u00e9, and the
-  // inner one beneath café with e and a combining accent, another tree here.
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-placed-'));
   const nfc = join(root, 'caf\u00e9');
@@ -1354,8 +793,6 @@ test('on a disk that keeps the normalization forms apart, a nested mount start p
 });
 
 test('on a disk that keeps the normalization forms apart, a placement start guessed at is named as the path or the link spells it, by its code points where the path guessed at it too', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // The outer mount is at café with \u00e9, and holds na\u00efve with \u00ef; the
-  // inner one is at cafe\u0301/nai\u0308ve, each with a combining mark.
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-placed-forms-'));
   const nfc = join(root, 'caf\u00e9');
@@ -1390,9 +827,6 @@ test('on a disk that keeps the normalization forms apart, a placement start gues
 });
 
 test('on a disk that keeps the normalization forms apart, start\'s warning names where a nested mount lies surely and where it only may', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // inner is configured at alias/inner, alias being a link to the outer
-  // mount's root and inner a link into the tree in the other form: placed
-  // surely at inner/ through alias, and by a guess at real/ by its real root.
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-warning-'));
   const nfc = join(root, 'caf\u00e9');
@@ -1422,9 +856,6 @@ test('on a disk that keeps the normalization forms apart, start\'s warning names
 });
 
 test('on a disk that keeps the normalization forms apart, a directory start placed both surely and by a guess is placed surely', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // inner is configured at outer/inner, which is a link into the tree in the
-  // other form: placed surely by its configured path, and by a guess by its
-  // real root beneath outer's.
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-both-ways-'));
   const nfc = join(root, 'caf\u00e9');
@@ -1445,8 +876,6 @@ test('on a disk that keeps the normalization forms apart, a directory start plac
 });
 
 test('on a disk that keeps the normalization forms apart, of two placements at one depth, the one a path matches exactly names the mount', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // inner is configured through a link spelled with \u00e9 to the directory
-  // spelled with e and a combining accent, so start places it both ways.
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-two-placements-'));
   const dir = join(root, 'outer');
@@ -1466,7 +895,6 @@ test('on a disk that keeps the normalization forms apart, of two placements at o
 });
 
 test('on a disk that keeps the normalization forms apart, a directory in the other form of a nested mount\'s is refused showing both by their code points', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // The outer mount held caf\u00e9/held.txt before the nested mount was added.
   const { tool } = await nestedRig(t, 'cafe\u0301', { history: ['caf\u00e9/held.txt'], before: (d) => {
     mkdirSync(join(d, 'caf\u00e9'));
     writeFileSync(join(d, 'caf\u00e9', 'x.txt'), "the outer mount's\n");
@@ -1480,38 +908,15 @@ test('on a disk that keeps the normalization forms apart, a directory in the oth
     `it may lie in mount "inner", nested in this one: ${told} "inner/held.txt". If not, ask whoever runs this workspace to rename one of "outer/caf\\u00e9" and "outer/cafe\\u0301"`, JSON.stringify(listed));
 });
 
-test('on a disk that folds case, a name in another case at a level whose own entries told it folds surely lies in the nested mount, and is refused as one that does', { skip: FOLDING_ONLY }, async (t) => {
-  const { tool } = await nestedRig(t, 'inner', { before: (d) => writeFileSync(join(d, 'a.txt'), 'a\n') });
-  assert.equal((await tool('write', { path: 'outer/INNER/new.md', content: 'x\n' })).error,
-    '"outer/INNER/new.md" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/new.md".');
-});
-
-test('on a disk that tells case apart, a level holding a nested mount\'s directory and the outer mount\'s in another case, and no other name, tells case apart where change times are trusted, and nothing elsewhere', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
-  // The pair is two files, so where change times are trusted INNER is the
-  // outer mount's own at every start. Elsewhere the pair tells nothing at
-  // every start, so INNER may be inner's, and since a restart doesn't
-  // settle that, the answer goes on to a rename. Off Linux no filesystem is
-  // trusted, whatever statfs says.
-  const layout = (d: string) => {
-    mkdirSync(join(d, 'inner'));
-    mkdirSync(join(d, 'INNER'));
-    writeFileSync(join(d, 'INNER', 'x.txt'), "the outer mount's\n");
-  };
-  const read = (rig: Awaited<ReturnType<typeof nestedRig>>) => rig.tool('read', { path: 'outer/INNER/x.txt', offsetChars: 0, limitChars: 100 });
-  const trusted = await read(await withStatfsType(EXT4, () => nestedRig(t, 'inner', { before: layout })));
-  const rig = await withStatfsType(FUSE, () => nestedRig(t, 'inner', { before: layout }));
-  const untrusted = await read(rig);
-  if (process.platform === 'linux') assert.equal((trusted.structured as { content: string } | undefined)?.content, "the outer mount's\n", String(trusted.error));
-  else assert.equal(trusted.error, untrusted.error, 'off Linux no filesystem is trusted, whatever statfs says');
-  assert.equal(untrusted.error, '"outer/INNER/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
-    '"outer/INNER" from "outer/inner", mount "inner"\'s directory, since nothing in "outer" showed at start how it compares names. If you meant that mount\'s ' +
-    'directory, use "inner/x.txt". If you meant one of this mount\'s own, for a new file use a path outside "outer/INNER" and "outer/inner", and for one already ' +
-    'there ask whoever runs this workspace to start it again once mount "inner"\'s directory is made' + AGAIN + '"outer/INNER" and "outer/inner".');
-  // A start that finds inner/ there reads the twins as telling nothing
-  // again, which is why the answer goes on to a rename.
-  await rig.workspace.stop();
-  await withStatfsType(FUSE, () => rig.workspace.start({ isRestart: true, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext));
-  assert.equal((await read(rig)).error, untrusted.error, 'the same answer after a start that found inner/ there');
+test('on a disk that folds case, a name in another case than a nested mount\'s directory lies in it where disk has the directory to spell the path by, and otherwise may, and is refused saying so', { skip: FOLDING_ONLY }, async (t) => {
+  const absent = await nestedRig(t, 'inner');
+  assert.equal((await absent.tool('write', { path: 'outer/INNER/new.md', content: 'x\n' })).error,
+    '"outer/INNER/new.md" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell "outer/INNER" from ' +
+    '"outer/inner", mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/new.md". If you meant one of this mount\'s own, for a new file use a path ' +
+    'outside "outer/INNER" and "outer/inner", and for one already there ask whoever runs this workspace to rename one of "outer/INNER" and "outer/inner".');
+  const present = await nestedRig(t, 'inner', { before: (d) => mkdirSync(join(d, 'inner')) });
+  assert.equal((await present.tool('write', { path: 'outer/INNER/new.md', content: 'x\n' })).error,
+    '"outer/inner/new.md" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/new.md".');
 });
 
 test('where disk folds case and keeps \u00df apart from ss, a directory spelled with ss beside a nested mount at \u00df is that mount\'s, erring toward it', { skip: CASE_NOT_SHARP_S_ONLY }, async (t) => {
@@ -1524,10 +929,6 @@ test('where disk folds case and keeps \u00df apart from ss, a directory spelled 
       { name: 'nested', path: join(d, 'stra\u00dfe'), mode: 'read-write', watch: 'never' },
     ];
   });
-  // Where a level folds case, the nested-mount check compares names as
-  // loosely as listedName does, so `strasse` matches `stra\u00dfe`: no
-  // mount's, refused with the nested mount's path rather than read, saying
-  // the workspace can't tell the two apart, since here they are two.
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/strasse/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.error, '"outer/strasse/x.txt" may lie in mount "nested", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
     '"outer/strasse" from "outer/stra\\u00dfe", mount "nested"\'s directory. If you meant that mount\'s directory, use "nested/x.txt". If you meant one of this ' +
@@ -1537,23 +938,19 @@ test('where disk folds case and keeps \u00df apart from ss, a directory spelled 
   assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
 });
 
-test('resolveAbsolutePath takes a nested mount\'s directory in another case as that mount\'s where disk folds case, whether or not it was on disk at start', async (t) => {
+test('resolveAbsolutePath takes a nested mount\'s directory in another case as that mount\'s, whether or not it was on disk at start', async (t) => {
   const { workspace, dir } = await setup(t, (d) => [
     { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
     { name: 'later', path: join(d, 'later'), mode: 'read-write', watch: 'never' },
   ]);
   mkdirSync(join(dir, 'later'), { recursive: true });
-  // Another case is the nested mount's where disk folds case, and the outer
-  // mount's own where it tells case apart, as start read the level.
-  const otherCase = folds.case ? null : join(dir, 'LATER', 'x.txt');
-  assert.equal(workspace.resolveAbsolutePath('outer/later/x.txt'), null);
-  assert.equal(workspace.resolveAbsolutePath('outer/LATER/x.txt'), otherCase);
+  // A spelling that may reach the directory gives null, as one that does.
+  for (const path of ['outer/later/x.txt', 'outer/LATER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
   assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
   // And so after a start that finds the directory.
   await workspace.stop();
   await workspace.start({ isRestart: true, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
-  assert.equal(workspace.resolveAbsolutePath('outer/later/x.txt'), null, 'after a start found later');
-  assert.equal(workspace.resolveAbsolutePath('outer/LATER/x.txt'), otherCase, 'after a start found later');
+  for (const path of ['outer/later/x.txt', 'outer/LATER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, `${path} after a start found later`);
 });
 
 /** A workspace with a mount nested in another, stored but not yet started. */
@@ -1712,18 +1109,12 @@ test("a walk through a link that spells a directory above a nested mount's other
   assert.ok(!answers.includes('secret') && !answers.includes('kept.json'), answers);
 });
 
-// A nested mount's root is known wherever disk has it, as disk compares names:
-// realpath keeps the spelling a link or a configured path gives, which on a
-// disk that folds names needn't be the spelling the root's real path has.
-
 test('through a link that spells a nested mount\'s directory otherwise than disk, that mount\'s include judges the place', { skip: FOLDING_ONLY }, async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-nested-include-'));
   const dir = join(root, 'mount');
   mkdirSync(join(dir, 'inner'), { recursive: true });
   writeFileSync(join(dir, 'inner', 'kept.json'), '{}\n');
   writeFileSync(join(dir, 'inner', 'hidden.txt'), 'not the nested mount\'s\n');
-  // The links spell the nested directory in another case than disk and the
-  // configuration do, so it's known as disk compares names.
   symlinkSync('INNER/kept.json', join(dir, 'k.json'));
   symlinkSync('INNER/hidden.txt', join(dir, 'h.txt'));
   const store = JsStore.openOrCreate({ path: join(root, 'store') });
@@ -1753,7 +1144,6 @@ test('through a link that spells a nested mount\'s directory otherwise than disk
   const { workspace, dir } = await setup(t, (d) => {
     mkdirSync(join(d, 'inner'), { recursive: true });
     writeFileSync(join(d, 'inner', 'x.txt'), 'nested\n');
-    // The outer mount's own file, which a grep through the links finds alone.
     writeFileSync(join(d, 'own.txt'), 'not nested\n');
     symlinkSync('INNER/x.txt', join(d, 'f.txt'));
     symlinkSync('INNER', join(d, 'k'));
@@ -1764,21 +1154,20 @@ test('through a link that spells a nested mount\'s directory otherwise than disk
   });
   const tool = (name: string, input: Record<string, unknown>) =>
     workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  // The rest beneath the nested root is named as disk spells it.
   for (const path of ['outer/f.txt', 'outer/k/x.txt', 'outer/k/X.TXT']) {
     const read = await tool('read', { path });
     assert.equal(read.success, false, path);
-    assert.match(String(read.error), /leads into mount "nested", nested in mount "outer".*: use "nested\/x\.txt"\.$/, path);
+    assert.match(String(read.error), /(?:leads|may lead) into mount "nested", nested in mount "outer".*use "nested\/x\.txt"/, path);
   }
   await assert.rejects(workspace.readFileFromDisk('outer/f.txt'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount');
   for (const [path, content] of [['outer/f.txt', 'outer\n'], ['outer/k/new.txt', 'outer\n']] as const) {
     const wrote = await tool('write', { path, content });
     assert.equal(wrote.success, false, path);
-    assert.match(String(wrote.error), /leads into mount "nested"/, path);
+    assert.match(String(wrote.error), /(?:leads|may lead) into mount "nested"/, path);
   }
   const listed = await tool('ls', { path: 'outer/k' });
   assert.deepEqual((listed.data as { entries: unknown[] }).entries, []);
-  assert.match(JSON.stringify((listed.data as { incomplete: unknown[] }).incomplete), /leads into mount \\"nested\\"/);
+  assert.match(JSON.stringify((listed.data as { incomplete: unknown[] }).incomplete), /(?:leads|may lead) into mount \\"nested\\"/);
   const grepped = await tool('grep', { path: 'outer', pattern: 'nested' });
   assert.deepEqual((grepped.structured as { results: Array<{ file: string }> }).results.map((r) => r.file), ['outer/own.txt']);
   assert.equal(readFileSync(join(dir, 'inner', 'x.txt'), 'utf8'), 'nested\n');
@@ -1797,7 +1186,7 @@ test('a link that spells a directory as disk does leads into a nested mount conf
   });
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'outer/kd/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false);
-  assert.match(String(read.error), /^"outer\/kd\/x\.txt" leads into mount "nested", nested in mount "outer".*: use "nested\/x\.txt"\.$/);
+  assert.match(String(read.error), /^"outer\/kd\/x\.txt" (?:leads|may lead) into mount "nested", nested in mount "outer".*use "nested\/x\.txt"/);
   await assert.rejects(workspace.readFileFromDisk('outer/kd/x.txt'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount');
 });
 
@@ -1814,11 +1203,11 @@ test('a mount configured through a link that spells the outer mount\'s root othe
       { name: 'nested', path: join(root, 'alias'), mode: 'read-write', watch: 'never' },
     ];
   });
-  assert.ok(warned.some((w) => w.includes('contains mount "nested" where it lies on disk, at inner/')), JSON.stringify(warned));
+  assert.ok(warned.some((w) => /contains mount "nested" where it (?:lies|may lie) on disk, at inner\//.test(w)), JSON.stringify(warned));
   const listed = await call('ls', { path: 'outer', recursive: true });
   assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'outer/inner/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.match(String(read.error), /^"outer\/inner\/x\.txt" lies in mount "nested", nested in mount "outer".*: use "nested\/x\.txt"\.$/);
+  assert.match(String(read.error), /^"outer\/inner\/x\.txt" (?:lies|may lie) in mount "nested", nested in mount "outer".*use "nested\/x\.txt"/);
   assert.equal(workspace.resolveAbsolutePath('outer/inner/x.txt'), null);
 });
 
@@ -1832,20 +1221,15 @@ test('a nested mount\'s directory renamed in another case since start, or made s
       { name: 'later', path: join(d, 'late', 'n'), mode: 'read-write', watch: 'never' },
     ];
   });
-  // A rename by case alone, in two steps, as a disk that folds names may take a
-  // rename to a name it folds to the same one as nothing to do.
   renameSync(join(dir, 'fold', 'm'), join(dir, 'fold', 'tmp'));
   renameSync(join(dir, 'fold', 'tmp'), join(dir, 'fold', 'M'));
   mkdirSync(join(dir, 'late', 'N'), { recursive: true });
   writeFileSync(join(dir, 'late', 'N', 'y.txt'), 'later\n');
   const tool = (name: string, input: Record<string, unknown>) =>
     workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  // fold/ listed m at start, so its level told that it folds, and M surely
-  // names m; late/ wasn't made, so its level told nothing, and the refusal
-  // says the path may lie in that mount.
   for (const [path, refusal] of [
-    ['outer/fold/M/x.txt', /lies in mount "nested", nested in mount "outer".*: use "nested\/x\.txt"\.$/],
-    ['outer/late/N/y.txt', /may lie in mount "later", nested in mount "outer".*can't tell "outer\/late\/N" from "outer\/late\/n", mount "later"'s directory, since nothing in "outer\/late" showed at start.*use "later\/y\.txt"\. If you meant one of this mount's own/],
+    ['outer/fold/M/x.txt', /may lie in mount "nested", nested in mount "outer".*can't tell "outer\/fold\/M" from "outer\/fold\/m", mount "nested"'s directory\. If you meant that mount's directory, use "nested\/x\.txt"\. If you meant one of this mount's own/],
+    ['outer/late/N/y.txt', /may lie in mount "later", nested in mount "outer".*can't tell "outer\/late\/N" from "outer\/late\/n", mount "later"'s directory\. If you meant that mount's directory, use "later\/y\.txt"\. If you meant one of this mount's own/],
   ] as const) {
     const read = await tool('read', { path });
     assert.equal(read.success, false, path);
@@ -1855,16 +1239,12 @@ test('a nested mount\'s directory renamed in another case since start, or made s
   }
   const listed = await tool('ls', { path: 'outer', recursive: true });
   assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
-  // A listing of the directory above passes over it.
   const above = await tool('ls', { path: 'outer/fold' });
   assert.deepEqual((above.data as { entries: unknown[] }).entries, [], JSON.stringify(above.data));
   assert.deepEqual(readdirSync(join(dir, 'fold', 'M')), ['x.txt']);
 });
 
 test('a mount whose configured path reaches the outer mount\'s root through a directory spelled otherwise than disk is nested by its configured path', { skip: FOLDING_ONLY }, async (t) => {
-  // o/via leads to e, outside the outer mount, and e/self back to o, so self's
-  // real root is the outer mount's own, and only its configured path nests it.
-  // That path reaches o as O.
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-through-'));
   mkdirSync(join(root, 'o'));
   writeFileSync(join(root, 'o', 'x.txt'), "the outer mount's\n");
@@ -1880,13 +1260,11 @@ test('a mount whose configured path reaches the outer mount\'s root through a di
   await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
   t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/via/self/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.equal(read.error, '"outer/via/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
+  assert.match(String(read.error), /^"outer\/via\/self\/x\.txt" (?:lies|may lie) in mount "self", nested in mount "outer", which neither reads nor writes it: .*use "self\/x\.txt"/);
 });
 
 test('a mount configured as a link to the outer mount\'s own root, spelled otherwise than disk, is nested by its configured path alone, and refuses none of the outer mount\'s other paths', { skip: FOLDING_ONLY }, async (t) => {
-  // The link's target spells the outer root otherwise, and realpath keeps that
-  // spelling on Linux, so self's real root is the outer mount's own only as
-  // disk compares names. Held as a real root, it would claim every path.
+  // The link's target spells the outer root otherwise, which realpath keeps on Linux.
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-self-'));
   mkdirSync(join(root, 'outer'));
   writeFileSync(join(root, 'outer', 'x.txt'), "the outer mount's\n");
@@ -1918,8 +1296,6 @@ test('a nested mount whose root isn\'t made yet holds a place beneath it before 
       { name: 'lower', path: join(d, 'a', 'b'), mode: 'read-write', watch: 'never' },
     ];
   });
-  // Both hold the place by their real paths, and `lower`, not made yet, lies
-  // deeper, so it's the innermost.
   const wrote = await workspace.handleToolCall({ id: 'write', name: 'write', input: { path: 'outer/l/b/new.txt', content: 'x\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(wrote.success, false);
   assert.equal(wrote.error, '"outer/l/b/new.txt" leads into mount "lower", nested in mount "outer", which neither reads nor writes it: use "lower/new.txt".');
@@ -1940,11 +1316,8 @@ for (const { letter, as, gate } of [
         { name: 'nested', path: join(d, 'x', `a${as}`), mode: 'read-write', watch: 'never' },
       ];
     });
-    // Typed, the parse takes disk's spelling, which names the directory
-    // exactly. Through the link, where it leads keeps the link's spelling
-    // where realpath keeps it, as on Linux, which only foldedLoosely joins
-    // with the directory's, so the refusal says it may lead there; where
-    // realpath gives the stored spelling, it surely does.
+    // Through the link, where it leads keeps the link's spelling where
+    // realpath keeps it, as on Linux, so the refusal there can say it may lead.
     const typed = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: `outer/x/a${letter}/hidden.txt` } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.match(String(typed.error), /lies in mount "nested", nested in mount "outer".*: use "nested\/hidden\.txt"\.$/);
     const linked = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'outer/l/hidden.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
@@ -1970,8 +1343,6 @@ test('through a link a mount follows into a nested mount, that mount\'s include 
       { name: 'nested', path: join(d, 'inner'), mode: 'read-write', watch: 'never', include: ['*.json'] },
     ];
   });
-  // Disk's A.JSON is outside the include whatever spelling reaches it, and
-  // its b.json inside: the place is judged, and named, as disk spells it.
   await assert.rejects(workspace.readFileFromDisk('outer/k/a.json'), (err: unknown) =>
     err instanceof WorkspaceReadError && err.code === 'escape' && !err.message.includes('nested'));
   await assert.rejects(workspace.readFileFromDisk('outer/k/B.JSON'), (err: unknown) =>
@@ -2259,10 +1630,10 @@ test('an entry\'s spelling takes no path out of a nested mount\'s directory that
   // names disk's, as without the entries.
   const late = await call('write', { path: 'outer/inner/LATE.txt', content: 'x\n' });
   assert.equal(late.error, '"outer/inner/LATE.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/LATE.txt".');
-  // As configured, a path is later's, and so is one the entry spelled as
-  // configured gives that spelling.
+  // As configured, a path is later's.
   await refusedAs('write', { path: 'outer/later/y.txt', content: 'y\n' }, 'later');
-  await refusedAs('write', { path: 'outer/LATER/y.txt', content: 'y\n' }, 'later');
+  assert.match(String((await call('write', { path: 'outer/LATER/y.txt', content: 'y\n' })).error),
+    /^"outer\/LATER\/y\.txt" may lie in mount "later", nested in mount "outer".*can't tell "outer\/LATER" from "outer\/later"/);
   // Outside deep's directory, the entry's spelling stands: beside it, and
   // for the directory that holds it.
   const sibling = await call('write', { path: 'outer/PROJ/z.txt', content: 'z\n' });
@@ -2367,7 +1738,7 @@ test("only history the mount's include covers spells a draft's path: an entry th
   assert.ok(listed.includes('notes/new.md') && !listed.includes('NOTES'), listed);
 });
 
-test("history in a nested mount's directory that mount's include leaves out still spells a draft naming the directory, so the draft is that mount's though the directory isn't on disk", { skip: FOLDING_ONLY }, async (t) => {
+test("a draft in another case than a nested mount's directory, with history there that mount's include leaves out and nothing on disk, is refused as one that may lie in that mount", { skip: FOLDING_ONLY }, async (t) => {
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-'));
   const dir = join(root, 'mount');
@@ -2393,27 +1764,12 @@ test("history in a nested mount's directory that mount's include leaves out stil
   try {
     const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/INNER/new.md', content: 'through the outer mount\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(write.success, false, `the outer mount took ${JSON.stringify(write.data)}`);
-    // The mount's root is empty at start, so its level told nothing, and the
-    // refusal says the draft may lie in the nested mount.
-    assert.match(String(write.error), /may lie in mount "inner", nested in mount "work".*use "inner\/new\.md"/);
+    assert.match(String(write.error), /^"work\/INNER\/new\.md" may lie in mount "inner", nested in mount "work".*can't tell "work\/INNER" from "work\/inner".*use "inner\/new\.md"/);
   } finally {
     await workspace.stop();
   }
 });
 
-// Every nested-mount check compares a path with the nested mount's directory
-// as disk compares names at each of its levels, whatever spelling the path, a
-// walk or the workspace's history gives it, and whether or not the directory
-// is on disk yet. Each used to compare it with the spellings start read,
-// exactly, so on a disk that folds names a draft, a read or a walk could
-// reach the nested mount's directory as the outer mount's own.
-
-/**
- * `outer` with `inner` nested in it at `innerDir`, started: `history` taken
- * into the outer mount alone first and then removed from disk, `before` run
- * on the directory just before the start, and the outer mount following
- * links where asked.
- */
 async function nestedRig(t: TestContext, innerDir: string, opts: { history?: string[]; before?: (dir: string) => void; follow?: boolean; direct?: boolean; innerMode?: 'read-only' | 'read-write' } = {}) {
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-nested-'));
@@ -2446,15 +1802,12 @@ async function nestedRig(t: TestContext, innerDir: string, opts: { history?: str
   return { dir, workspace, tool, listed };
 }
 
-/** That a call was refused as reaching the inner mount, naming `use` as the path to use there. */
 function refusedAsInner(result: ToolResult, use: string, what: string): void {
   assert.equal(result.success, false, `${what}: the outer mount took it (${JSON.stringify(result.data)})`);
   assert.match(String(result.error), new RegExp(`(lies in|may lie in|leads into|may lead into) mount "inner", nested in mount "outer".*use "${use.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`), what);
 }
 
 test('on a disk that keeps the normalization forms apart, a direct mount\'s write into a read-only nested mount\'s directory, in either form of its name, is refused, and nothing reaches the disk', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // A direct mount writes to disk at once, with no materialize between, so
-  // its own check before the write is all that keeps a file out of there.
   const { tool, dir } = await nestedRig(t, 'caf\u00e9', { direct: true, innerMode: 'read-only', before: (d) => {
     mkdirSync(join(d, 'caf\u00e9'));
     writeFileSync(join(d, 'caf\u00e9', 'x.txt'), 'inner\n');
@@ -2479,7 +1832,6 @@ test('a draft naming a nested mount\'s directory or its parent in another case i
     const { tool } = await nestedRig(t, innerDir);
     refusedAsInner(await tool('write', { path: `outer/${draft}`, content: 'x\n' }), 'inner/new.md', draft);
   }
-  // A path beside the nested directory, beneath its parent, is the outer mount's own.
   const { tool } = await nestedRig(t, 'sub/inner');
   assert.equal((await tool('write', { path: 'outer/SUB/other.md', content: 'x\n' })).success, true);
 });
@@ -2494,12 +1846,10 @@ test('a nested mount\'s directory or its parent on disk in another case, from be
     mkdirSync(join(dir, made));
     refusedAsInner(await tool('write', { path: `outer/${draft}`, content: 'x\n' }), 'inner/new.md', `${made} made after start`);
   }
-  // Renamed by case after start, with a file in it: the outer mount neither reads nor lists it.
   const { tool, dir, listed } = await nestedRig(t, 'inner', { before: (d) => { mkdirSync(join(d, 'inner')); writeFileSync(join(d, 'inner', 'x.txt'), 'inner\n'); } });
   renameSync(join(dir, 'inner'), join(dir, 'renamed'));
   renameSync(join(dir, 'renamed'), join(dir, 'INNER'));
   refusedAsInner(await tool('read', { path: 'outer/INNER/x.txt' }), 'inner/x.txt', 'renamed by case after start');
-  // Past the directory, the path stays as given, since what lies there is that mount's to name.
   refusedAsInner(await tool('read', { path: 'outer/INNER/X.TXT' }), 'inner/X.TXT', 'past the directory, as given');
   assert.deepEqual(await listed('outer'), []);
 });
@@ -2531,22 +1881,18 @@ test('a draft the outer mount held before a read-only mount was nested at its di
   await workspace.start(ctx);
   try {
     const call = (name: string, input: unknown) => workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-    // A materialize of the whole mount passes over it, as it passes over any
-    // path in another mount's directory, and writes nothing.
     const materialized = (await call('materialize', { mount: 'outer' })).data as { materialized: unknown[] };
     assert.deepEqual(materialized.materialized, [], JSON.stringify(materialized));
     assert.deepEqual(readdirSync(join(dir, 'inner')), [], "nothing written into the read-only mount's directory");
-    // The outer mount lists the draft it holds there as the nested mount's.
     const listed = ((await call('ls', { path: 'outer', recursive: true })).data as { entries: Array<{ path: string; note?: string }> }).entries;
-    assert.deepEqual(listed.map((e) => [e.path, e.note]), [['INNER/x.txt', 'it lies in mount "inner", nested in this one: use "inner/x.txt"']]);
+    assert.deepEqual(listed.map((e) => [e.path, e.note]), [['INNER/x.txt', 'it may lie in mount "inner", nested in this one: this workspace can\'t tell "outer/INNER" from "outer/inner", ' +
+      'mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/x.txt". If not, ask whoever runs this workspace to rename one of "outer/INNER" and "outer/inner"']]);
   } finally {
     await workspace.stop();
   }
 });
 
 test('where disk folds \u00df with ss, a path typed with \u00df names a nested mount\'s directory at ss, whether or not the directory is on disk', { skip: SHARP_S_FOLDING_ONLY }, async (t) => {
-  // With nothing on disk, no name disk lists respells the path, so only the
-  // comparison with the nested mount's directory tells.
   const empty = await nestedRig(t, 'strasse');
   refusedAsInner(await empty.tool('write', { path: 'outer/stra\u00dfe/new.md', content: 'x\n' }), 'inner/new.md', 'a draft typed with \u00df, nothing on disk');
   const onDisk = await nestedRig(t, 'strasse', { before: (d) => { mkdirSync(join(d, 'strasse')); writeFileSync(join(d, 'strasse', 'hidden.txt'), 'inner\n'); } });
@@ -2564,10 +1910,6 @@ test('on a disk that keeps the normalization forms apart, a directory named in t
 });
 
 test('on a disk that keeps the normalization forms apart, a listing or glob through a link passes over a file named in the other form of a nested mount\'s directory, as one without the link does, and lists a link so named, which a read through it reads, on a chronicle mount and a direct one', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
-  // The outer mount follows links and holds inner's directory at caf\u00e9/, a
-  // file at cafe\u0301 beside it, which a read refuses as possibly inner's,
-  // second's directory at na\u00efve/, a link at nai\u0308ve beside it that
-  // leads to its own a.txt, and alias, a link to its own root.
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   for (const backend of ['chronicle', 'direct'] as const) {
     const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-alias-'));

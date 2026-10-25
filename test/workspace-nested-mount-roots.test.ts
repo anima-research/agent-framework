@@ -695,9 +695,9 @@ describe('the checks where disk is acted on, called directly as a push and a rea
     symlinkSync(env.at('outer/a/b/x.txt'), env.at('outer/flink.txt'));
     // Cast, so the file also compiles against code whose nested mounts carry
     // no real root, for the run of these tests on it.
-    const nested = [{ dir: 'a/b', folds: [false, false], name: 'inner', real: realpathSync(env.at('outer/a/b')) }];
+    const nested = [{ dir: 'a/b', name: 'inner', real: realpathSync(env.at('outer/a/b')) }];
     const view = {
-      root: env.at('outer'), name: 'outer', followSymlinks: true, maxFileSize: 1 << 20, ignore: [], others: [{ dir: 'a/b', folds: [false, false] }], nested,
+      root: env.at('outer'), name: 'outer', followSymlinks: true, maxFileSize: 1 << 20, ignore: [], others: ['a/b'], nested,
     } as MountView;
     return { env, view, rootReal: realpathSync(env.at('outer')) };
   }
@@ -730,7 +730,7 @@ describe('the checks where disk is acted on, called directly as a push and a rea
   test('a directory made for a push isn\'t made where a link leads into a nested mount\'s root not made yet (G3)', async (t) => {
     const { env, view, rootReal } = rig(t);
     symlinkSync(env.at('outer/a'), env.at('outer/l'));
-    const nested = [{ dir: 'a/c', folds: [false, false], name: 'later', real: join(realpathSync(env.at('outer/a')), 'c') }];
+    const nested = [{ dir: 'a/c', name: 'later', real: join(realpathSync(env.at('outer/a')), 'c') }];
     const later = { ...view, nested } as MountView;
     assert.deepEqual(await checkDir(later, rootReal, 'l/c/d', { create: true }), {
       kind: 'unobserved', reason: '"outer/l/c" leads into mount "later", nested in mount "outer": use "later" in its place',

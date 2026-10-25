@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, includePatternReadable, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, ownCaseFolding, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, realSegments, restBeneath, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type Folding, type LinkFound, type MountView, type NestedDir, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, includePatternReadable, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, realSegments, restBeneath, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -230,8 +230,7 @@ class OutsideIncludeError extends Error {
 /**
  * A file operation's path lies in another mount's directory nested in the
  * mount it names. The message names the mount that holds it and the path to
- * use there, and, where the path lies there only by the comparison's guess,
- * says it may, with what the workspace can't tell apart (nestedStep).
+ * use there.
  */
 class NestedMountError extends Error {
   constructor(path: string, mount: string, holder: { name: string; use: string; guess?: NestedGuess }, how: 'lies in' | 'leads into' = 'lies in') {
@@ -422,41 +421,29 @@ function ancestorsOf(path: string): string[] {
  * directory as configured beneath the outer mount's configured path
  * (`outerPath`), beneath each directory above its configured path that is
  * the outer root on disk (`above`, each with where it lies on disk), and
- * where its real root lies beneath the outer root, each real path compared
- * as disk compares names (sameRoot, beneathRoot), level by level as each
- * real root's folding was read (`outer` and `inner`), with whether that
- * match was sure (surelyAtRoot): a configured path's is, and a directory
- * placed more than one way is placed surely if one way is. Each directory
- * comes with how disk compares names at each of its levels, read beneath
- * `readAt`, from a listing only where a level lies at or beneath one of
- * `roots` (levelFolds). Its real root is claimed where it doesn't hold the
- * outer root, which it would otherwise claim whole. Undefined where it's
- * nested nowhere.
+ * where its real root (`real`) lies beneath the outer root (`outerReal`).
+ * Its real root is claimed where it doesn't hold the outer root, which it
+ * would otherwise claim whole. Undefined where it's nested nowhere.
  */
-async function placementOf(
+function placementOf(
   outerPath: string,
-  outer: { real: string; folds: Folding },
+  outerReal: string,
   innerPath: string,
-  inner: { real: string; folds: Folding },
+  real: string,
   above: ReadonlyArray<{ dir: string; real: string }>,
-  readAt: string,
-  roots: readonly string[],
-): Promise<{ configured: string | undefined; fromRoots: NestedMountEntry['fromRoots']; claims: boolean } | undefined> {
+): { configured: string | undefined; fromRoots: NestedMountEntry['fromRoots']; claims: boolean } | undefined {
   const configured = nestedDir(outerPath, innerPath);
   const dirs = new Map<string, boolean>();
   const place = (dir: string | undefined, sure: boolean) => { if (dir !== undefined) dirs.set(dir, (dirs.get(dir) ?? false) || sure); };
   place(configured, true);
   for (const a of above) {
-    if (sameRoot(a.real, outer.real, outer.folds)) place(nestedDir(a.dir, innerPath), surelyAtRoot(a.real, outer.real, outer.folds));
+    if (sameRoot(a.real, outerReal)) place(nestedDir(a.dir, innerPath), surelyAtRoot(a.real, outerReal));
   }
-  const below = beneathRoot(inner.real, outer.real, outer.folds);
-  place(below, below !== undefined && surelyAtRoot(inner.real, outer.real, outer.folds));
+  const below = beneathRoot(real, outerReal);
+  place(below, below !== undefined && surelyAtRoot(real, outerReal));
   if (dirs.size === 0) return undefined;
-  const fromRoots: NestedMountEntry['fromRoots'] = [];
-  for (const [dir, sure] of dirs) {
-    fromRoots.push({ dir, folds: await levelFolds(readAt, dir.split('/'), roots), ...(sure ? {} : { guessed: true as const }) });
-  }
-  const claims = !sameRoot(outer.real, inner.real, inner.folds) && beneathRoot(outer.real, inner.real, inner.folds) === undefined;
+  const fromRoots: NestedMountEntry['fromRoots'] = [...dirs].map(([dir, sure]) => ({ dir, ...(sure ? {} : { guessed: true as const }) }));
+  const claims = !sameRoot(outerReal, real) && beneathRoot(outerReal, real) === undefined;
   return { configured, fromRoots, claims };
 }
 
@@ -465,64 +452,12 @@ interface NestedMountEntry {
   name: string;
   /**
    * Its real root, as realBeneath places it once a start has read it, and
-   * its root as resolved until then, with how disk compares names at each
-   * of its levels (`realFolds`, NestedMount's). None where it's the outer
-   * mount's own or holds it (NestedMount).
+   * its root as resolved until then. None where it's the outer mount's own
+   * or holds it (NestedMount).
    */
   real?: string;
-  realFolds?: Folding;
-  /**
-   * Its directory as configured and as the real roots place it, each with
-   * how disk compares names at each of its levels, and whether the real
-   * roots place it there only by a guess (NestedDir).
-   */
-  fromRoots: Array<{ dir: string; folds: Folding; guessed?: true }>;
-}
-
-/**
- * Whether the directory holding each of `segments`, read from `base`, folds
- * case, as its own entries tell (ownCaseFolding): `base` for the first, and
- * for each after it the directory the segments before it name. Null where
- * its own entries tell nothing, as for a directory that is empty, holds no
- * name with a letter a-z or A-Z, or isn't made yet, which the comparison
- * counts as folding (Folding): a level that tells case apart is told so by
- * its own entries. That's where the directory lies on disk at or beneath one
- * of `roots`, mounts' real roots, whose own walks read it; one above every
- * root, as a link on the way can lead, is read from the segment it holds
- * alone, with nothing listed (realLevelFolds). `canonical` says `base` and
- * the segments already name where each directory lies.
- */
-async function levelFolds(base: string, segments: readonly string[], roots: readonly string[], canonical = false): Promise<(boolean | null)[]> {
-  const folds: (boolean | null)[] = [];
-  for (let i = 0; i < segments.length; i++) {
-    const dir = join(base, ...segments.slice(0, i));
-    const real = canonical ? dir : await realBeneath(dir);
-    folds.push(await (roots.some((r) => isContainedPath(r, real)) ? ownCaseFolding(dir) : ownCaseFolding(dir, segments[i])));
-  }
-  return folds;
-}
-
-/**
- * levelFolds for a canonical path, level by level from the filesystem's
- * root, one for each segment as realSegments splits it: each of the root's
- * own segments, which no directory holds, is taken to fold, as a UNC
- * share's names do. A directory at or beneath one of `roots`, mounts' real
- * roots, is read from its entries, as the mount's own walk reads it and as
- * fromRoots' levels are. One above every root is read from the path's own
- * segment there alone: that name, its flipped spelling, and the name again,
- * and where the flipped spelling finds another directory, the name with its
- * first letter's case alone flipped, with nothing listed, so no name off the
- * path is looked up but those spellings of a segment, which reach another
- * filesystem only where a sibling of exactly such a name is itself a
- * mountpoint. There a segment with no letter a-z or A-Z, or one not there
- * yet, tells nothing, and a directory bind-mounted at its own flipped name,
- * on a disk that tells case apart, reads as folding; each fails closed, as a
- * level that told nothing does.
- */
-async function realLevelFolds(real: string, roots: readonly string[]): Promise<(boolean | null)[]> {
-  const { root } = parse(real);
-  const rest = real.slice(root.length);
-  return [...realSegments(root).map(() => true), ...await levelFolds(root, rest === '' ? [] : rest.split(sep), roots, true)];
+  /** Its directory as configured and as the real roots place it. */
+  fromRoots: Array<{ dir: string; guessed?: true }>;
 }
 
 /**
@@ -1035,13 +970,11 @@ export class WorkspaceModule implements Module {
   private ctimeTrust = new Map<string, string | null>();
   /**
    * Each mount's directories that are other mounts nested inside it, with
-   * each mount's name and real root, where each is placed: as configured, and
-   * where the real roots place it, where that differs (`fromRoots`), each
-   * with how disk compares names at each of its levels (NestedDir). Each is
-   * mount-relative and `/`-separated. The constructor nests by configured
-   * path, with each root as resolved standing for its real one and every
-   * level folding, and each start reads it all again with the roots placed
-   * where disk has them (readNesting).
+   * each mount's name and real root: as configured, and as the real roots
+   * place it, where that differs (`fromRoots`). Each is mount-relative and
+   * `/`-separated. The constructor nests by configured path, with each root
+   * as resolved standing for its real one, and each start reads it all again
+   * with the roots placed where disk has them (readNesting).
    */
   private otherMounts = new Map<string, NestedMountEntry[]>();
   /** Whether each mount's root folds case (foldsCase), where disk has it, as the last start read it. */
@@ -1050,8 +983,6 @@ export class WorkspaceModule implements Module {
   private placedRoots = new Map<string, string>();
   /** Each directory above each mount's configured path, with where the last start found it on disk (readNesting's `above`). */
   private placedAbove = new Map<string, Array<{ dir: string; real: string }>>();
-  /** How disk compares names at each level of each mount's real root, as the last start read it (readNesting's `realFolds`). */
-  private placedFolds = new Map<string, Folding>();
   /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
@@ -1144,9 +1075,7 @@ export class WorkspaceModule implements Module {
         const innerPath = resolve(inner.path);
         const dir = nestedDir(outerPath, innerPath);
         if (dir === undefined) continue;
-        // Until a start reads how disk compares names at each of its
-        // levels, none has told, so each counts as folding (Folding).
-        const configured = [{ dir, folds: dir.split('/').map(() => null) }];
+        const configured = [{ dir }];
         this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, real: innerPath, fromRoots: configured }]);
         console.warn(
           `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
@@ -1390,7 +1319,7 @@ export class WorkspaceModule implements Module {
     const rootReal = await realpath(root).catch(() => root);
     const view = { ...this.viewOf(mount, undefined), root: rootReal };
     const moved = await this.movedNesting(mount, rootReal);
-    return { view: moved === null ? view : { ...view, nested: moved, others: moved }, rootReal, moved };
+    return { view: moved === null ? view : { ...view, nested: moved, others: moved.map((n) => n.dir) }, rootReal, moved };
   }
 
   /** The view reconciliation needs of a mount, refreshed per pass. */
@@ -1490,13 +1419,12 @@ export class WorkspaceModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     // Which mounts are nested where, with the roots placed where disk has
-    // them and how disk compares names at each level of each nested mount's
-    // directory, and whether each mount's root folds case, read where disk
-    // has it, before this start sets anything, so a restart takes no call
+    // them, and whether each mount's root folds case, read where disk has
+    // it, before this start sets anything, so a restart takes no call
     // and walks or watches nothing before they're known. A stop begun
     // meanwhile stands, and this start then sets nothing.
     const stops = this.stopsBegun;
-    const { nesting, reals, above, realFolds } = await this.readNesting();
+    const { nesting, reals, above } = await this.readNesting();
     const rootFoldsCase = new Map<string, boolean>();
     for (const mount of this.config.mounts) rootFoldsCase.set(mount.name, await foldsCase(reals.get(mount.name)!));
     if (this.stopsBegun !== stops) return;
@@ -1504,7 +1432,6 @@ export class WorkspaceModule implements Module {
     this.rootFoldsCase = rootFoldsCase;
     this.placedRoots = reals;
     this.placedAbove = above;
-    this.placedFolds = realFolds;
 
     this.ctx = ctx;
     this.stopped = false;
@@ -2388,15 +2315,15 @@ export class WorkspaceModule implements Module {
    */
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
-      // Synchronous, so the path as given. The nested-mount check compares
-      // it with each nested mount's directory as disk compares names at each
-      // level, as every tool's does (holderOf). The include judges it as
-      // given, so on a disk that folds names a covered name whose file disk
-      // spells otherwise returns that file's path, which the tools refuse,
-      // and a covered file named in another case is null, which the tools
-      // read. A path the mount doesn't hold, outside its include or in
-      // another mount's directory nested in it, is null, as for a path that
-      // leaves the mount's directory.
+      // Synchronous, so the path as given. The nested-mount check takes it
+      // in any spelling a disk that folds names may fold to the nested
+      // mount's directory, erring toward that mount (holderOf). The include
+      // judges it as given, so on a disk that
+      // folds names a covered name whose file disk spells otherwise returns
+      // that file's path, which the tools refuse, and a covered file named in
+      // another case is null, which the tools read. A path the mount doesn't
+      // hold, outside its include or in another mount's directory nested in
+      // it, is null, as for a path that leaves the mount's directory.
       const { mount, relativePath } = this.refuseNotHeld({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath }, mountPrefixedPath);
       return resolve(mount.config.path, relativePath);
     } catch {
@@ -2642,13 +2569,9 @@ export class WorkspaceModule implements Module {
     }
   }
 
-  /**
-   * The directories of the mounts nested inside a mount, mount-relative,
-   * where each is placed, with how disk compares names at each level
-   * (NestedDir).
-   */
-  private othersOf(mountName: string): NestedDir[] {
-    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.fromRoots.map((s) => ({ dir: s.dir, folds: s.folds })));
+  /** The directories of the mounts nested inside a mount, mount-relative. */
+  private othersOf(mountName: string): string[] {
+    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.fromRoots.map((s) => s.dir));
   }
 
   /**
@@ -2664,19 +2587,13 @@ export class WorkspaceModule implements Module {
    * alone, with no real root, since through it it would claim the other's
    * every path.
    *
-   * Each way it lies there places its directory (`fromRoots`), read with
-   * whether the directory holding each of its levels folds case, as is its
-   * real root from the filesystem's root, above every root from the path's
-   * own names alone (realLevelFolds). So every check compares a path
-   * with it as disk compares names (NestedDir), whatever spelling the path,
-   * a walk or the workspace's history gives it, and whether or not the
-   * directory is on disk yet. Each mount's real root comes back beside the
-   * nesting (`reals`), for what start reads there, and each directory above
-   * each configured path with where it lies on disk (`above`), and how disk
-   * compares names at each level of each real root (`realFolds`), for a
-   * direct mount whose root moves (movedNesting).
+   * Each way it lies there is a spelling of its directory (`fromRoots`).
+   * Each mount's real root comes back beside the nesting (`reals`), for what
+   * start reads there, and each directory above each configured path with
+   * where it lies on disk (`above`), for a direct mount whose root moves
+   * (movedNesting).
    */
-  private async readNesting(): Promise<{ nesting: Map<string, NestedMountEntry[]>; reals: Map<string, string>; above: Map<string, Array<{ dir: string; real: string }>>; realFolds: Map<string, Folding> }> {
+  private async readNesting(): Promise<{ nesting: Map<string, NestedMountEntry[]>; reals: Map<string, string>; above: Map<string, Array<{ dir: string; real: string }>> }> {
     const reals = new Map<string, string>();
     // Each directory above a mount's configured path, with where it lies on
     // disk, so a path that reaches another mount's root through a link, as
@@ -2689,26 +2606,17 @@ export class WorkspaceModule implements Module {
       for (const dir of ancestorsOf(given)) dirs.push({ dir, real: await realBeneath(dir) });
       above.set(mount.name, dirs);
     }
-    // How disk compares names at each level of each real root, so one real
-    // path is found beneath another as disk finds it: realpath keeps the
-    // spelling a link or a configured path gives, which on a disk that folds
-    // names need not be the other root's.
-    const realFolds = new Map<string, Folding>();
-    const roots = [...reals.values()];
-    for (const mount of this.config.mounts) realFolds.set(mount.name, await realLevelFolds(reals.get(mount.name)!, roots));
     const nesting = new Map<string, NestedMountEntry[]>();
     for (const outer of this.config.mounts) {
       const outerPath = resolve(outer.path);
       const outerReal = reals.get(outer.name)!;
-      const outerFolds = realFolds.get(outer.name)!;
       for (const inner of this.config.mounts) {
         if (outer === inner) continue;
         const real = reals.get(inner.name)!;
-        const innerFolds = realFolds.get(inner.name)!;
-        const at = await placementOf(outerPath, { real: outerReal, folds: outerFolds }, resolve(inner.path), { real, folds: innerFolds }, above.get(inner.name)!, outerPath, roots);
+        const at = placementOf(outerPath, outerReal, resolve(inner.path), real, above.get(inner.name)!);
         if (at === undefined) continue;
         const { configured, fromRoots, claims } = at;
-        nesting.set(outer.name, [...(nesting.get(outer.name) ?? []), { name: inner.name, ...(claims ? { real, realFolds: innerFolds } : {}), fromRoots }]);
+        nesting.set(outer.name, [...(nesting.get(outer.name) ?? []), { name: inner.name, ...(claims ? { real } : {}), fromRoots }]);
         const placed = fromRoots.filter((s) => s.dir !== configured);
         if (placed.length > 0) {
           const at = (sure: boolean) => placed.filter((s) => !s.guessed === sure).map((s) => `${s.dir}/`).join(' and ');
@@ -2717,17 +2625,16 @@ export class WorkspaceModule implements Module {
         }
       }
     }
-    return { nesting, reals, above, realFolds };
+    return { nesting, reals, above };
   }
 
   /**
-   * The mounts nested in `mountName`, by directory where each is placed,
-   * name, real root where it has one, and include (MountView's `nested`),
-   * each with how disk compares names at each level (NestedMount).
+   * The mounts nested in `mountName`, by directory, name, real root where it
+   * has one, and include (MountView's `nested`).
    */
   private nestedOf(mountName: string): NestedMount[] {
     return (this.otherMounts.get(mountName) ?? []).flatMap((o) =>
-      o.fromRoots.map((s) => ({ dir: s.dir, folds: s.folds, ...(s.guessed ? { guessed: s.guessed } : {}), name: o.name, real: o.real, realFolds: o.realFolds, include: this.mounts.get(o.name)?.config.include })));
+      o.fromRoots.map((s) => ({ dir: s.dir, ...(s.guessed ? { guessed: s.guessed } : {}), name: o.name, real: o.real, include: this.mounts.get(o.name)?.config.include })));
   }
 
   /**
@@ -2766,33 +2673,26 @@ export class WorkspaceModule implements Module {
    * directory, and one repointed between a direct write's parse and its
    * staging can have the write land there. Each mount is placed as a start
    * places it (placementOf), from where its real root and the directories
-   * above its configured path lie on disk, and how disk compares names at
-   * each level of its real root and this one's. For a mount configured at this mount's own path or beneath it,
+   * above its configured path lie on
+   * disk. For a mount configured at this mount's own path or beneath it,
    * that's where they lie now: beneath `rootReal` where they lie beneath this
    * mount's path, and the directories above this mount's path as resolving
    * that path finds them. For any other mount, it's where the last start
    * found them. Each carries its own include, as nestedOf gives it. It
    * resolves nothing but the directories on this mount's own configured path
-   * and those beneath its root, and reads each level's folding of this root's
-   * real path, and of such a mount's, above every root from the path's own
-   * name there, that name flipped and the name again, and where the flipped
-   * name finds another directory, with its first letter's case alone flipped,
-   * with nothing listed, and at or beneath a root as that mount's own walk
-   * reads it (realLevelFolds), so a share elsewhere that doesn't answer holds
-   * only its own calls, unless such a directory is a link into it, where
-   * that mount's files lie, a sibling named exactly as one of those spellings
-   * is its mountpoint, or it's mounted in a directory that lies in a mount's
-   * root, which that mount's own walks read too. What it leaves to the next start:
-   * a mount configured elsewhere whose own root has moved since, as when a
-   * link on its configured path is repointed, this mount's own reached
-   * through another link among them, that mount's spellings through other
-   * links, and the other mounts' own placements, so a direct root moved into
-   * another mount's directory is that mount's too, as a nested mount's root
-   * moved while running stays placed.
+   * and those beneath its root, so a share elsewhere that doesn't answer
+   * holds only its own calls, unless such a directory is a link into it,
+   * where that mount's files lie. What it leaves to the next start: a mount
+   * configured elsewhere whose own root has moved since, as when a link on
+   * its configured path is repointed, this mount's own reached through
+   * another link among them, that mount's spellings through other links, and
+   * the other mounts' own placements, so a direct root moved into another
+   * mount's directory is that mount's too, as a nested mount's root moved
+   * while running stays placed.
    */
   private async movedNesting(mount: MountState, rootReal: string): Promise<NestedMount[] | null> {
     // One start's placements, whatever a start in the meantime sets.
-    const { placedRoots, placedAbove, placedFolds } = this;
+    const { placedRoots, placedAbove } = this;
     const placed = placedRoots.get(mount.config.name);
     if (!mount.direct || placed === undefined || placed === rootReal) return null;
     const there = await stat(rootReal).then(() => true, (err: unknown) => {
@@ -2806,44 +2706,38 @@ export class WorkspaceModule implements Module {
     // resolved as resolving the path itself does.
     let ownAbove: Array<{ dir: string; real: string }> | undefined;
     const aboveOwn = async () => ownAbove ??= await Promise.all(ancestorsOf(outerPath).map(async (dir) => ({ dir, real: await realBeneath(dir) })));
-    // Where each other mount lies: one configured on this mount's own path,
-    // or beneath it, where that path now leads, its real root and each
-    // directory above it resolved now, beneath this root where they lie
-    // beneath it; any other where the last start found it and the
-    // directories above its path. One leading here only since, as through
-    // this mount's own link, waits for the next start.
-    const lying: Array<{ inner: MountConfig; innerPath: string; real: string; now: boolean; above: ReadonlyArray<{ dir: string; real: string }> }> = [];
     for (const inner of this.config.mounts) {
       if (inner.name === mount.config.name) continue;
       const innerPath = resolve(inner.path);
       const configured = nestedDir(outerPath, innerPath);
+      let real: string | undefined;
+      let above: ReadonlyArray<{ dir: string; real: string }>;
       if (configured !== undefined || innerPath === outerPath) {
+        // A mount configured on this mount's own path, or beneath it, lies
+        // where that path now leads: its real root, and each directory above
+        // it, resolved now, beneath this root where they lie beneath it.
         const segments = configured?.split('/') ?? [];
+        real = await realBeneath(join(rootReal, ...segments));
         const beneath: Array<{ dir: string; real: string }> = [];
         for (let i = segments.length - 1; i >= 1; i--) {
           beneath.push({ dir: join(outerPath, ...segments.slice(0, i)), real: await realBeneath(join(rootReal, ...segments.slice(0, i))) });
         }
         // This mount's own path, which is the root, would add only the
         // configured directory, which placementOf adds anyway.
-        lying.push({ inner, innerPath, real: await realBeneath(join(rootReal, ...segments)), now: true, above: [...beneath, ...await aboveOwn()] });
+        above = [...beneath, ...await aboveOwn()];
       } else {
-        const real = placedRoots.get(inner.name);
-        if (real !== undefined) lying.push({ inner, innerPath, real, now: false, above: placedAbove.get(inner.name) ?? [] });
+        // Any other mount lies where the last start found it and the
+        // directories above its path. One leading here only since, as
+        // through this mount's own link, waits for the next start.
+        real = placedRoots.get(inner.name);
+        if (real === undefined) continue;
+        above = placedAbove.get(inner.name) ?? [];
       }
-    }
-    // How disk compares names at each level of this root, and of each mount
-    // configured on or beneath its path, read now, listing only at or beneath
-    // the roots: this one and the others' where they lie as placed above. Any
-    // other mount keeps the folding the last start read.
-    const roots = [rootReal, ...lying.map((l) => l.real)];
-    const rootFolds = await realLevelFolds(rootReal, roots);
-    for (const { inner, innerPath, real, now, above } of lying) {
-      const innerFolds = now ? await realLevelFolds(real, roots) : placedFolds.get(inner.name) ?? [];
-      const at = await placementOf(outerPath, { real: rootReal, folds: rootFolds }, innerPath, { real, folds: innerFolds }, above, rootReal, roots);
+      const at = placementOf(outerPath, rootReal, innerPath, real, above);
       if (at === undefined) continue;
       const include = this.mounts.get(inner.name)?.config.include;
       for (const s of at.fromRoots) {
-        nested.push({ dir: s.dir, folds: s.folds, ...(s.guessed ? { guessed: s.guessed } : {}), name: inner.name, ...(at.claims ? { real, realFolds: innerFolds } : {}), include });
+        nested.push({ dir: s.dir, ...(s.guessed ? { guessed: s.guessed } : {}), name: inner.name, ...(at.claims ? { real } : {}), include });
       }
     }
     return nested;
@@ -2854,10 +2748,7 @@ export class WorkspaceModule implements Module {
    * of that mount, judged lexically where the path lands (`.`, `..` and
    * repeated separators resolved, as for the traversal guard; a link of the
    * outer mount isn't followed), with the path to use there; undefined when
-   * no nested mount's directory holds it. The directory is compared as disk
-   * compares names at each of its levels (nestedHolder), so a path that
-   * names it in any spelling disk takes for it is that mount's, whether the
-   * parse respelled it or not, and whether or not the directory is on disk.
+   * no nested mount's directory holds it.
    */
   private holderOf(mountName: string, relativePath: string, moved: NestedMount[] | null = null): { name: string; use: string; guess?: NestedGuess } | undefined {
     const mount = this.mounts.get(mountName);
@@ -2867,7 +2758,7 @@ export class WorkspaceModule implements Module {
     if (!isContainedPath(root, resolved)) return undefined;
     const path = resolved === root ? '' : relative(root, resolved).split(sep).join('/');
     // A direct mount whose root a call found moved is judged by that call's
-    // nesting (movedNesting).
+    // nesting (movedNesting), each directory beneath its configured path.
     const holder = nestedHolder(path, moved ?? this.nestedOf(mountName));
     if (!holder) return undefined;
     const rest = restBeneath(path, holder);
@@ -2945,8 +2836,6 @@ export class WorkspaceModule implements Module {
     // whatever the place realpath stopped short of would say.
     if (judged && unresolved.code !== undefined) return new WorkspaceReadError('not_found', `Unable to resolve file: ${path}`, 'realpath', unresolved.code);
     let holder = await nestedAtReal(real, nested);
-    // Where the comparison guessed, the refusal shows where the path leads,
-    // when that lies in this mount, so this mount's real root is read then.
     if (holder?.guess === null) holder = await nestedAtReal(real, nested, { name: mount.config.name, rootReal: await realBeneath(resolve(mount.config.path)) });
     if (!holder) {
       if (!judged) return null;
@@ -2974,11 +2863,9 @@ export class WorkspaceModule implements Module {
    * A parsed path, refused where the mount doesn't hold it: in a nested
    * mount's directory first, naming the mount that holds it, then outside
    * the mount's include. Each is judged on the path as the caller parsed it:
-   * as disk spells it for parseFilePath, and as given for
-   * resolveAbsolutePath, which is synchronous. The nested-mount check
-   * compares either as disk compares names (holderOf). The include's refusal
-   * shows the path as given (`given`), since it answers the path the caller
-   * asked about.
+   * as disk spells it for parseFilePath, as given for resolveAbsolutePath,
+   * which is synchronous. The include's refusal shows the path as given
+   * (`given`), since it answers the path the caller asked about.
    */
   private refuseNotHeld<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, given: string, moved: NestedMount[] | null = null): P {
     const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath, moved);
@@ -3105,8 +2992,8 @@ export class WorkspaceModule implements Module {
 
   /**
    * How many segments the innermost nested mount's directory that holds
-   * `relativePath` has, compared as disk compares names (nestedHolder), or,
-   * for a direct mount whose root has moved, in the nesting there (`moved`);
+   * `relativePath` has, or, for a direct mount whose root has moved, in the
+   * nesting there (`moved`);
    * undefined when no nested mount's directory holds it.
    */
   private nestedDepth(mountName: string, relativePath: string, moved: NestedMount[] | null = null): number | undefined {
