@@ -423,6 +423,16 @@ describe('held prose drafts, end to end', () => {
       const injected = (h.membrane.lastStream?.receivedToolResultOptions ?? [])
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
+      // Round 2 called nothing that sends: its draft was held by round 1's
+      // send, and its own notice names that cause.
+      const secondNotice = msgs.find((m) => {
+        const meta = m.metadata as { kind?: string; draftIds?: string[] } | undefined;
+        return meta?.kind === 'prose-drafts' && meta.draftIds?.includes(ids[1]!) === true;
+      });
+      assert.ok(secondNotice, 'a notice names the second round\'s draft');
+      const secondText = secondNotice!.content.map((b) => (b as { text?: string }).text ?? '').join('');
+      assert.ok(secondText.includes(`held as draft ${ids[1]} because you made an explicit send in this round or an earlier one this turn. `),
+        `the later round's notice gives the earlier send as the cause: ${secondText}`);
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
       assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
 
