@@ -278,7 +278,7 @@ export class HookOrchestrator {
           }
           // Deprecated mechanism (agent-framework#171): still collected as
           // before, and a server is named once on stderr at its first
-          // injection that passes the checks above, before it's converted.
+          // injection that passes the checks above.
           warnContextInjectionDeprecated('mcpl-server', server.id);
           injections.push(convertMcplInjection(mcplInj));
         }

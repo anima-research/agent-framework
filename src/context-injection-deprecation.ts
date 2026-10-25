@@ -31,22 +31,48 @@
  *     comes before every message, so with a prefix cache each new text of
  *     that block misses the cache for everything after it in the request.
  *
+ * On a model that binds each signed thinking block to the request it was
+ * made in, a block that moves, or new text in a `system` block, also means
+ * no reply after the point where the request first changed can keep its
+ * thinking. As context-manager 0.22's thinking binding describes it, such a
+ * provider refuses the request or sets that thinking aside, and where the
+ * agent tells context-manager that its model binds, the compile leaves it out
+ * instead.
+ *
  * See anima-research/agent-framework#171.
  *
  * Nothing is removed yet, and the deprecation changes nothing about how
- * injections are applied. Hosts log one `[deprecated]` line per module that
- * returns injections, and per MCPL server with an injection that passes the
- * feature-set and grant checks, so remaining uses are visible before the
- * mechanism is removed. The framework's own `system` injections are added
- * after both and aren't logged: a silent heartbeat's `ephemeralSystemPrompt`,
- * and the subconscious's standing dispositions.
+ * injections are applied. Each module and MCPL server whose injections the
+ * host collects (adds to the list the module registry or the MCPL hook
+ * returns) is named in one `[deprecated]` line, so remaining uses are
+ * visible before the mechanism is removed. A module that returns none isn't
+ * named, and nor is a server whose injections the feature-set and grant
+ * checks all drop. The framework's own `system` injections pass through
+ * neither the registry nor the hook, so they aren't logged: the
+ * subconscious's standing dispositions and, before 0.23.0, a silent
+ * heartbeat's `ephemeralSystemPrompt`.
+ *
+ * Whoever configures the host can stop one MCPL server's injections and keep
+ * the rest of what it does, with
+ * `disabledCapabilities: ["contextHooks.beforeInference.inject"]` in its
+ * config. Any injection it still sends is dropped, each with a stderr line.
+ * A server's `system` injections are denied by default, so they arrive only
+ * if its config's `enabledCapabilities` grants them. A module has no such
+ * switch.
  *
  * Instead: deliver changing state as conversation content (push events,
  * tool results), so it is stored once at its own position and stays
  * cache-stable. Durable instructions belong in the agent's configured system
  * prompt, which the host's configuration sets. That prompt is fixed once the
  * agent is made, so `system` text that changes at runtime has no
- * replacement.
+ * provider-independent replacement. With membrane 0.7 and context-manager
+ * 0.22 and later, a stored message holding only a `system_change` block adds
+ * its `addSystem` text as a system message at its place in the conversation,
+ * or at the first point after it where the API takes one, and leaves the
+ * messages before it as they were. Only membrane's native formatter with its
+ * Anthropic adapter sends one, and membrane refuses the request through any
+ * other formatter or adapter. It adds text, and can't take back or replace
+ * any.
  */
 
 export const CONTEXT_INJECTION_DEPRECATION_NOTICE =
@@ -54,8 +80,10 @@ export const CONTEXT_INJECTION_DEPRECATION_NOTICE =
   'into conversation content (push events, tool results) is for whoever maintains the module or ' +
   "server named at the start of this line. Durable system text belongs in the agent's configured " +
   'system prompt, which whoever configures this host sets; system text that changes at runtime ' +
-  'has no replacement. Turning that module or server off removes its injections along with ' +
-  'whatever else it does.';
+  'has no provider-independent replacement. For an MCPL server, disabledCapabilities: ' +
+  '["contextHooks.beforeInference.inject"] in its config drops its injections and keeps the rest ' +
+  'of what it does, and its system injections are denied unless its config enables them. A module ' +
+  'has no such switch: turning it off removes its injections along with whatever else it does.';
 
 const warned = new Set<string>();
 

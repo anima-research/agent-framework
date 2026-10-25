@@ -121,12 +121,18 @@ export interface Module {
    * versions drop a `beforeUser` injection. A `system` injection's text is
    * appended to the system prompt, which comes before every message, so with
    * a prefix cache each new text of it misses the cache for everything after
-   * it. Do not add new implementations: changing state belongs in
-   * conversation content (events, tool results), and durable content in the
-   * agent's configured system prompt, which the host's configuration sets;
-   * `system` text that changes at runtime has no replacement. Still
-   * called for now; the framework logs one `[deprecated]` line per module
-   * that returns injections.
+   * it. On a model that binds each signed thinking block to the request it
+   * was made in, a moved injection or new `system` text also means no reply
+   * after the point where the request first changed can keep its thinking.
+   * Do not add new implementations: changing state belongs in conversation
+   * content (events, tool results), and durable content in the agent's
+   * configured system prompt, which the host's configuration sets; `system`
+   * text that changes at runtime has no provider-independent replacement.
+   * (With membrane 0.7 and context-manager 0.22 and later, a stored
+   * `system_change` block adds system text from its place in the
+   * conversation, through membrane's native formatter and Anthropic adapter
+   * only, and can't replace any.) Still called for now; the framework logs
+   * one `[deprecated]` line per module whose injections it collects.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 

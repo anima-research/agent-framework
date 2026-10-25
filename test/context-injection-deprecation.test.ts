@@ -1,8 +1,8 @@
 /**
- * Context injection is deprecated (#171). The deprecation changes nothing
- * about how injections are applied. Every module that returns injections,
- * and every MCPL server with an injection that passes the feature-set and
- * grant checks, is named once on stderr; a source with none isn't.
+ * Context injection is deprecated (#171). Injections are still collected as
+ * before, and each module or MCPL server whose injections are collected is
+ * named once on stderr; a module that returns none isn't, and nor is a
+ * server whose injections the grant check drops.
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -44,7 +44,7 @@ async function captureWarnings(fn: () => Promise<void>): Promise<string[]> {
 
 beforeEach(() => resetContextInjectionDeprecationWarnings());
 
-test('a module that injects is still applied and is named once across turns', async () => {
+test('a module that injects is still collected and is named once across turns', async () => {
   const registry = makeRegistry([injectingModule('hud', 1)]);
   let first: unknown[] = [];
   const warnings = await captureWarnings(async () => {
@@ -52,7 +52,7 @@ test('a module that injects is still applied and is named once across turns', as
     await registry.gatherContext('agent');
     await registry.gatherContext('agent');
   });
-  assert.equal(first.length, 1, 'injection still applied');
+  assert.equal(first.length, 1, 'injection still collected');
   assert.equal(warnings.length, 1, `one warning for three turns, got ${JSON.stringify(warnings)}`);
   assert.equal(
     warnings[0],
@@ -60,8 +60,10 @@ test('a module that injects is still applied and is named once across turns', as
       'Context injection is deprecated (anima-research/agent-framework#171). Moving changing state into conversation ' +
       'content (push events, tool results) is for whoever maintains the module or server named at the start of this ' +
       "line. Durable system text belongs in the agent's configured system prompt, which whoever configures this host " +
-      'sets; system text that changes at runtime has no replacement. Turning that module or server off removes ' +
-      'its injections along with whatever else it does.',
+      'sets; system text that changes at runtime has no provider-independent replacement. For an MCPL server, ' +
+      'disabledCapabilities: ["contextHooks.beforeInference.inject"] in its config drops its injections and keeps ' +
+      'the rest of what it does, and its system injections are denied unless its config enables them. A module has ' +
+      'no such switch: turning it off removes its injections along with whatever else it does.',
     'the whole line an operator reads',
   );
 });
@@ -89,14 +91,14 @@ function orchestratorWith(grantPaths: string[], position: string) {
 
 const params = { agentName: 'agent', userMessage: 'hi' } as any;
 
-test('an MCPL server injection within its grant is still applied and named once', async () => {
+test('an MCPL server injection within its grant is still collected and named once', async () => {
   const orchestrator = orchestratorWith(['contextHooks.beforeInference.inject.beforeUser'], 'beforeUser');
-  let applied: unknown[] = [];
+  let collected: unknown[] = [];
   const warnings = await captureWarnings(async () => {
-    applied = await orchestrator.beforeInference(params);
+    collected = await orchestrator.beforeInference(params);
     await orchestrator.beforeInference(params);
   });
-  assert.equal(applied.length, 1, 'injection still applied');
+  assert.equal(collected.length, 1, 'injection still collected');
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /MCPL server "recap-server" returns context injections, and this line changes nothing about how they're applied\./);
 });
@@ -106,12 +108,12 @@ test('an injection outside the grant is dropped as before and does not warn', as
   const errs: string[] = [];
   const origErr = console.error;
   console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
-  let applied: unknown[] = [];
+  let collected: unknown[] = [];
   let warnings: string[] = [];
   try {
-    warnings = await captureWarnings(async () => { applied = await orchestrator.beforeInference(params); });
+    warnings = await captureWarnings(async () => { collected = await orchestrator.beforeInference(params); });
   } finally { console.error = origErr; }
-  assert.equal(applied.length, 0);
+  assert.equal(collected.length, 0);
   assert.equal(warnings.length, 0);
   assert.ok(errs.some((e) => e.includes('dropped beforeInference injection')));
 });

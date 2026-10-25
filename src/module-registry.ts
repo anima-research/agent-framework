@@ -383,7 +383,7 @@ export class ModuleRegistry {
         module.gatherContext(agentName).then(r => {
           // Deprecated mechanism (agent-framework#171): still collected as
           // before, and a module is named once on stderr the first time it
-          // returns injections.
+          // adds injections to the list.
           if (r.length > 0) warnContextInjectionDeprecated('module', module.name);
           injections.push(...r);
         }),
