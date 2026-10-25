@@ -3,6 +3,7 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
@@ -1893,7 +1894,8 @@ export class Agent {
       );
       return;
     }
-    this.contextManager.addMessage(this.name, content, metadata);
+    // The agent's own round, stamped as its own (#291's audience stamp).
+    storeOwnRow(this, this.name, content, metadata);
   }
 
   /**
@@ -2080,8 +2082,8 @@ export class Agent {
     const content = guardedRefusal ? [] : response.content;
     const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(content);
 
-    // Add assistant response to context
-    if (!guardedRefusal) this.contextManager.addMessage(this.name, content);
+    // Add assistant response to context, as the agent's own row
+    if (!guardedRefusal) storeOwnRow(this, this.name, content);
 
     return {
       toolCalls,

@@ -195,7 +195,8 @@ test("an undo of the turn that wrote a direct mount gives the notice once, at th
   assert.equal(carries(first), true);
   assert.equal(h.notices().length, 1);
   const stored = h.cm().getAllMessages().find((m) => m.metadata?.kind === 'workspace-head-move')!;
-  assert.deepEqual(stored.metadata, { system: true, kind: 'workspace-head-move', mounts: ['ref'] });
+  // A notice about the agent's own writes is its own row (#291's audience stamp).
+  assert.deepEqual(stored.metadata, { system: true, kind: 'workspace-head-move', mounts: ['ref'], audience: ['scout'], ownRowOf: 'scout' });
   assert.match(JSON.stringify(first!.messages), new RegExp(TEXT.replace(/[.*+?^${}()|[\]\\`]/g, '\\$&').slice(0, 60)));
   // Later starts carry the one notice in its place, and store no other.
   const [later] = await h.turn([say('still here')]);

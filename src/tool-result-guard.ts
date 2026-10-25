@@ -6,6 +6,7 @@ import type { CompletedToolCall } from './types/index.js';
 import { ensureStateRegistered } from './module-registry.js';
 import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
+import { asOwnRow } from './dendrite/audience.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
 export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
@@ -323,7 +324,9 @@ export class ToolResultGuard {
 
   /** `keptCap` is where what a stub keeps of a withheld result is cut: the
    *  cap the caller stored `content` under, less the stub's notice room where
-   *  its message's bound sets it (toolResultShare, tool-image-ledger.ts). */
+   *  its message's bound sets it (toolResultShare, tool-image-ledger.ts).
+   *  The results are the agent's own row, stamped so (asOwnRow) on top of
+   *  the caller's `metadata`, guarded or not. */
   storeResults(
     content: ContentBlock[],
     wireResults: ToolResult[],
@@ -332,6 +335,7 @@ export class ToolResultGuard {
     /** Where what a stub keeps is cut. */
     keptCap: number | undefined,
   ): MessageId {
+    metadata = asOwnRow(metadata, this.agentName);
     if (!this.enabled) return this.cm.addMessage('user', content, metadata);
     if (this.pending) {
       // Idempotent for the same not-yet-submitted batch: a caller that

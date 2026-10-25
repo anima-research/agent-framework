@@ -117,10 +117,17 @@ import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttemp
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import {
   AgentRegistry,
+  RESIDENTS_SLOT,
+  asOwnRow,
+  audienceOf,
   conversationForkSpec,
+  observedSlot,
   residentSpec,
+  sameSlot,
+  storeOwnRow,
   subconsciousSpec,
   taskForkSpec,
+  withAudience,
   workerSpec,
 } from './dendrite/index.js';
 import type {
@@ -130,6 +137,7 @@ import type {
   AgentSpec,
   EndOutcome,
   HeldMail,
+  MessageSlotRef,
   PolicyEpoch,
   RegistrySnapshot,
 } from './dendrite/index.js';
@@ -6345,7 +6353,8 @@ export class AgentFramework {
     // live-routed already, so "your output was not delivered" would be a
     // false claim. addMessage alone requests no inference: no loop.
     try {
-      agent.getContextManager().addMessage(
+      storeOwnRow(
+        agent,
         'user',
         [{
           type: 'text',
@@ -9458,6 +9467,10 @@ export class AgentFramework {
         }
       }
       let inherit = spec?.inherit;
+      // Where the agent's own rows go, as the registry records it: an
+      // isolated slot of its own, or a shared fork's parent slot on the
+      // fork's branch.
+      let ownSlot: MessageSlotRef;
 
       if (inherit?.mode === 'shared') {
         // Shared reads, separate writes: the child's context is the parent's
@@ -9466,6 +9479,7 @@ export class AgentFramework {
         contextManager = derived.contextManager;
         inherit = derived.inherit;
         namespace = derived.namespace;
+        ownSlot = derived.ownSlot;
       } else {
         contextManager = await ContextManager.open({
           store: this.store,
@@ -9475,6 +9489,7 @@ export class AgentFramework {
           membrane: this.membrane,
           debugLogContext: !!process.env.DEBUG_CONTEXT,
         });
+        ownSlot = { namespace };
       }
 
       const agent = new Agent(config, contextManager, this.membrane);
@@ -9492,8 +9507,10 @@ export class AgentFramework {
               // on the fork's own branch — not in a namespace of its own.
               namespace: inherit?.mode === 'shared' ? namespace : spec.namespace ?? namespace,
               ...(inherit ? { inherit } : {}),
+              // As opened above, whatever the spec said.
+              ownSlot,
             }
-          : { ...workerSpec(config.name, { namespace }), model: config.model },
+          : { ...workerSpec(config.name, { namespace }), model: config.model, ownSlot },
       });
       this.ephemeralAgents.add(agent);
 
@@ -9612,9 +9629,13 @@ export class AgentFramework {
     if (!shared) {
       // The historical copy: the parent's compiled view, its turns renamed
       // so the child reads its inheritance as its own history.
+      // The copies, and the framing below, are the child's own rows: its
+      // inheritance and what it is told it is, stored for it, whoever they
+      // name as their participant.
       const { messages } = await parent.getContextManager().compile();
       for (const message of messages) {
-        created.contextManager.addMessage(
+        storeOwnRow(
+          created.agent,
           parent.isOwnParticipant(message.participant) ? options.name : message.participant,
           message.content,
         );
@@ -9623,7 +9644,7 @@ export class AgentFramework {
     }
     await this.framePendingRound(parent, created.contextManager, options, shared);
     for (const message of options.framing ?? []) {
-      created.contextManager.addMessage(message.participant, message.content, message.metadata);
+      storeOwnRow(created.agent, message.participant, message.content, message.metadata);
     }
     return created;
   }
@@ -9686,7 +9707,9 @@ export class AgentFramework {
             `[No result yet: this call was still running in ${parent.name} when ${options.name} was derived.]`;
       return { type: 'tool_result' as const, toolUseId: call.id, toolName: call.name, content, isError: false };
     });
-    const metadata = { kind: 'dendrite-pending-round', from: parent.name } as unknown as MessageMetadata;
+    // The child's own rows, though the round is voiced as the parent's in a
+    // shared fork: the framing of what the child is, stored for it.
+    const metadata = asOwnRow({ kind: 'dendrite-pending-round', from: parent.name } as unknown as MessageMetadata, options.name);
     child.addMessage(shared ? parent.name : options.name, structuredClone(pending), metadata);
     child.addMessage('user', results, metadata);
   }
@@ -9770,6 +9793,8 @@ export class AgentFramework {
         ...(keepSpawner ? { spawnedBy, onParentEnd: record.onParentEnd } : {}),
         ...(resultTo && this.registry.has(resultTo.to) ? { resultTo } : {}),
         ...(record.inherit ? { inherit: record.inherit } : {}),
+        // It continues on the context it left: the same slot.
+        ...(record.ownSlot ? { ownSlot: record.ownSlot } : {}),
         ...(fullConfig.selfParticipants?.length ? { selfParticipants: fullConfig.selfParticipants } : {}),
         ...(fullConfig.presentAs && fullConfig.presentAs !== name ? { presentAs: fullConfig.presentAs } : {}),
         ...(record.namespace ? { namespace: record.namespace } : {}),
@@ -9841,18 +9866,48 @@ export class AgentFramework {
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
     }
-    if (!record.namespace) {
+    // Reopened as it was opened, by where its own rows are (ownSlot), never
+    // by whether it read the shared slot: the subconscious read that slot
+    // through an observe edge while its own rows went to an isolated slot,
+    // and reopened on the shared slot it showed none of its own (#291).
+    // - Its own slot the residents' (a resident dropped from the
+    //   configuration, say): as createAgent opened it, on the shared slot
+    //   through the residents' view. Isolated, its namespace holds none of
+    //   what it read (nissa's #546 review, round 2).
+    // - Its own slot isolated: that slot, with each slot it observed merged
+    //   in as createSubconsciousAgent merges the residents', through the
+    //   residents' view where no edge on that slot showed held traffic.
+    const own = record.ownSlot;
+    if (own?.namespace === null) {
+      if (!record.namespace) {
+        throw new Error(`Agent "${record.name}": its record names no context to reopen`);
+      }
+      return ContextManager.open({
+        store: this.store,
+        namespace: record.namespace,
+        viewFilter: RESIDENT_VIEW_FILTER,
+        strategy: strategy ?? new PassthroughStrategy(),
+        membrane: this.membrane,
+        debugLogContext: !!process.env.DEBUG_CONTEXT,
+      });
+    }
+    const namespace = own?.namespace ?? record.namespace;
+    if (!namespace) {
       throw new Error(`Agent "${record.name}": its record names no context to reopen`);
     }
-    // A reader of the residents' shared slot (a resident dropped from the
-    // configuration, say) is reopened as createAgent opened it: on the
-    // shared slot, through the residents' view. Isolated, its namespace
-    // holds none of what it read (nissa's #546 review, round 2).
-    const sharedSlot = record.readsSharedSlot === true;
+    const observed = record.relationships.observes
+      .map((edge) => ({ edge, slot: observedSlot(edge) }))
+      .filter(({ slot }) => slot.namespace !== namespace);
+    const auxiliaryMessageViews = [...new Set(observed.map(({ slot }) => slot.namespace))]
+      .map((ns) => (ns === null ? {} : { namespace: ns }));
+    const observesResidents = observed.filter(({ slot }) => sameSlot(slot, RESIDENTS_SLOT));
+    const hidesHeld = observesResidents.length > 0 && !observesResidents.some(({ edge }) => edge.includeHeld === true);
     return ContextManager.open({
       store: this.store,
-      namespace: record.namespace,
-      ...(sharedSlot ? { viewFilter: RESIDENT_VIEW_FILTER } : { isolate: true }),
+      namespace,
+      isolate: true,
+      ...(auxiliaryMessageViews.length > 0 ? { auxiliaryMessageViews } : {}),
+      ...(hidesHeld ? { viewFilter: RESIDENT_VIEW_FILTER } : {}),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -9863,7 +9918,13 @@ export class AgentFramework {
   private async deriveSharedContext(
     config: AgentConfig,
     inherit: NonNullable<AgentSpec['inherit']>,
-  ): Promise<{ contextManager: ContextManager; inherit: NonNullable<AgentSpec['inherit']>; namespace: string }> {
+  ): Promise<{
+    contextManager: ContextManager;
+    inherit: NonNullable<AgentSpec['inherit']>;
+    namespace: string;
+    /** The parent's message slot, on the child's own branch. */
+    ownSlot: MessageSlotRef;
+  }> {
     const parent = this.agents.get(inherit.from);
     if (!parent) {
       throw new Error(`Agent "${config.name}": context source "${inherit.from}" is not a registered agent`);
@@ -9909,6 +9970,12 @@ export class AgentFramework {
           : {}),
       },
       namespace: this.registry.get(inherit.from)?.namespace ?? `subagent/${config.name}`,
+      ownSlot: {
+        namespace: derivation?.slots
+          ? derivation.slots.messageNamespace
+          : this.registry.ownSlotOf(inherit.from)?.namespace ?? null,
+        branch: ownBranch,
+      },
     };
   }
 
@@ -10171,6 +10238,10 @@ export class AgentFramework {
           mailId: mail.id,
           kind: mail.kind,
           from: mail.from,
+          // Who it is for, on the row: in the residents' shared slot the
+          // recipient's store holds every resident's mail, and the boot's
+          // redelivery check (reconcileAgentRegistry) tells them apart by it.
+          to: mail.to,
           // When the sender produced it — distinct from when it is read. A
           // result held across a restart arrives later than it was made,
           // and the reader should be able to tell.
@@ -10203,13 +10274,17 @@ export class AgentFramework {
     return true;
   }
 
-  /** A host-framed lifecycle fact in an agent's context. Never voiced as anyone. */
+  /**
+   * A host-framed lifecycle fact in an agent's context. Never voiced as
+   * anyone. Its `dendrite` detail names the agent it is for (`to`), as mail's
+   * does.
+   */
   private lifecycleNotice(agentName: string, text: string, detail: Record<string, unknown>): void {
     if (!this.agents.has(agentName)) return;
     this.addMessage(
       'user',
       [{ type: 'text', text }],
-      { system: true, kind: 'agent-lifecycle', dendrite: detail } as MessageMetadata,
+      { system: true, kind: 'agent-lifecycle', dendrite: { ...detail, to: agentName } } as MessageMetadata,
       { forAgent: agentName },
     );
   }
@@ -10597,9 +10672,16 @@ export class AgentFramework {
       const recipient = this.agents.get(mail.to);
       if (recipient) {
         // The message may have reached the store in the same sync that the
-        // release missed; never deliver it a second time.
+        // release missed; never deliver it a second time. In the residents'
+        // shared slot the recipient's store holds every resident's mail, so
+        // a copy counts only where it was for this recipient (dendrite.to); a
+        // row stored before mail carried `to` counts by its mail id alone.
         const already = recipient.getContextManager().queryMessages({ metadata: { 'dendrite.mailId': mail.id } });
-        if (already.messages.length > 0) {
+        const delivered = already.messages.some((message) => {
+          const to = (message.metadata as { dendrite?: { to?: unknown } } | undefined)?.dendrite?.to;
+          return to === undefined || to === mail.to;
+        });
+        if (delivered) {
           this.registry.releaseMail(mail.id);
           continue;
         }
@@ -11650,7 +11732,7 @@ export class AgentFramework {
       cm.editMessage(ep.markerId, blocks);
       this.rewindEpisode.set(agent.name, { markerId: ep.markerId, count, category });
     } else {
-      const id = cm.addMessage('user', blocks, {
+      const id = storeOwnRow(agent, 'user', blocks, {
         system: true, kind: 'refusal-rewind', category, count, cause,
       });
       this.rewindEpisode.set(agent.name, { markerId: id, count, category });
@@ -15230,7 +15312,9 @@ export class AgentFramework {
           this.storeDueClock(target, 'event');
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
-        const id = target.getContextManager().addMessage('user', content, AgentFramework.withStoredDigest(metadata, content));
+        // For the fork it is delivered to, not its own row.
+        const id = target.getContextManager().addMessage('user', content,
+          withAudience(AgentFramework.withStoredDigest(metadata, content), [target.name]));
         // Delivered to the fork, so it is the latest delivered inbound too
         // (the channel context's `incoming`; the fallback locus under the
         // legacy rule), as a resident's delivery is below.
@@ -15290,7 +15374,11 @@ export class AgentFramework {
     // the latest delivered inbound (the channel context's `incoming`, and
     // the fallback locus under the legacy rule) — a held one never is.
     const placement: CoalescingPlacement = { agent: '' };
-    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
+    // The row is for the recipients admission delivered it to, and for none
+    // of them when a tune-out holds it (inboundAudience).
+    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
+      placement, bypassDeferralFor: event.assemblingFor, audience: AgentFramework.inboundAudience(decision),
+    });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
     if (decision.locus) this.noteDeliveredOrPark(event);
 
@@ -15409,7 +15497,9 @@ export class AgentFramework {
     if (!this.turnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
-    const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
+    // For the fork it is delivered to, not its own row.
+    const id = agent.getContextManager().addMessage('user', event.content,
+      withAudience(AgentFramework.withStoredDigest(messageMetadata, event.content), [agent.name]));
     // Delivered to the channel's fork: the latest delivered inbound, as for a
     // resident (the channel context's `incoming`; the fallback locus under
     // the legacy rule). A held or dropped message never is.
@@ -15532,9 +15622,10 @@ export class AgentFramework {
           withoutReasoning, primaryNoticeTexts(template.getContextManager().getAllMessages()));
         const seed = stripUnpairedToolBlocks(withoutNotices);
         logSeedOmissions(name, template.name, compiled, withoutReasoning, withoutNotices, seed);
+        // The fork's own rows: its inheritance, stored for it.
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
-          contextManager.addMessage(participant, msg.content);
+          contextManager.addMessage(participant, msg.content, asOwnRow(undefined, name));
         }
       }
 
@@ -15776,7 +15867,10 @@ export class AgentFramework {
         this.settleEndedAgent(this.registry.end(binding.agentName, 'idle-ttl', 'framework', { record: true }));
         continue;
       }
-      agent.getContextManager().addMessage(
+      // Written for the fork's closing turn, as a [continue] row is for a
+      // continuation's: its own row.
+      storeOwnRow(
+        agent,
         'user',
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
         { channelId: binding.channelId, conversationClosure: true },
@@ -16067,6 +16161,16 @@ export class AgentFramework {
   ): Record<string, unknown> {
     metadata.storedBodyDigest = sourceBodyDigest(content);
     return metadata;
+  }
+
+  /**
+   * Who an admitted inbound message is for (#291's audience stamp): the
+   * recipients admission delivered it to, in their view, and nobody when a
+   * tune-out holds it, since then nothing may act for them (admit.ts). The
+   * stored row lands in one store, the delivery agent's, whoever these are.
+   */
+  private static inboundAudience(decision: AdmissionDecision): string[] {
+    return decision.held ? [] : [...decision.recipients];
   }
 
   /** Source envelope of a channels/incoming event (lane facts as given). */
@@ -16761,17 +16865,22 @@ export class AgentFramework {
     // Every agent that can read this message must not have compiled past it.
     // Residents share one message slot, so a message one of them read is
     // history for all of them (the never-rewrite rule is about the message,
-    // not the agent that happened to be asked). A tune-out-diverted message
-    // never enters a resident's compiled view; only the subconscious reads
-    // it through its merged view — no subconscious, nobody reads it.
+    // not the agent that happened to be asked): its readers are the agents
+    // whose own slot it is in and those that observe that slot (the
+    // registry's readersOf), the subconscious among them for the residents'
+    // slot. A row in an isolated slot, the subconscious's own included, is
+    // its owner's alone. A tune-out-diverted message never enters a
+    // resident's compiled view; only the subconscious reads it through its
+    // merged view — no subconscious, nobody reads it.
     let readers: Agent[];
     if (heldFromResidents(message.metadata as Record<string, unknown> | undefined)) {
       const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
       if (!subconscious) return true;
       readers = [subconscious];
     } else {
-      readers = this.registry.readsSharedSlot(agent.name)
-        ? this.registry.sharedSlotReaders()
+      const slot = this.registry.ownSlotOf(agent.name);
+      readers = slot
+        ? this.registry.readersOf(slot)
             .map((name) => this.agents.get(name))
             .filter((reader): reader is Agent => reader !== undefined)
         : [agent];
@@ -16960,7 +17069,9 @@ export class AgentFramework {
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
-      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
+      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
+        placement, bypassDeferralFor: event.assemblingFor, audience: AgentFramework.inboundAudience(decision),
+      });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
@@ -17981,7 +18092,8 @@ export class AgentFramework {
       'drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
     let mid: string;
     try {
-      mid = cm.addMessage(
+      mid = storeOwnRow(
+        agent,
         'user',
         [{ type: 'text', text }],
         { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: pending.map((d) => d.id) } as MessageMetadata,
@@ -18023,7 +18135,8 @@ export class AgentFramework {
     if (!due) return;
     let mid: string;
     try {
-      mid = agent.getContextManager().addMessage(
+      mid = storeOwnRow(
+        agent,
         'user',
         [{ type: 'text', text: due.text }],
         { system: true, kind: 'workspace-head-move', mounts: due.mounts } as MessageMetadata,
@@ -18583,7 +18696,8 @@ export class AgentFramework {
           ? `[delivered] plain speech → no channel — ${suppressedNote}`
           : `[delivered] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
-      const mid = agent.getContextManager().addMessage(
+      const mid = storeOwnRow(
+        agent,
         'user',
         [{ type: 'text', text }],
         {
@@ -18670,7 +18784,8 @@ export class AgentFramework {
     }
 
     try {
-      const id = agent.getContextManager().addMessage(
+      const id = storeOwnRow(
+        agent,
         'user',
         [{ type: 'text', text }],
         { system: true, kind: 'routing-notice' },
@@ -18755,7 +18870,7 @@ export class AgentFramework {
       return undefined;
     }
     if (!planned) return undefined;
-    const metadata = { system: true, kind: CLOCK_ROW_KIND, clock: planned.stamp } as MessageMetadata;
+    const metadata = asOwnRow({ system: true, kind: CLOCK_ROW_KIND, clock: planned.stamp } as MessageMetadata, agent.name);
     const before = this.storedCountOf(agent);
     let id: MessageId;
     try {
@@ -18837,12 +18952,12 @@ export class AgentFramework {
 
   /**
    * Whether `agent`'s store is the residents' one message slot, which every
-   * ordinary resident reads (`readsSharedSlot` in the registry). The subconscious reads that
-   * slot through a merged view, but its own store is isolated, as a fork's
-   * or an ephemeral agent's is.
+   * ordinary resident reads: its own slot in the registry (`ownSlot`) is
+   * that slot. The subconscious reads that slot through an observe edge, but
+   * its own store is isolated, as a fork's or an ephemeral agent's is.
    */
   private isOrdinaryResident(agent: Agent): boolean {
-    return this.registry.readsSharedSlot(agent.name) && agent.name !== this.subconsciousAgentName;
+    return sameSlot(this.registry.ownSlotOf(agent.name), RESIDENTS_SLOT);
   }
 
   /**
@@ -18853,11 +18968,9 @@ export class AgentFramework {
    */
   private noteForOtherResidents(agent: Agent, metadata: MessageMetadata | undefined, messageId: MessageId): void {
     if (!this.isOrdinaryResident(agent)) return;
-    for (const name of this.registry.sharedSlotReaders()) {
+    for (const name of this.registry.slotOwners(RESIDENTS_SLOT)) {
       const reader = this.agents.get(name);
-      if (reader && reader !== agent && this.isOrdinaryResident(reader)) {
-        this.noteArrival(reader.name, metadata, messageId);
-      }
+      if (reader && reader !== agent) this.noteArrival(reader.name, metadata, messageId);
     }
   }
 
@@ -18925,7 +19038,7 @@ export class AgentFramework {
           'speech now lands there for the rest of this turn. Other ' +
           'channels need an explicit send tool.',
     }];
-    const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
+    const metadata = asOwnRow({ system: true, kind: 'routing-notice' } as MessageMetadata, agent.name);
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
       this.lastAnnouncedLocus.set(agent.name, channel);
@@ -18965,7 +19078,7 @@ export class AgentFramework {
         `[routing] ${who} addressed you from ${this.channelShown(channel)} ${when}. ` +
         `Your plain speech ${where} this turn; reaching them takes an explicit send.`,
     }];
-    const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
+    const metadata = asOwnRow({ system: true, kind: 'routing-notice' } as MessageMetadata, agent.name);
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
@@ -19529,7 +19642,8 @@ export class AgentFramework {
     const before = this.storedCountOf(agent);
     let id: MessageId;
     try {
-      id = agent.getContextManager().addMessage(
+      id = storeOwnRow(
+        agent,
         'user',
         [{ type: 'text', text }],
         { system: true, kind: 'auto-continue', agentName: agent.name, continuation: count, maxConsecutive: max } as MessageMetadata,
@@ -20350,7 +20464,8 @@ export class AgentFramework {
       return;
     }
     try {
-      const id = agent.getContextManager().addMessage(
+      const id = storeOwnRow(
+        agent,
         'user',
         [{ type: 'text', text: proseModePrimer(mode, this.canAgentUseTool(agent.name, 'prose_help')) }],
         { system: true, kind: 'prose-routing-primer' },
@@ -22573,7 +22688,7 @@ export class AgentFramework {
               // AF #133: containment only. Never execute wrapper text, never
               // publish it, and never retain it as the freshest assistant
               // self-seed. Exact raw output remains in the provider ledger.
-              agent.getContextManager().addMessage('user', [{
+              storeOwnRow(agent, 'user', [{
                 type: 'text',
                 text: '[tool-boundary] No tool was called.',
               }], {
@@ -23933,15 +24048,15 @@ export class AgentFramework {
       // alone (writeDrainedInOrder).
       // The finally below flushes it itself if that turn is already over.
       ownedToEnd = this.activeTurnTokens.get(agentName) === turnToken;
+      // The pair is the agent's own, queued or not (asOwnRow).
       if (ownedToEnd) {
-        const cm = agent.getContextManager();
-        cm.addMessage(agentName, toolUse);
-        cm.addMessage('user', blocks);
+        storeOwnRow(agent, agentName, toolUse);
+        storeOwnRow(agent, 'user', blocks);
       } else {
         const heldAt = Date.now();
         this.deferredMessages.push(
-          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, forAgent: agentName, heldAt },
-          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, forAgent: agentName, heldAt },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, metadata: asOwnRow(undefined, agentName), forAgent: agentName, heldAt },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, metadata: asOwnRow(undefined, agentName), forAgent: agentName, heldAt },
         );
         // As addMessage's own deferral does: a crash before the next persist
         // must not lose the pair from a persisted queue.
@@ -26003,6 +26118,13 @@ export class AgentFramework {
        * any other write is weighed as if it weren't set.
        */
       bypassDeferralFor?: string;
+      /**
+       * Who the message is for, when that is decided before it gets here:
+       * the recipients admission delivered an inbound message to, or none
+       * for one a tune-out holds. Stamped on the row as `metadata.audience`
+       * (dendrite/audience.ts). Absent, the row is for its delivery agent.
+       */
+      audience?: readonly string[];
     }
   ): MessageId {
     // `deferredWriteId` is the framework's: a write from the queue is stored
@@ -26032,6 +26154,13 @@ export class AgentFramework {
         return '' as MessageId;
       }
       throw new Error('No agents configured');
+    }
+    // Who the row is for, written on it (#291): what the caller decided, else
+    // the agent it is delivered to, never as anyone's own row. A stamp the
+    // metadata carried is replaced, as a deferredWriteId is, except on a
+    // write from the queue, which carries the stamp it was queued with.
+    if (!(opts?.fromQueue && audienceOf(metadata))) {
+      metadata = withAudience(metadata, opts?.audience ?? [agent.name]);
     }
 
     // Defer non-tool_result messages while a tool cycle is mid-flight
@@ -26213,7 +26342,8 @@ export class AgentFramework {
       return;
     }
     for (const line of open) {
-      const metadata = { source: 'gate:debounce', policies: line.policyNames } as MessageMetadata;
+      // The delivery agent's own row: written for its start.
+      const metadata = asOwnRow({ source: 'gate:debounce', policies: line.policyNames } as MessageMetadata, slot.name);
       // A line is the wake's context, not its cause, so a write that fails
       // doesn't fail the start: the line stays undecided, for a later fresh
       // start of the wake. One whose write threw after its row landed counts
@@ -27297,7 +27427,7 @@ export class AgentFramework {
    * The writes the framework holds for the store `reader` reads, in queue
    * order: those addressed to it and, when it's an ordinary resident, those
    * addressed to any ordinary resident, since residents share one message
-   * slot (`readsSharedSlot` in the registry). A write whose target is gone isn't among them:
+   * slot (their `ownSlot` in the registry). A write whose target is gone isn't among them:
    * no module reads that agent's store, and the write waits for its window's
    * release (drainDeferredFor) or, at its flush, is dropped (addMessage), a
    * failed reply, or a channel notice its reader could act on, passing to the
@@ -28013,7 +28143,8 @@ export class AgentFramework {
         .filter((part): part is string => part !== undefined)
         .join(', ');
       try {
-        agent.getContextManager().addMessage(
+        storeOwnRow(
+          agent,
           'user',
           [{
             type: 'text',

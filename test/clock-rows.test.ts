@@ -366,8 +366,10 @@ describe('clock rows in the framework', () => {
       const between = all.slice(first + 1, second).filter(isClock);
       assert.deepEqual(between.map(textOf), ['Clock: 11:20 UTC'], 'one clock for the gap: 10:50 to 11:20 coalesced');
       assert.ok(isClock(all[second - 1]!), 'it stands right before the event');
+      // A clock row is the agent's own row, stamped so (#291's audience stamp).
       assert.deepEqual(all[second - 1]!.metadata, {
         system: true, kind: 'clock', clock: { at: at('2026-10-21T11:20:00Z'), onBoundary: true, zone: 'UTC' },
+        audience: ['assistant'], ownRowOf: 'assistant',
       });
       assert.equal(all[second - 1]!.participant, 'user');
       assert.match(requestText(x.membrane.calls[1]!), /Clock: 11:20 UTC[\s\S]*second/, 'the turn\'s request holds it before the event');

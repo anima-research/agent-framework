@@ -2515,7 +2515,8 @@ async function replyOpenFailedNotices(opts: {
   framework.agents = new Map((opts.live ?? [agentName]).map((name) => [name, { canUseTool: (tool: string) => !(opts.denied ?? []).includes(tool) }]));
   framework.usedEphemeralAgentNames = new Set();
   // A fork's home is a channel on the send's server.
-  framework.registry = { homeChannel: (name: string) => new Map((opts.homes ?? []).map(([n, id]) => [n, { serverId: 'chat-server', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+  // A resident's own slot is the residents' shared one: the registry's ownSlotOf (#291), where it read readsSharedSlot.
+  framework.registry = { homeChannel: (name: string) => new Map((opts.homes ?? []).map(([n, id]) => [n, { serverId: 'chat-server', channelId: id }])).get(name), ownSlotOf: (name: string) => ([...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) ? { namespace: null } : undefined) };
   framework.sharedSlotAgents = new Set();
   framework.primaryAgentName = opts.primary;
   framework.emitTrace = () => {};
@@ -2674,7 +2675,8 @@ test("a reply notice with no agent named, or an empty name, goes out unrouted, w
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.registry = { homeChannel: (name: string) => new Map().get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    // A resident's own slot is the residents' shared one: the registry's ownSlotOf (#291), where it read readsSharedSlot.
+    framework.registry = { homeChannel: (name: string) => new Map().get(name), ownSlotOf: (name: string) => ([...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) ? { namespace: null } : undefined) };
     framework.sharedSlotAgents = new Set();
     framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
       told.push({ text: content[0]!.text, ...(routed ? { forAgent: routed.forAgent } : {}) });
@@ -2753,7 +2755,8 @@ test("where a reply's reader can't close a channel selected for opening, the pri
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    // A resident's own slot is the residents' shared one: the registry's ownSlotOf (#291), where it read readsSharedSlot.
+    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), ownSlotOf: (name: string) => ([...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) ? { namespace: null } : undefined) };
     framework.sharedSlotAgents = new Set();
     // Forks are made where conversations are routed, here from the primary.
     framework.conversationRouter = c.homes ? { templateAgent: 'primary' } : undefined;
@@ -2879,7 +2882,9 @@ test('the opened notice names channel_close only where the agent it\'s addressed
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    // A resident's own slot is the residents' shared one: the registry's ownSlotOf (#291), where it read
+    // readsSharedSlot. The subconscious reads that slot through an observe edge; its own slot is isolated.
+    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), ownSlotOf: (name: string) => (name === framework.subconsciousAgentName ? { namespace: `subconscious/${c.primary}` } : [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) ? { namespace: null } : undefined) };
     framework.sharedSlotAgents = new Set();
     // Each fork is bound to its home, unless the sweep has ended its binding;
     // of two forks with one home, the router binds the later.
@@ -2927,7 +2932,8 @@ test("each channel notice is written on its own, and the reader's says the prima
       framework.agents = new Map([['fork', { name: 'fork', canUseTool: () => true }], ['primary', { name: 'primary', canUseTool: () => true }]]);
       framework.primaryAgentName = 'primary';
       framework.usedEphemeralAgentNames = new Set();
-      framework.registry = { homeChannel: (name: string) => new Map([['fork', { serverId: 'srv', channelId: 'y' }]]).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+      // A resident's own slot is the residents' shared one: the registry's ownSlotOf (#291), where it read readsSharedSlot.
+      framework.registry = { homeChannel: (name: string) => new Map([['fork', { serverId: 'srv', channelId: 'y' }]]).get(name), ownSlotOf: (name: string) => ([...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) ? { namespace: null } : undefined) };
       framework.sharedSlotAgents = new Set();
       framework.conversationRouter = { templateAgent: 'primary' };
       framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
@@ -2971,7 +2977,8 @@ test("a channel notice's inputs give the primary's by-name notice once its reade
   framework.agents = new Map([['primary', { name: 'primary', canUseTool: (tool: string) => tool !== 'channel_open' }]]);
   framework.primaryAgentName = 'primary';
   framework.usedEphemeralAgentNames = new Set();
-  framework.registry = { homeChannel: (name: string) => new Map().get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+  // A resident's own slot is the residents' shared one: the registry's ownSlotOf (#291), where it read readsSharedSlot.
+  framework.registry = { homeChannel: (name: string) => new Map().get(name), ownSlotOf: (name: string) => ([...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) ? { namespace: null } : undefined) };
   framework.sharedSlotAgents = new Set();
   // Every channel still as the notice says: open, or still waiting to open.
   framework.channelRegistry = { getDesiredState: () => 'open', isChannelOpen: () => false, nameShown: (ref: { channelId: string }) => ref.channelId };

@@ -273,13 +273,18 @@ describe('Dendrite lifecycle', () => {
     assert.equal(landed[0]!.text, 'the answer is 42');
     const stamp = landed[0]!.metadata.dendrite as Record<string, unknown>;
     assert.equal(typeof stamp.producedAt, 'number', 'when it was produced, apart from when it is read');
+    // The stamp names its recipient too (`to`, #291): in the residents'
+    // shared slot the recipient's store holds every resident's mail.
     assert.deepEqual({ ...stamp, producedAt: undefined }, {
       mailId: delivery.mailId,
       kind: 'result',
       from: { agent: 'fork-1', incarnation: 1 },
+      to: 'oren',
       causedBy: ['task-7'],
       producedAt: undefined,
     });
+    assert.deepEqual(landed[0]!.metadata.audience, ['oren'], 'stamped for its recipient');
+    assert.equal(landed[0]!.metadata.ownRowOf, undefined, 'and as nobody\'s own row: the sender\'s words, meant for oren');
     assert.deepEqual(framework.listHeldMail(), [], 'a delivered result is no longer held');
     // (Co-residents share one message slot today, so mira can read it too;
     // what the route decides is who it is addressed to and who is woken.)
@@ -302,9 +307,10 @@ describe('Dendrite lifecycle', () => {
     for (const fact of ['fork-1', 'task-fork', 'your weights', 'copy of your context', 'returns to you', 'orphaned']) {
       assert.ok(line.text.includes(fact), `the notice names ${JSON.stringify(fact)}: ${line.text}`);
     }
+    // A lifecycle notice's detail names who it is for (`to`, #291), as mail's does.
     assert.deepEqual(
       { ...(line.metadata.dendrite as Record<string, unknown>), lifetime: undefined, inherit: undefined },
-      { event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model', resultTo: { to: 'oren', as: 'message' }, lifetime: undefined, inherit: undefined },
+      { event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model', resultTo: { to: 'oren', as: 'message' }, lifetime: undefined, inherit: undefined, to: 'oren' },
     );
     assert.ok(
       !fork.contextManager.getAllMessages().some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle'),

@@ -340,7 +340,8 @@ describe('isNewestContextEntry', () => {
     assert.equal(linesIn('LINE-A'), 1, 'no longer newest: written');
     const written = internals().agents.get('scout')!.getContextManager().getAllMessages()
       .find((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes('LINE-A')))!;
-    assert.deepEqual(written.metadata, { source: 'gate:debounce', policies: ['addressed'] }, 'as 0.26.0 wrote it');
+    // As 0.26.0 wrote it, with #291's audience stamp: the delivery agent's own row, written for its start.
+    assert.deepEqual(written.metadata, { source: 'gate:debounce', policies: ['addressed'], audience: ['scout'], ownRowOf: 'scout' }, 'as 0.26.0 wrote it, stamped');
     assert.deepEqual(traces.filter((t) => t.type === 'message:added' && (t as { source?: string }).source === 'gate:wake-line').length, 1, 'its write traced as message:added');
     placing.placeWakeLines(scout(), [line]);
     assert.equal(linesIn('LINE-A'), 1, 'written once: a later start writes it no second time');

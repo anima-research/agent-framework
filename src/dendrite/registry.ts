@@ -16,8 +16,11 @@ import type {
   AgentRecord,
   AgentRef,
   AgentSpec,
+  ContextInheritance,
   EndOutcome,
   HeldMail,
+  MessageSlotRef,
+  ObserveEdge,
   RegistrySnapshot,
 } from './types.js';
 
@@ -68,6 +71,81 @@ const DEFAULT_ENDED_RETENTION = 256;
 
 function clone<T>(value: T): T {
   return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
+}
+
+/** The residents' shared un-namespaced slot, on the host's current branch. */
+export const RESIDENTS_SLOT: Readonly<MessageSlotRef> = Object.freeze({ namespace: null });
+
+/** Whether two refs name one slot: the same namespace on the same branch. */
+export function sameSlot(a: MessageSlotRef | undefined, b: MessageSlotRef | undefined): boolean {
+  return !!a && !!b && a.namespace === b.namespace && a.branch === b.branch;
+}
+
+/** The slot an observe edge reads. An edge names a slot on the host's current branch. */
+export function observedSlot(edge: ObserveEdge): MessageSlotRef {
+  return { namespace: edge.slot ?? null };
+}
+
+/**
+ * The slot a shared derivation's own rows are stored in: the parent's
+ * message slot, as context-manager's derivation record names it, on the
+ * child's own branch. Undefined for any other inheritance, or one whose
+ * record doesn't say.
+ */
+function derivedSlot(inherit: ContextInheritance | undefined): MessageSlotRef | undefined {
+  if (inherit?.mode !== 'shared' || typeof inherit.ownBranch !== 'string') return undefined;
+  const slots = (inherit.derivation as { slots?: { messageNamespace?: unknown } } | undefined)?.slots;
+  const namespace = slots?.messageNamespace;
+  if (namespace !== null && typeof namespace !== 'string') return undefined;
+  return { namespace, branch: inherit.ownBranch };
+}
+
+/**
+ * The own slot a spec or record declares, or, where it declares none (one
+ * written before `ownSlot` existed), the slot it meant: the shared slot for
+ * one that reads that slot with no observe edge on it, which is how a
+ * resident was declared; a shared derivation's slot; else the isolated slot
+ * of its namespace. A subconscious declared its reading of the shared slot
+ * as an observe edge from the start (subconsciousSpec), so it reads as
+ * isolated, as it was opened.
+ */
+function resolveOwnSlot(declared: {
+  ownSlot?: MessageSlotRef;
+  readsSharedSlot?: boolean;
+  observes?: ObserveEdge[];
+  inherit?: ContextInheritance;
+  namespace?: string;
+}): MessageSlotRef | undefined {
+  const own = declared.ownSlot;
+  if (own) return { namespace: own.namespace, ...(own.branch !== undefined ? { branch: own.branch } : {}) };
+  const derived = derivedSlot(declared.inherit);
+  if (derived) return derived;
+  if (declared.readsSharedSlot === true && !(declared.observes ?? []).some((edge) => edge.slot === undefined)) {
+    return { namespace: null };
+  }
+  return typeof declared.namespace === 'string' ? { namespace: declared.namespace } : undefined;
+}
+
+/** What a record's deprecated `readsSharedSlot` says: it owns the residents' slot or observes it. */
+function readsResidentsSlot(ownSlot: MessageSlotRef | undefined, observes: ObserveEdge[]): boolean {
+  return sameSlot(ownSlot, RESIDENTS_SLOT) || observes.some((edge) => sameSlot(observedSlot(edge), RESIDENTS_SLOT));
+}
+
+/**
+ * A restored record with its own slot: one written before `ownSlot` existed
+ * gets the slot its `readsSharedSlot`, observe edges, inheritance and
+ * namespace meant (resolveOwnSlot). Its `readsSharedSlot` is kept as written.
+ */
+function withOwnSlot(record: AgentRecord): AgentRecord {
+  if (record.ownSlot !== undefined) return record;
+  const ownSlot = resolveOwnSlot({
+    readsSharedSlot: record.readsSharedSlot,
+    observes: record.relationships?.observes,
+    inherit: record.inherit,
+    namespace: record.namespace,
+  });
+  if (ownSlot) record.ownSlot = ownSlot;
+  return record;
 }
 
 export class AgentRegistry {
@@ -122,6 +200,8 @@ export class AgentRegistry {
     const incarnation = (this.incarnations.get(spec.name) ?? 0) + 1;
     this.incarnations.set(spec.name, incarnation);
 
+    const observes = (spec.observes ?? []).map((edge) => ({ ...edge }));
+    const ownSlot = resolveOwnSlot({ ...spec, observes });
     const record: AgentRecord = {
       name: spec.name,
       kind: spec.kind,
@@ -133,7 +213,7 @@ export class AgentRegistry {
       onParentEnd: spec.onParentEnd ?? 'orphan',
       relationships: {
         ...(spec.spawnedBy ? { spawnedBy: spec.spawnedBy } : {}),
-        observes: (spec.observes ?? []).map((edge) => ({ ...edge })),
+        observes,
         // Explicit message paths accumulate over an identity's life.
         messagePeers: previous ? [...previous.relationships.messagePeers] : [],
         ...(spec.resultTo ? { resultTo: { ...spec.resultTo } } : {}),
@@ -142,7 +222,9 @@ export class AgentRegistry {
       ...(spec.selfParticipants?.length ? { selfParticipants: [...spec.selfParticipants] } : {}),
       ...(spec.presentAs ? { presentAs: spec.presentAs } : {}),
       ...(spec.homeChannel ? { homeChannel: { serverId: spec.homeChannel.serverId, channelId: spec.homeChannel.channelId } } : {}),
-      readsSharedSlot: spec.readsSharedSlot ?? false,
+      ...(ownSlot ? { ownSlot } : {}),
+      // Kept for readers of the record from before the split: derived from it.
+      readsSharedSlot: readsResidentsSlot(ownSlot, observes),
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
       createdAt: previous?.createdAt ?? this.now(),
@@ -254,13 +336,47 @@ export class AgentRegistry {
     return this.live.get(name)?.roles.ownsProviderScheduling === true;
   }
 
-  /** Agents reading the residents' shared message slot. */
+  /**
+   * Agents reading the residents' shared message slot.
+   *
+   * @deprecated Use `readersOf(RESIDENTS_SLOT)`, or `slotOwners` and
+   * `observersOf` where owning and observing differ.
+   */
   sharedSlotReaders(): AgentName[] {
     return this.namesWhere((r) => r.readsSharedSlot);
   }
 
+  /** @deprecated Use `ownSlotOf` and `observersOf`. */
   readsSharedSlot(name: AgentName): boolean {
     return this.live.get(name)?.readsSharedSlot === true;
+  }
+
+  /** The slot a live agent's own rows are stored in, if it names one. */
+  ownSlotOf(name: AgentName): MessageSlotRef | undefined {
+    const slot = this.live.get(name)?.ownSlot;
+    return slot ? { ...slot } : undefined;
+  }
+
+  /** Live agents whose own rows are stored in `slot`, in registration order. */
+  slotOwners(slot: MessageSlotRef): AgentName[] {
+    return this.namesWhere((r) => sameSlot(r.ownSlot, slot));
+  }
+
+  /**
+   * Live agents that read `slot` through an observe edge, in registration
+   * order. With `held`, only those whose edge shows held (policy-diverted)
+   * traffic.
+   */
+  observersOf(slot: MessageSlotRef, options: { held?: boolean } = {}): AgentName[] {
+    return this.namesWhere((r) => r.relationships.observes.some(
+      (edge) => sameSlot(observedSlot(edge), slot) && (!options.held || edge.includeHeld === true),
+    ));
+  }
+
+  /** Every live agent that reads `slot`, as its own or through an observe edge, in registration order. */
+  readersOf(slot: MessageSlotRef): AgentName[] {
+    return this.namesWhere((r) => sameSlot(r.ownSlot, slot)
+      || r.relationships.observes.some((edge) => sameSlot(observedSlot(edge), slot)));
   }
 
   /** The channel an agent is bound to, if it has one. */
@@ -492,7 +608,7 @@ export class AgentRegistry {
   restore(snapshot: RegistrySnapshot | null | undefined, endedHistory: AgentRecord[] = []): RestoreOutcome {
     const interrupted: AgentRecord[] = [];
     for (const raw of endedHistory.slice(-this.endedRetention)) {
-      if (raw && typeof raw === 'object' && raw.ended) this.ended.push(clone(raw));
+      if (raw && typeof raw === 'object' && raw.ended) this.ended.push(withOwnSlot(clone(raw)));
     }
     if (!snapshot) return { interrupted };
     if (snapshot.version !== 1) {
@@ -510,7 +626,7 @@ export class AgentRegistry {
     this.mail = clone(snapshot.mail);
 
     for (const raw of snapshot.records) {
-      const record = clone(raw);
+      const record = withOwnSlot(clone(raw));
       if (record.ended) continue; // history lives in the ended log
       if (record.lifetime.kind === 'persistent') {
         this.awaiting.set(record.name, record);

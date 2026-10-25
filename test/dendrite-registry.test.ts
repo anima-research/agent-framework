@@ -8,8 +8,10 @@ import assert from 'node:assert/strict';
 import {
   AgentRegistry,
   AgentSpecError,
+  RESIDENTS_SLOT,
   conversationForkSpec,
   residentSpec,
+  sameSlot,
   subconsciousSpec,
   taskForkSpec,
   workerSpec,
@@ -316,5 +318,97 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.throws(() => registry.restore({ version: 9 } as unknown as RegistrySnapshot), /reads as version 9, which this code doesn't read/);
     registry.register(residentSpec('mira', { primary: true }));
     assert.equal(registry.get('mira')!.incarnation, 1);
+  });
+});
+
+describe('AgentRegistry slots: where own rows go, apart from what is observed (#291)', () => {
+  /** A shared task fork as the framework registers one: its derivation names the parent's slot. */
+  const sharedFork = (name: string, parent: string) => taskForkSpec(name, {
+    parent,
+    idleTimeoutMs: 60_000,
+    inherit: {
+      mode: 'shared',
+      ownBranch: `dendrite/${name}`,
+      derivation: { slots: { messageNamespace: null, contextNamespace: `agents/${parent}`, auxiliaryNamespaces: [] } },
+    },
+  });
+
+  it('records each preset\'s own slot, and the shared slot\'s observers apart from its owners', () => {
+    const registry = new AgentRegistry();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(residentSpec('oren', { primary: false }));
+    registry.register(subconsciousSpec('Subconscious', 'mira'));
+    registry.register(conversationForkSpec('mira-chan-1', { template: 'mira', homeChannel: { serverId: 's1', channelId: 'c1' }, idleTtlMs: 60_000 }));
+    registry.register(workerSpec('worker-1', { spawnedBy: 'mira' }));
+    registry.register(sharedFork('fork-1', 'mira'));
+
+    assert.deepEqual(registry.ownSlotOf('mira'), { namespace: null });
+    assert.deepEqual(registry.ownSlotOf('Subconscious'), { namespace: 'subconscious/mira' }, 'isolated: it observes the residents\' slot');
+    assert.deepEqual(registry.ownSlotOf('mira-chan-1'), { namespace: 'conversations/mira-chan-1' });
+    assert.deepEqual(registry.ownSlotOf('worker-1'), { namespace: 'subagent/worker-1' });
+    assert.deepEqual(registry.ownSlotOf('fork-1'), { namespace: null, branch: 'dendrite/fork-1' }, 'the parent\'s slot, on its own branch');
+    assert.equal(sameSlot(registry.ownSlotOf('fork-1'), RESIDENTS_SLOT), false, 'which isn\'t the residents\' slot');
+    assert.equal(registry.ownSlotOf('nobody'), undefined);
+
+    assert.deepEqual(registry.slotOwners(RESIDENTS_SLOT), ['mira', 'oren']);
+    assert.deepEqual(registry.observersOf(RESIDENTS_SLOT), ['Subconscious']);
+    assert.deepEqual(registry.observersOf(RESIDENTS_SLOT, { held: true }), ['Subconscious'], 'its edge shows held traffic');
+    assert.deepEqual(registry.readersOf(RESIDENTS_SLOT), ['mira', 'oren', 'Subconscious']);
+    assert.deepEqual(registry.readersOf({ namespace: 'subconscious/mira' }), ['Subconscious']);
+    // The deprecated flag is derived from the split, and reads as it did.
+    assert.deepEqual(registry.sharedSlotReaders(), registry.readersOf(RESIDENTS_SLOT));
+    assert.deepEqual(
+      ['mira', 'Subconscious', 'mira-chan-1', 'worker-1', 'fork-1'].map((name) => registry.get(name)!.readsSharedSlot),
+      [true, true, false, false, false],
+    );
+  });
+
+  it('reads a spec that sets only the deprecated readsSharedSlot as an older one meant it', () => {
+    const registry = new AgentRegistry();
+    const roles = { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false };
+    registry.register({ name: 'owner', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, readsSharedSlot: true, namespace: 'agents/owner' });
+    registry.register({ name: 'watcher', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, readsSharedSlot: true, observes: [{}], namespace: 'watch/w' });
+    assert.deepEqual(registry.ownSlotOf('owner'), { namespace: null }, 'no observe edge explains the flag: it owns the slot, as a resident');
+    assert.deepEqual(registry.ownSlotOf('watcher'), { namespace: 'watch/w' }, 'an edge on the slot: it observes it from a slot of its own');
+    assert.deepEqual(registry.observersOf(RESIDENTS_SLOT), ['watcher']);
+  });
+
+  it('restores records written before own slots from what they say: a resident owns the shared slot, the subconscious observes it through its edge', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(residentSpec('oren', { primary: false }));
+    first.register(subconsciousSpec('Subconscious', 'mira'));
+    first.register(workerSpec('job', { spawnedBy: 'mira' }));
+    first.register(sharedFork('fork-1', 'mira'));
+    // The records as the code before the split wrote them: readsSharedSlot
+    // on the residents and the subconscious, no ownSlot on any.
+    const legacy = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    for (const record of legacy.records) delete (record as Partial<AgentRecord>).ownSlot;
+    assert.deepEqual(legacy.records.map((r) => [r.name, r.readsSharedSlot, r.relationships.observes]), [
+      ['mira', true, []], ['oren', true, []], ['Subconscious', true, [{ includeHeld: true }]], ['job', false, []], ['fork-1', false, []],
+    ]);
+
+    const second = make();
+    const { interrupted } = second.restore(legacy, []);
+    second.register(residentSpec('mira', { primary: true }));
+    second.reconcile(); // oren and the subconscious are no longer declared: ended, still inspectable
+
+    const restored = (name: string) => second.inspect(name)!;
+    assert.deepEqual(restored('oren').ownSlot, { namespace: null }, 'a resident: the flag with no edge is the slot it owned');
+    assert.deepEqual(restored('Subconscious').ownSlot, { namespace: 'subconscious/mira' }, 'the subconscious: isolated, as it was opened');
+    assert.deepEqual(restored('Subconscious').relationships.observes, [{ includeHeld: true }], 'its reading of the shared slot is its observe edge');
+    assert.equal(restored('Subconscious').readsSharedSlot, true, 'the old flag is kept as written');
+    assert.deepEqual(interrupted.find((r) => r.name === 'job')!.ownSlot, { namespace: 'subagent/job' });
+    assert.deepEqual(interrupted.find((r) => r.name === 'fork-1')!.ownSlot, { namespace: null, branch: 'dendrite/fork-1' },
+      'a shared fork: the slot its derivation names, on its branch');
+
+    // The ended log's records are filled the same way when they are read back.
+    const third = make();
+    const ended = JSON.parse(JSON.stringify(state.ended)) as AgentRecord[];
+    for (const record of ended) delete record.ownSlot;
+    third.restore(null, ended);
+    assert.deepEqual(third.inspect('Subconscious')!.ownSlot, { namespace: 'subconscious/mira' });
+    assert.deepEqual(third.inspect('oren')!.ownSlot, { namespace: null });
   });
 });

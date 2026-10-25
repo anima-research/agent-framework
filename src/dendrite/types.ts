@@ -119,14 +119,43 @@ export interface ResultRoute {
   as: 'message' | 'tool-result';
 }
 
-/** Read access to another slot, merged into this agent's view. */
+/**
+ * A message slot: where an agent's rows are stored, or a slot another agent
+ * reads. `namespace` null is the residents' shared un-namespaced slot; a
+ * string is the isolated slot of that namespace. `branch` is set for a
+ * derived agent, whose slot is its parent's slot on a Chronicle branch of
+ * its own; without it the slot is the one on the host's current branch,
+ * where residents and the agents beside them write. Two refs name one slot
+ * when both fields are equal (sameSlot).
+ */
+export interface MessageSlotRef {
+  namespace: string | null;
+  branch?: string;
+}
+
+/**
+ * Read access to a slot that isn't the agent's own, merged into its view:
+ * the relationship a watcher has with the slot it watches (the subconscious
+ * with the residents' slot). An edge names a slot on the host's current
+ * branch.
+ */
 export interface ObserveEdge {
   /** The agent whose slot is read, when the slot belongs to one. */
   agent?: AgentName;
   /** Message-slot namespace; undefined = the shared un-namespaced slot. */
   slot?: string;
-  /** Only messages at or after this sequence. */
+  /**
+   * Only messages at or after this sequence.
+   *
+   * @deprecated A sequence is a coordinate of one branch's record, not of
+   * what an agent was shown; use `fromMessageId`. Nothing reads either yet.
+   */
   fromSequence?: number;
+  /**
+   * Only messages from this one on, by message id, which names one row on
+   * every branch and in every agent's presentation order (#291).
+   */
+  fromMessageId?: string;
   /** Whether held (policy-diverted) traffic in that slot is visible. */
   includeHeld?: boolean;
 }
@@ -240,8 +269,24 @@ export interface AgentSpec {
    */
   homeChannel?: { serverId: string; channelId: string };
   /**
+   * The slot this agent's own rows are stored in: the residents' shared
+   * slot for a resident, its own namespace's slot for an isolated agent, the
+   * parent's slot on its own branch for a shared fork. The presets set it,
+   * and the framework fills it for the agents it derives or creates from
+   * how it opens their context. Absent, the registry reads it as an older
+   * spec meant it: a shared derivation's slot; the shared slot when
+   * `readsSharedSlot` is set and no observe edge on that slot explains it;
+   * else the isolated slot of `namespace`. A slot it reads without owning
+   * it is an observe edge (`observes`).
+   */
+  ownSlot?: MessageSlotRef;
+  /**
    * Whether the agent reads the residents' shared un-namespaced message
    * slot (as its own slot or through an observe edge).
+   *
+   * @deprecated One flag for two relationships: owning the shared slot and
+   * observing it. Use `ownSlot` and `observes`. Still read for a spec that
+   * sets no `ownSlot` (see there).
    */
   readsSharedSlot?: boolean;
   /** Chronicle namespace owning this agent's context. */
@@ -310,6 +355,20 @@ export interface AgentRecord {
    * as a wake that names a channel without its server is.
    */
   homeChannel?: { serverId: string; channelId: string } | string;
+  /**
+   * The slot the agent's own rows are stored in (see AgentSpec.ownSlot). A
+   * record written before the field existed has it filled at restore from
+   * what the record says. Absent only for an agent whose spec named neither
+   * a slot nor a namespace.
+   */
+  ownSlot?: MessageSlotRef;
+  /**
+   * Whether the agent reads the residents' shared slot, as its own slot or
+   * through an observe edge: derived from `ownSlot` and `relationships.observes`
+   * when the record is made.
+   *
+   * @deprecated Use `ownSlot` and `relationships.observes`.
+   */
   readsSharedSlot: boolean;
   namespace?: string;
   metadata?: Record<string, unknown>;

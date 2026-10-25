@@ -127,7 +127,10 @@ test('a small unclassified reason produces exactly the marker it did before', ()
     '[inference-failed] Your previous turn did not complete: the model call failed and produced no response, ' +
     'so nothing was sent. Reason: 400 image exceeds 5 MB. If this recurs with the same cause, change approach ' +
     'rather than retrying identically (e.g. drop an oversized attachment or an unsupported setting).');
-  assert.deepEqual(markers[0].meta, { system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1 });
+  // The marker is a notice about the agent's own failed turn: its own row, stamped so (#291's audience stamp).
+  assert.deepEqual(markers[0].meta, {
+    system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1, audience: ['cairn'], ownRowOf: 'cairn',
+  });
   assert.deepEqual(logged[0], { agent: 'cairn', consecutive: 1, reason: '400 image exceeds 5 MB', kind: 'inference-exhausted' });
   assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
 });
