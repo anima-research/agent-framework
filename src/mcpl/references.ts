@@ -27,8 +27,6 @@
  * code-execution materialization hook possible.
  */
 
-import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
-
 export const REFERENCE_LIMITS = { uri: 4096, mimeType: 255, name: 255, expiresAt: 64 } as const;
 export const DIGEST_PATTERN = /^sha256:[A-Za-z0-9_-]{43}$/;
 const MAX_SAFE = 9007199254740991; // 2^53 - 1
@@ -60,8 +58,19 @@ export type BlockClassification =
   | { kind: 'text' }
   | { kind: 'inline'; contradiction: boolean }
   | { kind: 'reference'; testimony: ReferenceTestimony }
+  /** MCP's embedded resource (embeddedResourceContents): each lane shows
+   *  its contents as it shows the block they make. */
+  | { kind: 'embedded'; contents: EmbeddedContents }
   /** `shown` is what the model-visible lanes put in the block's place. */
   | { kind: 'invalid'; shown: string };
+
+/** What an embedded resource's contents are shown as: the ordinary block
+ *  they make, withheld inline data, or a marker saying why they aren't
+ *  shown. */
+export type EmbeddedContents =
+  | { kind: 'block'; block: { type: 'text'; text: string } | { type: 'image' | 'audio'; data: string; mimeType: string } }
+  | { kind: 'withheld' }
+  | { kind: 'marker'; text: string };
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
@@ -107,8 +116,10 @@ export function classifyBlock(block: unknown): BlockClassification {
       if (hasLink) return parseReferenceFields(block);
       return { kind: 'invalid', shown: block.type === 'image' ? IMAGE_NO_DATA_TEXT : AUDIO_NO_DATA_TEXT };
     }
-    case 'resource':
-      return parseReferenceFields(block);
+    case 'resource': {
+      const contents = embeddedResourceContents(block);
+      return contents ? { kind: 'embedded', contents } : parseReferenceFields(block);
+    }
     case 'resource_link':
       // MCP's link to a resource is a reference too. RFC-005 §8.1 maps it
       // onto the reference record field for field, its `size` as `sizeBytes`,
@@ -123,6 +134,37 @@ export function classifyBlock(block: unknown): BlockClassification {
     default:
       return { kind: 'invalid', shown: unknownBlockText(block) };
   }
+}
+
+/**
+ * MCP's EmbeddedResource: a `resource` block with no uri of its own whose
+ * `resource` is a record with a string `uri`. RFC-005 §8.1 reads it as "an
+ * ordinary inline block, nothing new", so its contents show as the block
+ * they make: with exactly one of a string `text` or a string `blob`
+ * (base64), its text as text, and its blob as the inline image or audio its
+ * media type makes it, or as a marker for any other type; with both or
+ * neither, the marker saying its contents can't be read. Its uri is never shown, since
+ * no lane RFC-005 governs showed it before and nothing here can tell a
+ * capability in a uri from a location. A disposition on it is inline
+ * content claiming bulk disposition (RFC-005 vector 2), so it's withheld.
+ * Null for any other block, among them MCPL's reference, whose uri is its
+ * own.
+ */
+function embeddedResourceContents(block: Record<string, unknown>): EmbeddedContents | null {
+  if (block.uri !== undefined && block.uri !== null && block.uri !== '') return null;
+  if (!isRecord(block.resource) || typeof block.resource.uri !== 'string') return null;
+  const { text, blob, mimeType } = block.resource;
+  if (block.disposition !== undefined) return { kind: 'withheld' };
+  if ((typeof text === 'string') === (typeof blob === 'string')) return { kind: 'marker', text: EMBEDDED_RESOURCE_UNREADABLE_TEXT };
+  if (typeof text === 'string') return { kind: 'block', block: { type: 'text', text } };
+  const data = blob as string;
+  const type = typeof mimeType === 'string' ? mimeType : '';
+  // image/* or audio/*, with a subtype: a bare `image` is no media type a
+  // block can carry, so it reads as any other type does.
+  const family = /^(image|audio)\/[^/]/i.exec(type)?.[1]?.toLowerCase() as 'image' | 'audio' | undefined;
+  if (family) return { kind: 'block', block: { type: family, data, mimeType: type } };
+  if (type === '') return { kind: 'marker', text: EMBEDDED_RESOURCE_NO_MEDIA_TYPE_TEXT };
+  return { kind: 'marker', text: embeddedBinaryText(type, data) };
 }
 
 /** A link's classification, its testimony marked as a link's (fromLink). */
@@ -185,6 +227,30 @@ export const AUDIO_NO_MEDIA_TYPE_TEXT = '[Audio not shown: its data arrived with
  *  inline data, so a plain link isn't enough either. (A tool result's audio
  *  with a link is a reference, as any block with one is there.) */
 export const AUDIO_NO_DATA_TEXT = '[Audio not shown: it arrived with no usable inline data.]';
+/** MCP's embedded resource whose contents are neither text nor a blob, or
+ *  both. */
+export const EMBEDDED_RESOURCE_UNREADABLE_TEXT = '[Resource not shown: its contents arrived as neither text nor data, or as both.]';
+/** MCP's embedded resource whose blob has no media type, so it can't be
+ *  shown as an image or audio. */
+export const EMBEDDED_RESOURCE_NO_MEDIA_TYPE_TEXT = '[Resource not shown: its data arrived without a media type.]';
+
+/** MCP's embedded resource whose blob is of a type no lane can show: what
+ *  it was, by its type and size. Made well formed (a lone UTF-16 surrogate
+ *  becomes U+FFFD), as a stub is (#695), since it names the block's media
+ *  type, which sanitizeLabel leaves as it is: every lane then shows the same
+ *  text. */
+export function embeddedBinaryText(mimeType: string, blob: string): string {
+  const what = [referenceTypeLabel(mimeType), formatSizeBytes(Math.floor(blob.length * 3 / 4))].filter(Boolean).join(', ');
+  return `[Resource not shown: this host can't display its data (${what}).]`.toWellFormed();
+}
+/**
+ * What the converter (convertBlock, on every lane) shows for a text
+ * block whose text isn't a string, which only a nonconformant sender writes,
+ * so the agent learns that a block was there. It is the host's word, not the
+ * sender's, so it never makes content visible (isVisiblyEmptyConversion in
+ * visible-content.ts, which re-exports it).
+ */
+export const NON_STRING_TEXT_PLACEHOLDER = '[Text not shown: a text part arrived without readable text.]';
 export const REFERENCE_NO_LINK_TEXT = '[Reference not shown: it arrived without a link.]';
 export const REFERENCE_LINK_TOO_LONG_TEXT = '[Reference not shown: its link is longer than this host accepts.]';
 const UNREADABLE_BLOCK_TEXT = "[Content not shown: a part arrived in a form this host can't read.]";
@@ -906,10 +972,11 @@ export interface UriClaims {
  *  each read once, as referenceExpiry reads an expiry. */
 export function resultClaims(testimonies: Iterable<ReferenceTestimony>, nevers: Iterable<string> = []): ResultClaims {
   const claims = new Map<string, UriClaims>();
-  // A uri inline data marks `disposition: never` beside its data, the
-  // classifier's contradiction (inlineNeverUri): withheld unconditionally
-  // (RFC-005 §5), though the block is no reference. Only its never counts,
-  // since its other claims could loosen (Ada-1017, room-203 #201013).
+  // A uri inline content marks `disposition: never` (inlineNeverUri), inline
+  // data beside its data, the classifier's contradiction, or an embedded
+  // resource: withheld unconditionally (RFC-005 §5), though the block is no
+  // reference. Only its never counts, since its other claims could loosen
+  // (Ada-1017, room-203 #201013, #206688).
   const entry = (uri: string): UriClaims => {
     let c = claims.get(uri);
     if (!c) claims.set(uri, c = { never: false, rejected: false, unparseable: false, earliestMs: null });
@@ -946,14 +1013,18 @@ export function contentClaims(blocks: readonly unknown[]): ResultClaims {
   return resultClaims(testimonies, nevers);
 }
 
-/** The uri inline data marks `disposition: never` beside its data, the
- *  classifier's contradiction, which counts for that uri's claims
- *  (resultClaims); null for any other block. A uri that isn't a non-empty
- *  string names nothing a claim is kept for. */
+/** The uri inline content marks `disposition: never`, which counts for that
+ *  uri's claims (resultClaims) though the block is no reference: inline data
+ *  beside its uri, the classifier's contradiction, and MCP's embedded
+ *  resource, whose uri sits under `resource` (Ada-1017, room-203 #206688).
+ *  Null for any other block. A uri that isn't a non-empty string names
+ *  nothing a claim is kept for. */
 export function inlineNeverUri(block: unknown, c: BlockClassification = classifyBlock(block)): string | null {
-  if (c.kind !== 'inline' || !c.contradiction) return null;
-  const b = block as { uri?: unknown; disposition?: unknown };
-  return b.disposition === 'never' && typeof b.uri === 'string' && b.uri !== '' ? b.uri : null;
+  // Either kind is a record, so its fields can be read.
+  if (!(c.kind === 'inline' && c.contradiction) && c.kind !== 'embedded') return null;
+  const b = block as { uri?: unknown; disposition?: unknown; resource: { uri?: unknown } };
+  const uri = c.kind === 'embedded' ? b.resource.uri : b.uri;
+  return b.disposition === 'never' && typeof uri === 'string' && uri !== '' ? uri : null;
 }
 
 /** The claims a decision about a record reads: its result's for its uri,
@@ -1084,7 +1155,10 @@ export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now(), c
  * its existing (inline/text) handling. A reference's stub carries text taken
  * from the block's own fields, so it's made well formed (a lone UTF-16
  * surrogate becomes U+FFFD), as the context store would make it: a tool
- * result's copies then carry the same text (#695).
+ * result's copies then carry the same text (#695). For MCP's embedded
+ * resource, it's the text for contents that can't be shown (its marker is
+ * well formed where it's made), and null where they can: the caller shows the
+ * block they make (classifyBlock's `embedded`).
  */
 export function referenceStubOrNull(block: unknown, provenance?: string, serverId?: string, options?: StubOptions): string | null {
   const c = classifyBlock(block);
@@ -1093,6 +1167,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
     case 'inline':
       return c.contradiction ? INLINE_WITHHELD_TEXT : null;
     case 'reference': return buildReferenceStub(c.testimony, provenance, serverId, options).toWellFormed();
+    case 'embedded':
+      return c.contents.kind === 'withheld' ? INLINE_WITHHELD_TEXT : c.contents.kind === 'marker' ? c.contents.text : null;
     case 'invalid': return c.shown;
   }
 }
@@ -1129,7 +1205,9 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * or a new one bound to no server. A block the classifier
  * rejects becomes the notice the model's lanes show, and inline data that
  * also claims a bulk disposition, or a uri of any type but null, absent or
- * empty, the withheld notice, each as a text block.
+ * empty, the withheld notice, each as a text block. MCP's embedded resource
+ * becomes the block its contents make, as the model's lanes show it, never
+ * its uri.
  * A text block, or inline data that claims nothing, is returned as sent.
  */
 export function referenceBlockForScript(block: unknown, serverId?: string, claims?: ResultClaims, line?: ScriptLine): unknown {
@@ -1150,6 +1228,14 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
         : block;
     }
     case 'invalid': return { type: 'text', text: c.shown };
+    case 'embedded':
+      // The block its contents make, as the model's lanes show it, and never
+      // its uri or its `resource` record (Ada-1017, room-203 #206688): text,
+      // or inline data that claims nothing, as such a block reaches a script;
+      // the withheld notice where it claims a disposition; its marker
+      // otherwise. Given again, each is as it was.
+      if (c.contents.kind === 'block') return c.contents.block;
+      return { type: 'text', text: c.contents.kind === 'withheld' ? INLINE_WITHHELD_TEXT : c.contents.text };
     case 'reference': {
       const t = c.testimony;
       const record = referenceRegistry.register(t, serverId);

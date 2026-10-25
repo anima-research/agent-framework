@@ -411,6 +411,53 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it("another agent's stored context injection isn't in the caller's view, so its image takes no slot: index 0 is the attachment", async () => {
+    const h = await startTurn({
+      prefix: 'sri-other-injection-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      // After the attachment, a resident sharing the slot stored an injection
+      // carrying an image (stored-injections.ts): prime's view leaves it out.
+      seedHistory: (framework) => framework.getAgent('prime')!.getContextManager().addMessage('system_context:lessons', [
+        { type: 'text', text: "helper's lesson" },
+        { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+      ] as ContentBlock[], { system: true, kind: 'context-injection', contextInjection: { agent: 'helper', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 } }),
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+      assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not the other agent's image");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("the caller's own stored context injection is in its view, so its image takes index 0", async () => {
+    const h = await startTurn({
+      prefix: 'sri-own-injection-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/lesson.png', index: 0 })],
+        done,
+      ],
+      seedHistory: (framework) => framework.getAgent('prime')!.getContextManager().addMessage('system_context:lessons', [
+        { type: 'text', text: 'my lesson' },
+        { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+      ] as ContentBlock[], { system: true, kind: 'context-injection', contextInjection: { agent: 'prime', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 } }),
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.sha256, sha(PNG));
+      assert.ok((await fileBytes(h, 'files/lesson.png'))?.equals(PNG), "index 0 is the caller's own injection image");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('fails at the exact index when the newest image was evicted — never saves the older attachment', async () => {
     // A ledger that holds nothing: every retained image is evicted at once,
     // which is what a restart or a blown budget looks like from the scan.
@@ -460,6 +507,10 @@ describe('save_recent_image provenance (issue #104)', () => {
       const result = await waitForToolResult(h.framework, 'call_save');
       assert.strictEqual(result.isError, true);
       assert.match(result.content, /index 0 is a tool-result image from world--snap \(call call_old\) recorded without a retention ref/);
+      // An embedded image nested in a tool's data is kept only as its
+      // placeholder too, and a re-run records it the same way.
+      assert.match(result.content, /nested in the tool's data rather than its content/);
+      assert.match(result.content, /unless the image came nested in its data, which a re-run records the same way/);
       assert.ok((await fileBytes(h, 'files/phoenix.png')) === null, 'the older GIF must not be written under the PNG name');
     } finally {
       await h.framework.stop();

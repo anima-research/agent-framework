@@ -4,6 +4,7 @@ import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/cont
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
 import { ensureStateRegistered } from './module-registry.js';
+import { classifyBlock } from './mcpl/references.js';
 import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
 
@@ -90,16 +91,21 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
  * inline cap or less (storeResults' keptCap), they're cut, with a note that
  * says so and where the whole result is, since a later field can then be cut
  * away entirely. Undefined when it keeps nothing, as for a failed result
- * (agent-framework #277), or one whose claims can't be read whole
- * (resultClaimsOf). A write's file list is evidence of what it did, rarely
- * what drew a refusal, and keeping it is what shows a clobbered file when the
- * receipt is withheld.
+ * (agent-framework #277), one whose claims can't be read whole
+ * (resultClaimsOf), or one whose data is MCP's embedded resource, whose
+ * fields can't be kept apart from its contents or its uri. A write's file
+ * list is evidence of what it did, rarely what drew a refusal, and keeping it
+ * is what shows a clobbered file when the receipt is withheld.
  */
 export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: number | undefined): string | undefined {
   const { data, keepWhenWithheld: keys } = result;
   if (!result.success || result.isError || !keys?.length || !data || typeof data !== 'object' || Array.isArray(data)) {
     return undefined;
   }
+  // MCP's embedded resource is its contents: shown as text, it's the very
+  // body the guard withheld, and a field picked out of it, such as
+  // `resource`, is data that shows its uri. So it keeps nothing.
+  if (classifyBlock(data).kind === 'embedded') return undefined;
   const fields = data as Record<string, unknown>;
   const kept = Object.fromEntries(keys.filter((key) => Object.hasOwn(fields, key)).map((key) => [key, fields[key]]));
   if (Object.keys(kept).length === 0) return undefined;

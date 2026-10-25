@@ -165,7 +165,8 @@ describe('data the serializer doesn\'t read as content blocks', () => {
 
   it("governs MCP's embedded resource, whose uri sits under resource, at any depth", () => {
     const embedded = { type: 'resource', resource: { uri: URI, mimeType: 'application/pdf', blob: BASE64 } };
-    const line = '[Reference not shown: it arrived without a link.]';
+    // Its contents show as the block they make, and a pdf's data is no block any lane shows.
+    const line = "[Resource not shown: this host can't display its data (application/pdf, 24B).]";
     const nested = toolResultDataToHistoryString({ result: { content: [embedded] } });
     assert.ok(!nested.includes(SIGNATURE) && !nested.includes(BASE64), nested);
     assert.deepEqual(parsed(nested), { result: { content: [line] } });
