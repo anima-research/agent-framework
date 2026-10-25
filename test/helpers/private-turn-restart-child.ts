@@ -8,7 +8,6 @@ if (!storePath || !channelId) {
 }
 
 const membrane = new MockMembrane();
-membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about the build' }]));
 const framework = await AgentFramework.create({
   storePath,
   membrane: membrane.asMembrane(),
@@ -28,6 +27,15 @@ internals.channelRegistry = new Proxy({
     routed.push({ text, locus: locus?.channelId ?? null });
     return { delivered: true, serverId: 'discord', channelId: locus?.channelId };
   },
+  deliverSpeech: async (_agent: string, text: string, channel: { channelId: string } | string | null) => {
+    const id = typeof channel === 'string' ? channel : channel?.channelId ?? null;
+    routed.push({ text, locus: id });
+    return { status: 'delivered', destination: { serverId: 'discord', channelId: id }, at: Date.now() };
+  },
+  resolveProseTarget: (target: string) => ({ serverId: 'discord', channelId: target }),
+  resolveDestination: ({ channelId: id }: { channelId: string }) => ({ destination: { serverId: 'discord', channelId: id } }),
+  getDefaultPublishChannel: () => ({ serverId: 'discord', channelId: 'discord:g:lounge' }),
+  startTyping: () => {},
   getDescriptor: () => undefined,
   channelsNamed: (id: string) => [{ serverId: 'discord', channelId: id }],
   nameShown: (r: { channelId: string }) => r.channelId,
@@ -35,15 +43,19 @@ internals.channelRegistry = new Proxy({
 if (framework.getHostModeStatus().quiesced) await framework.resume();
 const landed = framework.getAgent('scout')!.getContextManager().getAllMessages()
   .some((m) => ((m.content[0] as { text?: string }).text ?? '').includes('the build finished'));
-internals.pendingRequests.push({
-  agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), channelId, addressed: true,
-});
-while (membrane.calls.length === 0) {
+const channelTurn = async (calls: number, reply: string) => {
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: reply }]));
+  internals.pendingRequests.push({
+    agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), channelId, addressed: true,
+  });
+  while (membrane.calls.length < calls) {
+    await framework.runUntilIdle();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   await framework.runUntilIdle();
-  await new Promise((resolve) => setTimeout(resolve, 10));
-}
-await framework.runUntilIdle();
-const started = membrane.calls.length > 0;
+};
+await channelTurn(1, 'about the build');
+await channelTurn(2, 'and the weather');
 await framework.stop();
-console.log(JSON.stringify({ landed, started, routed }));
+console.log(JSON.stringify({ landed, routed }));
 process.exit(0);

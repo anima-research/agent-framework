@@ -9,7 +9,7 @@ import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -1579,32 +1579,41 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a private turn's script report deferred across an update's restart keeps the next run's start out of every channel", async (context) => {
-      const storeDir = mkdtempSync(join(tmpdir(), 'private-turn-restart-'));
-      try {
-        const first = await surfaceRig({ storeDir });
+    for (const clock of ['as it was', 'set back'] as const) {
+      it(`a private turn's script report deferred across an update's restart keeps the next run's start out of every channel${clock === 'set back' ? ", with the clock set back so the report's turn id sits above the next run's" : ''}, and leaves a later turn its channel`, async (context) => {
+        const storeDir = mkdtempSync(join(tmpdir(), 'private-turn-restart-'));
         try {
-          await firstTurn(first, true);
-          const turnId = routingOf(first.framework).turnId as number;
-          await first.framework.quiesce({ reason: 'update' });
-          await (first.framework as unknown as {
-            scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
-          }).scriptWake('scout', 's1', '[script s1] the build finished', 's1-ended', turnId);
-          first.i.pendingRequests.length = 0;
-          assert.equal(first.framework.getHostModeStatus().deferredWrites, 1, 'control: the report is deferred, and kept');
+          const first = await surfaceRig({ storeDir });
+          try {
+            await firstTurn(first, true);
+            const turnId = routingOf(first.framework).turnId as number;
+            await first.framework.quiesce({ reason: 'update' });
+            await (first.framework as unknown as {
+              scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
+            }).scriptWake('scout', 's1', '[script s1] the build finished', 's1-ended', turnId);
+            first.i.pendingRequests.length = 0;
+            assert.equal(first.framework.getHostModeStatus().deferredWrites, 1, 'control: the report is deferred, and kept');
+          } finally {
+            await first.close();
+          }
+          if (clock === 'set back') {
+            const queuePath = join(storeDir, 'store', 'recovery', 'deferred-writes.json');
+            const queue = JSON.parse(readFileSync(queuePath, 'utf8')) as { pending: Array<{ metadata?: Record<string, unknown> }> };
+            assert.equal(typeof queue.pending[0]?.metadata?.callerTurnId, 'number', 'control: the report names its turn');
+            queue.pending[0]!.metadata!.callerTurnId = Date.now() * 1000 + 1e12;
+            writeFileSync(queuePath, JSON.stringify(queue));
+          }
+          const child = await runRestartChild(join(storeDir, 'store'), ROOM, context.signal);
+          assert.equal(child.status, 0, `the next run (signal ${child.signal}, stderr: ${child.stderr.slice(-800)})`);
+          const next = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { landed: boolean; routed: Array<{ text: string; locus: string | null }> };
+          assert.equal(next.landed, true, 'control: the next run stored the report');
+          assert.deepEqual(next.routed.filter((r) => r.text === 'about the build'), [], "the start that reads the earlier run's private report speaks in no channel");
+          assert.deepEqual(next.routed.filter((r) => r.text === 'and the weather').map((r) => r.locus), [ROOM], 'a later channel turn speaks in its channel');
         } finally {
-          await first.close();
+          rmSync(storeDir, { recursive: true, force: true });
         }
-        const child = await runRestartChild(join(storeDir, 'store'), ROOM, context.signal);
-        assert.equal(child.status, 0, `the next run (signal ${child.signal}, stderr: ${child.stderr.slice(-800)})`);
-        const next = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { landed: boolean; started: boolean; routed: unknown[] };
-        assert.equal(next.landed, true, 'control: the next run stored the report');
-        assert.equal(next.started, true, "control: the channel's wake started a turn");
-        assert.deepEqual(next.routed, [], "the report is the earlier run's private turn's, so the start that reads it speaks in no channel");
-      } finally {
-        rmSync(storeDir, { recursive: true, force: true });
-      }
-    });
+      });
+    }
 
     it("a provider hold that holds a private wake beside an equal one wakes a turn that speaks in no channel", async () => {
       const rig = await surfaceRig();

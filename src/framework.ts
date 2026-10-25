@@ -8200,7 +8200,13 @@ export class AgentFramework {
         { cause: error },
       );
     }
-    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({ ...m, seq: i + 1 }));
+    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({
+      ...m,
+      seq: i + 1,
+      ...(typeof (m.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number'
+        ? { metadata: { ...m.metadata, [CALLER_TURN_KEY]: 0 } as MessageMetadata }
+        : {}),
+    }));
     this.deferredSeq = Math.max(this.deferredSeq, restored.length);
     if (landed.size > 0) {
       console.error(

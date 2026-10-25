@@ -74,6 +74,10 @@
   `metadata.channelId` is only whitespace is now stamped as a surface's
   (`kind: 'surface'`). Before, it got no source stamp.
 
+- **Servers and modules writing message metadata:** a `callerTurnId` key in a
+  message a server or module stores is now dropped, since only the framework
+  writes that key. The first drop from each server is logged.
+
 - **Turn ids** (`ToolCall.callerTurnId`, `SpeechContext.turnId`) start from
   the clock (milliseconds since the epoch, times 1,000) instead of 1, so an
   id an earlier run of the process gave out is smaller than any a later run
