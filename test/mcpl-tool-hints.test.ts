@@ -401,3 +401,142 @@ test('toolHints is a boolean, and only for an MCPL server', () => {
   assert.deepEqual(serverConfigProblems({ id: 's', url: 'https://example.invalid/mcp', toolHints: false }), []);
   assert.deepEqual(serverConfigProblems({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: true }), []);
 });
+
+test('act and a direct call take one dispatch path: state exchange, lifecycle, results; only _meta differs', async () => {
+  const { createMockResponse } = await import('./helpers/mock-membrane.js');
+  const state = new State();
+  let n = 0;
+  const calls: Json[] = [];
+  const advert: Json = {
+    ...ADVERT,
+    // Host-managed state: each call is sent the state the last one returned.
+    featureSets: { 'arc.tools': { description: 'tools', uses: ['tools'], hostState: true }, 'arc.events': { description: 'events', uses: ['pushEvents'] } },
+  };
+  const server = await startScriptedServer({
+    advert, tools: TOOLS, listRev: () => state.rev,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, state.listResult()); return; }
+      if (msg.method === 'toolsets/open') {
+        state.open = [{ toolset: 'game', instance: 'g1', title: 'G1' }];
+        peer.reply(msg.id, { toolset: 'game', instance: 'g1', title: 'G1', _meta: { 'mcpl/hints': state.hint([{ name: 'play', instance: 'g1', visible: true }]) } });
+        return;
+      }
+      if (msg.method === 'tools/call') {
+        const p = msg.params as Json;
+        calls.push(p);
+        n++;
+        const hides = p.name === 'play' ? { _meta: { 'mcpl/hints': state.hint([{ name: 'play', instance: 'g1', visible: false }]) } } : {};
+        peer.reply(msg.id, { content: [{ type: 'text', text: `${String(p.name)} ran` }], state: { checkpoint: `c${n}`, parent: n > 1 ? `c${n - 1}` : null, data: { n } }, ...hides });
+        return;
+      }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  // A second server observes tool use (RFC-007), metadata only.
+  const lifecycle: Json[] = [];
+  const observer = await startScriptedServer({
+    advert: { toolLifecycle: { observe: true }, featureSets: { 'obs.watch': { description: 'watch', uses: ['toolLifecycle.observe'] } } },
+    tools: [],
+    on: (msg) => { if (msg.method === 'tools/lifecycle') lifecycle.push(msg.params as Json); },
+  });
+  const fw = await makeFramework([
+    { id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: true },
+    { id: 'obs', toolPrefix: 'obs', url: observer.url, toolLifecycle: { observe: {} } },
+  ] as McplServerConfig[]);
+  const traces: Array<{ type: string; [k: string]: unknown }> = [];
+  fw.framework.onTrace((e: unknown) => traces.push(e as never));
+  const dispatched: string[] = [];
+  const internals = fw.framework as unknown as { dispatchMcplToolCall: (agent: string, call: { name: string }, ...rest: unknown[]) => void };
+  const original = internals.dispatchMcplToolCall.bind(fw.framework);
+  internals.dispatchMcplToolCall = (agent, call, ...rest) => { dispatched.push(call.name); original(agent, call, ...rest); };
+  try {
+    await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status') && server.received.some((m) => m.method === 'toolsets/list'), 'connected');
+    await callTool(fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game', instance: 'g1' });
+    const use = (id: string, name: string, input: Json) => createMockResponse([{ type: 'tool_use', id, name, input }] as never, 'tool_use');
+    fw.membrane.pushResponse(use('toolu_01AAAAAAAAAAAAAAAAAAAAAA', 'arc--status', {}));
+    fw.membrane.pushResponse(use('toolu_01BBBBBBBBBBBBBBBBBBBBBB', 'toolsets--act', { tool: 'play', args: { point: 'D4' } }));
+    fw.membrane.pushResponse(use('toolu_01CCCCCCCCCCCCCCCCCCCCCC', 'arc--status', {}));
+    fw.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+    fw.framework.pushEvent({ type: 'external-message', source: 'test', content: [{ type: 'text', text: 'go' }], metadata: {}, triggerInference: true } as never);
+    await waitFor(() => calls.length === 3, 'three calls');
+    await waitFor(() => fw.membrane.lastStream?.receivedToolResults.length === 3, 'three results returned');
+
+    // One path: the same dispatch, under each tool's own name.
+    assert.deepEqual(dispatched, ['arc--status', 'arc--play', 'arc--status']);
+    const started = traces.filter((e) => e.type === 'tool:started').map((e) => `${String(e.module)}:${String(e.tool)}`);
+    assert.deepEqual(started, ['mcpl:arc:status', 'mcpl:arc:play', 'mcpl:arc:status']);
+    // The state exchange runs through act as through a direct call: each call
+    // is sent the state the one before it returned.
+    assert.deepEqual(calls.map((c) => c.state ?? null), [null, { n: 1 }, { n: 2 }]);
+    // Only the instance is added.
+    assert.deepEqual(calls.map((c) => c._meta ?? null), [null, { 'mcpl/instance': 'g1' }, null]);
+    // RFC-007 observers see the server's tool, not the meta-tool.
+    await waitFor(() => lifecycle.filter((p) => p.phase === 'started').length === 3, 'three openings observed');
+    const opened = lifecycle.filter((p) => p.phase === 'started').map((p) => `${String(p.serverId)}:${String(p.serverTool)}:${String(p.tool)}`);
+    assert.deepEqual(opened, ['arc:status:arc--status', 'arc:play:arc--play', 'arc:status:arc--status']);
+    // The act's result, as the model got it, shows the change its call made,
+    // and no notice repeats it.
+    const results = JSON.stringify(fw.membrane.lastStream!.receivedToolResults);
+    assert.match(results, /play ran/);
+    assert.match(results, /now unavailable: play/);
+    await settle(100);
+    assert.ok(!windowText(fw.framework).some((t) => t.includes('tool changes')), 'told once, in the result');
+  } finally {
+    await fw.stop();
+    await server.close();
+    await observer.close();
+  }
+});
+
+test('a hint change in the result of a call whose result the agent doesn\'t see is told as a notice', async () => {
+  const t = await setup((msg, peer, state) => {
+    if (msg.method !== 'tools/call') return false;
+    peer.reply(msg.id, { content: [{ type: 'text', text: 'reacted' }], _meta: { 'mcpl/hints': state.hint([{ name: 'peek', visible: true }]) } });
+    return true;
+  });
+  try {
+    // As the framework's own calls (a reaction, a send) are made: straight on the connection.
+    const connection = (t.fw.framework as unknown as { mcplServerRegistry: { getServer(id: string): { sendToolsCall(n: string, a: object): Promise<unknown> } } })
+      .mcplServerRegistry.getServer('arc');
+    await connection.sendToolsCall('status', {});
+    await waitFor(() => windowText(t.fw.framework).some((x) => x.includes('tool changes') && x.includes('peek()')), 'told as a notice');
+  } finally { await t.done(); }
+});
+
+test('close refuses an instance for a toolset without instances, and sends nothing', async () => {
+  const t = await setup((msg, peer, state) => {
+    if (msg.method === 'toolsets/open') {
+      state.open = [{ toolset: 'build', title: 'B' }];
+      peer.reply(msg.id, { toolset: 'build', title: 'B', _meta: { 'mcpl/hints': state.hint([{ name: 'place', visible: true }]) } });
+      return true;
+    }
+    return false;
+  });
+  try {
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
+    const r = await callTool(t.fw.framework, 'toolsets--close', { server: 'arc', toolset: 'build', instance: 'x' });
+    assert.ok(r.isError);
+    assert.match(resultText(r), /arc\/build has no instances: close it without one/);
+    assert.ok(!t.methods().includes('toolsets/close'), 'nothing sent');
+  } finally { await t.done(); }
+});
+
+test('the host\'s argument check is bounded: no server pattern runs, and deep or wide schemas are left to the server', async () => {
+  const { checkArgs } = await import('../src/mcpl/tool-signature.js');
+  // A pattern that backtracks catastrophically is never evaluated.
+  const started = Date.now();
+  assert.equal(checkArgs({ type: 'object', properties: { s: { type: 'string', pattern: '^(a+)+$' } } }, { s: `${'a'.repeat(40)}!` }), null);
+  assert.ok(Date.now() - started < 100);
+  // Types, enums and the rest are still checked.
+  assert.match(checkArgs({ type: 'object', properties: { n: { enum: [1, 2] } } }, { n: 3 })!, /must be one of 1\|2/);
+  // Nesting past the bound: unchecked rather than recursed into.
+  let deep: Record<string, unknown> = { type: 'string' };
+  for (let i = 0; i < 200; i++) deep = { allOf: [deep] };
+  assert.equal(checkArgs(deep, 5), null);
+  // anyOf fan-out that would take exponential time: unchecked past the step budget.
+  let wide: Record<string, unknown> = { type: 'string' };
+  for (let i = 0; i < 20; i++) wide = { anyOf: [{ allOf: [wide, { type: 'number' }] }, { allOf: [wide, { type: 'boolean' }] }] };
+  const t0 = Date.now();
+  assert.equal(checkArgs(wide, null), null);
+  assert.ok(Date.now() - t0 < 200, 'bounded');
+});

@@ -36,14 +36,23 @@ export async function serveToolsetServer(spec: ToolsetServerSpec, principal = 'a
   const server = new ToolsetServer(spec);
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   const sockets = new Set<WebSocket>();
+  /** Every request and notification method the server received, in order, across connections. */
+  const received: string[] = [];
   wss.on('connection', (ws) => {
     sockets.add(ws);
     ws.on('close', () => sockets.delete(ws));
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(String(data)) as { method?: unknown };
+        if (typeof msg.method === 'string') received.push(msg.method);
+      } catch { /* not JSON */ }
+    });
     void server.serve(McplConnection.fromWebSocket(ws as never), principal);
   });
   await listening(wss);
   return {
     server,
+    received,
     url: urlOf(wss),
     /** Drop every live connection (the host reconnects if configured to). */
     dropAll: () => { for (const ws of sockets) ws.terminate(); },

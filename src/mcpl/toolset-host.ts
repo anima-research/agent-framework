@@ -71,6 +71,8 @@ export class ToolsetController {
   private epoch = -1;
   /** What applying a message's hints changed, by the object that carried them. */
   private readonly readChanges = new WeakMap<object, ChangeSet>();
+  /** Results whose change no one has rendered yet (tellUnlessClaimed). */
+  private readonly unclaimed = new Set<object>();
   /** eventIds of pushes read on this transport (bounded): a repeat's hints are ignored (RFC §6.1). */
   private seenEvents = new Set<string>();
   /** A paged tools/list being read. */
@@ -240,6 +242,7 @@ export class ToolsetController {
     }
     if (awaited) {
       this.readChanges.set(res, cs);
+      this.tellUnlessClaimed(res, cs, method);
     } else {
       // RFC §6.1: a result nobody waits for any more (it timed out) applies
       // all the same, and its change is told on its own.
@@ -322,16 +325,40 @@ export class ToolsetController {
       `called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${tool}", args}. ${this.presence.toolStatus(tool)}.`;
   }
 
-  /** What applying `carrier`'s hints changed (a tool result, a push's params), rendered; '' for nothing. */
+  /**
+   * An awaited result's change is told by whoever renders that result, when
+   * the result goes to the agent: the model's own call of a tool (its tool
+   * result), a meta-tool. One no one renders by the time the awaiting code has
+   * run (the next macrotask), such as the result of a call the framework makes
+   * itself (a reaction, a send, an accounted side effect), is told as a notice
+   * instead, as a standalone tools/hints is (RFC §6.1: every change reaches the
+   * agent once).
+   */
+  private tellUnlessClaimed(res: object, cs: ChangeSet, method: string): void {
+    if (isEmptyChange(cs)) return;
+    this.unclaimed.add(res);
+    setImmediate(() => {
+      if (!this.unclaimed.delete(res)) return;
+      this.log(`${method} result's tool change wasn't shown with it: told as a notice`);
+      this.deliver(cs);
+    });
+  }
+
+  /** What applying `carrier`'s hints changed (a tool result, a push's params),
+   *  rendered, for its handler to show with it; '' for nothing. Taking it
+   *  means it's told there, not as a notice. */
   changeText(carrier: unknown): string {
     if (!isObj(carrier)) return '';
+    this.unclaimed.delete(carrier);
     const cs = this.readChanges.get(carrier);
     return cs ? this.presence.render(cs) : '';
   }
 
-  /** The change a carrier's hints made, or an empty one. */
+  /** The change a carrier's hints made, or an empty one; taken as changeText's is. */
   changeOf(carrier: unknown): ChangeSet {
-    return (isObj(carrier) ? this.readChanges.get(carrier) : undefined) ?? emptyChange();
+    if (!isObj(carrier)) return emptyChange();
+    this.unclaimed.delete(carrier);
+    return this.readChanges.get(carrier) ?? emptyChange();
   }
 
   // ── recovery (RFC §6.1) ──
@@ -468,14 +495,6 @@ export class ToolsetController {
     const r = await connection.sendToolsetsClose({ toolset, ...(instance ? { instance } : {}) }, TOOLSET_REQUEST_TIMEOUT_MS);
     const res = isObj(r) ? r : {};
     return { content: Array.isArray(res.content) ? res.content : [], change: this.changeOf(res) };
-  }
-
-  /** A dynamic tool's call (RFC §5.5): the instance rides in `_meta["mcpl/instance"]`. */
-  async call(tool: string, args: Record<string, unknown>, instance: string | undefined): Promise<{ content: unknown[]; isError: boolean; change: ChangeSet }> {
-    const connection = this.live();
-    const r = await connection.sendToolsCall(tool, args, undefined, instance ? { 'mcpl/instance': instance } : undefined);
-    const res = isObj(r) ? (r as Record<string, unknown>) : {};
-    return { content: Array.isArray(res.content) ? res.content : [], isError: res.isError === true, change: this.changeOf(res) };
   }
 
   /** Open or close an undeclared group (RFC §5.4): the host's own act; the server isn't told. */

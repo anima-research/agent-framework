@@ -11,7 +11,9 @@
  * Dynamic tools never enter the API tool list: changing it rebuilds the
  * prompt cache. They're announced in the conversation (in these tools'
  * results, in the results of calls that changed them, in push events and in
- * notices) and called here. The module is registered when a server is
+ * notices) and called through `toolsets--act`, which this module only
+ * resolves (resolveAct): the framework dispatches the call it resolves to
+ * down the same path as a direct call of the server's tool. The module is registered when a server is
  * configured with `toolHints: true`; its tools never change after that.
  *
  * Its gatherContext publishes the RFC §8.3 reminder, as a stored `afterUser`
@@ -132,6 +134,87 @@ function blocksResult(blocks: Block[], isError = false): ToolResult {
 
 const asBlocks = (content: unknown[]): Block[] => content.filter((b): b is Block => isObj(b) && typeof b.type === 'string');
 
+
+// ── choosing the server ──
+
+function pick(hub: ToolsetHub, server: unknown): ToolsetController {
+  const id = str(server);
+  const ids = hub.presenting().map((c) => c.serverId);
+  if (!id) {
+    if (ids.length === 1) return hub.get(ids[0]!)!;
+    return fail(`name a server: ${ids.join(', ') || '(no MCPL server presents toolsets now)'}`);
+  }
+  const c = hub.get(id);
+  if (!c) return fail(`no server "${id}" presents toolsets; the ones that do: ${ids.join(', ') || 'none'}`);
+  if (!c.presence.active) return fail(`${id} sends no tool hints now: its tools are in your tool list`);
+  return c;
+}
+
+/**
+ * RFC §8.2: `server` may be left out; the name decides, when exactly one
+ * presenting server has it. Two or more: name the server.
+ */
+function owner(hub: ToolsetHub, server: unknown, has: (c: ToolsetController) => boolean, what: string): ToolsetController {
+  if (str(server)) return pick(hub, server);
+  const owners = hub.presenting().filter(has);
+  if (owners.length === 1) return owners[0]!;
+  return fail(owners.length
+    ? `${what} is on several servers (${owners.map((c) => c.serverId).join(', ')}): add server`
+    : `no server that presents toolsets has ${what}`);
+}
+
+/** What a `toolsets--act` call resolves to: the server's tool, its instance and arguments. */
+export type ActTarget = { ok: true; serverId: string; tool: string; instance?: string; args: Record<string, unknown> } | { ok: false; error: string };
+
+/**
+ * Resolve a `toolsets--act` call (RFC §8.2) to the dynamic tool it calls,
+ * or the reason it can't be sent. The framework then dispatches it exactly as
+ * a direct call of that tool, with `_meta["mcpl/instance"]` added (RFC §5.5).
+ * Refused here, before anything is sent: a tool no presenting server has, a
+ * static tool (it's in the tool list), an instance that isn't named where
+ * several are open, a group the host has closed (RFC §5.4), and arguments
+ * that don't fit the definition in force for that instance (RFC §6.1).
+ */
+export function resolveAct(hub: ToolsetHub, input: unknown): ActTarget {
+  try {
+    const args = isObj(input) ? input : {};
+    const tool = str(args.tool) ?? fail('name the tool');
+    const c = owner(hub, args.server, (x) => !!x.presence.tool(tool), `a tool "${tool}"`);
+    const p = c.presence;
+    if (!p.tool(tool)) fail(`${c.serverId} has no tool "${tool}": ${META_TOOL_NAMES.look} {server:"${c.serverId}"} shows what's available`);
+    if (p.presenceOf(tool) === 'static') fail(`${tool} is not a dynamic tool: ${p.toolStatus(tool)}. Call it there.`);
+    if (args.args !== undefined && !isObj(args.args)) fail('args must be an object of the tool\'s arguments');
+    const callArgs = (args.args ?? {}) as Record<string, unknown>;
+    let instance = str(args.instance);
+    const ts = p.toolsetOf(tool);
+    const declared = ts !== undefined && p.isDeclared(ts);
+    const withInstances = declared && !!p.declared[ts!]!.instances;
+    if (withInstances && !instance) {
+      // RFC §5.5: the instance rides in _meta; with exactly one open, it's that one.
+      const open = p.openRecords(ts);
+      if (open.length === 1) instance = open[0]!.instance;
+      else if (!open.length) fail(`${tool} belongs to ${ts}, which isn't open: ${p.openHint(ts!)}`);
+      else fail(`several ${ts} instances are open (${open.map((o) => o.instance).join(', ')}): say which with instance`);
+    }
+    if (instance && !withInstances) fail(`${tool} ${ts ? `belongs to ${ts}, which has no instances` : 'belongs to no toolset'}: call it without instance`);
+    // RFC §5.4: the host gates calls into an undeclared group it has closed.
+    if (ts && !declared && !p.isOpen(ts)) fail(`${tool} is in ${ts}, which isn't open: ${p.openHint(ts)}`);
+    // RFC §6.1: arguments are checked against the definition in force for
+    // that instance: its own from hints (the legal moves of one game), else
+    // the toolset's, else the listed one.
+    const key = ts ? keyOf(ts, withInstances ? instance : undefined) : keyOf('');
+    const problem = checkArgs(p.defOf(key, tool).inputSchema, callArgs);
+    if (problem) {
+      fail(`Invalid arguments for ${tool} in ${p.label(key)}: ${problem}. Nothing was sent; ` +
+        `${META_TOOL_NAMES.look} {server:"${c.serverId}", tool:"${tool}"${instance ? `, instance:"${instance}"` : ''}} shows its current definition.`);
+    }
+    return { ok: true, serverId: c.serverId, tool, ...(instance ? { instance } : {}), args: callArgs };
+  } catch (error) {
+    if (error instanceof MetaError) return { ok: false, error: error.message };
+    throw error;
+  }
+}
+
 export class ToolsetsModule implements Module {
   readonly name = TOOLSETS_MODULE;
 
@@ -160,7 +243,7 @@ export class ToolsetsModule implements Module {
     try {
       switch (call.name) {
         case 'open': return await this.open(args);
-        case 'act': return await this.act(args);
+        case 'act': return this.act(args);
         case 'look': return await this.look(args);
         case 'close': return await this.close(args);
         default: return { success: false, isError: true, error: unknownToolMessage(this.name, call.name, META_TOOLS) };
@@ -171,34 +254,6 @@ export class ToolsetsModule implements Module {
         : `${META_TOOL_NAMES[call.name as keyof typeof META_TOOL_NAMES] ?? call.name}: ${error instanceof Error ? error.message : String(error)}`;
       return { success: false, isError: true, error: message };
     }
-  }
-
-  // ── choosing the server ──
-
-  private pick(server: unknown): ToolsetController {
-    const id = str(server);
-    const ids = this.hub.presenting().map((c) => c.serverId);
-    if (!id) {
-      if (ids.length === 1) return this.hub.get(ids[0]!)!;
-      return fail(`name a server: ${ids.join(', ') || '(no MCPL server presents toolsets now)'}`);
-    }
-    const c = this.hub.get(id);
-    if (!c) return fail(`no server "${id}" presents toolsets; the ones that do: ${ids.join(', ') || 'none'}`);
-    if (!c.presence.active) return fail(`${id} sends no tool hints now: its tools are in your tool list`);
-    return c;
-  }
-
-  /**
-   * RFC §8.2: `server` may be left out; the name decides, when exactly one
-   * presenting server has it. Two or more: name the server.
-   */
-  private owner(server: unknown, has: (c: ToolsetController) => boolean, what: string): ToolsetController {
-    if (str(server)) return this.pick(server);
-    const owners = this.hub.presenting().filter(has);
-    if (owners.length === 1) return owners[0]!;
-    return fail(owners.length
-      ? `${what} is on several servers (${owners.map((c) => c.serverId).join(', ')}): add server`
-      : `no server that presents toolsets has ${what}`);
   }
 
   private toolsAt(c: ToolsetController, key: string): HintedTool[] {
@@ -215,8 +270,8 @@ export class ToolsetsModule implements Module {
   private async open(args: Record<string, unknown>): Promise<ToolResult> {
     let toolset = str(args.toolset);
     const c = toolset && !str(args.server)
-      ? this.owner(undefined, (x) => x.presence.isDeclared(toolset!) || x.presence.undeclaredGroups.includes(toolset!), `a toolset "${toolset}"`)
-      : this.pick(args.server);
+      ? owner(this.hub, undefined, (x) => x.presence.isDeclared(toolset!) || x.presence.undeclaredGroups.includes(toolset!), `a toolset "${toolset}"`)
+      : pick(this.hub, args.server);
     const p = c.presence;
     const openable = [...Object.keys(p.declared), ...p.undeclaredGroups];
     if (!toolset) {
@@ -264,42 +319,17 @@ export class ToolsetsModule implements Module {
     return fail(`${c.serverId} has no toolset "${toolset}"${openable.length ? `; it has ${openable.join(', ')}` : ''}`);
   }
 
-  private async act(args: Record<string, unknown>): Promise<ToolResult> {
-    const tool = str(args.tool) ?? fail('name the tool');
-    const c = this.owner(args.server, (x) => !!x.presence.tool(tool), `a tool "${tool}"`);
-    const p = c.presence;
-    if (!p.tool(tool)) fail(`${c.serverId} has no tool "${tool}": ${META_TOOL_NAMES.look} {server:"${c.serverId}"} shows what's available`);
-    if (p.presenceOf(tool) === 'static') fail(`${tool} is not a dynamic tool: ${p.toolStatus(tool)}. Call it there.`);
-    if (args.args !== undefined && !isObj(args.args)) fail('args must be an object of the tool\'s arguments');
-    const callArgs = (args.args ?? {}) as Record<string, unknown>;
-    let instance = str(args.instance);
-    const ts = p.toolsetOf(tool);
-    const declared = ts !== undefined && p.isDeclared(ts);
-    const withInstances = declared && !!p.declared[ts!]!.instances;
-    if (withInstances && !instance) {
-      // RFC §5.5: the instance rides in _meta; with exactly one open, it's that one.
-      const open = p.openRecords(ts);
-      if (open.length === 1) instance = open[0]!.instance;
-      else if (!open.length) fail(`${tool} belongs to ${ts}, which isn't open: ${p.openHint(ts!)}`);
-      else fail(`several ${ts} instances are open (${open.map((o) => o.instance).join(', ')}): say which with instance`);
-    }
-    if (instance && !withInstances) fail(`${tool} ${ts ? `belongs to ${ts}, which has no instances` : 'belongs to no toolset'}: call it without instance`);
-    // RFC §5.4: the host gates calls into an undeclared group it has closed.
-    if (ts && !declared && !p.isOpen(ts)) fail(`${tool} is in ${ts}, which isn't open: ${p.openHint(ts)}`);
-    // RFC §6.1: arguments are checked against the definition in force for
-    // that instance: its own from hints (the legal moves of one game), else
-    // the toolset's, else the listed one.
-    const key = ts ? keyOf(ts, withInstances ? instance : undefined) : keyOf('');
-    const problem = checkArgs(p.defOf(key, tool).inputSchema, callArgs);
-    if (problem) {
-      fail(`Invalid arguments for ${tool} in ${p.label(key)}: ${problem}. Nothing was sent; ` +
-        `${META_TOOL_NAMES.look} {server:"${c.serverId}", tool:"${tool}"${instance ? `, instance:"${instance}"` : ''}} shows its current definition.`);
-    }
-    const r = await c.call(tool, callArgs, instance);
-    const change = p.render(r.change);
-    const blocks = [...asBlocks(r.content), ...(change ? [{ type: 'text', text: change }] : [])];
-    if (!blocks.length) blocks.push({ type: 'text', text: r.isError ? `${tool} failed without saying why` : `${tool} done.` });
-    return blocksResult(blocks, r.isError);
+  /**
+   * act is dispatched by the framework, not here: it resolves the call
+   * (resolveAct) and sends it down the same path as a direct call of the
+   * server's tool, so state, results, refusals and lifecycle are the same.
+   * A caller that reaches the module itself gets the resolution's refusal,
+   * or this.
+   */
+  private act(args: Record<string, unknown>): ToolResult {
+    const target = resolveAct(this.hub, args);
+    if (!target.ok) return { success: false, isError: true, error: target.error };
+    return { success: false, isError: true, error: `${META_TOOL_NAMES.act} is dispatched by the framework; nothing was sent` };
   }
 
   /** look restates the present: titles and visibility are re-read from the servers first (toolsets/list). */
@@ -313,11 +343,11 @@ export class ToolsetsModule implements Module {
 
   private lookNow(args: Record<string, unknown>, server: string | undefined, tool: string | undefined): ToolResult {
     if (!server) {
-      if (tool) return this.lookTool(this.owner(undefined, (c) => !!c.presence.tool(tool), `a tool "${tool}"`), tool, str(args.instance));
+      if (tool) return this.lookTool(owner(this.hub, undefined, (c) => !!c.presence.tool(tool), `a tool "${tool}"`), tool, str(args.instance));
       const ts = str(args.toolset);
       const inst = str(args.instance);
       if (ts || inst) {
-        const c = this.owner(
+        const c = owner(this.hub, 
           undefined,
           (x) => (ts ? x.presence.isDeclared(ts) || x.presence.undeclaredGroups.includes(ts) : true) && (!inst || x.presence.openRecords().some((o) => o.instance === inst)),
           ts ? `a toolset "${ts}"${inst ? ` with instance "${inst}"` : ''}` : `an open instance "${inst}"`,
@@ -328,7 +358,7 @@ export class ToolsetsModule implements Module {
       if (!all.length) return textResult('No MCPL server presents toolsets or dynamic tools now; every tool is in your tool list.');
       return textResult(all.map((c) => c.presence.catalog()).join('\n\n'));
     }
-    const c = this.pick(server);
+    const c = pick(this.hub, server);
     if (tool) return this.lookTool(c, tool, str(args.instance));
     const p = c.presence;
     let toolset = str(args.toolset);
@@ -374,8 +404,8 @@ export class ToolsetsModule implements Module {
   private async close(args: Record<string, unknown>): Promise<ToolResult> {
     const named = str(args.toolset);
     const c = named && !str(args.server)
-      ? this.owner(undefined, (x) => x.presence.isOpen(named, str(args.instance)) || x.presence.openRecords(named).length > 0, `an open toolset "${named}"`)
-      : this.pick(args.server);
+      ? owner(this.hub, undefined, (x) => x.presence.isOpen(named, str(args.instance)) || x.presence.openRecords(named).length > 0, `an open toolset "${named}"`)
+      : pick(this.hub, args.server);
     const p = c.presence;
     let toolset = named;
     let instance = str(args.instance);
@@ -393,6 +423,8 @@ export class ToolsetsModule implements Module {
       instance = open[0]!.instance;
     }
     if (p.isDeclared(toolset!)) {
+      // As open refuses one: a toolset without instances is closed without one.
+      if (instance && !p.declared[toolset!]!.instances) fail(`${c.serverId}/${toolset} has no instances: close it without one`);
       if (p.declared[toolset!]!.instances && !instance) {
         const open = p.openRecords(toolset);
         if (open.length !== 1) fail(open.length ? `several ${toolset} instances are open (${open.map((o) => o.instance).join(', ')}): say which` : `${toolset} is not open`);
@@ -409,6 +441,7 @@ export class ToolsetsModule implements Module {
       return blocksResult([...asBlocks(closed.content), { type: 'text', text: change }]);
     }
     if (p.undeclaredGroups.includes(toolset!)) {
+      if (instance) fail(`${c.serverId}/${toolset} takes no instance (the server doesn't declare it)`);
       if (!p.isOpen(toolset!)) fail(`${c.serverId}/${toolset} is not open`);
       const cs = c.setGroupOpen(toolset!, false);
       return textResult(p.render(cs) || `${p.label(keyOf(toolset!))} closed.`);

@@ -755,7 +755,7 @@ import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type Persist
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
-import { ToolsetsModule } from './mcpl/toolsets-module.js';
+import { ToolsetsModule, resolveAct } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -22240,6 +22240,18 @@ export class AgentFramework {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
 
+    // RFC-014: toolsets--act, resolved to the dynamic tool it calls, goes
+    // where a programmatic call of that tool goes, with its instance.
+    if (call.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const target = this.resolveToolsetAct(call);
+      if (!target.ok) return { success: false, error: target.error, isError: true };
+      if (origin.kind === 'agent') {
+        const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
+        if (failure) return failure;
+      }
+      return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
+    }
+
     // MCPL tools go where the model's own call of the name goes, by the same
     // resolver and with the prefix it matched: to the server whose listing
     // offers the name, else the longest matching prefix.
@@ -22288,9 +22300,60 @@ export class AgentFramework {
   }
 
   /**
-   * RFC-014 §6.2: a static tool's result with the tool change its hints made
-   * (applied as the result was read) told after the server's content. The
-   * result itself when there's none, as for every server without toolHints.
+   * RFC-014: the calls toolsets--act resolved to a server's dynamic tool,
+   * with the instance each is for (`_meta["mcpl/instance"]`, §5.5). The MCPL
+   * dispatch paths read it: such a call isn't refused as a dynamic tool
+   * called by name, and carries its instance. Nothing else about it differs
+   * from a direct call of the tool.
+   */
+  private readonly toolsetActCalls = new WeakMap<ToolCall, { instance?: string }>();
+
+  /** A toolsets--act call resolved (resolveAct) to the call of the server's
+   *  tool it makes, under that tool's model-facing name and with its
+   *  arguments, its id kept; or the reason it can't be sent. */
+  private resolveToolsetAct(call: ToolCall): { ok: true; call: ToolCall; serverId: string; prefix: string; instance?: string } | { ok: false; error: string } {
+    const target = resolveAct(this.toolsetHub!, call.input);
+    if (!target.ok) return target;
+    const prefix = this.mcplServerConfigs.get(target.serverId)?.toolPrefix ?? `mcpl--${target.serverId}`;
+    const inner: ToolCall = { ...call, name: `${prefix}--${target.tool}`, input: target.args };
+    this.toolsetActCalls.set(inner, target.instance !== undefined ? { instance: target.instance } : {});
+    return { ok: true, call: inner, serverId: target.serverId, prefix, ...(target.instance !== undefined ? { instance: target.instance } : {}) };
+  }
+
+  /**
+   * RFC-014 §8.2: a toolsets--act call from the agent (the model's, or a
+   * script's) goes down the path a direct call of the server's tool takes
+   * (dispatchMcplToolCall): its agent's allowedTools, the server's tool
+   * policy, the state exchange, RFC-005's reading of the result, the tool
+   * change shown after it, and RFC-007's lifecycle, which describes the call
+   * as that tool, with its arguments, before it opens. Only
+   * `_meta["mcpl/instance"]` is added. A call act can't resolve is refused
+   * before anything is sent.
+   */
+  private dispatchToolsetAct(agentName: string, call: ToolCall): void {
+    const target = this.resolveToolsetAct(call);
+    if (!target.ok) {
+      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: target.error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: TOOLSETS_MODULE,
+        result: this.refusedResult(agentName, call.id, target.error),
+      });
+      return;
+    }
+    const refusal = this.agentToolPermissionFailure(agentName, target.call);
+    if (refusal) {
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal });
+      return;
+    }
+    this.toolLifecycleEmitter?.retarget(agentName, call.id, target.call);
+    this.dispatchMcplToolCall(agentName, target.call, target.serverId, target.prefix);
+  }
+
+  /**
+   * RFC-014 §6.2: a tool result that goes to the agent, with the tool change
+   * its hints made (applied as the result was read) told after the server's
+   * content; taking it means it isn't told again as a notice. The result
+   * itself when there's none, as for every server without toolHints.
    */
   private withToolsetChange<R extends { content?: unknown }>(serverId: string, result: R): R {
     const change = this.toolsetHub?.get(serverId)?.changeText(result) ?? '';
@@ -22298,7 +22361,11 @@ export class AgentFramework {
     return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: change }] };
   }
 
-  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
+  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as
+   *  resolveMcplTool matched them, or as toolsets--act resolved them
+   *  (toolsetActCalls). Its RFC-014 tool change isn't shown with its result,
+   *  which goes to its caller, not necessarily to the agent: it's told as a
+   *  notice (ToolsetController.tellUnlessClaimed). */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized, so the call didn\'t run', isError: true };
@@ -22313,12 +22380,16 @@ export class AgentFramework {
     if (!isToolAllowed(toolName, config)) {
       return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
-    // RFC-014: a dynamic tool is called through toolsets--act.
-    const dynamicRefusal = modern ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    // RFC-014: a dynamic tool is called through toolsets--act, which marks
+    // the call it resolved (toolsetActCalls) with the instance it's for.
+    const act = this.toolsetActCalls.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
     if (dynamicRefusal) return { success: false, error: dynamicRefusal, isError: true };
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     try {
-      const result = modern ? await modern.callTool(toolName, args) : this.withToolsetChange(serverId, await server!.sendToolsCall(toolName, args));
+      const result = modern
+        ? await modern.callTool(toolName, args)
+        : await server!.sendToolsCall(toolName, args, undefined, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined);
       // A server's error is a failure here too, as the model's dispatch
       // reads it: its text (mcplToolFailure), without its other blocks, and
       // its structured content, kept by presence. A success is the server's
@@ -23930,6 +24001,15 @@ export class AgentFramework {
       return;
     }
 
+
+    // RFC-014: toolsets--act calls a server's dynamic tool, down the same
+    // path as a direct call of it (dispatchToolsetAct).
+    if (enrichedCall.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+      if (scriptWaiter) scriptWaiter.route.toServer = true;
+      this.dispatchToolsetAct(agentName, enrichedCall);
+      return;
+    }
 
     // Route MCPL tool calls to the appropriate server via prefix map
     const mcplMatch = this.resolveMcplTool(enrichedCall.name);
@@ -29626,9 +29706,12 @@ export class AgentFramework {
         const listed = new Set<string>();
         const repeated: string[] = [];
         // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
-        // the conversation and called through toolsets--act, never listed
-        // here: every change to this list rebuilds the prompt cache. The
-        // list was read through the server's tap, so its presence is current.
+        // the conversation and called through toolsets--act, never offered
+        // here: every change to this list rebuilds the prompt cache. Their
+        // server, RFC-008 class and feature set are kept as any tool's are,
+        // so a call act makes is attributed, classed and state-exchanged as
+        // a direct call of the tool would be. The list was read through the
+        // server's tap, so its presence is current.
         // A static↔dynamic move the server hinted applies here, at a list
         // boundary (§4.2), and the agent is told where the tool went.
         const presence = this.toolsetHub?.get(server.id);
@@ -29637,7 +29720,7 @@ export class AgentFramework {
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
-          if (dynamic(tool.name)) continue;
+          const offered = !dynamic(tool.name);
           const namespacedName = `${prefix}--${tool.name}`;
           if (listed.has(namespacedName)) {
             if (!repeated.includes(tool.name)) repeated.push(tool.name);
@@ -29660,11 +29743,13 @@ export class AgentFramework {
               : undefined;
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
-          tools.push({
-            name: namespacedName,
-            description: tool.description ?? '',
-            inputSchema: schema,
-          });
+          if (offered) {
+            tools.push({
+              name: namespacedName,
+              description: tool.description ?? '',
+              inputSchema: schema,
+            });
+          }
           if (featureSet !== undefined) {
             toolFeatureSets.set(namespacedName, featureSet);
           }
@@ -29978,8 +30063,10 @@ export class AgentFramework {
       });
       return;
     }
-    // RFC-014: a dynamic tool isn't in the list; it's called through act.
-    const dynamicRefusal = modern ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    // RFC-014: a dynamic tool isn't in the list; it's called through act,
+    // which marks the call it resolved (toolsetActCalls) with its instance.
+    const act = this.toolsetActCalls.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
     if (dynamicRefusal) {
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'a dynamic tool, called through toolsets--act' });
       this.pushEvent({
@@ -30184,7 +30271,7 @@ export class AgentFramework {
       }
     }
 
-    legacy.sendToolsCall(toolName, args, stateParams)
+    legacy.sendToolsCall(toolName, args, stateParams, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined)
       // RFC-014 §6.2: a call reports its own consequences; the tool change
       // its result carried is told after the server's content.
       .then((result) => this.withToolsetChange(serverId, result))

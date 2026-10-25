@@ -445,9 +445,14 @@ framework registers a `toolsets` module with four constant tools:
 - `toolsets--open {server?, toolset?, instance?, options?}` opens a toolset (or
   a named instance of one), and answers with what the server shows on opening
   and the tools usable now;
-- `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool, with
-  the instance in `_meta["mcpl/instance"]`, after checking `args` against the
-  definition in force for that instance;
+- `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool down
+  the same path as a direct call of it (the agent's `allowedTools`, the
+  server's tool policy, the state exchange, the reading of its result, RFC-007
+  observers, who see the server's tool), with only the instance added, in
+  `_meta["mcpl/instance"]`. It first checks `args` against the definition in
+  force for that instance; that check is bounded, and leaves `pattern` and
+  anything nested or branching too far to the server, which checks every
+  call itself;
 - `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
   and what can be opened, or one tool's whole definition;
 - `toolsets--close {server?, toolset?, instance?}` closes it.
@@ -459,8 +464,9 @@ refused push, a result that came after its timeout). A skipped rev re-reads
 (re)connect, adopting what the server kept open and never re-opening anything.
 What changed is told where it happened: after a call's own result, after the
 push that explains it, or as a notice (`kind: 'mcpl-toolsets'`, which wakes
-nothing) for a standalone `tools/hints`, a late result, an adoption or a
-recovery. Notices need the server's `pushEvents` grant, like any delivery. A
+nothing) for a standalone `tools/hints`, a late result, an adoption, a
+recovery, or a call whose result doesn't go to the agent (one the framework or
+a module makes itself). Notices need the server's `pushEvents` grant, like any delivery. A
 new tool's first sentence is told the first time its definition appears.
 Suggestions are shown, never acted on. Each `ended` id is told once. When an
 open toolset's announcements have left an agent's context (compressed or out

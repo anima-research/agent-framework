@@ -111,10 +111,10 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
     assert.equal(calls.length, 1, 'nothing reached the server');
   });
 
-  it('a call that hides a tool reports it in its own result', async () => {
+  it('a call that hides a tool reports it; a host\'s own call, whose result the agent may not see, as a notice', async () => {
     const second = await callTool(fw.framework, 'toolsets--act', { tool: 'play', instance: 'g1', args: { point: 'E5' } });
     assert.match(resultText(second), /play ok/);
-    assert.match(resultText(second), /now unavailable: play/);
+    await waitFor(() => windowText(fw.framework).some((t) => t.includes('tool changes') && t.includes('now unavailable: play')), 'the change told');
   });
 
   it('a dynamic tool called by a namespaced name is refused, pointing at act', async () => {
@@ -134,7 +134,8 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
 
   it('a call that ends its instance reports the close (no separate push)', async () => {
     const r = await callTool(fw.framework, 'toolsets--act', { tool: 'resign', instance: 'g2', args: {} });
-    assert.match(resultText(r), /\[arcade\/game:g2\] closed/);
+    assert.ok(!r.isError, resultText(r));
+    await waitFor(() => windowText(fw.framework).some((t) => t.includes('[arcade/game:g2] closed')), 'the close told');
     const look = resultText(await callTool(fw.framework, 'toolsets--look', { server: 'arcade' }));
     assert.doesNotMatch(look, /\[arcade\/game:g2\][^\n]*tools now/, 'g2 is no longer open');
     // RFC §5.3: an end the host didn't ask for is in `ended`; told once.
@@ -144,15 +145,19 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
   });
 
   it('after a reconnect, an instance the server kept is adopted, not opened again (vector 9)', async () => {
-    const opensBefore = calls.length;
+    const opens = () => srv.received.filter((m) => m === 'toolsets/open').length;
+    const lists = () => srv.received.filter((m) => m === 'toolsets/list').length;
+    const opensBefore = opens();
+    const listsBefore = lists();
     srv.dropAll();
     await waitFor(() => (fw.framework.listMcplServers().find((s) => s.id === 'arcade')?.connected ?? false) === false, 'the drop seen', 5000).catch(() => {});
     await waitFor(() => fw.framework.listMcplServers().find((s) => s.id === 'arcade')?.connected === true, 'reconnected');
     // Its toolsets/list is read after the policy settles.
-    await new Promise((r) => setTimeout(r, 400));
+    await waitFor(() => lists() > listsBefore, 'toolsets/list after the reconnect');
+    await new Promise((r) => setTimeout(r, 200));
     const look = resultText(await callTool(fw.framework, 'toolsets--look', { server: 'arcade' }));
     assert.match(look, /\[arcade\/game:g1\]/, 'g1 adopted');
-    assert.equal(calls.length, opensBefore);
+    assert.equal(opens(), opensBefore, 'no toolsets/open was sent across the reconnect');
     const act = await callTool(fw.framework, 'toolsets--act', { tool: 'resign', instance: 'g1', args: {} });
     assert.ok(!act.isError, resultText(act));
   });
