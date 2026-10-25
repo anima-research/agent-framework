@@ -232,11 +232,11 @@ function storedBlock(block: unknown): unknown {
  * before any host decoration is added and before storage shards it — with
  * each block as the store keeps it (storedBlock, canonicalJson). So a body
  * hashes alike as delivered, as handed to storage, and as read back
- * unsharded from the store, except one whose blocks the store changes
- * together (see storedBlock). The one-element array keeps the framing an
- * undecorated, unsharded stored copy has always hashed to, so a stamped
- * copy and an older copy of the same body share a version where the store
- * keeps the body as it did then.
+ * unsharded from the store with its blobs resolved, except one whose blocks
+ * the store changes together (see storedBlock). The one-element array keeps
+ * the framing an undecorated, unsharded stored copy has always hashed to, so
+ * a stamped copy and an older copy of the same body share a version where
+ * the store keeps the body as it did then.
  *
  * Ingestion stamps it as `metadata.sourceBodyDigest`, and the same function
  * over exactly the blocks handed to storage (decorations included) as
@@ -247,14 +247,14 @@ function storedBlock(block: unknown): unknown {
  * to its storedBodyDigest was changed after delivery (editMessage keeps
  * metadata), or holds blocks the store changes together (see storedBlock),
  * or its digest was taken under a release that kept some block of it
- * differently: a context-manager release that changed a stored form, or
- * an agent-framework release from 0.24.0 on that took stored forms from a
- * copy of the store's transform rather than from blockAsStored. Digests
- * already stamped are never recomputed. A body the store shards carries
- * the whole body's two digests on every shard, and no shard hashes to
- * them. Check a copy read back with its blobs resolved (getAllMessages,
- * getMessage, or getMessageWindow without `resolveBlobs: false`): a blob
- * reference never matches.
+ * differently: a context-manager release that changed a stored form, or an
+ * agent-framework release from 0.24.0 up to the one that brought in
+ * blockAsStored, which took stored forms from a copy of the store's
+ * transform. Digests already stamped are never recomputed. A body the store
+ * shards carries the whole body's two digests on every shard, and no shard
+ * hashes to them. Check a copy read back with its blobs resolved
+ * (getAllMessages, getMessage, or getMessageWindow without
+ * `resolveBlobs: false`): a blob reference never matches.
  *
  * Exported from the package root, so a consumer checks a copy against either
  * field with this same function rather than a copy of it.

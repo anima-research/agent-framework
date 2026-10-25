@@ -712,6 +712,9 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'base64 with non-zero unused bits': { blocks: [image(png.replace(/8=$/, '9='))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'base64 in the URL-safe alphabet': { blocks: [image(png.replace(/\//g, '_'))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    // A server can send data that isn't base64 at all: the store keeps the
+    // bytes its base64 read takes from it.
+    'an image whose data is not base64': { blocks: [image('not base64 at all!')], changed: true, digest: '75f6aed70407609a42b127029df45b37de6f61019f25c9ed8ea76c904c7ab6ed' },
     // Bytes the store has no signature for keep their label. Labeled
     // image/png, so a context-manager that learns to sniff one fails here.
     'SVG bytes labeled image/png': { blocks: [image(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'))], changed: false, digest: 'b4f895f137c12d828e3c38d9213f02b8126372824adbca4d49c084b2af7c8a99' },
@@ -808,7 +811,7 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     }
   });
 
-  it('a body the store refuses still has a digest, so digesting never fails a delivery', () => {
+  it('a body the store refuses still has a digest', () => {
     for (const block of [
       { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } },
       { type: 'image', source: { type: 'base64', data: Buffer.from('<svg/>').toString('base64') } },
