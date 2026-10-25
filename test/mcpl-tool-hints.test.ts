@@ -18,6 +18,7 @@ import {
   startScriptedServer, makeFramework, waitFor, callTool, resultText, windowText,
   type Json, type ScriptedPeer,
 } from './helpers/toolset-servers.js';
+import { createMockResponse } from './helpers/mock-membrane.js';
 
 const TOOLS: Json[] = [
   { name: 'status', description: 'Status of the arcade.', inputSchema: { type: 'object', properties: {} } },
@@ -642,6 +643,68 @@ test('an open or close whose outcome the host can\'t know is reported as unconfi
     assert.ok(r.isError);
     assert.match(resultText(r), /^arc didn't confirm closing build: .*the board is locked\. toolsets--look \{server:"arc"\} asks it what's open, or says it couldn't\.$/);
   } finally { await refused.done(); }
+});
+
+test('a refusal for a name the server doesn\'t have says what it has, or names look', async () => {
+  const t = await setup();
+  try {
+    const refusals: Array<[string, Json, RegExp]> = [
+      ['toolsets--look', { server: 'arc', toolset: 'nope' }, /^arc has no toolset "nope"; it has game, build, cave$/],
+      ['toolsets--close', { server: 'arc', toolset: 'nope' }, /^arc has no toolset "nope"; it has game, build, cave$/],
+      ['toolsets--open', { server: 'arc', toolset: 'nope' }, /^arc has no toolset "nope"; it has game, build, cave$/],
+      ['toolsets--look', { server: 'arc', tool: 'nope' }, /^arc has no tool "nope": toolsets--look \{server:"arc"\} shows what's available$/],
+      ['toolsets--look', { server: 'arc', instance: 'g9' }, /^no open instance "g9" on arc; no instance is open there$/],
+      ['toolsets--open', { toolset: 'nope' }, /^no server that presents toolsets has a toolset "nope": toolsets--look shows what they have$/],
+    ];
+    for (const [name, input, refusal] of refusals) {
+      const r = await callTool(t.fw.framework, name, input);
+      assert.ok(r.isError, `${name} ${JSON.stringify(input)} is refused`);
+      assert.match(resultText(r), refusal);
+    }
+  } finally { await t.done(); }
+
+  const none = await setup(() => false, {}, { ...ADVERT, toolHints: false });
+  try {
+    for (const input of [{}, { toolset: 'game' }]) {
+      const r = await callTool(none.fw.framework, 'toolsets--open', input);
+      assert.ok(r.isError);
+      assert.match(resultText(r), /^no MCPL server presents toolsets now: MCPL tools are called directly, by name$/);
+    }
+    const named = await callTool(none.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game' });
+    assert.ok(named.isError);
+    assert.equal(resultText(named), 'arc sends no tool hints now: its tools are called directly, by name, not through toolsets--act');
+  } finally { await none.done(); }
+});
+
+test('a toolsets--act call whose outcome the host can\'t know names look, for the model and for a caller in process', async () => {
+  const dropsOnPeek: Handler = (msg, peer) => {
+    if (msg.method !== 'tools/call' || (msg.params as Json).name !== 'peek') return false;
+    peer.ws.terminate();
+    return true;
+  };
+  const t = await setup(dropsOnPeek);
+  try {
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
+    await roundTrip(t);
+    t.fw.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'toolu_act', name: 'toolsets--act', input: { server: 'arc', tool: 'peek', args: {} } }] as never, 'tool_use'));
+    t.fw.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'turn over' }]));
+    t.fw.framework.pushEvent({ type: 'external-message', source: 'test', content: [{ type: 'text', text: 'go' }], metadata: {}, triggerInference: true } as never);
+    await waitFor(() => windowText(t.fw.framework).some((x) => x.includes('turn over')), 'the turn ended');
+    const results = (t.fw.membrane.lastStream?.receivedToolResults ?? []).flat() as Array<{ toolUseId: string; content: unknown }>;
+    const text = JSON.stringify(results.find((r) => r.toolUseId === 'toolu_act')?.content ?? null);
+    assert.match(text, /closed before it answered/);
+    assert.match(text, /toolsets--look \{server:\\"arc\\"\} asks it what's open, or says it couldn't\./);
+  } finally { await t.done(); }
+
+  const inProcess = await setup(dropsOnPeek);
+  try {
+    inProcess.server.peer.notify('tools/hints', inProcess.state.hint([{ name: 'peek', visible: true }]));
+    await roundTrip(inProcess);
+    const r = await callTool(inProcess.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: {} });
+    assert.ok(r.isError);
+    assert.match(resultText(r), /closed before it answered/);
+    assert.match(resultText(r), /toolsets--look \{server:"arc"\} asks it what's open, or says it couldn't\.$/);
+  } finally { await inProcess.done(); }
 });
 
 test('the host\'s argument check is bounded: no server pattern runs, and deep or wide schemas are left to the server', async () => {

@@ -764,7 +764,7 @@ import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
 import { isEmptyChange } from './mcpl/tool-presence.js';
-import { ToolsetsModule, resolveAct, type TakenChange } from './mcpl/toolsets-module.js';
+import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -22460,7 +22460,7 @@ export class AgentFramework {
       if (taken) taken.toolsets.tell(taken.cs);
       return {
         success: false,
-        error: redactServerText(err instanceof Error ? err.message : err, config ?? {}),
+        error: this.withActStateHint(call, serverId, err, redactServerText(err instanceof Error ? err.message : err, config ?? {})),
         isError: true,
       };
     }
@@ -22470,6 +22470,11 @@ export class AgentFramework {
     const joined = withChangeText(result, change);
     const { text } = this.storedToolResultText(agentName, { id: call.id, name: call.name, input: call.input, result: joined, durationMs: 0 }, maxChars);
     return text.endsWith(change.toWellFormed()) && (maxChars === undefined || text.length <= maxChars) ? joined : null;
+  }
+
+  private withActStateHint(call: ToolCall, serverId: string, error: unknown, text: string): string {
+    if (!this.toolsetActCalls?.has(call) || (error instanceof McplRequestError && error.outcome === 'not-sent')) return text;
+    return withLookHint(serverId, text);
   }
 
   // ---------------------------------------------------------------------------
@@ -30181,7 +30186,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: err.message, isError: true },
+        result: { success: false, error: this.withActStateHint(call, serverId, raw, err.message), isError: true },
       });
     };
 

@@ -85,7 +85,7 @@ const META_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'close',
-    description: 'Close an open toolset or instance: its tools and its events stop. Closing a game in progress may count as leaving it.',
+    description: 'Close an open toolset or instance: its tools stop, and for a toolset the server declares, the server is told and stops its events too. Closing a game in progress may count as leaving it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -170,11 +170,11 @@ function pick(hub: ToolsetHub, server: unknown): ToolsetController {
   const ids = hub.presenting().map((c) => c.serverId);
   if (!id) {
     if (ids.length === 1) return hub.get(ids[0]!)!;
-    return fail(`name a server: ${ids.join(', ') || '(no MCPL server presents toolsets now)'}`);
+    return fail(ids.length ? `name a server: ${ids.join(', ')}` : NONE_PRESENTS);
   }
   const c = hub.get(id);
   if (!c) return fail(`no server "${id}" presents toolsets; the ones that do: ${ids.join(', ') || 'none'}`);
-  if (!c.presence.active) return fail(`${id} sends no tool hints now: its tools are in your tool list`);
+  if (!c.presence.active) return fail(`${id} sends no tool hints now: its tools are called directly, by name, not through ${META_TOOL_NAMES.act}`);
   return c;
 }
 
@@ -186,9 +186,15 @@ function owner(hub: ToolsetHub, server: unknown, has: (c: ToolsetController) => 
   if (str(server)) return pick(hub, server);
   const owners = hub.presenting().filter(has);
   if (owners.length === 1) return owners[0]!;
-  return fail(owners.length
-    ? `${what} is on several servers (${owners.map((c) => c.serverId).join(', ')}): add server`
-    : `no server that presents toolsets has ${what}`);
+  if (owners.length) return fail(`${what} is on several servers (${owners.map((c) => c.serverId).join(', ')}): add server`);
+  return fail(hub.presenting().length ? `no server that presents toolsets has ${what}: ${META_TOOL_NAMES.look} shows what they have` : NONE_PRESENTS);
+}
+
+const NONE_PRESENTS = 'no MCPL server presents toolsets now: MCPL tools are called directly, by name';
+
+function noToolset(c: ToolsetController, toolset: string): string {
+  const names = [...Object.keys(c.presence.declared), ...c.presence.undeclaredGroups];
+  return `${c.serverId} has no toolset "${toolset}"; ${names.length ? `it has ${names.join(', ')}` : 'it has none'}`;
 }
 
 /** What a `toolsets--act` call resolves to: the server's tool, its instance and arguments. */
@@ -358,7 +364,7 @@ export class ToolsetsModule implements Module {
       else c.tell(cs);
       return textResult(lines.join('\n'));
     }
-    return fail(`${c.serverId} has no toolset "${toolset}"${openable.length ? `; it has ${openable.join(', ')}` : ''}`);
+    return fail(noToolset(c, toolset));
   }
 
   /**
@@ -432,12 +438,16 @@ export class ToolsetsModule implements Module {
     const p = c.presence;
     let toolset = str(args.toolset);
     const instance = str(args.instance);
-    if (!toolset && instance) toolset = p.openRecords().find((o) => o.instance === instance)?.toolset ?? fail(`no open instance "${instance}" on ${c.serverId}`);
-    if (!toolset) return textResult(p.catalog());
+    if (!toolset && instance) {
+      const open = p.openRecords().filter((o) => o.instance !== undefined);
+      toolset = open.find((o) => o.instance === instance)?.toolset
+        ?? fail(`no open instance "${instance}" on ${c.serverId}; ${open.length ? `open: ${open.map((o) => `${o.toolset}:${o.instance}`).join(', ')}` : 'no instance is open there'}`);
+    }
+    if (!toolset) return textResult(p.catalog({ mark }));
     if (p.isOpen(toolset, instance) || (!instance && p.openRecords(toolset).length === 1)) {
       const rec = p.isDeclared(toolset) ? (instance ? p.openRecords(toolset).find((o) => o.instance === instance) : p.openRecords(toolset)[0]) : undefined;
       const key = keyOf(toolset, rec?.instance);
-      const lines = p.toolBlock(key, this.toolsAt(c, key), { describeAll: true, title: rec?.title });
+      const lines = p.toolBlock(key, this.toolsAt(c, key), { describeAll: true, title: rec?.title, seen: mark ? undefined : new Set<string>() });
       const close = p.closeHint(key);
       if (close) lines.push(`${close} closes it.`);
       return textResult(lines.join('\n'));
@@ -457,12 +467,12 @@ export class ToolsetsModule implements Module {
       const names = p.allTools.filter((t) => p.toolsetOf(t.name) === toolset).map((t) => t.name);
       return textResult(`${c.serverId}/${toolset}: ${names.join(', ')}; not open: ${p.openHint(toolset)} opens it.`);
     }
-    return fail(`${c.serverId} has no toolset "${toolset}"`);
+    return fail(noToolset(c, toolset!));
   }
 
   private lookTool(c: ToolsetController, tool: string, instance: string | undefined): ToolResult {
     const p = c.presence;
-    if (!p.tool(tool)) fail(`${c.serverId} has no tool "${tool}"`);
+    if (!p.tool(tool)) fail(`${c.serverId} has no tool "${tool}": ${META_TOOL_NAMES.look} {server:"${c.serverId}"} shows what's available`);
     const ts = p.toolsetOf(tool);
     const where = [...p.view().entries()].filter(([, e]) => e.tools.has(tool)).map(([k]) => k);
     const key = instance && ts ? keyOf(ts, instance) : where[0];
@@ -521,6 +531,6 @@ export class ToolsetsModule implements Module {
       else c.tell(cs);
       return textResult(text);
     }
-    return fail(`${c.serverId} has no toolset "${toolset}"`);
+    return fail(noToolset(c, toolset!));
   }
 }

@@ -616,7 +616,7 @@ export class ToolsetController {
       this.presence.deactivate();
       this.log('the server withdrew toolHints: every tool is static from now on');
       const cs = this.presence.diff(before, this.presence.view());
-      cs.notes.push(`${this.serverId} no longer presents toolsets: its tools are all in your tool list now.`);
+      cs.notes.push(`${this.serverId} no longer presents toolsets: its tools are called directly now, by name, not through ${META_TOOL_NAMES.act}.`);
       this.deliver(cs);
       return;
     }
