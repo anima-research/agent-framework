@@ -830,10 +830,30 @@ export interface BeforeInferenceResult {
    * Context injections to apply.
    *
    * @deprecated Context injection is deprecated (agent-framework#171):
-   * injections are never stored and are re-anchored on every compile, which
-   * breaks prompt-cache prefixes. Servers should return an empty array and
-   * deliver state as push events or tool results instead. Hosts still apply
-   * injections for now and log a `[deprecated]` line per injecting server.
+   * injections are never stored in the conversation. A `beforeUser` or
+   * `afterUser` injection is placed beside the latest user-participant
+   * message, tool results included, on every compile, so it moves each time
+   * a newer one takes its place, which breaks prompt-cache prefixes at its old
+   * slot, and a `beforeUser` injection placed beside a tool result lands
+   * between the tool call and its result in the compiled messages; with no
+   * user-participant message, context-manager 0.16 and later put both at the
+   * end, and earlier versions drop a `beforeUser` injection. A `system`
+   * injection's text is appended to the system prompt, which comes before
+   * every message, so with a prefix cache each new text of it misses the
+   * cache for everything after it. On a model that binds each signed thinking
+   * block to the request it was made in, a moved injection or new `system`
+   * text also means no reply after the point where the request first changed
+   * can keep its thinking. Servers should return an empty array and deliver
+   * state as push events or tool results instead; `system` text that changes
+   * at runtime has no provider-independent replacement. (With membrane 0.7
+   * and context-manager 0.22 and later, a stored `system_change` block adds
+   * system text just before the next assistant turn after its place (or at
+   * the end, after a user turn), through membrane's native formatter and an
+   * adapter that can send it, such as its Anthropic adapter, to a model that
+   * takes mid-conversation system messages, and can't replace any.) The
+   * deprecation changes nothing about how hosts apply injections; they log a
+   * `[deprecated]` line per server whose injections they collect, and none
+   * for a server whose injections the feature-set and grant checks all drop.
    */
   contextInjections: McplContextInjection[];
 }

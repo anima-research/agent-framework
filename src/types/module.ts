@@ -110,13 +110,31 @@ export interface Module {
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    *
    * @deprecated Context injection is deprecated (agent-framework#171).
-   * Injections are per-compile overlays — never stored, re-anchored to the
-   * latest user message on every compile — so they break prompt-cache
-   * prefixes across activations (head-only hits on OpenAI lanes) and can
-   * land between a tool call and its result. Do not add new implementations:
-   * put durable content in the system prompt and deliver changing state as
-   * conversation content (events, tool results). Still called for now; the
-   * framework logs one `[deprecated]` line per module that injects.
+   * Injections are per-compile overlays, never stored in the conversation. A
+   * `beforeUser` or `afterUser` injection is placed beside the latest
+   * user-participant message, tool results included, on every compile, so it
+   * moves each time a newer one takes its place, which breaks prompt-cache
+   * prefixes at its old slot (head-only hits on OpenAI lanes), and a
+   * `beforeUser` injection placed beside a tool result lands between the tool
+   * call and its result in the compiled messages. With no user-participant
+   * message, context-manager 0.16 and later put both at the end, and earlier
+   * versions drop a `beforeUser` injection. A `system` injection's text is
+   * appended to the system prompt, which comes before every message, so with
+   * a prefix cache each new text of it misses the cache for everything after
+   * it. On a model that binds each signed thinking block to the request it
+   * was made in, a moved injection or new `system` text also means no reply
+   * after the point where the request first changed can keep its thinking.
+   * Do not add new implementations: changing state belongs in conversation
+   * content (events, tool results), and durable content in the agent's
+   * configured system prompt, which the host's configuration sets; `system`
+   * text that changes at runtime has no provider-independent replacement.
+   * (With membrane 0.7 and context-manager 0.22 and later, a stored
+   * `system_change` block adds system text just before the next assistant
+   * turn after its place (or at the end, after a user turn), through
+   * membrane's native formatter and an adapter that can send it, such as its
+   * Anthropic adapter, to a model that takes mid-conversation system
+   * messages, and can't replace any.) Still called for now; the framework
+   * logs one `[deprecated]` line per module whose injections it collects.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 
