@@ -113,7 +113,7 @@ function checkSelectors(args: Record<string, unknown>): void {
 /** A failure whose outcome is unknown, with how to find it out. */
 export function withLookHint(serverId: string, text: string): string {
   const said = text.trimEnd();
-  return `${said}${/[.!?]$/.test(said) ? '' : '.'} ${META_TOOL_NAMES.look} {server:"${serverId}"} asks it what's open.`;
+  return `${said}${/[.!?]$/.test(said) ? '' : '.'} ${META_TOOL_NAMES.look} {server:"${serverId}"} asks it what's open, or says it couldn't.`;
 }
 
 function requestFailure(serverId: string, did: string, unconfirmed: string, error: unknown): never {
@@ -121,6 +121,9 @@ function requestFailure(serverId: string, did: string, unconfirmed: string, erro
   if (error instanceof McplRequestError && error.outcome === 'not-sent') return fail(`${serverId} ${did}: ${message}`);
   return fail(withLookHint(serverId, `${serverId} ${unconfirmed}: ${message}`));
 }
+
+/** A result's tool change, for whoever shows it with the result (ToolsetsModule's takerFor). */
+export type TakenChange = { toolsets: ToolsetController; cs: ChangeSet };
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
@@ -244,7 +247,14 @@ export function resolveAct(hub: ToolsetHub, input: unknown): ActTarget {
 export class ToolsetsModule implements Module {
   readonly name = TOOLSETS_MODULE;
 
-  constructor(private readonly hub: ToolsetHub) {}
+  /** `takerFor`: who shows a call's result to an agent, taking the tool
+   *  change rendered into it; null when the result may reach none, and its
+   *  change is left to a notice (RFC-014 §6.1: told once). Left out, every
+   *  call's result is taken to reach the agent, as in 0.27.0. */
+  constructor(
+    private readonly hub: ToolsetHub,
+    private readonly takerFor: (call: ToolCall) => ((taken: TakenChange) => void) | null = () => ({ toolsets, cs }) => toolsets.told(cs),
+  ) {}
 
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
@@ -268,11 +278,12 @@ export class ToolsetsModule implements Module {
     const args = isObj(call.input) ? call.input : {};
     try {
       checkSelectors(args);
+      const take = this.takerFor(call);
       switch (call.name) {
-        case 'open': return await this.open(args);
+        case 'open': return await this.open(args, take);
         case 'act': return this.act(args);
-        case 'look': return await this.look(args);
-        case 'close': return await this.close(args);
+        case 'look': return await this.look(args, take);
+        case 'close': return await this.close(args, take);
         default: return { success: false, isError: true, error: unknownToolMessage(this.name, call.name, META_TOOLS) };
       }
     } catch (error) {
@@ -288,13 +299,14 @@ export class ToolsetsModule implements Module {
   }
 
   /** A change set rendered without the key the caller already showed whole. */
-  private renderOthers(c: ToolsetController, cs: ChangeSet, key: string): string {
-    return c.presence.render({ ...cs, changes: cs.changes.filter((ch) => ch.key !== key) });
+  private renderOthers(c: ToolsetController, cs: ChangeSet, key: string, shown: boolean): string {
+    return c.presence.render({ ...cs, changes: cs.changes.filter((ch) => ch.key !== key) }, { mark: shown, describeAll: !shown });
   }
 
   // ── the tools ──
 
-  private async open(args: Record<string, unknown>): Promise<ToolResult> {
+  private async open(args: Record<string, unknown>, take: ((taken: TakenChange) => void) | null): Promise<ToolResult> {
+    const shown = take !== null;
     let toolset = str(args.toolset);
     const c = toolset && !str(args.server)
       ? owner(this.hub, undefined, (x) => x.presence.isDeclared(toolset!) || x.presence.undeclaredGroups.includes(toolset!), `a toolset "${toolset}"`)
@@ -313,7 +325,7 @@ export class ToolsetsModule implements Module {
       if (instance && !p.declared[toolset]!.instances) fail(`${c.serverId}/${toolset} has no instances: open it without one`);
       let opened: Awaited<ReturnType<ToolsetController['open']>>;
       try {
-        opened = await c.open(toolset, instance, options);
+        opened = await c.open(toolset, instance, options, { shown });
       } catch (error) {
         return requestFailure(c.serverId, `did not open ${toolset}`, `didn't confirm opening ${toolset}`, error);
       }
@@ -322,15 +334,15 @@ export class ToolsetsModule implements Module {
         { type: 'text', text: `${p.label(opened.key)}${opened.title ? ` ${opened.title}` : ''}${opened.adopted ? ' (already open)' : ''}` },
         ...asBlocks(opened.content),
       ];
-      const tail = [...p.toolBlock(opened.key, this.toolsAt(c, opened.key), { headed: false })];
+      const tail = [...p.toolBlock(opened.key, this.toolsAt(c, opened.key), { headed: false, describeAll: !shown, seen: shown ? undefined : new Set<string>() })];
       const gone = opened.change.changes.find((ch) => ch.key === opened.key)?.gone ?? [];
       if (gone.length) tail.push(`now unavailable: ${gone.join(', ')}`);
-      const others = this.renderOthers(c, opened.change, opened.key);
+      const others = this.renderOthers(c, opened.change, opened.key, shown);
       if (others) tail.push(others);
       const close = p.closeHint(opened.key);
       if (close) tail.push(`${close} closes it.`);
       blocks.push({ type: 'text', text: tail.join('\n') });
-      c.told(opened.change);
+      take?.({ toolsets: c, cs: opened.change });
       return blocksResult(blocks);
     }
     if (p.undeclaredGroups.includes(toolset)) {
@@ -338,10 +350,12 @@ export class ToolsetsModule implements Module {
       if (instance || options) fail(`${c.serverId}/${toolset} takes no instance or options (the server doesn't declare it)`);
       const cs = c.setGroupOpen(toolset, true);
       const key = keyOf(toolset);
-      const lines = [`${p.label(key)} open.`, ...p.toolBlock(key, this.toolsAt(c, key), { headed: false })];
-      const others = this.renderOthers(c, cs, key);
+      const lines = [`${p.label(key)} open.`, ...p.toolBlock(key, this.toolsAt(c, key), { headed: false, describeAll: !shown, seen: shown ? undefined : new Set<string>() })];
+      const others = this.renderOthers(c, cs, key, shown);
       if (others) lines.push(others);
       lines.push(`${p.closeHint(key)} closes it.`);
+      if (take) take({ toolsets: c, cs });
+      else c.tell(cs);
       return textResult(lines.join('\n'));
     }
     return fail(`${c.serverId} has no toolset "${toolset}"${openable.length ? `; it has ${openable.join(', ')}` : ''}`);
@@ -361,32 +375,42 @@ export class ToolsetsModule implements Module {
   }
 
   /** look restates the present: titles and visibility are re-read from the servers first (toolsets/list). */
-  private async look(args: Record<string, unknown>): Promise<ToolResult> {
+  private async look(args: Record<string, unknown>, take: ((taken: TakenChange) => void) | null): Promise<ToolResult> {
     const server = str(args.server);
     const targets = server ? [this.hub.get(server)].filter((c): c is ToolsetController => !!c && c.presents) : this.hub.presenting();
-    const read = (await Promise.all(targets.map(async (c) => ({ c, cs: await c.refreshOpen().catch(() => null) }))))
-      .filter((r): r is { c: ToolsetController; cs: ChangeSet } => r.cs !== null);
+    const shown = take !== null;
+    const reads = await Promise.all(targets.map(async (c) => ({ c, cs: await c.refreshOpen({ shown }).catch(() => null) })));
+    const read = reads.filter((r): r is { c: ToolsetController; cs: ChangeSet } => r.cs !== null);
+    const unread = reads.filter((r) => r.cs === null).map(({ c }) => `${c.serverId} couldn't be asked just now: this is what the host last knew of it.`);
+    const giveBack = () => {
+      if (shown) for (const { c, cs } of read) c.tell(cs);
+    };
     let result: ToolResult;
     try {
-      result = this.lookNow(args, server, str(args.tool));
+      result = this.lookNow(args, server, str(args.tool), shown);
     } catch (error) {
-      for (const { c, cs } of read) c.tell(cs);
+      giveBack();
+      if (error instanceof MetaError && unread.length) fail([error.message, ...unread].join('\n'));
       throw error;
     }
-    const restates = !str(args.tool) && !str(args.toolset) && !str(args.instance);
-    if (result.isError || typeof result.data !== 'string' || !restates) {
-      for (const { c, cs } of read) c.tell(cs);
+    if (result.isError || typeof result.data !== 'string') {
+      giveBack();
       return result;
     }
-    const lines = read.flatMap(({ c, cs }) => {
-      const shown = [...cs.suggest.map((s) => c.presence.renderSuggestion(s)), ...c.presence.untoldNotes(cs), ...cs.notes];
-      c.told(cs);
-      return shown;
-    });
+    const restates = !str(args.tool) && !str(args.toolset) && !str(args.instance);
+    if (!restates) giveBack();
+    const lines = restates
+      ? read.flatMap(({ c, cs }) => {
+        const said = [...cs.suggest.map((s) => c.presence.renderSuggestion(s)), ...c.presence.untoldNotes(cs), ...cs.notes];
+        take?.({ toolsets: c, cs });
+        return said;
+      })
+      : [];
+    lines.push(...unread);
     return lines.length ? textResult(`${result.data}\n${lines.join('\n')}`) : result;
   }
 
-  private lookNow(args: Record<string, unknown>, server: string | undefined, tool: string | undefined): ToolResult {
+  private lookNow(args: Record<string, unknown>, server: string | undefined, tool: string | undefined, mark: boolean): ToolResult {
     if (!server) {
       if (tool) return this.lookTool(owner(this.hub, undefined, (c) => !!c.presence.tool(tool), `a tool "${tool}"`), tool, str(args.instance));
       const ts = str(args.toolset);
@@ -397,11 +421,11 @@ export class ToolsetsModule implements Module {
           (x) => (ts ? x.presence.isDeclared(ts) || x.presence.undeclaredGroups.includes(ts) : true) && (!inst || x.presence.openRecords().some((o) => o.instance === inst)),
           ts ? `a toolset "${ts}"${inst ? ` with instance "${inst}"` : ''}` : `an open instance "${inst}"`,
         );
-        return this.lookNow(args, c.serverId, tool);
+        return this.lookNow(args, c.serverId, tool, mark);
       }
       const all = this.hub.presenting();
-      if (!all.length) return textResult('No MCPL server presents toolsets or dynamic tools now; every tool is in your tool list.');
-      return textResult(all.map((c) => c.presence.catalog()).join('\n\n'));
+      if (!all.length) return textResult('No MCPL server presents toolsets or dynamic tools now; MCPL tools are called directly, by name.');
+      return textResult(all.map((c) => c.presence.catalog({ mark })).join('\n\n'));
     }
     const c = pick(this.hub, server);
     if (tool) return this.lookTool(c, tool, str(args.instance));
@@ -446,7 +470,8 @@ export class ToolsetsModule implements Module {
     return textResult(`${renderToolDefinition(def)}\n${p.toolStatus(tool)}`);
   }
 
-  private async close(args: Record<string, unknown>): Promise<ToolResult> {
+  private async close(args: Record<string, unknown>, take: ((taken: TakenChange) => void) | null): Promise<ToolResult> {
+    const shown = take !== null;
     const named = str(args.toolset);
     const c = named && !str(args.server)
       ? owner(this.hub, undefined, (x) => x.presence.isOpen(named, str(args.instance)) || x.presence.openRecords(named).length > 0, `an open toolset "${named}"`)
@@ -477,21 +502,24 @@ export class ToolsetsModule implements Module {
       }
       let closed: Awaited<ReturnType<ToolsetController['close']>>;
       try {
-        closed = await c.close(toolset!, instance);
+        closed = await c.close(toolset!, instance, { shown });
       } catch (error) {
         const what = `${toolset}${instance ? `:${instance}` : ''}`;
         return requestFailure(c.serverId, `did not close ${what}`, `didn't confirm closing ${what}`, error);
       }
       const key = keyOf(toolset!, instance);
-      const change = p.render(closed.change) || `${p.label(key)} closed.`;
-      c.told(closed.change);
+      const change = p.render(closed.change, { mark: shown, describeAll: !shown }) || `${p.label(key)} closed.`;
+      take?.({ toolsets: c, cs: closed.change });
       return blocksResult([...asBlocks(closed.content), { type: 'text', text: change }]);
     }
     if (p.undeclaredGroups.includes(toolset!)) {
       if (instance) fail(`${c.serverId}/${toolset} takes no instance (the server doesn't declare it)`);
       if (!p.isOpen(toolset!)) fail(`${c.serverId}/${toolset} is not open`);
       const cs = c.setGroupOpen(toolset!, false);
-      return textResult(p.render(cs) || `${p.label(keyOf(toolset!))} closed.`);
+      const text = p.render(cs, { mark: shown, describeAll: !shown }) || `${p.label(keyOf(toolset!))} closed.`;
+      if (take) take({ toolsets: c, cs });
+      else c.tell(cs);
+      return textResult(text);
     }
     return fail(`${c.serverId} has no toolset "${toolset}"`);
   }

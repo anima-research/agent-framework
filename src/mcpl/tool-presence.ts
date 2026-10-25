@@ -605,9 +605,10 @@ export class ToolPresence {
    * What the model reads for a change set. `bare`: a key whose header the
    * caller already printed. `mark: false` renders without counting the
    * definitions it describes as shown, for text that may not reach the model
-   * (markShown counts them once it has).
+   * (markShown counts them once it has). `describeAll`: every tool with its
+   * first sentence, as for a result that may reach no agent.
    */
-  render(cs: ChangeSet, opts: { bare?: string; mark?: boolean } = {}): string {
+  render(cs: ChangeSet, opts: { bare?: string; mark?: boolean; describeAll?: boolean } = {}): string {
     const local = new Set<string>();
     const seen: Shown = opts.mark === false ? { has: (d) => this.shown.has(d) || local.has(d), add: (d) => { local.add(d); } } : this.shown;
     const lines: string[] = [];
@@ -619,7 +620,7 @@ export class ToolPresence {
       }
       const title = (c.opened || c.retitled) && !bare ? c.title : undefined;
       const setChanged = c.opened || c.appeared.length > 0 || c.redefined.length > 0 || c.gone.length > 0;
-      if (setChanged) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title, seen }));
+      if (setChanged) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title, seen, describeAll: opts.describeAll }));
       else if (title) lines.push(`${this.label(c.key)} ${title}`);
       if (c.gone.length) lines.push(`now unavailable: ${c.gone.join(', ')}`);
       if (c.opened && !bare) {
@@ -657,14 +658,16 @@ export class ToolPresence {
     return lines.join('\n');
   }
 
-  /** look naming this server: what is open (with tools) and what can be opened. */
-  catalog(): string {
+  /** look naming this server: what is open (with tools) and what can be
+   *  opened. `mark: false`, as for render, for a look whose result may
+   *  reach no agent. */
+  catalog(opts: { mark?: boolean } = {}): string {
     const lines: string[] = [];
     lines.push(this.surface ? `${this.server} — ${[this.surface.title, this.surface.summary].filter(Boolean).join(': ')}` : this.server);
     const v = this.view();
     if (v.size) {
       for (const [key, e] of v) {
-        lines.push(...this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title }).map((l) => `  ${l}`));
+        lines.push(...this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title, seen: opts.mark === false ? new Set<string>() : undefined }).map((l) => `  ${l}`));
         const close = this.closeHint(key);
         if (close) lines.push(`    ${close} closes it.`);
       }

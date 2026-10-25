@@ -456,8 +456,9 @@ framework registers a `toolsets` module with four constant tools:
   call itself;
 - `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
   and what can be opened, or one tool's description and input schema. It
-  re-reads the server first; what that changed is in the answer when look
-  restates everything, and otherwise told as a notice;
+  re-reads the server first, and says so when it couldn't; what that changed
+  is in the answer when look restates everything, and otherwise told as a
+  notice;
 - `toolsets--close {server?, toolset?, instance?}` closes it.
 
 `server` can be left out when only one server has the name. Hint changes apply
@@ -472,8 +473,12 @@ never re-opening anything.
 What changed is told where it happened: after a call's own result, after the
 push that explains it, or as a notice (`kind: 'mcpl-toolsets'`, which wakes
 nothing) for a standalone `tools/hints`, a late result, an adoption, a
-recovery, or a call whose result doesn't go to the agent (one the framework or
-a module makes itself). A call's change also goes as a notice, ahead of its
+recovery, or a call whose result may not reach the agent (a script's, a
+module's or a host's, or one the framework makes itself); an open, close or
+look made that way also shows its caller the change, unless the change has
+already gone as a notice (below). A dynamic tool's change also goes as a notice
+when it wouldn't fit whole within its result's inline cap, or when its call
+fails after the result was read. A call's change also goes as a notice, ahead of its
 result, when a later change goes to the agent before the call's caller has
 taken it, so changes reach the agent in the order they were read. Notices and reminders
 need the server's `pushEvents` grant, like any delivery; without it, a change

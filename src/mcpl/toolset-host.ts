@@ -416,6 +416,10 @@ export class ToolsetController {
     this.notice(cs);
   }
 
+  private changeOf(carrier: object): ChangeSet {
+    return this.readChanges.get(carrier) ?? emptyChange();
+  }
+
   /** A carrier's change, taken to be told some other way (a notice this controller sends). */
   private claim(carrier: unknown): ChangeSet {
     return this.take(carrier);
@@ -525,16 +529,19 @@ export class ToolsetController {
   /**
    * Re-read what the server holds open (titles, visibility) without telling
    * it, for look. Returns what the re-read changed, taken from the notice it
-   * would otherwise get: look then either shows it (told) or hands it back
-   * (tell). Null when nothing was read.
+   * would otherwise get when `shown` (its result reaches an agent): look then
+   * either shows it (told) or hands it back (tell). Otherwise the change is
+   * left to its notice, and returned to be shown to the caller alone. Null
+   * when nothing was read.
    */
-  async refreshOpen(): Promise<ChangeSet | null> {
+  async refreshOpen(opts: { shown: boolean }): Promise<ChangeSet | null> {
     if (!this.presence.active) return null;
     const connection = this.connection;
     if (!connection || !connection.isConnected) return null;
     try {
       const r = await connection.sendToolsetsList(REFRESH_TIMEOUT_MS);
-      return isObj(r) ? this.claim(r) : null;
+      if (!isObj(r)) return null;
+      return opts.shown ? this.claim(r) : this.changeOf(r);
     } catch (error) {
       this.log(`toolsets/list (look) failed: ${error instanceof Error ? error.message : String(error)}`);
       return null;
@@ -543,8 +550,10 @@ export class ToolsetController {
 
   // ── the host's acts ──
 
-  /** toolsets/open (RFC §5.2). The server's refusal rejects. */
-  async open(toolset: string, instance: string | undefined, options: Record<string, unknown> | undefined): Promise<{
+  /** toolsets/open (RFC §5.2). The server's refusal rejects. Its change is
+   *  taken when `shown` (its result reaches an agent), else left to its
+   *  notice and returned for the caller alone; close's is the same. */
+  async open(toolset: string, instance: string | undefined, options: Record<string, unknown> | undefined, opts: { shown: boolean }): Promise<{
     key: string; title?: string; content: unknown[]; change: ChangeSet; adopted: boolean;
   }> {
     const connection = this.live();
@@ -559,17 +568,17 @@ export class ToolsetController {
       key,
       ...(title ? { title } : {}),
       content: Array.isArray(res.content) ? res.content : [],
-      change: this.takeChange(res),
+      change: opts.shown ? this.takeChange(res) : this.changeOf(res),
       adopted: res.adopted === true,
     };
   }
 
   /** toolsets/close (RFC §5.2). */
-  async close(toolset: string, instance: string | undefined): Promise<{ content: unknown[]; change: ChangeSet }> {
+  async close(toolset: string, instance: string | undefined, opts: { shown: boolean }): Promise<{ content: unknown[]; change: ChangeSet }> {
     const connection = this.live();
     const r = await connection.sendToolsetsClose({ toolset, ...(instance ? { instance } : {}) }, TOOLSET_REQUEST_TIMEOUT_MS);
     const res = isObj(r) ? r : {};
-    return { content: Array.isArray(res.content) ? res.content : [], change: this.takeChange(res) };
+    return { content: Array.isArray(res.content) ? res.content : [], change: opts.shown ? this.takeChange(res) : this.changeOf(res) };
   }
 
   /** Open or close an undeclared group (RFC §5.4): the host's own act; the server isn't told. */

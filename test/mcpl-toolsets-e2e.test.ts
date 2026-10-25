@@ -161,13 +161,11 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
     assert.ok(!act.isError, resultText(act));
   });
 
-  it('close reports what closing meant, and the toolset tools go', async () => {
+  it('close reports what closing meant; a host\'s own close, whose result the agent may not see, is told as a notice too', async () => {
     await callTool(fw.framework, 'toolsets--open', { server: 'arcade', toolset: 'build' });
     const closed = await callTool(fw.framework, 'toolsets--close', { server: 'arcade', toolset: 'build' });
     assert.match(resultText(closed), /\[arcade\/build\] closed/);
-    await new Promise((r) => setImmediate(r));
-    // Nothing of it reached the window as a notice: the results carried it.
-    assert.ok(!windowText(fw.framework).some((t) => t.includes('tool changes') && t.includes('[arcade/build]')));
+    await waitFor(() => windowText(fw.framework).some((t) => t.includes('tool changes') && t.includes('[arcade/build] closed')), 'the close told');
   });
 });
 

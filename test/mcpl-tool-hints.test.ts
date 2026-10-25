@@ -492,7 +492,7 @@ test('act and a direct call take one dispatch path: state exchange, lifecycle, r
     assert.match(results, /play ran/);
     assert.match(results, /now unavailable: play/);
     await nextMacrotask();
-    assert.ok(!windowText(fw.framework).some((t) => t.includes('tool changes')), 'told once, in the result');
+    assert.ok(!windowText(fw.framework).some((t) => t.includes('tool changes') && t.includes('now unavailable: play')), 'told once, in the result');
   } finally {
     await fw.stop();
     await server.close();
@@ -600,7 +600,7 @@ test('an open or close whose outcome the host can\'t know is reported as unconfi
     const r = await callTool(dropped.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
     assert.ok(r.isError);
     assert.match(resultText(r), /^arc didn't confirm opening build: The connection to the "arc" server closed before it answered/);
-    assert.match(resultText(r), /toolsets--look \{server:"arc"\} asks it what's open\.$/);
+    assert.match(resultText(r), /toolsets--look \{server:"arc"\} asks it what's open, or says it couldn't\.$/);
     const again = await callTool(dropped.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
     assert.ok(again.isError);
     assert.equal(resultText(again), 'arc did not open build: arc is not connected right now; try again later', 'with the connection gone, an open is known not sent');
@@ -619,7 +619,7 @@ test('an open or close whose outcome the host can\'t know is reported as unconfi
     await callTool(refused.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
     const r = await callTool(refused.fw.framework, 'toolsets--close', { server: 'arc', toolset: 'build' });
     assert.ok(r.isError);
-    assert.match(resultText(r), /^arc didn't confirm closing build: .*the board is locked\. toolsets--look \{server:"arc"\} asks it what's open\.$/);
+    assert.match(resultText(r), /^arc didn't confirm closing build: .*the board is locked\. toolsets--look \{server:"arc"\} asks it what's open, or says it couldn't\.$/);
   } finally { await refused.done(); }
 });
 
@@ -693,10 +693,12 @@ test('an ended record is told once it reaches the agent: a notice not written le
     if (msg.method === 'toolsets/list') state.ended = [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }];
     return false;
   }, { disabledCapabilities: ['pushEvents'] });
+  const agentLook = async () => resultText((await t.fw.framework.puppetToolCall('scout', 'toolsets--look', { server: 'arc' })).result);
   try {
-    assert.match(await look(t.fw), /\[arc\/game:g1\] ended: the game is over\./, 'look tells it');
+    assert.match(await look(t.fw), /\[arc\/game:g1\] ended: the game is over\./, 'a host\'s own look shows it to its caller');
     assert.ok(!notices(t.fw).length, 'without pushEvents no notice was written');
-    assert.doesNotMatch(await look(t.fw), /ended: the game is over/, 'and only once');
+    assert.match(await agentLook(), /\[arc\/game:g1\] ended: the game is over\./, 'so the agent\'s own look still tells it');
+    assert.doesNotMatch(await agentLook(), /ended: the game is over/, 'and only once');
   } finally { await t.done(); }
 });
 
@@ -1271,6 +1273,26 @@ test('close with nothing named, after a group the host opened was declared, says
   assert.match(String(result.error), /nothing is open on arc/);
 });
 
+test('a ToolsetsModule built as 0.27.0 built it, ToolsetsModule(hub), takes the change its look shows as told', async () => {
+  const statement = { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [{ name: 'peek', visible: true }] } } };
+  const look = async (module: (hub: ToolsetHub) => ToolsetsModule) => {
+    const { hub, told } = tappedController(() => true, TOOLS, {
+      toolsetsList: (r) => {
+        r({ kind: 'result', method: 'toolsets/list', params: {}, result: statement, awaited: true });
+        return statement;
+      },
+    });
+    const looked = resultText(await module(hub).handleToolCall({ id: 'l1', name: 'look', input: {} } as never));
+    await nextMacrotask();
+    return { looked, told };
+  };
+  const built = await look((hub) => new ToolsetsModule(hub));
+  assert.match(built.looked, /peek\(\)/);
+  assert.equal(built.told.length, 0, 'not told again as a notice');
+  const unshown = await look((hub) => new ToolsetsModule(hub, () => null));
+  assert.equal(unshown.told.length, 1, 'a look whose result reaches no agent leaves it to a notice');
+});
+
 test('a tool a recovery\'s list puts in a toolset leaves the model\'s tool list without a further list change', async () => {
   const tools: Json[] = TOOLS.map((x) => ({ ...x }));
   const t = await setup(() => false, {}, ADVERT, tools);
@@ -1328,7 +1350,7 @@ test('a change look hands back is told before a change read after it', async () 
       return statement;
     },
   });
-  const cs = await c.refreshOpen();
+  const cs = await c.refreshOpen({ shown: true });
   readCall(callResult(2, [{ name: 'peek', visible: false }]));
   c.tell(cs!);
   await nextMacrotask();
@@ -1489,4 +1511,48 @@ test('look at a toolset whose options a server nests very deep still answers', a
   c.manifestChanged({ toolHints: true, toolsets: { maze: { title: 'Maze', options: deep } } });
   const looked = await new ToolsetsModule(hub).handleToolCall({ id: 'l2', name: 'look', input: { server: 'arc', toolset: 'maze' } } as never);
   assert.ok(!looked.isError, String(looked.error));
+});
+
+test('look says when it couldn\'t ask a server, and shows what the host last knew of it', async () => {
+  let listing = true;
+  const t = await setup((msg, peer) => {
+    if (msg.method !== 'toolsets/list' || listing) return false;
+    peer.error(msg.id, -32000, 'busy');
+    return true;
+  });
+  try {
+    listing = false;
+    const text = await look(t.fw);
+    assert.match(text, /^arc\n {2}nothing open/);
+    assert.match(text, /\narc couldn't be asked just now: this is what the host last knew of it\.$/);
+    const refused = await callTool(t.fw.framework, 'toolsets--look', { server: 'arc', instance: 'g1' });
+    assert.ok(refused.isError);
+    assert.equal(resultText(refused), 'no open instance "g1" on arc; no instance is open there\narc couldn\'t be asked just now: this is what the host last knew of it.');
+  } finally { await t.done(); }
+});
+
+test('an open\'s tool change goes with its result where the agent reads it, and as a notice for a host\'s own open', async () => {
+  const opens: Handler = (msg, peer, state) => {
+    if (msg.method !== 'toolsets/open') return false;
+    state.open = [{ toolset: 'build', title: 'B' }];
+    peer.reply(msg.id, { toolset: 'build', title: 'B', _meta: { 'mcpl/hints': state.hint([{ name: 'place', visible: true }]) } });
+    return true;
+  };
+  const agent = await setup(opens);
+  try {
+    const { toolUseId } = await agent.fw.framework.puppetToolCall('scout', 'toolsets--open', { server: 'arc', toolset: 'build' });
+    const stored = agent.fw.framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content as unknown as Array<Record<string, unknown>>)
+      .find((b) => b.type === 'tool_result' && b.toolUseId === toolUseId);
+    assert.match(JSON.stringify(stored?.content ?? null), /place\(x\?: int\) — Place a block\./, 'the stored result holds the change');
+    await nextMacrotask();
+    assert.equal(notices(agent.fw).length, 0, 'the puppet\'s stored result told it');
+  } finally { await agent.done(); }
+
+  const host = await setup(opens);
+  try {
+    const r = await callTool(host.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
+    assert.match(resultText(r), /place\(x\?: int\) — Place a block\./, 'the caller reads the tools it opened');
+    await waitFor(() => notices(host.fw).some((x) => x.includes('[arc/build] B') && x.includes('place(x?: int) — Place a block.')), 'the agent told as a notice');
+  } finally { await host.done(); }
 });

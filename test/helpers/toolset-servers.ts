@@ -19,6 +19,7 @@ import { ToolsetServer, type ToolsetServerSpec } from '@animalabs/mcpl-core/tool
 
 import { AgentFramework } from '../../src/index.js';
 import type { McplServerConfig } from '../../src/mcpl/types.js';
+import type { FrameworkConfig } from '../../src/types/framework.js';
 import type { Module, ModuleContext, ProcessEvent, ProcessState, EventResponse, ToolDefinition, ToolResult } from '../../src/index.js';
 import { MockMembrane } from './mock-membrane.js';
 
@@ -169,8 +170,8 @@ class Quiet implements Module {
   }
 }
 
-/** A framework with one agent and the given MCPL servers. */
-export async function makeFramework(servers: McplServerConfig[]) {
+/** A framework with one agent and the given MCPL servers; `options` replaces any of its config. */
+export async function makeFramework(servers: McplServerConfig[], options: Partial<FrameworkConfig> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-toolsets-'));
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
@@ -179,6 +180,7 @@ export async function makeFramework(servers: McplServerConfig[]) {
     agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
     modules: [new Quiet()],
     mcplServers: servers,
+    ...options,
   });
   await framework.start();
   return {
