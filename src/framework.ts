@@ -9128,8 +9128,9 @@ export class AgentFramework {
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
    * `headFrom` names a running agent whose recorded head (toolDeclarations
-   * 'entries') the new agent starts with, a record of its own from then on:
-   * a host that seeds the
+   * 'entries') the new agent starts with, as its own record: the same head
+   * object at first, since a record is never changed in place, and each of
+   * the new agent's moves records its own. That's for a host that seeds the
    * agent with that agent's messages, its system changes stamped with
    * `systemChangeMetadata(config.name)`, then sends the same prefix, so the
    * new agent reads that agent's cache and declares only its own difference.
@@ -12435,7 +12436,7 @@ export class AgentFramework {
     const recognised = isMembraneError(error) && error.systemChangeRefused === true;
     const refused = isMembraneError(error) && error.httpStatus === 400;
     if (!recognised && !refused) return false;
-    agent.keepToHeadUntilRestart();
+    agent.keepToHeadUntilBuiltAgain();
     console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again: ${error.message}`);
     if (!recognised) {
       this.opsAlert('head-resend', agent.name,
@@ -14140,7 +14141,6 @@ export class AgentFramework {
     // Its recorded head stays in the store, as the rest of its data does, but
     // leaves memory: the name is never used again, so nothing needs it there.
     this.headDeclarationCache?.heads.delete(agentName);
-    this.headDeclarationsUnreadable.delete(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
     // Its scripts go with it, and leave the map once they've ended: no later
     // run of a fork's name trims them.

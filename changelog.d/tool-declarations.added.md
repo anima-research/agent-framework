@@ -20,10 +20,15 @@
   `'head'`, sends requests as before, leaving any system changes out. New
   trace events: `head:declared`, `head:moved` and `head:resend`.
 - A host can fork an ephemeral agent onto its parent's head:
-  `createEphemeralAgent(config, { headFrom })` starts the new agent with a
-  copy of the named running agent's recorded head, and `systemChangeMetadata`
+  `createEphemeralAgent(config, { headFrom })` starts the new agent with the
+  named running agent's recorded head, and `systemChangeMetadata`
   (exported beside `isSystemChangeMessage`) stamps the system changes copied
   into it as its own, so it reads the parent's cache and declares only its
   own difference. That pays for a fork with its parent's system text; a
   subagent with its own system prompt moves to its own head at its first
   request, as without it.
+- kv-unified's immutable-prefix hash takes an agent's tools as the wire
+  carries them, leaving out a field whose value is undefined, as membrane's
+  request does, where it wrote such a field as null. A host whose tool
+  definitions carry one, built as objects rather than parsed from JSON, gets
+  one fresh layout at the upgrade, on `'head'` too.

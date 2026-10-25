@@ -207,7 +207,7 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
-  it("names in a stream's notes the compile its request was built from, when a declared change compiles twice, with `binds: true`", async () => {
+  it("builds a declared change's request from the compile that wrote the record, so a note under it is taken, with `binds: true`", async () => {
     await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
       say(alpha, 'user', 'hello');
@@ -326,7 +326,7 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
-    it("gives the child a copy, so a change made in place to what the parent's request carries doesn't reach the child's head", async () => {
+    it("keeps the child's head as recorded when what the parent's request carries is changed in place", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const { alpha, child } = await forked(framework, {}, { headFrom: 'alpha' }, 'alpha-child');
         const parentRequest = await alpha.buildActivationRequest([tool('a'), tool('b')]);

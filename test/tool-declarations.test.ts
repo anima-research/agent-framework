@@ -300,6 +300,7 @@ describe('toolDeclarations', () => {
     await agent.buildActivationRequest([tool('a')]);
     const first = await agent.buildActivationRequest([tool('a'), tool('b')]);
     first.tools![0]!.description = 'changed in place, as a hook might';
+    (first.tools![0]!.inputSchema as { properties: Record<string, unknown> }).properties.added = { type: 'string' };
     const next = await agent.buildActivationRequest([tool('a'), tool('b')]);
     assert.deepEqual(next.tools, [tool('a')], 'the head as recorded');
     assert.equal(changeRows(context.rows).length, 1, 'with nothing declared back');
@@ -316,6 +317,17 @@ describe('toolDeclarations', () => {
     await agent.buildActivationRequest([tool('a'), tool('b')]);
     assert.equal(changeRows(context.rows).length, 1, 'declared once the results are in');
     assert.equal(context.rows.at(-1)!.participant, 'system');
+  });
+
+  it("hashes a head for kv-unified as the wire carries it, so a tool field left undefined hashes the same after adoption", async () => {
+    const context = fakeContext([said('user', 'hello')], { kvUnified: true });
+    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const withUndefined = { ...tool('a'), extra: undefined } as unknown as ToolDefinition;
+    await agent.buildActivationRequest([withUndefined]);
+    await agent.buildActivationRequest([withUndefined]);
+    const [adopted, next] = context.compiles.map((o) => o?.kvUnifiedImmutablePrefixHash);
+    assert.ok(adopted);
+    assert.equal(next, adopted, "the recorded head's hash is the adopted one's");
   });
 
   it('hashes the head that goes out for kv-unified: the recorded one, and the new one after a move', async () => {
@@ -708,7 +720,7 @@ describe('toolDeclarations', () => {
     it('takes the changes into the head when the compile after a declared change is refused over budget, and compiles once more', async () => {
       // The first compile fits; once the change is stored, it doesn't.
       const rows = [said('user', 'hello')];
-      const context = fakeContext(rows, { overBudget: (r) => r.some((row) => row.participant === 'system') });
+      const context = fakeContext(rows, { kvUnified: true, overBudget: (r) => r.some((row) => row.participant === 'system') });
       const heads = memoryHeadDeclarations();
       const events: HeadEvent[] = [];
       const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
@@ -719,6 +731,10 @@ describe('toolDeclarations', () => {
       assert.deepEqual(heads.read('agent')!.tools, [tool('a'), tool('b')]);
       assert.deepEqual(events.slice(1).map((e) => (e.type === 'head:moved' ? [e.type, e.why, e.changesRemoved, e.forced] : [e.type])),
         [['head:declared'], ['head:moved', 'consolidated', 1, 'budget']]);
+      // The compile the request is built from was made for the new head, as an adoption of it hashes it.
+      const fresh = fakeContext([said('user', 'hello')], { kvUnified: true });
+      await agentOn(fresh, { toolDeclarations: 'entries' }).buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash, fresh.compiles[0]?.kvUnifiedImmutablePrefixHash);
     });
 
     it("compiles once more after a move forced by the budget for the head that goes out, as kv-unified hashes it", async () => {

@@ -156,9 +156,12 @@ function stableHash(value: unknown): string {
   return createHash('sha256').update(encode(value)).digest('hex');
 }
 
-/** kv-unified's hash of a request's immutable prefix: its head's tools and system text. */
+/** kv-unified's hash of a request's immutable prefix: its head's tools as
+ *  the wire carries them (a field left undefined goes, as a request's copy of
+ *  the head and the binding's digests leave it out), and its system text. */
 function headHash(head: HeadDeclaration): string {
-  return stableHash({ tools: head.tools.length > 0 ? head.tools : undefined, system: systemTextOf(head.system) });
+  const tools = head.tools.length > 0 ? JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[] : undefined;
+  return stableHash({ tools, system: systemTextOf(head.system) });
 }
 
 /** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
@@ -354,7 +357,7 @@ export class Agent {
   readonly mayBindThinking: boolean;
   /** Set by the framework's fail-safe once the provider refused a system
    *  change: this agent then declares on its head until it's built again. */
-  private headUntilRestart = false;
+  private headUntilBuiltAgain = false;
   /** Where the recorded head is kept (system-changes.ts). The framework
    *  gives its store's state; an agent built alone keeps it in memory. */
   private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations();
@@ -2215,7 +2218,7 @@ export class Agent {
 
   /** Whether this agent's requests declare later changes in its context. */
   declaresEntries(): boolean {
-    return this.toolDeclarations === 'entries' && !this.headUntilRestart;
+    return this.toolDeclarations === 'entries' && !this.headUntilBuiltAgain;
   }
 
   /** The framework's record of heads, and its traces of what moved them. */
@@ -2230,8 +2233,8 @@ export class Agent {
   }
 
   /** The fail-safe: declare on the head until this agent is built again. */
-  keepToHeadUntilRestart(): void {
-    this.headUntilRestart = true;
+  keepToHeadUntilBuiltAgain(): void {
+    this.headUntilBuiltAgain = true;
   }
 
   /**
@@ -2273,6 +2276,9 @@ export class Agent {
       // thinking-binding record) would hold rows no later compile has, so
       // the next would differ from it there and leave out the thinking minted
       // since. So once they're removed, the compile runs again without them.
+      // That compile leaves out the thinking after where they stood, which
+      // was minted with them in the prefix: the cost of leaving them, which
+      // the request does either way.
       if (!dryRun && own.size > 0) {
         const changesRemoved = this.removeOwnChanges();
         this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved });
@@ -2341,14 +2347,6 @@ export class Agent {
     return current;
   }
 
-  /** Whether compiles made for heads `a` and `b` are told the same of them:
-   *  kv-unified's hash, and the thinking binding's digests, which take a
-   *  field left undefined differently (the hash writes it as null, a digest
-   *  leaves it out, as the wire does). */
-  private toldAlike(a: HeadDeclaration, b: HeadDeclaration): boolean {
-    return headHash(a) === headHash(b) && JSON.stringify(this.bindingCompileOptions(a)) === JSON.stringify(this.bindingCompileOptions(b));
-  }
-
   /**
    * Move the head to what's current: remove the changes it now holds, then
    * record a copy of it, in that order, so a stop between the two leaves the
@@ -2357,7 +2355,9 @@ export class Agent {
    * changes beside a head that already holds them. The compile runs again
    * when what it read changed, or when it was told something of its head
    * (`compiledWith`, null when it was told nothing) that differs for this
-   * one (toldAlike). A dry run shows the same, compiling again (dry) for
+   * one: kv-unified's hash and the thinking binding's digests are both of
+   * the head's tools as the wire carries them and its system text, which
+   * headHash compares. A dry run shows the same, compiling again (dry) for
    * another head, and changes nothing. It can't remove the rows before it
    * compiles, so it compiles with them and leaves them out of what it
    * shows: under a tight budget, its window can hold less than the move's.
@@ -2372,7 +2372,7 @@ export class Agent {
     sizes?: { changeTokens: number; inputTokens: number; forced?: 'share' },
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
-      const shown = compiledWith !== null && !this.toldAlike(compiledWith, current) ? await compile(current) : compiled;
+      const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
       const own = ownSystemChanges(shown, this.name);
       const kept = (_: unknown, index: number) => !own.has(index);
       // Its sources stay index for index with its messages.
@@ -2382,7 +2382,7 @@ export class Agent {
     const removed = this.removeOwnChanges();
     this.headDeclarations.write(this.name, copyHead(current));
     this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
-    const again = removed > 0 || (compiledWith !== null && !this.toldAlike(compiledWith, current));
+    const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
   }
 
