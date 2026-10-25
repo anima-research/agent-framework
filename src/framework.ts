@@ -753,7 +753,9 @@ import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineTex
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
+import { ToolsetsModule } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -3434,6 +3436,10 @@ export class AgentFramework {
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
+  /** MCPL RFC-014: every toolHints server's tool presence, for the
+   *  `toolsets` module's meta-tools and reminders. Made when the first
+   *  server configured with `toolHints: true` is set up; null until then. */
+  private toolsetHub: ToolsetHub | null = null;
   /** Inference routing policy from FrameworkConfig — stored so the MCPL
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
@@ -3992,6 +3998,9 @@ export class AgentFramework {
       // settings, and its tool prefix, which mustn't collide with a module
       // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
+      // RFC-014: a server configured with toolHints brings the toolsets
+      // module, whose name no prefix may take either.
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) moduleNames.add(TOOLSETS_MODULE);
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
         assertServerConfigBooleans(serverConfig);
@@ -4014,6 +4023,7 @@ export class AgentFramework {
         prefixesSeen.set(prefix, serverConfig.id);
       }
 
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) await framework.ensureToolsetsModule();
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -19383,6 +19393,15 @@ export class AgentFramework {
       // Both produce ContextInjection[] that get merged before inference.
       let injections: ContextInjection[] | undefined;
 
+      // RFC-014 §8.3: each compile this agent sends says which open
+      // toolsets' announcements it still carries; the toolsets module's
+      // gatherContext reminds it of those that left.
+      if (this.toolsetHub && !agent.onCompiledToSend) {
+        const hub = this.toolsetHub;
+        const name = agent.name;
+        agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
+      }
+
       // Module gatherContext (fail-open, per-module timeout — the module's
       // contextTimeoutMs, else the registry default). Injections are
       // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
@@ -22268,6 +22287,17 @@ export class AgentFramework {
     return this.moduleRegistry.handleToolCall(call);
   }
 
+  /**
+   * RFC-014 §6.2: a static tool's result with the tool change its hints made
+   * (applied as the result was read) told after the server's content. The
+   * result itself when there's none, as for every server without toolHints.
+   */
+  private withToolsetChange<R extends { content?: unknown }>(serverId: string, result: R): R {
+    const change = this.toolsetHub?.get(serverId)?.changeText(result) ?? '';
+    if (!change) return result;
+    return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: change }] };
+  }
+
   /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
@@ -22283,9 +22313,12 @@ export class AgentFramework {
     if (!isToolAllowed(toolName, config)) {
       return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
+    // RFC-014: a dynamic tool is called through toolsets--act.
+    const dynamicRefusal = modern ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) return { success: false, error: dynamicRefusal, isError: true };
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     try {
-      const result = modern ? await modern.callTool(toolName, args) : await server!.sendToolsCall(toolName, args);
+      const result = modern ? await modern.callTool(toolName, args) : this.withToolsetChange(serverId, await server!.sendToolsCall(toolName, args));
       // A server's error is a failure here too, as the model's dispatch
       // reads it: its text (mcplToolFailure), without its other blocks, and
       // its structured content, kept by presence. A success is the server's
@@ -26833,6 +26866,10 @@ export class AgentFramework {
     // never gate this: queued marks are delivered in the background.
     this.readyMcplPlanes();
     this.deliverDiscordAwarenessInBackground('startup', 'host');
+    // RFC-014 §5.3: each toolHints server's open toolsets, read once its policy settled.
+    for (const server of this.mcplServerRegistry?.getAllServers() ?? []) {
+      if (server.isConnected) this.reattachToolsets(server);
+    }
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
@@ -27463,6 +27500,76 @@ export class AgentFramework {
   }
 
   /**
+   * The host capabilities offered to one server: the host's own, plus
+   * RFC-014's `toolHints` where its configuration asks for them. Without it,
+   * the very object every server is offered.
+   */
+  private mcplHostCapabilitiesFor(config: McplServerConfig): McplHostCapabilities {
+    const base = this.mcplHostCapabilities!;
+    return config.toolHints === true ? { ...base, toolHints: true } : base;
+  }
+
+  /** RFC-014: every toolHints server's presence, made on first use. */
+  private toolsets(): ToolsetHub {
+    return (this.toolsetHub ??= new ToolsetHub({
+      notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
+      log: (line) => console.error(`[mcpl] ${line}`),
+      listedName: (serverId, tool) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`,
+    }));
+  }
+
+  /** RFC-014: the `toolsets` module (toolsets--open, --act, --look,
+   *  --close), registered once, by the first server configured with
+   *  toolHints. Its tools don't change after that. */
+  private async ensureToolsetsModule(): Promise<void> {
+    const hub = this.toolsets();
+    const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
+    if (existing instanceof ToolsetsModule) return;
+    if (existing) {
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints needs that name for its meta-tools`);
+    }
+    await this.addModule(new ToolsetsModule(hub));
+  }
+
+  /** RFC-014 §5.3: after a (re)connect whose policy has settled, read what
+   *  the server holds open and adopt it. In the background: its notices are
+   *  written as they come. */
+  private reattachToolsets(connection: McplServerConnection): void {
+    const controller = this.toolsetHub?.get(connection.id);
+    if (!controller) return;
+    void controller.connected(connection).catch((error: unknown) => {
+      console.error(`[mcpl] ${connection.id}: reading its open toolsets failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  /**
+   * RFC-014 §8.3: a tool change with no result or event to ride on (a
+   * standalone tools/hints, a late result, a reconnect's adoption, a
+   * recovery) is told as a notice, which doesn't wake the agent. Like any
+   * delivery from a server into the conversation, it needs `pushEvents`
+   * (§6.1); without it the change is still tracked, and toolsets--look shows
+   * it. The text is the server's (its tool definitions, titles, reasons), so
+   * the notice names the server.
+   */
+  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): void {
+    const connection = this.mcplServerRegistry?.getServer(serverId);
+    if (!CapabilityGrant.of(connection).has('pushEvents')) {
+      console.error(`[mcpl] ${serverId}: a tool change was not told (pushEvents is not granted); ${META_TOOL_NAMES.look} shows it`);
+      return;
+    }
+    if (this.agents.size === 0) return;
+    try {
+      this.addMessage(
+        'user',
+        [{ type: 'text', text: `MCPL server "${serverId}", tool changes:\n${text}` }],
+        { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
+      );
+    } catch (error) {
+      console.error(`[mcpl] ${serverId}: a tool change notice could not be written:`, error);
+    }
+  }
+
+  /**
    * Connect a single MCPL server: register routing entries, open the
    * connection, wire events, and initialize feature sets / scopes /
    * checkpoints. Shared by startup (initializeMcpl) and the runtime
@@ -27618,6 +27725,8 @@ export class AgentFramework {
     let connection: McplServerConnection;
     // The transport the connect registered, which its own exchange is for.
     let registeredEpoch = 0;
+    // RFC-014: a toolHints server's meta-tools exist before it connects.
+    if (config.toolHints === true) await this.ensureToolsetsModule();
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
@@ -27627,11 +27736,14 @@ export class AgentFramework {
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
         connectionConfig,
-        this.mcplHostCapabilities,
+        this.mcplHostCapabilitiesFor(config),
         abort.signal,
         (registering) => {
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
+          // RFC-014 §6.1: hints apply as the connection reads them, from its
+          // first message, so the tap is on before any I/O can deliver one.
+          if (config.toolHints === true) this.toolsets().controllerFor(config).attach(registering);
         },
       );
     } catch (error) {
@@ -27710,6 +27822,8 @@ export class AgentFramework {
     // connected once its attempt settles, granted or not.
     if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      // RFC-014 §5.3: what the server holds open is the truth after a connect.
+      this.reattachToolsets(connection);
     }
     // A connection can make queued awareness work deliverable; it never
     // waits on it.
@@ -27949,6 +28063,15 @@ export class AgentFramework {
           ? (fetched as { revision: string }).revision : null;
       connection.manifestState.lastFetchedAt = Date.now();
       connection.droppedCapabilities = new Set(dropped);
+      // RFC-014 §5.1: the `toolsets` domain (toolHints, toolsets, surface),
+      // read from the manifest as fetched. A toolset removed ends its open
+      // instances; toolHints withdrawn makes every tool static. Its impact is
+      // surface-changed, applied, with no grant consequence (§17.6).
+      const declarations = toolsetDeclarationsOf(fetched);
+      const toolsetsChanged = config.toolHints === true
+        && JSON.stringify(declarations) !== JSON.stringify(connection.toolsetDeclarations);
+      connection.toolsetDeclarations = declarations;
+      if (toolsetsChanged) this.toolsetHub?.get(connection.id)?.manifestChanged(declarations);
 
       const newDeclared = Object.keys(this.featureSetManager?.getDeclaredFeatureSets(connection.id) ?? {});
       const newEnabled = newDeclared.filter((n) => this.featureSetManager?.isEnabled(connection.id, n));
@@ -27962,6 +28085,7 @@ export class AgentFramework {
         ...added.map((p) => ({ impact: 'capability-expansion-pending', subject: p, disposition: negotiated ? 'applied' : 'decision-needed' })),
         ...degraded.map((n) => ({ impact: 'feature-degraded', subject: n, disposition: 'applied' })),
         ...restored.map((n) => ({ impact: 'feature-restored', subject: n, disposition: negotiated ? 'applied' : 'decision-needed' })),
+        ...(toolsetsChanged ? [{ impact: 'surface-changed', subject: 'toolsets', disposition: 'applied' }] : []),
       ];
       this.emitTrace({
         type: 'mcpl:manifest-change-receipt',
@@ -28982,7 +29106,33 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      // RFC-014 §6.1 carrier 2: the tool change this push explains was
+      // applied as it was read; it's told after the event's own content. A
+      // push the host then refuses still tells its change, on its own.
+      const change = this.toolsetHub?.get(connection.id)?.changeText(params) ?? '';
+      const content = (params as { payload?: { content?: unknown } } | null)?.payload?.content;
+      if (!change || !Array.isArray(content)) {
+        if (change) this.recordToolsetNotice(connection.id, change, { invite: false });
+        await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+        return;
+      }
+      let refused = false;
+      const told = {
+        respond: (result: unknown) => {
+          if ((result as { accepted?: unknown } | null)?.accepted === false) refused = true;
+          responder?.respond(result);
+        },
+        respondError: (code: number, message: string, data?: unknown) => {
+          refused = true;
+          (responder?.respondError as ((code: number, message: string, data?: unknown) => void) | undefined)?.(code, message, data);
+        },
+      };
+      await this.pushHandler?.handlePushEvent(
+        connection.id,
+        { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
+        told as never,
+      );
+      if (refused) this.recordToolsetNotice(connection.id, change, { invite: false });
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -29182,6 +29332,9 @@ export class AgentFramework {
         // listeners can close it.
         if (connection.transportEpoch !== epoch || !connection.isConnected) return;
         this.handleToolsListChanged(connection.id);
+        // RFC-014 §5.2–5.3: what the server still holds open is adopted, and
+        // what it doesn't is closed; nothing is re-opened.
+        this.reattachToolsets(connection);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,
@@ -29344,6 +29497,8 @@ export class AgentFramework {
       // Lost for good (no reconnect, and the registry has dropped it): its
       // tools leave the agents' list, as a disconnect's do.
       if (!connection.willReconnect && this.mcplServerRegistry?.getServer(connection.id) !== connection) {
+        // RFC-014: its toolsets go with it; a next connection reads them again.
+        this.toolsetHub?.get(connection.id)?.detach(connection);
         this.handleToolsListChanged(connection.id);
       }
     });
@@ -29470,8 +29625,19 @@ export class AgentFramework {
         listedServers.add(server.id);
         const listed = new Set<string>();
         const repeated: string[] = [];
+        // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
+        // the conversation and called through toolsets--act, never listed
+        // here: every change to this list rebuilds the prompt cache. The
+        // list was read through the server's tap, so its presence is current.
+        // A static↔dynamic move the server hinted applies here, at a list
+        // boundary (§4.2), and the agent is told where the tool went.
+        const presence = this.toolsetHub?.get(server.id);
+        const moves = presence?.presence.active ? presence.applyMoves() : [];
+        if (moves.length > 0) this.recordToolsetNotice(server.id, moves.join('\n'), { invite: false });
+        const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
+          if (dynamic(tool.name)) continue;
           const namespacedName = `${prefix}--${tool.name}`;
           if (listed.has(namespacedName)) {
             if (!repeated.includes(tool.name)) repeated.push(tool.name);
@@ -29812,6 +29978,20 @@ export class AgentFramework {
       });
       return;
     }
+    // RFC-014: a dynamic tool isn't in the list; it's called through act.
+    const dynamicRefusal = modern ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) {
+      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'a dynamic tool, called through toolsets--act' });
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        toolName: call.name,
+        agentName,
+        moduleName: `mcpl:${serverId}`,
+        result: this.refusedResult(agentName, call.id, dynamicRefusal),
+      });
+      return;
+    }
 
     this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
@@ -30005,6 +30185,9 @@ export class AgentFramework {
     }
 
     legacy.sendToolsCall(toolName, args, stateParams)
+      // RFC-014 §6.2: a call reports its own consequences; the tool change
+      // its result carried is told after the server's content.
+      .then((result) => this.withToolsetChange(serverId, result))
       .then(async (result) => {
         // RFC-005: register references and fetch the small ones, and every
         // one a script will read, before serialization, so their stubs carry
