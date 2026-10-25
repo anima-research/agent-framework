@@ -86,8 +86,7 @@ export interface TuneOutFrameworkHooks {
     metadata?: Record<string, unknown>,
     forAgent?: string,
   ) => string;
-  /** Queue an inference request for an agent, continuing the work of
-   *  `callerTurnId`, the turn that asked for a cancel. */
+  /** Queue an inference request for an agent. */
   requestInference: (agentName: string, reason: string, source: string, callerTurnId?: number) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
@@ -326,8 +325,7 @@ export class TuneOutCoordinator {
    * resident's window (capped), lifecycle notice, one wake for the
    * resident. `subconsciousNote` is the subconscious's own text (from its
    * cancel_tuneout call) — delivered verbatim under its name, never
-   * synthesized here. `callerTurnId` is the turn of the call that asked for
-   * the cancel, which the resident's wake carries.
+   * synthesized here.
    */
   cancel(
     serverId: string,

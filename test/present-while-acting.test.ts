@@ -461,7 +461,6 @@ describe('present while acting', () => {
     module.interjection = 'hey, quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
 
-    // An operator's message names no channel: a private turn.
     framework.pushEvent({ type: 'external-message', source: 'tui', content: 'go', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
 
@@ -1823,7 +1822,6 @@ describe('present while acting', () => {
     framework.openLogical = new Map();
     framework.scriptCallStarts = new Map();
     framework.agents = new Map();
-    // The record of private turns: none yet, and every id known.
     framework.privateTurnIds = new Set();
     framework.privateTurnsFloor = 0;
     return framework;
@@ -2879,9 +2877,6 @@ describe('present while acting', () => {
     assert.equal(stream.receivedToolResults.length, 1);
     const options = stream.receivedToolResultOptions[0];
     assert.ok(options?.injectedMessages, 'tool-result resume carried injected messages');
-    // The interjection names no channel, so it's a private surface's: the
-    // turn is private from this boundary, and the notice that says so rides
-    // the injections after it.
     assert.equal(options!.injectedMessages!.length, 2);
     const injected = options!.injectedMessages![0]!;
     assert.equal(injected.participant, 'Antra');

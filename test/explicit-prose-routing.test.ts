@@ -82,7 +82,6 @@ const serverOf = (channelId: string) => (channelId.startsWith('body:') ? 'body' 
 /** A stub channel, with its server. */
 const stub = (channelId: string): ChannelRef => ({ serverId: serverOf(channelId), channelId });
 
-/** The turns whose work a request continues, as the framework marks them (CALLER_TURNS). */
 const callerTurns = (r: object | undefined): number[] => {
   if (!r) return [];
   const mark = Object.getOwnPropertySymbols(r).find((k) => k.description === 'caller-turns');
@@ -178,9 +177,6 @@ describe('explicit prose routing', () => {
     return framework;
   }
 
-  /** A message in the channel the stub registry resolves every locus to, so
-   *  the turn is a channel's, as these tests' turns were before private
-   *  surfaces had turns of their own; a private one names no channel. */
   function trigger(framework: AgentFramework, privateSurface = false): void {
     framework.pushEvent({
       type: 'external-message',
@@ -1450,8 +1446,6 @@ describe('explicit prose routing', () => {
       // continuation 2.)
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]));
       feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
-      // A message in the open turn's channel, so the turn stays a channel's:
-      // a private surface's message would make it private.
       framework.pushEvent({
         type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'chan-alpha' },
       } as unknown as ProcessEvent);
@@ -2110,8 +2104,6 @@ describe('explicit prose routing', () => {
     ]) {
       assert.ok(help.includes(clause), `the help says: ${clause}`);
     }
-    // And that in a private turn a destination doesn't stick, and text
-    // without one is kept private, with no draft.
     assert.match(help, /private turn[^.]*only its own body/);
     assert.match(help, /private turn[^.]*kept private[^.]*no draft/);
     assert.deepEqual(routed, [{ text: 'got it', locus: 'chan-alpha' }]);
@@ -2652,8 +2644,6 @@ describe('explicit prose routing', () => {
   }
 
   it('a deliberate envelope is delivered alike in a private turn and a channel one; only hybrid\'s unprefixed prose differs', async () => {
-    // The trigger kinds: a private surface's message, and the same message
-    // with a channel.
     const cases: Array<{ mode: 'explicit' | 'hybrid'; text: string; channel: unknown[]; private: unknown[] }> = [
       { mode: 'explicit', text: '>>#cafe A message meant for the café.',
         channel: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }],

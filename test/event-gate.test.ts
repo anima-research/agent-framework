@@ -1208,14 +1208,12 @@ describe("a window that holds a private surface's message", () => {
     policyName: 'p', content: 'room', eventType: 'mcpl:channel-incoming', timestamp, inContext: true,
     channelId: 'discord:g:room', serverId: 'discord', authorId: 'u1', addressed: true, routeChannelId: 'discord:g:room',
   });
-  /** Flushes a window set in the gate's shared buffer, and returns its wakes. */
   async function flush(buffer: Pending[]) {
     const { gate, inferenceRequests } = makeGate(writeConfig('window.json', { policies: [], default: 'skip' }));
     const internals = gate as unknown as { inferenceBuffer: Pending[] };
     gate.onInferenceStarted('elsewhere');
     internals.inferenceBuffer.push(...buffer);
     gate.onInferenceEnded('elsewhere');
-    // The flush delivers in a microtask.
     await new Promise((resolve) => setImmediate(resolve));
     return inferenceRequests;
   }

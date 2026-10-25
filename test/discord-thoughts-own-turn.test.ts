@@ -150,7 +150,6 @@ test("a private surface's turn posts no speech and edits its thoughts into no me
     const client = (s.module as unknown as { client: { sendMessage(...args: unknown[]): Promise<unknown> } }).client;
     const sent: unknown[] = [];
     const sendMessage = client.sendMessage.bind(client);
-    // The turn sent a message deliberately.
     await s.send('A', 1, 'first');
     client.sendMessage = async (...args: unknown[]) => { sent.push(args); return sendMessage(...args); };
     await s.module.onAgentSpeech('A', [{ type: 'text', text: 'the reply' }], { ...ends(1), ...(privateTurn ? { nonChannelOrigin: true } : {}) });

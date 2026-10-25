@@ -57,7 +57,7 @@ export interface ScriptsHost {
   tools(agentName: string): PreludeTool[];
   /** The bridge: dispatch one of the script's calls as its agent's, through the ordinary dispatcher. Never rejects. */
   dispatch(agentName: string, toolName: string, argsJson: string, context: ScriptCallContext): Promise<ToolAnswer>;
-  /** Wake the agent with this text: a script's wake_agent() payload, or a left script's ending. `label` names this wake, for a spilled copy. `startTurnId` is the turn the script's run call was made in, when one was (ScriptCallContext.startTurnId). */
+  /** Wake the agent with this text: a script's wake_agent() payload, or a left script's ending. `label` names this wake, for a spilled copy. */
   wake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number | undefined): Promise<void>;
   /** Whether this agent's scripts may outlive its turn. */
   outlivesTurn(agentName: string): boolean;

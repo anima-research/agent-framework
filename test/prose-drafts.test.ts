@@ -348,12 +348,10 @@ async function harness(opts: {
         h.command({ op: 'incoming', channelId: ROOM, messageId: `in-${++incoming}`, mode: 'addressed', text: `message ${incoming}` });
       } else {
         // 'silent': a control-plane wake whose plain prose stays private, as
-        // a silent heartbeat's does. 'private': see below.
+        // a silent heartbeat's does.
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
           agentName, reason: 'test', source: 'test', timestamp: Date.now(),
           ...(via === 'silent' ? { suppressProse: true } : {}),
-          // 'private': a private turn, as an operator's console message
-          // opens one.
           ...(via === 'private' ? { nonChannelOrigin: true } : {}),
         });
       }
@@ -568,9 +566,6 @@ describe('held prose drafts, end to end', () => {
   });
 
   it("a private turn's words beside an explicit send, and after it, are held as drafts, as any turn's are", async () => {
-    // A private turn's own speech goes to no channel, but words a send
-    // silenced are drafted as in any turn: resending them takes a
-    // destination the resident names.
     for (const proseRouting of ['locus', 'hybrid'] as const) {
       const h = await harness({ agents: [{ name: 'scout', proseRouting }] });
       try {
@@ -1429,7 +1424,6 @@ describe('draft notices and turn-end settlement', () => {
       const d = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, notice: 'later' })[0]!;
       const attempt = f.proseDrafts.beginAttempt('scout', d.id, dest(), 'resend', false);
       f.proseDrafts.recordOutcome('scout', d.id, attempt, { status: 'unknown', reason: 'connection lost', at: Date.now(), destination: dest() });
-      // The turn then took in private input, and kept its later speech private.
       routing.nonChannelOrigin = true;
       routing.privateSuppressed = 1;
       f.appendProseDeliveryReceipt(h.agent, routing);
@@ -2383,8 +2377,6 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
   it("XML tool mode: a private turn's refused channel_publish silences nothing, so its round's envelope is delivered", async () => {
     const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
     try {
-      // The publish names no channel, which a private turn refuses
-      // (privatePublishRefusal): it posted nothing, so it's no send.
       const round = [text(`>>>${GENERAL} the envelope's words`), call('p1', 'channel_publish', { content: 'no channel named' })];
       await h.turn([
         createMockResponse(round, 'tool_use'),

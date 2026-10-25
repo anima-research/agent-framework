@@ -60,7 +60,6 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.pendingRequests = [];
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
-  // No turn checkpoints: a rewind's retry finds no start below what it shed.
   fw.getTurnCheckpoints = () => [];
   fw.agents = new Map([['cairn', {
     name: 'cairn',

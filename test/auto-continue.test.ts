@@ -176,8 +176,6 @@ describe('autoContinue', () => {
     return triggers;
   }
 
-  // A channel turn's start: an external message that names no channel opens
-  // a private turn, whose speech goes to no channel.
   function trigger(framework: AgentFramework, content = 'hello'): void {
     framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: { channelId: 'world:commons' } } as unknown as ProcessEvent);
   }

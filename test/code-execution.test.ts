@@ -1172,7 +1172,6 @@ describe('a round whose run or wait call watches a script that can change its ro
     async handleToolCall(call: ToolCall): Promise<ToolResult> {
       const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
       this.log.push(`tool:${name}`);
-      // A script passes what it saw to echo as a note, for a test to read.
       const note = (call.input as { note?: unknown } | undefined)?.note;
       if (name === 'echo' && typeof note === 'string') this.log.push(`note:${note}`);
       if (name === 'slow') {
@@ -2347,27 +2346,18 @@ describe('a round whose run or wait call watches a script that can change its ro
     }
   });
 
-  // A surface message names a channel, or names none and opens a private turn.
   const surface = (channelId?: string) => ({
     type: 'external-message', source: channelId ? 'bridge' : 'tui', content: 'go', metadata: channelId ? { channelId } : {},
   }) as unknown as ProcessEvent;
-  // The refusal of a channel_publish that names no channel, from a script
-  // whose start turn is private.
   const REFUSED = "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId";
   type ScriptHarness = Awaited<ReturnType<typeof scriptRound>>;
-  /** What the script's publish answered, as it passed it to echo. */
   const scriptNote = (h: ScriptHarness): string => {
     const note = h.log.find((entry) => entry.startsWith('note:'));
     assert.ok(note !== undefined, `control: the script ran to its end: ${JSON.stringify(h.log)}`);
     return note!;
   };
-  /** A script that publishes with these arguments and passes what the
-   *  publish answered, or the refusal it threw, to echo as its note. */
   const publishing = (args: string, before = '') =>
     `${before}let note; try { await tools.channel_publish(${args}); note = "posted"; } catch (e) { note = String(e && e.message); } await tools["test--echo"]({ note });`;
-  /** Runs the framework in steps until `cond` holds or a bound passes: a
-   *  script's later calls are dispatched as events, which only a running
-   *  framework processes. */
   const driven = async (h: ScriptHarness, cond: () => boolean) => {
     const deadline = Date.now() + 15_000;
     while (!cond() && Date.now() < deadline) {
@@ -2387,7 +2377,6 @@ describe('a round whose run or wait call watches a script that can change its ro
         await h.framework.runUntilIdle();
         if (privateTurn) {
           assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
-          // Where to find a channel id, for an agent that may list them.
           assert.ok(scriptNote(h).includes('; channel_list shows the channel ids; nothing was posted'), scriptNote(h));
           assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
         } else {

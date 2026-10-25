@@ -237,7 +237,6 @@ describe('tune-out end to end', () => {
   });
 });
 
-/** Stores a surface's message and asks for a turn, as a console's module does. */
 class SurfaceModule implements Module {
   readonly name = 'surface';
   async start(): Promise<void> {}
@@ -258,7 +257,6 @@ describe("the resident's turn after its own tune_out cancel", () => {
       const commandPath = join(tempDir, 'commands.txt');
       writeFileSync(commandPath, '');
       const membrane = new MockMembrane();
-      // Each stream that starts with nothing queued gets a reply of its own.
       const streamYielding = membrane.streamYielding.bind(membrane);
       let scoutStreams = 0;
       membrane.streamYielding = (request, options) => {

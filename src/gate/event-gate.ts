@@ -122,8 +122,6 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
-  /** The event is a private surface's message (the framework's
-   *  isNonChannelSurfaceEvent), which makes its window's wake private. */
   nonChannelOrigin?: boolean;
   /** The event's own identity among what the framework stored at arrival:
    *  a channel message's id, a push event's event id (isNewestEntry). */
@@ -166,7 +164,7 @@ export interface WakeProvenance {
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
   /** The window held a private surface's message: its wake is private, and
-   *  names no route (the framework's processInferenceRequests). */
+   *  names no route. */
   nonChannelOrigin?: boolean;
   /** The server of `routeChannelId`'s channel, beside it whenever the chosen
    *  event named its server: channel ids are unique only within one
@@ -265,16 +263,8 @@ function isMetadataTruthy(value: unknown): boolean {
 /**
  * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
  * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bearing event (a private message
- * that names its author counts as one); else, in a window that holds only
- * private surface messages naming no author, the newest of those. A private
- * window's wake is as recent as its newest private message. Channel, author and
+ * own locus rule); else the newest channel-bearing event. Channel, author and
  * addressed all come from that one event, so they can never disagree.
- *
- * A window that holds a private surface's message is private, whatever else
- * it holds, and names no route: the operator's words never start a turn
- * whose reply is published. Its channel, author and addressed stay, as
- * telemetry.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
@@ -313,7 +303,6 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
       : {}),
     ...(privateSurface ? { nonChannelOrigin: true } : {}),
     ...(channels.length > 0 ? { channels } : {}),
-    // A private window's wake is as recent as its newest private message.
     at: newestPrivate && newestPrivate.timestamp > pick.timestamp ? newestPrivate.timestamp : pick.timestamp,
   };
 }
@@ -1853,7 +1842,6 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
-  /** The turn that set the sleep, which its wake carries. */
   private sleepTurnId: number | undefined;
   // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
   // armed, though a turn a failed stop() left running can still ask for one.
@@ -3332,10 +3320,9 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches set no locus. A window that holds a
-    // private surface's message wakes a private turn, with no route. A batch
-    // whose line the gate left to the turn's start carries it too (`line`),
-    // one object shared by every agent the batch wakes, so it is written once.
+    // any traffic. Ambient-only batches set no locus. A batch whose line the
+    // gate left to the turn's start carries it too (`line`), one object
+    // shared by every agent the batch wakes, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of this.getAgentNamesFn()) {
