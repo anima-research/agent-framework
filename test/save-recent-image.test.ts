@@ -460,6 +460,10 @@ describe('save_recent_image provenance (issue #104)', () => {
       const result = await waitForToolResult(h.framework, 'call_save');
       assert.strictEqual(result.isError, true);
       assert.match(result.content, /index 0 is a tool-result image from world--snap \(call call_old\) recorded without a retention ref/);
+      // An embedded image nested in a tool's data is kept only as its
+      // placeholder too, and a re-run records it the same way.
+      assert.match(result.content, /nested in the tool's data rather than its content/);
+      assert.match(result.content, /unless the image came nested in its data, which a re-run records the same way/);
       assert.ok((await fileBytes(h, 'files/phoenix.png')) === null, 'the older GIF must not be written under the PNG name');
     } finally {
       await h.framework.stop();

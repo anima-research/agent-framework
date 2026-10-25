@@ -56,9 +56,11 @@ const blocks = (test: string) => [
   { type: 'audio', data: 'UklGRg==', mimeType: 'audio/wav', uri: 'https://files.example.invalid/beside?sig=beside-token' },
   // Inline data that claims nothing.
   { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
-  // Blocks the classifier rejects: a uri longer than its limit (4096 UTF-16
-  // units), and an MCP embedded resource (its uri nested).
+  // A block the classifier rejects: a uri longer than its limit (4096 UTF-16
+  // units).
   { type: 'resource', uri: `https://files.example.invalid/long?sig=${'s'.repeat(4096)}`, name: 'long' },
+  // An MCP embedded resource, its uri nested under `resource` beside its
+  // contents.
   { type: 'resource', resource: { uri: 'https://files.example.invalid/embedded?sig=embedded-token', mimeType: 'text/plain', text: 'embedded' } },
   // A link (MCP's resource_link), a reference (RFC-005 §8.1) the host can
   // fetch here, so its uri, which also carries a signature, stays out.
@@ -230,7 +232,10 @@ const treated = (report: string, big: string, old: string, link: string) => [
   { type: 'text', text: INLINE_WITHHELD_TEXT },
   { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
   { type: 'text', text: '[Reference not shown: its link is longer than this host accepts.]' },
-  { type: 'text', text: '[Reference not shown: it arrived without a link.]' },
+  // The embedded resource is the block its contents make, as the model's
+  // lanes show it, never its uri (Ada-1017, room-203 #206688), where main
+  // gave a script the no-link notice without its text.
+  { type: 'text', text: 'embedded' },
   { type: 'resource_link', refId: link, name: 'link', savedTo: null },
   { type: 'text', text: 'two attachments' },
   { type: 'image', refId: old, mimeType: 'image/png', expiresAt: '2099-12-31T00:00:00Z', savedTo: null, expired: EXPIRY_REASON.unparseable,
@@ -1314,10 +1319,10 @@ test("each shape RFC-005 governs, nested in an MCPL peer's block, reaches a scri
     const text = { type: 'text', text: 'shapes', embedded, byUri, emptyUri, sealedInline, objectUri };
     answer({ content: [text], structuredContent: {} });
     const [block] = (JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>> }).content;
-    // An MCP-form embedded resource is the classifier's invalid block, so its notice, without its text.
-    const shownEmbedded = block.embedded as Record<string, unknown>;
-    assert.equal(shownEmbedded.type, 'text');
-    assert.equal(String(shownEmbedded.text).includes('the doc'), false);
+    // An MCP-form embedded resource is the block its contents make, its text
+    // here, never its uri or its `resource` record (Ada-1017, room-203
+    // #206688), where main gave the no-link notice without its text.
+    assert.deepEqual(block.embedded, { type: 'text', text: 'the doc' });
     // A reference by uri alone is a stub bound to the peer.
     const shownByUri = block.byUri as Record<string, unknown>;
     assert.deepEqual([typeof shownByUri.refId, 'uri' in shownByUri], ['string', false]);
