@@ -11,6 +11,7 @@
  * part: recognising a change, folding the changes onto the head, and the
  * difference between that and what the agent advertises now.
  */
+import type { CompileResult } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
 
 /** What a request's head declares: its tools, and its system text as blocks,
@@ -126,9 +127,45 @@ export type DeclarationDifference =
 
 /** A message that holds system changes. context-manager refuses one that mixes
  *  them with other blocks, so its content is changes alone. Recognised by its
- *  block, which is what membrane sends, whatever metadata a stored copy carries. */
+ *  block, which is what membrane sends, whatever metadata a stored copy carries:
+ *  what a request on the head leaves out, and what readers of the
+ *  conversation's tail look past, are every change row. Folding onto the head
+ *  and consolidating read only the agent's own (ownSystemChanges). */
 export function isSystemChangeMessage(message: { content: readonly ContentBlock[] }): boolean {
   return message.content.some(isSystemChangeContent);
+}
+
+/** Whether a stored row carries `agentName`'s change metadata
+ *  (systemChangeMetadata), as each change the agent declares is stored: the
+ *  rows its removal takes. */
+function isOwnChangeRow(row: { metadata?: unknown }, agentName: string): boolean {
+  const metadata = row.metadata as { kind?: unknown; agent?: unknown } | undefined;
+  return metadata?.kind === 'system-change' && metadata.agent === agentName;
+}
+
+/**
+ * The positions, in order, of `agentName`'s own change rows among a compile's
+ * messages: a change by its block, compiled from stored rows that each carry
+ * the agent's change metadata. A compile's messages carry no metadata, so it's
+ * read from the stored rows the compile names as each message's sources
+ * (`provenance` and `rawBodies`); a compile that names none has none of the
+ * agent's own. The head's folding, a consolidation's price and place, and the
+ * rows a move of the head takes are these alone. A change row stored without
+ * the agent's metadata, as a host may write one, is an ordinary message to
+ * them: under 'entries' it goes out as stored, the agent declares its own
+ * difference without counting it, and no consolidation takes it.
+ */
+export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'provenance' | 'rawBodies'>, agentName: string): Set<number> {
+  const own = new Set<number>();
+  const sources = compiled.provenance?.messages;
+  compiled.messages.forEach((message, index) => {
+    if (!isSystemChangeMessage(message)) return;
+    const source = sources?.[index];
+    if (source?.kind !== 'raw' || source.bodies.length === 0) return;
+    const rows = source.bodies.flatMap((body) => compiled.rawBodies?.get(body.messageId) ?? []);
+    if (rows.length > 0 && rows.every((row) => isOwnChangeRow(row, agentName))) own.add(index);
+  });
+  return own;
 }
 
 /** A head to record: a copy, so a tool definition its caller later changes in

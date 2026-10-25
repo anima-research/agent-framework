@@ -1,6 +1,7 @@
 /**
- * System changes' pure part: a change is recognised by its block,
- * changes fold onto the head in order, and the difference from what the agent
+ * System changes' pure part: a change is recognised by its block, an agent's
+ * own by the metadata of the rows a compile names as its sources, changes fold
+ * onto the head in order, and the difference from what the agent
  * advertises now is one more change, nothing, or a replacement of the head.
  */
 import { describe, it } from 'node:test';
@@ -12,6 +13,8 @@ import {
   effectiveDeclaration,
   endsOnToolCall,
   isSystemChangeMessage,
+  ownSystemChanges,
+  systemChangeMetadata,
   systemTextOf,
   type HeadDeclaration,
 } from '../src/system-changes.js';
@@ -32,6 +35,38 @@ describe('system changes', () => {
     assert.equal(isSystemChangeMessage({ content: [{ type: 'system_change', removeTools: ['a'] }] }), true);
     assert.equal(isSystemChangeMessage({ content: [{ type: 'text', text: 'system_change' }] }), false);
     assert.equal(isSystemChangeMessage({ content: [] }), false);
+  });
+
+  it("finds an agent's own changes in a compile by the metadata of the rows it names as their sources", () => {
+    const change = (n: string) => [{ type: 'system_change', defineTools: [tool(n)] }] as never;
+    const row = (id: string, metadata?: Record<string, unknown>) => ({ id, ...(metadata ? { metadata } : {}) });
+    const raw = (...ids: string[]) => ({ kind: 'raw' as const, bodies: ids.map((messageId, sequence) => ({ messageId, sequence, complete: true })) });
+    const compiled = {
+      messages: [
+        { participant: 'user', content: [{ type: 'text', text: 'hello' }] },
+        { participant: 'system', content: change('a') },
+        { participant: 'system', content: change('b') },
+        { participant: 'system', content: change('c') },
+        { participant: 'system', content: change('d') },
+        { participant: 'system', content: change('e') },
+        { participant: 'system', content: change('f') },
+        { participant: 'system', content: change('g') },
+      ],
+      provenance: {
+        messages: [raw('said'), raw('own'), raw('other'), raw('host'), { kind: 'summary', summaries: [{ id: 's', level: 1 }] }, raw('own', 'host'), raw('own', 'own2'), raw('unread')],
+      },
+      rawBodies: new Map([
+        ['said', [row('said', systemChangeMetadata('agent'))]],
+        ['own', [row('own', systemChangeMetadata('agent'))]],
+        ['own2', [row('own2', { kind: 'system-change', agent: 'agent' })]],
+        ['other', [row('other', systemChangeMetadata('other'))]],
+        ['host', [row('host')]],
+      ]),
+    } as unknown as Parameters<typeof ownSystemChanges>[0];
+    assert.deepEqual([...ownSystemChanges(compiled, 'agent')], [1, 6],
+      "a change from the agent's own rows alone: not a message that isn't a change, another agent's, a host's without metadata, a summary, one with a host's row among its sources, or one whose row the compile didn't read");
+    assert.deepEqual([...ownSystemChanges(compiled, 'other')], [2]);
+    assert.deepEqual([...ownSystemChanges({ messages: compiled.messages }, 'agent')], [], 'a compile that names no sources has none');
   });
 
   it('joins the head\'s system blocks as buildSystemPrompt does', () => {

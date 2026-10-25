@@ -4,7 +4,8 @@
  * tools or addition to its system text is a system change stored where it
  * took effect; under 'head', the default, a request is as before, with any
  * change rows left out. The fake context manager keeps rows in order, as the
- * store would, and compiles them back whole.
+ * store would, and compiles them back whole, naming each row as its message's
+ * source, as a compile's provenance does.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,6 +33,9 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
       return {
         messages: rows.map((r) => ({ participant: r.participant, content: r.content })),
         systemInjections: (injections ?? []).filter((i) => i.position === 'system').flatMap((i) => i.content),
+        // Each message a raw copy of its row, which the compile read with its metadata.
+        provenance: { messages: rows.map((r, sequence) => ({ kind: 'raw', bodies: [{ messageId: r.id, sequence, complete: true }] })) },
+        rawBodies: new Map(rows.map((r) => [r.id, [{ ...r }]])),
         ...(opts.firstChanged ? { firstChanged: opts.firstChanged() } : {}),
       };
     },
@@ -83,6 +87,8 @@ const changeRow = (tools: ToolDefinition[]): Row => ({
   metadata: { system: true, kind: 'system-change', agent: 'agent' },
 });
 const lastMessage = (messages: NormalizedMessage[]) => messages.at(-1)!;
+const changesIn = (messages: readonly NormalizedMessage[]) =>
+  messages.filter((m) => m.content.some((b) => (b as { type: string }).type === 'system_change')).map((m) => m.content);
 
 describe('toolDeclarations', () => {
   it("leaves out of 'head' requests every change row, and sends the current tools and system text as before", async () => {
@@ -348,6 +354,50 @@ describe('toolDeclarations', () => {
     assert.deepEqual(changeRows(context.rows), []);
   });
 
+  it("counts only its own change rows: one a host stored without the agent's metadata is neither folded, priced nor taken", async () => {
+    // From their JSON, the host's row defining `x`, `y` and `z` is 79 tokens, and the agent's own, defining `b`, 33.
+    const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x'), tool('y'), tool('z')] } as never] };
+    const context = fakeContext([said('user', 'hello'), host, changeRow([tool('b')])]);
+    const heads = memoryHeadDeclarations();
+    heads.write('agent', { tools: [tool('a')], system: ['You are an agent.', 'v1'] });
+    const events: HeadEvent[] = [];
+    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+    const first = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
+    assert.deepEqual(first.tools, [tool('a')], 'the recorded head');
+    assert.deepEqual(changesIn(first.messages), [host.content, changeRow([tool('b')]).content], "the host's row goes out as stored, beside the agent's own");
+    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host', 'c-b'], "nothing declared: the agent's own row says its difference, and the host's isn't counted");
+    // Past a tenth of this input the agent's own row isn't, and the host's alone is past a fifth.
+    agent.noteResponseInput(380);
+    await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
+    assert.deepEqual(events, [], "no consolidation priced from the host's row");
+    // A replacement moves the head, taking the agent's own row and leaving the host's, as a dry run shows first.
+    const preview = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')], undefined, undefined, { dryRun: true });
+    assert.deepEqual(changesIn(preview.messages), [host.content]);
+    await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
+    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host']);
+    assert.deepEqual(events, [{ type: 'head:moved', why: 'replaced', changesRemoved: 1 }]);
+  });
+
+  it("declares again a change a host's row already says, since it counts only its own", async () => {
+    const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('b')] } as never] };
+    const context = fakeContext([said('user', 'hello'), host]);
+    const heads = memoryHeadDeclarations();
+    heads.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
+    const request = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('a'), tool('b')]);
+    assert.deepEqual(changesIn(request.messages), [host.content, [{ type: 'system_change', defineTools: [tool('b')] }]]);
+    assert.deepEqual(changeRows(context.rows).map((r) => r.metadata), [undefined, { system: true, kind: 'system-change', agent: 'agent' }]);
+  });
+
+  it("traces nothing on the head for a change row a host stored without the agent's metadata, and leaves it out of the request", async () => {
+    const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x')] } as never] };
+    const context = fakeContext([said('user', 'hello'), host]);
+    const events: HeadEvent[] = [];
+    const request = await agentOn(context, {}, memoryHeadDeclarations(), events).buildActivationRequest([tool('a')]);
+    assert.deepEqual(changesIn(request.messages), []);
+    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host'], 'the host\'s row stays');
+    assert.deepEqual(events, []);
+  });
+
   it('changes nothing in a dry run: at adoption, at a replacement, or on the head with rows left', async () => {
     const dry = { dryRun: true };
     {
@@ -451,6 +501,20 @@ describe('toolDeclarations', () => {
       assert.equal(moved.inputTokens, 250);
       assert.ok(moved.changeTokens! * 10 >= 250);
       assert.equal(moved.forced, undefined, 'a free move');
+    });
+
+    it("starts the changes at its own first one, past a host's change row before it", async () => {
+      // The host's row at 1, the agent's own at 2; the compile re-renders from 2. 33 tokens is a tenth of 300, not a fifth.
+      const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x')] } as never] };
+      const context = fakeContext([said('user', 'hello'), host, changeRow([tool('b')])], { firstChanged: () => 2 });
+      const heads = memoryHeadDeclarations();
+      heads.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+      agent.noteResponseInput(300);
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(events.map((e) => e.type === 'head:moved' && [e.why, e.changesRemoved, e.forced]), [['consolidated', 1, undefined]], 'a free move at a tenth');
+      assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host']);
     });
 
     it('moves them anyway once they reach a fifth of the input with no free compile, and not below a fifth', async () => {

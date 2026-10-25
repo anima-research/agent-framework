@@ -9106,6 +9106,8 @@ export class AgentFramework {
    * agent with that agent's messages, its system changes stamped with
    * `systemChangeMetadata(config.name)`, then sends the same prefix, so the
    * new agent reads that agent's cache and declares only its own difference.
+   * A change copied unstamped is the host's own row to the new agent, which
+   * then declares that change again.
    * That holds for a fork of the same self: system text that is the named
    * agent's head's blocks, plus additions. A new agent with its own system
    * prompt, or other system injections, meets a replacement at its first

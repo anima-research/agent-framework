@@ -15,6 +15,7 @@ import {
   isSystemChangeMessage,
   lastConversational,
   memoryHeadDeclarations,
+  ownSystemChanges,
   systemChangeMetadata,
   systemTextOf,
   copyHead,
@@ -2099,8 +2100,11 @@ export class Agent {
 
   /**
    * The head this request declares, and the change it adds, after the
-   * committing compile (system-changes.ts). On the head, what's current goes
-   * out, and a record or changes left from an earlier 'entries' period go.
+   * committing compile (system-changes.ts). It reads only the agent's own
+   * change rows (ownSystemChanges): one a host stored without the agent's
+   * metadata is neither folded onto the head nor consolidated. On the head,
+   * what's current goes out, and a record or changes left from an earlier
+   * 'entries' period go.
    * Under 'entries': with no record, the current head is adopted; a
    * replacement of system text moves the head to what's current; a
    * difference a change can say is declared at the end, unless the context
@@ -2118,24 +2122,25 @@ export class Agent {
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage }> {
     const current = this.currentHead(availableTools, compiled.systemInjections);
-    const changes = compiled.messages.filter(isSystemChangeMessage);
+    const own = ownSystemChanges(compiled, this.name);
     if (!entries) {
       // A record left from an earlier 'entries' period goes, on whichever
       // branch is current: a switch can bring one back. The store deletes
       // only a record it holds, so this costs a lookup otherwise.
       if (!dryRun) this.headDeclarations.delete(this.name);
-      // The request leaves them out, so this compile needn't run again.
-      if (!dryRun && changes.length > 0) {
+      // The request leaves every change row out, so this compile needn't run
+      // again.
+      if (!dryRun && own.size > 0) {
         const changesRemoved = this.removeOwnChanges();
         this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved });
       }
       return { compiled, head: current };
     }
     if (!recorded) return this.moveHead(compiled, compiledWith, current, 'adopted', dryRun, compile);
-    const blocks = changes.flatMap((message) => message.content.filter(isSystemChangeContent));
+    const blocks = compiled.messages.flatMap((message, index) => (own.has(index) ? message.content.filter(isSystemChangeContent) : []));
     const difference = declarationDifference(effectiveDeclaration(recorded, blocks), current);
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, current, 'replaced', dryRun, compile);
-    const consolidation = this.consolidation(compiled, blocks);
+    const consolidation = this.consolidation(compiled, own, blocks);
     if (consolidation) return this.moveHead(compiled, compiledWith, current, 'consolidated', dryRun, compile, consolidation);
     if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.storeEndsOnToolCall()) {
       return { compiled, head: recorded };
@@ -2174,7 +2179,8 @@ export class Agent {
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
-      return { compiled: { ...shown, messages: shown.messages.filter((m) => !isSystemChangeMessage(m)) }, head: current };
+      const own = ownSystemChanges(shown, this.name);
+      return { compiled: { ...shown, messages: shown.messages.filter((_, index) => !own.has(index)) }, head: current };
     }
     const removed = this.removeOwnChanges();
     this.headDeclarations.write(this.name, copyHead(current));
@@ -2184,8 +2190,9 @@ export class Agent {
   }
 
   /**
-   * Whether this compile is where the changes go into the head, and if so,
-   * their price and the input they reached a share of. Once the changes, priced
+   * Whether this compile is where the agent's own changes (`own`, from
+   * ownSystemChanges) go into the head, and if so, their price and the input
+   * they reached a share of. Once the changes, priced
    * from their JSON as context-manager prices them, reach a tenth of the last
    * response's reported input, at the first committing compile whose
    * `firstChanged` (context-manager's: the first compiled message whose bytes
@@ -2213,15 +2220,15 @@ export class Agent {
    * budget with changes kept moves the head too, at the assembly: `forced:
    * 'budget'`.)
    */
-  private consolidation(compiled: CompileResult, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number; forced?: 'share' } | undefined {
-    const firstChange = compiled.messages.findIndex(isSystemChangeMessage);
+  private consolidation(compiled: CompileResult, own: ReadonlySet<number>, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number; forced?: 'share' } | undefined {
+    const firstChange = own.values().next().value;
     const inputTokens = this.lastResponseInputTokens;
-    if (firstChange < 0 || inputTokens === undefined) return undefined;
+    if (firstChange === undefined || inputTokens === undefined) return undefined;
     const changeTokens = blocks.reduce((sum, block) => sum + Math.ceil(JSON.stringify(block).length / 4), 0);
     if (changeTokens * 10 < inputTokens) return undefined;
     // Read only once consolidation is in question: context-manager compares
     // it when it's read.
-    const firstChanged = (compiled as { firstChanged?: number | null }).firstChanged;
+    const { firstChanged } = compiled;
     const free = firstChanged != null && firstChanged <= firstChange && !(this.bindsThinking && compiled.messages.slice(0, firstChanged)
       .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
     if (free) return { changeTokens, inputTokens };
@@ -2229,7 +2236,8 @@ export class Agent {
   }
 
   /** Remove this agent's change rows from its context: by their metadata,
-   *  which in the residents' shared slot names the agent they declare for. */
+   *  which in the residents' shared slot names the agent they declare for,
+   *  and which ownSystemChanges reads in a compile. */
   private removeOwnChanges(): number {
     const rows = this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: this.name } }).messages;
     for (const row of rows) this.contextManager.removeMessage(row.id);
