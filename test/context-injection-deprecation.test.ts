@@ -61,9 +61,10 @@ test('a module that injects is still collected and is named once across turns', 
       'content (push events, tool results) is for whoever maintains the module or server named at the start of this ' +
       "line. Durable system text belongs in the agent's configured system prompt, which whoever configures this host " +
       'sets; system text that changes at runtime has no provider-independent replacement. For an MCPL server, ' +
-      'disabledCapabilities: ["contextHooks.beforeInference.inject"] in its config drops its injections and keeps ' +
-      'the rest of what it does, and its system injections are denied unless its config enables them. A module has ' +
-      'no such switch: turning it off removes its injections along with whatever else it does.',
+      'disabledCapabilities: ["contextHooks.beforeInference.inject"] in its config drops its injections and any ' +
+      'feature set of its that uses them, and keeps its other capabilities; its system injections are denied unless ' +
+      'its config enables them. A module has no such switch: turning it off removes its injections along with ' +
+      'whatever else it does.',
     'the whole line an operator reads',
   );
 });

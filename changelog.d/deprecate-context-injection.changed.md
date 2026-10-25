@@ -19,8 +19,9 @@
   are applied: each module and MCPL server whose injections the host collects
   is named in one `[deprecated]` line, and a server whose injections the
   feature-set and grant checks all drop isn't named. An MCPL server's
-  config can stop its injections alone, keeping the rest of what it does,
-  with `disabledCapabilities: ["contextHooks.beforeInference.inject"]`. The
+  config can stop its injections, and any of its feature sets whose `uses`
+  names them, with `disabledCapabilities: ["contextHooks.beforeInference.inject"]`,
+  keeping its other capabilities. The
   framework's own `system` injections aren't logged: the subconscious's
   standing dispositions and, before 0.23.0, a silent heartbeat's
   `ephemeralSystemPrompt`. `Module.gatherContext`,
@@ -31,6 +32,6 @@
   and which is fixed once the agent is made, so `system` text that changes
   at runtime has no provider-independent replacement (with membrane 0.7 and
   context-manager 0.22 and later, a stored `system_change` block adds system
-  text from its place in the conversation, through membrane's native
-  formatter and Anthropic adapter only, to a model that takes
-  mid-conversation system messages).
+  text after the first user turn at or after its place, through membrane's
+  native formatter and an adapter that can send it, such as its Anthropic
+  adapter, to a model that takes mid-conversation system messages).

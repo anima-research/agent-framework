@@ -53,13 +53,16 @@
  * subconscious's standing dispositions and, before 0.23.0, a silent
  * heartbeat's `ephemeralSystemPrompt`.
  *
- * Whoever configures the host can stop one MCPL server's injections and keep
- * the rest of what it does, with
+ * Whoever configures the host can stop one MCPL server's injections with
  * `disabledCapabilities: ["contextHooks.beforeInference.inject"]` in its
- * config. Any injection it still sends is dropped, each with a stderr line.
- * A server's `system` injections are denied by default, so they arrive only
- * if its config's `enabledCapabilities` grants them. A module has no such
- * switch.
+ * config. The server's other capabilities stay granted, but any feature set
+ * of its whose `uses` names an inject capability is disabled at the
+ * handshake, with a stderr line, and so is whatever else that feature set
+ * does, such as its push events. An injection the server still sends is
+ * dropped, with a stderr line for each, or without one when it comes under a
+ * disabled feature set. A server's `system` injections are denied by
+ * default, so they arrive only if its config's `enabledCapabilities` grants
+ * them. A module has no such switch.
  *
  * Instead: deliver changing state as conversation content (push events,
  * tool results), so it is stored once at its own position and stays
@@ -68,15 +71,15 @@
  * agent is made, so `system` text that changes at runtime has no
  * provider-independent replacement. With membrane 0.7 and context-manager
  * 0.22 and later, a stored message holding only a `system_change` block adds
- * its `addSystem` text as a system message at its place in the conversation,
- * or at the first point after it where the API takes one, and leaves the
- * messages before it as they were. Only membrane's native formatter with its
- * Anthropic adapter sends one, and membrane refuses the request through any
- * other formatter or adapter. Even there, membrane refuses a request with no
- * place for it after the change, as when the change follows the final
- * assistant message, and, as membrane's docs say, the API refuses one to a
- * model that doesn't take mid-conversation system messages. It adds text,
- * and can't take back or replace any.
+ * its `addSystem` text as a system message at the first point at or after
+ * its place that follows a user turn, and leaves the messages before it as
+ * they were. Only membrane's native formatter sends one, through an adapter
+ * that declares it can (of membrane's own, the Anthropic adapter), and
+ * membrane refuses the request through any other formatter or adapter. Even
+ * there, membrane refuses a request with no such point, as when the change
+ * follows the final assistant message, and, as membrane's docs say, the API
+ * refuses one to a model that doesn't take mid-conversation system messages.
+ * It adds text, and can't take back or replace any.
  */
 
 export const CONTEXT_INJECTION_DEPRECATION_NOTICE =
@@ -85,9 +88,10 @@ export const CONTEXT_INJECTION_DEPRECATION_NOTICE =
   "server named at the start of this line. Durable system text belongs in the agent's configured " +
   'system prompt, which whoever configures this host sets; system text that changes at runtime ' +
   'has no provider-independent replacement. For an MCPL server, disabledCapabilities: ' +
-  '["contextHooks.beforeInference.inject"] in its config drops its injections and keeps the rest ' +
-  'of what it does, and its system injections are denied unless its config enables them. A module ' +
-  'has no such switch: turning it off removes its injections along with whatever else it does.';
+  '["contextHooks.beforeInference.inject"] in its config drops its injections and any feature set of ' +
+  'its that uses them, and keeps its other capabilities; its system injections are denied unless its ' +
+  'config enables them. A module has no such switch: turning it off removes its injections along ' +
+  'with whatever else it does.';
 
 const warned = new Set<string>();
 
