@@ -10,6 +10,7 @@ import {
   AgentSpecError,
   RESIDENTS_SLOT,
   conversationForkSpec,
+  observedSlot,
   residentSpec,
   sameSlot,
   subconsciousSpec,
@@ -363,13 +364,63 @@ describe('AgentRegistry slots: where own rows go, apart from what is observed (#
     );
   });
 
+  it('keeps the deprecated readsSharedSlot on the resident and subconscious presets beside ownSlot, for readers of a preset spec', () => {
+    // Dropped when the presets took ownSlot, so a host reading the flag off a
+    // preset's spec read false. Kept for one release; the registry prefers
+    // ownSlot.
+    assert.equal(residentSpec('mira', { primary: true }).readsSharedSlot, true);
+    assert.equal(subconsciousSpec('Subconscious', 'mira').readsSharedSlot, true);
+    const registry = new AgentRegistry();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(subconsciousSpec('Subconscious', 'mira'));
+    assert.deepEqual(registry.ownSlotOf('mira'), { namespace: null });
+    assert.deepEqual(registry.ownSlotOf('Subconscious'), { namespace: 'subconscious/mira' }, 'its ownSlot, not the flag, places its rows');
+    assert.deepEqual(registry.observersOf(RESIDENTS_SLOT), ['Subconscious']);
+  });
+
+  it('an observe edge that names an agent and no slot reads that agent\'s own slot, not the residents\'', () => {
+    const registry = new AgentRegistry();
+    const roles = { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false };
+    const watcher = (name: string, observes: Array<{ agent?: string; slot?: string }>) =>
+      registry.register({ name, kind: 'watcher', roles, lifetime: { kind: 'persistent' }, observes, namespace: `watch/${name}` });
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(workerSpec('worker-1', { spawnedBy: 'mira' }));
+    registry.register(sharedFork('fork-1', 'mira'));
+    watcher('of-worker', [{ agent: 'worker-1' }]);
+    watcher('of-fork', [{ agent: 'fork-1' }]);
+    watcher('of-notes', [{ agent: 'worker-1', slot: 'notes' }]);
+
+    const workerSlot = { namespace: 'subagent/worker-1' };
+    assert.deepEqual(registry.observersOf(workerSlot), ['of-worker'], 'worker-1\'s slot');
+    assert.deepEqual(registry.observedSlotOf({ agent: 'worker-1' }), workerSlot);
+    assert.deepEqual(registry.readersOf(workerSlot), ['worker-1', 'of-worker']);
+    assert.deepEqual(registry.observersOf(RESIDENTS_SLOT), [], 'not the residents\' slot');
+    assert.deepEqual(registry.readersOf(RESIDENTS_SLOT), ['mira']);
+    assert.equal(registry.get('of-worker')!.readsSharedSlot, false, 'so the deprecated flag says it reads no shared slot');
+    assert.deepEqual(registry.observersOf({ namespace: null, branch: 'dendrite/fork-1' }), ['of-fork'], 'a shared fork\'s slot, on its own branch');
+    assert.deepEqual(registry.observersOf({ namespace: 'notes' }), ['of-notes'], 'a slot the edge names is that slot');
+
+    // An agent that ended still names the slot it owned, so an edge on it
+    // still reads that slot (a reopened observer merges it).
+    registry.end('worker-1', 'completed');
+    assert.deepEqual(registry.observersOf(workerSlot), ['of-worker']);
+    assert.equal(registry.observedSlotOf({ agent: 'nobody' }), undefined, 'an agent it doesn\'t know: no slot');
+    // The free function knows an agent's slot only through the lookup it is given.
+    assert.equal(observedSlot({ agent: 'worker-1' }), undefined);
+    assert.deepEqual(observedSlot({ agent: 'worker-1' }, () => workerSlot), workerSlot);
+    assert.deepEqual(observedSlot({}), RESIDENTS_SLOT);
+  });
+
   it('reads a spec that sets only the deprecated readsSharedSlot as an older one meant it', () => {
     const registry = new AgentRegistry();
     const roles = { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false };
     registry.register({ name: 'owner', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, readsSharedSlot: true, namespace: 'agents/owner' });
     registry.register({ name: 'watcher', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, readsSharedSlot: true, observes: [{}], namespace: 'watch/w' });
+    registry.register(workerSpec('worker-1', { spawnedBy: 'owner' }));
+    registry.register({ name: 'of-worker', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, readsSharedSlot: true, observes: [{ agent: 'worker-1' }], namespace: 'watch/o' });
     assert.deepEqual(registry.ownSlotOf('owner'), { namespace: null }, 'no observe edge explains the flag: it owns the slot, as a resident');
     assert.deepEqual(registry.ownSlotOf('watcher'), { namespace: 'watch/w' }, 'an edge on the slot: it observes it from a slot of its own');
+    assert.deepEqual(registry.ownSlotOf('of-worker'), { namespace: null }, 'an edge on another agent\'s slot doesn\'t explain the flag either');
     assert.deepEqual(registry.observersOf(RESIDENTS_SLOT), ['watcher']);
   });
 

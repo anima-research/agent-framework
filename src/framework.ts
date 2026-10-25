@@ -121,7 +121,6 @@ import {
   asOwnRow,
   audienceOf,
   conversationForkSpec,
-  observedSlot,
   residentSpec,
   sameSlot,
   storeOwnRow,
@@ -138,6 +137,7 @@ import type {
   EndOutcome,
   HeldMail,
   MessageSlotRef,
+  ObserveEdge,
   PolicyEpoch,
   RegistrySnapshot,
 } from './dendrite/index.js';
@@ -997,6 +997,20 @@ type ReleasedWindow = {
  *  message. */
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+}
+
+/**
+ * Whether a row, stored or queued, is a copy of `mail` for its recipient: it
+ * carries the mail's id, and names the mail's recipient as the one it is for
+ * (`dendrite.to`) or names none, as a copy stored before mail named its
+ * recipient does, which counts by its id. In the residents' shared slot a
+ * resident's store holds every resident's mail, so a copy for another
+ * recipient, one the mail was addressed to before a re-addressing, isn't its
+ * delivery.
+ */
+function isMailCopyFor(metadata: MessageMetadata | undefined, mail: Pick<HeldMail, 'id' | 'to'>): boolean {
+  const stamp = (metadata as { dendrite?: { mailId?: unknown; to?: unknown } } | undefined)?.dendrite;
+  return stamp?.mailId === mail.id && (stamp.to === undefined || stamp.to === mail.to);
 }
 
 /** A deferred entry as a log line names it: its id, participant and block
@@ -9912,7 +9926,11 @@ export class AgentFramework {
     //   what it read (nissa's #546 review, round 2).
     // - Its own slot isolated: that slot, with each slot it observed merged
     //   in as createSubconsciousAgent merges the residents', through the
-    //   residents' view where no edge on that slot showed held traffic.
+    //   residents' view where no edge on that slot showed held traffic. An
+    //   edge on an agent the registry no longer knows, or on a slot on a
+    //   branch of its own (a shared fork's), merges nothing: an auxiliary
+    //   view reads a namespace on this context's branch, which would show
+    //   another branch's rows as that slot's.
     const own = record.ownSlot;
     if (own?.namespace === null) {
       if (!record.namespace) {
@@ -9932,8 +9950,9 @@ export class AgentFramework {
       throw new Error(`Agent "${record.name}": its record names no context to reopen`);
     }
     const observed = record.relationships.observes
-      .map((edge) => ({ edge, slot: observedSlot(edge) }))
-      .filter(({ slot }) => slot.namespace !== namespace);
+      .map((edge) => ({ edge, slot: this.registry.observedSlotOf(edge) }))
+      .filter((entry): entry is { edge: ObserveEdge; slot: MessageSlotRef } =>
+        entry.slot !== undefined && entry.slot.branch === undefined && entry.slot.namespace !== namespace);
     const auxiliaryMessageViews = [...new Set(observed.map(({ slot }) => slot.namespace))]
       .map((ns) => (ns === null ? {} : { namespace: ns }));
     const observesResidents = observed.filter(({ slot }) => sameSlot(slot, RESIDENTS_SLOT));
@@ -10711,23 +10730,20 @@ export class AgentFramework {
         // release missed; never deliver it a second time. In the residents'
         // shared slot the recipient's store holds every resident's mail, so
         // a copy counts only where it was for this recipient (dendrite.to); a
-        // row stored before mail carried `to` counts by its mail id alone.
+        // row stored before mail carried `to` counts by its mail id alone
+        // (isMailCopyFor).
         const already = recipient.getContextManager().queryMessages({ metadata: { 'dendrite.mailId': mail.id } });
-        const delivered = already.messages.some((message) => {
-          const to = (message.metadata as { dendrite?: { to?: unknown } } | undefined)?.dendrite?.to;
-          return to === undefined || to === mail.to;
-        });
-        if (delivered) {
+        if (already.messages.some((message) => isMailCopyFor(message.metadata, mail))) {
           this.registry.releaseMail(mail.id);
           continue;
         }
       }
       // A write the restored deferred queue still holds for this mail lands
       // at the next flush and releases it then (releaseLandedMail); a second
-      // delivery here would put it in the window twice under one mail id.
-      const queued = this.deferredMessages.some(
-        (m) => (m.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === mail.id,
-      );
+      // delivery here would put it in the window twice under one mail id. A
+      // queued copy for another recipient is not that write, as a stored one
+      // isn't: it neither lands for this recipient nor releases the mail.
+      const queued = this.deferredMessages.some((m) => isMailCopyFor(m.metadata, mail));
       if (queued) continue;
       this.attemptMailDelivery(mail);
     }
@@ -26525,14 +26541,22 @@ export class AgentFramework {
 
   /**
    * Held agent mail is released only when its message has actually entered
-   * the recipient's store — never on a deferral. Called at every site that
-   * writes a message into a context: the direct path above and the two
-   * deferred-write flushes (turn start, tool boundary). Both writes reach
-   * disk in the same sync, so a crash keeps either both or neither.
+   * the recipient's store, as a copy for that recipient — never on a
+   * deferral. Called at every site that writes a message into a context: the
+   * direct path above and the two deferred-write flushes (turn start, tool
+   * boundary). Both writes reach disk in the same sync, so a crash keeps
+   * either both or neither.
    */
   private releaseLandedMail(metadata: MessageMetadata | undefined, recipient: string): void {
     const stamp = (metadata as { dendrite?: { mailId?: unknown; kind?: unknown; from?: { agent?: unknown } } } | undefined)?.dendrite;
     if (typeof stamp?.mailId !== 'string') return;
+    // A copy for another recipient than the mail's (isMailCopyFor) isn't its
+    // delivery: the mail stays held for its own recipient, and its delivery
+    // there, or boot's check, releases it. A copy that names no recipient,
+    // stored before mail named one, releases it by its id, as before.
+    const mailId = stamp.mailId;
+    const held = this.registry.listMail().find((mail) => mail.id === mailId);
+    if (held && !isMailCopyFor(metadata, held)) return;
     // The message is in the recipient's store; the release is written only
     // once the store has synced it, so a hard exit between the two leaves
     // the mail held and the next boot's check of the recipient's store

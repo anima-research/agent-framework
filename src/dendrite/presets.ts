@@ -27,6 +27,10 @@ export function residentSpec(name: AgentName, options: { primary: boolean }): Ag
     },
     lifetime: { kind: 'persistent' },
     ownSlot: { namespace: null },
+    // Deprecated: kept for one release beside ownSlot, which the registry
+    // reads first, for a host that reads the flag off a preset's spec or
+    // builds its specs from one.
+    readsSharedSlot: true,
     namespace: `agents/${name}`,
   };
 }
@@ -54,6 +58,9 @@ export function subconsciousSpec(name: AgentName, serves: AgentName): AgentSpec 
     observes: [{ includeHeld: true }],
     resultTo: { to: serves, as: 'message' },
     ownSlot: { namespace: `subconscious/${serves}` },
+    // Deprecated, as on residentSpec: it reads the residents' slot through
+    // its observe edge; its ownSlot places its rows.
+    readsSharedSlot: true,
     namespace: `subconscious/${serves}`,
   };
 }

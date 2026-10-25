@@ -81,9 +81,22 @@ export function sameSlot(a: MessageSlotRef | undefined, b: MessageSlotRef | unde
   return !!a && !!b && a.namespace === b.namespace && a.branch === b.branch;
 }
 
-/** The slot an observe edge reads. An edge names a slot on the host's current branch. */
-export function observedSlot(edge: ObserveEdge): MessageSlotRef {
-  return { namespace: edge.slot ?? null };
+/**
+ * The slot an observe edge reads. An edge that names a slot reads that
+ * namespace on the host's current branch. One that names an agent and no
+ * slot reads that agent's own slot, wherever it is (a shared fork's is on its
+ * own branch), as `ownSlotOf` looks it up: undefined where the lookup doesn't
+ * know the agent, or none is given. The registry's `observedSlotOf` passes its
+ * records. An edge that names neither reads the residents' shared slot.
+ */
+export function observedSlot(
+  edge: ObserveEdge,
+  ownSlotOf?: (agent: AgentName) => MessageSlotRef | undefined,
+): MessageSlotRef | undefined {
+  if (edge.slot !== undefined) return { namespace: edge.slot };
+  if (edge.agent === undefined) return { namespace: null };
+  const own = ownSlotOf?.(edge.agent);
+  return own ? { namespace: own.namespace, ...(own.branch !== undefined ? { branch: own.branch } : {}) } : undefined;
 }
 
 /**
@@ -107,7 +120,11 @@ function derivedSlot(inherit: ContextInheritance | undefined): MessageSlotRef | 
  * resident was declared; a shared derivation's slot; else the isolated slot
  * of its namespace. A subconscious declared its reading of the shared slot
  * as an observe edge from the start (subconsciousSpec), so it reads as
- * isolated, as it was opened.
+ * isolated, as it was opened. An edge on the shared slot here is one that
+ * names neither a slot nor an agent. One that names an agent reads that
+ * agent's slot, which isn't looked up here, so a spec reads as the same
+ * record does when it is restored, where that agent's record may not be
+ * loaded yet.
  */
 function resolveOwnSlot(declared: {
   ownSlot?: MessageSlotRef;
@@ -120,15 +137,19 @@ function resolveOwnSlot(declared: {
   if (own) return { namespace: own.namespace, ...(own.branch !== undefined ? { branch: own.branch } : {}) };
   const derived = derivedSlot(declared.inherit);
   if (derived) return derived;
-  if (declared.readsSharedSlot === true && !(declared.observes ?? []).some((edge) => edge.slot === undefined)) {
+  if (declared.readsSharedSlot === true && !(declared.observes ?? []).some((edge) => sameSlot(observedSlot(edge), RESIDENTS_SLOT))) {
     return { namespace: null };
   }
   return typeof declared.namespace === 'string' ? { namespace: declared.namespace } : undefined;
 }
 
 /** What a record's deprecated `readsSharedSlot` says: it owns the residents' slot or observes it. */
-function readsResidentsSlot(ownSlot: MessageSlotRef | undefined, observes: ObserveEdge[]): boolean {
-  return sameSlot(ownSlot, RESIDENTS_SLOT) || observes.some((edge) => sameSlot(observedSlot(edge), RESIDENTS_SLOT));
+function readsResidentsSlot(
+  ownSlot: MessageSlotRef | undefined,
+  observes: ObserveEdge[],
+  ownSlotOf: (agent: AgentName) => MessageSlotRef | undefined,
+): boolean {
+  return sameSlot(ownSlot, RESIDENTS_SLOT) || observes.some((edge) => sameSlot(observedSlot(edge, ownSlotOf), RESIDENTS_SLOT));
 }
 
 /**
@@ -224,7 +245,7 @@ export class AgentRegistry {
       ...(spec.homeChannel ? { homeChannel: { serverId: spec.homeChannel.serverId, channelId: spec.homeChannel.channelId } } : {}),
       ...(ownSlot ? { ownSlot } : {}),
       // Kept for readers of the record from before the split: derived from it.
-      readsSharedSlot: readsResidentsSlot(ownSlot, observes),
+      readsSharedSlot: readsResidentsSlot(ownSlot, observes, (name) => this.recordedSlotOf(name)),
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
       createdAt: previous?.createdAt ?? this.now(),
@@ -363,20 +384,36 @@ export class AgentRegistry {
   }
 
   /**
+   * The slot an observe edge reads (observedSlot): an edge that names an
+   * agent and no slot reads that agent's own slot, as its record names it,
+   * the live one, else the one awaiting re-declaration, else its newest
+   * ended one, so an edge on an agent that ended still reads the slot it
+   * read. Undefined for an agent the registry doesn't know.
+   */
+  observedSlotOf(edge: ObserveEdge): MessageSlotRef | undefined {
+    return observedSlot(edge, (name) => this.recordedSlotOf(name));
+  }
+
+  /**
    * Live agents that read `slot` through an observe edge, in registration
    * order. With `held`, only those whose edge shows held (policy-diverted)
    * traffic.
    */
   observersOf(slot: MessageSlotRef, options: { held?: boolean } = {}): AgentName[] {
     return this.namesWhere((r) => r.relationships.observes.some(
-      (edge) => sameSlot(observedSlot(edge), slot) && (!options.held || edge.includeHeld === true),
+      (edge) => sameSlot(this.observedSlotOf(edge), slot) && (!options.held || edge.includeHeld === true),
     ));
   }
 
   /** Every live agent that reads `slot`, as its own or through an observe edge, in registration order. */
   readersOf(slot: MessageSlotRef): AgentName[] {
     return this.namesWhere((r) => sameSlot(r.ownSlot, slot)
-      || r.relationships.observes.some((edge) => sameSlot(observedSlot(edge), slot)));
+      || r.relationships.observes.some((edge) => sameSlot(this.observedSlotOf(edge), slot)));
+  }
+
+  /** The own slot an agent's record names: live, else awaiting re-declaration, else its newest ended record. */
+  private recordedSlotOf(name: AgentName): MessageSlotRef | undefined {
+    return (this.live.get(name) ?? this.awaiting.get(name) ?? this.inspect(name))?.ownSlot;
   }
 
   /** The channel an agent is bound to, if it has one. */

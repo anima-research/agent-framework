@@ -136,13 +136,22 @@ export interface MessageSlotRef {
 /**
  * Read access to a slot that isn't the agent's own, merged into its view:
  * the relationship a watcher has with the slot it watches (the subconscious
- * with the residents' slot). An edge names a slot on the host's current
- * branch.
+ * with the residents' slot). The slot read is the one `slot` names, else the
+ * own slot of the agent `agent` names, else the residents' shared slot (the
+ * registry's `observedSlotOf`).
  */
 export interface ObserveEdge {
-  /** The agent whose slot is read, when the slot belongs to one. */
+  /**
+   * The agent whose slot is read. With no `slot`, the edge reads that
+   * agent's own slot (its `ownSlot`), on whatever branch that slot is, not
+   * the residents' shared slot. It must be registered when the edge is.
+   */
   agent?: AgentName;
-  /** Message-slot namespace; undefined = the shared un-namespaced slot. */
+  /**
+   * Message-slot namespace, on the host's current branch. Undefined: the
+   * own slot of the agent `agent` names, or the shared un-namespaced slot
+   * when it names none.
+   */
   slot?: string;
   /**
    * Only messages at or after this sequence.

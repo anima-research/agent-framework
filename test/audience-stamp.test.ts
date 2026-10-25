@@ -18,6 +18,9 @@
  * untargeted inbound in the slot it lands in, so the record tells it from a
  * write for the primary; a process response's messages are for the agents
  * its inference request names. With one resident, nothing changes.
+ *
+ * And held mail's copies: a copy for another recipient than the mail's
+ * (`dendrite.to`) is not its delivery, whether stored, queued or landing.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -350,6 +353,55 @@ describe('the audience stamp (#291)', () => {
       'delivered to oren: the stored copy was mira\'s');
     assert.equal(copies(legacy.id).length, 1, 'a copy with no recipient on it counts, as before');
     assert.deepEqual(framework.listHeldMail(), [], 'both released');
+  });
+
+  /** Held mail for oren, and a copy of it queued for mira (it was hers before a re-addressing, say). */
+  function mailForOrenQueuedForMira(framework: AgentFramework, text: string): HeldMail {
+    const internals = framework as unknown as { registry: AgentRegistry; deferredMessages: unknown[] };
+    const mail = internals.registry.holdMail({
+      kind: 'message', from: internals.registry.ref('mira'), to: 'oren', content: [{ type: 'text', text }],
+    });
+    internals.deferredMessages.push({
+      id: `copy-${mail.id}`, seq: 1_000 + internals.deferredMessages.length, participant: 'mira', content: [{ type: 'text', text }],
+      metadata: { kind: 'agent-message', dendrite: { mailId: mail.id, to: 'mira' } }, forAgent: 'mira', heldAt: Date.now(),
+    });
+    return mail;
+  }
+  /** The recipient (`dendrite.to`) of each copy of a mail in the residents' slot, in store order. */
+  const copiesOf = (framework: AgentFramework, mail: HeldMail) => rowsOf(framework, 'mira')
+    .filter((r) => (r.metadata?.dendrite as { mailId?: string } | undefined)?.mailId === mail.id)
+    .map((r) => (r.metadata?.dendrite as { to?: string }).to);
+
+  it('a copy of held mail queued for another resident doesn\'t hold back the mail\'s delivery at boot', async () => {
+    const framework = await boot();
+    const internals = framework as unknown as { reconcileAgentRegistry(interrupted: unknown[]): void };
+    const mail = mailForOrenQueuedForMira(framework, 'for oren, a copy queued for mira');
+
+    internals.reconcileAgentRegistry([]);
+    await framework.runUntilIdle();
+    // The queued check counted any queued copy by its mail id, so oren's
+    // mail waited for mira's copy to land, and was released by it.
+    assert.deepEqual(copiesOf(framework, mail), ['oren'], 'delivered to oren, mira\'s copy still queued');
+    assert.deepEqual(framework.listHeldMail(), [], 'and released by that delivery');
+  });
+
+  it('a copy of held mail for another resident that lands doesn\'t release the mail: its own delivery does', async () => {
+    const framework = await boot();
+    const internals = framework as unknown as {
+      reconcileAgentRegistry(interrupted: unknown[]): void;
+      flushForStart(agent: unknown, occasion: 'turn-start' | 'assembly'): boolean;
+    };
+    const mail = mailForOrenQueuedForMira(framework, 'for oren, a copy queued for mira that lands');
+
+    // A turn start's flush lands mira's copy in her store.
+    internals.flushForStart(framework.getAgent('mira')!, 'turn-start');
+    assert.deepEqual(copiesOf(framework, mail), ['mira'], 'mira\'s copy landed');
+    assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mail.id], 'still held for oren: the copy wasn\'t his');
+
+    internals.reconcileAgentRegistry([]);
+    await framework.runUntilIdle();
+    assert.deepEqual(copiesOf(framework, mail), ['mira', 'oren'], 'boot\'s check delivers it to oren');
+    assert.deepEqual(framework.listHeldMail(), [], 'which releases it');
   });
 
   it('an ended subconscious reopens on its own isolated slot, with the residents\' slot it observed merged in', async () => {
