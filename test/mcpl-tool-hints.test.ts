@@ -535,6 +535,61 @@ test('close refuses an instance for a toolset without instances, and sends nothi
   } finally { await t.done(); }
 });
 
+test('a selector that is there but isn\'t a name is refused, not read as left out: nothing is closed or called', async () => {
+  const t = await setup((msg, peer, state) => {
+    if (msg.method === 'toolsets/open') {
+      state.open = [{ toolset: 'game', instance: 'g1', title: 'G1' }];
+      peer.reply(msg.id, { toolset: 'game', instance: 'g1', title: 'G1', _meta: { 'mcpl/hints': state.hint([{ name: 'play', instance: 'g1', visible: true }]) } });
+      return true;
+    }
+    return false;
+  });
+  try {
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game' });
+    const refusals: Array<[string, Json, RegExp]> = [
+      ['toolsets--close', { server: 'arc', toolset: 'game', instance: '' }, /instance must be a name, or left out; got a blank string/],
+      ['toolsets--close', { server: 'arc', toolset: 5 }, /toolset must be a name, or left out; got a number/],
+      ['toolsets--close', { server: ['arc'] }, /server must be a name, or left out; got a list/],
+      ['toolsets--look', { server: 'arc', tool: { name: 'play' } }, /tool must be a name, or left out; got an object/],
+      ['toolsets--act', { server: 'arc', tool: 'play', instance: '  ', args: { point: 'D4' } }, /instance must be a name, or left out; got a blank string/],
+    ];
+    for (const [name, input, refusal] of refusals) {
+      const r = await callTool(t.fw.framework, name, input);
+      assert.ok(r.isError, `${name} ${JSON.stringify(input)} is refused`);
+      assert.match(resultText(r), refusal);
+    }
+    assert.ok(!t.methods().includes('toolsets/close'), 'nothing closed');
+    assert.ok(!t.server.received.some((m) => m.method === 'tools/call' && (m.params as Json).name === 'play'), 'nothing called');
+    assert.match(await look(t.fw), /G1/, 'g1 is still open');
+  } finally { await t.done(); }
+});
+
+test('a selector given as null reads as left out', async () => {
+  const t = await setup((msg, peer, state) => {
+    if (msg.method === 'toolsets/open') {
+      state.open = [{ toolset: 'game', instance: 'g1', title: 'G1' }];
+      peer.reply(msg.id, { toolset: 'game', instance: 'g1', title: 'G1', _meta: { 'mcpl/hints': state.hint([{ name: 'play', instance: 'g1', visible: true }]) } });
+      return true;
+    }
+    if (msg.method === 'toolsets/close') {
+      state.open = [];
+      peer.reply(msg.id, { _meta: { 'mcpl/hints': state.hint([{ name: 'play', instance: 'g1', visible: false }]) } });
+      return true;
+    }
+    return false;
+  });
+  try {
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game', instance: 'g1' });
+    const played = await callTool(t.fw.framework, 'toolsets--act', { server: null, tool: 'play', instance: null, args: { point: 'D4' } });
+    assert.ok(!played.isError, resultText(played));
+    const call = t.server.received.find((m) => m.method === 'tools/call' && (m.params as Json).name === 'play');
+    assert.deepEqual((call?.params as Json | undefined)?._meta, { 'mcpl/instance': 'g1' }, 'the one open instance, as with instance left out');
+    const closed = await callTool(t.fw.framework, 'toolsets--close', { server: 'arc', toolset: null, instance: null });
+    assert.ok(!closed.isError, resultText(closed));
+    assert.ok(t.methods().includes('toolsets/close'), 'the one open thing closed');
+  } finally { await t.done(); }
+});
+
 test('the host\'s argument check is bounded: no server pattern runs, and deep or wide schemas are left to the server', async () => {
   const { checkArgs } = await import('../src/mcpl/tool-signature.js');
   // A pattern that backtracks catastrophically is never evaluated.

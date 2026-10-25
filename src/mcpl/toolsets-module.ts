@@ -97,6 +97,18 @@ const META_TOOLS: ToolDefinition[] = [
 ];
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+
+const SELECTORS = ['server', 'toolset', 'instance', 'tool'] as const;
+
+function checkSelectors(args: Record<string, unknown>): void {
+  for (const key of SELECTORS) {
+    const v = args[key];
+    if (v === undefined || v === null || str(v) !== undefined) continue;
+    const got = typeof v === 'string' ? 'a blank string' : Array.isArray(v) ? 'a list' : typeof v === 'object' ? 'an object' : `a ${typeof v}`;
+    fail(`${key} must be a name, or left out; got ${got}, so nothing was done`);
+  }
+}
+
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
 type Block = { type: string; text?: string; [k: string]: unknown };
@@ -178,6 +190,7 @@ export type ActTarget = { ok: true; serverId: string; tool: string; instance?: s
 export function resolveAct(hub: ToolsetHub, input: unknown): ActTarget {
   try {
     const args = isObj(input) ? input : {};
+    checkSelectors(args);
     const tool = str(args.tool) ?? fail('name the tool');
     const c = owner(hub, args.server, (x) => !!x.presence.tool(tool), `a tool "${tool}"`);
     const p = c.presence;
@@ -241,6 +254,7 @@ export class ToolsetsModule implements Module {
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     const args = isObj(call.input) ? call.input : {};
     try {
+      checkSelectors(args);
       switch (call.name) {
         case 'open': return await this.open(args);
         case 'act': return this.act(args);
