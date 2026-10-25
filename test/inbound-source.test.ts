@@ -731,6 +731,9 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     // value kept in unparseableInput. The copied transform before
     // blockAsStored left it as given, so its stored copy didn't match.
     'a tool_use whose input is a string': { blocks: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: 'not an object' }], changed: true },
+    // The store keeps media whose data is a byte array as base64. The copy
+    // left it as given.
+    'a document whose data is a byte array': { blocks: [{ type: 'document', source: { type: 'base64', data: [...Buffer.from('%PDF-1.4')], mediaType: 'application/pdf' } }], changed: true },
   };
 
   it('every body hashes alike as handed to the store and as read back, live and after reopening', async () => {
@@ -802,9 +805,31 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
       { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } },
       { type: 'image', source: { type: 'base64', data: Buffer.from('<svg/>').toString('base64') } },
       { type: 'blob_ref', blobKind: 'image', hash: 'deadbeef', mediaType: 'image/png' },
+      // Refused for want of a media type. The copy re-encoded its data and
+      // dropped its filename before hashing.
+      { type: 'document', source: { type: 'base64', data: 'JVBE\nRi0xLjQ=' }, filename: 'a.pdf' },
     ]) {
       assert.throws(() => blockAsStored(block as never), MalformedContentError, `${block.type}: the store refuses it`);
       assert.equal(sourceBodyDigest([block]), plain([block]), `${block.type}: digested as given`);
+    }
+  });
+
+  it('a body the store keeps as it did then has the digest it was stamped with then', () => {
+    // Taken with the transform copied before blockAsStored, at agent-framework
+    // 3b9c7dd0 (context-manager 0.22.0), and unchanged by it. A body stamped
+    // then and read back now still matches; a context-manager release that
+    // keeps one of these differently fails here.
+    const stamped: Record<string, [unknown[], string]> = {
+      'text': [[{ type: 'text', text: 'hello' }], '20e8a9654f001815055a7b61692923120a516fc0095519f521c8c821421cb4b9'],
+      'a labeled image': [[image(png)], '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f'],
+      'PNG bytes labeled image/jpeg': [[image(png, 'image/jpeg')], '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f'],
+      'base64 with a newline in it': [[image(`${png.slice(0, 11)}\n${png.slice(11)}`)], '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f'],
+      'an image by URL': [[{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png' } }], '69559115fea2aeea150bbd084fac4f250a9be6bc6f368591e9ad3eec0e76acd4'],
+      'audio with a duration': [[media('audio', 'SUQz\nAwAAAAAA', 'audio/mpeg', { duration: 3 })], '98cffd2cea1945c6369cb5e7baff7b9c8227e297bb2065eb75ac756f6be2ec76'],
+      'text and an image': [[{ type: 'text', text: '[invitation]' }, image(png, 'image/jpeg')], '3f0d4fc29340a119137695e1488e1a393f12b206e0c98ca3600de891727d9d83'],
+    };
+    for (const [name, [blocks, digest]] of Object.entries(stamped)) {
+      assert.equal(sourceBodyDigest(blocks), digest, name);
     }
   });
 
