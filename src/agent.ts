@@ -1,8 +1,10 @@
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
+import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
+import { carriedBlock, type SentRow } from './sent-rows.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
@@ -49,8 +51,8 @@ export interface ActivationRequestOptions {
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
- *  them; context-manager 0.20.1 gives each compile its own, where the
- *  strategy records them, in `CompileResult.renderStats`. */
+ *  them; each compile carries its own, where the strategy records them, in
+ *  `CompileResult.renderStats`. */
 export type RenderStats = NonNullable<ReturnType<ContextManager['getRenderStats']>>;
 
 /** The render stats of the dry compile behind each request a dry run
@@ -63,6 +65,16 @@ const dryCompileStats = new WeakMap<object, RenderStats | undefined>();
  *  `AgentFramework.getRequestCompileStats`. */
 export function dryCompileStatsOf(request: object): RenderStats | null {
   return dryCompileStats.get(request) ?? null;
+}
+
+/**
+ * What a compile is told when the agent's model binds its thinking: `compile()`'s options for a context manager
+ * that keeps a thinking-binding record, as agent-framework holds the binding (with the participant whose messages
+ * are the agent's own replies) and as digests of the request's head (bindingCompileOptions).
+ */
+export interface BindingCompileOptions {
+  thinkingBinding?: { binds: boolean; dropBlock: boolean; participant: string };
+  identity?: RequestIdentity;
 }
 
 export interface StartStreamResult {
@@ -78,16 +90,28 @@ export interface StartStreamResult {
   continuePrompt?: RequestOnlyPrompt;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
+  /** Where each block a call of this stream reports the provider dropped came from: a stored reply this
+   *  request's compile rendered, a round the stream appended, or neither (placeThinkingDrops). Optional, so a
+   *  stand-in for the stream start needn't supply it; without it, no drop can be placed. */
+  placeDrops?: (entries: readonly ThinkingBindingEntry[]) => PlacedDrop[];
+  /** The compile's `thinkingRecordedAfter`, when it gave one: a reply stored at or below it predates the branch's
+   *  thinking-binding record, so the provider may drop its thinking with no strip having missed. */
+  thinkingRecordedAfter?: number;
+  /** Tells the context manager what the stream's later rounds carried after the compiled messages, every round so
+   *  far in sent order, with this request's head (context-manager's `noteRequestSent`). Present only where the
+   *  model binds its thinking and the context manager keeps a record it can be told of. */
+  noteRequestSent?: (rows: readonly SentRow[]) => boolean;
 }
 import type {
   ContextManager,
   TokenBudget,
   ContextInjection,
   CompileResult,
-  MessageId,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  MessageId,
   MessageMetadata,
+  RequestIdentity,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -121,15 +145,21 @@ function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, inje
     && messages.slice(messages.length - injectionTail).every((m) => m.participant.startsWith('system_context:'));
 }
 
+/** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
+ *  it out), key order aside: the head digests the thinking binding compares, so a change on the wire changes one. */
+function wireDigest(value: unknown): string {
+  return stableHash(JSON.parse(JSON.stringify(value) ?? 'null'));
+}
+
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock` or
- * `refusalHandling.autoRewind` holds anything but true or false
- * (assertBooleanSetting), or whose `thinking`, `thinkingBinding` or
+ * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
+ * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
  * or whose `autoContinue` resolveAutoContinue refuses. The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
@@ -152,12 +182,18 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
     );
   }
-  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ dropBlock: true }')) {
+  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ binds: true, dropBlock: true }')) {
     assertBooleanSetting(
       `${agent} thinkingBinding.dropBlock`,
       config.thinkingBinding.dropBlock,
       'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
         'and false or leaving it out sends nothing, so the account\'s default applies',
+    );
+    assertBooleanSetting(
+      `${agent} thinkingBinding.binds`,
+      config.thinkingBinding.binds,
+      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
+        'and false or leaving it out compiles as before',
     );
   }
   if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
@@ -252,6 +288,9 @@ export class Agent {
   /** Whether requests ask the provider to drop signed thinking whose earlier
    *  conversation changed (see AgentConfig.thinkingBinding.dropBlock). */
   private readonly thinkingDropBlock: boolean;
+  /** Whether the model binds its signed thinking to the conversation before
+   *  it (see AgentConfig.thinkingBinding.binds). */
+  private readonly thinkingBinds: boolean;
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
@@ -392,6 +431,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.thinkingDropBlock = config.thinkingBinding?.dropBlock === true;
+    this.thinkingBinds = config.thinkingBinding?.binds === true;
     this.refusalHandling = config.refusalHandling;
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
@@ -404,7 +444,12 @@ export class Agent {
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
-    this.physicalWindowTokens = config.physicalWindowTokens;
+    // The window size converted as the projection's comparison (`projected > window`) converts it, so a string such
+    // as "200000" from a JSON or YAML config is its number, for every rule that reads it. A value whose number isn't
+    // finite is no window: null, NaN and Infinity, which the comparison never passed, and -Infinity, which it always
+    // did, a restart at every boundary.
+    const window = config.physicalWindowTokens == null ? NaN : Number(config.physicalWindowTokens);
+    this.physicalWindowTokens = Number.isFinite(window) ? window : undefined;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
@@ -1204,7 +1249,10 @@ export class Agent {
    * manager commits what it commits for one, the consumed watermark moves,
    * and a prepared budget change settles. To inspect what the agent would
    * see, use the framework's `previewActivation`, which compiles as a dry
-   * run. */
+   * run. It isn't told the agent's thinking binding (`thinkingBinding.binds`),
+   * so a context manager that keeps a thinking-binding record neither reads
+   * nor writes the record here, and what it returns keeps thinking whose
+   * earlier conversation changed. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
@@ -1413,13 +1461,12 @@ export class Agent {
   async compileWithInjections(
     budget?: TokenBudget,
     injections?: ContextInjection[],
-    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean },
+    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } & BindingCompileOptions,
   ): Promise<CompileResult> {
     // A dry run is a compile that will never be sent. The context manager
     // persists no fold resolutions for it and queues none of the compression
-    // or merge work its fold plan calls for. Its thinking binding
-    // (context-manager#160, not yet released) will commit stamps and add a
-    // compile awaiting acceptance for a committing compile only. Here nothing
+    // or merge work its fold plan calls for, and, with the thinking binding
+    // (`thinkingBinding.binds`), writes no binding record. Here nothing
     // moves either: the agent never read what a dry run assembled, so the
     // consumed watermark stays. A dry run proves nothing about the budget
     // either, so it goes straight to the compile, around
@@ -1460,7 +1507,13 @@ export class Agent {
 
   /**
    * Run inference and return result with tool calls and speech content.
-   * Updates agent state during execution.
+   * Updates agent state during execution. Its compile commits. With
+   * `thinkingBinding.binds` it also writes the context manager's
+   * thinking-binding record, so then call it only while none of this agent's
+   * requests is streaming: a stream open meanwhile then has its later notes
+   * write nothing, and its replies go without their thinking at the next
+   * compile. Its own reply is never noted, so with `binds` its thinking is
+   * left out at the compile after it's stored.
    */
   async runInference(
     availableTools: ToolDefinition[],
@@ -1472,7 +1525,9 @@ export class Agent {
 
   /**
    * Run inference with context injections.
-   * Same as runInference but passes injections through to compile.
+   * Same as runInference but passes injections through to compile. Its
+   * compile commits, and with `thinkingBinding.binds` writes the
+   * thinking-binding record, as runInference's does (see there).
    */
   async runInferenceWithInjections(
     availableTools: ToolDefinition[],
@@ -1516,9 +1571,12 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
+    const binding = this.bindingCompileOptions(tools, (injections ?? [])
+      .filter((injection) => injection.position === 'system')
+      .flatMap((injection) => injection.content));
     const assemble = async (): Promise<NormalizedRequest> => {
       const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections));
+        () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
@@ -1649,7 +1707,10 @@ export class Agent {
    * watermark); a preview passes `options.dryRun`, so its compile commits
    * none of that (see `compileWithInjections` for what a dry run still
    * leaves). Either way the context manager is handed the compression tool
-   * definitions. Safe to call regardless of the agent's current status.
+   * definitions. Safe to call regardless of the agent's current status,
+   * except that with `thinkingBinding.binds` a compile that isn't a dry run
+   * writes the context manager's binding record, so while one of the
+   * agent's requests streams, a call to look passes `options.dryRun`.
    * It doesn't wait for the tool-result guard's annotations, so a preview
    * never waits on a workspace write (rollback, undo and redo report one), and
    * may show a withheld stub before its place is added; the activation waits
@@ -1661,7 +1722,7 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
+  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions }> {
     // Unstored, so they leave for the request here (text-as-stored.ts), the
     // layout hash below included.
     injections = injectionsAsStored(injections);
@@ -1690,35 +1751,43 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
-    const compiled = await this.compileWithInjections(
+    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
+    const compiledResult = await this.compileWithInjections(
       budget,
       injections,
-      immutablePrefixHash || options.dryRun
+      immutablePrefixHash || options.dryRun || binding.thinkingBinding
         ? {
             ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
             ...(options.dryRun ? { dryRun: true } : {}),
+            ...binding,
           }
         : undefined,
     );
-    let { messages } = compiled;
-    const { systemInjections } = compiled;
-    // context-manager 0.20.1's field, read structurally so this compiles
-    // against 0.20.0 too, whose compiles carry none. It counts what the
-    // compile selected, so a preview's stand-ins (appendedMessages, below)
-    // aren't in it.
-    const { renderStats } = compiled as typeof compiled & { renderStats?: RenderStats };
+    let { messages } = compiledResult;
+    const { systemInjections } = compiledResult;
+    // It counts what the compile selected, so a preview's stand-ins
+    // (appendedMessages, below) aren't in it.
+    const { renderStats } = compiledResult;
+    // What the request is built from, as the compile returned it: a block the provider drops is found again in
+    // it, through the copies below, by its signature (placeThinkingDrops).
+    const recordedAfter = compiledResult.thinkingRecordedAfter;
+    const compiled: CompiledForRequest = {
+      messages: compiledResult.messages,
+      ...(compiledResult.provenance ? { provenance: compiledResult.provenance } : {}),
+      ...(recordedAfter !== undefined ? { recordedAfter } : {}),
+    };
     // Each message's place in the compile, or a preview's stand-in (null),
     // for the count of stored rows the request ends on, below.
     let origin: Array<number | null> = messages.map((_, i) => i);
     // A request that's sent says which stored injections the agent now has in
     // view, which the next start's same-content skip reads (stored-injections.ts).
-    if (!options.dryRun) this.noteRenderedInjections(compiled);
+    if (!options.dryRun) this.noteRenderedInjections(compiledResult);
     const appended = options.appendedMessages ?? [];
     if (appended.length > 0) {
       // Where a start's compile would render them, as the window's newest
       // rows: last, unless the window has no user message, where the compile
       // places the injections it's given at the end, after the window.
-      const sources = compiled.provenance?.messages;
+      const sources = compiledResult.provenance?.messages;
       let at = messages.length;
       if (sources && !messages.some((m, i) => sources[i]?.kind !== 'injection' && m.participant.toLowerCase() === 'user')) {
         while (at > 0 && sources[at - 1]?.kind === 'injection') at--;
@@ -1736,7 +1805,7 @@ export class Agent {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (!hasRenderedContent(messages[i]!.content)) continue;
       const from = origin[i] ?? null;
-      if (from !== null && !this.isStoredInjectionRow(compiled, from)) break;
+      if (from !== null && !this.isStoredInjectionRow(compiledResult, from)) break;
       injectionTail++;
     }
 
@@ -1751,15 +1820,10 @@ export class Agent {
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
     // path entirely; twin of context-manager's stripEmptyTextBlocks on the
     // compression path.)
+    // The same pass a tool boundary applies to what it notes as sent
+    // (sent-rows.ts), so the two can't drift.
     messages = messages
-      .map((m) => ({
-        ...m,
-        content: m.content.filter(
-          // typeof guard is deliberate runtime defense: history loaded from
-          // disk can carry a non-string `text` despite what the types claim.
-          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
-        ),
-      }))
+      .map((m) => ({ ...m, content: m.content.filter(carriedBlock) }))
       .filter((m) => m.content.length > 0);
     // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
     messages = withoutTokenEstimates(messages);
@@ -1818,7 +1882,7 @@ export class Agent {
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
-    return { request, ...(continuePrompt ? { continuePrompt } : {}) };
+    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
   }
 
   /**
@@ -1859,6 +1923,57 @@ export class Agent {
     if (!this.thinkingDropBlock) return this.thinking;
     const own = this.thinking !== null && typeof this.thinking === 'object' ? this.thinking : { enabled: false };
     return { ...own, blockBinding: { prefixMismatchBehavior: 'drop_block' } };
+  }
+
+  /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given:
+   *  where the agent's model binds its thinking (context-manager's `noteRequestSent`). */
+  private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent'> {
+    const identity = binding.identity;
+    // Each note names the compile the stream was built from, so a note can't vouch for this stream under a record a
+    // later committing compile with binds wrote. A compile that reports no provenance gives the stream nothing to name, and the
+    // stream notes nothing: its replies go without their thinking at the next compile, never refused.
+    const compileId = compiled.provenance?.compileId;
+    if (!identity || compileId === undefined) return {};
+    const cm = this.contextManager;
+    return { noteRequestSent: (rows) => cm.noteRequestSent(rows, identity, compileId) };
+  }
+
+  /**
+   * The binding a compile of this agent is told of (bindingCompileOptions), and a preview of its context too: the
+   * participant whose messages are its replies is its own name. Undefined where the model doesn't bind.
+   * @internal For the framework's preview and its budget rule; not a host API.
+   */
+  thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
+    return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
+  }
+
+  /**
+   * What a compile the agent sends tells the context manager when the model binds its thinking
+   * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
+   * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of
+   * its messages, so a changed one can stand for a first difference where the context manager keeps a
+   * thinking-binding record. The system text is the one the request will carry, built from the system-position
+   * injections given to the compile as the kv-unified prefix hash builds it; the tools are the ones it will carry, in
+   * their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
+   * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
+   * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
+   */
+  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
+    const thinkingBinding = this.thinkingBindingOption();
+    if (!thinkingBinding) return {};
+    const { config, providerParams, prefillUserMessage } = this.requestSettings();
+    return {
+      thinkingBinding,
+      identity: {
+        system: wireDigest(this.buildSystemPrompt(systemInjections)),
+        tools: wireDigest(tools),
+        model: wireDigest(this.model),
+        request: wireDigest({
+          thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
+          prefillUserMessage: prefillUserMessage ?? null,
+        }),
+      },
+    };
   }
 
   /** The request `assembleActivationRequest` builds (see there), for preview
@@ -1953,7 +2068,7 @@ export class Agent {
     // Compiled only once each withheld stub's annotation has finished,
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
-    const { request, continuePrompt } = await this.toolResultGuard.afterAnnotations(
+    const { request, continuePrompt, compiled, binding } = await this.toolResultGuard.afterAnnotations(
       () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
@@ -2010,6 +2125,10 @@ export class Agent {
       stream,
       request,
       ...(continuePrompt ? { continuePrompt } : {}),
+      // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
+      placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
+      ...this.requestNotes(binding, compiled),
+      ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),
@@ -2063,7 +2182,7 @@ export class Agent {
    * Add an assistant response to context.
    * Called by framework when stream completes.
    */
-  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): void {
+  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): MessageId | undefined {
     // A turn whose entire output is thinking blocks produced NOTHING: no
     // speech, no tool call. That is what a refusal looks like on the wire —
     // the provider returns signed thinking (often with empty text, the
@@ -2087,9 +2206,9 @@ export class Agent {
         `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
         `output. See the refusal/inference-failed record for why.`,
       );
-      return;
+      return undefined;
     }
-    this.contextManager.addMessage(this.name, content, metadata);
+    return this.contextManager.addMessage(this.name, content, metadata);
   }
 
   /**
@@ -2334,7 +2453,7 @@ export class Agent {
         toolUseId: r.id,
         content: isError
           ? truncateForHistory(typeof error === 'string' ? error.toWellFormed() : error as string, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS, { toolName: r.name }),
         isError,
       };
     });

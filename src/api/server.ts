@@ -518,8 +518,7 @@ export class ApiServer {
     const contextManager = agent.getContextManager();
     // A dry run: listed, never sent, so it persists no fold resolutions and
     // queues none of the compression its fold plan calls for (see
-    // Agent.compileWithInjections for what a dry run still leaves, and for
-    // context-manager#160's thinking binding).
+    // Agent.compileWithInjections for what a dry run still leaves).
     const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;

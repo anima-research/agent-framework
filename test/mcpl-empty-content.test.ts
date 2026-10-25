@@ -32,6 +32,9 @@ const EMPTY_SHAPES: Array<[string, unknown[]]> = [
   ["''", [{ type: 'text', text: '' }]],
   ['whitespace-only text', [{ type: 'text', text: ' \n\t ' }]],
   ['several blank text blocks', [{ type: 'text', text: '' }, { type: 'text', text: '  ' }]],
+  // MCP's embedded resource shows as the block its contents make, here blank
+  // text (Ada-1017, room-203 #207161, #207631).
+  ['an embedded resource whose text is blank', [{ type: 'resource', resource: { uri: 'memo://blank', mimeType: 'text/plain', text: ' \n ' } }]],
 ];
 const IMAGE = { type: 'image', data: 'AAAA', mimeType: 'image/png' };
 const MARKER_ORIGIN = { source: 'heartbeat', reason: 'schedule', silent: true };

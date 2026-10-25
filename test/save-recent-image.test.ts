@@ -73,8 +73,8 @@ import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
  *  connecting to them: a ws:// or wss:// url for one the host connects to over
  *  a network, a command alone for a stdio server. */
 function configureServers(framework: AgentFramework, configs: Array<{ id: string; url?: string; command?: string; autofetch?: { maxTotalBytes?: number } }>): void {
-  const known = (framework as unknown as { mcplServerConfigs: Map<string, unknown> }).mcplServerConfigs;
-  for (const config of configs) known.set(config.id, config);
+  const configure = (framework as unknown as { setMcplServerConfig(config: unknown): void }).setMcplServerConfig.bind(framework);
+  for (const config of configs) configure(config);
 }
 
 const PNG = Buffer.from(
@@ -507,6 +507,10 @@ describe('save_recent_image provenance (issue #104)', () => {
       const result = await waitForToolResult(h.framework, 'call_save');
       assert.strictEqual(result.isError, true);
       assert.match(result.content, /index 0 is a tool-result image from world--snap \(call call_old\) recorded without a retention ref/);
+      // An embedded image nested in a tool's data is kept only as its
+      // placeholder too, and a re-run records it the same way.
+      assert.match(result.content, /nested in the tool's data rather than its content/);
+      assert.match(result.content, /unless the image came nested in its data, which a re-run records the same way/);
       assert.ok((await fileBytes(h, 'files/phoenix.png')) === null, 'the older GIF must not be written under the PNG name');
     } finally {
       await h.framework.stop();
@@ -2088,11 +2092,46 @@ describe('ToolImageLedger', () => {
       ['bound', {}, 'srv'],
       ['unbound', {}, undefined],
     ];
+    // And the reasons a fetch would be refused before it dials, each at its
+    // longest: a server's id is bounded as a label is, and a refused scheme
+    // isn't named.
+    const longServer = (kind: string) => `${kind}-${'s'.repeat(400)}`;
+    const host = {};
+    // srv is dialed on the references' own origin, so its rows reach the
+    // expiry's reasons and the fetch the stub offers.
+    referenceRegistry.setServerAddress('srv', { url: 'wss://example.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('stdio'), 'no-address', host);
+    referenceRegistry.setServerAddress(longServer('elsewhere'), { url: 'wss://elsewhere.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('dialed'), { url: 'wss://example.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('garbled'), { url: 'not a url' }, host);
+    endings.push(
+      ['no address', {}, longServer('stdio')],
+      ['unknown server', {}, longServer('unknown')],
+      ['server address', {}, longServer('garbled')],
+      ['third-party origin', {}, longServer('elsewhere')],
+      ['scheme', { uri: `${'x'.repeat(400)}://example.invalid/sri-longest-scheme.png` }, longServer('dialed')],
+      ['user name or password', { uri: 'https://user:pass@example.invalid/sri-longest-userinfo.png' }, longServer('dialed')],
+    );
+    const reasons: Record<string, string> = {
+      passed: '— the reference is expired',
+      unparseable: '— the reference is treated as expired, since its expiry time can\'t be read',
+      rejected: '— the reference is treated as expired, since its expiry time isn\'t in a form this host accepts',
+      bound: '— fetch with fetch_reference',
+      unbound: '— it\'s not tied to any server',
+      'no address': '— this host doesn\'t connect to the "stdio-s',
+      'unknown server': '— this host no longer has the "unknown-s',
+      'server address': '— the "garbled-s',
+      'third-party origin': '— third-party origin:',
+      scheme: '— scheme not allowed: this host fetches only',
+      'user name or password': '— its address carries a user name or password',
+    };
     for (const [name, extra, serverId] of endings) {
       const stub = longestId(buildReferenceStub(testimony(name, extra), 'o'.repeat(400), serverId));
       assert.ok(stub.length < REFERENCE_STUB_MAX_CHARS, `${name}: ${stub.length}`);
       assert.strictEqual(parseImagePlaceholders(stub).length, 1, name);
+      assert.ok(stub.includes(reasons[name]!), `${name}: ${stub}`);
     }
+    referenceRegistry.forgetServerAddress('srv', host);
     // A placeholder: RFC 6838 bounds a type or subtype name at 127
     // characters, so normalizeMediaType keeps the longest essence and refuses
     // one character more, and the size and ref take a safe integer's digits.

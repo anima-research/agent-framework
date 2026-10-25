@@ -4,7 +4,8 @@ import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/cont
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
 import { ensureStateRegistered } from './module-registry.js';
-import { rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
+import { classifyBlock } from './mcpl/references.js';
+import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
@@ -90,7 +91,9 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
  * inline cap or less (storeResults' keptCap), they're cut, with a note that
  * says so and where the whole result is, since a later field can then be cut
  * away entirely. Undefined when it keeps nothing, as for a failed result
- * (agent-framework #277). A write's file
+ * (agent-framework #277), one whose claims can't be read whole
+ * (resultClaimsOf), or one whose data is MCP's embedded resource, whose
+ * fields can't be kept apart from its contents or its uri. A write's file
  * list is evidence of what it did, rarely what drew a refusal, and keeping it
  * is what shows a clobbered file when the receipt is withheld.
  */
@@ -99,13 +102,23 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   if (!result.success || result.isError || !keys?.length || !data || typeof data !== 'object' || Array.isArray(data)) {
     return undefined;
   }
+  // MCP's embedded resource is its contents: shown as text, it's the very
+  // body the guard withheld, and a field picked out of it, such as
+  // `resource`, is data that shows its uri. So it keeps nothing.
+  if (classifyBlock(data).kind === 'embedded') return undefined;
   const fields = data as Record<string, unknown>;
   const kept = Object.fromEntries(keys.filter((key) => Object.hasOwn(fields, key)).map((key) => [key, fields[key]]));
   if (Object.keys(kept).length === 0) return undefined;
   // Data that RFC-005 shows as text, such as a reference's stub, keeps that
   // text: picked out of it, a kept uri would lose the type that makes it a
   // reference, and be written out of the stub that hides it.
-  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept);
+  // The kept fields are shown as the whole result claims (resultClaimsOf), so
+  // a never elsewhere in it still withholds a kept link's uri. Where a value
+  // stops that walk, such as a getter that throws, which the audit's JSON
+  // doesn't read, what the rest claims is unknown, and nothing is kept.
+  const claims = resultClaimsOf(fields);
+  if (claims === null) return undefined;
+  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept, undefined, { claims });
   if (!maxChars || whole.length <= maxChars) return whole;
   // Never half a surrogate pair: the stub goes to the provider as text, so
   // the cut can be one character short of the cap.
