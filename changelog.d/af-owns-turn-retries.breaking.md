@@ -28,15 +28,6 @@
     iterator before its terminal event, where membrane's streams send it as
     an `error` event, is held, retried and logged as that event is
     (agent-framework#734).
-  A resident's, a conversation agent's and an ephemeral run's context
-  managers ask membrane for no retries on their compression calls too: the
-  context strategy's compression lane pauses after a failure and sends the
-  request again, so membrane's schedules ran inside each of its sends, a 529
-  seven times. A compression or merge send that fails now pauses its lane
-  (5 s, doubling) where membrane resent it within the call, and a
-  transition summary (`resetHeadWindow()` with no text) is sent once, so a
-  failure membrane would have retried goes back to its caller after that
-  one send.
   A custom `ErrorPolicy` now sees failures membrane used to retry first (a
   5xx, a 529, a dropped connection, a 429), so it decides those itself.
   **Migration:** decide with membrane's own helpers (`classifyFailure`,
@@ -45,6 +36,6 @@
   (a resident's stated waits and acceleration 429s), refusal re-issues
   (`refusalRetries`), a direct caller of `Agent.startStream` (it keeps
   membrane's retries; `ActivationRequestOptions.membraneRetries: false` is
-  what the framework passes), and calls that aren't turns or compression
-  (the MCPL inference router and other host calls keep membrane's
+  what the framework passes), and calls that aren't turns (the MCPL
+  inference router, compression and other host calls keep membrane's
   retries).

@@ -2133,8 +2133,11 @@ function isMembraneError(error: unknown): error is MembraneError {
  *   one, so the turn meets that event's path: a provider hold, a stated
  *   wait, or the error policy's retry. Membrane's streams throw only on a
  *   cancellation or an internal fault, but a stream of another make can
- *   throw such a failure. Any other throw, a cancellation's included, is
- *   thrown on as it was.
+ *   throw such a failure. Before the event is given, the stream that threw
+ *   is cancelled, as far as its cancel() goes: a rejected next() ends this
+ *   loop without closing the stream, and a producer that outlives it would
+ *   otherwise run on beside the retry's stream. Any other throw, a
+ *   cancellation's included, is thrown on as it was.
  * - Once a terminal event (complete, error or aborted) has decided the turn,
  *   by its answer, its retry or hold, or its end, nothing after it decides
  *   it again. The first later event ends the events, and so does a throw,
@@ -2152,7 +2155,7 @@ function isMembraneError(error: unknown): error is MembraneError {
  *   last and then end; only a stream of another make sends or throws
  *   anything after it.
  */
-async function* turnStreamEvents(stream: AsyncIterable<StreamEvent>, agentName: string): AsyncGenerator<StreamEvent> {
+async function* turnStreamEvents(stream: YieldingStream, agentName: string): AsyncGenerator<StreamEvent> {
   let decidedBy: StreamEvent['type'] | undefined;
   try {
     for await (const event of stream) {
@@ -2172,6 +2175,11 @@ async function* turnStreamEvents(stream: AsyncIterable<StreamEvent>, agentName: 
     // Said here, since the error event's path doesn't log a failure that a
     // stop or the framework's cancel then settles, as the throw's did.
     console.error(`[stream] ${agentName}: the stream threw a retryable failure from its iterator, taken as its error event: ${describeFailureWithFrames(error)}`);
+    try {
+      stream.cancel();
+    } catch (cancelError) {
+      console.error(`[stream] ${agentName}: cancelling the stream that threw failed, so it may run on: ${describeFailureWithFrames(cancelError)}`);
+    }
     yield { type: 'error', error } as StreamEvent;
   }
 }
@@ -4939,8 +4947,7 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager takes no admission: see
-   * ephemeralRunMembrane.) Its
+   * single-use, so its context manager keeps the plain membrane.) Its
    * compression is the background work a resident's is, whether a
    * maintenance tick or a drain after a message starts it, so it is withdrawn
    * as a resident's is: a call made while a surgery holds the store, or once
@@ -4958,26 +4965,8 @@ export class AgentFramework {
       }
     });
   }
-  /** The membrane for every ephemeral run's context manager: no admission,
-   *  no membrane retries (membraneAdmitting), and one proxy made once for
-   *  all of them. context-manager judges a compression's failure against the
-   *  compressions that landed through the same membrane instance (its
-   *  compressionDomain), so the runs share that evidence, as they did when
-   *  each took the framework's own membrane. */
-  private ephemeralRunMembrane(): Membrane {
-    return this.ephemeralRunMembraneOnce ??= this.membraneAdmitting((run) => run());
-  }
-  private ephemeralRunMembraneOnce: Membrane | undefined;
-  /** The framework's membrane for a resident's, a conversation agent's and
-   *  an ephemeral run's context manager, with each complete() call passed
-   *  through `admit` along with the model it names, and asking membrane for
-   *  no retries (`retry: false`, over any the caller's options ask for). The
-   *  context strategy's compression lane retries its own calls, pausing
-   *  after a failure and sending the request again, so membrane's schedules
-   *  inside each call would retry them twice over (up to ten minutes at a
-   *  529 inside each of the lane's sends). (The subconscious's context
-   *  manager keeps the plain membrane: its strategy, a
-   *  WindowedPassthroughStrategy, makes no calls.) */
+  /** The framework's membrane, with each complete() call passed through
+   *  `admit` along with the model it names. */
   private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
@@ -4985,8 +4974,7 @@ export class AgentFramework {
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
           const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
-          const options = { ...(args[1] as object | undefined), retry: false };
-          return admit(() => Reflect.apply(value, this.membrane, [args[0], options, ...args.slice(2)]) as Promise<unknown>,
+          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
       }
@@ -9171,7 +9159,7 @@ export class AgentFramework {
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.ephemeralRunMembrane(),
+        membrane: this.membrane,
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 

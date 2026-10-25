@@ -394,6 +394,41 @@ test('a retryable 529 a stream of another make throws from its iterator is retri
   assert.deepEqual(thrown, sent, 'the same sends, the same policy questions and answers, the same trace as the error event');
 });
 
+/** The first turn stream throws a retryable 529 from its iterator, and its cancel() records or throws; it
+ *  notes whether that stream had been cancelled when the retry's stream was asked for. */
+class ThrowThenRecordMembrane extends OptionsMembrane {
+  thrown: ThrowingStream | undefined;
+  cancelledAtRetry: boolean | undefined;
+  constructor(private readonly cancelThrows: boolean) { super(); }
+  override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
+    if (!this.thrown) {
+      this.streamOptions.push(options);
+      const stream = new ThrowingStream(err({ type: 'server', retryable: true, httpStatus: 529, message: 'overloaded_error' }));
+      if (this.cancelThrows) stream.cancel = () => { stream.isCancelled = true; throw new Error('zz cancel fault'); };
+      this.thrown = stream;
+      return stream;
+    }
+    this.cancelledAtRetry ??= this.thrown.isCancelled;
+    return super.streamYielding(request, options);
+  }
+}
+
+for (const cancelThrows of [false, true]) {
+  test(`a stream whose iterator threw a retryable failure is cancelled before the retry's stream is asked for${cancelThrows ? ', and a cancel() that throws still leaves the retry to run' : ''}`, async (t: TestContext) => {
+    const membrane = new ThrowThenRecordMembrane(cancelThrows);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
+    const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
+    const events = traceOf(fw);
+    const { lines } = await laterEventLines(t, async () => {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+      await idle(fw);
+    }, 'cancelling the stream that threw failed');
+    assert.equal(membrane.cancelledAtRetry, true, 'cancelled before the retry');
+    assert.ok(events.some((e) => e.type === 'inference:completed'), 'the retry answered');
+    assert.equal(lines.length, cancelThrows ? 1 : 0, 'a cancel that throws is said');
+  });
+}
+
 for (const [what, thrown] of [
   ['a failure the provider says may not be retried', err({ type: 'invalid_request', retryable: false, httpStatus: 400 })],
   ['an error that is not a MembraneError', new Error('zz iterator fault')],
@@ -445,7 +480,7 @@ class CompleteOptionsMembrane extends MockMembrane {
   }
 }
 
-test("a resident's, a conversation agent's and an ephemeral run's context managers ask membrane for no retries, over a caller's own options; ephemeral runs share one membrane", async (t: TestContext) => {
+test("a resident's, a conversation agent's and an ephemeral run's context managers keep membrane's own retries: each complete() call goes with its caller's options as they were", async (t: TestContext) => {
   const membrane = new CompleteOptionsMembrane();
   const fw = await makeFramework(t, membrane, new DefaultErrorPolicy());
   const request = { messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-compress' }] }], config: { model: 'zz-model', maxTokens: 10 } } as unknown as NormalizedRequest;
@@ -454,20 +489,14 @@ test("a resident's, a conversation agent's and an ephemeral run's context manage
   const signal = new AbortController().signal;
 
   await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request, { signal });
-  assert.deepEqual(membrane.completeOptions.at(-1), { signal, retry: false }, "a resident's, its own options kept");
+  assert.deepEqual(membrane.completeOptions.at(-1), { signal }, "a resident's");
   await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request, { retry: true });
-  assert.deepEqual(membrane.completeOptions.at(-1), { retry: false }, "a caller's own retry is overridden");
+  assert.deepEqual(membrane.completeOptions.at(-1), { retry: true }, "a caller's own retry");
   await internal.conversationAuxiliaryMembraneFor('resident').complete(request);
-  assert.deepEqual(membrane.completeOptions.at(-1), { retry: false }, "a conversation agent's");
+  assert.equal(membrane.completeOptions.at(-1), undefined, "a conversation agent's");
   const { contextManager, cleanup } = await fw.createEphemeralAgent({ name: 'eph-retries', model: 'zz-model', systemPrompt: 'zz' });
   await membraneOf(contextManager).complete(request);
-  assert.deepEqual(membrane.completeOptions.at(-1), { retry: false }, "an ephemeral run's");
-  // context-manager judges a compression's failure against those that landed
-  // through the same membrane instance: every run's is the same one, as when
-  // each took the framework's own.
-  const second = await fw.createEphemeralAgent({ name: 'eph-retries-2', model: 'zz-model', systemPrompt: 'zz' });
-  assert.equal(membraneOf(second.contextManager), membraneOf(contextManager), 'one membrane for every ephemeral run');
-  second.cleanup();
+  assert.equal(membrane.completeOptions.at(-1), undefined, "an ephemeral run's");
   cleanup();
 });
 
