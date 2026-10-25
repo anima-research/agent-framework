@@ -66,7 +66,12 @@ function stubCm(messages: StoredMessage[], summaries: Array<Record<string, unkno
     // Branch-scoped like the real store: getMessage/getSummary answer null for
     // anything not on the current branch (see MessageStore.lookupIndex).
     getMessage(id: string) { return offBranch.has(id) ? null : (messages.find((m) => m.id === id) ?? null); },
-    getSummary(id: string) { return offBranch.has(id) ? null : (summaries.find((x) => x.id === id) ?? null); },
+    getSummary(id: string) {
+      const s = offBranch.has(id) ? undefined : summaries.find((x) => x.id === id);
+      // A SummaryEntry carries its mint time as `created`, which the range
+      // listing gives as `createdMs`.
+      return s ? { ...s, created: s.createdMs } : null;
+    },
     queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number }) {
       const all = messages.filter((m) => (o.fromMs === undefined || m.timestamp.getTime() >= o.fromMs) && (o.toMs === undefined || m.timestamp.getTime() <= o.toMs))
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
@@ -131,14 +136,16 @@ describe('HistoryModule semantic_search', () => {
     mod.bind(stubCm(messages, summaries));
     const r1 = await mod.syncSemanticIndex()!;
     assert.deepEqual({ pushed: r1.pushed, inserted: r1.inserted, more: r1.more }, { pushed: 4, inserted: 4, more: false });
-    assert.deepEqual([...svc.items.keys()].sort(), ['msg:m1', 'msg:m2', 'msg:m4', 'sum:s1']);
+    assert.deepEqual([...svc.items.keys()].sort(), ['msg:m1', 'msg:m2', 'msg:m4', `sum:s1@${T0 + 9000}`]);
     assert.equal(svc.items.get('msg:m1')!.cursor, T0 + 1000);
-    assert.equal(svc.items.get('sum:s1')!.cursor, T0 + 9000);
+    assert.equal(svc.items.get(`sum:s1@${T0 + 9000}`)!.cursor, T0 + 9000);
     assert.equal(svc.items.get('msg:m1')!.channel, 'chan-A');
-    // second pass: overlap re-sends the recent messages but the service reports them unchanged; the summary is not re-sent
+    // Second pass: the overlap re-sends the recent messages, and the summary at
+    // the cursor's millisecond is sent again; the service reports them all unchanged.
+    const before = svc.upserts.length;
     const r2 = await mod.syncSemanticIndex()!;
-    assert.equal(r2.inserted, 0);
-    assert.ok(!svc.upserts.at(-1)!.some((i) => i.id === 'sum:s1') || r2.pushed === 0);
+    assert.deepEqual({ inserted: r2.inserted, unchanged: r2.unchanged }, { inserted: 0, unchanged: r2.pushed });
+    assert.ok(svc.upserts.slice(before).flat().some((i) => i.id === `sum:s1@${T0 + 9000}`), 'the summary was sent again');
 
     const res = await mod.handleToolCall({ id: 'c1', name: 'semantic_search', input: { query: 'fluid sim', from: '2026-09-22T00:00:00Z', kinds: 'messages', limit: 5 } });
     assert.equal(res.success, true, JSON.stringify(res));
@@ -165,7 +172,7 @@ describe('HistoryModule semantic_search', () => {
       const offBranch = new Set<string>();
       mod.bind(stubCm(messages, summaries, offBranch));
       await mod.syncSemanticIndex()!;
-      assert.ok(svc2.items.has('msg:m2') && svc2.items.has('sum:s1'));
+      assert.ok(svc2.items.has('msg:m2') && svc2.items.has(`sum:s1@${T0 + 9000}`));
       // Before the undo: the think note is a hit.
       const before = await mod.handleToolCall({ id: 'b', name: 'semantic_search', input: { query: 'private note', kinds: 'messages' } });
       assert.equal(before.success, true, JSON.stringify(before));
@@ -211,7 +218,7 @@ describe('HistoryModule semantic_search', () => {
       const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxChars: 4 } });
       mod.bind(stubCm(messages, [{ ...summaries[0], content: `\n  x${grin.repeat(3)}  \n` }]));
       await mod.syncSemanticIndex()!;
-      assert.equal(svc2.items.get('sum:s1')?.text, `x${grin}`, 'the index holds the summary trimmed and cut at maxChars at a whole character');
+      assert.equal(svc2.items.get(`sum:s1@${T0 + 9000}`)?.text, `x${grin}`, 'the index holds the summary trimmed and cut at maxChars at a whole character');
       svc2.omitText = true;
       const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'x', level: 1 } });
       assert.equal(res.success, true, JSON.stringify(res));
@@ -244,28 +251,55 @@ describe('HistoryModule semantic_search', () => {
     }
   });
 
-  it('a summary hit shows the local summary even when the index holds another summary\'s text under its id, with the index\'s score and timestamp', async () => {
+  it('another branch\'s summary under the same id is dropped as off-branch, and this branch\'s is found by its own words and dated by its own start', async () => {
     // A branch made from an earlier point, as an undo makes one, can mint a
-    // summary id another branch already used, so the index can hold another
-    // summary's text and start under it. No catch-up before the search,
-    // which would send this summary again.
+    // summary id another branch already used. Each summary's key carries its
+    // creation time, so the index holds both, and a hit is this branch's only
+    // when its time is this branch's summary's.
     const svc2 = new FakeService(); await svc2.start();
     try {
       const local = [{ ...summaries[0] }];
-      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
       mod.bind(stubCm(messages, local));
       await mod.syncSemanticIndex()!;
-      local[0]!.content = 'Summary of a morning on this branch';
-      local[0]!.startMs = T0 + 86_400_000;
-      const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'evening', level: 1 } });
-      assert.equal(res.success, true, JSON.stringify(res));
-      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number; timestamp: string | null }> }).hits.find((h) => h.id === 'sum:s1');
-      assert.ok(hit, JSON.stringify(res.data));
-      assert.equal(svc2.items.get('sum:s1')?.text, 'Summary of the evening', 'the index still holds the other text');
-      assert.equal(hit.score, 0.9, 'the hit is still ranked by the text the index holds, the only one with "evening"');
-      assert.equal(hit.timestamp, new Date(T0).toISOString(), 'and dated by the start the index holds');
+      // Now on a branch whose own s1 was minted later, about a morning.
+      local[0] = { ...summaries[0], content: 'Summary of a morning on this branch', startMs: T0 + 86_400_000, createdMs: T0 + 90_000 };
+      await mod.syncSemanticIndex()!;
+      assert.equal(svc2.items.get(`sum:s1@${T0 + 9000}`)?.text, 'Summary of the evening', 'the other branch\'s s1 stays indexed');
+      assert.equal(svc2.items.get(`sum:s1@${T0 + 90_000}`)?.text, 'Summary of a morning on this branch', 'beside this branch\'s');
+      const evening = await mod.handleToolCall({ id: 'e', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      assert.equal(evening.success, true, JSON.stringify(evening));
+      const edata = evening.data as { hits: Array<{ id: string; score: number }>; index: { droppedOffBranch: number } };
+      assert.deepEqual(edata.hits.filter((h) => h.score > 0.5), [], 'the other branch\'s summary is not a hit here');
+      assert.equal(edata.index.droppedOffBranch, 1);
+      const morning = await mod.handleToolCall({ id: 'm', name: 'semantic_search', input: { query: 'morning', level: 1 } });
+      const hit = (morning.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number; timestamp: string | null }> }).hits.find((h) => h.id === 'sum:s1');
+      assert.ok(hit, JSON.stringify(morning.data));
+      assert.equal(hit.score, 0.9, 'ranked by its own text');
+      assert.equal(hit.timestamp, new Date(T0 + 86_400_000).toISOString(), 'and dated by its own start');
       assert.equal(hit.snippet, 'Summary of a morning on this branch');
       assert.equal(hit.chars, 'Summary of a morning on this branch'.length);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it('an item from before keys carried the creation time is never a hit, and isn\'t counted, whatever text the index holds', async () => {
+    // An old-form item can hold this branch's summary or another branch's
+    // under the same id, so it's left out, as superseded, before this
+    // branch's passes send the summary under its own key.
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const local = [{ ...summaries[0], content: 'Summary of a morning on this branch' }];
+      svc2.items.set('sum:s1', { id: 'sum:s1', text: 'Summary of the evening', kind: 'summary', level: 1, ts: T0, cursor: T0 + 9000 } as never);
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+      mod.bind(stubCm(messages, local));
+      const res = await mod.handleToolCall({ id: 'o', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      const data = res.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number; droppedStale: number } };
+      assert.ok(svc2.items.has('sum:s1'), 'the premise: the old item is still in the index');
+      assert.deepEqual(data.hits.map((h) => h.id), [], JSON.stringify(res.data));
+      assert.equal(data.index.droppedOffBranch, 0);
+      assert.equal(data.index.droppedStale, 0);
       await mod.stop();
     } finally { await svc2.stop(); }
   });
@@ -283,7 +317,7 @@ describe('HistoryModule semantic_search', () => {
       local[0]!.content = '  ';
       const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'evening', level: 1 } });
       assert.equal(res.success, true, JSON.stringify(res));
-      assert.equal(svc2.items.get('sum:s1')?.text, 'Summary of the evening', 'the index still holds the other text');
+      assert.equal(svc2.items.get(`sum:s1@${T0 + 9000}`)?.text, 'Summary of the evening', 'the index still holds the other text');
       const data = res.data as { hits: Array<{ id: string }>; index: { droppedStale: number } };
       assert.deepEqual(data.hits.map((h) => h.id), []);
       assert.equal(data.index.droppedStale, 1);

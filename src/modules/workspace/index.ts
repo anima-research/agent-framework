@@ -45,6 +45,9 @@ import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
 import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
+import { type FileText, fileText } from './text.js';
+import { DEFAULT_READ_LINE_LIMIT, characterPage, linePage } from './read-page.js';
+import { type GrepAnswer, grepText, textAnswer } from './result-text.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -1839,10 +1842,19 @@ export class WorkspaceModule implements Module {
   // Tool Definitions
   // ==========================================================================
 
+  /**
+   * Whether any of this host's mounts runs direct. The tools' descriptions
+   * and grep's notes mention direct mounts only on such a host, so both ask
+   * this one question.
+   */
+  private anyRunsDirect(): boolean {
+    return [...this.mounts.values()].some((m) => m.direct);
+  }
+
   getTools(): ToolDefinition[] {
     // Where a mount runs direct, four descriptions say what that changes.
     // A host with none keeps them as they were, and its residents' caches.
-    const direct = [...this.mounts.values()].some((m) => m.direct);
+    const direct = this.anyRunsDirect();
     const lsDirect = direct
       ? ' A direct mount (ls without a path says which, with its ignore list) lists disk\'s files as they are now: each with '
         + 'its size and no state, or a note where the mount doesn\'t take it. A path its ignore list covers is listed when you name it.'
@@ -2029,7 +2041,7 @@ export class WorkspaceModule implements Module {
           properties: {
             pattern: { type: 'string', description: 'Regular expression pattern' },
             path: { type: 'string', description: 'File or directory to search (mount-prefixed, optional)' },
-            glob: { type: 'string', description: 'Glob pattern to filter files, relative to the mount root (e.g., "src/**/*.ts"); in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts"), and in every other mount, as written' },
+            glob: { type: 'string', description: 'Glob pattern to filter files: one with a "/" is matched from the mount\'s root, whatever the path (e.g., "src/**/*.ts"), and in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts"), in every other mount as written; one with no "/" also matches a file\'s name at any depth (e.g., "*.ts")' },
             contextBefore: { type: 'integer', description: 'Context lines before match' },
             contextAfter: { type: 'integer', description: 'Context lines after match' },
           },
@@ -2182,16 +2194,21 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: `The ${call.name} call did nothing: ${problem}.` };
       }
       const input = call.input as Record<string, unknown>;
+      // The most of this call's result that can reach its caller whole: past
+      // it, a model's result spills into a file, and a script gets
+      // ResultTooLarge in its place. A call made in process carries none and
+      // takes the data itself, so its read pages by its line limit alone.
+      const resultMaxChars = call.resultMaxChars;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
         if (call.name === 'read' && call.callerAgentName === generated.agentName) {
-          return await this.handleRead(input as unknown as ReadInput, generated.read());
+          return await this.handleRead(input as unknown as ReadInput, resultMaxChars, generated.read());
         }
         return { success: false, isError: true, error: this.generatedFileRefusal(generated, call.callerAgentName) };
       }
 
       switch (call.name) {
-        case 'read': return await this.handleRead(input as unknown as ReadInput);
+        case 'read': return await this.handleRead(input as unknown as ReadInput, resultMaxChars);
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
         case 'write': return await this.handleWrite(input as unknown as WriteInput, call.callerAgentName);
         case 'edit': return await this.handleEdit(input as unknown as EditInput, call.resultMaxChars, call.callerAgentName);
@@ -2441,11 +2458,15 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Read a file's raw bytes from a mount (through the Chronicle tree, synced
-   * first like the `read` tool; on a direct mount, from disk as
-   * readBinaryFromDisk reads it, at most the mount's `maxFileSize`). Public
-   * API for the framework's synthesized `read_image` tool and other peer
-   * callers that need binary content.
+   * Read a file's raw bytes from a mount: through the Chronicle tree, a path
+   * the workspace doesn't hold observed first (ensureSynced); or, on a direct
+   * mount, from disk as readBinaryFromDisk reads it, at most the mount's
+   * `maxFileSize`. A path the workspace holds is read as the workspace holds
+   * it, not settled as the `read` tool settles it: the tree takes in no
+   * binary disk copy, so a pass over a held binary file that disk changed
+   * would drop the workspace's copy. Public API for the framework's
+   * synthesized `read_image` tool, where the workspace module doesn't serve
+   * read_image itself, and other peer callers that need binary content.
    */
   async readBinary(
     mountPrefixedPath: string,
@@ -3856,15 +3877,19 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Before a read: a path the workspace doesn't hold is observed under the
-   * three-way rule, which ingests a new disk file but never brings back a
-   * workspace deletion or a file absent from this branch. The pass names the
-   * path, as a file tool names the one it acts on: a path the mount passes
-   * over by design is observed, as a sync naming it would observe it (#276),
-   * while a path in another mount's directory is refused before this, and
-   * passed over by any pass. Answers the pass's report on the path, and why
-   * the pass decided nothing where it did (undecidedOf), which leaves disk
-   * unchecked. The caller holds the mount's turn.
+   * Before a deletion, and for readBinary: a path the workspace doesn't hold
+   * is observed under the three-way rule, which ingests a new disk file but
+   * never brings back a workspace deletion or a file absent from this branch.
+   * A path it holds is left alone. For a deletion, as for a write, taking
+   * disk's change in first would let the push remove that change unseen; for
+   * readBinary, a pass would drop a held binary file that disk changed, since
+   * the tree takes in no binary disk copy. The pass names the path, as a file
+   * tool names the one it acts on: a path the mount passes over by design is
+   * observed, as a sync naming it would observe it (#276), while a path in
+   * another mount's directory is refused before this, and passed over by any
+   * pass. Answers the pass's report on the path, and why the pass decided
+   * nothing where it did (undecidedOf), which leaves disk unchecked. The
+   * caller holds the mount's turn.
    */
   private async ensureSynced(mount: MountState, relativePath: string): Promise<{ report: PathReport | undefined; undecided: string | null }> {
     const store = this.getStore();
@@ -3903,21 +3928,52 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * A file's bytes for read, from where the mount keeps what it reads: the
-   * workspace's copy, taken in from disk first where it holds none
-   * (ensureSynced); or, on a direct mount, disk's file as it is now
-   * (bytesOnDisk). An error says why there are none to read.
+   * A file's bytes for read, and the notes that say which copy they are. On a
+   * 'chronicle' mount it's the workspace's copy, after a pass over the path
+   * takes disk's change to it in first. On a direct mount it's disk's file as
+   * it is now (bytesOnDisk), with no notes, since nothing else is kept. An
+   * error says why there are none to read.
    */
-  private async bytesOf(mount: MountState, relativePath: string, path: string): Promise<{ bytes: Buffer } | { error: string }> {
-    if (mount.direct) return this.bytesOnDisk(mount, relativePath, path);
+  private async bytesOf(mount: MountState, relativePath: string, path: string): Promise<{ bytes: Buffer; notes: string[] } | { error: string }> {
+    if (mount.direct) {
+      const read = await this.bytesOnDisk(mount, relativePath, path);
+      return 'error' in read ? read : { bytes: read.bytes, notes: [] };
+    }
     const store = this.getStore();
-    return this.withMount(mount, async () => {
-      const { report } = await this.ensureSynced(mount, relativePath);
+    return this.withMount(mount, async (): Promise<{ bytes: Buffer; notes: string[] } | { error: string }> => {
+      // A read shows the path as disk holds it now: a change on disk to a
+      // file the workspace holds is taken in first, by the rule a listing
+      // uses, as an edit's is. Where the stored copy is a draft and disk
+      // changed too, the read shows the draft and names the conflict. The
+      // pass names the path, as a file tool names the one it acts on, so a
+      // path the mount passes over by design is observed, as a sync naming
+      // it would observe it (#276).
+      const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
+      // A pass that decided nothing (undecidedOf: the selected branch kept
+      // changing) leaves no report. It's read as a copy disk couldn't be
+      // checked, with its reason, so the answer says the check didn't finish.
+      const undecided = undecidedOf(pass);
+      const report = pass.reports.get(relativePath)
+        ?? (undecided !== null ? { path: relativePath, state: 'unverified' as const, note: undecided } : undefined);
+      // A check that decided nothing may well finish on the next read, as
+      // grep's answer to the same says of grep.
+      const again = undecided !== null ? ['Read again to check it.'] : [];
+      // A mode taken in alone isn't a change to the text, so it leaves the
+      // read nothing to say, as it leaves an edit nothing.
+      const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op && !o.modeOnly);
       const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) return { error: this.notInWorkspace(path, report) };
+      if (!entry) {
+        // A pass also drops a copy disk made binary or too large, which
+        // the disk-only answer describes; any other drop is disk's deletion.
+        return {
+          error: took('deleted') && report?.state !== 'disk-only'
+            ? `File not found: ${path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
+            : [this.notInWorkspace(path, report), ...again].join(' '),
+        };
+      }
       const blob = store.getBlob(entry.blobHash);
       if (!blob) return { error: `Blob not found for: ${path}` };
-      return { bytes: blob };
+      return { bytes: blob, notes: [...whichCopyRead(report, took('modified'), mount.config.mode === 'read-only'), ...again] };
     });
   }
 
@@ -3962,92 +4018,38 @@ export class WorkspaceModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleRead(input: ReadInput, generatedContent?: string): Promise<ToolResult> {
+  /**
+   * A read's page, held to `maxChars`, the most of this call's result that
+   * can reach its caller whole. A call that carries none, made in process,
+   * takes the data itself: its page holds to its line limit alone, with every
+   * line whole, as it did before pages had a budget.
+   */
+  private async handleRead(input: ReadInput, maxChars: number | undefined, generatedContent?: string): Promise<ToolResult> {
     const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
-    const offsetChars = input.offsetChars ?? 0;
-    const limitChars = input.limitChars ?? 2000;
     // Each number is a whole number of at least its schema's minimum by now
     // (inputProblem).
     if (characterPaging && (input.offset !== undefined || input.limit !== undefined)) {
       return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
     }
-    let content = generatedContent;
-    if (content === undefined) {
+    let file: FileText;
+    let notes: string[] = [];
+    if (generatedContent === undefined) {
       const { mount, relativePath, path } = await this.parseFilePath(input.path);
       input = { ...input, path };
       const found = await this.bytesOf(mount, relativePath, path);
       if ('error' in found) return { success: false, error: found.error, isError: true };
-      content = found.bytes.toString('utf-8');
+      file = fileText(found.bytes);
+      notes = found.notes;
+    } else {
+      file = fileText(Buffer.from(generatedContent, 'utf-8'));
     }
-    if (characterPaging) {
-      const start = Math.min(offsetChars, content.length);
-      const splitsPair = (at: number): boolean =>
-        at > 0 && at < content.length
-        && content.charCodeAt(at - 1) >= 0xd800 && content.charCodeAt(at - 1) <= 0xdbff
-        && content.charCodeAt(at) >= 0xdc00 && content.charCodeAt(at) <= 0xdfff;
-      if (splitsPair(start)) {
-        return { success: false, isError: true, error: 'offsetChars splits a surrogate pair; use nextOffsetChars from the previous page.' };
-      }
-      let end = start + Math.min(limitChars, content.length - start);
-      if (splitsPair(end)) end++;
-      return {
-        success: true,
-        data: {
-          path: input.path,
-          totalChars: content.length,
-          offsetChars: start,
-          nextOffsetChars: end < content.length ? end : null,
-          content: content.slice(start, end),
-        },
-      };
-    }
-    const lines = linesOf(content);
-
-    // Apply offset/limit. An unlimited read of a large file would inject the
-    // whole thing into the turn (a 2MB file ≈ 600k tokens → the request blows
-    // past the model context and 400s), so an omitted limit falls back to a
-    // default cap; the result reports total/from/to so the agent can page.
-    const DEFAULT_READ_LINE_LIMIT = 2000;
-    const startLine = (input.offset ?? 1) - 1; // Convert to 0-indexed
-    if (startLine >= lines.length) {
-      // Nothing to show: an empty file, or an offset past the last line. No
-      // range is claimed, and the line count says where the file ends.
-      return {
-        success: true,
-        data: {
-          path: input.path,
-          totalLines: lines.length,
-          // Reading an empty file from its start is reading it whole.
-          ...(startLine > 0
-            ? { note: `Line ${startLine + 1} is past the end: the file has ${lines.length} line${lines.length === 1 ? '' : 's'}.` }
-            : {}),
-          content: '',
-        },
-      };
-    }
-    const effectiveLimit = input.limit ?? DEFAULT_READ_LINE_LIMIT;
-    const endLine = startLine + effectiveLimit;
-    const slice = lines.slice(startLine, endLine);
-    const truncated = endLine < lines.length;
-
-    // Format with line numbers (cat -n style)
-    const formatted = slice
-      .map((line, i) => `${String(startLine + i + 1).padStart(6)}\t${line}`)
-      .join('\n');
-
-    return {
-      success: true,
-      data: {
-        path: input.path,
-        totalLines: lines.length,
-        fromLine: startLine + 1,
-        toLine: Math.min(endLine, lines.length),
-        ...(truncated
-          ? { note: `Truncated at ${effectiveLimit} lines (file has ${lines.length}). Use offset/limit to read more.` }
-          : {}),
-        content: formatted,
-      },
-    };
+    // An unlimited read of a large file would inject the whole thing into the
+    // turn (a 2MB file ≈ 600k tokens → the request blows past the model
+    // context and 400s), so an omitted limit falls back to a default, and a
+    // page stops at the call's result limit where it has one.
+    return characterPaging
+      ? characterPage(input.path, file, input.offsetChars ?? 0, input.limitChars ?? 2000, maxChars, notes)
+      : linePage(input.path, file, input.offset ?? 1, input.limit ?? DEFAULT_READ_LINE_LIMIT, maxChars, notes);
   }
 
   private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
@@ -4403,15 +4405,12 @@ export class WorkspaceModule implements Module {
           change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
         })), () => { committed = true; });
         if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, { refused, modeKept }, maxChars);
-        return {
-          success: true,
-          data: editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
-            path: target.path,
-            plan,
-            notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
-            modeKept: modeKept.get(target.relativePath) ?? null,
-          })), given.length, maxChars),
-        };
+        return editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
+          path: target.path,
+          plan,
+          notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
+          modeKept: modeKept.get(target.relativePath) ?? null,
+        })), given.length, maxChars);
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4794,15 +4793,12 @@ export class WorkspaceModule implements Module {
       }
     }
     this.recordDirectWrite(mount, agentName);
-    return {
-      success: true,
-      data: editReceipt(tool, staged.map(({ target, staged: file }) => ({
-        path: target.path,
-        plan: plans.find((p) => p.target === target)!.plan,
-        notes: [reread(target, 'applied to'), linksNote(target.path, file, tool)].filter((note): note is string => note !== null),
-        modeKept: null,
-      })), editCount, maxChars),
-    };
+    return editReceipt(tool, staged.map(({ target, staged: file }) => ({
+      path: target.path,
+      plan: plans.find((p) => p.target === target)!.plan,
+      notes: [reread(target, 'applied to'), linksNote(target.path, file, tool)].filter((note): note is string => note !== null),
+      modeKept: null,
+    })), editCount, maxChars);
   }
 
   /**
@@ -5271,15 +5267,26 @@ export class WorkspaceModule implements Module {
     // starts there: past the walk's cap, a walk of the whole scope can stop
     // before it gets there. In the mount a pattern's first segment names, the
     // pattern is read mount-prefixed (prefixedGlob), from its rest's directory
-    // within `path`.
+    // within `path`. A `path` that directory can't overlap leaves no file the
+    // pattern can match, so the glob is refused, as grep's is, saying how
+    // the pattern is read, rather than answered with no matches; but a path
+    // in another mount's directory is that mount's, and is said so, as grep
+    // says it. Only a `path` can do either, and it names one mount, so
+    // nothing has been searched yet.
     const patternDir = literalDirOf(input.pattern);
-    for (const { mount, relativePath } of mountsToSearch) {
+    for (const { mount, relativePath, moved, root } of mountsToSearch) {
       const prefixed = prefixedGlob(input.pattern, mount.config.name);
       let start: string;
       let matched: (path: string) => boolean;
       if (prefixed) {
         const dir = deeperOf(relativePath, prefixed.dir);
-        if (dir === null) continue;
+        if (dir === null) {
+          if (this.holderOf(mount.config.name, relativePath, false, moved)) {
+            incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
+            continue;
+          }
+          return { success: false, error: await this.disjointRefusal('glob', input.path!, input.pattern, true, mount, relativePath, root), isError: true };
+        }
         start = await this.walkStart(mount, relativePath, dir === relativePath ? '' : dir.slice(relativePath ? relativePath.length + 1 : 0));
         matched = (path: string) => prefixed.regex.test(path);
       } else {
@@ -5314,11 +5321,19 @@ export class WorkspaceModule implements Module {
     }
 
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
-    // The filter matches mount-relative paths, so every file it lets through
-    // lies beneath its literal directory, and the walk starts at the deeper of
-    // that and `path`. In the mount a filter's first segment names, its
-    // mount-prefixed reading takes the filter's place (below).
+    // The filter matches mount-relative paths, from the mount's root whatever
+    // the `path`, so every file it lets through lies beneath its literal
+    // directory, and the walk starts at the deeper of that and `path`. In the
+    // mount a filter's first segment names, its mount-prefixed reading takes
+    // the filter's place (below). One with no "/" also matches a file's name,
+    // wherever the file lies, as ripgrep's --glob does: "*.ts" lets every .ts
+    // file through, where tested against the path alone it let through only
+    // those at the mount's root. The path is still tried, so a "**" in such a
+    // filter spans directories as it did, and nothing it let through before
+    // is lost. A filter read mount-prefixed always holds a "/" after the
+    // mount's name, so it never takes the name test.
     const filterDir = input.glob ? literalDirOf(input.glob) : '';
+    const byName = fileGlob !== null && !input.glob!.includes('/');
     const contextBefore = input.contextBefore ?? 0;
     const contextAfter = input.contextAfter ?? 0;
 
@@ -5335,12 +5350,30 @@ export class WorkspaceModule implements Module {
     }
 
     type GrepMatch = { line: number; text: string; context?: string[] };
-    const results: Array<{ file: string; state?: string; version: GrepText['version']; matches: GrepMatch[] }> = [];
+    type Searched = { lineEndings?: 'CRLF' | 'mixed'; matches: GrepMatch[] };
+    const results: Array<{ file: string; state?: string; version: GrepText['version'] } & Searched> = [];
     const skipped: GrepSkip[] = [];
     const incomplete: Array<{ path: string; reason: string }> = [];
 
-    const search = (content: string): GrepMatch[] => {
-      const lines = linesOf(content);
+    // Lines as read shows them (fileText): a CRLF end's CR is left out, for
+    // matching as well as display, unless the line's own text ends in a CR, so
+    // `foo$` finds a CRLF file's line, as it does under ripgrep's --crlf, and
+    // the line copies into an edit as read's do. ripgrep's --crlf still prints
+    // the line with its CR.
+    //
+    // Whether a file has CRLF ends or a BOM is a fact about the file, not a
+    // line, so each searched file that has either is kept here by its path,
+    // for the note on a pattern that names a CR or U+FEFF to name it. A
+    // conflict's disk version is kept, for each, only where the workspace's
+    // copy of its path doesn't have it, and is named as that version, since
+    // read doesn't show it.
+    const crlfFiles = new Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>();
+    const bomFiles = new Map<string, GrepText['version']>();
+    const search = (text: GrepText): Searched => {
+      const { lines, crlfEnds, lfEnds, bom } = fileText(text.bytes);
+      const lineEndings = crlfEnds > 0 ? (lfEnds > 0 ? 'mixed' : 'CRLF') : undefined;
+      if (lineEndings !== undefined && !crlfFiles.has(text.file)) crlfFiles.set(text.file, { ends: lineEndings, version: text.version });
+      if (bom && !bomFiles.has(text.file)) bomFiles.set(text.file, text.version);
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -5353,7 +5386,7 @@ export class WorkspaceModule implements Module {
           found.push(match);
         }
       }
-      return found;
+      return { ...(lineEndings !== undefined ? { lineEndings } : {}), matches: found };
     };
 
     for (const { mount, relativePath, moved, root } of mountsToSearch) {
@@ -5367,19 +5400,26 @@ export class WorkspaceModule implements Module {
       }
       // In the mount a filter's first segment names, the filter is read
       // mount-prefixed (prefixedGlob), from its rest's directory. A `path` and
-      // a filter whose directories don't overlap leave no file the filter can
-      // let through, so nothing is searched.
+      // a filter whose directories, in the reading this mount takes, don't
+      // overlap leave no file the filter can let through, so the grep is
+      // refused, saying how the filter is read, rather than answered with no
+      // matches: written relative to the `path`, as glob's pattern is, it
+      // names nothing there. Only a `path` can do this, and it names one
+      // mount, so nothing has been searched yet.
       const prefixed = input.glob ? prefixedGlob(input.glob, mount.config.name) : null;
       const deeper = deeperOf(relativePath, prefixed ? prefixed.dir : filterDir);
-      if (deeper === null) continue;
+      if (deeper === null) {
+        return { success: false, error: await this.disjointRefusal('grep', input.path!, input.glob!, prefixed !== null, mount, relativePath, root), isError: true };
+      }
       const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
       const searched = (text: GrepText): void => {
-        const matches = search(text.text);
-        if (matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, matches });
+        const hits = search(text);
+        if (hits.matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, ...hits });
       };
       const kept = prefixed
         ? (path: string): boolean => prefixed.regex.test(path)
-        : (path: string): boolean => fileGlob === null || fileGlob.test(path);
+        : (path: string): boolean => fileGlob === null || fileGlob.test(path)
+          || (byName && fileGlob.test(path.slice(path.lastIndexOf('/') + 1)));
       const found = mount.direct
         ? await this.textsFromDisk(mount, relativePath, root, start, kept, searched)
         : await this.textsFromStore(mount, relativePath, start, kept, searched);
@@ -5387,16 +5427,45 @@ export class WorkspaceModule implements Module {
       incomplete.push(...found.incomplete);
     }
 
-    return {
-      success: true,
-      data: {
-        pattern: input.pattern,
-        results,
-        totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
-        ...(skipped.length > 0 ? { skipped } : {}),
-        ...(incomplete.length > 0 ? { incomplete } : {}),
-      },
+    const answer: GrepAnswer = {
+      pattern: input.pattern,
+      results,
+      totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
+      // A pattern written for a CR can't find a CRLF end's, nor one written
+      // for U+FEFF a BOM, which lines as read shows them leave out, so the
+      // answer says why it didn't, and names the files that have them.
+      ...leftOutNote(input.pattern, crlfFiles, bomFiles, this.anyRunsDirect()),
+      ...(skipped.length > 0 ? { skipped } : {}),
+      ...(incomplete.length > 0 ? { incomplete } : {}),
     };
+    return textAnswer(grepText(answer, contextBefore), { ...answer });
+  }
+
+  /**
+   * Why a grep or a glob whose `path` (`given`, in the mount at
+   * `relativePath`) and filter or pattern can't overlap did nothing. grep's
+   * filter is matched from the mount's root, and in the mount its first
+   * segment names, either tool's is read mount-prefixed (`prefixed`), from
+   * that mount's root; either way no file at or beneath the path can pass
+   * it. Where the path isn't a file, it names the one that reaches beneath
+   * it, the one meant if it was written relative to the path, mount-prefixed
+   * as the tools write paths: the path's own `{`, `}`, `*` and `?` stand as
+   * `?`, which matches each of them, and since the search stays beneath the
+   * path, a `?` that would match a sibling's name too takes nothing in from
+   * outside it. One with an empty, `.` or `..` segment gets no suggestion,
+   * since no path holds such a segment. Segments are read as written, so one
+   * a brace group splits around isn't told apart.
+   */
+  private async disjointRefusal(tool: 'grep' | 'glob', given: string, filter: string, prefixed: boolean, mount: MountState, relativePath: string, root: string): Promise<string> {
+    const name = mount.config.name;
+    const rest = prefixed ? filter.slice(filter.indexOf('/') + 1) : filter;
+    const read = `The ${tool} did nothing: its ${tool === 'grep' ? 'glob' : 'pattern'} ${JSON.stringify(filter)} `
+      + (prefixed ? `is read mount-prefixed, from the root of mount ${JSON.stringify(name)}` : 'is matched against paths from the mount\'s root');
+    if (await this.namesFile(mount, relativePath, root)) return `${read}, so ${JSON.stringify(given)} doesn't match it.`;
+    const within = `${read}, so no file within ${JSON.stringify(given)} matches it.`;
+    if (rest.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')) return within;
+    const reaching = `${name}/${relativePath.replace(/[{}*?]/g, '?')}/${rest}`;
+    return `${within} To ${tool === 'grep' ? 'filter' : 'match'} beneath it, write ${JSON.stringify(reaching)}.`;
   }
 
   /**
@@ -5490,7 +5559,7 @@ export class WorkspaceModule implements Module {
         const entry = store.treeGet(mount.treeStateId, report.path);
         const blob = entry ? store.getBlob(entry.blobHash) : null;
         if (blob) {
-          each({ file, state: report.state, version: 'workspace', text: blob.toString('utf-8') });
+          each({ file, state: report.state, version: 'workspace', bytes: blob });
         } else if (entry) {
           skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
         }
@@ -5504,7 +5573,7 @@ export class WorkspaceModule implements Module {
         const changed = report.conflict?.diskChangedSinceRecorded === true;
         const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
         if (diskBlob) {
-          each({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', text: diskBlob.toString('utf-8') });
+          each({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', bytes: diskBlob });
         }
         if (disk?.stored && !diskBlob) {
           skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
@@ -5557,7 +5626,7 @@ export class WorkspaceModule implements Module {
       const what = { size: read.size, ...(mimeType ? { mimeType } : {}) };
       if (read.bytes === null) skipped.push({ file, reason: `over the size limit (${maxSize} bytes)`, ...what });
       else if (looksBinary(read.head)) skipped.push({ file, reason: 'binary: a NUL in its first 8 KB', ...what });
-      else each({ file, version: 'disk', text: read.bytes.toString('utf-8') });
+      else each({ file, version: 'disk', bytes: read.bytes });
     });
     return { skipped, incomplete: incomplete.map((region) => ({ path: `${name}/${region.path}`, reason: region.reason })) };
   }
@@ -6130,9 +6199,9 @@ export class WorkspaceModule implements Module {
    * on disk (a shell command's files, a deletion) is in the workspace when the
    * agent next looks. On a mount over its walkCap, that holds for the first
    * walkCap entries in the walk's order, which every batch's scan takes; files
-   * past them come in through syncs and the listings that reach them, while a
-   * read takes in only a file the workspace doesn't hold yet. A scan that
-   * outlasts the deadline stops holding the round: the miss is recorded on
+   * past them come in through syncs, the listings that reach them, and a read
+   * of the path, which takes disk's change in first as a listing does. A scan
+   * that outlasts the deadline stops holding the round: the miss is recorded on
    * the mount's status and pushed as a `workspace:agent-action-scan-incomplete`
    * event, and the scan continues, deciding on the branch selected when it
    * applies.
@@ -6291,13 +6360,14 @@ export class WorkspaceModule implements Module {
 
 /**
  * A text grep searches (textsFromStore, textsFromDisk): its mount-prefixed
- * file, which copy it is, and on a 'chronicle' mount, the path's state.
+ * file, which copy it is, on a 'chronicle' mount the path's state, and its
+ * bytes, whose lines grep matches as read shows them (fileText).
  */
 interface GrepText {
   file: string;
   state?: string;
   version: 'workspace' | 'conflicting-disk' | 'recorded-disk' | 'disk';
-  text: string;
+  bytes: Buffer;
 }
 
 /** A file, or a copy of one, grep doesn't search, with why. */
@@ -6714,14 +6784,43 @@ function storedButUnfinished(
 }
 
 /**
- * A text's lines, as read and grep number them: a final line end ends the
- * last line rather than starting an empty one, so "a\nb\n" is two lines,
- * and an empty text has none.
+ * What a read says about the copy it shows, when that isn't simply the one the
+ * workspace last agreed on with disk: disk's newer text, taken in first; the
+ * workspace's copy, because disk's couldn't be checked or disk has none that
+ * anything accounts for; or a draft in conflict with disk's change. A file
+ * the workspace didn't hold has no older copy, so taking it in needs no word.
+ * A conflict's note names the ways to settle it that work on the path's mount.
  */
-function linesOf(content: string): string[] {
-  const lines = content.split('\n');
-  if (lines.at(-1) === '') lines.pop();
-  return lines;
+function whichCopyRead(report: PathReport | undefined, tookChange: boolean, readOnly: boolean): string[] {
+  if (tookChange) {
+    return ['Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and this read shows that text.'];
+  }
+  if (report?.state === 'unverified') {
+    return [`The path couldn't be checked against disk (${report.note ?? 'not observed'}), so this read shows the workspace's copy.`];
+  }
+  if (report?.state === 'disk-missing-provenance-unknown') {
+    return ['Disk has no copy of this file, and nothing records whether it was deleted there, so this read shows the workspace\'s copy.'];
+  }
+  if (report?.state === 'conflict') {
+    const kind = report.conflict?.kind ?? 'both-changed';
+    // A sync takes disk's state as it is now, which a recorded conflict's kind
+    // doesn't follow: where disk has no copy, the sync takes its deletion, and
+    // the workspace's copy goes with it. Where disk has one, the sync keeps it
+    // and gives up the workspace's, taking disk's in only where the workspace
+    // can hold it (not binary or too large). A read-only mount can hold a
+    // copy disk doesn't, such as one a branch switch selected, but a
+    // materialize, forced or not, writes nothing to it.
+    const sync = report.diskNow === 'absent'
+      ? 'Sync the path to take disk\'s deletion, which removes the workspace\'s copy'
+      : 'Sync the path to keep disk\'s copy and give up the workspace\'s';
+    const force = readOnly
+      ? '. The mount is read-only, so nothing writes the workspace\'s copy to disk.'
+      : report.diskNow === 'absent'
+        ? ', or materialize it with force to write the workspace\'s copy back to disk.'
+        : ', or materialize it with force to write the workspace\'s over disk\'s.';
+    return [`The path is in conflict with disk (${kind}): this read shows the workspace's copy. ${sync}${force}`];
+  }
+  return [];
 }
 
 /**
@@ -6790,6 +6889,87 @@ function inputProblem(
     }
   }
   return null;
+}
+
+/** How many files a grep note names before it gives the count of the rest. */
+const NOTE_FILES_MAX = 20;
+
+/**
+ * The files a grep note names, in the order grep searched them, as its
+ * results are: at most NOTE_FILES_MAX of them, then how many more and how to
+ * see them. Each is named by its mount-prefixed path, with what `detail` says
+ * of it.
+ */
+function namedFiles<T>(files: Map<string, T>, detail: (value: T) => string): string {
+  const names = [...files.keys()];
+  const shown = names.slice(0, NOTE_FILES_MAX).map((name) => `${name}${detail(files.get(name)!)}`);
+  const rest = names.length - shown.length;
+  return `${shown.join(', ')}${rest > 0 ? `, and ${rest} more; narrow with path or glob` : ''}`;
+}
+
+/** What a note says of a conflict's disk version, which read doesn't show. */
+const ofVersion = (version: GrepText['version']): string =>
+  version === 'conflicting-disk' || version === 'recorded-disk' ? ` in its ${version} version` : '';
+
+/**
+ * grep's note for a pattern that names a character its lines leave out, where
+ * a file it searched has one: it says how many files searched have it and
+ * names them, so a search for a CR or a BOM still finds the files that have
+ * them. The CR note gives each file's ends, CRLF or mixed, and either note
+ * names a conflict's disk version as that version. The note says a
+ * character read shows it in the workspace's copy, since grep also searches a
+ * conflict's disk version, which read doesn't show. A direct mount keeps no
+ * workspace copy, and its read shows disk's file, so on a host with one
+ * (`direct`) the note names that too, as the tools' descriptions mention
+ * direct mounts only on such a host.
+ */
+function leftOutNote(
+  pattern: string,
+  crlfFiles: Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>,
+  bomFiles: Map<string, GrepText['version']>,
+  direct: boolean,
+): { note?: string } {
+  if (crlfFiles.size === 0 && bomFiles.size === 0) return {};
+  const named = namedLeftOut(pattern);
+  const onDisk = direct ? ', or in disk\'s file on a direct mount' : '';
+  const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? `file searched ${one}` : `files searched ${many}`}`;
+  const notes = [
+    named.cr && crlfFiles.size > 0
+      ? `The pattern names a CR, and ${count(crlfFiles.size, 'has', 'have')} CRLF line ends: `
+        + `${namedFiles(crlfFiles, ({ ends, version }) => ` (${ends}${ofVersion(version)})`)}. Lines are matched as read shows them, `
+        + `which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy${onDisk}.`
+      : null,
+    named.bom && bomFiles.size > 0
+      ? `The pattern names U+FEFF, and ${count(bomFiles.size, 'starts', 'start')} with a BOM: `
+        + `${namedFiles(bomFiles, (version) => (ofVersion(version) ? ` (${ofVersion(version).slice(1)})` : ''))}. Lines are matched as read shows them, `
+        + `and a BOM isn't part of the first line. read with offsetChars shows any BOM ${direct ? `in the workspace's copy${onDisk}` : 'the workspace\'s copy has'}.`
+      : null,
+  ].filter((n) => n !== null);
+  return notes.length ? { note: notes.join(' ') } : {};
+}
+
+/**
+ * Which of the characters grep's lines leave out a pattern names: a CR, as a
+ * literal one or as `\r`, `\x0d`, `\u000d`, `\cM`, `\015` or a backslash
+ * before a literal CR; and U+FEFF, as a literal one, `\uFEFF` or a backslash
+ * before a literal one. An escape counts only where its backslash isn't itself
+ * escaped. A pattern compiled without flags can match a CR other ways too,
+ * such as `\15` in a pattern of fewer than 15 groups or a class range that
+ * spans U+000D, and those go unnoticed.
+ */
+function namedLeftOut(pattern: string): { cr: boolean; bom: boolean } {
+  const named = { cr: false, bom: false };
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] === '\r') named.cr = true;
+    else if (pattern[i] === '\uFEFF') named.bom = true;
+    else if (pattern[i] === '\\') {
+      const next = pattern.slice(i + 1, i + 6);
+      if (/^(?:r|\r|x0[dD]|u000[dD]|c[mM]|015)/.test(next)) named.cr = true;
+      else if (/^(?:u[fF][eE][fF][fF]|\uFEFF)/.test(next)) named.bom = true;
+      i++;
+    }
+  }
+  return named;
 }
 
 /**

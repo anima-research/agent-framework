@@ -1,9 +1,11 @@
 /**
- * A context injection, a hook's or a module's, isn't stored, so it goes out
- * as given in every request while it's injected. A lone UTF-16 surrogate in
- * its text or its namespace reaches the request as U+FFFD, as the context
- * store would keep it: a provider refuses a request that carries a lone half
- * (#695).
+ * A context injection, a hook's or a module's, reaches the request well
+ * formed whichever way it gets there: placed by compile() at each start, as
+ * one given straight to an Agent's inference is, or stored first, as a
+ * start stores an afterUser one (stored-injections.ts, whose tests pin the
+ * stored row's form too). A lone UTF-16 surrogate in its text or its
+ * namespace reaches the request as U+FFFD, as the context store would keep
+ * it: a provider refuses a request that carries a lone half (#695).
  */
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';

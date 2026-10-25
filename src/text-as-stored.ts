@@ -4,9 +4,10 @@
  * request compiles comes from the store, which writes a lone UTF-16
  * surrogate as U+FFFD, and a provider refuses a request carrying one (#695).
  * Two things reach a request without the store, and each is made well formed
- * where it leaves for it: context injections, as an Agent compiles them into
- * a request, and the copies a tool boundary injects into the live round, as
- * they go to the stream.
+ * where it leaves for it: context injections compile() places (those not
+ * stored, stored-injections.ts), as an Agent compiles them into a request,
+ * and the copies a tool boundary injects into the live round, as they go to
+ * the stream. A stored injection takes the same form before it's stored.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';

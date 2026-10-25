@@ -91,7 +91,7 @@ function call(m: WorkspaceModule, name: string, input: Record<string, unknown> =
 async function data<T = Record<string, unknown>>(m: WorkspaceModule, name: string, input: Record<string, unknown> = {}): Promise<T> {
   const result = await call(m, name, input);
   assert.equal(result.success, true, `${name} ${JSON.stringify(input)}: ${result.error}`);
-  return result.data as T;
+  return (result.structured ?? result.data) as T;
 }
 
 async function failure(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<string> {

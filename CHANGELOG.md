@@ -12,6 +12,172 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.26.2 — 2026-10-24
+
+### Fixed
+
+- A turn whose call failed into a provider hold (a provider's stated wait, a
+  host's `providerHold`, or an organization-acceleration cooldown), or whose
+  compile a conversation agent's recorded wait held with nothing sent, now
+  counts as alive until the hold releases its retry, and so does a turn
+  whose error-policy retry a provider wait holds at the last admission
+  boundary before it starts (a conversation agent's own compression can
+  record one during the policy's delay). The host used to report it
+  `drained`, and a rollback, suppression or branch switch went through,
+  after which the retry ran on the rewound store, answering again on history
+  rewound under it. Now:
+  - `getHostModeStatus()` lists the agent in `activeTurnAgents` and counts it
+    in `activeTurns`, and `drained` reads `false`;
+  - a rollback, suppression or branch switch refuses as `agent-busy`, naming
+    the hold, its end (or `until released`) and its reason, and how to go on
+    sooner: a quiesce with `abandon: true`, or, where a stated wait holds the
+    turn, `release-provider-wait`;
+  - a quiesce waits for the turn, up to its `timeoutMs` (at least 1 s),
+    where it used to report drained at once, and lets the retry start when
+    the hold ends and finish; wakes that arrive meanwhile park, as for any
+    turn alive;
+  - a quiesce with `abandon: true` (once its wait for the drain runs out, or
+    at once on a host already quiesced), `stop()`, the inference policy, the
+    agent's removal or a conversation agent's disposal drops the retry, and
+    the turn ends with one `inference:aborted`, as a turn whose continuation
+    is dropped does;
+  - a closing conversation agent isn't disposed while a hold keeps its
+    turn's retry, nor while a continuation of its turn (a budget restart or
+    a tool-result guard's retry) waits in a hold, a park or a scheduler pass;
+  - once `stop()` has closed admission, a failure reported then installs no
+    hold, so no retry outlives the stop, and the turn ends with an
+    `inference:aborted` after its `inference:failed`, as a retry a stop
+    cancels does;
+  - a puppet tool call is refused while the retry waits, as during any live
+    turn, naming the hold and how to go on sooner;
+  - `abortInference()` ends the turn, and a turn whose budget restart or
+    tool-result guard's retry waits held or parked, where it reported
+    nothing to stop and the turn ran once the hold ended: one
+    `inference:aborted` with the stop's reason, and it returns `true`. Wakes
+    that arrived meanwhile still run: those the hold keeps beside the retry,
+    and those merged into the retry's or the continuation's start before it
+    began, which the stop puts back in the queue. A hold of such wakes alone
+    still has nothing to stop. From a listener of a failed stream's
+    `inference:failed` it reports `false`, as before (a turn's start that
+    fails still takes a listener's stop at its own check): every failure
+    site now reports `inference:failed` before a hold takes the turn's
+    retry, where a stream that throws, and the hold a conversation agent's
+    compile meets, used to hold it first;
+  - a quiesce with `abandon: true` puts back the wakes merged into a held
+    retry's or a continuation's start that hadn't begun, as a caller's stop
+    through `abortInference()` does: they park under the quiesce and run at
+    resume. Under a quiesce, a held retry starts alone, and the wakes merged
+    into its start before the quiesce park until resume. An abandon of a budget
+    restart's start merged with other wakes used to drop those wakes with
+    it, so their messages went unanswered until something else woke the
+    agent.
+
+  A wake a hold keeps at admission, with no turn of its own begun, keeps no
+  turn alive, as before.
+
+- What an MCPL peer's content block carries in its other fields now
+  reaches a script with RFC-005's treatment at any depth, as the block
+  itself does: an RFC-005 reference there arrives as its stub's facts,
+  bound to that server and not fetched for the script (its `savedTo` is
+  null unless an earlier fetch saved that URI), one the classifier
+  rejects as its notice, and inline data that also claims a URI of any
+  type, an empty one included, or a disposition, as the withheld notice.
+  Before, such fields reached a script whole, references' URIs included.
+  `structuredContent` still reaches a script whole, from every tool, in
+  any result that can be converted to JSON.
+
+## 0.26.1 — 2026-10-23
+
+### Added
+
+- `HostModeStatus.activeTurnAgents` lists, sorted, the agents with a turn
+  alive, the ones `activeTurns` counts: each from its turn's dequeue to its
+  settled teardown, so a turn in its hooks or compile, one finishing its
+  deliveries, or one whose continuation is on its way to its start, is
+  listed. So a host can record which agents are mid-turn before it abandons
+  their turns or stops.
+
+### Changed
+
+- `stop()` ends a turn whose continuation hasn't started, as `shutdown`,
+  with the continuation dropped.
+- A budget restart's `inference:stream_restarted`, and its boundary's usage
+  report, now come after its continuation is queued and its stream
+  cancelled.
+  A restart boundary reached while the framework is stopping emits no
+  `inference:stream_restarted` and queues no continuation: the turn ends as
+  `shutdown`.
+
+### Fixed
+
+- A coalesced `push/event` or `channels/incoming` message whose receipt the
+  host couldn't write is no longer admitted again when the producer retries.
+  The failed write was answered "host could not persist the acceptance; retry"
+  after the occurrence's effects were in, and no receipt was kept. So each
+  retry was a fresh admission: a copy the agent had read arrived again, a
+  deferred notice rendered again, a deletion notice was appended again, and the
+  answer named the occurrence's own eventId as `priorEventId`. Now the receipt
+  is kept. A retry writes it again and makes it durable, then answers the first
+  result without repeating an effect, as RFC-006 §3.1 has a coalescing host
+  do. While the write keeps failing, each retry gets the same answer and
+  repeats nothing. A host killed before a later save and commit carried the
+  receipt still admits the retry as a new occurrence.
+- On `channels/incoming`, a coalesced message admitted whose receipt couldn't
+  be written or made durable was answered `accepted: false`, which says it
+  wasn't admitted, so a producer could hold it as never delivered. The request
+  is now answered with a -32000 error carrying the same message, since a
+  per-message result can only say a message was taken or wasn't, and the
+  messages after it in the request aren't admitted until they're sent again.
+  An uncoalesced message before it in the same request is admitted again when
+  the request is sent again. A retry of an admitted message while the host is
+  stopping fails the request the same way. A failure before any effect, such
+  as "host is stopping" for a new message, is still a per-message refusal.
+- A save of the coalescing state that fails is kept for the next save or the
+  host's stop, instead of being dropped until the state next changes.
+
+- A module's blocks in a script's `content` now get the treatment the
+  model's lanes give a module's result, as an MCPL peer's already did,
+  since what a script prints comes back to the model. Such blocks include
+  an MCPL peer's result that a module got through `ctx.callTool` and
+  returns whole. An RFC-005 reference anywhere in them, a `disposition:
+  "never"` one included, arrives without its URI, as the stub's facts an
+  MCPL peer's reference arrives as (`refId`, the labels the block gave,
+  `savedTo`). Inline data that also claims a URI, of any type, or a
+  disposition arrives as the withheld notice; a null or absent URI is
+  none, and in a module's result so is an empty one, as the model's
+  history reads it. A reference the classifier
+  rejects arrives as its notice; that includes an MCP-form embedded
+  resource, whose URI sits under `resource`, which the model's history
+  shows the same way, so a script no longer gets its text. Anything else
+  arrives as the module returned it. Before, a module's structured result
+  reached a script with its blocks as the module returned them,
+  references' URIs included. Which results are a module's is decided by
+  where the dispatch sent the call, not by the tool's name. An MCPL
+  peer's inline data beside a URI that isn't a string, such as an object,
+  now also reaches a script as the withheld notice. `structuredContent`
+  still reaches a script whole, from every tool, and so do fields a server
+  puts outside its content blocks' reference positions.
+
+- A turn whose continuation (a budget restart's, or a tool-result guard's
+  retry) is waiting to start now counts as alive. Between the turn's stream
+  ending and the continuation's start, a stretch that a provider wait stated
+  meanwhile makes as long as the wait, the host used to report `drained`, a
+  `quiesce()` returned drained and the continuation then started while the
+  host was quiesced, and `quiesce({ abandon: true })` found nothing to end.
+  Now `activeTurnAgents` lists the agent, a `quiesce()` waits for the
+  continuation's turn, and an abandon ends the turn with the continuation
+  dropped. A puppet tool call and a branch switch are refused in that
+  stretch, as during any live turn.
+- A turn whose continuation is dropped by an abandon, `stop()`, the
+  inference policy, the agent's removal or a conversation agent's disposal
+  now ends, with one `inference:aborted`. A drop other than an abandon or a
+  stop also releases the EventGate window held for the continuation,
+  closes the turn's logical turn and withholds the tool-result guard's
+  pending batch from later requests, as for a turn that ends before it
+  sends anything. A provider hold left empty by the drop releases without
+  queueing a retry turn. An ephemeral run that ends takes such a
+  continuation with it, its own end having ended the turn.
+
 ## 0.26.0 — 2026-10-23
 
 ### Breaking

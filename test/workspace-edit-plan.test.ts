@@ -16,6 +16,7 @@ import {
   lineNumbersAt,
   planFile,
 } from '../src/modules/workspace/edit-plan.js';
+import { countingCalls } from './helpers/count-calls.js';
 
 const spec = (index: number, oldText: string, newText: string, expected: number | 'all' = 1): EditSpec =>
   ({ index, oldText, newText, expected });
@@ -155,11 +156,12 @@ test("a call counts occurrences past what its edits need only within its budget,
   assert.ok('problems' in problems);
   const left = COUNT_MAX - (5_000_000 - 21);
   assert.deepEqual(problems.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]), [[5_000_000, false, false], [21 + left + 1, true, true], [22, true, true]]);
-  // Two hundred such edits hold the event loop no longer than a few counts.
-  const before = process.cpuUsage();
-  planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'a', 'b')));
-  const used = process.cpuUsage(before);
-  assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
+  // Two hundred such edits share the one budget: past the first two, each
+  // stops one past its free 21.
+  const many = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'a', 'b')));
+  assert.ok('problems' in many);
+  assert.deepEqual(many.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]),
+    [[5_000_000, false, false], [21 + left + 1, true, true], ...Array.from({ length: 198 }, () => [22, true, true])]);
 });
 
 test("a crowded edit whose count the budget stopped short of its ask, or at it, is named by that count where the crowded check names none", () => {
@@ -240,16 +242,26 @@ test("crowded edits whose counts stopped short, where the crowded check names no
   assert.ok('problems' in planned);
   assert.equal(planned.problems.length, 200_001);
   assert.ok(planned.problems.every((p) => p.kind === 'count'));
-  // Where the crowded check names them, their problems aren't made: 200,000
-  // edits of one line of 2,000,000 that a crowded refusal names take no
-  // longer than their counts.
+  // Where the crowded check names them, their problems aren't made. A count
+  // problem finds its matches' lines by searching the text for line feeds, so
+  // over one line of 2,000,000, made for each of 200,000 edits that a crowded
+  // refusal names, those would be a search or more each. The first three
+  // edits count past the 3,000 they ask for before the budget runs out, so
+  // their problems are made, and their searches show that the count sees a
+  // problem being made.
   const line = Buffer.from('a'.repeat(2_000_000));
-  const before = process.cpuUsage();
-  const crowded = planFile(decodeForEdit(line)!, line, Array.from({ length: 200_000 }, (_, k) => spec(k, 'a', 'y', 3_000)));
-  const used = process.cpuUsage(before);
-  assert.ok('problems' in crowded && crowded.problems.some((p) => p.kind === 'crowded'));
-  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
+  const lineFile = decodeForEdit(line)!;
+  const crowdedSpecs = Array.from({ length: 200_000 }, (_, k) => spec(k, 'a', 'y', 3_000));
+  const { result: crowded, calls } = lineFeedSearches(() => planFile(lineFile, line, crowdedSpecs));
+  assert.ok('problems' in crowded);
+  assert.deepEqual(crowded.problems.map((p) => p.kind === 'crowded' ? [p.kind, p.edits.length] : p.kind), ['count', 'count', 'count', ['crowded', 199_997]]);
+  assert.ok(calls >= 1 && calls < 1_000, `${calls} searches for a line feed`);
 });
+
+/** The searches `run` makes for a line feed with indexOf; past 1,000, it throws. */
+function lineFeedSearches<R>(run: () => R): { result: R; calls: number } {
+  return countingCalls(String.prototype, 'indexOf', (args) => args[0] === '\n', 1_000, run);
+}
 
 test("a miss's closest region is the line most like the first 2,000 code units of the old text's first line, its bigrams each counted as often as that line has them", () => {
   // Line 2 is the old text's first 2,000 code units; line 3 its next 3,000.
@@ -268,13 +280,40 @@ test("a miss's closest region is the line most like the first 2,000 code units o
   assert.equal(region('ababababab\nabcx\n', 'abcd'), 2);
 });
 
-test("a miss's closest region over 100,000 lines that share a bigram with the old text takes under 2 s of CPU", () => {
-  const text = 'abc\n'.repeat(100_000);
-  const before = process.cpuUsage();
+test("a miss's closest region, among lines that score alike, is the first of them", () => {
+  // Each line shares "ab" with the old text, for a score of 0.50; the first
+  // such line is the one the hint names.
+  const text = 'abc\n'.repeat(1_000);
   const [miss] = problems(text, [spec(0, 'abd', 'z')]);
   assert.ok(miss?.kind === 'miss' && miss.hint.startsWith('Closest region (line 1, similarity 0.50)'), JSON.stringify(miss));
-  const used = process.cpuUsage(before);
-  assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
+});
+
+test("a miss's closest region clears only the bigram slots each line used, in fewer than ten iterator steps a line", () => {
+  // After each line, closestRegion clears only the slots that line used
+  // (touched). Never cleared, touched grows by a slot a line, and the search
+  // over 100,000 lines took 5.3 s of CPU rather than 33 ms, on Linux with
+  // Node 24.22.1. The clearing is a for...of over touched, so the child
+  // counts the steps of the array iterator over the search of 1,000 lines:
+  // two a line, one for the line's slot and one to end the loop. Every array
+  // loop in a process goes through the patched next while it's in place, and
+  // V8 may keep a slower path after it's restored, so the count runs in a
+  // child. Past ten steps a line, it throws.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const helperUrl = new URL('./helpers/count-calls.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    const { countingCalls } = await import(${JSON.stringify(helperUrl)});
+    const bytes = Buffer.from('abc\\n'.repeat(1_000));
+    const file = decodeForEdit(bytes);
+    const arrayIterator = Object.getPrototypeOf([][Symbol.iterator]());
+    const { result, calls } = countingCalls(arrayIterator, 'next', () => true, 10_000,
+      () => planFile(file, bytes, [{ index: 0, oldText: 'abd', newText: 'z', expected: 1 }]));
+    console.log(JSON.stringify({ steps: calls, hint: result.problems[0].hint }));
+  `], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  const { steps, hint } = JSON.parse(child.stdout) as { steps: number; hint: string };
+  assert.ok(hint.startsWith('Closest region (line 1, similarity 0.50)'), hint);
+  assert.ok(steps >= 1_000 && steps < 10_000, `${steps} steps of the array iterator`);
 });
 
 test("in a file with no CRLF line end, the size floor is exact for an old text with line feeds", () => {
@@ -428,28 +467,22 @@ test('a thousand edits of one stretch are named as at most a thousand clashes', 
 test('many edits matching one text cost their replacements, not their pairs at every place', () => {
   // Every pair of these 2,000 edits overlaps at each of 500 places. Walking
   // the pairs at every place, the planner took 34 s on this case, on Linux
-  // with Node 24.22.0; linking past each named edit's replacements takes
-  // 0.3 s. The child reports the CPU time its planning took, which a slow or
-  // throttled machine doesn't stretch as it does the wall clock, and is
-  // stopped at 120 s.
-  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
-  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
-    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
-    const bytes = Buffer.from('x '.repeat(500));
-    const specs = Array.from({ length: 2000 }, (_, index) => ({ index, oldText: 'x', newText: 'y', expected: 'all' }));
-    const before = process.cpuUsage();
-    const planned = planFile(decodeForEdit(bytes), bytes, specs);
-    const used = process.cpuUsage(before);
-    console.log(JSON.stringify({
-      ms: (used.user + used.system) / 1000,
-      problems: planned.problems.map((problem) => [problem.kind, problem.edits, problem.same]),
-    }));
-  `], { encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024 });
-  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
-  const { ms, problems: named } = JSON.parse(child.stdout) as { ms: number; problems: unknown };
-  assert.ok(ms < 5_000, `planning took ${ms} ms of CPU`);
+  // with Node 24.22.0. Each later replacement the walk meets is looked up in
+  // a Set, whether its edit is named, and where it isn't, whether its pair is.
+  // Linking past each named edit's replacements, the walk meets each later
+  // replacement about once, about a million lookups in all; walking the pairs
+  // at every place, it would make about a billion. Past ten times the
+  // 1,000,000 replacements, the count throws; at least half of them shows the
+  // count reaches the walk.
+  const bytes = Buffer.from('x '.repeat(500));
+  const specs = Array.from({ length: 2000 }, (_, index) => spec(index, 'x', 'y', 'all'));
+  const file = decodeForEdit(bytes)!;
+  const { result: planned, calls } = countingCalls(Set.prototype, 'has', () => true, 10_000_000, () => planFile(file, bytes, specs));
+  assert.ok('problems' in planned);
+  assert.ok(calls >= 500_000, `${calls} lookups`);
   // Each edit after the first is named once, with the first, as the same text.
-  assert.deepEqual(named, Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
+  assert.deepEqual(planned.problems.map((problem) => problem.kind === 'clash' && [problem.kind, problem.edits, problem.same]),
+    Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
 });
 
 test('each clash names its own line', () => {
@@ -543,21 +576,44 @@ test("an old text carrying a line's CR at its end matches before a CRLF line end
 test('an old text read without its BOM or CR is found in one pass over a long run of the same', () => {
   // Only the text's start, or a place before a CRLF line end, takes such an
   // old text, so the places it passes over are most of the run. Searching
-  // again from each, the planner compared the old text in full at every
-  // place: 3.3 s of CPU for the first of these and 5.3 s for the second, on
-  // Linux with Node 24.22.0.
+  // again from each with indexOf, the planner compared the old text in full
+  // at every place: 3.3 s of CPU for the first of these and 5.3 s for the
+  // second, on Linux with Node 24.22.0. In one pass, the read form is
+  // searched for by its code units (charCodeAt), a few for each of the
+  // text's, and never with indexOf; the old text as given is, once. Past a
+  // few such searches, or ten code units read for each of the text's, the
+  // counts throw.
   const run = 'a'.repeat(200_000);
   const needle = 'a'.repeat(50_000);
   for (const [text, oldText, newText, after] of [
     [`\uFEFF${run}`, `\uFEFF${needle}`, '\uFEFFb', `\uFEFFb${'a'.repeat(150_000)}`],
     [`${run}\r\n`, `${needle}\r`, 'b\r', `${'a'.repeat(150_000)}b\r\n`],
   ]) {
-    const before = process.cpuUsage();
-    const planned = plan(text!, [spec(0, oldText!, newText!)]);
-    const used = process.cpuUsage(before);
-    assert.ok((used.user + used.system) / 1000 < 500, `${(used.user + used.system) / 1000} ms of CPU`);
-    assert.equal(planned.bytes.toString(), after);
+    const bytes = Buffer.from(text!);
+    const file = decodeForEdit(bytes)!;
+    let read = 0;
+    const { result: planned, calls: searches } = countingCalls(String.prototype, 'indexOf', (args) => typeof args[0] === 'string' && args[0].length >= needle.length, 4, () => {
+      const counted = countingCalls(String.prototype, 'charCodeAt', () => true, 10 * text!.length, () => planFile(file, bytes, [spec(0, oldText!, newText!)]));
+      read = counted.calls;
+      return counted.result;
+    });
+    assert.ok('plan' in planned, JSON.stringify(planned));
+    assert.equal(planned.plan.bytes.toString(), after);
+    assert.ok(searches <= 1, `${searches} searches for the old text with indexOf`);
+    assert.ok(read >= text!.length, `${read} code units read`);
   }
+});
+
+test("each of 200 edits of an old text read more than one way counts its other reading only until a refusal has more than it shows", () => {
+  // Lines alternate between "x" with a CR of its own and "x" alone, before
+  // CRLF ends, so "x\r" reads as given on the one and without its CR on the
+  // other, 400,000 times each. Each edit's other reading stops at 21, one
+  // past the 20 a refusal shows.
+  const bytes = Buffer.from('x\r\r\nx\r\n'.repeat(400_000));
+  const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'x\r', `${k}`)));
+  assert.ok('problems' in planned);
+  assert.deepEqual(planned.problems.map((p) => p.kind === 'readings' && p.readings.map((reading) => reading.leaves === 'cr' && [reading.found, reading.atLeast])),
+    Array.from({ length: 200 }, () => [false, [21, true]]));
 });
 
 test("a read form's one pass finds a match inside one it passed over, and none that a mismatch ends", () => {

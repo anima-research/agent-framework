@@ -15,12 +15,13 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
-import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type PublishOutcome } from '../src/mcpl/channel-registry.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { appendInTwoParts } from './helpers/command-file.js';
 
 type Publish = (params: { channelId: string }) => Promise<unknown>;
 
@@ -323,6 +324,18 @@ describe('channel_publish answers by the receipt rule', () => {
     assert.deepEqual(result.data, { delivered: true, messageId: 'posted-1' });
   });
 
+  it('tells a caller that asks its outcome, with the channel a delivered post went to', async () => {
+    const { registry, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'c', '#c');
+    const seen: { outcome?: PublishOutcome } = {};
+    const result = await registry.handleChannelToolCall('channel_publish', { channelId: 'c', content: 'words' }, undefined, seen);
+    assert.equal(result.success, true);
+    assert.equal(seen.outcome?.status, 'delivered');
+    // Both halves of the key a publish is noted under (destinationKey).
+    assert.equal(seen.outcome?.destination?.serverId, 'discord');
+    assert.equal(seen.outcome?.destination?.channelId, 'c');
+  });
+
   for (const [what, receipt] of [['a missing receipt', undefined], ['an empty receipt', {}], ['a malformed delivered field', { delivered: 'yes' }]] as const) {
     it(`answers ${what} as unconfirmed, never as success`, async () => {
       const result = await publishWith(async () => receipt);
@@ -420,8 +433,12 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
       .map((m) => (m.content[0] as { text: string }).text);
     const traces: Array<{ type: string; detail?: unknown }> = [];
     framework.onTrace((event) => traces.push(event));
-    const turn = async (mode: string, n: number, detail?: unknown) => {
-      appendFileSync(commandPath, JSON.stringify({ op: 'publish-mode', mode, detail }) + '\n');
+    // `inTwoParts` writes the mode's line in two parts, as a poll can read a
+    // long line half written: the fixture waits for its newline.
+    const turn = async (mode: string, n: number, detail?: unknown, inTwoParts = false) => {
+      const line = JSON.stringify({ op: 'publish-mode', mode, detail });
+      if (inTwoParts) await appendInTwoParts(commandPath, line, 100);
+      else appendFileSync(commandPath, line + '\n');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply ${n}` }]));
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: 'discord:g1:room', messageId: `m-${n}`, mode: 'addressed', text: 'hello?' }) + '\n');
       await until(() => markers().length === n, `marker ${n}`);
@@ -435,7 +452,8 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     assert.doesNotMatch(uncertain!, /did not receive|Nothing was posted/);
     assert.match(failed!, /could not be delivered/);
     assert.match(failed!, /Nothing was posted/);
-    await turn('error', 3, { posted: ['111'], note: 'x'.repeat(10_000) });
+    // About 10 KB, long enough for a poll to read it half written.
+    await turn('error', 3, { posted: ['111'], note: 'x'.repeat(10_000) }, true);
     const partial = markers()[2]!;
     assert.match(partial, /was not confirmed/);
     assert.match(partial, /Connector detail:.*"posted":\["111"\]/);

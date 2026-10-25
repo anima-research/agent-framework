@@ -81,7 +81,11 @@ export interface AgentConfig {
   temperature?: number;
 
   /** Max input tokens before framework breaks a yielding stream and
-   *  restarts with recompiled (compressed) context. Default: 150000. */
+   *  restarts with recompiled (compressed) context. Default: 150000. Not
+   *  checked mid-turn for an agent whose model binds its thinking
+   *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
+   *  there would take the turn's own earlier reasoning out of the request, and
+   *  the window projection still guards the provider's hard cap. */
   maxStreamTokens?: number;
 
   /**
@@ -94,7 +98,9 @@ export interface AgentConfig {
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
    * stream has reported its prompt. Unset → no projection; only the
-   * maxStreamTokens restart applies.
+   * maxStreamTokens restart applies. A value is converted to a number as a
+   * comparison converts it, so a string such as "200000" reads as its number;
+   * one whose number isn't finite, such as null, reads as unset.
    */
   physicalWindowTokens?: number;
 
@@ -152,7 +158,9 @@ export interface AgentConfig {
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks
    * with cryptographic signatures, and the API enforces `temperature: 1`
-   * (Membrane handles this). Omit or set `enabled: false` to disable.
+   * (Membrane handles this). Omit or set `enabled: false` to disable, except
+   * on a model whose thinking is always on (Fable, Mythos), which thinks
+   * whatever this says.
    */
   thinking?: {
     enabled: boolean;
@@ -162,9 +170,97 @@ export interface AgentConfig {
     /**
      * How thinking content is returned: 'summarized' (readable summary) or
      * 'omitted' (empty thinking field, signature only). Fable 5 / Opus 4.7+
-     * default to 'omitted' — set 'summarized' to receive thinking text.
+     * default to 'omitted' — set 'summarized' to receive thinking text. A
+     * model whose thinking is always on (Fable, Mythos) is sent a thinking
+     * config only to carry `thinkingBinding.dropBlock`, so this reaches it
+     * only with that set.
      */
     display?: 'summarized' | 'omitted';
+  };
+  /**
+   * How the provider binds this agent's signed thinking to the conversation
+   * before it. A host sets it from what it knows of the agent's model and
+   * route.
+   */
+  thinkingBinding?: {
+    /**
+     * Ask the provider to drop a signed thinking block whose earlier
+     * conversation has changed, as a fold changes it, rather than refuse the
+     * request. An account that enforces the binding otherwise answers such a
+     * request with a 400. One that doesn't decides for itself: the four
+     * accounts tried on 2026-10-18 dropped such blocks silently, so there the
+     * model sees nothing different and the report is what's new, and one
+     * that would show such a block to the model is asked to drop it instead.
+     *
+     * It's sent as `thinking.block_binding.prefix_mismatch_behavior:
+     * "drop_block"` with the `thinking-binding-controls-2026-08-01` beta,
+     * which membrane's Anthropic and Bedrock adapters carry (Bedrock's
+     * acceptance of the beta hasn't been tried). On any other adapter it does
+     * nothing, so a host should refuse it there. A thinking config the host
+     * sends itself, through `request.extra` or as `thinking` in
+     * `providerParams`, replaces the one membrane builds, control included.
+     *
+     * On a model whose thinking is always on (Fable, Mythos), membrane
+     * carries it in an adaptive thinking config whatever `thinking.enabled`
+     * says, with `thinking.display` when that's set, so such an agent's
+     * `display` takes effect only with this setting. On any other model, it
+     * goes only in the thinking config membrane sends while thinking is on.
+     * Membrane tells the first kind by its id, which names `fable` or
+     * `mythos`. Opus 5.5, Haiku 5.5, Sonnet 5.5, Sonnet 5, Fable 5 and Fable
+     * 5.1 accepted the config on 2026-10-18. Mythos hasn't been tried, and
+     * membrane notes that the family has refused thinking configs with a 400
+     * before, so for a Mythos model the setting may fail every request.
+     *
+     * On a framework turn, each call's report of the blocks the provider
+     * dropped goes to its `inference:usage` trace, and neither that call nor
+     * its stream's later calls feed the context strategy's calibration, since
+     * the provider doesn't bill a block it dropped and the strategy still
+     * counts it. After a fold, each block after the stretch it rewrote is
+     * bound to a conversation the request no longer holds. Where the context
+     * strategy still sends such a block, the provider drops it on every call
+     * until a later fold takes it out of the context, and while such blocks
+     * are sent, no stream gives a sample and the calibration keeps the value
+     * it had. A strategy that leaves that thinking out at the fold sends none
+     * to drop. The direct API carries the control too, but reads no report: it
+     * traces no usage and feeds no calibration.
+     *
+     * Default false: nothing is sent, and the account's default applies.
+     */
+    dropBlock?: boolean;
+    /**
+     * Whether this agent's model binds its signed thinking to the
+     * conversation before it, as the host knows from its own model records.
+     * A context manager that keeps a record of what each branch sent can
+     * then leave out thinking whose earlier conversation changed before the
+     * provider sees it. Set:
+     * - each compile the agent sends tells the context manager so
+     *   (`thinkingBinding`: `binds`, `dropBlock` as set here, and the agent's
+     *   name as the `participant` whose replies are its own), with digests
+     *   of what the request carries ahead of its messages (`identity`: the
+     *   system text with its system-position injections, the tools in the
+     *   order sent, the model, and the thinking config, `maxTokens`,
+     *   `providerParams` and `prefillUserMessage`);
+     * - each framework stream tells the context manager which stored rows
+     *   its later rounds and its last reply carried as stored
+     *   (`noteRequestSent`), naming the compile it was built from, so their
+     *   thinking is kept at the next compile. The direct API
+     *   (`runInference`) notes nothing, so each of its replies' thinking is
+     *   left out at the compile after it's stored;
+     * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
+     *   starts a new stream mid-turn, since the new stream's compile can take
+     *   the turn's earlier reasoning out of the request;
+     * - with `dropBlock` set too, where a compile reports where the branch's
+     *   record began (`thinkingRecordedAfter`), a block the provider drops
+     *   that the record doesn't account for raises the
+     *   `thinking-binding-loss` ops alert, once per incident and again if a
+     *   call drops more. The provider reports drops only on a request that
+     *   carries the drop control; without it, such a block is refused.
+     * The record and the notes
+     * vouch for requests as agent-framework hands them to membrane, so a
+     * membrane `beforeRequest` hook that changes a request must change every
+     * request alike. Default false: compiles and streams are as they were.
+     */
+    binds?: boolean;
   };
   /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).
@@ -446,9 +542,13 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
-  /** Host-owned: this wake's sole cause is reading this deferred write, a
-   *  coalesced render placed in its agent's queue (wakeToRead). Once the
-   *  agent has read the write, or it was removed, the wake starts no turn. */
+  /** Host-owned: this wake's sole cause is this write, deferred for its
+   *  agent while a turn was alive: a coalesced render placed in its queue
+   *  (wakeToRead), or a message, notice or event whose wake was queued with
+   *  it. Once a request that carried the write was answered and, for a wake
+   *  that carries a channel, the agent has since published into that
+   *  channel having read it, or once the write is in neither the agent's
+   *  queue nor its store's current branch, the wake starts no turn. */
   readsDeferredWrite?: string;
   agentName: string;
   reason: string;
@@ -492,6 +592,16 @@ export interface InferenceRequest {
    * not capture the agent's voice just by being newest.
    */
   addressed?: boolean;
+  /**
+   * Host-owned: true when the triggering message's server marked it ambient
+   * (`chat:ambient`). A coalesced push's wake carries it only to read a
+   * render, and only when every notice the render stands for was. Such a
+   * message asked nothing of the agent, so a wake for it that carries
+   * `readsDeferredWrite` is dropped once a request that carried the message
+   * was answered, with no publish asked of the agent. A message with neither
+   * tag is in doubt, and is judged as an addressed one.
+   */
+  ambient?: true;
   /**
    * Who spoke the message that triggered this inference, as an adapter-
    * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display

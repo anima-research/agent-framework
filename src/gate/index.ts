@@ -1,4 +1,4 @@
-export { EventGate, wakeProvenance, wakeLineText, type WakeProvenance } from './event-gate.js';
+export { EventGate, wakeProvenance, wakeLineText, type WakeProvenance, type WritePlacement } from './event-gate.js';
 export type {
   GateConfig,
   GateOptions,

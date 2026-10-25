@@ -163,6 +163,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       inboundOnlyServer: () => undefined,
@@ -203,12 +205,15 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.match(text, /Doing nothing is also fine\./);
     // #406: what else reaches the agent is each server's delivery (slack-mcpl
     // keeps its own subscription), so the invitation says only what holds on
-    // every server, and that a reply opens the channel, as routeSpeech does.
+    // every server.
     assert.match(
       text,
       /a channel you haven't opened\. Messages there that address you, such as an @-mention, reach you whether or not you open it\./,
     );
-    assert.match(text, /prefixed with ">>#portables"; it will be delivered there, which opens the channel\./);
+    // Here nobody decided to keep the channel closed, so a reply opens it, as
+    // speech does, and the invitation says so, with how to reply without
+    // opening it.
+    assert.match(text, /\n1\. Reply — write your reply this turn prefixed with ">>#portables"; it will be delivered there, which opens the channel\. To reply without opening it, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/);
     assert.match(text, /2\. Open the channel — call channel_open/);
     assert.doesNotMatch(text, /invisible to you|follow-ups to your reply|without joining/);
     // No surface-tracked tally on this event → no missed-count sentence.
@@ -222,6 +227,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       inboundOnlyServer: () => undefined,
@@ -289,6 +296,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (c: { serverId: string; channelId: string }) => { asked.push(`${c.serverId}/${c.channelId}`); return '@_reim0n'; },
@@ -309,6 +318,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
@@ -318,7 +329,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.handleMcplPushEvent(dmEvent('m4'));
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
-    assert.match(t2, /Replying with a ">>" prefix isn't available here: .* Open it \(option 2\) to reply\./);
+    assert.match(t2, /\n1\. Reply — no single-word target reaches this channel unambiguously/);
+    assert.match(t2, /check whether discord exposes a send tool that can address it\. Replying there opens the channel\. To reply without opening it, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/,
+      'the hint promises no tool, and says what replying does');
     assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'opening stays available');
     await fw2.stop();
 
@@ -328,6 +341,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
       getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
       inboundOnlyServer: () => undefined,
@@ -336,6 +351,91 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.handleMcplPushEvent(dmEvent('m5'));
     assert.match(textOf(fw3), /prefixed with ">>discord:dm:1555"/);
     await fw3.stop();
+  });
+
+  it('in a channel the agent closed or declined itself, the invitation says a reply leaves it closed', async () => {
+    const textOf = (framework: Awaited<ReturnType<typeof makeFramework>>) =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const mention = (id: string) => ({
+      type: 'mcpl:push-event' as const,
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: `discord_msg_${id}`,
+      content: [{ type: 'text' as const, text: 'Antra: can you look at this?' }],
+      origin: { source: 'discord', messageId: id, mcplChannelId: 'discord:G1:C7', channelName: 'portables' },
+      tags: ['chat:mention', 'chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: `i-${id}`,
+      triggerInference: false,
+    });
+    for (const target of ['#portables', undefined]) {
+      const framework = await makeFramework();
+      const asked: string[] = [];
+      internals(framework).channelRegistry = {
+        ensureChannelRegistered: () => {},
+        isChannelOpen: () => false,
+        // A reply leaves this channel closed: the agent closed or declined it.
+        speechOpens: (c: { serverId: string; channelId: string }) => { asked.push(`${c.serverId}/${c.channelId}`); return false; },
+        getDesiredState: () => 'closed',
+        getChannelLabel: () => undefined,
+        getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+        proseTargetFor: () => target,
+        inboundOnlyServer: () => undefined,
+        stopAll: () => {},
+      };
+      internals(framework).handleMcplPushEvent(mention(`m-${target ?? 'none'}`));
+      const text = textOf(framework);
+      assert.deepEqual(asked, ['discord/discord:G1:C7'], 'asked about this channel on the server it came from');
+      // What else reaches the agent from a channel left closed is its server's
+      // to say (#406), so the line says only that the channel stays closed.
+      assert.match(text, target
+        ? /\n1\. Reply — write your reply this turn prefixed with ">>#portables"; it will be delivered there, and the channel stays closed\.\n/
+        : /\n1\. Reply — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; check whether discord exposes a send tool that can address it\. Replying there leaves the channel closed\.\n/);
+      assert.doesNotMatch(text, /opens the channel|decline it first|follow-ups to your reply/);
+      await framework.stop();
+    }
+  });
+
+  it('a direct message carries no invitation: all of a DM reaches the agent, open or closed', async () => {
+    // A DM registers closed, and stays closed until the agent answers it, or for good once the
+    // agent closes it. An invitation on its messages would repeat a block whose premise is false
+    // there: there is no other traffic to miss, and nothing to join.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getChannelLabel: () => undefined,
+      getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
+      proseTargetFor: () => '@_reim0n',
+      inboundOnlyServer: () => undefined,
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: 'discord_msg_m6',
+      content: [{ type: 'text', text: '_reim0n: you there?' }],
+      origin: { source: 'discord', messageId: 'm6', mcplChannelId: 'discord:dm:1555', isDM: true, authorName: '_reim0n' },
+      // As discord-mcpl tags a DM, after the host's core-tag closure.
+      tags: ['chat:dm', 'chat:addressed', 'chat:private'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i6',
+      triggerInference: false,
+    });
+    const text = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /you there\?/);
+    assert.doesNotMatch(text, /Channel invitation/);
+    await framework.stop();
   });
 
   it('the invitation offers no reply into a channel its server declared inbound-only, and says why', async () => {
@@ -347,6 +447,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
       getDescriptor: () => ({ label: 'Body · ears', direction: 'inbound' }),
       getChannelLabel: () => 'Body · ears',
       proseTargetFor: () => '#ears',
@@ -394,6 +496,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
       getDescriptor: (c: { channelId: string }) => ({ label: labels[c.channelId] }),
       getChannelLabel: (_serverId: string, id: string) => labels[id],
       inboundOnlyServer: () => undefined,
@@ -476,7 +580,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const one = lastText();
     assert.match(
       one,
-      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again\./,
+      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again\./,
     );
     assert.doesNotMatch(one, /will reach you/);
 
@@ -484,7 +588,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const two = lastText();
     assert.match(
       two,
-      /Selected for opening by subscription policy: slack:C1, slack:C2\. The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want one of them, use channel_close: neither the subscription policy nor its server's own default opens it again\./,
+      /Selected for opening by subscription policy: slack:C1, slack:C2\. The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want one of them, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again\./,
     );
     assert.doesNotMatch(two, /will reach you/);
     await framework.stop();

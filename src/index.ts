@@ -5,6 +5,7 @@ export * from './types/index.js';
 export { AgentFramework, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
+export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
@@ -67,7 +68,7 @@ export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './co
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
 // EventGate
-export { EventGate, wakeLineText, type WakeProvenance } from './gate/index.js';
+export { EventGate, wakeLineText, type WakeProvenance, type WritePlacement } from './gate/index.js';
 export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine } from './gate/index.js';
 
 // MCPL channel registry (exposed for modules that need channel-level operations)

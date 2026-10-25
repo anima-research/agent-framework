@@ -21,6 +21,7 @@ import type {
   ProcessEvent,
   TraceEventListener,
   ModuleMessage,
+  ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
 import { heldWriteId } from './held-writes.js';
@@ -110,11 +111,11 @@ export class ModuleRegistry {
   private store: JsStore;
   private queue: ModuleQueue;
   private getAgents: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
@@ -134,11 +135,11 @@ export class ModuleRegistry {
     queue: ModuleQueue,
     options: {
       getAgents: () => Agent[];
-      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
       getMessage: (id: MessageId) => ModuleMessage | null;
-      queryMessages: (filter: MessageQuery) => MessageQueryResult;
+      queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
@@ -230,7 +231,8 @@ export class ModuleRegistry {
 
   /**
    * Set state for a module by name.
-   * Used by the framework to apply stateUpdate from EventResponse atomically.
+   * Used by the framework to apply stateUpdate from EventResponse after its
+   * message changes.
    */
   setModuleState(moduleName: string, state: unknown): void {
     const ctx = this.moduleContexts.get(moduleName);
@@ -439,8 +441,18 @@ export class ModuleRegistry {
 
   /**
    * Gather context injections from all modules before inference.
-   * Calls each module's gatherContext() in parallel with a per-module timeout.
-   * Fail-open: timed-out or erroring modules are skipped (with a stderr line).
+   * Calls each module's gatherContext() in parallel with a per-module timeout,
+   * and returns their injections in the modules' registration order, whatever
+   * order they finish in. Fail-open: timed-out or erroring modules are skipped
+   * (with a stderr line), whether the call throws, rejects, or answers with
+   * something that isn't an array of objects, or with a `system` entry whose
+   * content isn't an array of objects, every block of which the agent's
+   * buildSystemPrompt reads, and one that answers after its timeout adds
+   * nothing. An array returned without a promise is taken as the module's
+   * answer. An entry's other fields are the module's to get right. Each
+   * module's budget starts once its call returns, after its own synchronous
+   * work and every earlier module's; a later module's synchronous work still
+   * counts against it.
    *
    * The per-module budget is `module.contextTimeoutMs` when declared, else the
    * `timeoutMs` default (15s). Modules whose gatherContext does real work —
@@ -450,12 +462,16 @@ export class ModuleRegistry {
    * to MAX_CONTEXT_TIMEOUT_MS so no single module can hold every turn hostage.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ContextInjection[]> {
-    const injections: ContextInjection[] = [];
+  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ModuleContextInjection[]> {
+    // Each module's result in registration order, whatever order they finish
+    // in: a stored injection's content hash follows that order, and a module
+    // that answers after its timeout adds nothing (it's skipped, fail-open).
+    const results: ModuleContextInjection[][] = [];
     const promises: Promise<void>[] = [];
 
     for (const module of this.modules.values()) {
-      if (!module.gatherContext) continue;
+      const gather = module.gatherContext;
+      if (!gather) continue;
 
       // Clamp the per-module budget. A module declaring `contextTimeoutMs`
       // legitimately needs more than the shared default (e.g. a retrieval
@@ -467,14 +483,43 @@ export class ModuleRegistry {
         MAX_CONTEXT_TIMEOUT_MS,
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      const slot = results.length;
+      results.push([]);
+      // Called here, before its timer is set, so its budget starts after its
+      // synchronous work; a call that throws is skipped as a rejection is.
+      let call: Promise<ModuleContextInjection[]>;
+      try {
+        call = Promise.resolve(gather.call(module, agentName));
+      } catch (err) {
+        call = Promise.reject(err);
+      }
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => {
-          injections.push(...r);
+        call.then(r => {
+          if (timedOut) return;
+          // Checked before it's kept, so an answer that isn't an array of
+          // objects skips the module, as does a system entry whose content
+          // isn't an array of objects: buildSystemPrompt reads every block
+          // of it, and one it can't read would fail the turn. Each array is
+          // read through Array.from, which reads a hole as `undefined`, as
+          // context-manager's compile does when it spreads the content.
+          if (!Array.isArray(r) || Array.from(r).some((entry) => entry === null || typeof entry !== 'object')) {
+            throw new TypeError(`gatherContext answered with ${Array.isArray(r) ? 'an array holding an entry that is not an object' : r === null ? 'null' : typeof r}, not an array of objects`);
+          }
+          const unreadable = r.find((entry) => entry.position === 'system'
+            && !(Array.isArray(entry.content) && Array.from(entry.content).every((block) => block !== null && typeof block === 'object')));
+          if (unreadable) {
+            throw new TypeError(`gatherContext answered with a system injection in namespace ${logValue(unreadable.namespace)} whose content isn't an array of objects`);
+          }
           this.noteBlocksNotShown(module.name, r);
+          results[slot] = [...r];
         }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
-            () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
+            () => {
+              timedOut = true;
+              rej(new Error(`gatherContext timed out after ${budgetMs}ms`));
+            },
             budgetMs,
           );
         }),
@@ -486,7 +531,7 @@ export class ModuleRegistry {
     }
 
     await Promise.all(promises);
-    return injections;
+    return results.flat();
   }
 
   /**
@@ -607,11 +652,11 @@ class ModuleContextImpl implements ModuleContext {
   private registry: ModuleRegistry;
   readonly isRestart: boolean;
   private getAgentsFn: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
@@ -627,11 +672,11 @@ class ModuleContextImpl implements ModuleContext {
     registry: ModuleRegistry,
     isRestart: boolean,
     getAgents: () => Agent[],
-    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
+    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => ModuleMessage | null,
-    queryMessages: (filter: MessageQuery) => MessageQueryResult,
+    queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult,
     pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
     callTool: (call: ToolCall) => Promise<ToolResult>
@@ -753,9 +798,17 @@ class ModuleContextImpl implements ModuleContext {
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    opts?: { forAgent?: string },
   ): MessageId {
-    const id = this.addMessageFn(participant, content, metadata);
+    // The external id map is read in the primary's store
+    // (findMessageByExternalId), so a mapping into another window would
+    // answer wrong.
+    if (metadata?.external && opts?.forAgent !== undefined) {
+      throw new Error(`A message for agent ${JSON.stringify(opts.forAgent)} can't carry metadata.external: `
+        + "its external id would be looked up in the primary's window. Leave forAgent out, or the external id.");
+    }
+    const id = this.addMessageFn(participant, content, metadata, opts);
 
     // Track external ID if provided. A write the framework holds keeps '',
     // as it did before held writes had handles: the map is module state an
@@ -819,8 +872,8 @@ class ModuleContextImpl implements ModuleContext {
     return this.getMessageFn(id);
   }
 
-  queryMessages(filter: MessageQuery): MessageQueryResult {
-    return this.queryMessagesFn(filter);
+  queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult {
+    return this.queryMessagesFn(filter, opts);
   }
 
   getAgents(): AgentInfo[] {
@@ -976,7 +1029,7 @@ function withoutRefusal(call: ToolCall, result: ToolResult): ToolResult {
 }
 
 /** A result's flags, which consumers read for their truth: booleans here. */
-const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
+const RESULT_FLAGS = ['success', 'isError', 'endTurn', 'dataIsContent'] as const;
 
 /**
  * A module's tool result as the framework can store, send and trace it. A
@@ -1047,7 +1100,7 @@ export function checkedToolResult(call: ToolCall, result: unknown): { result: To
     endTurn = Boolean(fields.endTurn);
     read('error');
     ownText = errorText(fields.error);
-    for (const key of ['success', 'isError', 'data']) read(key);
+    for (const key of ['success', 'isError', 'data', 'dataIsContent']) read(key);
     for (const key of Object.keys(candidate)) {
       if (key !== 'toJSON' && !(key in fields)) fields[key] = candidate[key];
     }

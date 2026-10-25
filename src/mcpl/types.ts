@@ -96,6 +96,9 @@ export interface McplAudioContent {
   disposition?: 'never' | 'ref';
 }
 
+/** MCPL's reference block (RFC-005 §3). A `resource` block with no `uri` of
+ *  its own may be MCP's embedded resource instead, its contents under
+ *  `resource`, which classifyBlock tells apart and shows as its contents. */
 export interface McplResourceContent {
   type: 'resource';
   /** Resource URI (e.g., "memory://facts/12345") */
@@ -1299,7 +1302,8 @@ export interface ChannelIncomingMessageResult {
  * Non-normative; host-defined. See Spec Section 11.5.
  */
 export interface InferenceRoutingPolicy {
-  /** Default model for all inference requests */
+  /** Model for a request no override, byFeature or wildcards entry names a
+   *  model for. Left empty, such a request is refused with -32603. */
   default: string;
 
   /** Model override per feature set name */

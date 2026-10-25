@@ -194,6 +194,18 @@ export interface ToolResult {
    * it reads the result's error text, if any.
    */
   data?: unknown;
+  /**
+   * Whether `data` is a protocol result's content: an array in which every
+   * element is a content block, of a type this host can show or not. The
+   * framework sets it on an MCPL tool's result, and a module that returns a
+   * content array can set it too. When it's set, each element reaches the
+   * model as itself, as a reference's stub, or as a marker saying what it was
+   * and why it isn't shown, never as JSON. When it isn't, an array counts as
+   * content only when every element is a block of one of MCP's types (text,
+   * image, audio, resource, resource_link), and any other array is data,
+   * written as JSON.
+   */
+  dataIsContent?: boolean;
   /** Error message (if failure) */
   error?: string;
   /** Whether this was an error (for LLM) */
@@ -299,7 +311,10 @@ export interface ToolCall {
    * leaves room for them; and a result nested past 2,000 levels, or whose parse
    * needs more of the script's memory than is free, doesn't reach the script
    * whatever its length. A result that doesn't reach it is answered
-   * ResultTooLarge, the call having taken effect. Nothing is cut or saved to
+   * ResultTooLarge, the call having taken effect. One the host can't convert
+   * to JSON at all, such as one nested deeper than its runtime's
+   * JSON.stringify can take, is answered instead as a failure naming the
+   * tool and saying the call itself completed. Nothing is cut or saved to
    * a file. A tool that pages or budgets its answer can stay under it. The
    * framework sets it on a model's, a script's and the operator's puppet's
    * call to a module, a utility run through `utils` included. A call
@@ -308,7 +323,9 @@ export interface ToolCall {
    * read_image tool passes a model's call to the workspace without it; and a
    * utility run through `utils` carries what its `utils` call carried.
    * Without it, a module holds its answer to a bound of its own, if any: the
-   * workspace's is the house default, 24,000.
+   * workspace's `edit` and `edit_many` answers hold to the house default,
+   * 24,000, and a `read` holds its page to its line limit alone, with every
+   * line whole, since such a caller takes the data itself.
    */
   resultMaxChars?: number;
 }
