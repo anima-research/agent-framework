@@ -14423,9 +14423,11 @@ export class AgentFramework {
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
     ];
     // Each draft is told apart by its length and, among several, by its
-    // place: one hold keeps its segments in the order written. None of its
-    // words are quoted: they reach user-role text only through the drafts
-    // tool, when the resident asks.
+    // place: one hold keeps its segments in the order written. The notice
+    // itself quotes none of a draft's words: the drafts tool shows them when
+    // the resident asks. riskText does carry a connector's error message,
+    // bounded, so a connector whose error echoes what it was sent could put
+    // a draft's words here.
     const named = held.map((d) => `${d.id} (${d.text.length} chars)`);
     const which = many
       ? `your ${held.length} plain-speech messages`
@@ -14530,9 +14532,9 @@ export class AgentFramework {
    * reached the history (a crash, an aborted turn), or a rollback or branch
    * move took the notices away. Every draft it marks is named by id, newest
    * first: the newest eight with their state and why each was held, the rest
-   * by id. Like every notice, it quotes none of their words; the drafts tool
-   * shows them. A draft a recent message already names is recorded as
-   * noticed rather than named again: its notice landed after its turn ended,
+   * by id. It quotes none of their words; the drafts tool shows them. A
+   * draft a recent message already names is recorded as noticed rather
+   * than named again: its notice landed after its turn ended,
    * as a bounce does when a delivery runs after a tool ends an explicit turn.
    * It reads only the recent history (draftsNamedInHistory), so its notice
    * claims no more than that. Left out are the open logical turn's own
