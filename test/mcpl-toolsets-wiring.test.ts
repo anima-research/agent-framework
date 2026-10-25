@@ -85,8 +85,8 @@ async function hintingServer(answer: Json, { pushEvents = true, listing = (): bo
   return { server, showPeek };
 }
 
-async function connectedTo(server: Awaited<ReturnType<typeof startScriptedServer>>, options: Partial<FrameworkConfig> = {}) {
-  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: true }], options);
+async function connectedTo(server: Awaited<ReturnType<typeof startScriptedServer>>, options: Partial<FrameworkConfig> = {}, config: Partial<McplServerConfig> = {}) {
+  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: true, ...config }], options);
   await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'static tools listed');
   await waitFor(() => server.received.some((m) => m.method === 'toolsets/list'), 'toolsets/list after connecting');
   return fw;
@@ -322,5 +322,39 @@ test('a tool change with no result to ride on is a notice only where pushEvents 
   } finally {
     await withoutGrant.stop();
     await refused.server.close();
+  }
+});
+
+test('a capability mask that names none of RFC-014\'s declarations leaves them alone: none is logged as masked, and hints still apply', async () => {
+  const advert: Json = {
+    ...ADVERT,
+    toolsets: { build: { title: 'Building', summary: 'Blocks', default: 'closed' } },
+    surface: { title: 'Arcade' },
+  };
+  const server = await startScriptedServer({
+    advert,
+    tools: [STATUS, PEEK],
+    listRev: () => 0,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [] } } }); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  let fw: Fw | undefined;
+  try {
+    fw = await connectedTo(server, {}, { enabledCapabilities: ['pushEvents'] });
+    const masked = logged.filter((line) => line.includes('masked by host config'));
+    assert.ok(!masked.some((line) => /toolHints|toolsets|surface/.test(line)), `nothing of RFC-014 masked: ${masked.join(' | ')}`);
+    const names = fw.framework.getAllTools().map((t) => t.name);
+    assert.ok(names.includes('arc--status'), 'the static tool is listed');
+    assert.ok(!names.includes('arc--peek'), 'the dynamic tool is not: hints apply');
+    assert.ok(names.includes('toolsets--look'), 'the meta-tools are offered');
+  } finally {
+    console.error = error;
+    await fw?.stop();
+    await server.close();
   }
 });
