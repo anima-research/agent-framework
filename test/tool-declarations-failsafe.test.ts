@@ -191,7 +191,7 @@ describe("toolDeclarations' fail-safe", () => {
       assert.equal(alerts.length, 1, `binds ${binds}: one operator line`);
       const alert = alerts[0] as { message: string; data?: { httpStatus?: number } };
       assert.match(alert.message, /role system not accepted here/, 'quoting the 400');
-      assert.match(alert.message, /keeps to its head until a restart/);
+      assert.match(alert.message, /keeps to its head until it's built again/);
       assert.equal(/sets aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it's paid`);
       assert.equal(alert.data?.httpStatus, 400);
     }

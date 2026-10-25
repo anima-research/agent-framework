@@ -30,6 +30,7 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
   let next = rows.length;
   const compiles: Array<{ kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } | undefined> = [];
   const reads = { firstChanged: 0 };
+  const windows: Array<{ offset: number; limit: number; resolveBlobs?: boolean }> = [];
   let lastCommitted: string[] | null = null;
   const cm = {
     compile: async (_budget: unknown, injections: Array<{ position: string; content: ContentBlock[] }> | undefined, o?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean }) => {
@@ -74,9 +75,12 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
     getStrategy: () => ({ isKvUnifiedEnabled: () => opts.kvUnified === true }),
     getAllMessages: () => rows.map((r) => ({ id: r.id, participant: r.participant, content: r.content, metadata: r.metadata ?? {} })),
     getMessageCount: () => rows.length,
-    getMessageWindow: (offset: number, limit: number) => ({ messages: rows.slice(offset, offset + limit), startIndex: offset }),
+    getMessageWindow: (offset: number, limit: number, o?: { resolveBlobs?: boolean }) => {
+      windows.push({ offset, limit, resolveBlobs: o?.resolveBlobs });
+      return { messages: rows.slice(offset, offset + limit), startIndex: offset };
+    },
   };
-  return { cm: cm as unknown as ContextManager, rows, compiles, reads };
+  return { cm: cm as unknown as ContextManager, rows, compiles, reads, windows };
 }
 
 const tool = (name: string, description = `${name} does a thing`): ToolDefinition => ({
@@ -278,6 +282,27 @@ describe('toolDeclarations', () => {
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(changeRows(context.rows).length, declares ? 1 : 0, what);
     }
+  });
+
+  it("reads only the store's tail, blob-free, to see whether a change may go at the end", async () => {
+    const context = fakeContext(Array.from({ length: 1000 }, (_, i) => said(i % 2 ? 'agent' : 'user', `turn ${i}`)));
+    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    await agent.buildActivationRequest([tool('a')]);
+    context.windows.length = 0;
+    await agent.buildActivationRequest([tool('a'), tool('b')]);
+    assert.equal(changeRows(context.rows).length, 1, 'declared');
+    assert.deepEqual(context.windows, [{ offset: 984, limit: 16, resolveBlobs: false }], 'one window of the newest rows');
+  });
+
+  it("keeps its recorded head as recorded when what a request carries is changed in place", async () => {
+    const context = fakeContext([said('user', 'hello')]);
+    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    await agent.buildActivationRequest([tool('a')]);
+    const first = await agent.buildActivationRequest([tool('a'), tool('b')]);
+    first.tools![0]!.description = 'changed in place, as a hook might';
+    const next = await agent.buildActivationRequest([tool('a'), tool('b')]);
+    assert.deepEqual(next.tools, [tool('a')], 'the head as recorded');
+    assert.equal(changeRows(context.rows).length, 1, 'with nothing declared back');
   });
 
   it('waits for the results before declaring after calls that have none yet', async () => {
@@ -501,6 +526,21 @@ describe('toolDeclarations', () => {
     }).assembleActivationRequest([tool('a'), tool('b')], [systemInjection('v2')], undefined, undefined, { dryRun: true });
     assert.equal(compiled.messages.length, 2, 'the change row left out');
     assert.deepEqual(compiled.provenance?.messages.map((source) => source.bodies?.[0]?.messageId), ['user:hello', 'user:go on'], 'and its source with it');
+  });
+
+  it("compiles a dry move again for a head told differently only by a field the hash writes as null and the wire leaves out, with `binds: true`", async () => {
+    const withExtra = (extra: unknown) => ({ ...tool('x'), extra }) as unknown as ToolDefinition;
+    // The agent's change defines `x` as it's advertised now; the record has `extra: null`.
+    const stored: Row = { id: 'c-x', participant: 'system', content: [{ type: 'system_change', defineTools: [JSON.parse(JSON.stringify(withExtra(undefined)))] } as never], metadata: { system: true, kind: 'system-change', agent: 'agent' } };
+    const context = fakeContext([said('user', 'hello'), stored]);
+    const heads = memoryHeadDeclarations();
+    heads.write('agent', { tools: [withExtra(null)], system: ['You are an agent.'] });
+    const agent = agentOn(context, { toolDeclarations: 'entries', thinkingBinding: { binds: true } }, heads);
+    agent.noteResponseInput(1); // the change past a fifth: a forced move, which a dry run shows
+    const before = context.compiles.length;
+    const preview = await agent.buildActivationRequest([withExtra(undefined)], undefined, undefined, undefined, { dryRun: true });
+    assert.equal(context.compiles.length - before, 2, 'compiled again for the new head');
+    assert.equal((context.compiles.at(-1) as { identity?: Record<string, string> }).identity!.tools, digest(preview.tools ?? []), "told the digests of the head it shows");
   });
 
   it('takes only rows holding a change when it moves the head, not a message stored with change metadata that holds none', async () => {
@@ -731,13 +771,16 @@ describe('toolDeclarations', () => {
         const rows = [said('user', 'hello')];
         let refuse = false;
         const context = fakeContext(rows, { overBudget: () => refuse });
-        const agent = agentOn(context, { toolDeclarations: 'entries' });
+        const heads = memoryHeadDeclarations();
+        const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
         await agent.buildActivationRequest([tool('a')]);
         await agent.buildActivationRequest([tool('a'), tool('b')]);
         refuse = true;
         const compiles = context.compiles.length;
         await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')]), refusal, 'the changes weren\'t the cause');
         assert.equal(context.compiles.length - compiles, 2, 'one more compile, not a loop');
+        assert.deepEqual(changeRows(rows), [], 'the move stands: the rows are gone');
+        assert.deepEqual(heads.read('agent')!.tools, [tool('a'), tool('b')], 'and the head is current');
       }
       {
         const rows = [said('user', 'hello')];

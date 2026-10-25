@@ -1,6 +1,7 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, SystemChangeContent, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse, isSystemChangeContent } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
+import { jsonTokenEstimator } from '@animalabs/context-manager';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
@@ -112,7 +113,6 @@ export interface StartStreamResult {
    *  model binds its thinking and the context manager keeps a record it can be told of. */
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
 }
-import { jsonTokenEstimator } from '@animalabs/context-manager';
 import type {
   ContextManager,
   TokenBudget,
@@ -1743,7 +1743,9 @@ export class Agent {
     const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: systemTextOf(settled.head.system),
-      tools: settled.head.tools.length > 0 ? settled.head.tools : undefined,
+      // A copy, so a hook or a caller that changes what the request carries,
+      // in place, leaves the recorded head as it is.
+      tools: settled.head.tools.length > 0 ? copyHead(settled.head).tools : undefined,
       ...this.requestSettings(),
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
@@ -2265,11 +2267,16 @@ export class Agent {
       // branch is current: a switch can bring one back. The store deletes
       // only a record it holds, so this costs a lookup otherwise.
       if (!dryRun) this.headDeclarations.delete(this.name);
-      // The request leaves every change row out, so this compile needn't run
-      // again.
+      // The agent's own change rows go too. The request leaves every change
+      // row out, but this compile held the agent's, and what it committed
+      // (context-manager's comparison baseline, and with `binds: true` its
+      // thinking-binding record) would hold rows no later compile has, so
+      // the next would differ from it there and leave out the thinking minted
+      // since. So once they're removed, the compile runs again without them.
       if (!dryRun && own.size > 0) {
         const changesRemoved = this.removeOwnChanges();
         this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved });
+        if (changesRemoved > 0) return { compiled: await compile(current), head: current };
       }
       return { compiled, head: current };
     }
@@ -2334,17 +2341,26 @@ export class Agent {
     return current;
   }
 
+  /** Whether compiles made for heads `a` and `b` are told the same of them:
+   *  kv-unified's hash, and the thinking binding's digests, which take a
+   *  field left undefined differently (the hash writes it as null, a digest
+   *  leaves it out, as the wire does). */
+  private toldAlike(a: HeadDeclaration, b: HeadDeclaration): boolean {
+    return headHash(a) === headHash(b) && JSON.stringify(this.bindingCompileOptions(a)) === JSON.stringify(this.bindingCompileOptions(b));
+  }
+
   /**
    * Move the head to what's current: remove the changes it now holds, then
    * record a copy of it, in that order, so a stop between the two leaves the
    * old head and no changes. The next assembly then declares the difference
    * as one change, or moves the head again for a replacement; never the old
    * changes beside a head that already holds them. The compile runs again
-   * when what it read changed, or when it was made for another head
-   * (`compiledWith`, null when the compile was told nothing of its head):
-   * kv-unified's hash and the thinking binding's digests are both of the
-   * head's tools and system text, which headHash compares. A dry run shows
-   * the same, compiling again (dry) for another head, and changes nothing.
+   * when what it read changed, or when it was told something of its head
+   * (`compiledWith`, null when it was told nothing) that differs for this
+   * one (toldAlike). A dry run shows the same, compiling again (dry) for
+   * another head, and changes nothing. It can't remove the rows before it
+   * compiles, so it compiles with them and leaves them out of what it
+   * shows: under a tight budget, its window can hold less than the move's.
    */
   private async moveHead(
     compiled: CompileResult,
@@ -2356,7 +2372,7 @@ export class Agent {
     sizes?: { changeTokens: number; inputTokens: number; forced?: 'share' },
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
-      const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
+      const shown = compiledWith !== null && !this.toldAlike(compiledWith, current) ? await compile(current) : compiled;
       const own = ownSystemChanges(shown, this.name);
       const kept = (_: unknown, index: number) => !own.has(index);
       // Its sources stay index for index with its messages.
@@ -2366,7 +2382,7 @@ export class Agent {
     const removed = this.removeOwnChanges();
     this.headDeclarations.write(this.name, copyHead(current));
     this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
-    const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
+    const again = removed > 0 || (compiledWith !== null && !this.toldAlike(compiledWith, current));
     return { compiled: again ? await compile(current) : compiled, head: current };
   }
 

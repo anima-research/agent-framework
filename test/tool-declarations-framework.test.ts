@@ -58,6 +58,15 @@ async function withFramework<T>(
   }
 }
 
+/** The assembly, for what it returns beside the request: the compile it was built from and the binding its stream notes with. */
+type Assembling = {
+  assembleActivationRequest(tools: ToolDefinition[]): Promise<{
+    request: { messages: NormalizedMessage[] };
+    compiled: { provenance?: { compileId?: string } };
+    binding: { identity?: unknown };
+  }>;
+};
+
 const say = (agent: Agent, participant: string, text: string) =>
   agent.getContextManager().addMessage(participant, [{ type: 'text', text } as ContentBlock]);
 
@@ -196,6 +205,47 @@ describe('toolDeclarations in the framework', () => {
       assert.match(alerts[0]!.message, /^a compile was refused over budget with 2 system changes kept, so the head took them and the compile ran again: one whole write/);
       assert.deepEqual(alerts[0]!.data, { forced: 'budget', changesRemoved: 2 });
     });
+  });
+
+  it("names in a stream's notes the compile its request was built from, when a declared change compiles twice, with `binds: true`", async () => {
+    await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      const assembled = await (alpha as unknown as Assembling).assembleActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(changesIn(assembled.request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'declared');
+      assert.equal(alpha.getContextManager().noteRequestSent([], assembled.binding.identity as never, assembled.compiled.provenance!.compileId!), true,
+        'a note under its compile is taken: that compile wrote the record');
+    });
+  });
+
+  it("compiles again on the head once it takes the agent's own change rows out, so a reply after keeps its thinking, with `binds: true`", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'tool-declarations-onhead-'));
+    const storePath = join(tempDir, 'store.chronicle');
+    const binding = { binds: true, dropBlock: true };
+    try {
+      await withFramework([{ ...resident('alpha'), thinkingBinding: binding }], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      }, storePath);
+      // The same agent built on its head: its change row from the 'entries' period goes.
+      await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', thinkingBinding: binding }], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        const assembled = await (alpha as unknown as Assembling).assembleActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(changesIn(assembled.request.messages), []);
+        const cm = alpha.getContextManager();
+        assert.equal(cm.getAllMessages().filter(isChange).length, 0, 'the change row went');
+        // The reply, as its stream stores it and notes it.
+        const reply = cm.addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+        assert.equal(cm.noteRequestSent([reply], assembled.binding.identity as never, assembled.compiled.provenance!.compileId!), true);
+        const next = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.ok(next.messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking')), 'the reply keeps its thinking at the next compile');
+      }, storePath);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('leaves out the thinking a replacement of the head sets aside, with `binds: true`, and keeps it past a declared change', async () => {
@@ -345,11 +395,11 @@ describe('toolDeclarations in the framework', () => {
         [{ type: 'system_change', defineTools: [tool('b')] }],
         [{ type: 'system_change', defineTools: [tool('c')] }],
       ], 'its template\'s change, then its own');
-      const heads = framework as unknown as { headDeclarations: { read(name: string): unknown }; disposeConversationAgent(name: string): void };
+      const heads = framework as unknown as { headDeclarations: { read(name: string): unknown }; disposeConversationAgent(name: string): void; headDeclarationCache: { heads: Map<string, unknown> } | null };
       assert.notEqual(heads.headDeclarations.read('alpha-fork'), null);
-      assert.notStrictEqual(heads.headDeclarations.read('alpha-fork'), heads.headDeclarations.read('alpha'), "the fork's head is a copy of its template's, not the same object");
       heads.disposeConversationAgent('alpha-fork');
-      assert.notEqual(heads.headDeclarations.read('alpha-fork'), null, "a closed fork's head stays, as the rest of its data does");
+      assert.equal(heads.headDeclarationCache?.heads.has('alpha-fork'), false, "a closed fork's head leaves memory");
+      assert.notEqual(heads.headDeclarations.read('alpha-fork'), null, "and stays in the store, as the rest of its data does");
       assert.notEqual(heads.headDeclarations.read('alpha'), null);
     }, undefined, { conversations: { templateAgent: 'alpha' } });
   });

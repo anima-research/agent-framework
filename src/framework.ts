@@ -79,7 +79,6 @@ import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMess
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, dryCompileStatsOf, type RenderStats } from './agent.js';
 import {
-  copyHead,
   isHeadDeclaration,
   isOthersSystemChange,
   isSystemChangeMessage,
@@ -9129,7 +9128,8 @@ export class AgentFramework {
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
    * `headFrom` names a running agent whose recorded head (toolDeclarations
-   * 'entries') the new agent starts with, as a copy: a host that seeds the
+   * 'entries') the new agent starts with, a record of its own from then on:
+   * a host that seeds the
    * agent with that agent's messages, its system changes stamped with
    * `systemChangeMetadata(config.name)`, then sends the same prefix, so the
    * new agent reads that agent's cache and declares only its own difference.
@@ -9190,7 +9190,7 @@ export class AgentFramework {
       // The parent's head as late as it can be read, after the open, since the
       // host copies the parent's messages once this returns.
       const seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
-      if (seedHead) heads.write(config.name, copyHead(seedHead));
+      if (seedHead) heads.write(config.name, seedHead);
       this.attachHeads(agent, heads);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
@@ -12407,6 +12407,15 @@ export class AgentFramework {
     }
   }
 
+  /** What an operator line says of the thinking a move of an agent's head
+   *  sets aside: `said` outright where the host declares that the model binds
+   *  its thinking (`thinkingBinding.binds: true`), on that condition where
+   *  `binds` is left out, and nothing where the host says it doesn't. */
+  private thinkingSetAside(agent: Agent, said: string): string {
+    if (!agent.mayBindThinking) return '';
+    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
+  }
+
   /**
    * The fail-safe's trigger (system-changes.ts): a request that carried a
    * system change, refused with membrane's `systemChangeRefused` (its
@@ -12421,25 +12430,16 @@ export class AgentFramework {
    * retries the turn at once (attempt + 1, so it continues the same turn:
    * no second undo checkpoint, the turn's tool-call count kept).
    */
-  /** What an operator line says of the thinking a move of an agent's head
-   *  sets aside: `said` outright where the host declares that the model binds
-   *  its thinking (`thinkingBinding.binds: true`), on that condition where
-   *  `binds` is left out, and nothing where the host says it doesn't. */
-  private thinkingSetAside(agent: Agent, said: string): string {
-    if (!agent.mayBindThinking) return '';
-    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
-  }
-
   private keepToHeadAfterRefusal(agent: Agent, error: Error, request: NormalizedRequest | undefined): boolean {
     if (!agent.declaresEntries() || !request?.messages.some(isSystemChangeMessage)) return false;
     const recognised = isMembraneError(error) && error.systemChangeRefused === true;
     const refused = isMembraneError(error) && error.httpStatus === 400;
     if (!recognised && !refused) return false;
     agent.keepToHeadUntilRestart();
-    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until a restart: ${error.message}`);
+    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again: ${error.message}`);
     if (!recognised) {
       this.opsAlert('head-resend', agent.name,
-        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which sets aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until a restart, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
+        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which sets aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
         { data: { httpStatus: 400 } });
     }
     this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
@@ -13953,7 +13953,7 @@ export class AgentFramework {
           else contextManager.addMessage(participant, msg.content);
         }
         const templateHead = this.headDeclarations.read(template.name);
-        if (templateHead) this.headDeclarations.write(name, copyHead(templateHead));
+        if (templateHead) this.headDeclarations.write(name, templateHead);
       }
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
@@ -14137,6 +14137,10 @@ export class AgentFramework {
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
+    // Its recorded head stays in the store, as the rest of its data does, but
+    // leaves memory: the name is never used again, so nothing needs it there.
+    this.headDeclarationCache?.heads.delete(agentName);
+    this.headDeclarationsUnreadable.delete(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
     // Its scripts go with it, and leave the map once they've ended: no later
     // run of a fork's name trims them.

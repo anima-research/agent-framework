@@ -223,8 +223,11 @@ export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'pro
   return own;
 }
 
-/** A head to record: a copy, so a tool definition its caller later changes in
- *  place is declared as a change rather than changing the head unseen. */
+/** A copy of a head: what's recorded, so a tool definition its caller later
+ *  changes in place is declared as a change rather than changing the head
+ *  unseen, and what a request carries, so a change made to the request in
+ *  place leaves the record as it was. A record is never changed in place, so
+ *  two agents' records may be one object, as a fork's and its template's. */
 export function copyHead(head: HeadDeclaration): HeadDeclaration {
   return { tools: JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[], system: [...head.system] };
 }

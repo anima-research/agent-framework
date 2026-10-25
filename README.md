@@ -102,10 +102,11 @@ already rewrites the changes; past a fifth of the input, or when a compile
 is refused over budget with changes kept, it happens anyway, with an
 operator line. `thinkingBinding.binds` says whether the model binds its
 thinking to everything before it. Unless it's `false`, such a compile must
-keep no thinking before the changes, and a forced move sets that thinking
-aside; with `true`, each compile is told the head the request carries, so
-the context manager leaves out the thinking a move of the head sets aside. The host chooses both settings from what it knows
-of the model; neither is a runtime setting.
+keep no thinking before the first message it renders anew (its
+`firstChanged`), and a forced move sets that thinking aside; with `true`,
+each compile is told the head the request carries, so the context manager
+leaves out the thinking a move of the head sets aside. The host chooses both
+settings from what it knows of the model; neither is a runtime setting.
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.
