@@ -96,6 +96,9 @@ export interface McplAudioContent {
   disposition?: 'never' | 'ref';
 }
 
+/** MCPL's reference block (RFC-005 §3). A `resource` block with no `uri` of
+ *  its own may be MCP's embedded resource instead, its contents under
+ *  `resource`, which classifyBlock tells apart and shows as its contents. */
 export interface McplResourceContent {
   type: 'resource';
   /** Resource URI (e.g., "memory://facts/12345") */

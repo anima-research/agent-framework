@@ -81,7 +81,11 @@ export interface AgentConfig {
   temperature?: number;
 
   /** Max input tokens before framework breaks a yielding stream and
-   *  restarts with recompiled (compressed) context. Default: 150000. */
+   *  restarts with recompiled (compressed) context. Default: 150000. Not
+   *  checked mid-turn for an agent whose model binds its thinking
+   *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
+   *  there would take the turn's own earlier reasoning out of the request, and
+   *  the window projection still guards the provider's hard cap. */
   maxStreamTokens?: number;
 
   /**
@@ -94,7 +98,9 @@ export interface AgentConfig {
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
    * stream has reported its prompt. Unset → no projection; only the
-   * maxStreamTokens restart applies.
+   * maxStreamTokens restart applies. A value is converted to a number as a
+   * comparison converts it, so a string such as "200000" reads as its number;
+   * one whose number isn't finite, such as null, reads as unset.
    */
   physicalWindowTokens?: number;
 
@@ -256,8 +262,40 @@ export interface AgentConfig {
      */
     dropBlock?: boolean;
     /**
-     * Whether the model's thinking is bound to everything before it (default
-     * true), so a change to earlier bytes sets it aside. Under
+     * Whether this agent's model binds its signed thinking to the
+     * conversation before it, as the host knows from its own model records.
+     * A context manager that keeps a record of what each branch sent can
+     * then leave out thinking whose earlier conversation changed before the
+     * provider sees it. Set:
+     * - each compile the agent sends tells the context manager so
+     *   (`thinkingBinding`: `binds`, `dropBlock` as set here, and the agent's
+     *   name as the `participant` whose replies are its own), with digests
+     *   of what the request carries ahead of its messages (`identity`: the
+     *   system text with its system-position injections, the tools in the
+     *   order sent, the model, and the thinking config, `maxTokens`,
+     *   `providerParams` and `prefillUserMessage`);
+     * - each framework stream tells the context manager which stored rows
+     *   its later rounds and its last reply carried as stored
+     *   (`noteRequestSent`), naming the compile it was built from, so their
+     *   thinking is kept at the next compile. The direct API
+     *   (`runInference`) notes nothing, so each of its replies' thinking is
+     *   left out at the compile after it's stored;
+     * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
+     *   starts a new stream mid-turn, since the new stream's compile can take
+     *   the turn's earlier reasoning out of the request;
+     * - with `dropBlock` set too, where a compile reports where the branch's
+     *   record began (`thinkingRecordedAfter`), a block the provider drops
+     *   that the record doesn't account for raises the
+     *   `thinking-binding-loss` ops alert, once per incident and again if a
+     *   call drops more. The provider reports drops only on a request that
+     *   carries the drop control; without it, such a block is refused.
+     * The record and the notes
+     * vouch for requests as agent-framework hands them to membrane, so a
+     * membrane `beforeRequest` hook that changes a request must change every
+     * request alike. Default false: compiles and streams are as they were.
+     *
+     * Consolidation reads it as true unless it's false, since a change to
+     * earlier bytes sets bound thinking aside. Under
      * `toolDeclarations: 'entries'` a binding model consolidates for free
      * only where no thinking sits before the compile's `firstChanged` (the
      * first message that compile renders differently from the last one;

@@ -205,7 +205,7 @@ test("an image a provider can't take inline is saved: another type, or over the 
   const data = r.data as Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
   assert.equal(data[0]!.text, '[image: image/tiff, 4 B, saved to workspace file home/tool-results/L-1.tiff]');
   assert.equal(data[1]!.text,
-    '[image: image/png, 5.0 MB, saved to workspace file home/tool-results/L-2.png; not shown inline: over the 5.0 MB a model takes per image]');
+    '[image: image/png, 5.0 MB, saved to workspace file home/tool-results/L-2.png; not shown inline: over the 5.0 MB this host sends inline per image]');
   assert.deepEqual(data[2], { type: 'image', data: atLimit, mimeType: 'image/png' }, 'exactly at the limit stays native');
   assert.deepEqual(data[3], { type: 'image', data: b64('ok'), mimeType: 'image/jpeg' }, 'a type a provider takes, in its canonical spelling');
 });

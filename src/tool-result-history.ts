@@ -168,6 +168,13 @@ function toolResultBlock(raw: unknown, claims: ResultClaims): ToolResultBlock {
       };
     case 'invalid':
       return { kind: 'marker', text: c.shown };
+    case 'embedded':
+      // MCP's embedded resource shows as the block its contents make would
+      // show here. Its uri never shows.
+      if (c.contents.kind === 'block') return toolResultBlock(c.contents.block, claims);
+      return c.contents.kind === 'withheld'
+        ? { kind: 'withheld', text: INLINE_WITHHELD_TEXT }
+        : { kind: 'marker', text: c.contents.text };
     case 'inline': {
       if (c.contradiction) return { kind: 'withheld', text: INLINE_WITHHELD_TEXT };
       const b = raw as { type: 'image' | 'audio'; data: string; mimeType?: unknown };
@@ -374,10 +381,8 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
   if (blocks === null) return null;
   const parts = blocks.map((block, blockIndex): { kind: HistoryBlockSpan['kind']; text: string } => {
     if (block.kind !== 'image') return block;
-    // Decoded byte estimate from base64 length (3/4 ratio, rounded).
-    const approxBytes = Math.floor(block.data.length * 3 / 4);
     const ref = options?.imageRef?.(blockIndex, { data: block.data, mimeType: block.mimeType }) ?? null;
-    return { kind: 'image', text: formatToolImagePlaceholder(block.mimeType, formatSize(approxBytes), ref) };
+    return { kind: 'image', text: storedText(block, ref) };
   });
   if (options?.onBlocks) {
     const spans: HistoryBlockSpan[] = [];
@@ -393,11 +398,13 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
 
 /**
  * Whether RFC-005 governs a value of a tool result's data, wherever it sits.
- * A reference is a `resource` with a uri, at its top level or under
- * `resource` (where MCP embeds a resource's uri), or an `image` or `audio`
- * given by uri; inline data is an `image` or `audio` whose data is a string.
- * There a uri that is null, absent or empty counts as none, and data that
- * isn't a string isn't inline data, so a record that only shares one of
+ * A reference is a `resource` with a uri at its top level, or an `image` or
+ * `audio` given by uri; inline data is an `image` or `audio` whose data is a
+ * string, or MCP's embedded resource, a `resource` with a uri under
+ * `resource` beside its contents. There a uri that is null, absent or empty
+ * counts as none, except under `resource`, where a string, an empty one
+ * included, tells an embedded resource, as the classifier tells it. Data
+ * that isn't a string isn't inline data, so a record that only shares one of
  * those type names is data. A uri of any other value, string or not, counts,
  * so a credential fails closed. MCP's `resource_link` (RFC-005 §8.1) is
  * governed whatever value its uri has, so one whose uri isn't usable is its
@@ -405,7 +412,12 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
  * array, which the classifier reads, it's the marker.
  */
 function governedByRfc005(b: Record<string, unknown>): boolean {
-  if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
+  if (b.type === 'resource') {
+    // MCP's embedded resource is told by a string uri under `resource`, ''
+    // included, as classifyBlock tells it; a uri of any other value there
+    // counts too, failing closed.
+    return hasUri(b.uri) || (isPlainRecord(b.resource) && (typeof b.resource.uri === 'string' || hasUri(b.resource.uri)));
+  }
   // A link that names a uri is governed whatever its value, so one without
   // a usable uri (empty, null, not a string) is its marker here, as on the
   // content lanes, never its fields. One that names none is data at depth,
@@ -436,17 +448,25 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * A value of a tool result's data as history shows it, by RFC-005's rules,
  * wherever it sits in the data. A value RFC-005 governs (governedByRfc005) is
  * shown as the reference lanes show it: a reference as its stub, an invalid
- * one (such as a uri that isn't a string, or MCP's embedded resource, whose
- * uri isn't at its top level) as the marker saying why it isn't shown, and
- * inline data that also claims a uri or a disposition as withheld. So of
- * the uris RFC-005 governs, the only one shown is a link's, in its line,
- * where the host can't fetch the link and its uri can't carry a credential
- * (shownLinkUri). Inline data that claims neither is itself, as is any other
- * value: a block of another type keeps its fields, a url among them, since
- * RFC-005 governs references.
+ * one (such as a uri that isn't a string) as the marker saying why it isn't
+ * shown, MCP's embedded resource as the text its stored copy shows (its
+ * text, an image's placeholder or a marker), never its fields, which carry
+ * its uri, and inline data that also claims a uri or a disposition as
+ * withheld. So of the uris RFC-005 governs, the only one shown is a link's,
+ * in its line, where the host can't fetch the link and its uri can't carry a
+ * credential (shownLinkUri). Inline data that claims neither is itself, as is
+ * any other value: a block of another type keeps its fields, a url among
+ * them, since RFC-005 governs references.
  */
 function shownInHistory(value: unknown, claims?: ResultClaims): unknown {
-  return walkedInHistory(value, (b) => referenceStubOrNull(b, 'from tool result', undefined, { unfetchedLinkUri: true, claims }));
+  return walkedInHistory(value, (b) => {
+    // MCP's embedded resource is the text its stored copy shows: its text,
+    // an image's placeholder or its marker. As JSON it would carry its uri.
+    // Made well formed, as a content array's texts are (toolResultBlocks),
+    // since at the root this text is the result's whole text, as it's sent.
+    if (classifyBlock(b).kind === 'embedded') return storedText(toolResultBlock(b, claims ?? resultClaims([]))).toWellFormed();
+    return referenceStubOrNull(b, 'from tool result', undefined, { unfetchedLinkUri: true, claims });
+  });
 }
 
 /**
@@ -500,7 +520,7 @@ function claimsInHistory(data: unknown): ResultClaims | null {
 function claimsInHistoryOrThrow(data: unknown): ResultClaims {
   const testimonies: ReferenceTestimony[] = [];
   // Inline data's never, which walkedInHistory withholds before it asks
-  // `read` (inlineNeverUri).
+  // `read`, and an embedded resource's, which `read` notes (inlineNeverUri).
   const nevers: string[] = [];
   const noteInline = (value: unknown): void => {
     if (!isPlainRecord(value) || (value.type !== 'image' && value.type !== 'audio')) return;
@@ -510,9 +530,12 @@ function claimsInHistoryOrThrow(data: unknown): ResultClaims {
   const read = (b: Record<string, unknown>): string | null => {
     const c = classifyBlock(b);
     if (c.kind === 'reference') testimonies.push(c.testimony);
-    // Text where referenceStubOrNull gives text, so the walk descends where
-    // showing descends. Inline data never reaches here: walkedInHistory
-    // decides it first.
+    const never = inlineNeverUri(b, c);
+    if (never !== null) nevers.push(never);
+    // Text ('') wherever showing gives text (shownInHistory), an embedded
+    // resource included, so the walk stops where showing stops, never
+    // reading such a value's fields, and descends only where showing does.
+    // Inline data never reaches here: walkedInHistory decides it first.
     return c.kind === 'text' ? null : '';
   };
   noteInline(data);
@@ -534,16 +557,18 @@ function claimsInHistoryOrThrow(data: unknown): ResultClaims {
  * (shownInHistory), as a JSON replacer applies them at every depth: what
  * RFC-005 governs is shown as the script lane shows it, a reference as its
  * stub's facts, a link's uri among them only where the model's line for it
- * would show it, and an invalid one as the notice (referenceBlockForScript),
- * and inline data that also claims a uri of any type or a disposition as the
- * withheld notice, each as a text block. A null, absent or empty uri claims
+ * would show it, an invalid one as the notice, and MCP's embedded resource as
+ * the block its contents make (referenceBlockForScript), and inline data
+ * that also claims a uri of any type or a disposition as the withheld
+ * notice, each notice as a text block. A null, absent or empty uri claims
  * none (hasUri), so inline data beside one is itself. Any other value is
  * itself. `claims` are those of everything the script's view shows
  * (scriptViewClaims), and `line` the model's line for the result, its claims
  * and its records as it reads them (ScriptLine), which decide where a link's
- * uri is shown. What it gives is either a stub or a notice, which
- * RFC-005 doesn't govern, or the value itself, which it gives again, so
- * applying it twice gives what applying it once gave.
+ * uri is shown. What it gives is either a stub, a notice or a text block,
+ * which RFC-005 doesn't govern, or inline data that claims nothing, or the
+ * value itself, each of which it gives again, so applying it twice gives
+ * what applying it once gave.
  */
 export function shownToScript(value: unknown, claims?: ResultClaims, line?: ScriptLine): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
@@ -597,7 +622,8 @@ export function shownToScriptFromServer(value: unknown, serverId: string, claims
 /**
  * The text RFC-005 shows a value of a tool result's data as, when it shows it
  * as text rather than as its fields: a reference's stub, an invalid one's
- * marker, or inline data withheld. Null for any other value.
+ * marker, inline data withheld, or what an embedded resource's stored copy
+ * shows. Null for any other value.
  */
 export function rfc005TextOf(value: unknown): string | null {
   // A single value claims only what it says itself, which its stub reads.
@@ -643,6 +669,14 @@ function historyJson(data: unknown, given?: ResultClaims): string | undefined {
   const root = shownInHistory(data, claims);
   if (root !== data && typeof root === 'string') return root;
   return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value, claims)) as string | undefined;
+}
+
+/** A block's text in the stored copy: an image as its placeholder, with the
+ *  retention ref given, and any other block as its text. */
+function storedText(block: ToolResultBlock, ref: string | null = null): string {
+  if (block.kind !== 'image') return block.text;
+  // Decoded byte estimate from base64 length (3/4 ratio, rounded).
+  return formatToolImagePlaceholder(block.mimeType, formatSize(Math.floor(block.data.length * 3 / 4)), ref);
 }
 
 function formatSize(bytes: number): string {

@@ -131,7 +131,10 @@ describe('toolDeclarations in the framework', () => {
   });
 
   it('raises an operator line when the changes force the head to move', async () => {
-    await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true } }], async (framework) => {
+    // `binds` left out: consolidation reads that as a model that may bind, and the
+    // context manager keeps no record, so the compile keeps the reply's thinking.
+    // With `binds: true` its record would leave out thinking no stream noted as sent.
+    await withFramework([resident('alpha')], async (framework) => {
       const traces: TraceEvent[] = [];
       framework.onTrace((event) => { traces.push(event); });
       const alpha = framework.getAgent('alpha')!;
