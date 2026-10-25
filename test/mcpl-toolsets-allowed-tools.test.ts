@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { Module } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { startScriptedServer, waitFor, type Json } from './helpers/toolset-servers.js';
+import { startScriptedServer, waitFor, resultText, windowText, type Json } from './helpers/toolset-servers.js';
 
 type SeenResult = { toolUseId: string; content: string; isError?: boolean };
 
@@ -16,6 +16,7 @@ async function withGateFixture(
     membrane: MockMembrane;
     serverCalls: () => string[];
   }) => Promise<void>,
+  options: { policy?: { enabledTools?: string[]; disabledTools?: string[] }; allowedTools?: string[] } = {},
 ): Promise<void> {
   let rev = 0;
   const server = await startScriptedServer({
@@ -64,11 +65,11 @@ async function withGateFixture(
       membrane: membrane.asMembrane(),
       agents: [{
         name: 'scout', model: 'test-model', systemPrompt: 'You are scout.',
-        allowedTools: ['arc--status', 'toolsets--act', 'code_execution'],
+        allowedTools: options.allowedTools ?? ['arc--status', 'toolsets--act', 'code_execution'],
       }],
       modules: [quiet],
       codeExecution: { enabled: true },
-      mcplServers: [{ id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: true }],
+      mcplServers: [{ id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: true, ...options.policy }],
     });
     await framework.start();
     await waitFor(() => framework!.getAllTools().some(tool => tool.name === 'arc--status'), 'static tool listed');
@@ -159,4 +160,69 @@ test('an ephemeral agent calling act cannot run a dynamic tool left out of its a
     await run;
     assertOnlyNamedToolRan(resultsOf(membrane), serverCalls());
   });
+});
+
+test('operator tool policy controls dynamic visibility and act calls', async (t) => {
+  const scenarios: Array<{
+    name: string;
+    policy?: { enabledTools?: string[]; disabledTools?: string[] };
+    permitted: boolean;
+  }> = [
+    { name: 'permitted dynamic tool', permitted: true },
+    { name: 'enabledTools omits dynamic tool', policy: { enabledTools: ['status'] }, permitted: false },
+    { name: 'disabledTools denies dynamic tool', policy: { disabledTools: ['peek'] }, permitted: false },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      await withGateFixture(async ({ framework, membrane, serverCalls }) => {
+        const look = await framework.executeToolCall({
+          id: 'policy-look', name: 'toolsets--look', input: { server: 'arc' }, callerAgentName: 'scout',
+        });
+        assert.equal(Boolean(look.isError), false, resultText(look));
+        const listedByLook = /peek\(\)/.test(resultText(look));
+        const announced = windowText(framework).some(text => /peek\(\)/.test(text));
+
+        membrane.pushResponse(createMockResponse(toolCalls(), 'tool_use'));
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'policy done' }]));
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
+        await framework.runUntilIdle();
+        const cm = framework.getAgent('scout')!.getContextManager();
+        await waitFor(() => cm.getAllMessages().some(message => JSON.stringify(message.content).includes('policy done')), 'policy turn settled');
+        const results = resultsOf(membrane);
+        const status = results.find(result => result.toolUseId === 'gate-status');
+        const target = results.find(result => result.toolUseId === 'gate-act');
+        assert.ok(status, 'the permitted static control answered');
+        assert.match(status.content, /SERVER RAN status/);
+        assert.ok(target, 'the dynamic call answered the model');
+        const callsAfterModel = serverCalls();
+
+        const direct = await framework.executeToolCall({
+          id: 'policy-programmatic', name: 'toolsets--act',
+          input: { server: 'arc', tool: 'peek', args: {} }, callerAgentName: 'scout',
+        });
+        const observed = {
+          listedByLook,
+          announced,
+          modelRefused: Boolean(target.isError),
+          modelReturnedTarget: /SERVER RAN peek/.test(target.content),
+          callsAfterModel,
+          programmaticRefused: Boolean(direct.isError),
+          programmaticReturnedTarget: /SERVER RAN peek/.test(resultText(direct)),
+          allServerCalls: serverCalls(),
+        };
+        assert.deepEqual(observed, scenario.permitted ? {
+          listedByLook: true, announced: true,
+          modelRefused: false, modelReturnedTarget: true, callsAfterModel: ['status', 'peek'],
+          programmaticRefused: false, programmaticReturnedTarget: true, allServerCalls: ['status', 'peek', 'peek'],
+        } : {
+          listedByLook: false, announced: false,
+          modelRefused: true, modelReturnedTarget: false, callsAfterModel: ['status'],
+          programmaticRefused: true, programmaticReturnedTarget: false, allServerCalls: ['status'],
+        }, scenario.name);
+      }, {
+        policy: scenario.policy,
+        allowedTools: ['arc--status', 'arc--peek', 'toolsets--act', 'toolsets--look'],
+      });
+    });
+  }
 });
