@@ -256,6 +256,14 @@ export type HintRead =
 /** Requests whose results can carry hint state, remembered for a late answer (RFC-014 §6.1). */
 const HINTED_METHODS: ReadonlySet<string> = new Set(['tools/call', 'toolsets/open', 'toolsets/close', 'toolsets/list']);
 
+function hintedParams(method: string, params: Record<string, unknown>): { toolset?: string; instance?: string } {
+  if (method !== 'toolsets/open' && method !== 'toolsets/close') return {};
+  return {
+    ...(typeof params.toolset === 'string' ? { toolset: params.toolset } : {}),
+    ...(typeof params.instance === 'string' ? { instance: params.instance } : {}),
+  };
+}
+
 /**
  * A handshake that failed, and whose cleanup couldn't confirm that the child
  * exited. The transport goes to whoever owns the launch.
@@ -465,9 +473,11 @@ export class McplServerConnection extends EventEmitter {
    */
   private readTap: ((read: HintRead, epoch: number) => void) | null = null;
   /** The hinted requests sent on this transport, by id, kept past a timeout
-   *  so a late result is still tapped; bounded. Cleared at each boundary,
+   *  so a late result is still tapped: each one's method, and an open's or
+   *  close's toolset and instance, which are all the read of its result
+   *  uses; never a call's arguments. Bounded. Cleared at each boundary,
    *  since the next transport numbers its requests afresh. */
-  private hintedRequests = new Map<string | number, { method: string; params: Record<string, unknown> }>();
+  private hintedRequests = new Map<string | number, { method: string; params: { toolset?: string; instance?: string } }>();
 
   /** Install (or, with null, remove) the RFC-014 read tap (see readTap). */
   setReadTap(tap: ((read: HintRead, epoch: number) => void) | null): void {
@@ -2243,7 +2253,7 @@ export class McplServerConnection extends EventEmitter {
       // RFC-014: a request whose result can carry hints is remembered past
       // its timeout, so a late result's hints still apply (readTap).
       if (this.readTap && HINTED_METHODS.has(method)) {
-        this.hintedRequests.set(id, { method, params });
+        this.hintedRequests.set(id, { method, params: hintedParams(method, params) });
         if (this.hintedRequests.size > 1000) this.hintedRequests.delete(this.hintedRequests.keys().next().value!);
       }
       try {

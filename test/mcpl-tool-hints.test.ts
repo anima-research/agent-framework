@@ -308,6 +308,27 @@ test('vector 28: the hints of a result that arrives after its timeout are applie
   } finally { await t.done(); }
 });
 
+test('a close answered after its timeout still closes the instance it named, and is told', async () => {
+  let held: { id: unknown; peer: ScriptedPeer } | null = null;
+  const t = await setup((msg, peer, state) => {
+    if (msg.method === 'toolsets/close') { held = { id: msg.id, peer }; return true; }
+    if (msg.method !== 'toolsets/open') return false;
+    state.open.push({ toolset: 'game', instance: 'g1' });
+    peer.reply(msg.id, { toolset: 'game', instance: 'g1', _meta: { 'mcpl/hints': state.hint([{ name: 'play', instance: 'g1', visible: true }]) } });
+    return true;
+  });
+  try {
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game', instance: 'g1' });
+    const connection = (t.fw.framework as unknown as { mcplServerRegistry: { getServer(id: string): { sendToolsetsClose(p: Json, ms: number): Promise<unknown> } } })
+      .mcplServerRegistry.getServer('arc');
+    await assert.rejects(connection.sendToolsetsClose({ toolset: 'game', instance: 'g1' }, 300));
+    assert.ok(held, 'the close reached the server');
+    const h = held as unknown as { id: unknown; peer: ScriptedPeer };
+    h.peer.reply(h.id, { content: [] });
+    await waitFor(() => notices(t.fw).some((x) => x.includes('[arc/game:g1] closed.')), 'the late close told');
+  } finally { await t.done(); }
+});
+
 test('vector 30: a duplicate eventId\'s hints are ignored', async () => {
   const t = await setup();
   try {
