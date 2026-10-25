@@ -648,6 +648,8 @@ test('a nested mount\'s directory is matched level by level as any disk may comp
   assert.equal(beneathNested(['FOLD', 'm'], m), true, 'another case at the level above');
   assert.equal(beneathNested(['fold', 'n'], m), false, 'another name');
   assert.equal(beneathNested(['fold'], m), false, 'a path above the directory is not in it');
+  assert.equal(beneathNested([''], { dir: '\u200d' }), false, 'the mount\'s root, beside a directory named only by a default-ignorable code point');
+  assert.equal(beneathNested(['\u200b'], { dir: '\u200d' }), true, 'a name of only another default-ignorable code point');
   for (const [given, dir, what] of [
     ['cafe\u0301', 'caf\u00e9', 'the other normalization form'],
     ['CAFE\u0301', 'caf\u00e9', 'the other form in another case'],
@@ -1227,7 +1229,7 @@ test('through a link that spells a nested mount\'s directory otherwise than disk
   assert.deepEqual(readdirSync(join(dir, 'inner')), ['x.txt']);
 });
 
-test('a link that spells a directory as disk does leads into a nested mount configured in another spelling', { skip: FOLDING_ONLY }, async (t) => {
+test('a link that spells a directory as disk does is refused as leading into a nested mount configured in another spelling', { skip: FOLDING_ONLY }, async (t) => {
   const { workspace } = await setup(t, (d) => {
     mkdirSync(join(d, 'inner'), { recursive: true });
     writeFileSync(join(d, 'inner', 'x.txt'), 'nested\n');
@@ -1701,7 +1703,7 @@ test('a stop made while start reads whether a mount\'s root folds case leaves th
   let stopped: Promise<void> | undefined;
   fs.promises.readdir = ((path: fs.PathLike, ...rest: unknown[]) => {
     // Start lists the inner mount's root only for whether it folds case,
-    // after it has read the nested mounts' spellings: stop then.
+    // after it has placed the nested mounts: stop then.
     if (basename(String(path)) === 'inner') stopped ??= workspace.stop();
     return (original as (...args: unknown[]) => unknown)(path, ...rest);
   }) as typeof fs.promises.readdir;

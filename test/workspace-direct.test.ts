@@ -1569,6 +1569,7 @@ test("a direct root moved beside directories spelled in another case or form pla
   symlinkSync(join(env.root, 'cafe'), link);
   const own = await answer(moved);
   assert.equal(own.success, false, String(own.error));
+  assert.match(String(own.error), /may lie in mount "upper", nested in mount "ref".*can't tell whether "ref\/inner" is mount "upper"'s directory/);
   assert.deepEqual(own, await answer(await new Env(t).open(...mounts)));
 
   rmSync(link);

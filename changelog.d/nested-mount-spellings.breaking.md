@@ -2,5 +2,5 @@
   - a name in another case than a nested mount's directory's name, on a disk that tells case apart;
   - a name in the other Unicode normalization form, on a disk that keeps the forms apart, as ext4 does by default;
   - a name the comparison folds with it that the disk keeps apart, such as `ss` beside a nested `ß`, or `ı` beside a nested `i`, or a name that differs from a nested directory's only by a default-ignorable code point, such as `inner` with a soft hyphen or a zero-width joiner inside, which the comparison takes for `inner`, as Linux's casefold does.
-  - **What to do:** rename one of the two spellings; the refusal names both. Where two mounts' roots are configured in spellings the workspace can't tell apart, start places the nested mount by a guess, and the refusal asks for the configuration to be checked.
+  - **What to do:** rename one of the two spellings, which the refusal names, except where it can't show where a link leads. Where two mounts' roots are configured in spellings the workspace can't tell apart, start places the nested mount by a guess, and the refusal asks for the configuration to be checked.
   - **What the outer mount already held there** stays in its history, and no push of the outer mount writes it. Where the mounts' includes cover it, a listing shows it with the same note.

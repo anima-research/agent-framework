@@ -3020,11 +3020,7 @@ export class WorkspaceModule implements Module {
       // Only an entry this mount's include covers spells a draft's path
       // (insideMount): not a key no spelling names, such as `c/` or `a//b.txt`
       // from an earlier version, nor one the include leaves out, which would
-      // respell a covered draft into a name the include leaves out. An entry
-      // in a nested mount's directory that this mount's include covers
-      // spells one whatever that mount's include says, so on a disk that
-      // folds names, a draft naming the directory in another spelling takes
-      // the entry's spelling and is judged as in it.
+      // respell a covered draft into a name the include leaves out.
       under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => insideMount(path, mount.config.include)),
       holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,

@@ -703,7 +703,7 @@ function entryName(paths: readonly string[], prefix: string, segment: string): s
 }
 
 function sameLevel(given: string, name: string): boolean {
-  return given === name || foldedFully(given) === foldedFully(name);
+  return given === name || (given !== '' && foldedFully(given) === foldedFully(name));
 }
 
 function beginsWith(segments: readonly string[], dir: readonly string[]): boolean {
