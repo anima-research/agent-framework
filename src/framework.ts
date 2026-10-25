@@ -803,9 +803,9 @@ import {
 } from './operator-log.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
-/** Each agent's recorded head under `toolDeclarations: 'entries'`, by name
- *  (system-changes.ts). */
-const HEAD_DECLARATIONS_ID = 'framework/head-declarations';
+/** The state of an agent's recorded head under `toolDeclarations:
+ *  'entries'` (system-changes.ts): one per agent, so a write covers its own. */
+const headDeclarationId = (agentName: string) => `framework/head-declarations/${agentName}`;
 /** Snapshot slot mirroring context writes deferred while quiesced (#122). */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
 /** What a write of the deferred-write queue did: wrote the record (the
@@ -3616,7 +3616,6 @@ export class AgentFramework {
   ): Promise<AgentFramework> {
     // Register framework states
     ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
-    ensureStateRegistered(store, { id: HEAD_DECLARATIONS_ID, strategy: 'snapshot' });
     ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
       ensureStateRegistered(store, { id, strategy: 'snapshot' });
@@ -12293,69 +12292,81 @@ export class AgentFramework {
     }
   }
 
-  /** Each agent's recorded head (system-changes.ts), kept in the store's
-   *  state and in memory after the first read on a branch, since the
-   *  framework is its only writer. The state is the branch's, so a switch
+  /** Each agent's recorded head (system-changes.ts), each in a state of its
+   *  own in the store, kept in memory after its first read on a branch, since
+   *  the framework is its only writer. The state is the branch's, so a switch
    *  (undo, redo, a rollback, a fork) reads it again: kept across one, it
-   *  answered with the other branch's heads and its next write stored them
-   *  over this branch's. Null until read; unreadable leaves it unread, and
-   *  then no write goes, so one agent's adoption never stores over the
-   *  others'. */
-  private headDeclarationMap: { branch: string; heads: Map<string, HeadDeclaration> } | null = null;
-  /** The branch whose recorded heads couldn't be read, so that's said once
-   *  a branch, though every request on the head asks. */
-  private headDeclarationsUnreadableOn: string | null = null;
+   *  answered with the other branch's head and its next write stored it over
+   *  this branch's. Null where nothing is recorded, or what is isn't a head. */
+  private headDeclarationCache: { branch: string; heads: Map<string, HeadDeclaration | null> } | null = null;
+  /** The states registered so far: each before its first read or write, since
+   *  a branch made from another (an undo's) carries registered states only. */
+  private readonly registeredHeadStates = new Set<string>();
+  /** Each agent whose recorded head couldn't be read, on the branch named,
+   *  so that's said once a branch, though every request on the head asks. */
+  private readonly headDeclarationsUnreadable = new Map<string, string>();
 
   private readonly headDeclarations: HeadDeclarationStore = {
-    read: (agentName) => this.readHeadDeclarations()?.get(agentName) ?? null,
-    write: (agentName, head) => this.storeHeadDeclarations((map) => { map.set(agentName, head); }),
+    read: (agentName) => this.readHeadDeclaration(agentName) ?? null,
+    write: (agentName, head) => this.storeHeadDeclaration(agentName, head),
     delete: (agentName) => {
-      if (this.readHeadDeclarations()?.has(agentName)) this.storeHeadDeclarations((map) => { map.delete(agentName); });
+      if (this.readHeadDeclaration(agentName)) this.storeHeadDeclaration(agentName, null);
     },
   };
 
-  private readHeadDeclarations(): Map<string, HeadDeclaration> | null {
+  private headStateId(agentName: string): string {
+    const id = headDeclarationId(agentName);
+    if (!this.registeredHeadStates.has(id)) {
+      ensureStateRegistered(this.store, { id, strategy: 'snapshot' });
+      this.registeredHeadStates.add(id);
+    }
+    return id;
+  }
+
+  /** The recorded heads read on the current branch, by agent. */
+  private headsOnBranch(): Map<string, HeadDeclaration | null> {
     const branch = this.store.currentBranch().name;
-    if (this.headDeclarationMap?.branch === branch) return this.headDeclarationMap.heads;
+    if (this.headDeclarationCache?.branch !== branch) this.headDeclarationCache = { branch, heads: new Map() };
+    return this.headDeclarationCache.heads;
+  }
+
+  /** An agent's recorded head on the current branch: null where none is
+   *  recorded, and undefined where its state couldn't be read. Then the agent
+   *  sends its current head, as on 'head', and its next write replaces the
+   *  record. A record that isn't a head is set aside: the agent adopts again,
+   *  one write. */
+  private readHeadDeclaration(agentName: string): HeadDeclaration | null | undefined {
+    const heads = this.headsOnBranch();
+    if (heads.has(agentName)) return heads.get(agentName);
+    const branch = this.headDeclarationCache!.branch;
     try {
-      const stored = this.store.getStateJson(HEAD_DECLARATIONS_ID);
-      const map = new Map<string, HeadDeclaration>();
-      const dropped: string[] = [];
-      if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
-        for (const [name, head] of Object.entries(stored as Record<string, unknown>)) {
-          if (isHeadDeclaration(head)) map.set(name, head);
-          else dropped.push(name);
-        }
-      } else if (stored != null) {
-        dropped.push('(the whole record, not a map)');
-      }
-      // What can't be used is set aside, and its agents adopt again: one
-      // write each. The next write stores the map without it.
-      if (dropped.length > 0) console.error(`[head-declarations] recorded heads that can't be used were set aside: ${dropped.join(', ')}`);
-      this.headDeclarationMap = { branch, heads: map };
-      this.headDeclarationsUnreadableOn = null;
-      return map;
+      const stored = this.store.getStateJson(this.headStateId(agentName));
+      const head = isHeadDeclaration(stored) ? stored : null;
+      if (stored != null && head === null) console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside`);
+      heads.set(agentName, head);
+      this.headDeclarationsUnreadable.delete(agentName);
+      return head;
     } catch (error) {
-      // Each agent then sends its current head, as on 'head', until a read works.
-      if (this.headDeclarationsUnreadableOn !== branch) console.error('[head-declarations] the recorded heads could not be read:', error);
-      this.headDeclarationsUnreadableOn = branch;
-      return null;
+      if (this.headDeclarationsUnreadable.get(agentName) !== branch) console.error(`[head-declarations] ${agentName}: the recorded head could not be read:`, error);
+      this.headDeclarationsUnreadable.set(agentName, branch);
+      return undefined;
     }
   }
 
-  /** A record that can't be stored is logged, not thrown: the request in hand
-   *  is right either way. The map keeps the head that request went with, so
-   *  the process stays consistent; the store keeps the old one until a later
-   *  write lands, and a restart or a branch switch, which read the store
-   *  again, then declares the difference once. */
-  private storeHeadDeclarations(change: (map: Map<string, HeadDeclaration>) => void): void {
-    const map = this.readHeadDeclarations();
-    if (!map) return;
-    change(map);
+  /** Record an agent's head, or with null, record none. A write that would
+   *  change nothing isn't made. One that can't be stored is logged, not
+   *  thrown: the request in hand is right either way. Memory keeps the head
+   *  that request went with, so the process stays consistent; the store
+   *  keeps the old one until a later write lands, and a restart or a branch
+   *  switch, which read the store again, then declares the difference once. */
+  private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): void {
+    const recorded = this.readHeadDeclaration(agentName);
+    if (recorded !== undefined && JSON.stringify(recorded) === JSON.stringify(head)) return;
+    this.headsOnBranch().set(agentName, head);
     try {
-      this.store.setStateJson(HEAD_DECLARATIONS_ID, Object.fromEntries(map));
+      this.store.setStateJson(this.headStateId(agentName), head);
     } catch (error) {
-      console.error('[head-declarations] the recorded heads could not be stored:', error);
+      console.error(`[head-declarations] ${agentName}: the recorded head could not be stored:`, error);
     }
   }
 
@@ -13873,7 +13884,7 @@ export class AgentFramework {
           else contextManager.addMessage(participant, msg.content);
         }
         const templateHead = this.headDeclarations.read(template.name);
-        if (templateHead) this.headDeclarations.write(name, templateHead);
+        if (templateHead) this.headDeclarations.write(name, copyHead(templateHead));
       }
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };

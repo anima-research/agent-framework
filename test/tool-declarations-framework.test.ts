@@ -260,6 +260,7 @@ describe('toolDeclarations in the framework', () => {
       ], 'its template\'s change, then its own');
       const heads = framework as unknown as { headDeclarations: { read(name: string): unknown }; disposeConversationAgent(name: string): void };
       assert.notEqual(heads.headDeclarations.read('alpha-fork'), null);
+      assert.notStrictEqual(heads.headDeclarations.read('alpha-fork'), heads.headDeclarations.read('alpha'), "the fork's head is a copy of its template's, not the same object");
       heads.disposeConversationAgent('alpha-fork');
       assert.equal(heads.headDeclarations.read('alpha-fork'), null, 'a closed fork\'s head goes with it');
       assert.notEqual(heads.headDeclarations.read('alpha'), null);
@@ -326,6 +327,103 @@ describe('toolDeclarations in the framework', () => {
       assert.equal(all.filter(isSystemChangeMessage).length, 1, 'declared once the result is in');
       assert.ok(isSystemChangeMessage(all.at(-1)!), 'after the result');
       assert.equal((all.at(-2)!.content[0] as { type?: string }).type, 'tool_result');
+    });
+  });
+
+  describe('the recorded heads in the store', () => {
+    type Store = { setStateJson(id: string, value: unknown): unknown; getStateJson(id: string): unknown };
+    type Internals = { store: Store; headDeclarationCache: unknown; headDeclarations: { read(name: string): unknown; write(name: string, head: unknown): void } };
+    const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
+    /** The ids of the states written while `run` runs. */
+    async function statesWritten(store: Store, run: () => Promise<unknown>): Promise<string[]> {
+      const written: string[] = [];
+      const set = store.setStateJson.bind(store);
+      store.setStateJson = (id, value) => { written.push(id); return set(id, value); };
+      try { await run(); } finally { store.setStateJson = set; }
+      return written;
+    }
+
+    it("keeps each agent's head in a state of its own, so one agent's write leaves the others' unwritten", async () => {
+      await withFramework([resident('alpha'), resident('beta')], async (framework) => {
+        const internals = framework as unknown as Internals;
+        const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')], system('v1'));
+        await beta.buildActivationRequest([tool('b')]);
+        const betaHead = internals.store.getStateJson('framework/head-declarations/beta');
+        const written = await statesWritten(internals.store, () => alpha.buildActivationRequest([tool('a')], system('v2')));
+        assert.deepEqual(written, ['framework/head-declarations/alpha'], "alpha's replacement writes alpha's state alone");
+        assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as { system: string[] }).system, ['You are alpha.', 'v2']);
+        assert.deepEqual(internals.store.getStateJson('framework/head-declarations/beta'), betaHead);
+      });
+    });
+
+    it('makes no write that would change nothing', async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const internals = framework as unknown as Internals;
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        const recorded = JSON.parse(JSON.stringify(internals.headDeclarations.read('alpha')));
+        assert.deepEqual(await statesWritten(internals.store, async () => internals.headDeclarations.write('alpha', recorded)), []);
+        assert.deepEqual(await statesWritten(internals.store, async () => internals.headDeclarations.write('alpha', { ...recorded, system: ['other'] })), ['framework/head-declarations/alpha']);
+      });
+    });
+
+    it("sets aside a record that isn't a head, and the agent adopts again", async () => {
+      await withFramework([resident('alpha'), resident('beta')], async (framework) => {
+        const internals = framework as unknown as Internals;
+        const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await beta.buildActivationRequest([tool('b')]);
+        internals.store.setStateJson('framework/head-declarations/alpha', { tools: 'not a list', system: [] });
+        internals.headDeclarationCache = null;
+        const traces: TraceEvent[] = [];
+        framework.onTrace((event) => { traces.push(event); });
+        const errors: string[] = [];
+        const error = console.error;
+        console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+        let request: Awaited<ReturnType<Agent['buildActivationRequest']>>;
+        try { request = await alpha.buildActivationRequest([tool('a'), tool('c')]); } finally { console.error = error; }
+        assert.deepEqual(request.tools, [tool('a'), tool('c')], 'what is current');
+        assert.deepEqual(traces.filter((t) => t.type === 'head:moved').map((t) => (t as { why: string }).why), ['adopted']);
+        assert.deepEqual(errors, ["[head-declarations] alpha: the recorded head isn't one, so it was set aside"]);
+        assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as { tools: ToolDefinition[] }).tools, [tool('a'), tool('c')], 'and the record is a head again');
+        assert.deepEqual((internals.headDeclarations.read('beta') as { tools: ToolDefinition[] }).tools, [tool('b')], "beta's stays");
+      });
+    });
+
+    it("sends the current head while an agent's record can't be read, saying so once, and records it again", async () => {
+      await withFramework([resident('alpha'), resident('beta')], async (framework) => {
+        const internals = framework as unknown as Internals;
+        const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await beta.buildActivationRequest([tool('b')]);
+        const get = internals.store.getStateJson.bind(internals.store);
+        internals.store.getStateJson = (id) => {
+          if (id === 'framework/head-declarations/alpha') throw new Error('unreadable');
+          return get(id);
+        };
+        internals.headDeclarationCache = null;
+        const errors: string[] = [];
+        const error = console.error;
+        console.error = (...args: unknown[]) => { errors.push(String(args[0])); };
+        try {
+          const request = await alpha.buildActivationRequest([tool('a'), tool('c')]);
+          assert.deepEqual(request.tools, [tool('a'), tool('c')], 'what is current');
+          assert.deepEqual(changesIn(request.messages), []);
+          internals.headDeclarationCache = null;
+          await alpha.buildActivationRequest([tool('a'), tool('c')]);
+        } finally {
+          console.error = error;
+          internals.store.getStateJson = get;
+        }
+        assert.deepEqual(errors, ['[head-declarations] alpha: the recorded head could not be read:'], 'said once on the branch');
+        assert.deepEqual((get('framework/head-declarations/alpha') as { tools: ToolDefinition[] }).tools, [tool('a'), tool('c')], 'the record is written again');
+        assert.deepEqual((internals.headDeclarations.read('beta') as { tools: ToolDefinition[] }).tools, [tool('b')], "beta's is read as before");
+      });
     });
   });
 
