@@ -155,9 +155,23 @@ export function renderToolDefinition(tool: HintedTool): string {
 //
 // A deliberate subset of JSON Schema: type, enum, const, required, properties,
 // additionalProperties, items, min/maxItems, minimum, maximum,
-// exclusiveMinimum/Maximum, min/maxLength, pattern, anyOf, oneOf, allOf.
-// Anything else isn't checked, so the check can only fail to refuse what the
-// server would refuse on those keywords, never refuse what it would accept.
+// exclusiveMinimum/Maximum, min/maxLength, anyOf, oneOf, allOf. Anything else
+// isn't checked, so the check can only fail to refuse what the server would
+// refuse on those keywords, never refuse what it would accept; the server
+// checks every call itself.
+//
+// The schema is the server's, so its cost is bounded here: `pattern` is never
+// evaluated (a server's regular expression run on the host's event loop could
+// backtrack for as long as it likes), and a schema nested deeper than
+// MAX_CHECK_DEPTH, or whose check would take more than MAX_CHECK_STEPS steps
+// (anyOf fan-out, a long enum), isn't checked at all.
+
+/** Schema levels the check descends before it gives up and lets the server decide. */
+export const MAX_CHECK_DEPTH = 24;
+/** Schema nodes and enum entries the check visits before it gives up. */
+export const MAX_CHECK_STEPS = 5_000;
+
+const OVER_BUDGET: unique symbol = Symbol('over budget');
 
 function typeOk(t: string, v: unknown): boolean {
   switch (t) {
@@ -180,27 +194,47 @@ function typeOk(t: string, v: unknown): boolean {
   }
 }
 
-const same = (a: unknown, b: unknown): boolean => canonicalJson(a) === canonicalJson(b);
+/**
+ * The first problem with `value` against `schema`, as a short phrase naming
+ * where; null when it fits, or when the schema is past the check's bounds
+ * (the server decides those).
+ */
+export function checkArgs(schema: unknown, value: unknown): string | null {
+  const budget = { steps: 0 };
+  try {
+    return check(schema, value, 'args', 0, budget);
+  } catch (error) {
+    if (error === OVER_BUDGET) return null;
+    throw error;
+  }
+}
 
-/** The first problem with `value` against `schema`, as a short phrase naming where; null when it fits. */
-export function checkArgs(schema: unknown, value: unknown, at = 'args'): string | null {
+function spend(budget: { steps: number }, steps: number): void {
+  budget.steps += steps;
+  if (budget.steps > MAX_CHECK_STEPS) throw OVER_BUDGET;
+}
+
+function check(schema: unknown, value: unknown, at: string, depth: number, budget: { steps: number }): string | null {
   if (!isObj(schema)) return null;
+  if (depth > MAX_CHECK_DEPTH) throw OVER_BUDGET;
+  spend(budget, 1);
   const s = schema;
   if (s.type !== undefined) {
     const types = Array.isArray(s.type) ? (s.type as string[]) : [s.type as string];
     if (!types.some((t) => typeOk(t, value))) return `${at}: must be ${types.join(' or ')}`;
   }
-  if (Array.isArray(s.enum) && !s.enum.some((e) => same(e, value))) return `${at}: must be one of ${s.enum.map((e) => JSON.stringify(e)).join('|')}`;
-  if (s.const !== undefined && !same(s.const, value)) return `${at}: must be ${JSON.stringify(s.const)}`;
+  if (Array.isArray(s.enum) || s.const !== undefined) {
+    const own = canonicalJson(value);
+    if (Array.isArray(s.enum)) {
+      spend(budget, s.enum.length);
+      if (!s.enum.some((e) => canonicalJson(e) === own)) return `${at}: must be one of ${s.enum.map((e) => JSON.stringify(e)).join('|')}`;
+    }
+    if (s.const !== undefined && canonicalJson(s.const) !== own) return `${at}: must be ${JSON.stringify(s.const)}`;
+  }
   if (typeof value === 'string') {
     const n = [...value].length;
     if (typeof s.minLength === 'number' && n < s.minLength) return `${at}: at least ${s.minLength} characters`;
     if (typeof s.maxLength === 'number' && n > s.maxLength) return `${at}: at most ${s.maxLength} characters`;
-    if (typeof s.pattern === 'string') {
-      let re: RegExp | null = null;
-      try { re = new RegExp(s.pattern, 'u'); } catch { /* a pattern this runtime can't compile isn't checked */ }
-      if (re && !re.test(value)) return `${at}: does not match ${s.pattern}`;
-    }
   }
   if (typeof value === 'number') {
     if (typeof s.minimum === 'number' && value < s.minimum) return `${at}: at least ${s.minimum}`;
@@ -213,7 +247,7 @@ export function checkArgs(schema: unknown, value: unknown, at = 'args'): string 
     if (typeof s.maxItems === 'number' && value.length > s.maxItems) return `${at}: at most ${s.maxItems} items`;
     if (isObj(s.items)) {
       for (let i = 0; i < value.length; i++) {
-        const e = checkArgs(s.items, value[i], `${at}[${i}]`);
+        const e = check(s.items, value[i], `${at}[${i}]`, depth + 1, budget);
         if (e) return e;
       }
     }
@@ -225,25 +259,25 @@ export function checkArgs(schema: unknown, value: unknown, at = 'args'): string 
     }
     for (const [k, v] of Object.entries(value)) {
       if (Object.hasOwn(props, k)) {
-        const e = checkArgs(props[k], v, `${at}.${k}`);
+        const e = check(props[k], v, `${at}.${k}`, depth + 1, budget);
         if (e) return e;
       } else if (s.additionalProperties === false) {
         return `${at}.${k}: not an argument of this tool`;
       } else if (isObj(s.additionalProperties)) {
-        const e = checkArgs(s.additionalProperties, v, `${at}.${k}`);
+        const e = check(s.additionalProperties, v, `${at}.${k}`, depth + 1, budget);
         if (e) return e;
       }
     }
   }
   for (const k of ['anyOf', 'oneOf'] as const) {
     const alts = s[k];
-    if (Array.isArray(alts) && alts.length && !alts.some((a) => checkArgs(a, value, at) === null)) {
-      return checkArgs(alts[0], value, at) ?? `${at}: fits none of the allowed forms`;
+    if (Array.isArray(alts) && alts.length && !alts.some((a) => check(a, value, at, depth + 1, budget) === null)) {
+      return check(alts[0], value, at, depth + 1, budget) ?? `${at}: fits none of the allowed forms`;
     }
   }
   if (Array.isArray(s.allOf)) {
     for (const a of s.allOf) {
-      const e = checkArgs(a, value, at);
+      const e = check(a, value, at, depth + 1, budget);
       if (e) return e;
     }
   }
