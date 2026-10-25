@@ -22505,27 +22505,38 @@ export class AgentFramework {
                   isError: true,
                 });
               }
-              // Flush pending assistant blocks
+              // Store the round and its results, with the same bounded spill
+              // policy as the ordinary path (issue #89: this guard path must
+              // not become the one door a giant blob still walks through).
+              // The results are built first, as the ordinary boundary builds
+              // them, and the round and its results are then stored back to
+              // back with no await between. A spill is a workspace write, and
+              // a write that lands while it runs and isn't deferred (another
+              // resident's own row in the shared slot, a module's tool_result,
+              // a channel's row in a fork) is stored before both, never
+              // between the round's tool_use and its result. The round is the
+              // one held when the response completed, so a teardown that
+              // clears it during the build doesn't leave its results stored
+              // alone, and its entry is cleared after both stores only if it
+              // still holds that round.
               const pending = this.pendingAssistantBlocks.get(agent.name);
-              if (pending) {
-                agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
+              const readyState = agent.state as AgentState;
+              const ready = readyState.status === 'ready' ? readyState : undefined;
+              const inline = ready ? this.resolveToolResultInlineCap(agent) : undefined;
+              const built = ready && inline
+                ? await this.buildStoredToolResultContent(agent.name, ready.toolResults, inline.cap, inline.bound)
+                : undefined;
+              const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
+              if (pending) agent.addAssistantResponse(pending, turnRowMetadata);
+              if (ready && inline && built) {
+                agent.toolResultGuard.storeResults(built.blocks, ready.toolResults.map((tc) =>
+                  this.toMembraneToolResult(tc.id, tc.result, inline.cap, built.spilled.get(tc.id), tc.name)), ready.toolResults,
+                  turnRowMetadata, built.keptCap);
+              }
+              if (pending && this.pendingAssistantBlocks.get(agent.name) === pending) {
                 this.pendingAssistantBlocks.delete(agent.name);
               }
-              // Store tool results — same bounded spill policy as the
-              // ordinary path (issue #89: this guard path must not become the
-              // one door a giant blob still walks through).
-              const readyState = agent.state as AgentState;
-              if (readyState.status === 'ready') {
-                const { cap, bound } = this.resolveToolResultInlineCap(agent);
-                const { blocks: toolResultContent, spilled, keptCap } = await this.buildStoredToolResultContent(
-                  agent.name,
-                  readyState.toolResults,
-                  cap,
-                  bound,
-                );
-                agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
-                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id), tc.name)), readyState.toolResults,
-                  this.silentTurnRowMetadata(agent.name), keptCap);
+              if (built) {
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
                 agent.toolResultGuard.settleTurnEnded();
