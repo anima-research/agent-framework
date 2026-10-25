@@ -22304,9 +22304,10 @@ export class AgentFramework {
    * with the instance each is for (`_meta["mcpl/instance"]`, §5.5). The MCPL
    * dispatch paths read it: such a call isn't refused as a dynamic tool
    * called by name, and carries its instance. Nothing else about it differs
-   * from a direct call of the tool.
+   * from a direct call of the tool. Created on first use, so a framework
+   * assembled field by field (as unit tests do) needs no setup for it.
    */
-  private readonly toolsetActCalls = new WeakMap<ToolCall, { instance?: string }>();
+  private toolsetActCalls?: WeakMap<ToolCall, { instance?: string }>;
 
   /** A toolsets--act call resolved (resolveAct) to the call of the server's
    *  tool it makes, under that tool's model-facing name and with its
@@ -22316,7 +22317,7 @@ export class AgentFramework {
     if (!target.ok) return target;
     const prefix = this.mcplServerConfigs.get(target.serverId)?.toolPrefix ?? `mcpl--${target.serverId}`;
     const inner: ToolCall = { ...call, name: `${prefix}--${target.tool}`, input: target.args };
-    this.toolsetActCalls.set(inner, target.instance !== undefined ? { instance: target.instance } : {});
+    (this.toolsetActCalls ??= new WeakMap()).set(inner, target.instance !== undefined ? { instance: target.instance } : {});
     return { ok: true, call: inner, serverId: target.serverId, prefix, ...(target.instance !== undefined ? { instance: target.instance } : {}) };
   }
 
@@ -22382,7 +22383,7 @@ export class AgentFramework {
     }
     // RFC-014: a dynamic tool is called through toolsets--act, which marks
     // the call it resolved (toolsetActCalls) with the instance it's for.
-    const act = this.toolsetActCalls.get(call);
+    const act = this.toolsetActCalls?.get(call);
     const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
     if (dynamicRefusal) return { success: false, error: dynamicRefusal, isError: true };
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
@@ -30065,7 +30066,7 @@ export class AgentFramework {
     }
     // RFC-014: a dynamic tool isn't in the list; it's called through act,
     // which marks the call it resolved (toolsetActCalls) with its instance.
-    const act = this.toolsetActCalls.get(call);
+    const act = this.toolsetActCalls?.get(call);
     const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
     if (dynamicRefusal) {
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'a dynamic tool, called through toolsets--act' });
