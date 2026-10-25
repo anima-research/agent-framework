@@ -16,6 +16,10 @@
  * and the error result of each call still running. (Before, framePendingRound
  * read results only from a round waiting for its tools, so each call was
  * framed with a note that it was still running.)
+ *
+ * A message for prime that comes in meanwhile waits, as any write for an
+ * agent whose turn is alive does, and is stored after the round and its
+ * results, never between them.
  */
 
 import { describe, it } from 'node:test';
@@ -353,6 +357,43 @@ describe('a stream that completes while its tools run', () => {
       } finally {
         await run.cleanup();
       }
+    }
+  });
+
+  it('stores a message for prime that comes in while its results are built after the round and its results', async () => {
+    const run = await primeCompletedWhileSpillHeld();
+    const { framework, blocks } = run;
+    const queued = (framework as unknown as { deferredMessages: Array<{ content: ContentBlock[] }> }).deferredMessages;
+    const said = (content: ContentBlock[]) => content.some((b) => b.type === 'text' && b.text === 'a word for prime');
+    try {
+      // A message for prime (CannedModule's onProcess stores an event that
+      // names no agent as a message for prime, and wakes prime), taken in
+      // while the spill is held: it is in the slot or waiting to be, which is
+      // all this waits for. Where it lands is checked once the turns end.
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'a word for prime' }],
+        metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      await waitFor('the message for prime to be taken in', () =>
+        blocks().includes('text:a word for prime') || queued.some((m) => said(m.content)));
+
+      await run.finish();
+      // It woke prime, whose next turn read it.
+      await waitFor("prime's turn on the message to end", () =>
+        blocks().includes('text:prime again') && framework.getHostModeStatus().activeTurns === 0);
+
+      const all = blocks();
+      const round = all.indexOf('text:Fetching both.');
+      assert.ok(round >= 0, "the round's text is stored");
+      assert.deepEqual(all.slice(round, round + 3), ['text:Fetching both.', 'tool_use:call_fetch', 'tool_use:call_slow'],
+        'the round: its text and both calls');
+      assert.deepEqual(all.slice(round + 3, round + 5).sort(), ['tool_result:call_fetch', 'tool_result:call_slow'],
+        'then both results, right after it');
+      assert.deepEqual(all.filter((b) => b === 'text:a word for prime'), ['text:a word for prime'], 'the message is stored once');
+      assert.equal(all.indexOf('text:a word for prime'), round + 5, 'right after the results: after both, not between them');
+      assert.ok(all.indexOf('text:prime again') > round + 5, "and prime's answer to it after it");
+    } finally {
+      await run.cleanup();
     }
   });
 });

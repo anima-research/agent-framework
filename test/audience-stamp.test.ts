@@ -8,7 +8,9 @@
  *
  * Also the registry's own-slot / observe split as the framework uses it: an
  * ended subconscious reopens on its own isolated slot (it read the shared
- * slot through an observe edge, and was reopened on that slot before).
+ * slot through an observe edge, and was reopened on that slot before), and a
+ * row in that slot is unread until the subconscious, its one reader, has
+ * compiled past it, whatever the residents have read.
  *
  * And the deferred queue an earlier version left: its entries carry no
  * stamp, and are stamped when the queue is restored, so whichever flush
@@ -425,6 +427,52 @@ describe('the audience stamp (#291)', () => {
     reopened.addMessage('user', [{ type: 'text', text: 'written on the reopened context' }]);
     assert.equal(second.getAgent('mira')!.getContextManager().getAllMessages().some((m) => textOf(m).includes('written on the reopened')), false,
       'and a write there goes to its own slot, not the residents\'');
+  });
+
+  it('a write for the subconscious, in its own slot, is unread until the subconscious compiles past it, whatever the residents have read', async () => {
+    // The coalescer retracts or replaces only an unread message (its isUnread,
+    // then removePlacement). A row's readers are the agents whose own slot it
+    // is in and those that observe that slot (registry.readersOf): for the
+    // subconscious's own slot, the subconscious alone. While the subconscious
+    // read as a reader of the residents' slot, the residents' watermarks
+    // counted for its own rows too, so such a row counted as read once a
+    // resident compiled, though the subconscious never had.
+    const framework = await boot({ subconscious: true });
+    type Placement = { agent?: string; messageId?: string };
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata: unknown, opts: { forAgent: string; placement: Placement }): string;
+      isUnreadPlacement(placement: Placement, by?: 'consumed' | 'shown'): boolean;
+      removePlacement(placement: Placement): boolean;
+    };
+    const subconscious = framework.getAgent('Subconscious')!;
+    // Written through the framework's addMessage for the subconscious by
+    // name, as a module's hook (the tune-out coordinator's, the gate's)
+    // writes for an agent it names.
+    const write = (text: string): Placement => {
+      const placement: Placement = {};
+      internals.addMessage('user', [{ type: 'text', text }], { kind: 'test-note' }, { forAgent: 'Subconscious', placement });
+      return placement;
+    };
+    const notes = (agent: string) => rowsOf(framework, agent).map(textOf).filter((t) => t.endsWith('for the subconscious'));
+
+    subconscious.markContextConsumed(); // it has compiled, before either write
+    const first = write('first for the subconscious');
+    const second = write('second for the subconscious');
+    assert.deepEqual([first.agent, second.agent], ['Subconscious', 'Subconscious']);
+    assert.deepEqual(notes('Subconscious'), ['first for the subconscious', 'second for the subconscious']);
+    assert.deepEqual(notes('mira'), [], 'in its own slot, not the residents\'');
+
+    // Both residents compile past both rows' places in the store.
+    for (const name of ['mira', 'oren']) framework.getAgent(name)!.markContextConsumed();
+    assert.equal(internals.isUnreadPlacement({ ...first }), true, 'unread: the residents read another slot');
+    assert.equal(internals.isUnreadPlacement({ ...first }, 'shown'), true, 'and never shown');
+    assert.equal(internals.removePlacement({ ...first }), true, 'so it can be retracted');
+    assert.deepEqual(notes('Subconscious'), ['second for the subconscious'], 'and is');
+
+    // The subconscious compiles past the other: read.
+    subconscious.markContextConsumed();
+    assert.equal(internals.isUnreadPlacement({ ...second }), false, 'read once the subconscious compiled past it');
+    assert.equal(internals.isUnreadPlacement({ ...second }, 'shown'), false, 'and shown');
   });
 
   // The deferred queue an earlier version persisted, before the stamp: each

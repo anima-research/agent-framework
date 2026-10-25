@@ -210,6 +210,15 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     assert.deepEqual(h.module.speeches, ['continued']);
     assert.ok(strategy.snapshots.every((s) => !s.includes('original-text-payload') && !s.includes(image)),
       'background strategy ingress must never see withheld payloads');
+    // The check above passes on an empty list, so it means something only if
+    // the hook heard the rows: the results row among them, as the guard's
+    // placeholder (the notice, or the stub it settles to, which begins with
+    // it). context-manager reaches onNewMessage through its presentation
+    // dispatch now, which a change there could stop.
+    assert.ok(strategy.snapshots.length > 0, 'the strategy heard the rows');
+    const heardResults = strategy.snapshots.filter((s) => s.includes('"type":"tool_result"'));
+    assert.ok(heardResults.length > 0, 'it heard the results row');
+    assert.ok(heardResults.every((s) => s.includes(TOOL_RESULT_GUARD_NOTICE)), "and heard it as the guard's placeholder");
 
     const store = h.framework.getStore();
     const audit = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
