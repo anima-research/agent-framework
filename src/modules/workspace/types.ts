@@ -20,9 +20,8 @@ export interface MountConfig {
    * Where the mount's tools get what they read (default: 'chronicle').
    * - 'chronicle': the workspace keeps the mount's files in its store, where
    *   writes and edits land first, and takes in disk's changes under the
-   *   three-way rule as its listings, searches, syncs and scans reach them.
-   *   A read of a path the store doesn't hold takes in a new file there;
-   *   otherwise it reads the store's copy.
+   *   three-way rule as `read`, listings, searches, syncs and scans reach
+   *   them. Its tools read the store's copy.
    * - 'direct': for a checkout, such as a git one, whose history is its
    *   own. Every read, listing and search is disk's own copy as it is when
    *   it runs, and none of its files go into the store. No scan or watcher

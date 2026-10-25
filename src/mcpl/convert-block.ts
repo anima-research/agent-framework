@@ -11,6 +11,7 @@ import {
   IMAGE_NO_DATA_TEXT,
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
+  classifyBlock,
   isInlineContradiction,
   referenceStubOrNull,
   unknownBlockText,
@@ -85,12 +86,24 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       }
       return { type: 'text', text: isFilledString(block.data) ? AUDIO_NO_MEDIA_TYPE_TEXT : AUDIO_NO_DATA_TEXT };
 
-    case 'resource':
+    case 'resource': {
+      // MCP's embedded resource shows as the block its contents make would
+      // show here (RFC-005 §8.1), its uri never.
+      const c = classifyBlock(block);
+      if (c.kind === 'embedded' && c.contents.kind === 'block') {
+        return convertBlock(c.contents.block as McplContentBlock, provenance, serverId);
+      }
       // RFC-005: reference blocks become bounded stubs — never raw URIs
       // (a signed URL is a bearer credential that looks like a location).
       return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+    }
 
     default: {
+      // MCP's link to a resource isn't one of MCPL's own blocks, but a server
+      // can send one, and RFC-005 §8.1 makes it a reference, shown as one.
+      if ((block as { type?: unknown }).type === 'resource_link') {
+        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+      }
       // Unknown wire block types previously fell off the exhaustive switch
       // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
       // that isn't a string is no type, and is never converted to one: an

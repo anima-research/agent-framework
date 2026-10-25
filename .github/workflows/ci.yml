@@ -9,9 +9,64 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes the run still going on its older
+# commit: that run's result says nothing about the code now under review, and
+# it holds runners, macOS's above all, which the organization gets few of at
+# once, so other pull requests' macOS jobs queue behind it (up to ten minutes
+# in October 2026). Pushes to main are never cancelled: each gets its run.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Which macOS legs a run takes. macOS runners are what queue (the
+  # organization gets few at once, shared by every repository), so a pull
+  # request takes the ones that test it: Build & Test's macOS leg at the
+  # engines floor only, and code_execution's Bun macOS legs only when it
+  # touches what they run: any source (the tests import the framework, not
+  # only code_execution), tsconfig.json, package.json, their own tests and
+  # helpers, or this workflow. ci-workflow-pins.test.ts checks every file
+  # those tests import falls inside the filter. The diff is base...head, as
+  # changelog.yml takes it, not the merge commit, which can carry main's
+  # newer commits. Pushes to main take every leg.
+  changes:
+    name: What the change touches
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      bun-os: ${{ steps.decide.outputs.bun-os }}
+      build-exclude: ${{ steps.decide.outputs.build-exclude }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          both='["ubuntu-latest","macos-latest"]'
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "bun-os=$both" >> "$GITHUB_OUTPUT"
+            echo 'build-exclude=[{"os":"macos-latest","node":24}]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'build-exclude=[{"os":"macos-latest","node":24},{"os":"macos-latest","node":"latest"}]' >> "$GITHUB_OUTPUT"
+          changed=$(git diff --name-only "$BASE"..."$HEAD_SHA")
+          echo "$changed"
+          if echo "$changed" | grep -qE '^(src/|test/code-execution|test/helpers/|tsconfig\.json$|package\.json$|\.github/workflows/ci\.yml$)'; then
+            echo "bun-os=$both" >> "$GITHUB_OUTPUT"
+          else
+            echo "bun-os=[\"ubuntu-latest\"]" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-test:
     name: Build & Test (${{ matrix.os }}, node ${{ matrix.node }})
+    needs: changes
     runs-on: ${{ matrix.os }}
     # Without a limit, a step that hangs leaves the check pending until
     # GitHub's six-hour limit. Passing runs take under seven minutes. A
@@ -28,13 +83,13 @@ jobs:
       # admits; and, between them, every maintained major line (24), as
       # membrane and context-manager test theirs. stdio flushing semantics
       # around process exit differ between versions and platforms. macOS runs
-      # the two ends only.
+      # the two ends on a push to main, and the floor alone on a pull request
+      # (`changes`): its runners queue, and the ends rarely part on one
+      # platform without the other's ubuntu leg showing it.
       matrix:
         os: [ubuntu-latest, macos-latest]
         node: ['22.12.0', 24, latest]
-        exclude:
-          - os: macos-latest
-            node: 24
+        exclude: ${{ fromJSON(needs.changes.outputs.build-exclude) }}
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -60,8 +115,20 @@ jobs:
 
       # Tests run on both platforms: process/stdio behaviour differs (pipes
       # are asynchronous on macOS), and ubuntu-only runs have missed that.
+      #
+      # As many test files at once as the runner has cores, said here rather
+      # than left to Node's default of one fewer. macOS runners come with 3
+      # cores or 5, and on 3 the default ran two files at once: 582 s, where
+      # a 5-core runner took 290 s for the same tests. At the core count,
+      # those took 444 s and 236 s, and ubuntu's 4-core runs went from about
+      # 380 s to 300 s. Most files wait on timers and child processes, not
+      # the CPU.
       - name: Test
-        run: npm test
+        run: |
+          AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length")
+          echo "cores: $AF_TEST_CONCURRENCY (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
+          export AF_TEST_CONCURRENCY
+          npm test
 
       # npm test runs with --test-force-exit, which hides async work a test
       # leaves running, such as a late arrival after stop() ("Queue is
@@ -146,14 +213,22 @@ jobs:
   # are where runtimes and platforms differ. code_execution needs Bun 1.4.0 or
   # later (create() refuses it on an older one), so they run under 1.4.0, the
   # oldest release it admits, and under 1.4.3.
+  #
+  # On a pull request that touches no source, none of these tests or the
+  # test helpers, and not tsconfig.json, package.json or this workflow (a
+  # change to other tests or the docs), the macOS legs are left out
+  # (`changes`): they take two of the few macOS runners the organization gets
+  # at once, and nothing they run has changed. Every push to main runs both
+  # platforms.
   code-execution-bun:
     name: code_execution under Bun (${{ matrix.os }}, bun ${{ matrix.bun }})
+    needs: changes
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.changes.outputs.bun-os) }}
         bun: [1.4.0, 1.4.3]
 
     steps:

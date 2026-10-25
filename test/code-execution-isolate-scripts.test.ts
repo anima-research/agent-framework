@@ -297,8 +297,8 @@ test("each call carries the script's origin, and the watching call's turn only w
   await scripts.dispose();
 });
 
-test("a script's calls carry the turn its run was made in, under a later turn's wait too", async () => {
-  const contexts: Array<{ name: string; watch?: { turnId?: number }; startTurnId?: number }> = [];
+test("a script's calls carry the turn its run was made in, and what its agent had read then, under a later turn's wait too", async () => {
+  const contexts: Array<{ name: string; watch?: { turnId?: number }; startTurnId?: number; startReadThrough?: unknown }> = [];
   const gates: Array<() => void> = [];
   const { scripts } = setup({
     config: { yieldMs: 30_000 },
@@ -311,7 +311,8 @@ test("a script's calls carry the turn its run was made in, under a later turn's 
     },
   });
   // The run returns at once, and the script goes on; a later turn waits on it.
-  const run = await scripts.run('alice', `await tools.slow({}); await tools.echo({});`, 0, { watch: { turnId: 7, endTurn: false } });
+  const atStart = { branch: 'main', sequence: 3 };
+  const run = await scripts.run('alice', `await tools.slow({}); await tools.echo({});`, 0, { watch: { turnId: 7, endTurn: false }, startReadThrough: atStart });
   for (let i = 0; i < 2_000 && gates.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
   const waiting = scripts.wait('alice', run.scriptId, 30_000, { turnId: 9, endTurn: false });
   gates[0]!();
@@ -320,6 +321,7 @@ test("a script's calls carry the turn its run was made in, under a later turn's 
   const echo = contexts.find((c) => c.name === 'echo');
   assert.equal(echo?.watch?.turnId, 9, 'the call carries the turn watching it');
   assert.equal(echo?.startTurnId, 7, 'and the turn its script was started in');
+  assert.deepEqual(echo?.startReadThrough, atStart, 'and what its agent had read when it started');
   await scripts.dispose();
 });
 

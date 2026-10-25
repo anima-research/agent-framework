@@ -1363,16 +1363,15 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it("an addressed message a boundary leaves out of the injection doesn't re-pin the turn: the live stream heard only the notice of it", async () => {
-    // The control is the test above that re-pins: the same DM, injected,
-    // moves the trailing prose to the DM. The notice is a system line, which
-    // moves no locus.
+  it("an addressed message the render gives null goes in as stored, and re-pins the turn", async () => {
+    // As the test above, with the render placing the DM before its window:
+    // the live stream hears it as stored, so the trailing prose follows it.
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Station four, proceeding.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([
-      { type: 'text', text: 'Carrying on where I was.' },
+      { type: 'text', text: 'Answering the person who addressed me.' },
     ] as ContentBlock[]));
 
     const framework = await createFramework();
@@ -1387,22 +1386,21 @@ describe('present while acting', () => {
     trigger(framework);
     await framework.runUntilIdle();
 
-    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM');
     const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
-    assert.equal(injected.length, 1, 'only the notice of what was left out is injected');
-    assert.ok(JSON.stringify(injected[0]!.content).startsWith('[{"type":"text","text":"[not shown]'), JSON.stringify(injected[0]));
+    assert.deepEqual(injected[0], { participant: 'Antra', content: [{ type: 'text', text: 'hey, quick question over here?' }] }, 'the DM, as stored');
     assert.deepEqual(routed, [
       { text: 'Station four, proceeding.', locus: 'chan-live-1' },
-      { text: 'Carrying on where I was.', locus: 'chan-live-1' },
+      { text: 'Answering the person who addressed me.', locus: 'discord:dm:antra' },
     ]);
 
     await framework.stop();
   });
 
-  it("a budget restart takes as an arrival an addressed message its boundary stored and left out of the injection", async () => {
-    // The boundary renders the DM as null, as for one the next compile won't
-    // send among its newest, so the live stream never hears it. The restart
-    // compiles anew, and the DM is still an arrival of the turn it continues.
+  it("a budget restart takes as an arrival an addressed message its boundary stored, though the render gave it null", async () => {
+    // The boundary renders the DM as null, and the stream is over its budget,
+    // so no live stream hears it. The restart compiles anew, and the DM is
+    // still an arrival of the turn it continues.
     const overBudget = createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use');
@@ -1423,7 +1421,7 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 2, 'control: the turn restarted for its budget');
-    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM');
     assert.deepEqual(routed, [{ text: 'After the restart.', locus: 'discord:dm:antra' }], 'the restart re-pinned to the DM');
 
     await framework.stop();
@@ -1783,15 +1781,21 @@ describe('present while acting', () => {
   // A tool's late write lands in the turn that called it: a send's engaged
   // channel, and a channel_open's move of the locus. (The dispatch functions
   // run on a bare framework, as checkpoint-attribution.test.ts's harness does.)
+  /** What a stub agent needs for its sleep's announcement to be noted on it
+   *  (Agent.notePublished). */
+  const noteStub = { getConsumedWatermark: () => null, notePublished: () => {} };
+
   function bareFramework(): Record<string, unknown> & { [method: string]: any } {
     const framework = Object.create(AgentFramework.prototype) as Record<string, unknown> & { [method: string]: any };
     framework.emitTrace = () => {};
     framework.pushEvent = () => {};
     framework.conversationAgentHomes = new Map();
+    framework.ephemeralRuns = new Map();
     framework.lastAnnouncedLocus = new Map();
     framework.activeTurnTriggers = new Map();
     framework.openLogical = new Map();
-    framework.scriptCallStartTurns = new Map();
+    framework.scriptCallStarts = new Map();
+    framework.agents = new Map();
     return framework;
   }
   const until = async (done: () => boolean, label: string): Promise<void> => {
@@ -1900,6 +1904,8 @@ describe('present while acting', () => {
     framework.checkpointManager = null;
     framework.channelRegistry = {
       openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      // The send's own channel, which nobody closed, so its answer carries no note.
+      resolveSendTarget: () => undefined,
       directsLifecycle: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
@@ -1919,6 +1925,126 @@ describe('present while acting', () => {
     assert.deepEqual([...sending.engaged], [destinationKey({ serverId: 'chat', channelId: 'discord:guild:portables' })],
       "the channel the send went to, on the send tool's server");
     assert.deepEqual([...next.engaged], [], "the next turn didn't send there");
+  });
+
+  // A send the framework sees is noted on its agent as a publish into its
+  // channel, with what the agent had read when it made the call, so a wake
+  // for a message there that it read first needs nothing more of it. Its
+  // channel is the one the open resolves, the canonical id a wake carries,
+  // not the raw id the send was given. A send the server refused publishes
+  // nothing, and a background script's, made in no turn, was written with
+  // the script, before what the agent read since.
+  for (const [how, refused, inTurn, status] of [
+    [' is noted on its agent with what it had read at dispatch, however late its open resolves', false, true, 'already-open'],
+    [' the server refused is not noted', true, true, 'already-open'],
+    [" a background script made, in no turn, is not noted", false, false, 'already-open'],
+    [' whose open finds no such channel is not noted', false, true, 'unknown-channel'],
+    [' whose open finds the channel ambiguous is not noted', false, true, 'ambiguous'],
+  ] as const) {
+    it(`a send${how}`, async () => {
+      let read = { branch: 'main', sequence: 7 };
+      const noted: Array<[string, unknown]> = [];
+      const sent: unknown[] = [];
+      let resolveOpen: ((outcome: { status: string; channelId: string }) => void) | undefined;
+      const framework = bareFramework();
+      framework.agents = new Map([['assistant', {
+        getConsumedWatermark: () => read,
+        notePublished: (channelId: string, readThrough: unknown) => { noted.push([channelId, readThrough]); },
+      }]]);
+      framework.mcplServerRegistry = {
+        getServer: (id: string) => id === 'chat' ? {
+          id: 'chat',
+          sendToolsCall: async (...args: unknown[]) => {
+            sent.push(args);
+            return refused
+              ? { content: [{ type: 'text', text: 'missing permission' }], isError: true }
+              : { content: [{ type: 'text', text: 'sent' }] };
+          },
+        } : null,
+      };
+      framework.mcplServerConfigs = new Map([['chat', { id: 'chat', toolPrefix: 'chat' }]]);
+      framework.mcplToolFeatureSets = new Map();
+      framework.checkpointManager = null;
+      framework.channelRegistry = {
+        openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+        // The send's own channel, which nobody closed, so its answer carries no note.
+        resolveSendTarget: () => undefined,
+        directsLifecycle: () => true,
+      };
+      const engaged = new Set<string>();
+      framework.turnRouting = new Map([['assistant', { turnId: 1, engaged, wasIn: [] }]]);
+      const results: unknown[] = [];
+      framework.pushEvent = (event: { type: string }) => { if (event.type === 'tool-result') results.push(event); };
+
+      framework.dispatchMcplToolCall('assistant', {
+        id: 'send-1', name: 'chat--send_message', input: { channelId: '1180342', text: 'hi' },
+        ...(inTurn ? { callerTurnId: 1 } : {}),
+      }, 'chat', 'chat');
+      await until(() => results.length > 0, 'the send to finish');
+      assert.equal(sent.length, 1, 'the premise: the server got the send');
+      // The agent reads more before the open resolves: the send was written
+      // before that.
+      const atDispatch = read;
+      read = { branch: 'main', sequence: 12 };
+      if (refused) {
+        assert.equal(resolveOpen, undefined, 'a refused send opens nothing');
+        assert.deepEqual(noted, []);
+        return;
+      }
+      resolveOpen!({ status, channelId: 'discord:guild:portables' });
+      if (status !== 'already-open') {
+        // The open's outcome is handled on the microtask queue.
+        await new Promise((r) => setImmediate(r));
+        assert.deepEqual(noted, [], 'no channel the open could name is noted');
+        assert.deepEqual([...engaged], []);
+        return;
+      }
+      if (!inTurn) {
+        // A call made outside the turn engages nothing either (callingTurnOf).
+        await new Promise((r) => setImmediate(r));
+        assert.deepEqual(noted, []);
+        assert.deepEqual([...engaged], []);
+        return;
+      }
+      await until(() => noted.length > 0, 'the open to resolve');
+      assert.deepEqual(noted, [[destinationKey({ serverId: 'chat', channelId: 'discord:guild:portables' }), atDispatch]]);
+    });
+  }
+
+  // A channel_publish is noted the same way, with what the agent had read
+  // when it made the call, however late its outcome comes back.
+  it('a channel_publish is noted on its agent with what it had read at dispatch, however late its outcome arrives', async () => {
+    let read = { branch: 'main', sequence: 7 };
+    const noted: Array<[string, unknown]> = [];
+    let deliver: (() => void) | undefined;
+    const framework = bareFramework();
+    framework.agents = new Map([['assistant', {
+      getConsumedWatermark: () => read,
+      notePublished: (destination: string, readThrough: unknown) => { noted.push([destination, readThrough]); },
+    }]]);
+    framework.channelRegistry = {
+      handleChannelToolCall: (_name: string, _input: unknown, _origin: unknown, seen: { outcome?: unknown }) =>
+        new Promise((resolve) => {
+          deliver = () => {
+            seen.outcome = { status: 'delivered', destination: { serverId: 'chat', channelId: 'discord:guild:portables' }, at: Date.now() };
+            resolve({ success: true, data: {} });
+          };
+        }),
+    };
+    framework.turnRouting = new Map([['assistant', { turnId: 1, engaged: new Set(), wasIn: [] }]]);
+    const results: unknown[] = [];
+    framework.pushEvent = (event: { type: string }) => { if (event.type === 'tool-result') results.push(event); };
+
+    framework.dispatchChannelToolCall('assistant', {
+      id: 'publish-1', name: 'channel_publish', input: { channelId: 'discord:guild:portables', content: 'hi' }, callerTurnId: 1,
+    });
+    // The agent reads more before the outcome comes back: the words were
+    // written before that.
+    const atDispatch = read;
+    read = { branch: 'main', sequence: 12 };
+    deliver!();
+    await until(() => results.length > 0, 'the publish to finish');
+    assert.deepEqual(noted, [[destinationKey({ serverId: 'chat', channelId: 'discord:guild:portables' }), atDispatch]]);
   });
 
   // A channel_open's result can land after a later start has made another
@@ -2018,6 +2144,8 @@ describe('present while acting', () => {
     framework.checkpointManager = null;
     framework.channelRegistry = {
       openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      // The send's own channel, which nobody closed, so its answer carries no note.
+      resolveSendTarget: () => undefined,
       directsLifecycle: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
@@ -2036,7 +2164,7 @@ describe('present while acting', () => {
   it("a sleep announces in the calling turn's locus, and a call made outside the turn announces nowhere", async () => {
     const framework = bareFramework();
     const announced: Array<{ text: string; locus: unknown }> = [];
-    framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
+    framework.agents = new Map([['assistant', { proseRouting: 'locus', ...noteStub }]]);
     framework.eventGate = { setSleep: () => ({ until: Date.now() + 60_000 }) };
     framework.channelRegistry = {
       routeSpeech: async (_agent: string, text: string, locus: unknown) => { announced.push({ text, locus }); return { delivered: true }; },
@@ -2067,7 +2195,7 @@ describe('present while acting', () => {
     const silent = { turnId: 8, engaged: new Set(), wasIn: [], locus: stub('chan-silent'), pin: stub('pin-silent') };
     for (const mode of ['explicit', 'locus'] as const) {
       announced.length = 0;
-      framework.agents = new Map([['assistant', { proseRouting: mode }]]);
+      framework.agents = new Map([['assistant', { proseRouting: mode, ...noteStub }]]);
       // Turn 7 open and live: its sleep announces in its own pin or locus.
       framework.openLogical.set('assistant', open);
       framework.turnRouting = new Map([['assistant', open]]);
@@ -2087,7 +2215,7 @@ describe('present while acting', () => {
     }
     // With prose routing disabled, the turn's own sleep announces nowhere.
     announced.length = 0;
-    framework.agents = new Map([['assistant', { proseRouting: 'disabled' }]]);
+    framework.agents = new Map([['assistant', { proseRouting: 'disabled', ...noteStub }]]);
     framework.turnRouting = new Map([['assistant', open]]);
     framework.activeTurnTriggers = new Map([['assistant', {}]]);
     sleep(7);

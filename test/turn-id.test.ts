@@ -233,6 +233,43 @@ test('a script\'s inner calls carry the turn of the code_execution call that run
   });
 });
 
+test("a script's inner calls carry what its agent had read when the run call started the script, after the agent has read more", async () => {
+  await withFramework({ codeExecution: true }, async ({ framework, membrane, recorder }) => {
+    type Start = { turnId?: number; readThrough: { branch: string; sequence: number } | null };
+    const fw = framework as unknown as { dispatchScriptToolCall: (...args: unknown[]) => Promise<unknown> };
+    const agent = framework.getAgent('assistant') as unknown as {
+      getConsumedWatermark(): { branch: string; sequence: number } | null;
+      getContextManager(): { addMessage(participant: string, content: unknown[]): unknown };
+      markContextConsumed(): void;
+    };
+    // What the bridge hands the dispatch with each of the script's calls.
+    const seen: Array<{ start: Start; read: unknown }> = [];
+    const dispatch = fw.dispatchScriptToolCall.bind(framework);
+    fw.dispatchScriptToolCall = (...args: unknown[]) => {
+      seen.push({ start: args[5] as Start, read: agent.getConsumedWatermark() });
+      return dispatch(...args);
+    };
+    // The agent reads more between the script's two calls, as a later
+    // round's boundary would have it.
+    recorder.onCall = async (call) => {
+      if (messageOf(call) !== 'first') return;
+      agent.getContextManager().addMessage('Antra', [{ type: 'text', text: 'read since the script started' }]);
+      agent.markContextConsumed();
+    };
+    queueToolTurn(membrane, {
+      id: 'call-ce',
+      name: 'code_execution',
+      input: { code: 'await tools["test--echo"]({ message: "first" });\nawait tools["test--echo"]({ message: "second" });' },
+    });
+    await runTurn(framework, 'go');
+    assert.equal(seen.length, 2, 'the script made both calls');
+    assert.ok(seen[0]!.start.readThrough, "the call carries its script's start reading");
+    assert.deepEqual(seen[0]!.start.readThrough, seen[0]!.read, 'what the agent had read as the run call started it');
+    assert.notDeepEqual(seen[1]!.read, seen[0]!.read, 'the agent read more before the second call');
+    assert.deepEqual(seen[1]!.start.readThrough, seen[0]!.read, 'and the second call carries the start reading still');
+  });
+});
+
 test('a utility run through utils carries the turn of the utils call', async () => {
   await withFramework({}, async ({ framework, membrane, recorder }) => {
     queueToolTurn(membrane, { id: 'call-utils', name: 'utils', input: { action: 'run', name: 'test--note', args: {} } });

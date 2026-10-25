@@ -48,6 +48,8 @@ export interface ScriptCallContext {
   watching?(): ScriptWatch | undefined;
   /** The turn the script's run call was made in, when one was: the turn its words were written in, which a later turn's wait doesn't change. */
   startTurnId?: number;
+  /** What its agent had read when the run call started the script (the host's consumed watermark), given at run: what the script's words were written having read, which a later round's wait doesn't change. */
+  startReadThrough?: { branch: string; sequence: number } | null;
 }
 
 export interface ScriptsHost {
@@ -115,7 +117,7 @@ interface Script {
   /** The code it runs. */
   code: string;
   run: ScriptRun;
-  context: { origin?: unknown };
+  context: { origin?: unknown; startReadThrough?: { branch: string; sequence: number } | null };
   /** The turn its run call was made in, when one was: its agent's turns end it by that. */
   turnId: number | undefined;
   startedAt: number;
@@ -178,7 +180,7 @@ export class AgentScripts {
     agentName: string,
     code: string,
     askedMs?: number,
-    options: { origin?: unknown; watch?: ScriptWatch } = {},
+    options: { origin?: unknown; watch?: ScriptWatch; startReadThrough?: { branch: string; sequence: number } | null } = {},
   ): Promise<ScriptReturn> {
     // Listed first, so a module whose tool list throws refuses the run with nothing taken.
     let tools: readonly PreludeTool[];
@@ -204,7 +206,10 @@ export class AgentScripts {
       agentName,
       code,
       run: null as unknown as ScriptRun,
-      context: options.origin === undefined ? {} : { origin: options.origin },
+      context: {
+        ...(options.origin === undefined ? {} : { origin: options.origin }),
+        ...(options.startReadThrough === undefined ? {} : { startReadThrough: options.startReadThrough }),
+      },
       turnId: options.watch?.turnId,
       startedAt: Date.now(),
       endedAt: null,

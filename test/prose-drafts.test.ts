@@ -15,6 +15,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
+import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const ROOM = 'discord:g1:room';
@@ -426,6 +427,16 @@ describe('held prose drafts, end to end', () => {
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
       assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
 
+      // A publish into a channel is noted on the agent with what it had read
+      // when it made the call (a wake for a message there that it read first
+      // needs nothing more of it): nothing yet in room.
+      const scout = h.framework.getAgent('scout') as unknown as {
+        getConsumedWatermark(): { branch: string; sequence: number };
+        publishedAfterReading(channelId: string, branch: string, sequence: number): boolean;
+      };
+      const room = destinationKey({ serverId: 'discord', channelId: ROOM });
+      assert.equal(scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0), false, 'nothing published in room yet');
+
       // Next turn: list (every field present, nulls), read, then resend all three.
       await h.turn([
         createMockResponse([drafts('d1', { action: 'list' })], 'tool_use'),
@@ -433,6 +444,10 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([drafts('d3', { action: 'resend', draftIds: ids, destination: ROOM })], 'tool_use'),
         createMockResponse([]),
       ]);
+      const readThrough = scout.getConsumedWatermark();
+      assert.equal(scout.publishedAfterReading(room, readThrough.branch, readThrough.sequence), true,
+        'the resend is noted as a publish into room, made having read what the turn read');
+      assert.equal(scout.publishedAfterReading(room, readThrough.branch, readThrough.sequence + 1), false, 'and nothing stored since');
       const [list, read, resend] = h.toolResults();
       assert.match(list!, /3 open drafts, newest first/);
       assert.ok(read!.endsWith(`exactly as a resend publishes it):\n${segments[1]}`), `read shows the text in full: ${read}`);
@@ -563,6 +578,89 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("a resend made in no turn, as a background script's or a puppet's is, isn't noted as a publish into its channel", async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('words held for later'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [held] = h.drafts();
+      assert.ok(held, 'the words are held as a draft');
+      // Dispatched as a background script's call is: with no turn.
+      let finished = false;
+      h.framework.onTrace((event) => {
+        if (event.type === 'tool:completed' && (event as { callId?: string }).callId === 'from-script') finished = true;
+      });
+      (h.framework as unknown as {
+        dispatchToolCall(agentName: string, call: { id: string; name: string; input: unknown }, turnId?: number): void;
+      }).dispatchToolCall('scout', { id: 'from-script', name: 'drafts', input: { action: 'resend', draftIds: [held.id], destination: ROOM } });
+      await h.until(() => finished, 'the resend to finish');
+      assert.ok(h.publishes().some((p) => p.channelId === ROOM && p.text === 'words held for later'), 'the resend delivered');
+      const scout = h.framework.getAgent('scout') as unknown as {
+        getConsumedWatermark(): { branch: string; sequence: number };
+        publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
+      };
+      const room = destinationKey({ serverId: 'discord', channelId: ROOM });
+      assert.equal(scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0), false,
+        "a background script's resend is not noted");
+
+      // Through executeToolCall, as the admin puppet and ephemeral agents call.
+      await h.turn([
+        createMockResponse([text('more words held'), explicitSend('s2')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [again] = h.drafts();
+      assert.ok(again, 'the new words are held as a draft');
+      const result = await h.framework.executeToolCall({
+        id: 'from-puppet', name: 'drafts', input: { action: 'resend', draftIds: [again.id], destination: ROOM }, callerAgentName: 'scout',
+      });
+      assert.equal(result.success, true, `the puppet's resend delivered: ${JSON.stringify(result)}`);
+      assert.ok(h.publishes().some((p) => p.channelId === ROOM && p.text === 'more words held'));
+      assert.equal(scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0), false, "a puppet's resend is not noted");
+    } finally {
+      await h.close();
+    }
+  });
+
+  // A script's resend was decided as its run call started it, though a later
+  // round's wait watches it under the same turn.
+  it("a script's resend is noted with what its agent had read when the run call started the script", async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('words a script will send'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [held] = h.drafts();
+      assert.ok(held, 'the words are held as a draft');
+      const fw = h.framework as unknown as {
+        turnRouting: Map<string, unknown>;
+        scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string }>;
+      };
+      const scout = h.framework.getAgent('scout') as unknown as {
+        getConsumedWatermark(): { branch: string; sequence: number };
+        publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
+      };
+      const room = destinationKey({ serverId: 'discord', channelId: ROOM });
+      const now = scout.getConsumedWatermark();
+      const atStart = { branch: now.branch, sequence: now.sequence - 1 };
+      fw.turnRouting.set('scout', { turnId: 99, wasIn: [], engaged: new Set() });
+
+      let answered: { ok: boolean; json: string } | undefined;
+      void fw.scriptToolCall('scout', 'drafts', JSON.stringify({ action: 'resend', draftIds: [held.id], destination: ROOM }),
+        { watch: { turnId: 99, endTurn: false }, startTurnId: 99, startReadThrough: atStart }).then((a) => { answered = a; });
+      await h.until(() => answered !== undefined, "the script's resend to be answered");
+
+      assert.ok(h.publishes().some((p) => p.channelId === ROOM && p.text === 'words a script will send'), `the resend delivered: ${answered!.json}`);
+      assert.equal(JSON.parse(answered!.json).isError, false, `the call succeeded: ${answered!.json}`);
+      assert.equal(scout.publishedAfterReading(room, atStart.branch, atStart.sequence), true, 'noted with what the agent had read when the script started');
+      assert.equal(scout.publishedAfterReading(room, now.branch, now.sequence), false, 'not with what it has read since');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('drafts belong to their resident: another resident can neither list nor resend them', async () => {
     const h = await harness({ agents: [{ name: 'scout' }, { name: 'other' }] });
     try {
@@ -603,15 +701,25 @@ describe('held prose drafts, end to end', () => {
       const resend = (id: string, confirm?: boolean) =>
         drafts(id, { action: 'resend', draftIds: [draft!.id], destination: ROOM, ...(confirm ? { confirmDuplicate: true } : {}) });
 
+      // Only a delivered resend is noted as a publish into its channel.
+      const scout = h.framework.getAgent('scout') as unknown as {
+        getConsumedWatermark(): { branch: string; sequence: number };
+        publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
+      };
+      const room = destinationKey({ serverId: 'discord', channelId: ROOM });
+      const noted = () => scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0);
+
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /not sent to .* Nothing was posted by this attempt\. The draft stays held\./);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'held');
+      assert.equal(noted(), false, 'a refused resend is not noted');
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([resend('r2')], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /NOT confirmed — it may or may not have been posted/);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
+      assert.equal(noted(), false, 'an unconfirmed resend is not noted');
 
       h.command({ op: 'publish-mode', mode: 'delivered' });
       await h.turn([createMockResponse([resend('r3')], 'tool_use'), createMockResponse([])]);
@@ -620,6 +728,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([resend('r4', true)], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /delivered to/);
       assert.equal(h.publishes().length, before + 1);
+      assert.equal(noted(), true, 'a delivered resend is noted');
       const attempts = h.store().get('scout', draft!.id)!.attempts;
       assert.deepEqual(attempts.map((a) => [a.outcome?.status, a.confirmedDuplicate ?? false]), [
         ['failed', false], ['unknown', false], ['delivered', true],

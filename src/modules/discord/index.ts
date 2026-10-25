@@ -828,7 +828,7 @@ export class DiscordModule implements Module {
       const stored = this.storedRow(msg.discordMessageId);
       if (live) live.phase = 'writing';
 
-      // Return declarative response - framework applies all writes atomically
+      // Return declarative response - the framework applies its writes
       return {
         ...(stored ? {} : {
           addMessages: [

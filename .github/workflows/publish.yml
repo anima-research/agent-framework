@@ -49,8 +49,15 @@ jobs:
       - name: Build
         run: npm run build
 
+      # As many test files at once as the runner has cores, as ci.yml's
+      # Build & Test runs them, so a release's gate runs the suite as a pull
+      # request's did.
       - name: Test
-        run: npm test
+        run: |
+          AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length")
+          echo "cores: $AF_TEST_CONCURRENCY (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
+          export AF_TEST_CONCURRENCY
+          npm test
 
   # The tarball npm publish makes from this tree, installed alone into an
   # empty directory with its dependencies from npm (linked, so each package
