@@ -65,7 +65,6 @@ describe('DefaultErrorPolicy on membrane\'s schedules', () => {
     assert.equal(waits.length, 12, 'twelve retries after the first send');
     const steps = [10_000, 20_000, 40_000, 80_000, 160_000, ...Array(7).fill(300_000)];
     waits.forEach((w, i) => assert.ok(w >= Math.floor(steps[i] / 2) && w < steps[i], `retry ${i + 1} waits ${w} ms, in [${steps[i] / 2}, ${steps[i]})`));
-    // 2,410 s nominal, against 0.26.0's 2,440 s (membrane's 7 sends inside each of 4 tries).
     assert.equal(steps.reduce((a, b) => a + b, 0), 2_410_000);
     // An overloaded error mid-stream carries no status, only its message.
     assert.equal(delays(policy, err({ type: 'server', retryable: true, message: 'overloaded_error: Overloaded' })).length, 12);
@@ -78,7 +77,6 @@ describe('DefaultErrorPolicy on membrane\'s schedules', () => {
     assert.deepEqual(delays(custom, err({ type: 'server', retryable: true, httpStatus: 529 })), [1000, 2000]);
     assert.equal(custom.maxRetries, 4, 'its largest class allows four retries (rate_limited)');
     assert.equal(policy.maxRetries, 12, 'the defaults allow twelve (overloaded)');
-    // A host's settings are taken as they are: membrane's own give a 529 its seven tries.
     assert.equal(delays(new DefaultErrorPolicy(MEMBRANE_RETRY_SETTINGS as RetrySettings), err({ type: 'server', retryable: true, httpStatus: 529 })).length, 6);
   });
 
@@ -163,7 +161,6 @@ class FlakyMembrane extends OptionsMembrane {
   }
 }
 
-/** A framework with one resident, `errorPolicy` (the default when left out) and any other options. */
 async function makeFramework(t: TestContext, membrane: MockMembrane, errorPolicy?: unknown, extra: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-retry-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -205,7 +202,6 @@ test("a direct caller of Agent.startStream keeps membrane's retries", async (t: 
   assert.equal((membrane.streamOptions[0] as { retry?: unknown }).retry, undefined, 'no retry: false on a stream the framework does not drive');
 });
 
-/** A stream of another make: its iterator throws the failure instead of sending an error event. */
 class ThrowingStream extends ErrorStream {
   constructor(private readonly thrown: Error) { super(thrown); }
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -213,7 +209,6 @@ class ThrowingStream extends ErrorStream {
   }
 }
 
-/** The first turn stream throws `error` from its iterator; then they answer. */
 class ThrowOnceMembrane extends OptionsMembrane {
   constructor(private error: Error | null) { super(); }
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
@@ -260,10 +255,6 @@ test("a turn waiting out the policy's delay says so as the wait begins, with its
   assert.equal(events[failed + 1]!.type, 'inference:waiting', 'said as the wait begins, right after the failure');
   const first = events[failed + 1]!;
   assert.ok(first.until !== undefined && first.until >= first.at + 900 && first.until <= first.at + 1_100, `its end is the delay away: ${first.until! - first.at} ms`);
-  // About ten at a 100 ms cadence over a 1 s wait. The wait and its cadence
-  // count down by its timers, so late timers lengthen it rather than change
-  // how many cadence points it has; a cadence twice as long would give five,
-  // and one half as long twenty.
   assert.ok(waiting.length >= 8 && waiting.length <= 12, `said at each cadence point while the wait lasted, and no more often (${waiting.length} in all)`);
   assert.ok(waiting.every((e) => events.indexOf(e) < restarted), 'nothing once the wait has ended');
   assert.ok(waiting.every((e) => e.until === first.until), 'each names the same end');
@@ -277,8 +268,6 @@ test("a wall clock stepping back during the wait doesn't stretch its cadence: it
     onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 1_000 } : { retry: false }),
   });
   (fw as unknown as { waitingTraceEveryMs: number }).waitingTraceEveryMs = 100;
-  // As the wait first says so, the wall clock steps back two minutes, as an
-  // NTP correction or a hand-set clock can.
   const realNow = Date.now;
   t.after(() => { Date.now = realNow; });
   let stepped = false;
@@ -293,8 +282,6 @@ test("a wall clock stepping back during the wait doesn't stretch its cadence: it
   await idle(fw);
   Date.now = realNow;
   assert.ok(stepped, 'the clock stepped back');
-  // About ten, as with a steady clock; a cadence read from the wall clock
-  // would say nothing more for two minutes, past the end of this wait.
   assert.ok(waiting.length >= 8 && waiting.length <= 12, `said at the cadence after the clock stepped back (${waiting.length} in all)`);
 });
 
@@ -302,11 +289,8 @@ test('a listener of inference:waiting that stops the framework ends the wait, an
   const membrane = new FlakyMembrane(1);
   const fw = await makeFramework(t, membrane, {
     maxRetries: 1,
-    // Long enough that only the stop ends it.
     onInferenceError: () => ({ retry: true, delayMs: 60_000 }),
   });
-  // The default cadence, under connectome-host 0.13's two-minute reaper: the
-  // stop has to end the wait itself, not wait for the next cadence point.
   assert.equal((fw as unknown as { waitingTraceEveryMs: number }).waitingTraceEveryMs, 60_000);
   const events = traceOf(fw);
   let stopped: Promise<void> | undefined;
@@ -340,7 +324,6 @@ test('a wait too long for a date says it is waiting, with no until', async (t: T
   await fw.stop();
 });
 
-/** The first turn stream sends `error` as an error event, as membrane's own streams do; then they answer. */
 class EventOnceMembrane extends OptionsMembrane {
   constructor(private error: Error | null) { super(); }
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
@@ -354,7 +337,6 @@ class EventOnceMembrane extends OptionsMembrane {
   }
 }
 
-/** The default policy on scaled settings, recording what it is asked and what it decides. */
 function recordingPolicy() {
   const policy = new DefaultErrorPolicy(scaled(20));
   const asked: Array<{ type: string; httpStatus?: number; attempt: number; retry: boolean }> = [];
@@ -394,8 +376,6 @@ test('a retryable 529 a stream of another make throws from its iterator is retri
   assert.deepEqual(thrown, sent, 'the same sends, the same policy questions and answers, the same trace as the error event');
 });
 
-/** The first turn stream throws a retryable 529 from its iterator, and its cancel() records or throws; it
- *  notes whether that stream had been cancelled when the retry's stream was asked for. */
 class ThrowThenRecordMembrane extends OptionsMembrane {
   thrown: ThrowingStream | undefined;
   cancelledAtRetry: boolean | undefined;
@@ -436,7 +416,6 @@ for (const [what, thrown] of [
   test(`${what}, thrown from a stream's iterator, ends the turn as a throw did, without asking the error policy`, async (t: TestContext) => {
     const membrane = new ThrowOnceMembrane(thrown);
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-never' }]));
-    // A policy that would retry anything it's asked about once: the throw's path doesn't ask it.
     let asked = 0;
     const fw = await makeFramework(t, membrane, {
       maxRetries: 1,
@@ -471,7 +450,6 @@ test("a retryable failure on the start path, before any stream, is retried by th
   assert.ok(events.some((e) => e.type === 'inference:completed'), 'the retry answered');
 });
 
-/** Records the options each complete() call is given. */
 class CompleteOptionsMembrane extends MockMembrane {
   readonly completeOptions: unknown[] = [];
   override async complete(request: NormalizedRequest, options?: unknown) {
@@ -548,7 +526,6 @@ test('the wait says nothing while its agent is not the one registered under its 
   let restoredAt = 0;
   fw.onTrace((e) => {
     if (e.type !== 'inference:waiting' || replacedAt) return;
-    // Another agent under the name for half a second, then the waiting one again.
     const real = agents.get('resident');
     agents.set('resident', Object.create(real as object));
     replacedAt = Date.now();
@@ -562,7 +539,6 @@ test('the wait says nothing while its agent is not the one registered under its 
   assert.ok(waiting.some((e) => e.at >= restoredAt), 'said again once it had it back');
 });
 
-/** A stream that sends `events`, then throws `thrown` from its iterator, or with none simply ends. */
 class SendThenThrowStream extends ErrorStream {
   constructor(private readonly events: StreamEvent[], private readonly thrown: Error | null) { super(thrown ?? new Error('unused')); }
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -571,7 +547,6 @@ class SendThenThrowStream extends ErrorStream {
   }
 }
 
-/** Each turn stream sends the next script's events, then throws its error; once the scripts run out, they answer. */
 class SendThenThrowMembrane extends OptionsMembrane {
   constructor(private readonly scripts: Array<{ events: StreamEvent[]; thrown: Error | null }>) { super(); }
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
@@ -585,7 +560,6 @@ class SendThenThrowMembrane extends OptionsMembrane {
 const answer = (text: string) => ({ type: 'complete', response: createMockResponse([{ type: 'text', text }]) }) as unknown as StreamEvent;
 const accelerationLimit = () => err({ type: 'rate_limit', retryable: true, httpStatus: 429, message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute" });
 
-/** What a turn left behind: its trace, its inference-log rows, and the resident's messages that say a turn failed. */
 function afterTurn(fw: AgentFramework, events: Array<{ type: string }>) {
   const rows = fw.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry as { success?: boolean });
   const messages = fw.getAgent('resident')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>;
@@ -597,7 +571,6 @@ function afterTurn(fw: AgentFramework, events: Array<{ type: string }>) {
   };
 }
 
-/** console.error's lines while `run` runs that name what a stream did: by default, what it sent or threw after its terminal event. */
 async function laterEventLines<T>(t: TestContext, run: () => Promise<T>, naming = 'which decided its turn'): Promise<{ result: T; lines: string[] }> {
   const lines: string[] = [];
   const original = console.error;
@@ -650,7 +623,6 @@ for (const [what, type, later] of [
       });
       return { left: { ...afterTurn(fw, trace), sends: membrane.streamOptions.length }, lines };
     };
-    // Two later events: the line names the first, which ends the stream.
     const withLater = await run([answer('zz-answered'), later() as unknown as StreamEvent, later() as unknown as StreamEvent]);
     const answerAlone = await run([answer('zz-answered')]);
     assert.deepEqual(withLater.left, answerAlone.left, 'the same trace, sends, log rows and [inference-failed] lines as the answer alone');
@@ -660,7 +632,6 @@ for (const [what, type, later] of [
   });
 }
 
-/** A stream that answers, then sends tool calls and holds its iterator for their results, as membrane's own streams do before a terminal event. */
 class AnswerThenToolCallsStream extends ErrorStream {
   private gotResults!: () => void;
   private readonly results = new Promise<void>((r) => { this.gotResults = r; });
@@ -741,7 +712,6 @@ for (const [what, type, terminal] of [
     const first = () => terminal() as unknown as StreamEvent;
     const thrownAfter = await run({ events: [first()], thrown: err({ type: 'server', retryable: true, httpStatus: 529, message: 'overloaded_error thrown after the event' }) });
     const laterAfter = await run({ events: [first(), answer('zz-a-late-answer')], thrown: null });
-    // The control: the same event, and then the stream simply ends.
     const eventAlone = await run({ events: [first()], thrown: null });
     assert.equal(eventAlone.left.types.filter((x) => x === 'inference:exhausted').length, 1, 'the control: the event alone ends the turn');
     assert.deepEqual(thrownAfter.left, eventAlone.left, 'a throw after it: the same trace, log rows and [inference-failed] lines as the event alone');
@@ -751,7 +721,6 @@ for (const [what, type, terminal] of [
   });
 }
 
-/** A stream that waits until it is cancelled, then throws a retryable 529, as a failure landing after the cancel. */
 class ThrowAfterCancelStream extends ErrorStream {
   private cancelled!: () => void;
   private readonly whenCancelled = new Promise<void>((r) => { this.cancelled = r; });
@@ -780,8 +749,6 @@ test('a retryable 529 thrown after a stop cancelled the stream ends the turn as 
   }, 'taken as its error event');
   assert.equal(membrane.streamOptions.length, 1, 'no retry');
   assert.ok(events.some((e) => e.type === 'inference:aborted'), 'it ended as the stop');
-  // The stop settles the turn without logging the failure, so the line is
-  // where the throw is seen.
   assert.equal(lines.length, 1, 'one line names the thrown failure');
   assert.match(lines[0]!, /overloaded_error after the cancel/);
   assert.deepEqual(events.filter((e) => ['inference:waiting', 'inference:exhausted', 'inference:failed'].includes(e.type)).map((e) => e.type), []);

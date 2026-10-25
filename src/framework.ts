@@ -1936,16 +1936,16 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
  * this policy after one send, and the framework is the one retry layer: each
  * retry is a fresh compile, a stop cancels its wait, and the wait is seen.
  * The decision is membrane's (`@animalabs/membrane/retry`), on the settings
- * given: membrane's, as TURN_RETRY_SETTINGS adjusts them for the turn path,
- * unless a host passes its own (e.g. from a recipe's retry config), which
- * are taken as they are:
+ * given: membrane's, with the two changes below for the turn path, unless a
+ * host passes its own (e.g. from a recipe's retry config), which are taken as
+ * they are:
  * - not retryable (400 invalid_request, 401 auth, context_length, safety,
  *   a caller-code error): terminal on the first failure. Retrying them burns
  *   API quota without any chance of success; production traces showed clerk +
  *   reviewer wasting 4 inferences on each 400 due to blind retries.
  * - overloaded (a 529, or an overloaded error mid-stream): the overloaded
- *   schedule, jittered, 10 s doubling to 5 min (by default 13 tries, about
- *   30 min: see TURN_RETRY_SETTINGS).
+ *   schedule, jittered, 10 s doubling to 5 min (by default 13 tries, where
+ *   membrane's settings have 7: about 30 min).
  * - rate limited (429): the base schedule with at least 5 tries.
  * - any other retryable failure, a stream deadline on a sent request
  *   included (membrane leaves those to its caller): the base schedule (by
@@ -2074,25 +2074,7 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
-/** How many tries the default policy gives an overloaded error (a 529).
- *  Its 12 waits on membrane's overloaded schedule, 10 s doubling to 5 min,
- *  come to 2,410 s nominal. 0.26.0 nested membrane's 7 sends inside each of
- *  its policy's 4 tries: 24 such waits, 2,440 s nominal. Both are jittered
- *  into [d/2, d), so a turn bears a capacity storm about as long as on
- *  0.26.0, about 20 to 40 minutes. */
 const OVERLOADED_TURN_TRIES = 13;
-/**
- * The default error policy's settings: membrane's own, with two changes for
- * the turn path.
- * - The overloaded class takes OVERLOADED_TURN_TRIES, where membrane's takes 7.
- * - Every class's stated-wait ceiling is at least the framework's own cap: a
- *   stated wait up to it is slept and retried, as it was before #728
- *   (nonOwningProviderWait ends an ephemeral run on a longer one, and a
- *   resident's waits are held before the policy runs). Membrane's schedules
- *   alone would end the turn on one past a minute (five minutes for the
- *   overloaded class).
- * A host that passes its own settings gets them as they are.
- */
 const TURN_RETRY_SETTINGS: RetrySettings = Object.fromEntries(
   Object.entries(MEMBRANE_RETRY_SETTINGS as RetrySettings).map(([cls, s]) => [cls, s && {
     ...s,
@@ -2105,10 +2087,8 @@ const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** The latest instant a Date can hold (epoch ms). */
 const MAX_DATE_MS = 8_640_000_000_000_000;
-/** How often a wait for a turn's retry says it is still waiting (the
- *  `inference:waiting` trace). Under two minutes, which is how long
- *  connectome-host 0.13's subagent reaper lets a subagent go silent with no
- *  request in flight before it reclaims its slot. */
+/** Under two minutes: connectome-host 0.13's subagent reaper reclaims a
+ *  subagent silent that long with no request in flight. */
 const WAITING_TRACE_EVERY_MS = 60_000;
 /** A stated wait recorded to hold a model longer than this, or until
  *  released, raises an ops alert. It is honoured in full either way: a hold
@@ -2127,33 +2107,11 @@ function isMembraneError(error: unknown): error is MembraneError {
 }
 
 /**
- * A turn stream's events, as driveStream reads them (agent-framework#734).
- * - Before its terminal event, a retryable provider failure its iterator
- *   throws is given as the `error` event membrane's own streams send for
- *   one, so the turn meets that event's path: a provider hold, a stated
- *   wait, or the error policy's retry. Membrane's streams throw only on a
- *   cancellation or an internal fault, but a stream of another make can
- *   throw such a failure. Before the event is given, the stream that threw
- *   is cancelled, as far as its cancel() goes: a rejected next() ends this
- *   loop without closing the stream, and a producer that outlives it would
- *   otherwise run on beside the retry's stream. Any other throw, a
- *   cancellation's included, is thrown on as it was.
- * - Once a terminal event (complete, error or aborted) has decided the turn,
- *   by its answer, its retry or hold, or its end, nothing after it decides
- *   it again. The first later event ends the events, and so does a throw,
- *   each with a line naming it, where driveStream would act on the turn a
- *   second time: a later failure ended an answered turn as failed, with an
- *   `[inference-failed]` line after its answer, or held it to send it again,
- *   and a later event ran its case for a turn already decided. Ending them
- *   at that event, rather than pulling on past it, closes the stream (its
- *   iterator's return()), so a stream that sends a later event and then
- *   holds its iterator for something that will never come, such as that
- *   event's tool results, can't keep the turn from finishing. One pull past
- *   the terminal event is still made, to see what follows: a stream that
- *   holds its iterator there without sending anything keeps the turn
- *   waiting, as on main. Membrane's own streams send their terminal event
- *   last and then end; only a stream of another make sends or throws
- *   anything after it.
+ * agent-framework#734. Membrane's own streams send a retryable failure as an
+ * `error` event and send nothing after their terminal event. A stream of
+ * another make can throw one from its iterator, or send or throw after its
+ * terminal event. `for await` doesn't close an iterator whose `next()`
+ * rejected.
  */
 async function* turnStreamEvents(stream: YieldingStream, agentName: string): AsyncGenerator<StreamEvent> {
   let decidedBy: StreamEvent['type'] | undefined;
@@ -2172,8 +2130,6 @@ async function* turnStreamEvents(stream: YieldingStream, agentName: string): Asy
       return;
     }
     if (!(isMembraneError(error) && error.retryable === true)) throw error;
-    // Said here, since the error event's path doesn't log a failure that a
-    // stop or the framework's cancel then settles, as the throw's did.
     console.error(`[stream] ${agentName}: the stream threw a retryable failure from its iterator, taken as its error event: ${describeFailureWithFrames(error)}`);
     try {
       stream.cancel();
@@ -2899,8 +2855,6 @@ export class AgentFramework {
   private providerWaits: ProviderWaits | undefined;
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
   private retryWaitWakers = new Set<() => void>();
-  /** How often a retry's wait says it is waiting (WAITING_TRACE_EVERY_MS);
-   *  a field so tests can shorten it. */
   private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   private providerAdmissionClosed = false;
   /** Invalidates framework turns still assembling when stop begins. */
@@ -5230,12 +5184,6 @@ export class AgentFramework {
    * framework is never left with a wait parked for days. The frame's window
    * (checkWindow) carries a waker that ends the whole wait: a stop
    * abortInference() records, or an operator's abandon, wakes it.
-   *
-   * The wait says so (`inference:waiting`, for `agent` while it is the one
-   * registered under its name) as it begins and every waitingTraceEveryMs
-   * while it lasts, so a host's watch for agents gone quiet doesn't take a
-   * waiting one for stuck. Nothing is said once it has ended. A listener of
-   * it that calls abortInference() or stop() ends the wait too.
    */
   private async waitForRetry(ms: number, checkWindow: CheckWindow, agent: Agent): Promise<void> {
     // An infinite delay waits until stop(), like any wait too long to end; a
@@ -5244,9 +5192,7 @@ export class AgentFramework {
     if (!(remaining > 0)) return;
     const until = Date.now() + remaining;
     // stop() wakes this step through retryWaitWakers and ends the rest by
-    // closing admission; the window's waker ends the rest itself. Both are in
-    // place before anything is said, so a listener of inference:waiting that
-    // stops the agent or the framework ends the wait.
+    // closing admission; the window's waker ends the rest itself.
     let ended = false;
     let wakeStep: (() => void) | undefined;
     const wake = (): void => { wakeStep?.(); };
@@ -5255,22 +5201,15 @@ export class AgentFramework {
     checkWindow.wake = () => { ended = true; wake(); };
     const over = (): boolean => !(remaining > 0) || ended || this.providerAdmissionClosed;
     const every = this.waitingTraceEveryMs;
-    // How long since the wait last said so, counted by its timers as the
-    // wait itself is, so a step of the wall clock can't stretch the cadence.
     let sinceSaid = Number.POSITIVE_INFINITY;
     try {
       for (;;) {
         if (over()) return;
         if (sinceSaid >= every) {
           sinceSaid = 0;
-          // Said only for the agent still registered under its name: a wait
-          // whose agent was removed or replaced runs on as before, unseen,
-          // since its name now stands for another agent or for none. A wait
-          // too long for a date has no end a reader can use.
           if (this.agents.get(agent.name) === agent) {
             this.emitTrace({ type: 'inference:waiting', agentName: agent.name, ...(until <= MAX_DATE_MS ? { until } : {}) });
           }
-          // Its listeners can end the wait.
           if (over()) return;
         }
         const step = Math.min(remaining, MAX_TIMER_DELAY_MS, Math.max(1, every - sinceSaid));
@@ -5279,9 +5218,6 @@ export class AgentFramework {
           wakeStep = () => { clearTimeout(timer); resolve(); };
         });
         wakeStep = undefined;
-        // Counted by its timer, not the clock, as before: a step a stop or
-        // an abort woke early ends the wait anyway, and a late timer makes
-        // the wait end later than its `until`, never sooner.
         remaining -= step;
         sinceSaid += step;
       }

@@ -121,10 +121,8 @@ export type TraceEvent =
        * seconds while it lasts, while its agent is the one registered under
        * its name, and never after the wait ends (its time coming, a stop, or
        * an abort). The failure being retried is the `inference:failed` just
-       * before it. It is there so a host watching for agents gone quiet can
-       * tell a waiting one from a stuck one: connectome-host 0.13's subagent
-       * reaper reclaims a subagent silent for two minutes with no request in
-       * flight, and `inference:failed` ends its request in flight.
+       * before it. A host watching for agents gone quiet can tell a waiting
+       * one from a stuck one by it.
        */
       type: 'inference:waiting';
       agentName: string;
