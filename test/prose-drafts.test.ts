@@ -446,6 +446,11 @@ describe('held prose drafts, end to end', () => {
       const [list, read, resend] = h.toolResults();
       assert.match(list!, /3 open drafts, newest first/);
       assert.ok(read!.endsWith(`exactly as a resend publishes it):\n${segments[1]}`), `read shows the text in full: ${read}`);
+      // Round 2's draft gives the cause its notice gave wherever it's shown.
+      const secondLine = list!.split('\n').find((l) => l.includes(`${ids[1]} · `));
+      assert.ok(secondLine?.includes(' · explicit send in its turn · '), `the listing gives the turn's send as the reason: ${list}`);
+      assert.ok(read!.includes(`${ids[1]} — held; held `) && read!.includes('(an explicit send in its round or an earlier one of its turn held it back)'),
+        `read gives the same cause: ${read}`);
       assert.match(resend!, new RegExp(`${ids[0]}: delivered to #room \\(Guild One\\) \\(${ROOM}\\), message posted-2`));
       const sent = h.publishes().slice(1);
       assert.deepEqual(sent.map((p) => [p.channelId, p.text]), segments.map((s) => [ROOM, s]), 'verbatim, in order');
@@ -897,8 +902,8 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
       assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice on this branch names: /);
-      assert.match(notice, /d-[a-z2-9]{7} \(held \(not sent\); explicit send in the same round\)/);
-      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in the same round\\)`));
+      assert.match(notice, /d-[a-z2-9]{7} \(held \(not sent\); explicit send in its turn\)/);
+      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in its turn\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
       assert.ok(!notice.includes('orphaned words') && !notice.includes('half-sent words'), `the notice quotes no draft's words: ${notice}`);
       await h.turn([createMockResponse([])]);
@@ -917,7 +922,7 @@ describe('held prose drafts, end to end', () => {
       assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice on this branch names: /);
       // Newest first: the eight newest with their state, then the two oldest
       // by id alone. No draft's words appear.
-      const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(held \(not sent\); explicit send in the same round\)/g)].map((m) => m[1]);
+      const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(held \(not sent\); explicit send in its turn\)/g)].map((m) => m[1]);
       assert.deepEqual(named, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => held[i]!.id));
       assert.ok(notice.includes(` · and 2 more: ${held[1]!.id}, ${held[0]!.id}.`), notice);
       assert.ok(!/orphan \d/.test(notice), `the notice quotes no draft's words: ${notice}`);
@@ -947,7 +952,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice on this branch names: ${draft!.id} \\(held \\(not sent\\); explicit send in the same round\\)`));
+      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice on this branch names: ${draft!.id} \\(held \\(not sent\\); explicit send in its turn\\)`));
       assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');

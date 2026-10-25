@@ -14384,13 +14384,13 @@ export class AgentFramework {
   }
 
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
-    'explicit-send': 'an explicit send in the same round holds plain speech back',
+    'explicit-send': 'an explicit send in its round or an earlier one of its turn held it back',
     'no-destination': 'it had no destination — after a routing envelope failed, plain speech waits for a new valid target',
     bounced: 'its routing prefix bounced',
   };
 
   private static readonly DRAFT_REASON_SHORT: Record<DraftReason, string> = {
-    'explicit-send': 'explicit send in the same round',
+    'explicit-send': 'explicit send in its turn',
     'no-destination': 'no destination',
     bounced: 'routing prefix bounced',
   };
