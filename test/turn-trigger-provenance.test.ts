@@ -11,8 +11,6 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { AgentFramework, readInboundSource } from '../src/index.js';
 import { isNonChannelSurfaceEvent } from '../src/framework.js';
 import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse } from '../src/index.js';
@@ -394,28 +392,6 @@ async function surfaceRig(opts: {
 }
 
 type Routing = Record<string, unknown>;
-const RESTART_CHILD = fileURLToPath(new URL('./helpers/private-turn-restart-child.js', import.meta.url));
-
-function runRestartChild(storePath: string, channelId: string, abort: AbortSignal): Promise<{ status: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [RESTART_CHILD, storePath, channelId], { signal: abort, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    let failure: Error | undefined;
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
-    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
-    child.on('error', (error) => {
-      failure = error;
-      if (child.pid === undefined) reject(error);
-    });
-    child.on('close', (status, signal) => {
-      if (failure) reject(new Error(`${failure.message} (stderr: ${stderr.slice(-800)})`, { cause: failure }));
-      else resolve({ status, signal, stdout, stderr });
-    });
-  });
-}
 const routingOf = (framework: AgentFramework): Routing =>
   (framework as unknown as { routingOf(name: string): Routing }).routingOf('scout');
 const tuiWake = (): InferenceRequest => ({ agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true });
@@ -1604,14 +1580,15 @@ describe('private wins, one way', () => {
       }
     });
 
-    for (const clock of ['as it was', 'set back'] as const) {
-      it(`a private turn's script report deferred across an update's restart keeps the next run's start out of every channel${clock === 'set back' ? ", with the clock set back so the report's turn id sits above the next run's" : ''}, and leaves a later turn its channel`, async (context) => {
+    for (const reportId of ['its own', 'above the next run\'s floor'] as const) {
+      it(`a private turn's script report deferred across an update's restart${reportId === 'its own' ? '' : ", naming an earlier run's turn id above the next run's floor,"} keeps the next run's start out of every channel, and leaves a later turn its channel`, async () => {
         const storeDir = mkdtempSync(join(tmpdir(), 'private-turn-restart-'));
         try {
           const first = await surfaceRig({ storeDir });
+          let turnId: number;
           try {
             await firstTurn(first, true);
-            const turnId = routingOf(first.framework).turnId as number;
+            turnId = routingOf(first.framework).turnId as number;
             await first.framework.quiesce({ reason: 'update' });
             await (first.framework as unknown as {
               scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
@@ -1621,19 +1598,30 @@ describe('private wins, one way', () => {
           } finally {
             await first.close();
           }
-          if (clock === 'set back') {
+          if (reportId !== 'its own') {
             const queuePath = join(storeDir, 'store', 'recovery', 'deferred-writes.json');
             const queue = JSON.parse(readFileSync(queuePath, 'utf8')) as { pending: Array<{ metadata?: Record<string, unknown> }> };
-            assert.equal(typeof queue.pending[0]?.metadata?.callerTurnId, 'number', 'control: the report names its turn');
-            queue.pending[0]!.metadata!.callerTurnId = Date.now() * 1000 + 1e12;
+            assert.equal(queue.pending[0]?.metadata?.callerTurnId, turnId, 'control: the report names its turn');
+            queue.pending[0]!.metadata!.callerTurnId = turnId + 1e9;
             writeFileSync(queuePath, JSON.stringify(queue));
           }
-          const child = await runRestartChild(join(storeDir, 'store'), ROOM, context.signal);
-          assert.equal(child.status, 0, `the next run (signal ${child.signal}, stderr: ${child.stderr.slice(-800)})`);
-          const next = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { landed: boolean; routed: Array<{ text: string; locus: string | null }> };
-          assert.equal(next.landed, true, 'control: the next run stored the report');
-          assert.deepEqual(next.routed.filter((r) => r.text === 'about the build'), [], "the start that reads the earlier run's private report speaks in no channel");
-          assert.deepEqual(next.routed.filter((r) => r.text === 'and the weather').map((r) => r.locus), [ROOM], 'a later channel turn speaks in its channel');
+          const next = await surfaceRig({ storeDir });
+          try {
+            if (next.framework.getHostModeStatus().quiesced) await next.framework.resume();
+            assert.ok(stored(next).includes('the build finished'), 'control: the next run stored the report');
+            const channelTurn = async () => {
+              const before = next.routed.length;
+              const streams = next.streams.length;
+              next.i.pendingRequests.push(roomWake());
+              await next.until(() => next.streams.length > streams && next.framework.getAgent('scout')!.state.status === 'idle', 'a channel turn to run');
+              await next.framework.runUntilIdle();
+              return next.routed.slice(before).map((r) => r.locus);
+            };
+            assert.deepEqual(await channelTurn(), [], "the start that reads the earlier run's private report speaks in no channel");
+            assert.deepEqual(await channelTurn(), [ROOM], 'a later channel turn speaks in its channel');
+          } finally {
+            await next.close();
+          }
         } finally {
           rmSync(storeDir, { recursive: true, force: true });
         }

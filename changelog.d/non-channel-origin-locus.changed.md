@@ -79,7 +79,7 @@
   message a server or module stores is now dropped, since only the framework
   writes that key. The first drop from each server is logged.
 
-- **A script's report deferred across a restart,** such as an update's,
-  counts as private input in the next run whichever turn started the
-  script, since that run can't know the turn: the start that reads it is
+- **A report from a script a turn started, deferred across a restart,** such
+  as an update's, counts as private input in the next run, whichever turn it
+  was, since that run can't know the turn: the start that reads it is
   private, failing closed.
