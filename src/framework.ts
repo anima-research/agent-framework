@@ -30,6 +30,7 @@ import {
   locateMessageIndices,
   removeStoredMessage,
   removeStoredMessages,
+  scanFromTail,
 } from './stored-removal.js';
 import type {
   FrameworkConfig,
@@ -990,18 +991,18 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
  *  aren't messages anyone sent. Where fewer than `n + 1` messages are stored,
  *  -(their count) - 1 instead, so the caller can say how many there are. */
 function indexBeforeLastMessages(cm: Pick<ContextManager, 'getMessageCount' | 'getMessageWindow'>, n: number): number {
-  const WINDOW = 200;
   let counted = 0;
-  for (let end = cm.getMessageCount(); end > 0; end -= WINDOW) {
-    const start = Math.max(0, end - WINDOW);
-    const rows = cm.getMessageWindow(start, end - start, { resolveBlobs: false }).messages;
-    for (let i = rows.length - 1; i >= 0; i--) {
-      if (isSystemChangeMessage(rows[i]!)) continue;
-      if (counted === n) return start + i;
-      counted++;
+  let before: number | undefined;
+  scanFromTail(cm, (row, index) => {
+    if (isSystemChangeMessage(row)) return false;
+    if (counted === n) {
+      before = index;
+      return true;
     }
-  }
-  return -counted - 1;
+    counted++;
+    return false;
+  });
+  return before ?? -counted - 1;
 }
 
 /** Whether a deferred message can join a live stream at a tool boundary:
@@ -24353,14 +24354,19 @@ export class AgentFramework {
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
-   *  a clock row after it aside: a channel message by its server, channel and
-   *  message id, a push event by its server and event id, and never one a
-   *  tune-out holds. */
+   *  clock rows and system changes after it aside: a channel message by its
+   *  server, channel and message id, a push event by its server and event id,
+   *  and never one a tune-out holds. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
-    // A clock row the framework wrote after it (a turn start's, an event's)
-    // isn't a message a reply could be meant for, so it doesn't count.
-    const newest = agent.getContextManager().queryMessages({ limit: 2, reverse: true }).messages
-      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND);
+    // A clock row the framework wrote after it (a turn start's, an event's),
+    // or a system change any agent's assembly stored, isn't a message a reply
+    // could be meant for, so it doesn't count, however many follow it.
+    let newest: { metadata?: unknown } | undefined;
+    scanFromTail(agent.getContextManager(), (row) => {
+      if ((row.metadata as { kind?: unknown } | undefined)?.kind === CLOCK_ROW_KIND || isSystemChangeMessage(row)) return false;
+      newest = row;
+      return true;
+    });
     const md = newest?.metadata as Record<string, unknown> | undefined;
     if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
     if (entry.eventType === 'mcpl:channel-incoming') {

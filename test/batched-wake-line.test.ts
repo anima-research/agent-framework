@@ -470,6 +470,22 @@ describe('isNewestContextEntry', () => {
     assert.equal(ask(), false);
   });
 
+  it('still newest with system changes and clock rows after it, however many, an unstamped change too', async () => {
+    command(`dm ev-${++n} 134 1548000000000000001 a DM`);
+    const md = await stored('a DM');
+    const ask = () => internals().isNewestContextEntry({ eventType: 'mcpl:push-event', serverId: 'discord', eventId: md.eventId as string });
+    const cm = internals().agents.get('scout')!.getContextManager() as unknown as { addMessage(participant: string, content: unknown[], metadata?: unknown): unknown };
+    const change = (name: string) => [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object', properties: {} } }] }];
+    cm.addMessage('system', change('a'), { system: true, kind: 'system-change', agent: 'scout' });
+    cm.addMessage('user', [{ type: 'text', text: '[clock row]' }], { system: true, kind: CLOCK_ROW_KIND, clock: { at: Date.now() } });
+    cm.addMessage('system', change('b'), { system: true, kind: 'system-change', agent: 'another' });
+    cm.addMessage('system', change('c'));
+    cm.addMessage('user', [{ type: 'text', text: '[clock row]' }], { system: true, kind: CLOCK_ROW_KIND, clock: { at: Date.now() } });
+    assert.equal(ask(), true, "a system change isn't a message a reply could be meant for");
+    internals().addMessage('someone', [{ type: 'text', text: 'after the changes' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-s-${n}` });
+    assert.equal(ask(), false);
+  });
+
   it('false while a turn is alive (started, or streaming) or a write is deferred for the agent', async () => {
     command(`dm ev-${++n} 134 1548000000000000001 a DM`);
     const md = await stored('a DM');

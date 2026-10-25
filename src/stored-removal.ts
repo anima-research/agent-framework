@@ -16,6 +16,26 @@ export interface SurgeryReadableCm {
 const SURGERY_SCAN_WINDOW = 500;
 
 /**
+ * Visit the active branch's rows from the tail, newest first, with each one's
+ * slot index, until `visit` returns true. It reads blob-free windows: the rows
+ * wanted are almost always recent, and a full `getAllMessages()` re-inflates
+ * every attachment on the branch.
+ */
+export function scanFromTail<M>(
+  cm: {
+    getMessageCount(): number;
+    getMessageWindow(offset: number, limit: number, opts?: { resolveBlobs?: boolean }): { messages: M[]; startIndex: number };
+  },
+  visit: (row: M, index: number) => boolean,
+): void {
+  for (let end = cm.getMessageCount(); end > 0; end -= SURGERY_SCAN_WINDOW) {
+    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
+    const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
+    for (let i = messages.length - 1; i >= 0; i--) if (visit(messages[i]!, startIndex + i)) return;
+  }
+}
+
+/**
  * Slot index of `messageId` on the active branch, or -1. Scans from the tail
  * in blob-free windows: operator targets are almost always recent, and a
  * full `getAllMessages()` re-inflates every attachment on the branch.
@@ -31,20 +51,14 @@ export function locateMessageIndices(
   ids: Set<string>,
 ): Map<string, { index: number; bodyGroupId?: string }> {
   const found = new Map<string, { index: number; bodyGroupId?: string }>();
-  const total = cm.getMessageCount();
-  for (let end = total; end > 0 && found.size < ids.size; end -= SURGERY_SCAN_WINDOW) {
-    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
-    const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const id = String(messages[i].id);
-      if (ids.has(id) && !found.has(id)) {
-        found.set(id, {
-          index: startIndex + i,
-          ...(messages[i].bodyGroupId ? { bodyGroupId: messages[i].bodyGroupId } : {}),
-        });
-      }
+  if (ids.size === 0) return found;
+  scanFromTail(cm, (row, index) => {
+    const id = String(row.id);
+    if (ids.has(id) && !found.has(id)) {
+      found.set(id, { index, ...(row.bodyGroupId ? { bodyGroupId: row.bodyGroupId } : {}) });
     }
-  }
+    return found.size === ids.size;
+  });
   return found;
 }
 
