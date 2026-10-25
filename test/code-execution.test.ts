@@ -1625,7 +1625,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     } finally { await h.done(); }
   });
 
-  it("explicit: a drafts call inside the script keeps its round's unprefixed line from bouncing, as a direct one does (#701)", async () => {
+  it("explicit: a drafts call inside the script holds its round's unprefixed line with no notice rather than bouncing it, as a direct one does (#701)", async () => {
     const h = await scriptRound('explicit', [
       createMockResponse([
         { type: 'text', text: 'checking my drafts' },
@@ -1637,7 +1637,24 @@ describe('a round whose run or wait call watches a script that can change its ro
       await h.run();
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha'],
         'the next round is delivered');
-      assert.deepStrictEqual(heldDrafts(h.framework), [], "the drafts round's line is kept in context, not bounced into a draft");
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'no-destination' }],
+        "the drafts round's line is held, not bounced");
+    } finally { await h.done(); }
+  });
+
+  it("explicit: a script whose only drafts call the bridge refuses makes no drafts round, so its round's unprefixed line bounces (#701)", async () => {
+    const h = await scriptRound('explicit', [
+      createMockResponse([
+        { type: 'text', text: 'checking my drafts' },
+        scriptCall({ code: 'try { await tools.drafts("not an object"); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: '>>#alpha the answer' }] as ContentBlock[]),
+    ], {}, { serveWakes: true });
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha']);
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'bounced' }],
+        'a refused drafts call counts for nothing, so the line bounces as on main');
     } finally { await h.done(); }
   });
 
@@ -1652,7 +1669,8 @@ describe('a round whose run or wait call watches a script that can change its ro
     try {
       await h.run();
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha']);
-      assert.deepStrictEqual(heldDrafts(h.framework), [], 'the permitted drafts call makes a drafts round, so the line is kept');
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'no-destination' }],
+        'the permitted drafts call makes a drafts round, so the line is held, not bounced');
     } finally { await h.done(); }
   });
 

@@ -1624,19 +1624,28 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  it("in a drafts round, a line with no destination is kept rather than bounced, while a target is delivered and a refused one still bounces (#701)", async () => {
+  it("in a drafts round, a line with no destination is held with no notice rather than bounced, while a target is delivered and a refused one still bounces (#701)", async () => {
     const framework = await createFramework();
     const routed = stubRegistry(framework);
     const internals = framework as unknown as {
       deliverProse(agent: unknown, text: string, round?: { draftsRound?: boolean }): Promise<void>;
       turnRouting: Map<string, { continuation: boolean; keptPrivate: number }>;
+      proseDrafts: ProseDraftStore;
     };
     const agent = framework.getAgent('assistant')!;
 
     await internals.deliverProse(agent, 'narration beside the call', { draftsRound: true });
     assert.equal(routed.length, 0, 'nothing is delivered');
     assert.equal(context(framework).bounces, 0, 'and nothing bounced');
-    assert.equal(internals.turnRouting.get('assistant')?.keptPrivate, 1, 'it is counted as kept');
+    assert.deepEqual(internals.proseDrafts.open('assistant').map((d) => [d.text, d.reason]), [['narration beside the call', 'no-destination']],
+      'it is held as a draft, so its words are not lost');
+    const [held] = internals.proseDrafts.open('assistant');
+    const read = await (framework as unknown as {
+      handleDraftsTool(agent: string, input: unknown): Promise<{ success: boolean; data?: Array<{ text: string }> }>;
+    }).handleDraftsTool('assistant', { action: 'read', draftIds: [held!.id] });
+    const readText = (read.data ?? []).map((d) => d.text).join('\n');
+    assert.ok(readText.includes('it had no destination: plain speech with no target waits for one'), readText);
+    assert.ok(!readText.includes('envelope failed'), 'no envelope failed here, and the cause says none did');
 
     await internals.deliverProse(agent, '>>#alpha ! a deliberate send', { draftsRound: true });
     assert.deepEqual(routed.map((r) => [r.text, r.locus]), [['a deliberate send', 'chan-alpha']]);
@@ -1646,6 +1655,46 @@ describe('explicit prose routing', () => {
     assert.equal(context(framework).bounces, 1, 'a refused target still bounces');
 
     await framework.stop();
+  });
+
+  it("in a drafts round, a line with no destination holds its words as a bounce would: {{unsent}} expands, and a bare one is the latest bounce itself (#701)", async () => {
+    const framework = await createFramework();
+    try {
+      stubRegistry(framework);
+      const internals = framework as unknown as {
+        deliverProse(agent: unknown, text: string, round?: { draftsRound?: boolean }): Promise<void>;
+        proseDrafts: ProseDraftStore;
+      };
+      const agent = framework.getAgent('assistant')!;
+      const open = () => internals.proseDrafts.open('assistant').map((d) => [d.text, d.reason]).sort();
+      await internals.deliverProse(agent, 'lost words');
+      assert.deepEqual(open(), [['lost words', 'bounced']], 'outside a drafts round, the line bounces');
+      await internals.deliverProse(agent, '{{unsent}}', { draftsRound: true });
+      assert.deepEqual(open(), [['lost words', 'bounced']], 'a bare {{unsent}} is that bounce: nothing new is held');
+      await internals.deliverProse(agent, 'again: {{unsent}}', { draftsRound: true });
+      assert.deepEqual(open(), [['again: lost words', 'no-destination'], ['lost words', 'bounced']], 'the token is expanded');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("in a drafts round, a line with no destination that the drafts journal can't hold bounces, and the bounce says so (#701)", async () => {
+    const framework = await createFramework();
+    try {
+      stubRegistry(framework);
+      const internals = framework as unknown as {
+        deliverProse(agent: unknown, text: string, round?: { draftsRound?: boolean }): Promise<void>;
+        proseDrafts: ProseDraftStore;
+      };
+      internals.proseDrafts.hold = () => ({ held: [], notHeld: { count: 1, error: 'ENOSPC: no space left on device' } });
+      const agent = framework.getAgent('assistant')!;
+      await internals.deliverProse(agent, 'narration beside the call', { draftsRound: true });
+      assert.equal(context(framework).bounces, 1, 'it bounces');
+      const notice = context(framework).texts.find((t) => t.includes('could not be held as a draft'));
+      assert.ok(notice, 'the bounce notice says the words could not be held');
+    } finally {
+      await framework.stop();
+    }
   });
 
   it("in a drafts round, a deliberate send whose delivery fails still bounces into a draft (#701)", async () => {

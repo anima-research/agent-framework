@@ -67,20 +67,22 @@ The notice requests inference so the resend can happen immediately — capped at
 2 consecutive bounce-wakes per agent (then notices append without waking,
 breaking any loop).
 
-In a round that calls `drafts`, with any action, words that would be held
-because an explicit send silenced the turn, or bounced or held for lack of a
-destination, stay in the agent's context only, and the turn's receipt counts
-them (explicit mode writes no receipt), so no draft of them is offered for
-resend. A silenced turn holds a round's envelopes too, so there a drafts
-round keeps all its words, while its envelopes still move the router. Outside
-a silenced turn, what the round would deliver is delivered, an unprefixed
-line to the turn's sticky target included, and a refused target, a malformed
-envelope or a failed delivery still bounces. Without this, an agent that
-writes a line beside each call would resend its own narration round after
-round, inside one turn, where the bounce-wake cap doesn't reach (#701). So in
-explicit mode, while the turn has no destination, an unprefixed line beside a
-`drafts` call is kept in context, with no bounce or resend offer. In XML tool
-mode, where a turn's prose is routed once at its end with no notice
+In a round that calls `drafts`, with any action, what the round would bounce
+or hold for lack of a destination is held as a draft with no notice instead of
+bouncing: a later `drafts` listing shows it, and the turn's receipt or, in
+`explicit` mode, which writes none, the next turn's catch-up notice names it,
+but nothing offers it for resend while the turn runs. In a `locus` or `hybrid`
+turn a send has silenced, the round's plain speech stays in the agent's
+context instead, counted in the receipt as kept private, and what a `>>>`
+envelope addressed is held with no notice. Without this, an agent that writes
+a line beside each call would resend its own narration round after round,
+inside one turn, where the bounce-wake cap doesn't reach (#701). Outside a
+silenced turn, what the round would deliver is delivered, an unprefixed line
+to the turn's sticky target included, and a refused target, a malformed
+envelope or a failed delivery still bounces. Only the framework's own `drafts`
+tool makes such a round, not a module's or server's tool of that bare name. An
+envelope beside a script whose code mentions `drafts` waits for the script. In
+XML tool mode, where a turn's prose is routed once at its end with no notice
 mid-turn, a drafts round is routed as any other: its unprefixed line still
 bounces, and the bounce-wake cap ends a cycle of `drafts` resends after two
 wakes, counted from the last turn with a cause of its own or the last
@@ -137,6 +139,10 @@ The grammar is never injected into context. The mode switch appends one short
 durable notice (persisted per agent, so reboots never re-notice); the first
 undelivered text produces a bounce notice carrying the exact resend syntax —
 the model learns by doing, and the knowledge accretes into its own history.
+The one place a first undelivered line doesn't bounce is a round that calls
+`drafts` (above): there the line is held with no notice, and the agent is
+told of it by a later `drafts` listing and the next turn's catch-up notice,
+so a line written there teaches no syntax.
 When the agent's `allowedTools` permits `prose_help`, the full reference is
 available on demand through that tool. Its result is model-requested content. The system prompt is never touched: those
 bytes belong to the recipe, and the deepest KV prefix must not vary with
