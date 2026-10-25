@@ -327,7 +327,11 @@ export class ToolPresentation {
     if (!available.some((t) => t.name === name)) {
       const near = closestNames(name, available.map((t) => t.name));
       throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
-        + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`);
+        + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`
+        // The index lists only the tools the resident has: a name the file holds that it has no tool by
+        // now (a tool away, removed or not allowed to this agent, or a key that was never a tool) is
+        // named by a diagnostic instead, in these words.
+        + ` If the catalogue's diagnostics say Not currently available: ${quoted(name)}, your file keeps a setting under that name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.`);
     }
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
       throw new PresentationRefusal(`Nothing was changed: the description is ${count(characters(args.description))} characters, over the ${count(MAX_DESCRIPTION_CHARS)} allowed. Shorten it and call set_tool_description again.`);
@@ -350,10 +354,12 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
     'Visible = supplied in new requests. Hidden = stored away, still available.',
     'These are your visibility choices, not fixed primary/secondary rankings.',
     'Copy exact names from the index; similar-sounding names may not exist.',
+    'Index by source: line N.',
     'Show a hidden tool: set_tool_visibility {"name":"EXACT_NAME","visible":true}.',
     `Read details: workspace--read {"path":${JSON.stringify(snapshot.cataloguePath)},"offset":LINE,"limit":LINES}.`,
     'Line references below belong to this revision; reread the index after changes.', '',
   ];
+  const indexLineAt = lines.indexOf('Index by source: line N.');
   // One line each: a quoted parse error can hold the file's own line breaks.
   for (const diagnostic of snapshot.diagnostics) lines.push('Diagnostic: '+diagnostic.replace(/\r\n|\r|\n/g, '\\n'));
   // The available tools hidden from the resident come right after the header
@@ -365,8 +371,12 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
   const hidden = snapshot.entries.filter(e => !e.visible);
   if (hidden.length) {
     lines.push(`## Hidden (${hidden.length})`, '');
-    for (const entry of hidden) lines.push(`### ${entry.name} (${entry.source})`, '', ...entry.description.split('\n'), '');
+    // Each description line quoted, so none is the same as one of the catalogue's own lines, such as
+    // a heading or an index row ahead of the real index; one line each, so no offset moves.
+    for (const entry of hidden) lines.push(`### ${entry.name} (${entry.source})`, '', ...entry.description.split('\n').map(line => line ? `> ${line}` : '>'), '');
   }
+  // The index's line, for a read that stops before it: filled in now that it's known.
+  lines[indexLineAt] = `Index by source: line ${lines.length + 1}.`;
   lines.push('## Index by source', '');
   const index = new Map<string, number>();
   for (const [source, entries] of groups) {
