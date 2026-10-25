@@ -12298,8 +12298,12 @@ export class AgentFramework {
    *  answered with the other branch's head and its next write stored it over
    *  this branch's. Null where nothing is recorded, or what is isn't a head. */
   private headDeclarationCache: { branch: string; heads: Map<string, HeadDeclaration | null> } | null = null;
-  /** The states registered so far: each before its first read or write, since
-   *  a branch made from another (an undo's) carries registered states only. */
+  /** The states registered so far: each before its first write, since a
+   *  branch made from another (an undo's) carries registered states only, and
+   *  a state never written holds nothing to carry. Registrations last for good
+   *  and each costs a lookup at every branch made, so an agent that records no
+   *  head, as on 'head', registers none; a state never registered reads as
+   *  null. */
   private readonly registeredHeadStates = new Set<string>();
   /** Each agent whose recorded head couldn't be read, on the branch named,
    *  so that's said once a branch, though every request on the head asks. */
@@ -12339,7 +12343,7 @@ export class AgentFramework {
     if (heads.has(agentName)) return heads.get(agentName);
     const branch = this.headDeclarationCache!.branch;
     try {
-      const stored = this.store.getStateJson(this.headStateId(agentName));
+      const stored = this.store.getStateJson(headDeclarationId(agentName));
       const head = isHeadDeclaration(stored) ? stored : null;
       if (stored != null && head === null) console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside`);
       heads.set(agentName, head);
@@ -14066,9 +14070,6 @@ export class AgentFramework {
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
-    // Its recorded head goes too: the name is never used again, and the
-    // map is written whole at every head write.
-    this.headDeclarations.delete(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
     // Its scripts go with it, and leave the map once they've ended: no later
     // run of a fork's name trims them.

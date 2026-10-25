@@ -14,12 +14,16 @@ export interface SurgeryReadableCm {
 }
 
 const SURGERY_SCAN_WINDOW = 500;
+/** The tail scan's first window, doubled at each read up to SURGERY_SCAN_WINDOW. */
+const FIRST_SCAN_WINDOW = 16;
 
 /**
  * Visit the active branch's rows from the tail, newest first, with each one's
  * slot index, until `visit` returns true. It reads blob-free windows: the rows
  * wanted are almost always recent, and a full `getAllMessages()` re-inflates
- * every attachment on the branch.
+ * every attachment on the branch. The first window is small and each next one
+ * twice the size, up to SURGERY_SCAN_WINDOW, since a reader usually stops
+ * within the newest few rows.
  */
 export function scanFromTail<M>(
   cm: {
@@ -28,10 +32,12 @@ export function scanFromTail<M>(
   },
   visit: (row: M, index: number) => boolean,
 ): void {
-  for (let end = cm.getMessageCount(); end > 0; end -= SURGERY_SCAN_WINDOW) {
-    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
+  let end = cm.getMessageCount();
+  for (let size = FIRST_SCAN_WINDOW; end > 0; size = Math.min(size * 2, SURGERY_SCAN_WINDOW)) {
+    const start = Math.max(0, end - size);
     const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
     for (let i = messages.length - 1; i >= 0; i--) if (visit(messages[i]!, startIndex + i)) return;
+    end = start;
   }
 }
 

@@ -262,7 +262,7 @@ describe('toolDeclarations in the framework', () => {
       assert.notEqual(heads.headDeclarations.read('alpha-fork'), null);
       assert.notStrictEqual(heads.headDeclarations.read('alpha-fork'), heads.headDeclarations.read('alpha'), "the fork's head is a copy of its template's, not the same object");
       heads.disposeConversationAgent('alpha-fork');
-      assert.equal(heads.headDeclarations.read('alpha-fork'), null, 'a closed fork\'s head goes with it');
+      assert.notEqual(heads.headDeclarations.read('alpha-fork'), null, "a closed fork's head stays, as the rest of its data does");
       assert.notEqual(heads.headDeclarations.read('alpha'), null);
     }, undefined, { conversations: { templateAgent: 'alpha' } });
   });
@@ -355,6 +355,23 @@ describe('toolDeclarations in the framework', () => {
         assert.deepEqual(written, ['framework/head-declarations/alpha'], "alpha's replacement writes alpha's state alone");
         assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as { system: string[] }).system, ['You are alpha.', 'v2']);
         assert.deepEqual(internals.store.getStateJson('framework/head-declarations/beta'), betaHead);
+      });
+    });
+
+    it("registers an agent's state at its first write, and none for an agent on its head", async () => {
+      const registered: string[] = [];
+      await withFramework([resident('alpha'), { ...resident('beta'), toolDeclarations: 'head' }], async (framework) => {
+        const internals = framework as unknown as Internals & { store: { registerState(r: { id: string }): void } };
+        const register = internals.store.registerState.bind(internals.store);
+        internals.store.registerState = (r) => { registered.push(r.id); return register(r); };
+        const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
+        say(alpha, 'user', 'hello');
+        await beta.buildActivationRequest([tool('b')]);
+        await beta.buildActivationRequest([tool('b'), tool('c')]);
+        assert.deepEqual(registered.filter((id) => id.startsWith('framework/head-declarations')), [], 'beta, on its head, registers nothing');
+        assert.equal(internals.headDeclarations.read('beta'), null, 'and reads no record');
+        await alpha.buildActivationRequest([tool('a')]);
+        assert.deepEqual(registered.filter((id) => id.startsWith('framework/head-declarations')), ['framework/head-declarations/alpha'], "alpha's state, at its adoption");
       });
     });
 
