@@ -414,3 +414,29 @@ test('a toolHints server whose reconnect is pending, restarted under another id,
     await third.close();
   }
 });
+
+test('a server-chosen value the toolset host logs is redacted with the server\'s configuration and stays one field of one line', async () => {
+  const token = 'sekret-token-4417';
+  const { server, showPeek } = await hintingServer({ content: [] });
+  const fw = await connectedTo(server, {}, { token });
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    const eventId = `evt ${token}\nnext line`;
+    const push = (hints: Json) => server.peer.request('push/event', {
+      featureSet: 'arc.events', eventId, timestamp: new Date().toISOString(), payload: { content: [{ type: 'text', text: 'moved' }] }, hints,
+    });
+    await push(showPeek());
+    await push(showPeek());
+    await waitFor(() => logged.some((line) => line.includes('was read before')), 'the duplicate logged');
+    const line = logged.find((l) => l.includes('was read before'))!;
+    assert.ok(!line.includes(token), `no credential: ${line}`);
+    assert.ok(!line.includes('\n'), `one line: ${JSON.stringify(line)}`);
+    assert.match(line, /push "evt[^"]*next[^"]*line" was read before/, `one quoted field: ${line}`);
+  } finally {
+    console.error = error;
+    await fw.stop();
+    await server.close();
+  }
+});

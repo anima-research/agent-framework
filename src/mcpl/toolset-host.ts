@@ -26,6 +26,8 @@
 import { McplRequestError, type McplServerConnection, type HintRead } from './server-connection.js';
 import type { McplServerConfig } from './types.js';
 import { isToolAllowed } from './tool-policy.js';
+import { redactServerText } from './protocol-family.js';
+import { logDetail, logValueRedacted } from './log-value.js';
 import {
   ToolPresence, emptyChange, isEmptyChange, keyOf,
   type ChangeSet, type MetaToolNames,
@@ -102,6 +104,14 @@ export class ToolsetController {
 
   private log(line: string): void {
     this.deps.log(`${this.serverId}: ${line}`);
+  }
+
+  private field(value: unknown): string {
+    return logValueRedacted(value, (text) => redactServerText(text, this.config));
+  }
+
+  private failure(error: unknown): string {
+    return logDetail(redactServerText(error instanceof Error ? error.message : String(error), this.config));
   }
 
   /** A restart can bring a new configuration under the same id. */
@@ -183,7 +193,7 @@ export class ToolsetController {
     // RFC §7: a push carrying hints is never coalesced; when its changes
     // would apply is undefined, so they're ignored and the state re-read.
     if (p.coalesce !== undefined && p.coalesce !== null) {
-      this.log(`push ${String(p.eventId ?? '')} carries hints and coalesce (RFC-014 §7 forbids it): its hints are ignored; recovering`);
+      this.log(`push ${this.field(p.eventId ?? '')} carries hints and coalesce (RFC-014 §7 forbids it): its hints are ignored; recovering`);
       this.scheduleRecovery();
       return;
     }
@@ -191,7 +201,7 @@ export class ToolsetController {
     const eventId = typeof p.eventId === 'string' || typeof p.eventId === 'number' ? String(p.eventId) : '';
     if (eventId) {
       if (this.seenEvents.has(eventId)) {
-        this.log(`push ${eventId} was read before: its hints are ignored`);
+        this.log(`push ${this.field(eventId)} was read before: its hints are ignored`);
         return;
       }
       this.seenEvents.add(eventId);
@@ -261,9 +271,9 @@ export class ToolsetController {
   private applyHints(h: unknown, source: string): ChangeSet {
     if (h === undefined || !this.presence.active) return emptyChange();
     const before = this.presence.view();
-    const last = this.presence.rev;
+    const last = this.field(this.presence.rev);
     const r = this.presence.apply(h);
-    const rev = String((h as { rev?: unknown } | null)?.rev);
+    const rev = this.field((h as { rev?: unknown } | null)?.rev);
     if (r.behind) {
       this.log(`hint change rev ${rev} (${source}) is not after rev ${last}: ignored; recovering from tools/list and toolsets/list`);
       this.scheduleRecovery();
@@ -287,7 +297,7 @@ export class ToolsetController {
     const before = this.presence.view();
     this.presence.setTools(tools);
     if (this.presence.active && this.presence.noteListRev(isObj(last._meta) ? last._meta['mcpl/rev'] : undefined)) {
-      this.log(`tools/list was written after rev ${String(isObj(last._meta) ? last._meta['mcpl/rev'] : '')}, past the last rev read: a message was lost; recovering`);
+      this.log(`tools/list was written after rev ${this.field(isObj(last._meta) ? last._meta['mcpl/rev'] : '')}, past the last rev read: a message was lost; recovering`);
       this.scheduleRecovery();
     }
     return this.presence.diff(before, this.presence.view());
@@ -496,7 +506,7 @@ export class ToolsetController {
       if (this.presence.movesOwed) this.deps.refreshTools(this.serverId);
       return true;
     } catch (error) {
-      this.log(`tools/list failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(`tools/list failed: ${this.failure(error)}`);
       return false;
     }
   }
@@ -506,7 +516,7 @@ export class ToolsetController {
       const r = await connection.sendToolsetsList(timeoutMs);
       return this.claim(r);
     } catch (error) {
-      this.log(`toolsets/list (${why}) failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(`toolsets/list (${why}) failed: ${this.failure(error)}`);
       return emptyChange();
     }
   }
@@ -547,7 +557,7 @@ export class ToolsetController {
       if (!isObj(r)) return null;
       return opts.shown ? this.claim(r) : this.changeOf(r);
     } catch (error) {
-      this.log(`toolsets/list (look) failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(`toolsets/list (look) failed: ${this.failure(error)}`);
       return null;
     }
   }
@@ -565,7 +575,7 @@ export class ToolsetController {
     const res = isObj(r) ? r : {};
     const inst = typeof res.instance === 'string' && res.instance ? res.instance : instance;
     // RFC §5.2: a proposed name is used as given or the open refused.
-    if (instance && inst !== instance) this.log(`proposed instance "${instance}" came back as "${inst}" (RFC-014 §5.2 forbids renaming): using the server's`);
+    if (instance && inst !== instance) this.log(`proposed instance ${this.field(instance)} came back as ${this.field(inst)} (RFC-014 §5.2 forbids renaming): using the server's`);
     const key = keyOf(toolset, this.presence.declared[toolset]?.instances ? inst : undefined);
     const title = typeof res.title === 'string' && res.title ? res.title : this.presence.openRecords().find((o) => keyOf(o.toolset, o.instance) === key)?.title;
     return {
