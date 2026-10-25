@@ -1,6 +1,7 @@
 - **Turns opened from a private surface** (WebUI, TUI, CLI, headless, or an
   `api:message`: any `external-message` or `api:message` whose
-  `metadata.channelId` names no channel) freeze no inferred channel locus, so
+  `metadata.channelId` names no channel, other than the framework's own
+  MCPL tool-list notice) freeze no inferred channel locus, so
   their plain speech stays on that surface unless the agent uses an explicit
   send. Before, such a turn's speech went to the most recent inbound channel.
 
@@ -21,13 +22,16 @@
   rewind's retry, a self-wake it arms with `skip_reply`'s `wake_in_seconds`, a
   `sleep`'s wake, the resident's turn after a tune-out cancel it asked for,
   and the wakes of a script it started (`wake_agent()`, and a script left
-  running reporting its end). Such a wake goes by the turn that armed it as
-  that turn stands when the wake's start reads it, so a turn that took in
-  private input after arming it counts, even after the wake was queued. A
-  script's wake message is private input, as a private surface's message is,
-  when the script's start turn is private as the message is stored or
-  injected: a turn that reads it is private, and a tool boundary that injects
-  it makes its turn private from there.
+  running reporting its end). Each goes by the turn that caused it as that
+  turn stands when its start reads it, so a turn that took in private input
+  after causing it counts, even after the wake was queued. An operator's
+  `nudge` or `unstick` retakes a turn, and is private when that turn was: the
+  newest turn, across a restart too, or after an `undo` in the same run, the
+  turn whose inputs the undo leaves last. A script's wake message is private
+  input, as a private surface's message is, when the script's start turn is
+  private as the message is stored or injected: a turn that reads it is
+  private, and a tool boundary that injects it makes its turn private from
+  there.
 
   In locus and hybrid mode, a private turn that holds a channel's message
   tells its resident which channels' messages it holds and that its plain

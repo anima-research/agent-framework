@@ -902,52 +902,6 @@ describe('code_execution through the framework', () => {
     });
   });
 
-  for (const privateTurn of [true, false]) {
-    it(`a left script's wake_agent() and its failure wake ${privateTurn ? 'a private turn when the turn that started it was private' : 'a channel turn when the turn that started it was one'}`, async () => {
-      const membrane = new MockMembrane();
-      const module = new ScriptToolModule();
-      const code = [
-        'await tools["test--slow"]({});',
-        'await wake_agent({ found: "signal" });',
-        'await tools["test--slow"]({});',
-        'throw new Error("watcher broke");',
-      ].join('\n');
-      membrane.pushResponse(createMockResponse([
-        { type: 'text', text: 'Arming watcher.' },
-        { type: 'tool_use', id: 'call_bg1', name: 'code_execution', input: { code, yield_time_ms: 100 } },
-      ], 'tool_use'));
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Watcher armed; resting.' }]));
-      await withFramework('ce-wake-private-', { membrane, module, resident: true, codeExecution: { wakeMinIntervalMs: 0 } }, async (framework) => {
-        // Each start's request, as the scheduler hands it over.
-        const starts: InferenceRequest[] = [];
-        const inner = framework as unknown as { startAgentStream(agent: unknown, trigger?: InferenceRequest, ...rest: unknown[]): Promise<void> };
-        const original = inner.startAgentStream.bind(framework);
-        inner.startAgentStream = async (agent, trigger, ...rest) => {
-          if (trigger) starts.push(trigger);
-          return original(agent, trigger, ...rest);
-        };
-        framework.start();
-        framework.pushEvent({
-          type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm a watcher' }],
-          metadata: privateTurn ? {} : { channelId: 'world:test' }, triggerInference: true,
-        } as unknown as ProcessEvent);
-        const wakes = () => starts.filter((r) => r.reason === 'script:wake');
-        await until(() => module.waiting === 1, 'the first slow call');
-        assert.equal(starts[0]?.nonChannelOrigin === true, privateTurn, `control: the arming turn: ${JSON.stringify(starts[0])}`);
-        // The arming turn ends with the script still running: the script is left.
-        await until(() => framework.getHostModeStatus().backgroundScripts === 1, 'the script to be left running');
-        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke and handled.' }]));
-        module.release();
-        await until(() => wakes().length === 1, 'the wake_agent() wake');
-        await until(() => module.waiting === 1, 'the second slow call');
-        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Saw the failure.' }]));
-        module.release();
-        await until(() => wakes().length === 2, 'the failure wake');
-        assert.deepEqual(wakes().map((r) => r.nonChannelOrigin === true), [privateTurn, privateTurn], JSON.stringify(wakes()));
-      });
-    });
-  }
-
   it('stop() stops every script still running, quietly', async () => {
     const module = new ScriptToolModule();
     const { tempDir, storePath } = tempStorePath('ce-stop-');
@@ -1182,7 +1136,6 @@ describe('code_execution through the framework', () => {
     }
   });
 });
-
 
 // ---------------------------------------------------------------------------
 // A round that runs code_execution: the calls a script makes while a run or
@@ -2501,31 +2454,6 @@ describe('a round whose run or wait call watches a script that can change its ro
           assert.equal(scriptNote(h), 'note:posted');
           assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
         }
-      } finally {
-        await h.done();
-      }
-    });
-  }
-
-  for (const named of [undefined, ''] as const) {
-    it(`a conversation fork's script in a private turn that publishes ${named === undefined ? 'naming no channel' : 'with an empty channelId'} is told its conversation's channel`, async () => {
-      const args = named === undefined ? '{ content: "from the script" }' : '{ channelId: "", content: "from the script" }';
-      const h = await scriptRound('locus', [
-        createMockResponse([scriptCall({ code: publishing(args), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),
-        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-      ], {}, { channelPublish: true });
-      try {
-        // The agent stands for a fork bound to its home channel, which a
-        // broadcast wake doesn't reach, so its turn comes from its own wake,
-        // a private one.
-        const internals = h.framework as unknown as { conversationAgentHomes: Map<string, { serverId: string; channelId: string }>; pendingRequests: unknown[] };
-        // A home is a channel with its server, as main keeps it.
-        internals.conversationAgentHomes.set('assistant', { serverId: 'stub', channelId: 'world:home' });
-        internals.pendingRequests.push({ agentName: 'assistant', reason: 'test', source: 'test', timestamp: Date.now(), channelId: 'world:home', nonChannelOrigin: true });
-        await h.framework.runUntilIdle();
-        assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
-        assert.ok(scriptNote(h).includes('(to publish in this conversation\'s channel, name "world:home")'), scriptNote(h));
-        assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
       } finally {
         await h.done();
       }

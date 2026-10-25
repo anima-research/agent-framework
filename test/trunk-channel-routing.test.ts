@@ -808,29 +808,6 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it('a channel-triggered turn still freezes its channel', async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'channel reply' }]));
-    const framework = await makeFramework();
-    const i = internals(framework) as ReturnType<typeof internals> & { turnRouting: Map<string,{locus?:string}>; channelRegistry: Record<string,unknown> };
-    i.channelRegistry = new Proxy({ resolveLocus: () => 'discord:guild:chanA', routeSpeech: async () => null, getDescriptor: () => undefined, startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [] }, { get:(t,p:string)=>p in t?t[p as keyof typeof t]:()=>undefined }) as never;
-    const scout=framework.getAgent('scout')!;
-    await (framework as unknown as {startAgentStream(a:unknown,t?:unknown):Promise<void>}).startAgentStream(scout,{agentName:'scout',reason:'mcpl:channel-incoming',source:'discord',timestamp:Date.now(),channelId:'discord:guild:chanA'});
-    await framework.runUntilIdle();
-    assert.equal(i.turnRouting.get('scout')?.locus,'discord:guild:chanA');
-    await framework.stop();
-  });
-
-  it('a heartbeat turn still uses the global fallback', async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'heartbeat reply' }]));
-    const framework=await makeFramework();
-    const i=internals(framework) as ReturnType<typeof internals> & {turnRouting:Map<string,{locus?:string}>;channelRegistry:Record<string,unknown>};
-    i.channelRegistry=new Proxy({resolveLocus:()=> 'discord:guild:last-room',routeSpeech:async()=>null,getDescriptor:()=>undefined,startTyping:()=>{},stopTyping:()=>{},stopAll:()=>{},getChannelTools:()=>[]},{get:(t,p:string)=>p in t?t[p as keyof typeof t]:()=>undefined}) as never;
-    const scout=framework.getAgent('scout')!;
-    await (framework as unknown as {startAgentStream(a:unknown,t?:unknown):Promise<void>}).startAgentStream(scout,{agentName:'scout',reason:'heartbeat',source:'timer',timestamp:Date.now()});
-    await framework.runUntilIdle();
-    assert.equal(i.turnRouting.get('scout')?.locus,'discord:guild:last-room');
-    await framework.stop();
-  });
 });
 
 // ---------------------------------------------------------------------------

@@ -619,9 +619,9 @@ export interface SpeechContext {
   turnId?: number;
 
   /**
-   * True when the turn this speech ends is private: a private surface's input
-   * (a console, a WebUI, an API message naming no channel) took part in it. A
-   * handler that would publish its speech or thoughts to a channel leaves it.
+   * True when the turn this speech ends is private: private input took part
+   * in it. A handler that would publish its speech or thoughts to a channel
+   * leaves it.
    */
   nonChannelOrigin?: boolean;
 }

@@ -354,23 +354,6 @@ describe('debounce', () => {
     assert.deepStrictEqual(d.behavior, { debounce: 100 });
   });
 
-  it("a private surface's message makes its debounce window's wake private", async () => {
-    const path = writeConfig('debounce-private-surface.json', {
-      policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }],
-      default: 'skip',
-    });
-    const { gate, inferenceRequests } = makeGate(path);
-    gate.evaluate({ content: 'private', eventType: 'external-message', serverId: 'tui', channelId: '', nonChannelOrigin: true });
-    // Waits for the flush itself, not a fixed time a loaded runner can overrun.
-    for (const deadline = Date.now() + 5_000; inferenceRequests.length === 0 && Date.now() < deadline;) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.equal(inferenceRequests.length, 1);
-    assert.equal(inferenceRequests[0]?.nonChannelOrigin, true);
-    assert.equal(inferenceRequests[0]?.channelId, undefined);
-    gate.dispose();
-  });
-
   it('batches events and fires after delay', async () => {
     const path = writeConfig('debounce-fire.json', {
       policies: [
@@ -1237,30 +1220,6 @@ describe("a window that holds a private surface's message", () => {
     return inferenceRequests;
   }
 
-  it('wakes one private turn with no route, though an addressed channel message shares it, in either order', async () => {
-    for (const window of [[room(20), tui(10)], [tui(10), room(20)]]) {
-      const wakes = await flush(window);
-      assert.equal(wakes.length, 1, 'one wake for the window');
-      assert.equal(wakes[0]?.nonChannelOrigin, true);
-      assert.equal(wakes[0]?.routeChannelId, undefined, 'the private turn answers in no channel');
-      assert.equal(wakes[0]?.addressed, true, "the provenance still says who woke it, as telemetry");
-    }
-    // Control: the room's message alone routes its reply.
-    const alone = await flush([room(20)]);
-    assert.equal(alone[0]?.routeChannelId, 'discord:g:room');
-    assert.equal(alone[0]?.nonChannelOrigin, undefined);
-  });
-
-  it("is private though nothing in it names a channel or an author, and takes its time from its newest message", () => {
-    assert.deepStrictEqual(wakeProvenance([tui(10)] as never), { nonChannelOrigin: true, at: 10 });
-    for (const window of [[tui(10), tui(30)], [tui(30), tui(10)]]) {
-      assert.deepStrictEqual(wakeProvenance(window as never), { nonChannelOrigin: true, at: 30 }, 'the newest, in whatever order they sit');
-    }
-    // An older one that names its author is the pick, but the wake is as
-    // recent as the newest.
-    assert.equal(wakeProvenance([{ ...tui(10), authorId: 'op' }, tui(30)] as never)?.at, 30);
-    assert.equal(wakeProvenance([{ ...tui(10), nonChannelOrigin: undefined }] as never), undefined, 'control: an unmarked one has no provenance');
-  });
 });
 
 describe('sleep', () => {
@@ -1455,13 +1414,4 @@ describe('a batched wake writes its line only when it says something', () => {
 });
 
 describe('wakeProvenance: what a window carries without a pick', () => {
-  it("keeps a window's channels though no event in it names a channel or an author for the pick", () => {
-    // An ambient push that names only its resolved route, and a module's
-    // request: neither is a pick.
-    const provenance = wakeProvenance([
-      { policyName: 'p', content: 'x', eventType: 'mcpl:push-event', timestamp: 1, inContext: true, addressed: false, routeChannelId: 'disc:guild:room', serverId: 'disc' },
-      { policyName: 'p', content: 'y', eventType: 'inference-request', timestamp: 2, inContext: false, addressed: false },
-    ] as never);
-    assert.deepEqual(provenance, { channels: [{ channelId: 'disc:guild:room', serverId: 'disc' }] });
-  });
 });

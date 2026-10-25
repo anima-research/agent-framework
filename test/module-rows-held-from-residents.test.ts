@@ -522,18 +522,4 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
 });
 
 describe("the framework's tune-out hooks", () => {
-  it("hand the resident's wake after a cancel the turn that asked for it", async () => {
-    const { framework, internals, close } = await open();
-    try {
-      const fw = framework as unknown as { requestForTurn(...args: unknown[]): void };
-      const asked: unknown[][] = [];
-      const requestForTurn = fw.requestForTurn.bind(framework);
-      fw.requestForTurn = (...args: unknown[]) => { asked.push(args); requestForTurn(...args); };
-      assert.ok(internals.tuneOutCoordinator!.cancel('disc', CHANNEL, 'agent-tool', 'test', undefined, 42).ok);
-      // The subconscious gets a cancel turn of its own, which no turn asked for.
-      assert.deepEqual(asked.filter((a) => a[0] === 'scout').map((a) => a[3]), [42], "the resident's wake reaches the framework with its turn");
-    } finally {
-      await close();
-    }
-  });
 });

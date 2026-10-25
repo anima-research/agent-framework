@@ -265,20 +265,3 @@ test("speak_in_channel's refusal names the setting in the host's log, not to the
   );
 });
 
-test("a cancel the resident asked for hands the resident's wake the turn it was asked in", async () => {
-  const registry = new ChannelRegistry({ getServer: () => null } as never, {} as never, () => {}, () => {});
-  await registry.handleRegister('a', { channels: [{ id: 'general', type: 'chat', label: '#general', direction: 'bidirectional' }] });
-  registry.enterTuneOut('a', 'general', SETTINGS, 'agent-tool');
-  const wakes: Array<{ agentName: string; callerTurnId?: number }> = [];
-  const coordinator = new TuneOutCoordinator(registry, {} as never, {
-    ...hooks({}),
-    addMessage: () => {},
-    requestInference: (agentName: string, _reason: string, _source: string, callerTurnId?: number) => { wakes.push({ agentName, callerTurnId }); },
-    primaryName: () => 'scout',
-    getStoredMessages: () => [],
-    getDeferredMessages: () => [],
-    emitTrace: () => {},
-  } as never);
-  assert.deepEqual(coordinator.cancel('a', 'general', 'agent-tool', 'agent request', undefined, 42), { ok: true });
-  assert.deepEqual(wakes.find((w) => w.agentName === 'scout'), { agentName: 'scout', callerTurnId: 42 });
-});

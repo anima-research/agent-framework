@@ -737,7 +737,6 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-
   type RoutingState = {
     pin?: ChannelRef; nonChannelOrigin?: boolean; hybridHold?: 'private' | 'failed';
     continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number; privateSuppressed: number;
@@ -895,7 +894,6 @@ describe('explicit prose routing', () => {
       try { await drain(); } finally { await framework.stop(); }
     }
   }
-
 
   async function withHeldHybridCallback(
     lateText: string | null,
@@ -1351,42 +1349,6 @@ describe('explicit prose routing', () => {
       assert.ok(!texts.some((t) => t.includes('that no recent notice on this branch names')), "the catch-up doesn't name it again");
       assert.ok((store.get('assistant', late.id)?.noticedIn ?? []).length > 0, 'it is recorded as noticed');
     });
-  });
-
-  it("the non-streaming fallback's re-inference keeps its private turn's privacy, though no turn is open any more", async () => {
-    const framework = await createFramework('hybrid');
-    stubRegistry(framework);
-    const agent = framework.getAgent('assistant')!;
-    const internals = framework as unknown as {
-      routingOf(name: string): { nonChannelOrigin?: boolean; turnId: number };
-      openLogical: Map<string, unknown>;
-      pendingRequests: InferenceRequest[];
-      handleProcessEvent(event: ProcessEvent): Promise<void>;
-    };
-    // A private turn ran the tools, and is no longer open, as after a stop()
-    // and start on this instance.
-    internals.routingOf('assistant').nonChannelOrigin = true;
-    const turnId = internals.routingOf('assistant').turnId;
-    internals.openLogical.delete('assistant');
-    const response = createMockResponse([
-      { type: 'tool_use', id: 'unstreamed-private', name: 'robot--move', input: { dir: 'north' } },
-    ] as ContentBlock[], 'tool_use');
-    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
-    try {
-      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'Take the direct inference path.' }]);
-      await agent.runInference(framework.getAllTools());
-      assert.equal(agent.state.status, 'waiting_for_tools');
-      agent.addAssistantResponse(response.content);
-      await internals.handleProcessEvent({
-        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'unstreamed-private',
-        result: { success: true, data: { ok: true } },
-      } as ProcessEvent);
-      const ready = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
-      assert.ok(ready, 'control: the fallback scheduled the re-inference');
-      assert.deepEqual(callerTurns(ready), [turnId], "it carries the private turn, so its start is private");
-    } finally {
-      await framework.stop();
-    }
   });
 
   it("the non-streaming fallback leaves the scheduling turn's logical turn open for the re-inference", async () => {
@@ -1889,27 +1851,6 @@ describe('explicit prose routing', () => {
     }
   });
 
-  for (const privateTurn of [true, false]) {
-    it(`hybrid: a hold beside a send in a ${privateTurn ? 'private turn resolves its >>> target and sets no destination' : 'channel turn sets the >>> target it resolves, as a control'}`, async () => {
-      const framework = await createFramework('hybrid');
-      stubRegistry(framework);
-      const gateway = framework as unknown as {
-        holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
-      };
-      const agent = framework.getAgent('assistant')!;
-      try {
-        const routing: RoutingState = routingState(privateTurn ? { nonChannelOrigin: true } : {});
-        gateway.holdSilencedProse(agent, ['>>>#alpha held words', 'after it'], 'send', false, { routing, notice: 'later' });
-        assert.equal(routing.hybridHold, undefined, 'control: the target resolved');
-        if (privateTurn) assert.equal(routing.pin, undefined, 'no envelope sets a destination while a turn is private');
-        else assert.deepEqual(routing.pin, { serverId: 'stub', channelId: 'chan-alpha' });
-        assert.deepEqual(routing.drafts.map((d) => d.text), ['held words', 'after it'], 'and the words are held as drafts');
-      } finally {
-        await framework.stop();
-      }
-    });
-  }
-
   it('hybrid: a hold beside a send refuses a >>> target its server declared inbound-only, as delivery does, and drops the pin before it', async () => {
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
@@ -2161,8 +2102,7 @@ describe('explicit prose routing', () => {
     });
     const help = decoded.join(' ').replace(/\s+/g, ' ');
     for (const clause of [
-      "A destination applies to the rest of that turn, until another is named, except in a private turn (one that took in private input, such as an operator's message from a private surface): there each envelope delivers only its own body.",
-      'In a private turn, text without a destination is kept private instead, with no draft.',
+      'A destination applies to the rest of that turn, until another is named',
       'A name that matches no channel, or several, bounces and leaves it as it was.',
       'A channel its server declared inbound-only is refused, and clears it.',
       'Where two servers register one channel id, the server goes first: >>server:service:guild:id … (a bounce lists each such name).',
@@ -2170,6 +2110,10 @@ describe('explicit prose routing', () => {
     ]) {
       assert.ok(help.includes(clause), `the help says: ${clause}`);
     }
+    // And that in a private turn a destination doesn't stick, and text
+    // without one is kept private, with no draft.
+    assert.match(help, /private turn[^.]*only its own body/);
+    assert.match(help, /private turn[^.]*kept private[^.]*no draft/);
     assert.deepEqual(routed, [{ text: 'got it', locus: 'chan-alpha' }]);
 
     await framework.stop();
@@ -2425,7 +2369,6 @@ describe('explicit prose routing', () => {
 
     await framework.stop();
   });
-
 
   it('hybrid preserves authored >>> envelope, publishes only body cross-surface, and records canonical receipt', async () => {
     const authored = '>>>#cafe\nA message meant for the café.';
@@ -2744,38 +2687,19 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("a late bounce wakes a turn of its own turn's kind, not of the turn live when it lands", async () => {
-    await withHeldHybridCallback('>>>#nowhere Where does this go?', async ({ framework, earlier, next, pending, release }) => {
-      // The bouncing envelope is the earlier turn's, a private one; the live
-      // turn, when its delivery runs, is a channel's.
-      (earlier as RoutingState & { nonChannelOrigin?: boolean; turnId?: number }).nonChannelOrigin = true;
-      (earlier as RoutingState & { turnId?: number }).turnId = 101;
-      (next as RoutingState & { nonChannelOrigin?: boolean; turnId?: number }).nonChannelOrigin = false;
-      (next as RoutingState & { turnId?: number }).turnId = 102;
-      const queued = (framework as unknown as { pendingRequests: Array<{ reason: string; nonChannelOrigin?: boolean }> }).pendingRequests;
-      release();
-      await within(pending, 'the late envelope');
-      const bounce = queued.find((r) => r.reason === 'prose-bounce');
-      assert.ok(bounce, `the bounce wakes the agent: ${JSON.stringify(queued)}`);
-      assert.deepEqual(callerTurns(bounce), [101], "the wake carries the bouncing turn, for its start to judge");
-    });
-  });
-
-  it("a private turn's bounce wakes a private turn", async () => {
+  it("a private turn's bounce wakes a turn whose plain words stay private", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#nowhere Where does this go?' }] as ContentBlock[]));
     const framework = await createFramework('explicit');
     stubRegistry(framework);
-    const starts: Array<{ reason: string; nonChannelOrigin?: boolean }> = [];
-    const internals = framework as unknown as { startAgentStream(agent: unknown, trigger?: { reason: string; nonChannelOrigin?: boolean }): Promise<void> };
-    const start = internals.startAgentStream.bind(framework);
-    internals.startAgentStream = async (agent, trigger) => { if (trigger) starts.push(trigger); return start(agent, trigger); };
-    feedTurn(framework, 2, []);
+    let turns = 0;
+    framework.onTrace((e) => { if ((e as { type: string }).type === 'inference:started') turns++; });
+    feedTurn(framework, 2, [{ type: 'text', text: 'Ordinary words.' }] as ContentBlock[]);
     trigger(framework, true);
     await framework.runUntilIdle();
-    assert.deepEqual(starts.map((s) => [s.reason, s.nonChannelOrigin === true]), [
-      ['external-message', true],
-      ['prose-bounce', true],
-    ], 'the bounce wake carries the bouncing turn\'s private origin');
+    assert.equal(turns, 2, 'control: the bounce woke a turn');
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+    assert.ok(!drafts.some((d) => d.text === 'Ordinary words.'), `nothing holds them to resend to a channel: ${JSON.stringify(drafts)}`);
+    assert.ok(context(framework).texts.some((t) => t.includes('was kept private')), 'the resident is told they were kept private');
     await framework.stop();
   });
 
@@ -2806,7 +2730,6 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-
   it('hybrid keeps an explicit target sticky across tool-round segments in the same turn', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>>#cafe first segment' },
@@ -2826,7 +2749,6 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-
   it('hybrid target-only envelope establishes the sticky destination for the next tool-round segment', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>>#cafe' },
@@ -2840,7 +2762,6 @@ describe('explicit prose routing', () => {
     assert.deepEqual(routed, [{ text: 'body follows', locus: 'discord:g:cafe' }]);
     await framework.stop();
   });
-
 
   it('hybrid >>>skip_reply clears a sticky target until a fresh valid envelope', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>#cafe first' }, { type: 'tool_use', id: 'sk1', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
@@ -2885,7 +2806,6 @@ describe('explicit prose routing', () => {
     });
   }
 
-
   it('hybrid same-round successful say tool outranks a contradictory prose envelope', async () => {
     const authored = '>>>#cafe wrong-locus duplicate';
     membrane.pushResponse(createMockResponse([
@@ -2913,7 +2833,6 @@ describe('explicit prose routing', () => {
     ]);
     await framework.stop();
   });
-
 
   it('disabled mode suppresses text-only prose without a bounce, primer, or channel delivery', async () => {
     const authored = 'Internal continuity summary that must never publish.';

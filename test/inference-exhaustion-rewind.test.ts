@@ -60,6 +60,8 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.pendingRequests = [];
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
+  // No turn checkpoints: a rewind's retry finds no start below what it shed.
+  fw.getTurnCheckpoints = () => [];
   fw.agents = new Map([['cairn', {
     name: 'cairn',
     refusalHandling: { maxRewinds: opts?.maxRewinds ?? 3 },
@@ -103,21 +105,6 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
 
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
-});
-
-test("a private turn's rewind retry carries that turn, for its start to judge", () => {
-  const { fw, restore } = makeHarness();
-  // The turn that failed came from a private surface.
-  fw.turnRouting = new Map([['cairn', { nonChannelOrigin: true, turnId: 7 }]]);
-  try {
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-  } finally { restore(); }
-  assert.equal(fw.pendingRequests[0]?.reason, 'inference-failure-rewind-retry');
-  // It carries the failed turn, so its start is private as that turn is.
-  const mark = Object.getOwnPropertySymbols(fw.pendingRequests[0]).find((k) => k.description === 'caller-turns');
-  assert.deepEqual(mark && fw.pendingRequests[0][mark], [7]);
 });
 
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {

@@ -1491,13 +1491,23 @@ function isTurnContinuation(reason: string): boolean {
 }
 
 /**
+ * The `external-message` events the framework builds itself, such as an MCPL
+ * server's tool-list notice: no operator wrote them, so they aren't a private
+ * surface's message. Only the framework adds to it, so a module can't make
+ * its own event read as one of these.
+ */
+const FRAMEWORK_NOTICES = new WeakSet<ProcessEvent>();
+
+/**
  * Whether an event is a private surface's message: an `external-message` or
  * `api:message` (a console, a TUI, a WebUI, an API caller) whose metadata
  * names no channel. Any source counts, so a new surface is private without
- * an allow-list. Its wake makes its turn private.
+ * an allow-list; only the framework's own notices (FRAMEWORK_NOTICES) don't.
+ * Its wake makes its turn private.
  */
 export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
   if (event.type !== 'external-message' && event.type !== 'api:message') return false;
+  if (FRAMEWORK_NOTICES.has(event)) return false;
   const channelId = (event.metadata as Record<string, unknown> | undefined)?.channelId;
   return !(typeof channelId === 'string' && channelId.trim().length > 0);
 }
@@ -1568,6 +1578,9 @@ interface TurnCheckpoint {
   sequenceBefore: number;
   branchName: string;
   timestamp: number;
+  /** Set once the start's turn is private (markCheckpointPrivate). Absent
+   *  reads public, as a checkpoint from before the field ran. */
+  private?: true;
 }
 
 type DiscordAwarenessDrainOutcome =
@@ -10258,10 +10271,8 @@ export class AgentFramework {
       ? 'idle+turn-alive'
       : agent.state.status;
     this.pendingRequests.push({
-      agentName: name,
-      reason: requestedBy ? `admin-nudge (${requestedBy})` : 'admin-nudge',
+      ...this.retakeRequest(name, requestedBy ? `admin-nudge (${requestedBy})` : 'admin-nudge'),
       source: 'admin',
-      timestamp: Date.now(),
     });
     console.error(
       `[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}` +
@@ -10518,12 +10529,7 @@ export class AgentFramework {
         channelId: params.channelId ?? '',
       });
       this.refusalRewinds.set(agentName, 0);
-      this.pendingRequests.push({
-        agentName,
-        reason: 'unstick',
-        source: 'framework',
-        timestamp: Date.now(),
-      });
+      this.pendingRequests.push(this.retakeRequest(agentName, 'unstick'));
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -12188,6 +12194,32 @@ export class AgentFramework {
     }
 
     this.saveTurnCheckpoints(agentName, checkpoints);
+  }
+
+  /** Mark the agent's newest checkpoint private: its start's turn is private,
+   *  as it began or from a boundary on, so a retake from it is (retakeRequest). */
+  private markCheckpointPrivate(agentName: string): void {
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    const newest = checkpoints.at(-1);
+    if (!newest || newest.private) return;
+    newest.private = true;
+    this.saveTurnCheckpoints(agentName, checkpoints);
+  }
+
+  /**
+   * A request that retakes the agent's last turn, as a nudge or an unstick
+   * does: private when the start whose material the context ends on was.
+   * After an undo that's the redo stack's top, otherwise the newest checkpoint.
+   */
+  private retakeRequest(agentName: string, reason: string): InferenceRequest {
+    const start = this.redoStacks.get(agentName)?.at(-1)?.checkpoint ?? this.getTurnCheckpoints(agentName).at(-1);
+    return {
+      agentName,
+      reason,
+      source: 'framework',
+      timestamp: Date.now(),
+      ...(start?.private ? { nonChannelOrigin: true } : {}),
+    };
   }
 
   /**
@@ -17179,6 +17211,7 @@ export class AgentFramework {
     const wasPrivate = routing.nonChannelOrigin === true;
     routing.nonChannelOrigin = true;
     this.notePrivateTurn(routing.turnId);
+    if (!wasPrivate) this.markCheckpointPrivate(agent.name);
     const had = routing.locus ?? routing.pin;
     delete routing.locus;
     delete routing.pin;
@@ -19280,7 +19313,8 @@ export class AgentFramework {
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
-    if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
+    const checkpointed = attempt === 0 && trigger?.reason !== 'tool_result_guard_retry';
+    if (checkpointed) {
       this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
@@ -19439,6 +19473,8 @@ export class AgentFramework {
         if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
       }
     }
+    // A retake from this start's checkpoint goes by its privacy as it began.
+    if (checkpointed && routing.nonChannelOrigin) this.markCheckpointPrivate(agent.name);
     // A private turn names the channels whose messages its start took in,
     // before it compiles: in locus and hybrid mode, where a channel's message
     // can move where plain speech goes, as at a boundary and its arrivals.
@@ -23175,7 +23211,6 @@ export class AgentFramework {
       : toolName === 'channel_publish' && !input.channelId
         && context.startTurnId !== undefined && this.isPrivateTurn(context.startTurnId)
         ? "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId"
-          + `${this.conversationAgentHomes.has(agentName) ? ` (to publish in this conversation's channel, name "${this.forkHomeShown(agentName)}")` : ''}`
           + `${this.canAgentUseTool(agentName, 'channel_list') ? '; channel_list shows the channel ids' : ''}; nothing was posted`
       : undefined;
     // A call that reaches the host while a run or wait call watches the
@@ -29615,12 +29650,14 @@ export class AgentFramework {
 
     if (newTools.length > 0) {
       const toolList = newTools.map(t => t.name).join(', ');
-      this.pushEvent({
+      const notice: ProcessEvent = {
         type: 'external-message',
         source: `mcpl:${serverId}`,
         content: `New tools available: ${toolList}`,
         metadata: { newTools: newTools.map(t => t.name), removedTools },
-      });
+      };
+      FRAMEWORK_NOTICES.add(notice);
+      this.pushEvent(notice);
     }
   }
 
@@ -30069,11 +30106,9 @@ export class AgentFramework {
   }
 
   /**
-   * The refusal of a private turn's channel_publish that names no channel, or
-   * undefined. Its default, the latest inbound message's channel, is one the
-   * resident didn't choose, and a fork's home is no different. Judged at
-   * dispatch by the call's own turn, and in routing by the stream's; a
-   * script's call is judged at the bridge by its start turn (scriptToolCall).
+   * The refusal of a private turn's channel_publish that names no channel:
+   * its default, the latest inbound message's channel, is one the resident
+   * didn't choose. A script's call is judged at the bridge by its start turn.
    */
   private privatePublishRefusal(
     agentName: string,
@@ -30082,20 +30117,8 @@ export class AgentFramework {
   ): string | undefined {
     if (call.name !== 'channel_publish' || !privateTurn) return undefined;
     if ((call.input as { channelId?: unknown } | undefined)?.channelId) return undefined;
-    const home = this.forkHomeShown(agentName);
     return 'This private turn has no default channel; channel_publish requires an explicit channelId.'
-      + (home ? ` To publish in this conversation's channel, name "${home}".` : '')
       + (this.canAgentUseTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
-  }
-
-  /** A conversation fork's home channel for a refusal to name: as the agent
-   *  is shown it where that is a name the fork's guard takes as its home, its
-   *  id or server-qualified name, and its id otherwise. */
-  private forkHomeShown(agentName: string): string | undefined {
-    const home = this.conversationAgentHomes.get(agentName);
-    if (!home) return undefined;
-    const shown = this.channelRegistry?.nameShown(home);
-    return shown === qualifiedChannelName(home) ? shown : home.channelId;
   }
 
   /**
