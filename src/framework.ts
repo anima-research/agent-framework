@@ -8542,7 +8542,30 @@ export class AgentFramework {
         { cause: error },
       );
     }
-    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({ ...m, seq: i + 1 }));
+    // An entry a version before the audience stamp (#291) queued carries
+    // none: the stamp is written when a write is queued (addMessage), and
+    // that version wrote none. The tool boundary's, a turn start's and a
+    // released window's flushes store an entry with the metadata it was
+    // queued with, straight into the store, so unstamped here it would be
+    // stored unstamped after the upgrade, and read as a row stored before
+    // it. It is stamped as addMessage stamps a write it queues: for the
+    // agent it is queued for (its delivery agent when it names none), and
+    // for nobody when it carries a tune-out's hold, since no resident is
+    // shown it (inboundAudience). The entry doesn't say who stored it, so
+    // it isn't taken for anyone's own row: a puppeted pair that version
+    // queued is stamped as for its agent. An entry that has a stamp keeps
+    // it, and so does one with no agent to be for, on a host with none,
+    // where addMessage stores nothing. The queue's next write carries the
+    // stamps; until then each boot stamps the same entries the same way.
+    const stamped = (m: (typeof ordered)[number]): typeof m => {
+      if (audienceOf(m.metadata)) return m;
+      if (heldFromResidents(m.metadata as Record<string, unknown> | undefined)) {
+        return { ...m, metadata: withAudience(m.metadata, []) };
+      }
+      const target = m.forAgent ?? this.deliveryAgent()?.name;
+      return target === undefined ? m : { ...m, metadata: withAudience(m.metadata, [target]) };
+    };
+    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({ ...stamped(m), seq: i + 1 }));
     this.deferredSeq = Math.max(this.deferredSeq, restored.length);
     if (landed.size > 0) {
       console.error(
@@ -26133,7 +26156,8 @@ export class AgentFramework {
        * Who the message is for, when that is decided before it gets here:
        * the recipients admission delivered an inbound message to, or none
        * for one a tune-out holds. Stamped on the row as `metadata.audience`
-       * (dendrite/audience.ts). Absent, the row is for its delivery agent.
+       * (dendrite/audience.ts). Absent, the row is for its delivery agent,
+       * or for nobody when its metadata carries a tune-out's hold.
        */
       audience?: readonly string[];
     }
@@ -26167,11 +26191,15 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
     // Who the row is for, written on it (#291): what the caller decided, else
-    // the agent it is delivered to, never as anyone's own row. A stamp the
-    // metadata carried is replaced, as a deferredWriteId is, except on a
-    // write from the queue, which carries the stamp it was queued with.
+    // the agent it is delivered to, never as anyone's own row. A write that
+    // carries a tune-out's hold (heldFromResidents) is for nobody, whatever
+    // agent's store it lands in, as an inbound message a tune-out holds is
+    // (inboundAudience): no resident is shown it. A stamp the metadata
+    // carried is replaced, as a deferredWriteId is, except on a write from
+    // the queue, which carries the stamp it was queued with.
     if (!(opts?.fromQueue && audienceOf(metadata))) {
-      metadata = withAudience(metadata, opts?.audience ?? [agent.name]);
+      const held = heldFromResidents(metadata as Record<string, unknown> | undefined);
+      metadata = withAudience(metadata, opts?.audience ?? (held ? [] : [agent.name]));
     }
 
     // Defer non-tool_result messages while a tool cycle is mid-flight
