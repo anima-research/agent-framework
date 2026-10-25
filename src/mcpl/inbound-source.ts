@@ -193,29 +193,9 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * A block as the store hands it back: context-manager's own `blockAsStored`,
- * the same transform its write path applies (blob-manager.ts). Inline media
- * comes back as `{ type, source: { type: 'base64', data, mediaType } }` and
- * nothing else, its data re-encoded from the decoded bytes and an image's
- * media type taken from its bytes' signature where they have one; a
- * `tool_use` whose input isn't an object comes back mended. A block the store
- * refuses on write has no stored form, so `blockAsStored` throws for it (a
- * caller-supplied `blob_ref` among them), and it is digested as given: no
- * stored copy holds one, and an unresolved read's `blob_ref` and its resolved
- * form keep distinct digests. Whatever `blockAsStored` throws, the block is
- * digested as given; every refusal tried throws `MalformedContentError`.
- *
- * This is one block's stored form. The store also changes blocks together:
- * when it mends a `tool_use`, it releases a raw replay form (`rawXml`,
- * `rawItem`) that other blocks in the message share, which one block can't
- * show. A body like that doesn't hash as its stored copy does. MCPL's content
- * conversion (convert-block.ts) produces only text, image and audio blocks,
- * so a body an MCPL server delivers is never one.
- *
- * So a digest is a digest under the context-manager release that computed it.
- * A release that changes what the store keeps, such as its set of image
- * signatures, changes the stored form and with it the digest of a body it
- * touches.
+ * blockAsStored throws for a block the store refuses on write, a
+ * caller-supplied `blob_ref` among them. Such a block has no stored form,
+ * and whatever is thrown, it is digested as given.
  */
 function storedBlock(block: unknown): unknown {
   try {
@@ -230,13 +210,21 @@ function storedBlock(block: unknown): unknown {
  * room-220 #46752–#47210): SHA-256 hex of `canonicalJson([blocks])` over the
  * ContentBlock[] the framework stores for the body — after MCPL conversion,
  * before any host decoration is added and before storage shards it — with
- * each block as the store keeps it (storedBlock, canonicalJson). So a body
- * hashes alike as delivered, as handed to storage, and as read back
- * unsharded from the store with its blobs resolved, except one whose blocks
- * the store changes together (see storedBlock). The one-element array keeps
- * the framing an undecorated, unsharded stored copy has always hashed to, so
- * a stamped copy and an older copy of the same body share a version where
- * the store keeps the body as it did then.
+ * each block as the store keeps it, which context-manager's `blockAsStored`
+ * gives. So a body hashes alike as delivered, as handed to storage, and as
+ * read back unsharded from the store with its blobs resolved, except one
+ * whose blocks the store changes together: when it mends a `tool_use` whose
+ * input isn't an object, it also releases a raw replay form (`rawXml`,
+ * `rawItem`) that the message's other blocks share, which no one block's
+ * stored form shows. A body an MCPL lane stamps is never one. A block the
+ * store refuses on write, a `blob_ref` among them, is digested as given. The
+ * one-element array keeps the framing an undecorated, unsharded stored copy
+ * has always hashed to, so a stamped copy and an older copy of the same body
+ * share a version where the store keeps the body as it did then.
+ *
+ * A digest is a digest under the context-manager release that computed it: a
+ * release that changes what the store keeps, such as its set of image
+ * signatures, changes the digest of a body it touches.
  *
  * Ingestion stamps it as `metadata.sourceBodyDigest`, and the same function
  * over exactly the blocks handed to storage (decorations included) as
@@ -245,16 +233,16 @@ function storedBlock(block: unknown): unknown {
  * materialization, a correction), not the admission. Neither proves later
  * presence or completeness. An unsharded stored copy that no longer hashes
  * to its storedBodyDigest was changed after delivery (editMessage keeps
- * metadata), or holds blocks the store changes together (see storedBlock),
- * or its digest was taken under a release that kept some block of it
- * differently: a context-manager release that changed a stored form, or an
- * agent-framework release from 0.24.0 up to the one that brought in
- * blockAsStored, which took stored forms from a copy of the store's
- * transform. Digests already stamped are never recomputed. A body the store
- * shards carries the whole body's two digests on every shard, and no shard
- * hashes to them. Check a copy read back with its blobs resolved
- * (getAllMessages, getMessage, or getMessageWindow without
- * `resolveBlobs: false`): a blob reference never matches.
+ * metadata), or holds blocks the store changes together, or its digest was
+ * taken under a release that kept some block of it differently: a
+ * context-manager release that changed a stored form, or an agent-framework
+ * release from 0.24.0 up to the one that brought in blockAsStored, which
+ * took stored forms from a copy of the store's transform. Digests already
+ * stamped are never recomputed. A body the store shards carries the whole
+ * body's two digests on every shard, and no shard hashes to them. Check a
+ * copy read back with its blobs resolved (getAllMessages, getMessage, or
+ * getMessageWindow without `resolveBlobs: false`): a blob reference never
+ * matches.
  *
  * Exported from the package root, so a consumer checks a copy against either
  * field with this same function rather than a copy of it.

@@ -690,20 +690,11 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     ({ type: 'image', source: { type: 'base64', data, mediaType }, ...extra });
   const media = (type: string, data: string, mediaType: string, extra: Record<string, unknown> = {}) =>
     ({ type, source: { type: 'base64', data, mediaType }, ...extra });
-  /**
-   * Each body, whether the store hands it back changed, and its digest. Every
-   * digest but the two marked below is the one agent-framework 0.24.0 and later
-   * stamped through a copy of the store's transform, so a stamp already in a
-   * store still matches its copy; a context-manager release that keeps one of
-   * these differently fails here.
-   */
   const bodies: Record<string, { blocks: unknown[]; changed: boolean; digest: string }> = {
     'plain text': { blocks: [{ type: 'text', text: 'hello' }], changed: false, digest: '20e8a9654f001815055a7b61692923120a516fc0095519f521c8c821421cb4b9' },
     'a labeled image': { blocks: [image(png)], changed: false, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true, digest: '828ac28be2d13e7621768ba98ec74d555409d97567f9c05b1a1428e614cf9233' },
-    // One fixture per signature the store sniffs, each labeled as something
-    // else, so a context-manager that stops sniffing one fails here.
     'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e6e7bf5cc2225c979b2063abbe811ba02db8208e49b8315d0cab6565b55631fc' },
     'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true, digest: 'd7b8b855a4e81d88931ebf4a1d91c76c57da9d79572f523e29de1b9d23143fb1' },
     'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e643b5a67e56b99e8c555cd1064bc24ccba134e76a240b99c651934b761a9c72' },
@@ -712,8 +703,6 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'base64 with non-zero unused bits': { blocks: [image(png.replace(/8=$/, '9='))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
     'base64 in the URL-safe alphabet': { blocks: [image(png.replace(/\//g, '_'))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
-    // A server can send data that isn't base64 at all: the store keeps the
-    // bytes its base64 read takes from it.
     'an image whose data is not base64': { blocks: [image('not base64 at all!')], changed: true, digest: '75f6aed70407609a42b127029df45b37de6f61019f25c9ed8ea76c904c7ab6ed' },
     // Bytes the store has no signature for keep their label. Labeled
     // image/png, so a context-manager that learns to sniff one fails here.
@@ -737,13 +726,7 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     // Only a non-URL image is blobbed: a URL image keeps even a stray data
     // string as given, and storedBlock must not re-encode it.
     'an image by URL with a stray data string': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } }], changed: false, digest: 'bc49add8c15470ee7f0c265407c27a487a5a4db29e0a72bcd67459cb40790d7c' },
-    // The store mends a tool_use whose input isn't an object: input {}, the
-    // value kept in unparseableInput. The copied transform before
-    // blockAsStored left it as given, so its stored copy didn't match, and
-    // its digest changed.
     'a tool_use whose input is a string': { blocks: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: 'not an object' }], changed: true, digest: 'cad2fc7ae441d577c80caf5c1b600b75b1fac068fbad1bb3c927cf5eaa6ecc8e' },
-    // The store keeps media whose data is a byte array as base64. The copy
-    // left it as given, so its digest changed too.
     'a document whose data is a byte array': { blocks: [{ type: 'document', source: { type: 'base64', data: [...Buffer.from('%PDF-1.4')], mediaType: 'application/pdf' } }], changed: true, digest: '8d07d2f460b247e61d54154454f0c53601b54996af04de5403ac5059a6a7ef2a' },
   };
 
