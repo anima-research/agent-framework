@@ -1374,10 +1374,12 @@ describe('private wins, one way', () => {
         try {
           const settled = () => ['scout', 'ranger'].every((name) => rig.framework.getAgent(name)!.state.status === 'idle');
           const channelTurn = async (agentName: string) => {
+            const before = rig.routed.length;
             const starts = rig.starts.length;
             rig.i.pendingRequests.push({ ...roomWake(), agentName });
             await rig.until(() => rig.starts.length > starts && settled(), `${agentName}'s channel turn`);
             await rig.framework.runUntilIdle();
+            assert.deepEqual(rig.routed.slice(before).map((r) => r.locus), [ROOM], `control: ${agentName}'s turn spoke in its channel`);
           };
           await channelTurn('scout');
           if (step === 'undo') {
