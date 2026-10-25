@@ -30,7 +30,7 @@ import {
   type ToolCall,
   type ToolResult,
 } from '../src/index.js';
-import { ContextManager, MalformedContentError } from '@animalabs/context-manager';
+import { ContextManager, MalformedContentError, blockAsStored } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { canonicalJson } from '../src/mcpl/inbound-source.js';
@@ -695,7 +695,7 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     'a labeled image': { blocks: [image(png)], changed: false },
     'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true },
     'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true },
-    // One fixture per branch of the copied sniffer, each labeled as something
+    // One fixture per signature the store sniffs, each labeled as something
     // else, so a context-manager that stops sniffing one fails here.
     'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
     'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true },
@@ -727,6 +727,10 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     // Only a non-URL image is blobbed: a URL image keeps even a stray data
     // string as given, and storedBlock must not re-encode it.
     'an image by URL with a stray data string': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } }], changed: false },
+    // The store mends a tool_use whose input isn't an object: input {}, the
+    // value kept in unparseableInput. The copied transform before
+    // blockAsStored left it as given, so its stored copy didn't match.
+    'a tool_use whose input is a string': { blocks: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: 'not an object' }], changed: true },
   };
 
   it('every body hashes alike as handed to the store and as read back, live and after reopening', async () => {
@@ -789,6 +793,18 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a block the store refuses has no stored form, so it is digested as given', () => {
+    const plain = (blocks: unknown[]) => createHash('sha256').update(canonicalJson([blocks])).digest('hex');
+    for (const block of [
+      { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } },
+      { type: 'image', source: { type: 'base64', data: Buffer.from('<svg/>').toString('base64') } },
+      { type: 'blob_ref', blobKind: 'image', hash: 'deadbeef', mediaType: 'image/png' },
+    ]) {
+      assert.throws(() => blockAsStored(block as never), MalformedContentError, `${block.type}: the store refuses it`);
+      assert.equal(sourceBodyDigest([block]), plain([block]), `${block.type}: digested as given`);
     }
   });
 

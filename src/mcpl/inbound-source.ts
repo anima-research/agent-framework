@@ -22,6 +22,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { blockAsStored } from '@animalabs/context-manager';
 
 /** The MCPL admission lane that accepted an item. Its contract decides what
  *  an `eventId` is worth: `push/event` deduplicates by eventId, and RFC-006
@@ -192,68 +193,28 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * A block as the store hands it back. Context-manager keeps inline media as
- * blobs (blob-manager.ts): an image whose source isn't a URL, and every
- * document, audio or video block, comes back as `{ type, source: { type:
- * 'base64', data, mediaType } }` and nothing else, its data re-encoded from
- * the decoded bytes, and an image's media type taken from its bytes'
- * signature where they have one. Any other block comes back as it was given,
- * except a store-internal `blob_ref` from an unresolved read, which resolves
- * to inline media by default. It is digested as given here, so an unresolved
- * read and its resolved form differ. Context-manager refuses caller-supplied
- * blob_ref writes; the MCPL lanes never store one.
+ * A block as the store hands it back: context-manager's own `blockAsStored`,
+ * the same transform its write path applies (blob-manager.ts). Inline media
+ * comes back as `{ type, source: { type: 'base64', data, mediaType } }` and
+ * nothing else, its data re-encoded from the decoded bytes and an image's
+ * media type taken from its bytes' signature where they have one; a
+ * `tool_use` whose input isn't an object comes back mended. A block the store
+ * refuses on write has no stored form, so `blockAsStored` throws for it (a
+ * caller-supplied `blob_ref` among them), and it is digested as given: no
+ * stored copy holds one, and an unresolved read's `blob_ref` and its resolved
+ * form keep distinct digests.
+ *
+ * So a digest is a digest under the context-manager release that computed it.
+ * A release that changes what the store keeps, such as its set of image
+ * signatures, changes the stored form and with it the digest of a body it
+ * touches.
  */
 function storedBlock(block: unknown): unknown {
-  const media = block as { type?: unknown; source?: { type?: unknown; data?: unknown; mediaType?: unknown } } | null;
-  const blob = media?.type === 'image'
-    ? media.source?.type !== 'url'
-    : media?.type === 'document' || media?.type === 'audio' || media?.type === 'video';
-  const source = media?.source;
-  if (!blob || typeof source?.data !== 'string') return block;
-  const data = canonicalBase64(source.data);
-  const mediaType = media!.type === 'image'
-    ? sniffRasterImageMediaType(Buffer.from(data.slice(0, 32), 'base64')) ?? source.mediaType
-    : source.mediaType;
-  return { type: media!.type, source: { type: 'base64', data, mediaType } };
-}
-
-/**
- * Base64 as the store writes it back from the decoded bytes: padded, with no
- * whitespace, the standard alphabet and zero unused bits. Data already in
- * that form, as every stored copy's is, is returned without decoding it all.
- */
-function canonicalBase64(data: string): string {
-  if (data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
-    const last = data.slice(-4);
-    if (Buffer.from(last, 'base64').toString('base64') === last) return data;
+  try {
+    return blockAsStored(block as Parameters<typeof blockAsStored>[0]);
+  } catch {
+    return block;
   }
-  return Buffer.from(data, 'base64').toString('base64');
-}
-
-/**
- * The store's own test for raster image types with an unambiguous byte
- * signature, copied from context-manager's blob-manager.ts (it isn't
- * exported): the store relabels an image whose bytes match one of these.
- */
-function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
-  if (bytes.length >= 8 &&
-      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
-      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
-    return 'image/png';
-  }
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  if (bytes.length >= 6) {
-    const signature = Buffer.from(bytes.subarray(0, 6)).toString('ascii');
-    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
-  }
-  if (bytes.length >= 12 &&
-      Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
-      Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP') {
-    return 'image/webp';
-  }
-  return null;
 }
 
 /**
