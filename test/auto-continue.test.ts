@@ -235,6 +235,27 @@ describe('autoContinue', () => {
     }
   });
 
+  it("a continuation's request ends on a changed context injection, stored after its [continue] row", async () => {
+    let gathered = 0;
+    (module as unknown as { gatherContext: () => Promise<unknown[]> }).gatherContext = async () =>
+      [{ namespace: 'lessons', position: 'afterUser', content: [text(`LESSON ${++gathered}`)] }];
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    script(framework, [empty(), skipReply()]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      const textOf = (m: { content: unknown } | undefined) =>
+        ((m?.content ?? []) as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+      const continued = membrane.calls[1]!.messages;
+      assert.equal(textOf(continued.at(-1)), 'LESSON 2', 'it ends on the injection');
+      assert.ok(textOf(continued.at(-2)).startsWith('[continue] assistant'), 'right after the [continue] row');
+      assert.ok(continued.some((m) => textOf(m) === 'LESSON 1'), 'the first turn\'s copy stays where it was');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('stops at maxConsecutive, and says so on the last continuation', async () => {
     const framework = await createFramework({ maxConsecutive: 2 });
     stubRegistry(framework);

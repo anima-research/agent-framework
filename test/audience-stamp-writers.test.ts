@@ -151,6 +151,8 @@ const DIRECT_WRITES: Record<string, { count: number; stamp: keyof typeof STAMPED
   'framework.ts AgentFramework.repinTurnLocus': { count: 1, stamp: 'own', what: 'a routing notice' },
   'framework.ts AgentFramework.addressedElsewhereNotice': { count: 1, stamp: 'own', what: 'a routing notice' },
   'framework.ts AgentFramework.placeWakeLines': { count: 1, stamp: 'own', what: "a batched wake's line" },
+  // main's #782: an afterUser context injection stored where compile() placed it, this agent's own context.
+  'framework.ts AgentFramework.storeInjections': { count: 1, stamp: 'own', what: "a stored context injection, the agent's own context" },
 };
 
 const keyOf = (site: Site) => `${site.file} ${site.scope.join('.')}`;

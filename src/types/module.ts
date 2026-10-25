@@ -26,6 +26,29 @@ export interface MessageQuery {
 }
 
 /**
+ * A context injection a module gathers (Module.gatherContext).
+ *
+ * An `afterUser` one is stored in the agent's window, as the message
+ * `compile()` would have placed after the last user message, where it then
+ * stays: so the replies after it keep their thinking, and the cache keeps the
+ * turns before it. The same source's unchanged content isn't stored again
+ * while the copy the agent will read as current has it whole: the one its
+ * last request held, or a newer one a start stored whose compile then
+ * didn't record. Once a fold has summarized it or a strategy's window has
+ * scrolled past it, it's stored again, as one more row. (See
+ * stored-injections.ts.)
+ *
+ * `placedEachCompile: true` opts out: `compile()` places the injection after
+ * the last user message at each start, near the end, as before it was
+ * stored. That's for context meant to stay near the end, such as
+ * instructions moved off `system`. Its cost: it moves, and on a model that
+ * binds a reply's thinking to everything before it, every reply after its old
+ * place loses its thinking. It has no effect on a `system` or `beforeUser`
+ * injection, which `compile()` always places.
+ */
+export type ModuleContextInjection = ContextInjection & { placedEachCompile?: true };
+
+/**
  * A message as a module context's reads answer it: a stored row, or a row
  * for a write the framework holds (`held`). Either is marked
  * `heldFromResidents` when a tune-out holds it from the residents.
@@ -159,9 +182,16 @@ export interface Module {
    * Called before each inference to collect data (e.g., HUD overlays, game state)
    * that should be injected into the compiled context.
    * Complementary to MCPL push-based hooks — modules pull via gatherContext.
+   * An `afterUser` injection is appended to the agent's window, where it
+   * then stays, unless the copy the agent will read as current has the same
+   * content, every part of it (the one its last request held, or a newer
+   * one a start stored whose compile then didn't record), or it opts out
+   * (ModuleContextInjection.placedEachCompile). At a
+   * turn's start or a restart after tool results, that's where `compile()`
+   * would have placed it.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  gatherContext?(agentName: string): Promise<ContextInjection[]>;
+  gatherContext?(agentName: string): Promise<ModuleContextInjection[]>;
 
   /**
    * Called once an agent's tool batch has completed — when the round's last
@@ -303,15 +333,47 @@ export interface ModuleContext {
    * id, and which names the stored row once the write lands
    * (ModuleMessage.held). The writes a process held, and keeps across a
    * restart, show to the next process's modules once create() has restored
-   * them, which is after every module's start(). The write names no agent,
-   * so its row is stamped (`metadata.audience`, #291) for the agents that
-   * take untargeted inbound in the slot it lands in: every resident on a
+   * them, which is after every module's start().
+   *
+   * With `opts.forAgent`, it's added to the named agent's window instead: a
+   * conversation fork's or a running sub-agent's own store, or, for an
+   * ordinary resident, the residents' shared slot. It's held while that
+   * agent's turn is alive, as a write for the primary is while the
+   * primary's is. A name that isn't a registered agent when the write is
+   * made, or the empty name, throws, naming the registered ones, so a write
+   * for a launcher that has gone is heard. For an ephemeral run (a
+   * sub-agent's run) or a conversation fork, whose window nothing reads
+   * after it's released, a write it never read goes to the primary at its
+   * release, as the write itself, through the primary's own delivery. It's
+   * read as the framework reads a notice: once it's below the target's
+   * consumed watermark, which a compile built to send moves when it
+   * commits (a row that compile's strategy left out counts as read too),
+   * and a tool round moves when it injects messages into a stream that
+   * declares it carries them. So one that waited for its target's end (a
+   * run's end, or a fork's last turn), one stored while it was idle and
+   * never sent, one stored at a tool round that ended the turn, and one
+   * injected into a stream that didn't declare it carries injections go to
+   * the primary. The framework's own
+   * writes for a run or a fork are unchanged: they stay in its store,
+   * unless they're notices the primary already takes in their place (a
+   * failed reply, or a channel notice its reader could act on). getMessage,
+   * editMessage and removeMessage read the delivery agent's window (the
+   * primary's, or the first agent's when none is primary): they don't take
+   * an id or handle for a row in a fork's or a sub-agent's window, and don't
+   * find it (read it with queryMessages and the same forAgent). The
+   * residents' shared slot is the primary's window too, for a primary
+   * that's an ordinary resident, so there they do.
+   * `metadata.external` with a target throws: its id map is read in the
+   * primary's window. The row is stamped (`metadata.audience`, #291) for
+   * the agent named, or, with no agent named, for the agents that take
+   * untargeted inbound in the slot it lands in: every resident on a
    * residents' host.
    */
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    opts?: { forAgent?: string },
   ): MessageId;
 
   /**
@@ -357,8 +419,17 @@ export interface ModuleContext {
    * restored them, after every module's start() (addMessage). A message a
    * tune-out holds from the residents is among the rows, marked
    * `heldFromResidents` (ModuleMessage).
+   *
+   * It reads the primary's window (the first registered agent's when none
+   * is primary), or with `opts.forAgent`, the named agent's: a conversation
+   * fork's or a running sub-agent's own store, or, for an ordinary resident,
+   * the residents' shared slot. For the subconscious, it's the
+   * subconscious's own store, not the residents' slot its compile merges
+   * in. A name that isn't a registered agent, or the empty name, throws,
+   * naming the registered ones, so a typo is heard rather than read as an
+   * empty window.
    */
-  queryMessages(filter: MessageQuery): MessageQueryResult;
+  queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult;
 
   /**
    * Get info about all agents.

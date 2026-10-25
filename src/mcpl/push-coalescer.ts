@@ -439,14 +439,20 @@ export function validateCoalescedContent(
 /**
  * Whether the converter (`convertBlock` in convert-block.ts, which every lane
  * uses) shows a block as itself, its text or its image or
- * audio source, or as a reference stub, and not as a placeholder: an
+ * audio source (for MCP's embedded resource, its contents'), or as a
+ * reference stub, and not as a placeholder: an
  * unrecognized block, a no-data or no-media-type one, withheld inline data,
  * or a text block whose text isn't a string. This follows its branches in
  * their order.
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';
-  if (b.type === 'resource' || b.type === 'resource_link') return classifyBlock(b).kind === 'reference';
+  if (b.type === 'resource' || b.type === 'resource_link') {
+    const c = classifyBlock(b);
+    // MCP's embedded resource shows as the block its contents make.
+    if (c.kind === 'embedded') return c.contents.kind === 'block' && showsAsItself(c.contents.block);
+    return c.kind === 'reference';
+  }
   if (b.type !== 'image' && b.type !== 'audio') return false;
   if (isInlineContradiction(b)) return false;
   if (isFilledString(b.uri) && b.disposition !== undefined) return classifyBlock(b).kind === 'reference';
