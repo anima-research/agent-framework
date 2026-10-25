@@ -372,6 +372,45 @@ test('vector 33: a manifest change that removes a toolset closes its instances',
   } finally { await t.done(); }
 });
 
+test('a manifest change that removes a toolset closes each of its open instances', async () => {
+  let advert: Json = ADVERT;
+  const t = await setup((msg, peer, state) => {
+    if (msg.method === 'mcpl/manifest') { peer.reply(msg.id, { version: '0.5', pushEvents: true, ...advert }); return true; }
+    if (msg.method === 'toolsets/open') {
+      const instance = String((msg.params as Json).instance);
+      state.open = [...state.open, { toolset: 'game', instance, title: instance.toUpperCase() }];
+      peer.reply(msg.id, { toolset: 'game', instance, title: instance.toUpperCase(), _meta: { 'mcpl/hints': state.hint([{ name: 'play', instance, visible: true }]) } });
+      return true;
+    }
+    return false;
+  });
+  try {
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game', instance: 'g1' });
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game', instance: 'g2' });
+    advert = { ...ADVERT, toolsets: { build: (ADVERT.toolsets as Json).build } };
+    t.server.peer.notify('mcpl/manifestChanged', { revision: 'r2', domains: ['toolsets'] });
+    await waitFor(() => ['[arc/game:g1] closed', '[arc/game:g2] closed'].every((line) => windowText(t.fw.framework).some((x) => x.includes(line))), 'both closes told');
+    assert.doesNotMatch(await look(t.fw), /\[arc\/game:/);
+  } finally { await t.done(); }
+});
+
+test('a manifest change that withdraws toolHints makes every tool static, and the agent is told', async () => {
+  let advert: Json = ADVERT;
+  const t = await setup((msg, peer) => {
+    if (msg.method === 'mcpl/manifest') { peer.reply(msg.id, { version: '0.5', pushEvents: true, ...advert }); return true; }
+    return false;
+  });
+  try {
+    const listed = () => t.fw.framework.getAllTools().map((x) => x.name);
+    assert.ok(!listed().includes('arc--peek'), 'a dynamic tool, while hints apply');
+    const { toolHints: _withdrawn, toolsets: _gone, ...rest } = ADVERT;
+    advert = rest;
+    t.server.peer.notify('mcpl/manifestChanged', { revision: 'r2', domains: ['toolsets'] });
+    await waitFor(() => windowText(t.fw.framework).some((x) => x.includes('arc no longer presents toolsets: its tools are called directly now, by name, not through toolsets--act.')), 'the withdrawal told');
+    await waitFor(() => ['play', 'place', 'dig', 'peek'].every((tool) => listed().includes(`arc--${tool}`)), 'every tool listed');
+  } finally { await t.done(); }
+});
+
 test('vector 34: a server with toolHints and no declared toolsets states its dynamic tools in toolsets/list', async () => {
   const advert: Json = { toolHints: true, featureSets: ADVERT.featureSets };
   const tools = [TOOLS[0]!, TOOLS[4]!];
