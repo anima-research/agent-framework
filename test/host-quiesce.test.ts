@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1887,6 +1887,28 @@ test('a failed chronicle sync keeps flushed deferred writes in the durable queue
 
 const CRASH_CHILD = fileURLToPath(new URL('./helpers/quiesce-crash-child.js', import.meta.url));
 
+function runCrashChild(
+  storePath: string,
+  mode: string,
+  abort: AbortSignal,
+): Promise<{ status: number | null; signal: NodeJS.Signals | null; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CRASH_CHILD, storePath, mode], { signal: abort, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    let failure: Error | undefined;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', (error) => {
+      failure = error;
+      if (child.pid === undefined) reject(error);
+    });
+    child.on('close', (status, signal) => {
+      if (failure) reject(new Error(`${failure.message} (stderr: ${stderr.slice(-800)})`, { cause: failure }));
+      else resolve({ status, signal, stderr });
+    });
+  });
+}
+
 const CRASH_SCENARIOS = [
   { mode: 'after-ack', label: 'right after the first ack of the resume flush',
     expect: ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], bootQuiesced: true },
@@ -1901,7 +1923,7 @@ const CRASH_SCENARIOS = [
 ] as const;
 
 for (const scenario of CRASH_SCENARIOS) {
-  test(`a REAL process exit ${scenario.label} loses no deferred write and duplicates none`, async () => {
+  test(`a REAL process exit ${scenario.label} loses no deferred write and duplicates none`, async (context) => {
     const dir = mkdtempSync(join(tmpdir(), `host-quiesce-crash-${scenario.mode}-`));
     const storePath = join(dir, 'store');
     const config = () => ({
@@ -1912,11 +1934,8 @@ for (const scenario of CRASH_SCENARIOS) {
     });
     let framework: AgentFramework | null = null;
     try {
-      const child = spawnSync(process.execPath, [CRASH_CHILD, storePath, scenario.mode], {
-        encoding: 'utf8',
-        timeout: 60_000,
-      });
-      assert.equal(child.status, 0, `child staged the crash (stderr: ${child.stderr.slice(-800)})`);
+      const child = await runCrashChild(storePath, scenario.mode, context.signal);
+      assert.equal(child.status, 0, `child staged the crash (signal: ${child.signal}; stderr: ${child.stderr.slice(-800)})`);
 
       const wanted = new Set<string>(scenario.expect);
       const texts = () => framework!.getAgent('agent')!.getContextManager().getAllMessages()

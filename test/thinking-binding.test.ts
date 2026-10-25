@@ -226,7 +226,7 @@ describe('thinkingBinding.dropBlock', () => {
     try {
       for (const [settings, message] of [
         [{ thinkingBinding: { dropBlock: 'true' } }, `Agent "agent" thinkingBinding.dropBlock must be true or false, unquoted, not a string: ${DROP_BLOCK}`],
-        [{ thinkingBinding: true }, 'Agent "agent" thinkingBinding must be an object, such as { dropBlock: true }, not a boolean'],
+        [{ thinkingBinding: true }, 'Agent "agent" thinkingBinding must be an object, such as { binds: true, dropBlock: true }, not a boolean'],
       ] as const) {
         await assert.rejects(createWith(settings), (error: Error) => {
           assert.equal(error.message, message);

@@ -1,8 +1,8 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceBlockForScript, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
-import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
+import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
   writeFileSync,
@@ -115,13 +115,19 @@ import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type Provi
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
+  goesNative,
   nonErrorResultText,
+  nonErrorResultTextOrThrow,
+  isContentArray,
+  resultClaimsOrThrow,
+  scriptViewClaims,
   shownToScript,
   shownToScriptFromServer,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
   type HistoryBlockSpan,
+  type ToolResultBlock,
 } from './tool-result-history.js';
 import {
   TOOL_IMAGE_REF_RE,
@@ -160,7 +166,10 @@ import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
+import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
+import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -341,6 +350,12 @@ const ROUTING_TOOL_NAMED = new RegExp(
  */
 const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUTING_TOOL_NAMED) ?? []);
 
+/** The metadata key on a module's write for an ephemeral run or a
+ *  conversation fork (ModuleContext addMessage's forAgent), whose window
+ *  nothing reads after its release: true, the write goes to the primary, as
+ *  the module wrote it, if its target never read it (passesToPrimary). */
+const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
+
 /**
  * The keys of a stored message's metadata that only the host writes and that
  * some reader takes on its own as what the message is: `system` and `kind`
@@ -350,8 +365,13 @@ const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUT
  * delivery of a coalesced occurrence, `firstView` the coalescer's mark that
  * no version of the message was shown, `deferredWriteId` the landed copy of
  * a deferred write, `external` a module's own row for an outside message,
- * and `openaiResponsesItems` membrane's mark of an imported Responses
- * history. A server's metadata, a channel message's `metadata` or a
+ * `openaiResponsesItems` membrane's mark of an imported Responses
+ * history, `contextInjection` an agent's stored context injection
+ * (stored-injections.ts), which every other agent's view leaves out, and
+ * `primaryIfUnread` a module's write for an ephemeral run or a
+ * conversation fork, which goes to the primary if its target never read it
+ * (passesToPrimary). A
+ * server's metadata, a channel message's `metadata` or a
  * push event's `origin`, is stored without them, and the host writes its own
  * after it: MCPL SPEC §16.6 makes metadata the producer's untrusted claims,
  * which a host may disbelieve. Keys a server writes by protocol, such as
@@ -361,7 +381,7 @@ const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUT
  */
 const HOST_METADATA_KEYS = [
   'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView',
-  'deferredWriteId', 'external', 'openaiResponsesItems', 'callerTurnId',
+  'deferredWriteId', 'external', 'openaiResponsesItems', STORED_INJECTION_KEY, PRIMARY_IF_UNREAD_KEY, 'callerTurnId',
 ] as const;
 
 const CALLER_TURN_KEY = 'callerTurnId';
@@ -419,10 +439,10 @@ function malformedResponseContent(response: EventResponse): { where: string; pla
 
 /**
  * Rough token estimate for the blocks a continuation round is about to
- * append to the live wire (issue #92 physical-window projection): the
- * spilled tool-result strings at chars/4, a flat per-image cost for the
- * native image blocks a tool result carries (provider vision tokens are
- * resolution-dependent; 1600 ≈ one image at Anthropic's largest size), a
+ * append to the live wire (issue #92 physical-window projection): each tool
+ * result's live copy as the request carries it, its text at chars/4 and a
+ * flat per-image cost for its native image blocks (provider vision tokens
+ * are resolution-dependent; 1600 ≈ one image at Anthropic's largest size), a
  * mid-turn message's text at chars/4 and its other blocks about as
  * context-manager's store prices them (injectedBlockTokens), and a small
  * per-block envelope allowance. On membrane's native tool path a mid-turn
@@ -437,19 +457,28 @@ function malformedResponseContent(response: EventResponse): { where: string; pla
  * the cost of underestimating is the 400 this projection exists to prevent.
  */
 function estimateAppendedRoundTokens(
-  toolResults: CompletedToolCall[],
-  spilled: Map<string, { text: string; filePath: string | null }>,
+  toolResults: MembraneToolResult[],
   injections: Array<{ content: ContentBlock[] }>,
 ): number {
   let chars = 0;
   let images = 0;
-  for (const tc of toolResults) {
-    chars += spilled.get(tc.id)?.text.length ?? 0;
-    if (Array.isArray(tc.result.data)) {
-      for (const raw of tc.result.data) {
-        const b = raw as { type?: unknown };
-        if (b && typeof b === 'object' && b.type === 'image') images += 1;
-      }
+  for (const result of toolResults) {
+    // Each result's live copy, read from the copies the round already built
+    // (toMembraneToolResult), so nothing is classified again: its stored
+    // text, where it goes as that, or else its native blocks, each text block
+    // cut at the cap on its own, an embedded resource's among them, and each
+    // image. A result whose links and markers pass the cap goes as its
+    // stored text (goesNative), and its images count as nothing more. These
+    // are the copies before the tool-result guard's, so a result the guard
+    // withholds from the request still counts, an overestimate, as this
+    // projection means to.
+    if (typeof result.content === 'string') {
+      chars += result.content.length;
+      continue;
+    }
+    for (const block of result.content) {
+      if (block.type === 'text') chars += block.text.length;
+      else if (block.type === 'image') images += 1;
     }
   }
   let injectedTokens = 0;
@@ -534,7 +563,7 @@ const SEND_ENGAGEMENT_TOOLS = new Set([
 function extractChannelIdFromToolResult(
   content: Array<{ type: string; text?: string }> | undefined,
 ): string | undefined {
-  const text = content?.find((c) => c.type === 'text' && c.text)?.text;
+  const text = content?.find((c) => c?.type === 'text' && c.text)?.text;
   if (!text) return undefined;
   try {
     const parsed = JSON.parse(text) as { channelId?: unknown };
@@ -546,6 +575,33 @@ function extractChannelIdFromToolResult(
   }
 }
 
+/** A tool result's stored copy as the history path wrote it: its text,
+ *  spilled or cut at the cap, the spill file, and, where its live copy goes
+ *  as native blocks (goesNative), the blocks the text was made from, which
+ *  the live copy is built from (toMembraneToolResult). */
+interface StoredToolResult {
+  text: string;
+  filePath: string | null;
+  live: ToolResultBlock[] | null;
+}
+
+/**
+ * How the host reaches an MCPL server, for fetching its references: the url
+ * it dials the server at, as the transport decides. None for a server the
+ * host spawns, as a stdio server, nor for a WebSocket server whose url the
+ * transport won't dial, which buildWebSocketUrl refuses: one that isn't a
+ * ws:// or wss:// url, or has a fragment.
+ */
+function serverAddressOf(cfg: McplServerConfig): ServerAddress {
+  if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
+  try {
+    buildWebSocketUrl(cfg, null);
+  } catch {
+    return 'no-address';
+  }
+  return { url: cfg.url };
+}
+
 /**
  * The text of an MCPL tools/call result: its text blocks' text, joined by
  * line breaks, with empty ones left out. A text block whose text isn't a
@@ -554,8 +610,10 @@ function extractChannelIdFromToolResult(
  * too, has no text.
  */
 function mcplResultText(content: McpToolResultContent[] | undefined): string {
+  // An element that isn't a block, null among them, has no text: it shows as
+  // its marker where the content is shown block by block.
   return (Array.isArray(content) ? content : [])
-    .filter((c) => c.type === 'text')
+    .filter((c) => c?.type === 'text')
     .map((c) => (typeof c.text === 'string' ? c.text : NON_STRING_TEXT_PLACEHOLDER))
     .filter((text) => text !== '')
     .join('\n');
@@ -707,7 +765,9 @@ import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineTex
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
+import { ToolsetsModule, resolveAct } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -726,7 +786,7 @@ import type {
   ChannelsChangedParams,
   ChannelsIncomingParams,
 } from './mcpl/types.js';
-import type { ContextInjection } from '@animalabs/context-manager';
+import type { ContextInjection, ThinkingBinding } from '@animalabs/context-manager';
 import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
 import { CLOCK_ROW_KIND, clockStampOf, planClock, takesClockBefore } from './clock-rows.js';
 import { firstFreeBranchName } from './branch-names.js';
@@ -922,7 +982,9 @@ type SpillWrite = { path: string; error?: string; branchLeft?: true } | null;
 /** A released agent's window as its pass to the primary reads it
  *  (AgentFramework.releasedWindow). */
 type ReleasedWindow = {
-  unread: MessageMetadata[];
+  /** Each unread message the primary takes in its place, in store order,
+   *  with what it says: a sharded body's shards' content joined. */
+  unread: Array<{ participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
   held: Map<string, { copies: StoredCopy[]; unread: boolean }>;
 };
 
@@ -1137,6 +1199,15 @@ const SCRIPT_CALL_NO_RESULT = new WeakSet<ToolResult>();
  * everyone (checkedToolResult).
  */
 const SCRIPT_RESULT_UNCONVERTIBLE = new WeakMap<ToolResult, unknown>();
+
+/**
+ * The claims of an MCPL peer's blocks as a script's view reads them
+ * (scriptViewClaims), or what stopped their walk, read once at dispatch, by
+ * the content array the result carries: its demand fetch reads them, and the
+ * script lane's reading of the same blocks takes them from here, so the two
+ * read the same claims (Ada-1017, room-203 #201013).
+ */
+const SCRIPT_VIEW_CLAIMS = new WeakMap<object, { claims: ResultClaims } | { error: unknown }>();
 
 /**
  * One logical turn's routing state and receipt tallies
@@ -1690,13 +1761,16 @@ function withoutPrimaryNotices<M extends { content: ContentBlock[] }>(messages: 
  *  sees a fork answer differently from its template has something to check:
  *  the template's thinking blocks, its channel and by-name notices
  *  (primaryNoticeTexts, counting any text block that repeats one word for
- *  word), and the tool blocks the pairing pass dropped (calls
- *  with no result in the seed, results whose call isn't in it).
+ *  word), its stored context injections (stored-injections.ts: compiled
+ *  messages whose stored rows all carry the mark), and the tool blocks the
+ *  pairing pass dropped (calls with no result in the seed, results whose
+ *  call isn't in it).
  *  `withoutReasoning` is the seed without thinking, `withoutNotices` without
  *  those notices too, and `seed` after the pairing pass. */
 function logSeedOmissions(
   fork: string,
   template: string,
+  injections: number,
   compiled: readonly { content: ContentBlock[] }[],
   withoutReasoning: readonly { content: ContentBlock[] }[],
   withoutNotices: readonly { content: ContentBlock[] }[],
@@ -1708,9 +1782,10 @@ function logSeedOmissions(
   const notices = count(withoutReasoning, (b) => b.type === 'text') - count(withoutNotices, (b) => b.type === 'text');
   const calls = count(withoutNotices, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
   const results = count(withoutNotices, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
-  if (thinking + notices + calls + results === 0) return;
+  if (injections + thinking + notices + calls + results === 0) return;
   console.log(
-    `[conversation] ${fork}: seeded from ${template} without ${thinking} thinking block(s), ` +
+    `[conversation] ${fork}: seeded from ${template} without ${injections} stored context injection(s), ` +
+    `${thinking} thinking block(s), ` +
     `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
   );
 }
@@ -2732,10 +2807,18 @@ function channelNoticePassOn(metadata: unknown): ChannelNoticePassOn | null {
 
 /** Whether a notice an agent never read goes to the primary in its place
  *  when the agent ends: a failed reply's, or a channel notice that carries
- *  its inputs, since its reader was told it could act (ChannelNoticePassOn). */
+ *  its inputs, since its reader was told it could act (ChannelNoticePassOn);
+ *  or a module's write for a run or a fork (PRIMARY_IF_UNREAD_KEY), which
+ *  goes as the write itself (noticeForPrimary). */
 function passesToPrimary(metadata: unknown): boolean {
   return (metadata as { kind?: unknown } | null | undefined)?.kind === 'discord-send-failed' ||
-    channelNoticePassOn(metadata) !== null;
+    channelNoticePassOn(metadata) !== null || isPrimaryIfUnread(metadata);
+}
+
+/** Whether a stored message or queued write is a module's write for an
+ *  ephemeral run or a conversation fork (PRIMARY_IF_UNREAD_KEY). */
+function isPrimaryIfUnread(metadata: unknown): boolean {
+  return (metadata as Record<string, unknown> | null | undefined)?.[PRIMARY_IF_UNREAD_KEY] === true;
 }
 
 /** The batched-wake lines a merge of wakes carries (InferenceRequest
@@ -2757,6 +2840,14 @@ function wakeLineKey(line: WakeLine): string {
   return JSON.stringify([eventType, serverId ?? null, channelId ?? null, messageId ?? null, eventId ?? null]);
 }
 
+/** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
+ *  the compiled messages, and whether it has stopped noting. */
+interface StreamRequestNotes {
+  note: (rows: readonly SentRow[]) => boolean;
+  rounds: RoundRow[];
+  stopped: boolean;
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -2775,16 +2866,15 @@ export class AgentFramework {
    * compile does after the select. The agent then changes the messages
    * itself, and the stats come from before that: they count a message it
    * drops, such as one left holding only blank text, and leave out the turns
-   * it adds, such as `[Continue]`, a silent heartbeat's separator and
-   * request-only turns. A later preview or live compile leaves them as they
-   * were.
+   * it adds, such as `[Continue]`, a silent heartbeat's separator,
+   * request-only turns, and the stand-ins `previewActivation` shows for the
+   * `afterUser` injections a start would store (stored-injections.ts). A
+   * later preview or live compile leaves them as they were.
    * They're the object the compile returned, not a copy, so treat them as
    * read-only: a change to them shows in every later read. Null for a request
    * no dry run built, a request that is sent included, and when the agent's
    * strategy records none (of context-manager's own, the autobiographical
-   * strategy and the knowledge strategy built on it do). Null too with
-   * context-manager before 0.20.1, whose compiles carry no render stats: a
-   * host that reads them moves its own context-manager to 0.20.1.
+   * strategy and the knowledge strategy built on it do).
    */
   getRequestCompileStats(request: object): RenderStats | null {
     return dryCompileStatsOf(request);
@@ -3318,6 +3408,14 @@ export class AgentFramework {
    *  publish the call makes is credited with (publishReadThrough). Kept only
    *  while the dispatch runs (dispatchScriptToolCall). */
   private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: { branch: string; sequence: number } | null }>();
+  /** Per agent, the unexpected thinking drops its last operator alert counted (noteThinkingLoss). */
+  private readonly thinkingLossIncidents = new ThinkingLossIncidents();
+  /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
+  private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
+  /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
+   *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
+   *  the blocks themselves, so it goes wherever they go. */
+  private readonly pendingRoundSent = new WeakMap<ContentBlock[], ContentBlock[] | null>();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -3401,6 +3499,10 @@ export class AgentFramework {
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
+  /** MCPL RFC-014: every toolHints server's tool presence, for the
+   *  `toolsets` module's meta-tools and reminders. Made when the first
+   *  server configured with `toolHints: true` is set up; null until then. */
+  private toolsetHub: ToolsetHub | null = null;
   /** Inference routing policy from FrameworkConfig — stored so the MCPL
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
@@ -3487,11 +3589,11 @@ export class AgentFramework {
     // go through pushModuleEvent(), which names the module.
     this.moduleRegistry = new ModuleRegistry(store, { push: (event, moduleName) => this.pushModuleEvent(event, moduleName, false) }, {
       getAgents: () => Array.from(this.agents.values()),
-      addMessage: (p, c, m) => this.addModuleMessage(p, c, m),
+      addMessage: (p, c, m, opts) => this.addModuleMessage(p, c, m, opts),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
-      queryMessages: (filter) => this.queryMessages(filter),
+      queryMessages: (filter, opts) => this.queryMessages(filter, opts),
       pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
@@ -3968,6 +4070,9 @@ export class AgentFramework {
       // settings, and its tool prefix, which mustn't collide with a module
       // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
+      // RFC-014: a server configured with toolHints brings the toolsets
+      // module, whose name no prefix may take either.
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) moduleNames.add(TOOLSETS_MODULE);
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
         assertServerConfigBooleans(serverConfig);
@@ -3990,6 +4095,7 @@ export class AgentFramework {
         prefixesSeen.set(prefix, serverConfig.id);
       }
 
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) await framework.ensureToolsetsModule();
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -4135,6 +4241,11 @@ export class AgentFramework {
     // and withheld spills, closed for the generation a stop ended, are open
     // for this one.
     this.lifecycleGeneration++;
+    // Its servers' addresses, which an earlier stop() took out of the
+    // reference registry, for its stubs.
+    for (const config of this.mcplServerConfigs.values()) {
+      referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+    }
     // A sleep kept through a stop() wakes this lifecycle at its end, or now
     // if it ended while stopped. Before the loop's first pass, so that a wake
     // owed now joins the requests already pending in one turn.
@@ -4582,8 +4693,9 @@ export class AgentFramework {
     // once the host stops, so its pass to the primary runs here, deferred
     // while quiesced like any write, so it waits in the queue with the rest:
     // each notice stored unread in that window that the primary takes in its
-    // place (a failed reply, or a channel notice its reader could act on),
-    // and each such notice still queued for that agent, under its own id,
+    // place (a failed reply, a channel notice its reader could act on, or a
+    // module's write for a run or a fork: passesToPrimary), and each such
+    // notice still queued for that agent, under its own id,
     // unless the agent read a copy of it that landed in its window
     // (passOnFromReleasedWindow). What else was queued for it goes as boot
     // would send it (readdDrained): dropped, logged, since nothing lands
@@ -4653,6 +4765,10 @@ export class AgentFramework {
       shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
     shutdownPromises.push(this.closeModernMcpConnections(teardownTimeoutMs));
+    // A stopped framework's servers' addresses leave the reference registry,
+    // so no other framework's stub reads them and the registry doesn't keep
+    // this one reachable. start() records them again.
+    step(() => { for (const id of this.mcplServerConfigs.keys()) referenceRegistry.forgetServerAddress(id, this); });
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
     for (const result of await Promise.allSettled(shutdownPromises)) {
@@ -6232,18 +6348,8 @@ export class AgentFramework {
         (serverId) => {
           const cfg = this.mcplServerConfigs.get(serverId);
           if (!cfg) return undefined;
-          // A server's address is the url the host dials it at, as the
-          // transport decides: none for a server the host spawns, as a stdio
-          // server, nor for a WebSocket server whose url the transport won't
-          // dial, which buildWebSocketUrl refuses: one that isn't a ws:// or
-          // wss:// url, or has a fragment.
-          if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
-          try {
-            buildWebSocketUrl(cfg, null);
-          } catch {
-            return 'no-address';
-          }
-          return { url: cfg.url, token: cfg.token, autofetch: cfg.autofetch };
+          const address = serverAddressOf(cfg);
+          return address === 'no-address' ? address : { url: address.url, token: cfg.token, autofetch: cfg.autofetch };
         },
         // A null tells the agent only that the payload couldn't be stored;
         // why, which can name the host's paths, goes to the log.
@@ -6275,6 +6381,14 @@ export class AgentFramework {
     return this.referenceFetcherInstance;
   }
 
+  /** Configure an MCPL server: its config, for tool routing and the fetcher,
+   *  which reads a server's address and credential from it, and its address
+   *  in the reference registry, where a reference's stub reads it. */
+  private setMcplServerConfig(config: McplServerConfig): void {
+    this.mcplServerConfigs.set(config.id, config);
+    referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+  }
+
   /** Register every RFC-005 reference in an MCPL peer's tool-result content
    *  against its server, then fetch by `mode`:
    *  - `register`: nothing. An in-process caller (executeMcplToolCall) may
@@ -6284,14 +6398,19 @@ export class AgentFramework {
    *    bound, so fetch_reference can fetch it.
    *  - `model`: eagerly fetch the ones inside the autofetch envelope (below
    *    the eager ceiling, connection origin — never worse than the server
-   *    having inlined the bytes). Failures are non-fatal: the stub then says
-   *    fetch_reference instead of a path.
-   *  - `script`: as `model`, then fetch every reference ("eagerly lazy"): a
+   *    having inlined the bytes, for a reference whose claim is true; a fetch
+   *    it starts stops reading at the first chunk past that ceiling).
+   *    Failures are non-fatal: the stub then says fetch_reference instead of
+   *    a path, and the eager default doesn't choose that reference again.
+   *  - `script`: as `model`, then fetch every reference but a link ("eagerly lazy"): a
    *    script receiving a result is the strongest available signal that the
    *    bytes are wanted (scripts process, they do not browse), so the stub it
    *    receives carries a workspace path it can open directly.
-   *  A uri the result calls expired is fetched in no mode. */
-  private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script'): Promise<void> {
+   *  A uri the result calls expired is fetched in no mode: by its blocks, or
+   *  by `claims` where given, those of everything a script's view of it
+   *  shows (scriptViewClaims), nested fields included, as the module
+   *  route's demand fetch reads them (Ada-1017, room-203 #201013). */
+  private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script', claims?: ResultClaims): Promise<void> {
     if (!Array.isArray(content)) return;
     // Register every block first, then judge each uri once, by its latest
     // record. The registry keys records by uri and evicts the one registered
@@ -6301,23 +6420,36 @@ export class AgentFramework {
     // record here, hence the key by uri. A uri that any of this result's
     // blocks calls expired takes no slot, whichever block registered last. A
     // later result's fresh expiry still supersedes, through register().
-    const byUri = new Map<string, { record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean }>();
+    // A link (MCP's resource_link) is registered, so the agent can fetch it,
+    // but never fetched here: a tool's links are what it offers to follow,
+    // and fetching them would spend the server's fetch budget on bytes
+    // nobody asked for. A uri a link names is fetched only when a block of
+    // the result that isn't a link names it too.
+    const byUri = new Map<string, {
+      record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean; linkOnly: boolean;
+    }>();
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
       const record = referenceRegistry.register(c.testimony, serverId);
-      const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
-      byUri.set(c.testimony.uri, { record, expiredHere });
+      const prior = byUri.get(c.testimony.uri);
+      const expiredHere = prior?.expiredHere === true || isReferenceExpired(c.testimony);
+      const linkOnly = (prior?.linkOnly ?? true) && c.testimony.fromLink === true;
+      byUri.set(c.testimony.uri, { record, expiredHere, linkOnly });
     }
     if (mode === 'register') return;
     const fetcher = this.getReferenceFetcher();
-    const live = [...byUri.values()].filter(({ expiredHere }) => !expiredHere).map(({ record }) => record);
+    const nowMs = Date.now();
+    const live = [...byUri.values()]
+      .filter(({ record, expiredHere, linkOnly }) => !expiredHere && !linkOnly
+        && (claims === undefined || Boolean(record.fetchedPath) || claimedExpiry(record, claims, nowMs) === null))
+      .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
     const eligible = live.filter((record) => fetcher.isEagerEligible(record));
     await Promise.all(eligible.slice(0, MAX_EAGER_PER_RESULT).map(async (record) => {
-      const outcome = await fetcher.fetch(record, { timeoutMs: EAGER_FETCH_TIMEOUT_MS });
+      const outcome = await fetcher.fetchEager(record);
       if (!outcome.ok) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
     }));
     if (mode !== 'script') return;
@@ -7527,8 +7659,8 @@ export class AgentFramework {
     try {
       // The windows of forks and runs deregistered during the window are
       // released first, each landing its queued writes and passing on its
-      // unread failed replies, and the channel notices it could act on, as at
-      // any release. Then flush context writes
+      // unread failed replies, the channel notices it could act on, and a
+      // run's unread module writes, as at any release. Then flush context writes
       // deferred by the quiesce window (module events, api message.send) —
       // with no turn alive there is no other flush point. The batch is
       // stored in queue order and acknowledged once, after the chronicle
@@ -7602,8 +7734,9 @@ export class AgentFramework {
     this.handOffDeferredWrites(flush);
     // A write for a target no longer registered, such as a fork or a run gone
     // before a crash that left it to boot recovery, goes as readdDrained
-    // sends it: a failed reply, or a channel notice its reader could act on,
-    // to the primary, anything else dropped, logged.
+    // sends it: a failed reply, a channel notice its reader could act on, or
+    // a module's write for a run or a fork, to the primary (passesToPrimary),
+    // anything else dropped, logged.
     const stored = this.readdDrained(flush, `host-mode ${label}`).length;
     // Ack = sync the chronicle FIRST, then rewrite the durable queue without
     // the batch. Never the other way round.
@@ -8292,10 +8425,9 @@ export class AgentFramework {
    * delegates to `Agent.buildActivationRequest`. No tokens are spent, no
    * external MCPL server is contacted, no fold resolution is persisted and
    * none of the compression its fold plan calls for is queued; the consumed
-   * watermark and any prepared budget change are left alone; and once
-   * context-manager's thinking binding (context-manager#160, not yet
-   * released) ships, no stamps are committed and no compile awaits
-   * acceptance. In context-manager 0.14 its dry run leaves nothing else
+   * watermark and any prepared budget change are left alone; and with the
+   * thinking binding (`thinkingBinding.binds`), no binding record is
+   * written. In context-manager 0.14 its dry run leaves nothing else
    * behind but the release of an expired compression hold, as any compile
    * does (see `Agent.compileWithInjections`). The preview keeps in-memory
    * bookkeeping of its own, such as handing the context manager the
@@ -8321,9 +8453,16 @@ export class AgentFramework {
    *
    * Pass `{ injections: true }` to opt into full-fidelity gathering and accept
    * those side effects (byte-faithful to a real activation's injected context).
+   * An `afterUser` injection a start would store (stored-injections.ts) is
+   * shown where that start's compile would render it, and one it would skip
+   * isn't shown again; nothing is stored. The stand-in isn't weighed against
+   * the budget or shaped as the stored row would be, so where the strategy
+   * would cap, shard or leave out rows to fit it, the start's request
+   * differs from the preview.
    *
    * What the dry compile selected, by kind, is `getRequestCompileStats` of the
-   * request this returns.
+   * request this returns. It doesn't count the stand-in, which is added after
+   * the compile.
    */
   async previewActivation(
     agentName: string,
@@ -8385,8 +8524,21 @@ export class AgentFramework {
       }
     }
 
+    // What a start would store (storeInjections) is appended after the
+    // compile, as the start would have stored it before its compile, and
+    // what it would skip, being in view already, isn't placed. While the
+    // window is held, the start would have compile() place what it would
+    // store, and so does the preview. Nothing is stored: a preview writes no
+    // row. Its stand-in rows aren't weighed against the budget, as stored
+    // rows are at the next compile.
+    const plan = this.planInjectionStores(agent, injections);
+    const held = plan !== undefined && this.slotHeldFrom(agent);
+    const placed = new Set(plan ? (held ? [...plan.leftAt, ...plan.rows.map((row) => row.at)] : plan.leftAt) : []);
     return capture(await agent.buildActivationRequest(
-      tools, injections, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+      tools, plan ? (injections ?? []).filter((_, at) => placed.has(at)) : injections, opts?.budget, presentation?.available ?? tools, {
+        dryRun: true,
+        ...(plan && !held ? { appendedMessages: plan.rows.map(({ participant, content }) => ({ participant, content })) } : {}),
+      },
     ));
   }
 
@@ -8426,10 +8578,13 @@ export class AgentFramework {
       previewContext?: (
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean },
+        opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
       ) => unknown;
     };
     if (typeof cm.previewContext !== 'function') return null;
+    // A preview prices what the agent's compile would send, so it's told the binding a compile is (a context
+    // manager that keeps a thinking-binding record prices a summary's carriers by it).
+    const thinkingBinding = agent.thinkingBindingOption();
     // reserveForResponse mirrors the live compile so the previewed middle is
     // comparable to what the agent actually gets. `opts.render` additionally
     // returns the rendered entries — opt-in, since they are megabytes on a
@@ -8437,7 +8592,7 @@ export class AgentFramework {
     return cm.previewContext(
       { maxTokens: budgetTokens, reserveForResponse: agent.maxTokens },
       overrides,
-      opts,
+      thinkingBinding ? { ...opts, thinkingBinding } : opts,
     );
   }
 
@@ -9436,7 +9591,8 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
-        // Its sleep and self-wake end with it, as a fork's do.
+        this.thinkingLossIncidents.forget(agent.name);
+        // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
       }
@@ -12263,7 +12419,11 @@ export class AgentFramework {
       // the timeline (KV-prefix-stable delivery). The stored originals
       // remain in the shared slot for the subconscious's merged view,
       // fetch_history, and audit.
-      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut,
+      // Another agent's stored context injections (stored-injections.ts) are
+      // that agent's context, not conversation: they stay out of this view,
+      // and so out of its folds, as the residents share this slot.
+      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut
+        && !isAnotherAgentsInjection(message.metadata, config.name),
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -12336,9 +12496,13 @@ export class AgentFramework {
       store: this.store,
       namespace: `subconscious/${primaryName}`,
       isolate: true,
-      // The residents' shared un-namespaced slot, merged read-only and
-      // UNfiltered (no viewFilter here — stamped messages included).
+      // The residents' shared un-namespaced slot, merged read-only, with the
+      // tune-out's stamped messages included. The filter, which context-
+      // manager applies to the merged view too, leaves out only the
+      // residents' stored context injections (stored-injections.ts): their
+      // context, which this agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
+      viewFilter: (message) => !isAnotherAgentsInjection(message.metadata, name),
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -12588,14 +12752,16 @@ export class AgentFramework {
           // Flush pending assistant blocks (tool_use + preamble text) to context
           const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
           const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
+          let replyId: MessageId | undefined;
           if (pendingBlocks) {
-            agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
+            replyId = agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
             this.pendingAssistantBlocks.delete(agent.name);
           }
+          const replySent = pendingBlocks ? this.pendingRoundSent.get(pendingBlocks) : undefined;
           const membraneResults = currentState.toolResults.map(tc =>
-            this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
+            this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id), tc.name)
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
+          const resultsId = agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
           // Flush any messages that were deferred while this turn was in
           // flight: this agent's own entries, those addressed to it and, for
@@ -12666,7 +12832,7 @@ export class AgentFramework {
           // Everything queued for the agent waits for the turn-end flush, as
           // a held message does, rather than sitting in the window between
           // rounds the stream never showed it.
-          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
+          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
           // What this boundary stored for the agent to hear, in store order,
           // for a boundary that leaves it to the turn's next start as
           // arrivals: that start's compile sends it.
@@ -12736,12 +12902,13 @@ export class AgentFramework {
             // stand in for it, or the anchor be past it, and then it goes in
             // where the next compile doesn't send it.
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
-            if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata });
+            if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
               midTurnInjections.push({
                 participant: h.msg.participant,
                 content: asSent(i + first, h.content),
                 ...(h.msg.metadata ? { metadata: h.msg.metadata } : {}),
+                id: h.id,
               });
             });
           }
@@ -12782,8 +12949,13 @@ export class AgentFramework {
           // Check if any tool result requested endTurn
           const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
 
-          // Check if accumulated input tokens exceed the agent's budget
+          // Check if accumulated input tokens exceed the agent's budget. Not for an agent whose model binds its
+          // thinking with its window size set (thinkingBinding.binds, physicalWindowTokens): a new stream mid-turn
+          // compiles afresh, and what that compile changes ahead of the turn's own earlier rounds takes their
+          // reasoning out of the request mid-step. The window projection below still breaks the stream before a
+          // request the window can't hold (issue #92).
           const overBudget = currentState.stream
+            && !(agent.thinkingBindingOption() !== undefined && agent.physicalWindowTokens !== undefined)
             && agent.lastStreamInputTokens > 0
             && agent.lastStreamInputTokens > agent.maxStreamTokens;
 
@@ -12811,7 +12983,7 @@ export class AgentFramework {
             ? agent.lastStreamRealInputTokens
               + agent.lastStreamOutputTokens
               + agent.lastStreamUnreportedTokens
-              + estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections)
+              + estimateAppendedRoundTokens(membraneResults, midTurnInjections)
               + agent.maxTokens
             : 0;
           const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
@@ -12903,6 +13075,11 @@ export class AgentFramework {
             for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
           }
 
+          // A boundary that ends the stream (a result that ends the turn, a restart, a stopping framework) has
+          // stored the stream's last reply above: its final row. Its results go nowhere this stream sends.
+          if (currentState.stream && (shouldEndTurn || overBudget || overPhysical)) {
+            this.noteStreamEnd(agent, currentState.stream, { kind: 'reply', id: replyId, sent: replySent ?? [] }, replySent == null);
+          }
           if (shouldEndTurn) {
             // endTurn: what this boundary stored stays; cancel stream, reset to idle.
             // The batch is never submitted, so nothing can refuse it: admit
@@ -12980,7 +13157,7 @@ export class AgentFramework {
             // call reports no prompt, the next boundary projects it from the
             // growth since the last call that did.
             if (agent.physicalWindowTokens !== undefined) {
-              agent.lastStreamUnreportedTokens += estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections);
+              agent.lastStreamUnreportedTokens += estimateAppendedRoundTokens(membraneResults, midTurnInjections);
             }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
@@ -12994,11 +13171,19 @@ export class AgentFramework {
             // keeps them, whether it's a heard message, rendered or not, or a
             // notice the boundary made: this is where they leave for the
             // request.
+            const submitted = agent.toolResultGuard.submissionResults(membraneResults);
+            const injectedMessages = midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) }));
+            // Before the round's reply exists, so the reply that comes next is the reply to this request.
+            this.noteRoundSent(agent, currentState.stream, [
+              { kind: 'reply', id: replyId, sent: replySent ?? [] },
+              { kind: 'results', id: resultsId, sent: submitted },
+              ...midTurnInjections.map((injection, i) => ({
+                kind: 'injected' as const, id: injection.id, participant: injectedMessages[i]!.participant, sent: injectedMessages[i]!.content,
+              })),
+            ], replySent === null || replySent === undefined);
             currentState.stream.provideToolResults(
-              agent.toolResultGuard.submissionResults(membraneResults),
-              midTurnInjections.length > 0
-                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) })) }
-                : undefined,
+              submitted,
+              midTurnInjections.length > 0 ? { injectedMessages } : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
             // is assembly too when the stream carries the injected messages
@@ -13020,9 +13205,11 @@ export class AgentFramework {
             // carried, such as another slot's messages, and a write that
             // bypassed deferral into this slot (a fresh tool_result, a
             // routed channel message). That over-cover can't be left out.
-            // Under context-manager#160 such a write already gives the
-            // replies stored after it stamps their requests didn't carry,
-            // whatever the mark says; deferring those writers is the fix.
+            // Under a context manager's thinking-binding record
+            // (`thinkingBinding.binds`), such a write sits in the next
+            // compile where the stream's notes named other rows, so the
+            // replies after it go without their thinking, whatever the mark
+            // says; deferring those writers is the fix.
             if (midTurnInjections.length > 0) {
               // Possibly shown, whatever the stream declares: the first-view
               // mark (CoalescerHost.isUnshown) counts a doubt as shown.
@@ -13656,8 +13843,8 @@ export class AgentFramework {
       // Both compiles are dry runs: neither is sent, and the template's runs
       // while the template may be mid-stream, where a committing compile
       // would commit fold resolutions and queue the compression its fold plan
-      // calls for (and, once context-manager's thinking binding ships, fence
-      // its stream's replies). In context-manager 0.14 a dry run leaves
+      // calls for. These compiles carry no thinking binding, so they'd write
+      // no binding record either way. In context-manager 0.14 a dry run leaves
       // nothing else behind but the release of an expired compression hold
       // (see Agent.compileWithInjections), so the template's request in
       // flight keeps its calibration estimate.
@@ -13703,13 +13890,24 @@ export class AgentFramework {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
-        const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
+        const { messages: compiledWhole, provenance } = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const templateRows = template.getContextManager().getAllMessages();
+        // The template's stored context injections (stored-injections.ts) are
+        // its context, not the conversation, so the seed leaves them out, as
+        // it had none before they were stored: a compiled message whose
+        // stored rows are all marked as injections, by the compile's own
+        // account of where each message came from.
+        const injectionRows = new Set(templateRows.filter((m) => storedInjectionMarkOf(m.metadata)).map((m) => m.id));
+        const compiled = compiledWhole.filter((_, i) => {
+          const source = provenance?.messages[i];
+          return !(source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId)));
+        });
         const withoutReasoning = withoutThinking(compiled);
         const withoutNotices = withoutPrimaryNotices(
-          withoutReasoning, primaryNoticeTexts(template.getContextManager().getAllMessages()));
+          withoutReasoning, primaryNoticeTexts(templateRows));
         const seed = stripUnpairedToolBlocks(withoutNotices);
-        logSeedOmissions(name, template.name, compiled, withoutReasoning, withoutNotices, seed);
+        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -13854,8 +14052,9 @@ export class AgentFramework {
    * and keeping the agent registered would just grow every agent scan and
    * broadcast filter forever. Its window is released now, or, while the host
    * is quiesced, at resume (releaseWindowNowOrAfterResume); when stop() ends
-   * it then, stop()'s pass for postponed releases passes on the failed
-   * replies it left unread instead. No binding names it
+   * it then, stop()'s pass for postponed releases passes on what it left
+   * unread that the primary takes in its place instead (passesToPrimary:
+   * failed replies, channel notices, module writes). No binding names it
    * by then: the idle sweep unbinds its channel as the closure begins,
    * stop() unbinds it just before it ends the fork, and a spawn whose fork
    * stop() has ended binds nothing (spawnConversationAgent). The fork's
@@ -13885,8 +14084,8 @@ export class AgentFramework {
     this.activeStreams.delete(agentName);
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
-    // Its sleep and self-wake end with it (the gate's sleep holds back every
-    // agent's wakes), and neither wake goes to a name that's gone.
+    this.thinkingLossIncidents.forget(agentName);
+    // Its pending self-wake ends with it, rather than wake a name that's gone.
     this.eventGate?.agentGone(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
@@ -16858,6 +17057,135 @@ export class AgentFramework {
   }
 
   /**
+   * Store `agent`'s `afterUser` injections in its own window, as the
+   * messages `compile()` would have placed after the last user message, and
+   * return the injections left for `compile()` to place: the rest, and any
+   * that couldn't be stored (stored-injections.ts, #155 part 5). Which are
+   * stored, and which skipped, is planInjectionStores'.
+   *
+   * Nothing is stored while the window is held (slotHeldFrom: the host is
+   * quiesced, or another reader of the residents' shared slot has a turn
+   * alive, as for a clock row): `compile()` places what the plan would have
+   * stored, and what it skips, being in view already, isn't placed again.
+   * Rows are written in the order gathered. A row whose write throws is
+   * placed by `compile()` instead, with every row after it, unless the
+   * read-back shows it landed; where the read-back fails, a row whose write
+   * returned counts as landed and the rest are placed, so the request may
+   * carry a landed one twice, which is logged as unknown.
+   */
+  private storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined {
+    const plan = this.planInjectionStores(agent, injections);
+    if (!plan) return injections;
+    // By position, as the plan is: what compile() places, in the order given.
+    const placed = new Set<number>(plan.leftAt);
+    if (this.slotHeldFrom(agent)) {
+      for (const row of plan.rows) placed.add(row.at);
+    } else {
+      const cm = agent.getContextManager();
+      const before = this.storedCountOf(agent);
+      const key = (mark: { namespace: string; contentHash: string; part: number }) => `${mark.namespace}\0${mark.contentHash}\0${mark.part}`;
+      const traced = new Set<string>();
+      try {
+        for (const row of plan.rows) {
+          const id = cm.addMessage(row.participant, row.content, {
+            system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: row.mark,
+          } as MessageMetadata);
+          traced.add(key(row.mark));
+          this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.mark.namespace}` });
+        }
+      } catch (err) {
+        // A write can throw after its row landed, as storeDueClock's can: the
+        // rows that landed stay where they are, and compile() places the rest.
+        const wanted = new Set(plan.rows.map((row) => key(row.mark)));
+        const markOf = new Map<MessageId, StoredInjectionMark>();
+        const landed = before === undefined ? undefined : this.storedSince(agent, before, (m) => {
+          const mark = storedInjectionMarkOf(m.metadata);
+          if (!mark || mark.agent !== agent.name || !wanted.has(key(mark))) return false;
+          markOf.set(m.id, mark);
+          return true;
+        }, 'injection', 'the injection writes');
+        const kept = new Set(traced);
+        for (const copy of landed ?? []) {
+          const mark = markOf.get(copy.id)!;
+          kept.add(key(mark));
+          if (!traced.has(key(mark))) {
+            traced.add(key(mark));
+            this.emitTrace({ type: 'message:added', messageId: copy.id, source: `context-injection:${mark.namespace}` });
+          }
+        }
+        const rest = plan.rows.filter((row) => !kept.has(key(row.mark)));
+        for (const row of rest) placed.add(row.at);
+        console.error(`[injection] ${agent.name}: a write threw with ${plan.rows.length - rest.length} of ${plan.rows.length} injection row(s) stored${landed ? '' : ' (whether the one that threw landed is unknown)'}, and compile() places the rest:`, err);
+      }
+    }
+    const left = (injections ?? []).filter((_, at) => placed.has(at));
+    return left.length > 0 ? left : undefined;
+  }
+
+  /**
+   * Which of `injections` a start stores in `agent`'s window, and which it
+   * leaves for `compile()`. Each source's stored kind (isStoredKind), by
+   * namespace, is one unit. A unit is skipped, neither stored nor placed,
+   * when the copy the agent will read as that namespace's current one has
+   * every part of it with the same content: the newest copy this agent
+   * stored since its last request compiled to send, where a start stored one
+   * and its compile then didn't record, as when it threw
+   * (Agent.unsentInjection), and otherwise the
+   * newest stored unit of that namespace the last request held
+   * (Agent.renderedInjection). It's where the agent saw it, or will see it
+   * at this compile, and placing it again would move it; a fold or scroll-out
+   * since costs one request, as below. A part the strategy cut at its
+   * per-message cap, or stripped an image from, counts as held, since a new
+   * copy would meet the same. One a fold has summarized, a strategy's window
+   * has scrolled past, a throwing write left part-stored, or that no request
+   * since this agent started has held (and no failed start since has
+   * stored), is stored again at the next start,
+   * so the agent has the current copy at the cost of one more row: a fold
+   * between two starts leaves the request after it with the summary's word,
+   * and the start after that stores it again. The rows to store come in the order gathered,
+   * as `compile()` would have placed them. A stored row is appended, so
+   * where the window ends on a user message (a turn's start, a restart
+   * after tool results) it lands where `compile()` would have placed it;
+   * where it ends on the agent's latest reply (a wake with nothing new), it
+   * lands after that reply, where `compile()` placed it after the last user
+   * message, before the reply, or at the end when there was none.
+   * Undefined when there's nothing of the stored kind.
+   */
+  private planInjectionStores(
+    agent: Agent,
+    injections: ContextInjection[] | undefined,
+  ): {
+    rows: Array<{ at: number; participant: string; content: ContextInjection['content']; mark: StoredInjectionMark }>;
+    leftAt: number[];
+  } | undefined {
+    // By position, not identity: a source can give the same object twice.
+    const given = injections ?? [];
+    const stored = given.map((injection) => isStoredKind(injection) && hasRenderedContent(injection.content));
+    if (!stored.includes(true)) return undefined;
+    const asRows = given.flatMap((injection, at) => (stored[at] ? [{ at, ...asStoredRow(injection) }] : []));
+    const units = new Map<string, typeof asRows>();
+    for (const row of asRows) units.set(row.namespace, [...(units.get(row.namespace) ?? []), row]);
+    const marks = new Map<number, StoredInjectionMark>();
+    for (const [namespace, unit] of units) {
+      const contentHash = unitHash(unit);
+      // A copy a start stored whose compile then didn't record (it threw, or
+      // the start failed before it) is newer than what the last request
+      // held, and no request has sent it yet, so it decides: a retry of that
+      // start (an error policy's) doesn't store it again, one more copy at
+      // each attempt, and content that changed back while a compile failed
+      // is stored again rather than left older than it.
+      const newest = agent.unsentInjection(namespace) ?? agent.renderedInjection(namespace);
+      if (newest?.whole && newest.contentHash === contentHash) continue;
+      unit.forEach((row, part) => marks.set(row.at, { agent: agent.name, namespace, contentHash, part, parts: unit.length }));
+    }
+    return {
+      rows: asRows.filter((row) => marks.has(row.at))
+        .map(({ participant, content, at }) => ({ at, participant, content, mark: marks.get(at)! })),
+      leftAt: given.flatMap((_, at) => (stored[at] ? [] : [at])),
+    };
+  }
+
+  /**
    * Whether a write the framework makes into `agent`'s window of its own
    * accord (a clock row, a batched wake's line) waits: while the host is
    * quiesced, or, for a reader of the residents' shared slot (the
@@ -16868,6 +17196,9 @@ export class AgentFramework {
   private slotHeldFrom(agent: Agent): boolean {
     return this.quiesced || this.sharedSlotBusy(agent);
   }
+
+  /** Rows isNewestIn reads back past clock rows and stored injections. */
+  private static readonly NEWEST_SCAN_ROWS = 32;
 
   /** Rows a window's last-clock scan reads at a time. */
   private static readonly CLOCK_SCAN_ROWS = 256;
@@ -16983,7 +17314,7 @@ export class AgentFramework {
     routing: TurnRouting,
     channel: ChannelRef,
     cause: string,
-  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; id: MessageId } | undefined {
     if (sameChannel(routing.locus, channel)) return undefined;
     const prevPin = routing.locus ?? null;
     routing.locus = channel;
@@ -17005,7 +17336,7 @@ export class AgentFramework {
       this.lastAnnouncedLocus.set(agent.name, channel);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       console.error(`[routing] ${agent.name}: ${cause} re-pin ${prevPin ? qualifiedChannelName(prevPin) : '(none)'} -> ${qualifiedChannelName(channel)}`);
-      return { participant: 'user', content, metadata };
+      return { participant: 'user', content, metadata, id };
     } catch (err) {
       console.error('turn locus re-pin: failed to record routing notice:', err);
       return undefined;
@@ -19325,6 +19656,15 @@ export class AgentFramework {
       // Both produce ContextInjection[] that get merged before inference.
       let injections: ContextInjection[] | undefined;
 
+      // RFC-014 §8.3: each compile this agent sends says which open
+      // toolsets' announcements it still carries; the toolsets module's
+      // gatherContext reminds it of those that left.
+      if (this.toolsetHub && !agent.onCompiledToSend) {
+        const hub = this.toolsetHub;
+        const name = agent.name;
+        agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
+      }
+
       // Module gatherContext (fail-open, per-module timeout — the module's
       // contextTimeoutMs, else the registry default). Injections are
       // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
@@ -19394,18 +19734,31 @@ export class AgentFramework {
         }
       }
 
+      // Each afterUser injection is appended to the agent's window, so it
+      // stays where it's first seen (stored-injections.ts), unless the copy
+      // the agent will read as current already has its content whole (what its
+      // last request held, or a newer copy a start stored whose compile then
+      // didn't record), when it's left out; the rest go to compile(), as do those
+      // it would store while the window is held.
+      injections = this.storeInjections(agent, injections);
+
       const {
         stream,
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
         continuePrompt,
+        placeDrops,
+        thinkingRecordedAfter,
+        noteRequestSent,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
         // membrane's inside each attempt.
         membraneRetries: false,
       });
+      // Each later round this stream sends is noted as it goes (noteRoundSent).
+      if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -19509,6 +19862,7 @@ export class AgentFramework {
         takeKvSubmission,
         drainKvSubmissionIds,
         new Set(tools.map((tool) => tool.name)),
+        placeDrops ? { place: placeDrops, ...(thinkingRecordedAfter !== undefined ? { recordedAfter: thinkingRecordedAfter } : {}) } : undefined,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -19669,6 +20023,9 @@ export class AgentFramework {
     takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined,
     drainKvSubmissionIds?: () => string[],
     knownToolNames: ReadonlySet<string> = new Set(),
+    /** Where each block a call reports the provider dropped came from, and the compile's thinking-binding
+     *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
+    thinkingDrops?: StreamThinkingDrops,
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     const startTime = Date.now();
@@ -20287,6 +20644,9 @@ export class AgentFramework {
             assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
+            this.pendingRoundSent.set(assistantBlocks, roundContent && roundContent.length > 0
+              ? roundContent.filter((b) => b.type !== 'tool_result')
+              : null);
 
             // Note: max_tokens truncation cannot produce tool-calls events here.
             // The membrane only yields 'tool-calls' when stop_reason is 'tool_use'
@@ -20651,8 +21011,11 @@ export class AgentFramework {
               // Flush pending assistant blocks
               const pending = this.pendingAssistantBlocks.get(agent.name);
               if (pending) {
-                agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
+                const pendingId = agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
                 this.pendingAssistantBlocks.delete(agent.name);
+                const pendingSent = this.pendingRoundSent.get(pending);
+                // The stream's last reply, stored: its final row.
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: pendingId, sent: pendingSent ?? [] }, pendingSent == null);
               }
               // Store tool results — same bounded spill policy as the
               // ordinary path (issue #89: this guard path must not become the
@@ -20667,7 +21030,7 @@ export class AgentFramework {
                   bound,
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
-                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
+                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id), tc.name)), readyState.toolResults,
                   this.silentTurnRowMetadata(agent.name), keptCap);
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
@@ -20688,10 +21051,9 @@ export class AgentFramework {
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
             );
-            const terminalContent = stampThinkingTokenEstimates(
-              lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content,
-              outputTokensSinceStamp,
-            );
+            // What membrane returned of the last reply, beside the stamped copy the store keeps.
+            const terminalSent = lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content;
+            const terminalContent = stampThinkingTokenEstimates(terminalSent, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
@@ -20717,12 +21079,19 @@ export class AgentFramework {
               console.error(
                 `[tool-boundary] ${agent.name}: contained whole-response prose wrapper for registered tool ${guardedWrapperTool}; no tool called`,
               );
+              // A system row stands where the reply would be: the stream's reply isn't stored as returned.
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: undefined, sent: terminalSent }, false);
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+              } else {
+                // Nothing after the last results: the rows are judged as of now, the last batch settled.
+                this.noteStreamEnd(agent, stream, undefined, false);
               }
             } else {
-              agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
@@ -21524,6 +21893,11 @@ export class AgentFramework {
             const thinkingReport = event.round?.thinking;
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             if (thinkingDropped) thinkingDroppedInStream = true;
+            // Against the branch's binding record, when the context manager keeps one: a drop it can't account
+            // for tells the operators (noteThinkingLoss), and a call with no report shows no such drop.
+            if (thinkingDrops?.recordedAfter !== undefined) {
+              this.noteThinkingLoss(agent.name, thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], thinkingDrops.recordedAfter);
+            }
             try {
               if (!thinkingDroppedInStream) {
                 strat?.reportRealInputTokens?.(
@@ -22138,6 +22512,18 @@ export class AgentFramework {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
 
+    // RFC-014: toolsets--act, resolved to the dynamic tool it calls, goes
+    // where a programmatic call of that tool goes, with its instance.
+    if (call.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const target = this.resolveToolsetAct(call);
+      if (!target.ok) return { success: false, error: target.error, isError: true };
+      if (origin.kind === 'agent') {
+        const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
+        if (failure) return failure;
+      }
+      return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
+    }
+
     // MCPL tools go where the model's own call of the name goes, by the same
     // resolver and with the prefix it matched: to the server whose listing
     // offers the name, else the longest matching prefix.
@@ -22185,7 +22571,74 @@ export class AgentFramework {
     return this.moduleRegistry.handleToolCall(call);
   }
 
-  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
+  /**
+   * RFC-014: the calls toolsets--act resolved to a server's dynamic tool,
+   * with the instance each is for (`_meta["mcpl/instance"]`, §5.5). The MCPL
+   * dispatch paths read it: such a call isn't refused as a dynamic tool
+   * called by name, and carries its instance. Nothing else about it differs
+   * from a direct call of the tool. Created on first use, so a framework
+   * assembled field by field (as unit tests do) needs no setup for it.
+   */
+  private toolsetActCalls?: WeakMap<ToolCall, { instance?: string }>;
+
+  /** A toolsets--act call resolved (resolveAct) to the call of the server's
+   *  tool it makes, under that tool's model-facing name and with its
+   *  arguments, its id kept; or the reason it can't be sent. */
+  private resolveToolsetAct(call: ToolCall): { ok: true; call: ToolCall; serverId: string; prefix: string; instance?: string } | { ok: false; error: string } {
+    const target = resolveAct(this.toolsetHub!, call.input);
+    if (!target.ok) return target;
+    const prefix = this.mcplServerConfigs.get(target.serverId)?.toolPrefix ?? `mcpl--${target.serverId}`;
+    const inner: ToolCall = { ...call, name: `${prefix}--${target.tool}`, input: target.args };
+    (this.toolsetActCalls ??= new WeakMap()).set(inner, target.instance !== undefined ? { instance: target.instance } : {});
+    return { ok: true, call: inner, serverId: target.serverId, prefix, ...(target.instance !== undefined ? { instance: target.instance } : {}) };
+  }
+
+  /**
+   * RFC-014 §8.2: a toolsets--act call from the agent (the model's, or a
+   * script's) goes down the path a direct call of the server's tool takes
+   * (dispatchMcplToolCall): its agent's allowedTools, the server's tool
+   * policy, the state exchange, RFC-005's reading of the result, the tool
+   * change shown after it, and RFC-007's lifecycle, which describes the call
+   * as that tool, with its arguments, before it opens. Only
+   * `_meta["mcpl/instance"]` is added. A call act can't resolve is refused
+   * before anything is sent.
+   */
+  private dispatchToolsetAct(agentName: string, call: ToolCall): void {
+    const target = this.resolveToolsetAct(call);
+    if (!target.ok) {
+      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: target.error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: TOOLSETS_MODULE,
+        result: this.refusedResult(agentName, call.id, target.error),
+      });
+      return;
+    }
+    const refusal = this.agentToolPermissionFailure(agentName, target.call);
+    if (refusal) {
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal });
+      return;
+    }
+    this.toolLifecycleEmitter?.retarget(agentName, call.id, target.call);
+    this.dispatchMcplToolCall(agentName, target.call, target.serverId, target.prefix);
+  }
+
+  /**
+   * RFC-014 §6.2: a tool result that goes to the agent, with the tool change
+   * its hints made (applied as the result was read) told after the server's
+   * content; taking it means it isn't told again as a notice. The result
+   * itself when there's none, as for every server without toolHints.
+   */
+  private withToolsetChange<R extends { content?: unknown }>(serverId: string, result: R): R {
+    const change = this.toolsetHub?.get(serverId)?.changeText(result) ?? '';
+    if (!change) return result;
+    return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: change }] };
+  }
+
+  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as
+   *  resolveMcplTool matched them, or as toolsets--act resolved them
+   *  (toolsetActCalls). Its RFC-014 tool change isn't shown with its result,
+   *  which goes to its caller, not necessarily to the agent: it's told as a
+   *  notice (ToolsetController.tellUnlessClaimed). */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized, so the call didn\'t run', isError: true };
@@ -22200,9 +22653,16 @@ export class AgentFramework {
     if (!isToolAllowed(toolName, config)) {
       return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
+    // RFC-014: a dynamic tool is called through toolsets--act, which marks
+    // the call it resolved (toolsetActCalls) with the instance it's for.
+    const act = this.toolsetActCalls?.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) return { success: false, error: dynamicRefusal, isError: true };
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     try {
-      const result = modern ? await modern.callTool(toolName, args) : await server!.sendToolsCall(toolName, args);
+      const result = modern
+        ? await modern.callTool(toolName, args)
+        : await server!.sendToolsCall(toolName, args, undefined, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined);
       // A server's error is a failure here too, as the model's dispatch
       // reads it: its text (mcplToolFailure), without its other blocks, and
       // its structured content, kept by presence. A success is the server's
@@ -22220,10 +22680,12 @@ export class AgentFramework {
       // agent's own fetch_reference needs, on bytes nobody asked for. A
       // failure keeps only its text, so no stub is made of its references and
       // they aren't registered. Only an MCPL peer's blocks are references; a
-      // modern server's and an MCP-only peer's are standard.
+      // modern server's and an MCP-only peer's are standard. An MCPL peer's
+      // content is marked as content (dataIsContent), as on the model's path.
       if (server && server.capabilities !== null) {
         await this.autoFetchReferences(result.content, serverId, 'register')
           .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
+        return Array.isArray(direct.data) ? { ...direct, dataIsContent: true } : direct;
       }
       return direct;
     } catch (err) {
@@ -22617,12 +23079,12 @@ export class AgentFramework {
     bound: number | undefined = undefined,
   ): Promise<{
     blocks: ContentBlock[];
-    spilled: Map<string, { text: string; filePath: string | null }>;
+    spilled: Map<string, StoredToolResult>;
     /** Where a withheld stub's kept fields are cut: the share's keptCap
      *  (toolResultShare), which is the cap where there's no bound. */
     keptCap: number | undefined;
   }> {
-    const spilled = new Map<string, { text: string; filePath: string | null }>();
+    const spilled = new Map<string, StoredToolResult>();
     const dateLabel = new Date().toISOString().slice(0, 10);
     // The results are stored as one message, whose bound a reader's
     // strategy spends across them in order. Each is stored as it would be
@@ -22631,20 +23093,23 @@ export class AgentFramework {
     // stored under its share (toolResultShare). A result carrying an image
     // keeps its live copy cut at the cap; any other's live copy is its stored
     // text.
-    const alone = new Map<string, { text: string; shown: ShownRanges | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
+    const alone = new Map<string, { text: string; shown: ShownRanges | null; live: ToolResultBlock[] | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
     for (const tc of toolResults) {
-      const { text, shown } = this.storedToolResultText(agentName, tc, maxChars);
-      alone.set(tc.id, { text, shown, stored: await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown, bound) });
+      const { text, shown, live } = this.storedToolResultText(agentName, tc, maxChars);
+      alone.set(tc.id, { text, shown, live, stored: await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown, bound) });
     }
     const share = maxChars === undefined ? undefined : toolResultShare(maxChars, bound, toolResults.length);
     const total = [...alone.values()].reduce((sum, { stored }) => sum + stored.text.length, 0);
     const byShare = share?.bound !== undefined && toolResults.length > 1
       && (this.toolRoundsByShare.has(toolResults) || total > bound!);
     for (const tc of toolResults) {
-      const { text, shown, stored } = alone.get(tc.id)!;
-      spilled.set(tc.id, byShare
+      const { text, shown, live, stored } = alone.get(tc.id)!;
+      const kept = byShare
         ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written, { readCap: maxChars! })
-        : stored);
+        : stored;
+      // The live copy is built from the blocks the stored text was made
+      // from, never classified again (StoredToolResult.live).
+      spilled.set(tc.id, { text: kept.text, filePath: kept.filePath, live });
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
@@ -22670,21 +23135,24 @@ export class AgentFramework {
    * the image stays reachable by provenance after the bytes leave the wire.
    *
    * The live copy is the stored text itself unless the result is a content
-   * array carrying an inline image, which tryNativeToolResultContent sends
-   * as native blocks. It takes the same arrays the serializer takes block by
-   * block, and shows each image and each reference block's stub whole and
-   * each text block up to where it cuts that block at the cap (`maxChars`,
-   * toolResultCutAt), so those are the ranges of the text it showed.
+   * array carrying an inline image whose links and markers fit the cap
+   * together (goesNative). Then `live` holds the blocks this text was made
+   * from, which toMembraneToolResult sends as native blocks (nativeContent),
+   * showing each image, stub and marker whole and each text block up to where
+   * it cuts that block at the cap (`maxChars`, toolResultCutAt), so those are
+   * the ranges of the text it showed.
    */
   private storedToolResultText(
     agentName: string,
     tc: CompletedToolCall,
     maxChars: number | undefined,
-  ): { text: string; shown: ShownRanges | null } {
-    if (tc.result.isError) return { text: (tc.result.error ?? 'Unknown error').toWellFormed(), shown: null };
+  ): { text: string; shown: ShownRanges | null; live: ToolResultBlock[] | null } {
+    if (tc.result.isError) return { text: (tc.result.error ?? 'Unknown error').toWellFormed(), shown: null, live: null };
     const ledger = this.toolImageLedgerFor(agentName);
     let blocks = null as HistoryBlockSpan[] | null;
+    let classified = null as ToolResultBlock[] | null;
     const text = nonErrorResultText(tc.result, undefined, {
+      toolName: tc.name,
       imageRef: (blockIndex, image) => ledger.retain({
         toolCallId: tc.id,
         toolName: tc.name,
@@ -22692,13 +23160,16 @@ export class AgentFramework {
         data: image.data,
         mediaType: image.mimeType,
       }).ref,
-      onBlocks: (spans) => { blocks = spans; },
+      onBlocks: (spans, result) => { blocks = spans; classified = result; },
     });
-    if (!blocks?.some((block) => block.kind === 'image')) return { text, shown: null };
+    if (!blocks || !classified || !goesNative(blocks.map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
+      return { text, shown: null, live: null };
+    }
     return {
       text,
       shown: blocks.map(({ kind, start, end }): [number, number] =>
         [start, kind === 'text' && maxChars ? start + toolResultCutAt(text.slice(start, end), maxChars) : end]),
+      live: classified,
     };
   }
 
@@ -23015,7 +23486,9 @@ export class AgentFramework {
    * what the model would read: a structured result's blocks as the dispatch
    * gave them (the direct reading, with RFC-005's treatment of an MCPL peer's
    * blocks there, bound to the server that sent them), a module's under
-   * history's reading of RFC-005 at every depth (shownToScript), and
+   * history's reading of RFC-005 at every depth (shownToScript), each
+   * reading the claims of everything the script's view shows, nested fields
+   * included (scriptViewClaims), and
    * otherwise one text block of the model's text, which for a failure is its
    * error. A module's is any result whose call the dispatch didn't send to
    * a server (`toServer`, from the call's waiter). `structuredContent` is the
@@ -23033,31 +23506,26 @@ export class AgentFramework {
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse), so the stub the script receives carries a workspace path
-    // it can open directly. An MCPL peer's references were fetched for the
-    // script at dispatch (autoFetchReferences). Any other tool's content
+    // it can open directly. An MCPL peer's references, but its links, were
+    // fetched for the script at dispatch (autoFetchReferences). Any other tool's content
     // array, a module's, is materialized here. Only a reference registered
     // against its server can be fetched: a module's result can carry content
     // it got from a call of its own (ctx.callTool), whose references were
     // registered on arrival (executeMcplToolCall). A reference a module makes
     // itself has no server, so its fetch is refused (and logged here) and the
     // script gets its stub, as it does for a reference nested in other data,
-    // which isn't fetched.
+    // which isn't fetched. A link (MCP's resource_link) isn't fetched either:
+    // a tool's links are what it offers to follow, and the script can fetch
+    // the ones it wants with fetch_reference.
     // Whenever the result's blocks reach the script: a structured failure's
     // included, as a module's error can carry content.
     // Not a server's result: a module's, whose blocks no dispatch has given
     // RFC-005's treatment.
     const fromModule = !toServer;
-    if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
-      const fetcher = this.getReferenceFetcher();
-      for (const block of result.data) {
-        const c = classifyBlock(block);
-        if (c.kind !== 'reference') continue;
-        const record = referenceRegistry.findByUri(c.testimony.uri)
-          ?? referenceRegistry.register(c.testimony);
-        const outcome = await fetcher.fetch(record);
-        if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
-      }
-    }
+    // A structured result's blocks, as #538 gives them: none when its content
+    // isn't a list, the structured view carrying the result. A failure with
+    // no blocks reads as its error text.
+    const showsBlocks = structured && (!isError || (Array.isArray(result.data) && result.data.length > 0));
     const failed = (err: unknown): ToolAnswer => {
       const error = unconvertibleScriptResult(toolName, err, isError ? result.error : undefined);
       return {
@@ -23067,55 +23535,145 @@ export class AgentFramework {
         brief: error,
       };
     };
-    // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
-    // treatment couldn't be given them at dispatch.
-    if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
-    let content: unknown[];
-    let text: string | undefined;
-    // A structured result's blocks, as #538 gives them: none when its content
-    // isn't a list, the structured view carrying the result. A failure with
-    // no blocks reads as its error text.
-    if (structured && (!isError || (Array.isArray(result.data) && result.data.length > 0))) {
-      content = Array.isArray(result.data) ? result.data : [];
-      // A module's blocks, such as an MCPL peer's it got from ctx.callTool
-      // and returns whole, are read as history reads a module's data: what
-      // RFC-005 governs, at any depth, as the script lane shows it, and
-      // anything else as sent. What a script prints comes back to the model,
-      // so no uri the model's lanes withhold reaches it. What this gives is
-      // a stub, a notice or the value itself, so a module that returns
-      // blocks it already gave has them left as they are.
-      if (fromModule) {
+    // The claims a module's result is shown by, read once, so the fetches
+    // below and what the script gets read the same: a structured result's
+    // view's (scriptViewClaims), nested fields included, or the model's text's
+    // (resultClaimsOrThrow, which throws where resultClaimsOf answers null).
+    // Where the walk stops, the script's answer is a
+    // failure naming the tool, before any fetch or treatment, so neither runs
+    // without them (Ada-1017, room-203 #200250, #200374): on both of a
+    // script's routes, `isError` says nothing could be shown, where the
+    // model's lane shows UNCHECKED_RESULT_TEXT.
+    let claims: ResultClaims | undefined;
+    // The model's line for the result, its claims and its records as it reads
+    // them, which decide where a link's object shows its uri
+    // (referenceBlockForScript's line). Its records are the registry's as
+    // the model's line leaves it, before the lane's own registrations
+    // (openJournal): where the line renders the result's blocks, the demand
+    // loop below registers them in their order, as the line's render does;
+    // the treatment then registers, rebinds and evicts as it goes, which the
+    // line never sees (Ada-1017, room-203 #202683, #203011, #203172).
+    let line: ScriptLine | undefined;
+    let journal: RegistryJournal | undefined;
+    try {
+      if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
+        let lineClaims: ResultClaims;
         try {
-          content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value))) as unknown[];
+          // The flag as the render reads it, so a value other than a
+          // boolean decides the same way here (isContentArray reads `true`).
+          lineClaims = resultClaimsOrThrow(result.data, Boolean(result.dataIsContent));
+          claims = showsBlocks ? scriptViewClaims(result.data, false) : lineClaims;
         } catch (err) {
           return failed(err);
         }
+        // The loop's registrations are the line's own only where the line
+        // renders these blocks: a content array's, block by block at the top
+        // level, and not a failure's, whose line is its error. There the loop
+        // registers links too, in the result's order, and the journal opens
+        // after it. Elsewhere the line registers nothing (a failure) or
+        // registers in its own walk's order (data at depth), which the loop
+        // can't follow, so the journal opens before the loop, which leaves
+        // links to the treatment: the line's records are then the registry
+        // before the line's own walk, which can only be stricter, by an
+        // eviction (Ada-1017, room-203 #203172). Past 2,000 references in one
+        // result, a content array's loop can evict an earlier never before
+        // the line, rendering in order, would have (#203184).
+        const blocksAreLines = !isError && isContentArray(result.data, Boolean(result.dataIsContent));
+        if (showsBlocks && !blocksAreLines) {
+          journal = referenceRegistry.openJournal();
+          line = { claims: lineClaims, recordBefore: journal.before };
+        }
+        const fetcher = this.getReferenceFetcher();
+        for (const block of result.data) {
+          const c = classifyBlock(block);
+          if (c.kind !== 'reference' || (c.testimony.fromLink && !blocksAreLines)) continue;
+          // Registered, not only found, so a re-issued reference's claims
+          // replace a link's, or a stale reference's, before the fetch reads
+          // them, as on any other path, while the record isn't fetched yet. A
+          // record its uri already has keeps the server it's bound to.
+          const record = referenceRegistry.register(c.testimony);
+          // A link of blocks the line renders is registered too, in the
+          // result's order, and not fetched: the registry then holds its
+          // records in the order the model's own render makes, so a
+          // registration here evicts what that render's would, short of more
+          // references in one result than the registry holds, and the text
+          // route, which reads the live registry, decides each link's uri as
+          // the model's line does (Ada-1017, room-203 #203000).
+          if (c.testimony.fromLink) continue;
+          // A uri any of the result's references gives an expiry that counts
+          // isn't fetched, as autoFetchReferences passes over one that any block
+          // of an MCPL result marks expired.
+          const expired = record.fetchedPath ? null : claimedExpiry(record, claims, Date.now());
+          if (expired !== null) {
+            console.error(`[rfc005] script-demand fetch of ${record.refId} not made: by the result's claims, the reference is ${EXPIRY_REASON[expired]}`);
+            continue;
+          }
+          const outcome = await fetcher.fetch(record);
+          if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+        }
+        // Where the loop's registrations are the ones the model's line makes,
+        // the treatment's, below, are the script lane's own, which the
+        // journal keeps the line's records from (Ada-1017, room-203 #203011).
+        if (showsBlocks && blocksAreLines) {
+          journal = referenceRegistry.openJournal();
+          line = { claims: lineClaims, recordBefore: journal.before };
+        }
       }
-    } else {
-      // As in history, a reference is its stub at any depth and inline data
-      // claiming a uri or a disposition is withheld (RFC-005).
+      // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
+      // treatment couldn't be given them at dispatch.
+      if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
+      let content: unknown[];
+      let text: string | undefined;
+      if (showsBlocks) {
+        content = Array.isArray(result.data) ? result.data : [];
+        // A module's blocks, such as an MCPL peer's it got from ctx.callTool
+        // and returns whole, are read as history reads a module's data: what
+        // RFC-005 governs, at any depth, as the script lane shows it, and
+        // anything else as sent. What a script prints comes back to the model,
+        // so no uri the model's lanes withhold reaches it through the blocks
+        // (structured content goes as sent, as on main). What this gives is
+        // a stub, a notice or the value itself, so a module that returns
+        // blocks it already gave has them left as they are.
+        if (fromModule) {
+          try {
+            content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value, claims, line))) as unknown[];
+          } catch (err) {
+            return failed(err);
+          }
+        }
+      } else {
+        // As in history, a reference is its stub at any depth and inline data
+        // claiming a uri or a disposition is withheld (RFC-005), by the claims
+        // the fetches read, or else the serializer's own reading of them,
+        // whose walk throws where it stops, failing as a stopped render does.
+        try {
+          text = isError
+            ? result.error ?? 'tool call failed'
+            : result.data === undefined || result.data === null
+              ? nonErrorResultTextOrThrow(result)
+              : toolResultDataToHistoryString(result.data, undefined, {
+                dataIsContent: Boolean(result.dataIsContent),
+                ...(claims ? { claims } : {}),
+              });
+        } catch (err) {
+          return failed(err);
+        }
+        content = [{ type: 'text', text }];
+      }
+      let json: string;
       try {
-        text = isError
-          ? result.error ?? 'tool call failed'
-          : result.data === undefined || result.data === null
-            ? nonErrorResultText(result)
-            : toolResultDataToHistoryString(result.data);
+        json = JSON.stringify({
+          content,
+          structuredContent: structured && result.structured !== undefined ? result.structured : null,
+          isError,
+        });
       } catch (err) {
         return failed(err);
       }
-      content = [{ type: 'text', text }];
+      return { ok: true, json, isError, brief: text ?? scriptResultBrief(content) };
+    } finally {
+      journal?.close();
     }
-    let json: string;
-    try {
-      json = JSON.stringify({
-        content,
-        structuredContent: structured && result.structured !== undefined ? result.structured : null,
-        isError,
-      });
-    } catch (err) {
-      return failed(err);
-    }
-    return { ok: true, json, isError, brief: text ?? scriptResultBrief(content) };
   }
 
   /**
@@ -23246,9 +23804,13 @@ export class AgentFramework {
     callId: string,
     afResult: ToolResult,
     maxChars?: number,
-    /** Pre-spilled outcome from the history path — used for the non-image
-     *  path so the live wire copy byte-matches what the window stored. */
-    precomputed?: { text: string; filePath: string | null },
+    /** The history path's outcome: its stored text, spilled or cut, and the
+     *  blocks it was made from where the live copy goes natively. The live
+     *  copy is built from these, never classified again, so the two copies
+     *  agree on every block and on whether it goes natively (goesNative). */
+    precomputed?: StoredToolResult,
+    /** The tool's name, for the log line of a result shown as the notice. */
+    toolName?: string,
   ): MembraneToolResult {
     if (afResult.isError) {
       // Same spill policy as successes: reuse the history copy so a giant
@@ -23264,79 +23826,63 @@ export class AgentFramework {
     // blocks natively rather than JSON-stringifying them away. Anything else
     // goes as text. The error path was handled above, so isError is always
     // false on these return paths.
-    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
-    if (blocks) {
-      return { toolUseId: callId, content: blocks, isError: false };
-    }
     if (precomputed !== undefined) {
-      return { toolUseId: callId, content: precomputed.text, isError: false };
+      return {
+        toolUseId: callId,
+        content: precomputed.live ? this.nativeContent(precomputed.live, maxChars, precomputed.filePath) : precomputed.text,
+        isError: false,
+      };
     }
-    // Without the history path's copy, the text is made as that copy is
-    // (nonErrorResultText), so a reference's uri stays out of it at any depth
-    // (RFC-005), a result with no data reads its error text, or no text, and
-    // never the value undefined.
-    return { toolUseId: callId, content: nonErrorResultText(afResult, maxChars), isError: false };
+    // Without the history path's copy, one classification makes both the
+    // decision and the copy, as on that path: the text is made as that copy
+    // is (nonErrorResultText), so a reference shows at any depth as its stub,
+    // or a link as its line (RFC-005), a result with no data reads its error
+    // text, or no text, and never the value undefined; and where it's a
+    // content array whose links and markers fit the cap beside an image
+    // (goesNative), the very blocks that text was made from go natively.
+    let spans = null as HistoryBlockSpan[] | null;
+    let classified = null as ToolResultBlock[] | null;
+    const text = nonErrorResultText(afResult, maxChars, { toolName, onBlocks: (s, b) => { spans = s; classified = b; } });
+    if (spans && classified && goesNative((spans as HistoryBlockSpan[]).map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
+      return { toolUseId: callId, content: this.nativeContent(classified, maxChars, null), isError: false };
+    }
+    return { toolUseId: callId, content: text, isError: false };
   }
 
   /**
-   * If `data` is an MCP tool-result content array carrying at least one image,
-   * convert to Membrane's native ToolResultContentBlock[]. Returns null when
-   * the array is text-only (let JSON path handle it; saves a code path).
-   * `maxChars`, when provided, caps each accompanying text block so an image
-   * inlined alongside an enormous text payload can't blow the context. A
-   * block is cut at the cap as the stored copy's cut at that cap is
-   * (toolResultCutAt), never inside a slot, so the stored copy can keep
-   * exactly the slots this showed (#403); under a readers' bound the stored
-   * copy's cut can come earlier (cutStoredToolResultToFit).
+   * A content array's blocks (toolResultBlocks) as Membrane's native
+   * ToolResultContentBlock[], for a caller that found they go natively: at
+   * least one image, with links and markers that fit the cap together
+   * (goesNative), which this doesn't check. Each image as itself, each text block
+   * cut at the cap, and every other block whole, as the text the stored copy
+   * shows for it. `maxChars`, when provided, caps each text block so an image
+   * inlined beside an enormous text payload can't blow the context. A block
+   * is cut as the stored copy is at that cap (toolResultCutAt), never inside a
+   * slot, so the stored copy can keep exactly the slots this showed (#403);
+   * under a readers' bound the stored copy's cut can come earlier
+   * (cutStoredToolResultToFit). Each text is already well formed, as the
+   * stored copy's is (toolResultBlocks).
    */
-  private tryNativeToolResultContent(
-    data: unknown,
-    maxChars?: number,
+  private nativeContent(
+    blocks: ToolResultBlock[],
+    maxChars: number | undefined,
     /** Spill file written by the history path — referenced from truncation
      *  notices so an image-adjacent giant text block stays recoverable. */
-    spillPath: string | null = null,
-  ): ToolResultContentBlock[] | null {
-    if (!Array.isArray(data)) return null;
-    let hasImage = false;
-    const blocks: ToolResultContentBlock[] = [];
-    for (const raw of data) {
-      if (!raw || typeof raw !== 'object') return null;
-      const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-      if (isInlineContradiction(b)) {
-        // RFC-005 vector 2: withhold inline data claiming bulk disposition.
-        blocks.push({ type: 'text', text: INLINE_WITHHELD_TEXT });
-        continue;
+    spillPath: string | null,
+  ): ToolResultContentBlock[] {
+    return blocks.map((block): ToolResultContentBlock => {
+      if (block.kind === 'image') {
+        return { type: 'image', source: { type: 'base64', data: block.data, mediaType: block.mimeType } };
       }
-      if (b.type === 'text') {
-        // A text that isn't a string shows as the converters' placeholder,
-        // rather than sending the whole array to the JSON fallback.
-        // Well formed, as the stored copy's text is (nonErrorResultText).
-        let text = typeof b.text === 'string' ? b.text.toWellFormed() : NON_STRING_TEXT_PLACEHOLDER;
-        if (maxChars && text.length > maxChars) {
-          text = text.slice(0, toolResultCutAt(text, maxChars))
-            + '\n\n[truncated — original was ' + text.length + ' chars'
-            + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
-            + ']';
-        }
-        blocks.push({ type: 'text', text });
-      } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
-        hasImage = true;
-        blocks.push({
-          type: 'image',
-          source: { type: 'base64', data: b.data, mediaType: b.mimeType },
-        });
-      } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
-        // RFC-005 reference block → bounded stub. Previously this bailed the
-        // whole array to JSON, which both inlined the reference verbatim and
-        // demoted any adjacent image block to stringified base64.
-        const stub = referenceStubOrNull(b, 'from tool result');
-        if (stub === null) return null;
-        blocks.push({ type: 'text', text: stub });
-      } else {
-        return null; // unknown shape: the stored copy's text, which shows any reference in it as its stub
+      let text = block.text;
+      if (block.kind === 'text' && maxChars && text.length > maxChars) {
+        text = text.slice(0, toolResultCutAt(text, maxChars))
+          + '\n\n[truncated — original was ' + text.length + ' chars'
+          + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
+          + ']';
       }
-    }
-    return hasImage ? blocks : null;
+      return { type: 'text', text };
+    });
   }
 
   private toolImageLedgerFor(agentName: string): ToolImageLedger {
@@ -23741,6 +24287,15 @@ export class AgentFramework {
     }
 
 
+    // RFC-014: toolsets--act calls a server's dynamic tool, down the same
+    // path as a direct call of it (dispatchToolsetAct).
+    if (enrichedCall.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+      if (scriptWaiter) scriptWaiter.route.toServer = true;
+      this.dispatchToolsetAct(agentName, enrichedCall);
+      return;
+    }
+
     // Route MCPL tool calls to the appropriate server via prefix map
     const mcplMatch = this.resolveMcplTool(enrichedCall.name);
     if (mcplMatch && this.mcplServerRegistry) {
@@ -24013,6 +24568,9 @@ export class AgentFramework {
        * it was first held.
        */
       fromQueue?: { id: string; seq: number; heldAt: number };
+      /** Set by addModuleMessage for a write it marked for a run or a fork
+       *  (PRIMARY_IF_UNREAD_KEY): any other write has the mark taken off. */
+      markedForRun?: true;
       /** Out-param: where the message landed (RFC-006 needs to find it again). */
       placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
       /**
@@ -24038,6 +24596,14 @@ export class AgentFramework {
     // reads a fork's store, which is isolated.
     if (!opts?.fromQueue && metadata && 'deferredWriteId' in metadata) {
       const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
+      metadata = rest as MessageMetadata;
+    }
+    // So is the mark of a module's write for a run or a fork
+    // (PRIMARY_IF_UNREAD_KEY), which only addModuleMessage sets: a module's
+    // process response, or an event an API module passes on, can't send a
+    // write to the primary by carrying it.
+    if (!opts?.fromQueue && !opts?.markedForRun && metadata && PRIMARY_IF_UNREAD_KEY in metadata) {
+      const { [PRIMARY_IF_UNREAD_KEY]: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
       metadata = rest as MessageMetadata;
     }
     // Content context-manager won't store is refused here, as the store's own
@@ -24261,14 +24827,16 @@ export class AgentFramework {
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
-   *  a clock row after it aside: a channel message by its server, channel and
-   *  message id, a push event by its server and event id, and never one a
-   *  tune-out holds. */
+   *  clock rows and stored context injections after it aside: a channel
+   *  message by its server, channel and message id, a push event by its
+   *  server and event id, and never one a tune-out holds. Past
+   *  NEWEST_SCAN_ROWS such rows, it answers no. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
-    // A clock row the framework wrote after it (a turn start's, an event's)
-    // isn't a message a reply could be meant for, so it doesn't count.
-    const newest = agent.getContextManager().queryMessages({ limit: 2, reverse: true }).messages
-      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND);
+    // A clock row the framework wrote after it (a turn start's, an event's),
+    // or a stored context injection (any agent's, a start's), isn't a
+    // message a reply could be meant for, so it doesn't count.
+    const newest = agent.getContextManager().queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages
+      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata));
     const md = newest?.metadata as Record<string, unknown> | undefined;
     if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
     if (entry.eventType === 'mcpl:channel-incoming') {
@@ -24326,8 +24894,8 @@ export class AgentFramework {
     // to its window's release at resume (runReleasesAfterResume, which clears
     // the name first), which stores its writes in that window, or to stop()'s
     // pass for postponed releases, which clears the name, passes its notices
-    // on as that release would (as boot would, where its pass throws), and
-    // drops the rest, logged. Drained by any
+    // and marked module writes on as that release would (as boot would,
+    // where its pass throws), and drops the rest, logged. Drained by any
     // other flush meanwhile, they would meet no registered agent and be
     // dropped, or written into a window no one reads.
     if (this.releasesAfterResume.has(agentName)) return [];
@@ -24787,23 +25355,29 @@ export class AgentFramework {
    *  A target no longer registered (a fork or a run that has ended, here or
    *  before a crash) has no window to land in: a failed reply queued for it,
    *  or a channel notice it could have acted on, becomes the primary's
-   *  by-name notice, under the entry's own id and place in the queue
-   *  (queuedNoticeForPrimary), and is written with the rest; any other write
-   *  is dropped, logged, by addMessage. Nothing here reads the gone agent's
+   *  by-name notice, and a module's write for a run or a fork goes to it as
+   *  written, each under the entry's own id and place in the queue
+   *  (passesToPrimary, queuedNoticeForPrimary), written with the rest; any
+   *  other write is dropped, logged, by addMessage. Nothing here reads the gone agent's
    *  window, so such a notice an earlier write of which landed there, and
    *  which the agent read, goes on too. */
   private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
     let passed = 0;
+    let writes = 0;
     const entries = drained.flatMap((msg) => {
       if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
       if (!passesToPrimary(msg.metadata)) return [msg];
       const forPrimary = this.queuedNoticeForPrimary(msg.forAgent, msg);
       if (!forPrimary) return [];
-      passed++;
+      if (isPrimaryIfUnread(msg.metadata)) writes++;
+      else passed++;
       return [forPrimary];
     });
     if (passed > 0) {
       console.error(`[deferred-flush] ${where}: ${passed} notice${passed === 1 ? '' : 's'} of an agent that has ended passed to the primary`);
+    }
+    if (writes > 0) {
+      console.error(`[deferred-flush] ${where}: ${writes} module write${writes === 1 ? '' : 's'} queued for a run or fork that has ended passed to the primary`);
     }
     const bypassFor = (msg: DeferredWrite): string | undefined =>
       opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
@@ -24851,7 +25425,8 @@ export class AgentFramework {
    *
    * The agent never reads its window again, so every failed-reply notice it
    * never read, and every channel notice it could act on and never read, is
-   * passed to the primary, by name, once (passesToPrimary,
+   * passed to the primary, by name, once, and so is every module write for
+   * it that it never read, as the write itself (passesToPrimary,
    * passOnFromReleasedWindow): each one stored in its window above its
    * consumed watermark (flushed there at its turn's end, or stored while it
    * was idle) and not heard at a tool boundary, and each one still queued
@@ -24929,8 +25504,9 @@ export class AgentFramework {
    * The part of a released agent's pass to the primary that its release and
    * stop() share (stop() runs it for a release the quiesce postponed). Each
    * notice stored in its window that it never read and the primary takes in
-   * its place (passesToPrimary: a failed reply, or a channel notice its
-   * reader could act on) goes on as stored, by name (passNoticeToPrimary),
+   * its place (passesToPrimary: a failed reply, a channel notice its reader
+   * could act on, or a module's write for a run or a fork, which goes as
+   * the write itself) goes on as stored, by name (passNoticeToPrimary),
    * except a copy of an entry for it still in the durable queue, pending or
    * un-acked: that entry is the notice's one identity until its ack, the one
    * boot's check for landed writes knows, so it's the entry that goes on, as
@@ -24955,7 +25531,7 @@ export class AgentFramework {
     const mine = (msg: DeferredWrite): boolean => (msg.forAgent ?? this.primaryAgentName) === agent.name;
     const unacked = this.unackedDeferredWrites.filter(mine);
     const window = this.releasedWindow(agent, new Set([...this.deferredMessages.filter(mine), ...unacked].map((m) => m.id)));
-    for (const metadata of window?.unread ?? []) this.passNoticeToPrimary(agent.name, metadata);
+    for (const { metadata, ...written } of window?.unread ?? []) this.passNoticeToPrimary(agent.name, metadata, written);
     const forPrimary: DeferredWrite[] = [];
     const passOn = (msg: DeferredWrite): void => {
       if (!passesToPrimary(msg.metadata)) return;
@@ -24971,8 +25547,11 @@ export class AgentFramework {
    * What a released agent's window holds that its pass to the primary reads
    * (passOnFromReleasedWindow): `unread`, the notices stored there that it
    * never read and the primary takes in its place (passesToPrimary: its
-   * failed replies, and the channel notices it was told it could act on),
-   * other than copies of the entries `held` names; and `held`, for each of
+   * failed replies, the channel notices it was told it could act on, and a
+   * run's or a fork's module writes), each with its participant and
+   * content, a sharded body's shards joined into one text, as the
+   * autobiographical strategy joins them (asCompiled), other than
+   * copies of the entries `held` names; and `held`, for each of
    * those entries with a copy there, its copies and whether any of them is
    * unread. A notice is read below the lower of its consumed watermark and
    * the point where the watermark's branch and the current one part
@@ -24996,13 +25575,16 @@ export class AgentFramework {
         : Number.NEGATIVE_INFINITY;
       // A body the store took as more than one message (a sharded body)
       // carries the same metadata on each of its shards, and is one notice,
-      // so a shard that continues the body before it isn't taken again. Which
+      // so a shard that continues the body before it isn't taken again: its
+      // content joins the body's, which a module's write passes on. Which
       // messages make up a body is context-manager's rule (continuesBody,
       // pairwise in store order): a group id names the text, so the same text
       // stored twice is two bodies under one id. A held entry's copies are
       // kept whole, each shard among them, as its lookup by id finds them.
       const read: ReleasedWindow = { unread: [], held: new Map() };
       const messages = cm.getAllMessages();
+      const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
+      let lastUnread = -1;
       messages.forEach((m, i) => {
         const id = (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
         if (typeof id === 'string' && held.has(id)) {
@@ -25010,10 +25592,19 @@ export class AgentFramework {
           copies.copies.push(storedCopy(m));
           copies.unread ||= m.sequence > floor;
           read.held.set(id, copies);
-        } else if (m.sequence > floor && passesToPrimary(m.metadata) && !continuesBody(messages[i - 1], m)) {
-          read.unread.push(m.metadata as MessageMetadata);
+        } else if (m.sequence > floor && passesToPrimary(m.metadata)) {
+          if (!continuesBody(messages[i - 1], m)) {
+            bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
+            lastUnread = i;
+          } else if (lastUnread === i - 1) {
+            bodies.at(-1)!.shards.push(m);
+            lastUnread = i;
+          }
         }
       });
+      // A body's shards joined into one text, as the strategy joins them
+      // (asCompiled), whole: a compile may also cut each shard to its cap.
+      read.unread = bodies.map(({ shards, ...body }) => ({ ...body, content: asCompiled(shards) }));
       return read;
     } catch (err) {
       // A release must complete whatever its window's read meets.
@@ -25062,8 +25653,8 @@ export class AgentFramework {
    * deregistered, so its stream can't dispatch anything more and resume
    * doesn't weigh its context, and a write addressed to it meanwhile is
    * treated as for any agent no longer registered (dropped, or passed to the
-   * primary if it's a failed reply, or a channel notice its reader could act
-   * on).
+   * primary if it's a failed reply, a channel notice its reader could act
+   * on, or a module's write for a run or a fork: passesToPrimary).
    */
   private releaseWindowNowOrAfterResume(agent: Agent): void {
     if (this.quiesced) this.releasesAfterResume.set(agent.name, agent);
@@ -25093,11 +25684,15 @@ export class AgentFramework {
    * learns of it (noticeForPrimary). Never throws: it runs inside a release,
    * which must complete whatever this write meets.
    */
-  private passNoticeToPrimary(speaker: string, metadata: MessageMetadata | undefined): void {
-    const notice = this.noticeForPrimary(speaker, metadata);
+  private passNoticeToPrimary(
+    speaker: string,
+    metadata: MessageMetadata | undefined,
+    written?: { participant: string; content: ContentBlock[] },
+  ): void {
+    const notice = this.noticeForPrimary(speaker, metadata, written);
     if (!notice) return;
     try {
-      this.addMessage('user', notice.content, notice.metadata);
+      this.addMessage(notice.participant, notice.content, notice.metadata);
     } catch (err) {
       console.error(`[route-failure] failed to tell the primary ${notice.about}:`, err);
     }
@@ -25118,10 +25713,10 @@ export class AgentFramework {
    * decided).
    */
   private queuedNoticeForPrimary(speaker: string, msg: DeferredWrite): DeferredWrite | null {
-    const notice = this.noticeForPrimary(speaker, msg.metadata);
+    const notice = this.noticeForPrimary(speaker, msg.metadata, msg);
     if (!notice) return null;
     return {
-      id: msg.id, seq: msg.seq, participant: 'user', content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt,
+      id: msg.id, seq: msg.seq, participant: notice.participant, content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt,
       ...(msg.landing ? { landing: msg.landing } : {}),
     };
   }
@@ -25130,22 +25725,30 @@ export class AgentFramework {
    * The primary's by-name notice in place of one `speaker` never read, and
    * what it's about, as a log line says it: a failed reply's
    * (failedReplyNoticeForPrimary) or a channel notice's
-   * (channelNoticeForPrimary). null when no one is told, which is logged
+   * (channelNoticeForPrimary). A module's write for a run or a fork that
+   * it never read (PRIMARY_IF_UNREAD_KEY), given with what was `written`,
+   * goes as the write itself: its participant, its content, and its
+   * metadata without the mark. null when no one is told, which is logged
    * where it's decided.
    */
   private noticeForPrimary(
     speaker: string,
     metadata: MessageMetadata | undefined,
-  ): { content: ContentBlock[]; metadata: MessageMetadata; about: string } | null {
+    written?: { participant: string; content: ContentBlock[] },
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; about: string } | null {
+    if (written && isPrimaryIfUnread(metadata)) {
+      const { [PRIMARY_IF_UNREAD_KEY]: _mark, ...rest } = metadata as Record<string, unknown>;
+      return { participant: written.participant, content: written.content, metadata: rest as MessageMetadata, about: `of a module's write for ${speaker}` };
+    }
     const kind = (metadata as { kind?: unknown } | undefined)?.kind;
     if (kind === 'discord-send-failed') {
       const notice = this.failedReplyNoticeForPrimary(speaker, metadata);
-      return notice && { ...notice, about: `that ${speaker}'s reply to ${String(notice.metadata.channelId)} failed` };
+      return notice && { ...notice, participant: 'user', about: `that ${speaker}'s reply to ${String(notice.metadata.channelId)} failed` };
     }
     const passOn = channelNoticePassOn(metadata);
     if (!passOn) return null;
     const notice = this.channelNoticeForPrimary(speaker, passOn);
-    return notice && { ...notice, about: `of ${speaker}'s channel notice` };
+    return notice && { ...notice, participant: 'user', about: `of ${speaker}'s channel notice` };
   }
 
   /**
@@ -25283,15 +25886,40 @@ export class AgentFramework {
 
 
   /**
-   * A module's write through its context: addMessage's, except that a write
-   * the framework holds is answered by its handle (heldHandle) rather than
-   * '', so the module can find, read, edit and remove what it wrote before
-   * the write lands. The framework's own callers keep the '' they've always
-   * had, which their traces and checks take as a write not stored yet.
+   * A module's write through its context (ModuleContext.addMessage):
+   * addMessage's, except that a write the framework holds is answered by its
+   * handle (heldHandle) rather than '', so the module can find, read, edit
+   * and remove what it wrote before the write lands, through getMessage,
+   * editMessage and removeMessage, which read the delivery agent's window: a
+   * handle for a write held for a fork or a sub-agent isn't found there. The
+   * framework's own callers keep the '' they've always had, which their
+   * traces and checks take as a write not stored yet.
+   *
+   * With `forAgent`, the write is for the named agent's window, which must
+   * be registered when the write is made: a name that isn't, or the empty
+   * one, which addMessage would read as none (deliveryAgent), throws, naming
+   * the registered ones, as queryMessages does. The framework's own writes
+   * log and drop instead, as a held write does whose agent is gone by its
+   * flush. A write for an ephemeral run or a conversation fork, whose
+   * window nothing reads after its release, is marked (PRIMARY_IF_UNREAD_KEY),
+   * so the release passes it to the primary if its target never read it,
+   * as it passes a notice (passOnFromReleasedWindow).
    */
-  private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata): MessageId {
+  private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId {
+    if (opts?.forAgent !== undefined && (opts.forAgent === '' || !this.agents.has(opts.forAgent))) {
+      throw this.unknownAgentError(opts.forAgent, 'A write');
+    }
+    // A write for an ephemeral run or a conversation fork carries the
+    // framework's mark, so the release passes it to the primary if its
+    // target never read it (passesToPrimary); addMessage takes it off any
+    // other write.
+    const forRun = opts?.forAgent !== undefined
+      && (this.ephemeralRuns.has(opts.forAgent) || this.conversationAgentHomes.has(opts.forAgent));
     const placement: { deferredId?: string } = {};
-    const id = this.addMessage(participant, content, withoutCallerTurn(metadata), { placement });
+    const kept = withoutCallerTurn(metadata);
+    const id = this.addMessage(participant, content, forRun ? { ...kept, [PRIMARY_IF_UNREAD_KEY]: true } as MessageMetadata : kept, {
+      placement, ...(opts?.forAgent !== undefined ? { forAgent: opts.forAgent } : {}), ...(forRun ? { markedForRun: true as const } : {}),
+    });
     return placement.deferredId === undefined ? id : heldHandle(placement.deferredId);
   }
 
@@ -25303,7 +25931,8 @@ export class AgentFramework {
    * no module reads that agent's store, and the write waits for its window's
    * release (drainDeferredFor) or, at its flush, is dropped (addMessage), a
    * failed reply, or a channel notice its reader could act on, passing to the
-   * primary as its notice (queuedNoticeForPrimary).
+   * primary as its notice, and a module's write for a run as written
+   * (passesToPrimary, queuedNoticeForPrimary).
    */
   private heldWritesFor(reader: Agent): DeferredWrite[] {
     const heldFor = (m: DeferredWrite): boolean => {
@@ -25561,9 +26190,34 @@ export class AgentFramework {
     return row ? asModuleRow(row) : null;
   }
 
-  private queryMessages(filter: MessageQuery): { messages: ModuleMessage[]; totalCount: number } {
-    const agent = this.deliveryAgent();
+  /** The refusal of a module's `forAgent` that names no registered agent:
+   *  the name, cut at 120 characters; the registered ones, a list over 400
+   *  characters cut with how many there are; and what leaving forAgent out
+   *  does. With none registered, there's no window either way, and it says
+   *  so. */
+  private unknownAgentError(named: string, what: 'A query' | 'A write'): Error {
+    const unknown = `Unknown agent: ${safeSlice(JSON.stringify(named), 0, 120)}.`;
+    // The empty name is refused even when an agent is registered under it.
+    const names = [...this.agents.keys()].filter((name) => name !== '');
+    if (names.length === 0) return new Error(`${unknown} No agent is registered yet, so there's no window to ${what === 'A query' ? 'read' : 'write to'}.`);
+    const listed = names.map((n) => JSON.stringify(n)).join(', ');
+    const shown = listed.length > 400 ? `${safeSlice(listed, 0, 400)}… (${names.length} in all)` : listed;
+    return new Error(`${unknown} ${what} names a registered agent: ${shown} (ModuleContext.getAgents() lists them), or leaves forAgent `
+      + `out to ${what === 'A query' ? 'read' : 'write to'} the delivery agent's window: the primary's, or the first agent's when none is primary.`);
+  }
+
+  /** A module's query (ModuleContext.queryMessages): the delivery agent's
+   *  window (the primary's, or the first agent's when none is primary), or
+   *  the named agent's, which must be registered: an unknown name, or the
+   *  empty one, throws, naming the registered ones, as a write's does. */
+  private queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): { messages: ModuleMessage[]; totalCount: number } {
+    // A name given is a name: it doesn't fall back to the primary, as
+    // deliveryAgent's would for the empty one, which is refused, as a
+    // write's is, since a write can't be routed to it.
+    const named = opts?.forAgent;
+    const agent = named === undefined ? this.deliveryAgent() : named === '' ? undefined : this.agents.get(named);
     if (!agent) {
+      if (named !== undefined) throw this.unknownAgentError(named, 'A query');
       return { messages: [], totalCount: 0 };
     }
     const cm = agent.getContextManager();
@@ -25786,6 +26440,101 @@ export class AgentFramework {
     data?: Record<string, unknown>,
   ): void {
     this.opsAlert(kind, agentName, message, { data });
+  }
+
+  /**
+   * Tells the context manager what a stream's later round carries after its compiled messages: every round so far,
+   * in sent order, with the round's own rows appended (roundRows): each stored row's id where the next request will
+   * carry it as the stream sent it, the marker where it won't. A request-only row (a heartbeat tick, a `[Continue]`)
+   * isn't a row here: the next request puts it back in the same place (renderRequestOnlyRows), and no compile holds
+   * it. A round with no `roundContent` (membrane's XML or fallback path, where the stored reply is the framework's
+   * rebuild) can't be vouched for, so nothing more of the stream is noted, and its later rounds' thinking is left
+   * out at the next compile rather than refused. So is a stream whose note threw or wrote nothing (noteStreamRows).
+   */
+  private noteRoundSent(agent: Agent, stream: YieldingStream, rows: RoundRow[], unvouched: boolean): void {
+    const notes = this.streamRequestNotes.get(stream);
+    if (!notes || notes.stopped) return;
+    if (unvouched) { notes.stopped = true; return; }
+    notes.rounds.push(...rows);
+    this.noteStreamRows(agent, notes);
+  }
+
+  /**
+   * At the stream's end, after its last reply is stored: every row so far, judged as of now, with that reply as the
+   * final row (or none, where the stream's last request had no reply after it). Past the record's end nothing
+   * keeps its thinking, so the last reply keeps its own only by being noted here. Judged as of now, a batch the
+   * tool-result guard held at its boundary and has since settled to the originals is named. A reply with no
+   * `roundContent` to vouch for ends noting instead, as a round's does.
+   */
+  private noteStreamEnd(agent: Agent, stream: YieldingStream, reply: RoundRow | undefined, unvouched: boolean): void {
+    const notes = this.streamRequestNotes.get(stream);
+    if (!notes || notes.stopped) return;
+    if (unvouched) { notes.stopped = true; return; }
+    if (reply) notes.rounds.push(reply);
+    notes.stopped = true;
+    this.noteStreamRows(agent, notes);
+  }
+
+  /**
+   * Every row so far, judged as of now (roundRows), noted. A note the context manager writes nothing for (false)
+   * ends the stream's notes, with a line saying so: where the stream's compile no longer wrote the branch's record, or
+   * the branch has none, no later note could write either; where its store failed, a later one might, and stopping
+   * gives that up for this stream's later rounds, whose thinking then goes at the next compile, as it would have
+   * after the failed write. A note that throws is a fault, and ends them too.
+   */
+  private noteStreamRows(agent: Agent, notes: StreamRequestNotes): void {
+    const cm = agent.getContextManager();
+    try {
+      const ids = notes.rounds.flatMap((row) => row.id === undefined ? [] : [row.id]);
+      const rendered = cm.renderAsNewest(ids);
+      const carried = new Map<MessageId, { participant: string; content: ContentBlock[] } | null>();
+      ids.forEach((id, i) => {
+        const stored = cm.getMessage(id);
+        const content = rendered ? rendered[i]! : stored?.content ?? null;
+        carried.set(id, stored && content ? { participant: stored.participant, content } : null);
+      });
+      const rows = roundRows(notes.rounds, (id) => carried.get(id) ?? null);
+      if (!notes.note(rows)) {
+        notes.stopped = true;
+        console.error(`[thinking-binding] ${agent.name}: the context manager wrote nothing for this stream's note (its compile no longer wrote the branch's binding record, the branch has none, or the store failed), so this stream notes nothing more, and the thinking of its rounds from here is left out at the next compile`);
+      }
+    } catch (error) {
+      notes.stopped = true;
+      console.error(`[thinking-binding] ${agent.name}: couldn't note the rounds this stream sent, so its later rounds' thinking is left out at the next compile:`, error);
+    }
+  }
+
+  /**
+   * A call's dropped blocks, placed, against the branch's binding-record start (splitThinkingDrops). Replies stored at
+   * or below it may lose their thinking with no strip having missed, since the context manager recorded nothing they
+   * were sent under, and so may any block for a binding the record doesn't track (the account's). Any other drop is
+   * one the record doesn't account for: a change ahead of it that the record didn't see. The operators hear of it
+   * once per incident, again only if a call shows more, and the incident ends at a call that shows no unexpected drop
+   * (ThinkingLossIncidents).
+   */
+  private noteThinkingLoss(agentName: string, placed: readonly PlacedDrop[], recordedAfter: number): void {
+    const { unexpected } = splitThinkingDrops(placed, recordedAfter);
+    const count = this.thinkingLossIncidents.observe(agentName, unexpected.length);
+    if (count === undefined) return;
+    const replies = unexpected.filter((drop) => drop.kind === 'reply');
+    const rounds = unexpected.filter((drop) => drop.kind === 'round');
+    const unplaced = unexpected.filter((drop) => drop.kind === 'unplaced');
+    this.opsAlert('thinking-binding-loss', agentName,
+      `the provider dropped ${count} signed thinking block${count === 1 ? '' : 's'} that the context manager's ` +
+      `binding record doesn't account for (${replies.length} in stored replies after the record began at sequence ` +
+      `${recordedAfter}, ${rounds.length} from the stream's own rounds, ${unplaced.length} that couldn't be placed). ` +
+      'The agent loses that reasoning, and without ' +
+      'thinkingBinding.dropBlock an account that enforces the binding would have refused the request. It clears at a ' +
+      'call that drops none of those. If it recurs, look for what changes this agent\'s requests after the compile, such as a ' +
+      'membrane request hook',
+      { data: {
+        blocks: count,
+        recordedAfter,
+        replies: replies.flatMap((drop) => drop.bodies.map((body) => body.messageId)),
+        rounds: rounds.map((drop) => drop.round),
+        unplaced: unplaced.length,
+        reasons: [...new Set(unexpected.map((drop) => drop.entry.reason))],
+      } });
   }
 
   private opsAlert(
@@ -26243,7 +26992,7 @@ export class AgentFramework {
     for (const config of serverConfigs) {
       const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
       this.mcplPrefixMap.set(prefix, config.id);
-      this.mcplServerConfigs.set(config.id, config);
+      this.setMcplServerConfig(config);
     }
 
     // Find shouldTriggerInference callback:
@@ -26492,6 +27241,10 @@ export class AgentFramework {
     // never gate this: queued marks are delivered in the background.
     this.readyMcplPlanes();
     this.deliverDiscordAwarenessInBackground('startup', 'host');
+    // RFC-014 §5.3: each toolHints server's open toolsets, read once its policy settled.
+    for (const server of this.mcplServerRegistry?.getAllServers() ?? []) {
+      if (server.isConnected) this.reattachToolsets(server);
+    }
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
@@ -27122,6 +27875,76 @@ export class AgentFramework {
   }
 
   /**
+   * The host capabilities offered to one server: the host's own, plus
+   * RFC-014's `toolHints` where its configuration asks for them. Without it,
+   * the very object every server is offered.
+   */
+  private mcplHostCapabilitiesFor(config: McplServerConfig): McplHostCapabilities {
+    const base = this.mcplHostCapabilities!;
+    return config.toolHints === true ? { ...base, toolHints: true } : base;
+  }
+
+  /** RFC-014: every toolHints server's presence, made on first use. */
+  private toolsets(): ToolsetHub {
+    return (this.toolsetHub ??= new ToolsetHub({
+      notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
+      log: (line) => console.error(`[mcpl] ${line}`),
+      listedName: (serverId, tool) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`,
+    }));
+  }
+
+  /** RFC-014: the `toolsets` module (toolsets--open, --act, --look,
+   *  --close), registered once, by the first server configured with
+   *  toolHints. Its tools don't change after that. */
+  private async ensureToolsetsModule(): Promise<void> {
+    const hub = this.toolsets();
+    const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
+    if (existing instanceof ToolsetsModule) return;
+    if (existing) {
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints needs that name for its meta-tools`);
+    }
+    await this.addModule(new ToolsetsModule(hub));
+  }
+
+  /** RFC-014 §5.3: after a (re)connect whose policy has settled, read what
+   *  the server holds open and adopt it. In the background: its notices are
+   *  written as they come. */
+  private reattachToolsets(connection: McplServerConnection): void {
+    const controller = this.toolsetHub?.get(connection.id);
+    if (!controller) return;
+    void controller.connected(connection).catch((error: unknown) => {
+      console.error(`[mcpl] ${connection.id}: reading its open toolsets failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  /**
+   * RFC-014 §8.3: a tool change with no result or event to ride on (a
+   * standalone tools/hints, a late result, a reconnect's adoption, a
+   * recovery) is told as a notice, which doesn't wake the agent. Like any
+   * delivery from a server into the conversation, it needs `pushEvents`
+   * (§6.1); without it the change is still tracked, and toolsets--look shows
+   * it. The text is the server's (its tool definitions, titles, reasons), so
+   * the notice names the server.
+   */
+  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): void {
+    const connection = this.mcplServerRegistry?.getServer(serverId);
+    if (!CapabilityGrant.of(connection).has('pushEvents')) {
+      console.error(`[mcpl] ${serverId}: a tool change was not told (pushEvents is not granted); ${META_TOOL_NAMES.look} shows it`);
+      return;
+    }
+    if (this.agents.size === 0) return;
+    try {
+      this.addMessage(
+        'user',
+        [{ type: 'text', text: `MCPL server "${serverId}", tool changes:\n${text}` }],
+        { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
+      );
+    } catch (error) {
+      console.error(`[mcpl] ${serverId}: a tool change notice could not be written:`, error);
+    }
+  }
+
+  /**
    * Connect a single MCPL server: register routing entries, open the
    * connection, wire events, and initialize feature sets / scopes /
    * checkpoints. Shared by startup (initializeMcpl) and the runtime
@@ -27192,7 +28015,7 @@ export class AgentFramework {
       if (owner === config.id && other !== prefix) this.mcplPrefixMap.delete(other);
     }
     this.mcplPrefixMap.set(prefix, config.id);
-    this.mcplServerConfigs.set(config.id, config);
+    this.setMcplServerConfig(config);
 
     if (family === 'modern') {
       // Registered and wired before its first connect, so the connect in
@@ -27277,6 +28100,8 @@ export class AgentFramework {
     let connection: McplServerConnection;
     // The transport the connect registered, which its own exchange is for.
     let registeredEpoch = 0;
+    // RFC-014: a toolHints server's meta-tools exist before it connects.
+    if (config.toolHints === true) await this.ensureToolsetsModule();
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
@@ -27286,11 +28111,14 @@ export class AgentFramework {
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
         connectionConfig,
-        this.mcplHostCapabilities,
+        this.mcplHostCapabilitiesFor(config),
         abort.signal,
         (registering) => {
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
+          // RFC-014 §6.1: hints apply as the connection reads them, from its
+          // first message, so the tap is on before any I/O can deliver one.
+          if (config.toolHints === true) this.toolsets().controllerFor(config).attach(registering);
         },
       );
     } catch (error) {
@@ -27369,6 +28197,8 @@ export class AgentFramework {
     // connected once its attempt settles, granted or not.
     if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      // RFC-014 §5.3: what the server holds open is the truth after a connect.
+      this.reattachToolsets(connection);
     }
     // A connection can make queued awareness work deliverable; it never
     // waits on it.
@@ -27608,6 +28438,15 @@ export class AgentFramework {
           ? (fetched as { revision: string }).revision : null;
       connection.manifestState.lastFetchedAt = Date.now();
       connection.droppedCapabilities = new Set(dropped);
+      // RFC-014 §5.1: the `toolsets` domain (toolHints, toolsets, surface),
+      // read from the manifest as fetched. A toolset removed ends its open
+      // instances; toolHints withdrawn makes every tool static. Its impact is
+      // surface-changed, applied, with no grant consequence (§17.6).
+      const declarations = toolsetDeclarationsOf(fetched);
+      const toolsetsChanged = config.toolHints === true
+        && JSON.stringify(declarations) !== JSON.stringify(connection.toolsetDeclarations);
+      connection.toolsetDeclarations = declarations;
+      if (toolsetsChanged) this.toolsetHub?.get(connection.id)?.manifestChanged(declarations);
 
       const newDeclared = Object.keys(this.featureSetManager?.getDeclaredFeatureSets(connection.id) ?? {});
       const newEnabled = newDeclared.filter((n) => this.featureSetManager?.isEnabled(connection.id, n));
@@ -27621,6 +28460,7 @@ export class AgentFramework {
         ...added.map((p) => ({ impact: 'capability-expansion-pending', subject: p, disposition: negotiated ? 'applied' : 'decision-needed' })),
         ...degraded.map((n) => ({ impact: 'feature-degraded', subject: n, disposition: 'applied' })),
         ...restored.map((n) => ({ impact: 'feature-restored', subject: n, disposition: negotiated ? 'applied' : 'decision-needed' })),
+        ...(toolsetsChanged ? [{ impact: 'surface-changed', subject: 'toolsets', disposition: 'applied' }] : []),
       ];
       this.emitTrace({
         type: 'mcpl:manifest-change-receipt',
@@ -28057,6 +28897,7 @@ export class AgentFramework {
         if (owner === id) this.mcplPrefixMap.delete(prefix);
       }
       this.mcplServerConfigs.delete(id);
+      referenceRegistry.forgetServerAddress(id, this);
 
       await this.refreshMcplTools();
       this.emitMcplToolDiff(oldToolNames, id);
@@ -28640,7 +29481,33 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      // RFC-014 §6.1 carrier 2: the tool change this push explains was
+      // applied as it was read; it's told after the event's own content. A
+      // push the host then refuses still tells its change, on its own.
+      const change = this.toolsetHub?.get(connection.id)?.changeText(params) ?? '';
+      const content = (params as { payload?: { content?: unknown } } | null)?.payload?.content;
+      if (!change || !Array.isArray(content)) {
+        if (change) this.recordToolsetNotice(connection.id, change, { invite: false });
+        await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+        return;
+      }
+      let refused = false;
+      const told = {
+        respond: (result: unknown) => {
+          if ((result as { accepted?: unknown } | null)?.accepted === false) refused = true;
+          responder?.respond(result);
+        },
+        respondError: (code: number, message: string, data?: unknown) => {
+          refused = true;
+          (responder?.respondError as ((code: number, message: string, data?: unknown) => void) | undefined)?.(code, message, data);
+        },
+      };
+      await this.pushHandler?.handlePushEvent(
+        connection.id,
+        { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
+        told as never,
+      );
+      if (refused) this.recordToolsetNotice(connection.id, change, { invite: false });
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -28840,6 +29707,9 @@ export class AgentFramework {
         // listeners can close it.
         if (connection.transportEpoch !== epoch || !connection.isConnected) return;
         this.handleToolsListChanged(connection.id);
+        // RFC-014 §5.2–5.3: what the server still holds open is adopted, and
+        // what it doesn't is closed; nothing is re-opened.
+        this.reattachToolsets(connection);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,
@@ -29002,6 +29872,8 @@ export class AgentFramework {
       // Lost for good (no reconnect, and the registry has dropped it): its
       // tools leave the agents' list, as a disconnect's do.
       if (!connection.willReconnect && this.mcplServerRegistry?.getServer(connection.id) !== connection) {
+        // RFC-014: its toolsets go with it; a next connection reads them again.
+        this.toolsetHub?.get(connection.id)?.detach(connection);
         this.handleToolsListChanged(connection.id);
       }
     });
@@ -29128,8 +30000,22 @@ export class AgentFramework {
         listedServers.add(server.id);
         const listed = new Set<string>();
         const repeated: string[] = [];
+        // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
+        // the conversation and called through toolsets--act, never offered
+        // here: every change to this list rebuilds the prompt cache. Their
+        // server, RFC-008 class and feature set are kept as any tool's are,
+        // so a call act makes is attributed, classed and state-exchanged as
+        // a direct call of the tool would be. The list was read through the
+        // server's tap, so its presence is current.
+        // A static↔dynamic move the server hinted applies here, at a list
+        // boundary (§4.2), and the agent is told where the tool went.
+        const presence = this.toolsetHub?.get(server.id);
+        const moves = presence?.presence.active ? presence.applyMoves() : [];
+        if (moves.length > 0) this.recordToolsetNotice(server.id, moves.join('\n'), { invite: false });
+        const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
+          const offered = !dynamic(tool.name);
           const namespacedName = `${prefix}--${tool.name}`;
           if (listed.has(namespacedName)) {
             if (!repeated.includes(tool.name)) repeated.push(tool.name);
@@ -29152,11 +30038,13 @@ export class AgentFramework {
               : undefined;
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
-          tools.push({
-            name: namespacedName,
-            description: tool.description ?? '',
-            inputSchema: schema,
-          });
+          if (offered) {
+            tools.push({
+              name: namespacedName,
+              description: tool.description ?? '',
+              inputSchema: schema,
+            });
+          }
           if (featureSet !== undefined) {
             toolFeatureSets.set(namespacedName, featureSet);
           }
@@ -29472,6 +30360,22 @@ export class AgentFramework {
       });
       return;
     }
+    // RFC-014: a dynamic tool isn't in the list; it's called through act,
+    // which marks the call it resolved (toolsetActCalls) with its instance.
+    const act = this.toolsetActCalls?.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) {
+      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'a dynamic tool, called through toolsets--act' });
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        toolName: call.name,
+        agentName,
+        moduleName: `mcpl:${serverId}`,
+        result: this.refusedResult(agentName, call.id, dynamicRefusal),
+      });
+      return;
+    }
 
     this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
@@ -29530,7 +30434,9 @@ export class AgentFramework {
       if (mcpl) {
         if (!Array.isArray(direct.data)) return direct;
         // Each block by the classifier, then what's nested in each, at any
-        // depth. The blocks came from the wire as JSON, so the round trip
+        // depth, each reading the claims of everything the script's view
+        // shows, nested fields included (scriptViewClaims; Ada-1017, room-203
+        // #200094). The blocks came from the wire as JSON, so the round trip
         // changes nothing else. But a value that parsed can still fail to go
         // back: past some depth JSON.stringify overflows the stack where
         // JSON.parse didn't (on Node 24.19 an array 5,000 deep does, on Bun
@@ -29547,15 +30453,47 @@ export class AgentFramework {
         // dropped, since they are untreated and the result travels on, to the
         // waiter and to the listeners of its event's trace. Its structured
         // content is kept, as every result keeps it, since RFC-005's
-        // treatment doesn't reach it.
-        const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId));
-        try {
-          return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId))) as unknown[] };
-        } catch (err) {
+        // treatment doesn't reach it. The view's claims are read first, by
+        // a walk of their own: where it stops, the treatment doesn't run
+        // (Ada-1017, room-203 #200250), a RangeError meaning a result it
+        // can't convert, as below, and anything else a fault.
+        const unconvertible = (err: unknown): ToolResult => {
           if (!(err instanceof RangeError)) throw err;
-          const unconvertible: ToolResult = { ...direct, data: [] };
-          SCRIPT_RESULT_UNCONVERTIBLE.set(unconvertible, err);
-          return unconvertible;
+          const dropped: ToolResult = { ...direct, data: [] };
+          SCRIPT_RESULT_UNCONVERTIBLE.set(dropped, err);
+          return dropped;
+        };
+        let claims: ResultClaims;
+        // The model's line for a peer's content reads its blocks' claims
+        // alone, and each record as it stood before the treatment registered
+        // anything (openJournal), which decide where a link's object shows
+        // its uri (Ada-1017, room-203 #202683).
+        let lineClaims: ResultClaims;
+        try {
+          // As the dispatch read them for its demand fetch, where it did.
+          const read = SCRIPT_VIEW_CLAIMS.get(direct.data);
+          if (read && 'error' in read) throw read.error;
+          claims = read ? read.claims : scriptViewClaims(direct.data, true);
+          lineClaims = resultClaimsOrThrow(direct.data, true);
+        } catch (err) {
+          return unconvertible(err);
+        }
+        const journal = referenceRegistry.openJournal();
+        try {
+          const line: ScriptLine = { claims: lineClaims, recordBefore: journal.before };
+          const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims, line));
+          // The top-level blocks were treated just above; the pass treats
+          // what's nested in them. Reading a treated block again would take
+          // a link object's uri, as shownUri shows it, for a new link,
+          // registered apart from the one the result named.
+          const nested = function (this: unknown, _key: string, value: unknown): unknown {
+            return this === blocks ? value : shownToScriptFromServer(value, serverId, claims, line);
+          };
+          return { ...direct, data: JSON.parse(JSON.stringify(blocks, nested)) as unknown[] };
+        } catch (err) {
+          return unconvertible(err);
+        } finally {
+          journal.close();
         }
       }
       // A standard peer's content that isn't a list of blocks is a malformed
@@ -29630,7 +30568,10 @@ export class AgentFramework {
       }
     }
 
-    legacy.sendToolsCall(toolName, args, stateParams)
+    legacy.sendToolsCall(toolName, args, stateParams, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined)
+      // RFC-014 §6.2: a call reports its own consequences; the tool change
+      // its result carried is told after the server's content.
+      .then((result) => this.withToolsetChange(serverId, result))
       .then(async (result) => {
         // RFC-005: register references and fetch the small ones, and every
         // one a script will read, before serialization, so their stubs carry
@@ -29641,7 +30582,26 @@ export class AgentFramework {
         if (mcplPeer) {
           const scriptReads = forScript
             && (!result.isError || Object.prototype.hasOwnProperty.call(result, 'structuredContent'));
-          await this.autoFetchReferences(result.content, serverId, scriptReads ? 'script' : 'model')
+          // A script's demand fetch reads the claims of everything its view
+          // shows, as the module route's does; where that walk stops, the view
+          // isn't written (reading()), so nothing is fetched for it, the
+          // references only registered (Ada-1017, room-203 #201013).
+          let mode: 'register' | 'model' | 'script' = scriptReads ? 'script' : 'model';
+          let claims: ResultClaims | undefined;
+          // Only where the script reads a view of the blocks (reading()'s own
+          // condition): without structured content it reads the model lane's
+          // text, and its fetch passes over what each top-level block's own
+          // expiry marks, as a model's call does. No fetch reads a `never`.
+          if (scriptReads && Object.prototype.hasOwnProperty.call(result, 'structuredContent') && Array.isArray(result.content)) {
+            try {
+              claims = scriptViewClaims(result.content, true);
+              SCRIPT_VIEW_CLAIMS.set(result.content, { claims });
+            } catch (error) {
+              SCRIPT_VIEW_CLAIMS.set(result.content, { error });
+              mode = 'register';
+            }
+          }
+          await this.autoFetchReferences(result.content, serverId, mode, claims)
             .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
         }
         return { result, toolResult: await reading(result, mcplPeer) };
@@ -29842,11 +30802,14 @@ export class AgentFramework {
     // for callers that expect data to be string-ish (mcplResultText).
     let textContent = mcplResultText(blocks);
     if (blocks.length === 0 && hasStructured) textContent = JSON.stringify(result.structuredContent) ?? 'null';
-    const hasNonText = blocks.some((c) => c.type !== 'text');
+    const hasNonText = blocks.some((c) => c?.type !== 'text');
     const structured = hasStructured ? { structured: result.structuredContent } : {};
+    // Blocks passed through are marked as content (dataIsContent), so each
+    // shows as itself, its stub or its marker, never as the array's JSON.
     return {
       success: !result.isError,
       data: result.isError ? undefined : hasNonText ? blocks : (textContent || undefined),
+      ...(!result.isError && hasNonText ? { dataIsContent: true } : {}),
       error: result.isError ? (textContent.trim() ? textContent : mcplToolNoWordsText(serverId, callName)) : undefined,
       isError: result.isError ?? false,
       ...structured,
@@ -30297,6 +31260,9 @@ export class AgentFramework {
       });
       const shadowWarnings = this.eventGate!.lintShadows()
         .map((w) => formatShadowWarning(w));
+      // A rule no probe event matches, such as one scoped to external-message,
+      // is invisible in the table: name it, so its rows don't read as its effect.
+      const notProbed = this.eventGate!.probeUnreached();
       finish({
         success: true,
         data: {
@@ -30305,9 +31271,16 @@ export class AgentFramework {
           policies: this.getGatePolicyNames(),
           ...(shadowWarnings.length > 0 ? { shadowWarnings } : {}),
           probes,
+          ...(notProbed.length > 0
+            ? { notProbed, notProbedNote: 'No probe event matches these rules, so the probes above don\'t show what they do: the probes are a few MCPL chat events and a heartbeat, and these rules ask for something none of them carries, such as another event type (a module\'s messages are external-message), a source, channel or path, or particular content, metadata or tags.' }
+            : {}),
           ...(probes.some((p) => 'changed' in p)
             ? {}
-            : { note: 'No canonical probe changed its winning rule — the new rule affects none of the common chat/heartbeat shapes, or only channel/path-specific events the probes do not model.' }),
+            : {
+              note: notProbed.includes(policy.name)
+                ? 'No canonical probe changed its winning rule: the new rule matches no probe event (see notProbed), so the probes don\'t show its effect.'
+                : 'No canonical probe changed its winning rule — the new rule affects none of the common chat/heartbeat shapes.',
+            }),
         },
       });
     } catch (err) {
@@ -30440,6 +31413,27 @@ export class AgentFramework {
   }
 
   private dispatchSleepToolCall(agentName: string, call: ToolCall): void {
+    // The gate's sleep quiets the whole agent, every conversation of it, so a
+    // conversation fork or an ephemeral run neither sets one nor ends the
+    // agent's own. Refused before the tool runs, as a fork's channel_open is.
+    const fork = this.conversationAgentHomes.has(agentName);
+    if (fork || this.ephemeralRuns.has(agentName)) {
+      const one = fork ? 'conversation' : 'run';
+      // Only where the fork can follow it: skip_reply needs the channel
+      // registry, which a fork made from an event pushed straight to the
+      // framework (pushEvent, with no MCPL server) doesn't have, and a
+      // closing fork's wake ends with it.
+      const comeBack = fork && this.channelRegistry && this.canAgentUseTool(agentName, 'skip_reply')
+        && !this.closingConversationAgents.has(agentName)
+        ? ' To come back to this conversation later, call skip_reply with wake_in_seconds.'
+        : '';
+      const error = call.name === 'sleep'
+        ? `Nothing was set: a sleep quiets the whole agent, not one ${one}.${comeBack}`
+        : `Nothing was changed: a sleep is the agent's, so this ${one} can't end one.`;
+      this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: `${agentName}: ${error}` });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result: this.refusedResult(agentName, call.id, error) });
+      return;
+    }
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
     const gate = this.eventGate!;
     const input = (call.input ?? {}) as { seconds?: number; announce?: boolean; message?: string };
@@ -30560,8 +31554,8 @@ export class AgentFramework {
    * Handle the synthesized `read_image` tool: read image bytes from a
    * workspace mount and return them as a native MCP-shaped content array
    * (`[{type:'text'…},{type:'image', data, mimeType}]`). The live-turn
-   * converter (tryNativeToolResultContent → membrane tool_result image
-   * blocks) delivers the actual image to the model; history storage keeps
+   * converter (toMembraneToolResult's nativeContent → membrane tool_result
+   * image blocks) delivers the actual image to the model; history storage keeps
    * the standard compact `[image: …]` placeholder.
    */
   /** RFC-005 on-demand dereference: [ref id] → workspace file, via the
@@ -30627,8 +31621,13 @@ export class AgentFramework {
         if (typeof input.path !== 'string' || input.path.length === 0) {
           throw new Error('read_image: `path` (mount-prefixed) is required');
         }
-        // Anthropic rejects images >5MB (and >8000px); guard the hard byte
-        // limit here — resizing is out of scope without an image library.
+        // This host's own per-image limit for read_image, applied to every
+        // image it reads, whichever route the image would go to: read_image
+        // refuses an image over it. It's kept for providers that enforce one,
+        // though some routes take more. The standard MCP reading holds an
+        // inline image to the same 5 MB (NATIVE_IMAGE_MAX_BYTES in
+        // tool-result-normalize.ts); the RFC-005 lanes hold an image to no
+        // such limit. Resizing is out of scope without an image library.
         const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
         // Prefer the workspace module's own read_image handler when it exists:
         // it reads tree-first with a FILESYSTEM FALLBACK, so binaries that live
@@ -30656,7 +31655,7 @@ export class AgentFramework {
             if (byteLength > MAX_IMAGE_BYTES) {
               throw new Error(
                 `read_image: "${input.path}" is ~${byteLength} bytes — ` +
-                `over the ${MAX_IMAGE_BYTES}-byte model limit`,
+                `over the ${MAX_IMAGE_BYTES}-byte limit this host sends per image`,
               );
             }
           }
@@ -30675,7 +31674,7 @@ export class AgentFramework {
         if (read.data.byteLength > MAX_IMAGE_BYTES) {
           throw new Error(
             `read_image: "${input.path}" is ${read.data.byteLength} bytes — ` +
-            `over the ${MAX_IMAGE_BYTES}-byte model limit`,
+            `over the ${MAX_IMAGE_BYTES}-byte limit this host sends per image`,
           );
         }
         finish({
@@ -30850,9 +31849,11 @@ export class AgentFramework {
           if (candidate.ref === null) {
             throw new Error(
               `save_recent_image: image at index ${position} is a tool-result image from ${describeTool(candidate)} ` +
-              'recorded without a retention ref (written before tool-image retention existed, or inside a ' +
-              'script run, where tool images are not retained) — its bytes are not available. Nothing written. ' +
-              'Re-run the tool for a fresh image rather than saving an older one.',
+              'recorded without a retention ref (written before tool-image retention existed, inside a ' +
+              'script run, where tool images are not retained, or nested in the tool\'s data rather than its ' +
+              'content, where an image is kept only as its placeholder) — its bytes are not available. Nothing written. ' +
+              'Re-run the tool for a fresh image rather than saving an older one, unless the image came nested in ' +
+              'its data, which a re-run records the same way.',
             );
           }
           const lookup = ledger.lookup(candidate.ref);
@@ -31016,6 +32017,9 @@ export class AgentFramework {
           for (let i = messages.length - 1; i >= 0 && collecting(); i--) {
             const content = messages[i]?.content;
             if (!Array.isArray(content)) continue;
+            // Another agent's stored context injection isn't in this agent's
+            // view (stored-injections.ts), so its images aren't either.
+            if (isAnotherAgentsInjection(messages[i]?.metadata, agentName)) continue;
             const messagesBack = total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {

@@ -5,6 +5,7 @@ export * from './types/index.js';
 export { AgentFramework, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
+export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
@@ -95,6 +96,8 @@ export type { McplServerConfig } from './mcpl/index.js';
 // exactly the way the framework host does: MCPL over stdio or WebSocket, and
 // modern MCP over stdio or Streamable HTTP)
 export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
+// RFC-014: the meta-tools' module and its names.
+export { ToolsetsModule, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/index.js';
 export { ModernMcpConnection } from './mcpl/index.js';
 export type { ModernToolCallResult } from './mcpl/index.js';
 export {

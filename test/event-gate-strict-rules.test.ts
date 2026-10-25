@@ -1799,7 +1799,9 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   // The disk fills partway through the reconcile's write.
   const gate = failingStart(dir, 'write', 'ENOSPC: no space left on device, write', { default: 'skip', policies: [userInput, tickets] } as GateConfig);
 
-  assert.deepEqual(names(gate), ['user-input', 'mine', 'tickets'], 'what it read, and what it was adding');
+  // The recipe's rule "tickets" takes its recipe place, after "user-input" and ahead of gate.json's own "mine" (the
+  // start's merge against the recipe last applied), where an append put it last.
+  assert.deepEqual(names(gate), ['user-input', 'tickets', 'mine'], 'what it read, and what it was adding');
   assert.equal(gate.getStatus().configSource, 'file');
   const [fileError, unsaved, ...rest] = gate.getStatus().errors;
   // gate.json's entry says what's in force, as the start's entry beside it does.
@@ -1845,14 +1847,14 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   });
   assert.throws(() => gate.removePolicy('mine'), { message: /^gate\.json isn't JSON the gate can read \(/ });
   assert.deepEqual(readFileSync(configPath), left);
-  assert.deepEqual(names(gate), ['user-input', 'mine', 'tickets']);
+  assert.deepEqual(names(gate), ['user-input', 'tickets', 'mine']);
   // Once gate.json is gone, a change edits the text that write was writing, so gate.json's own fields and the rule the
   // gate leaves out are written back as written; and once it's written, nothing the start ran is unsaved.
   rmSync(configPath);
   gate.addPolicy({ name: 'later', behavior: 'defer' });
   const rewritten = onDisk(configPath);
   assert.equal(rewritten.comment, 'ops');
-  assert.deepEqual(rewritten.policies.map((rule) => rule.name), ['user-input', 'mine', 'held', 'tickets', 'later']);
+  assert.deepEqual(rewritten.policies.map((rule) => rule.name), ['user-input', 'tickets', 'mine', 'held', 'later']);
   assert.ok(!gate.getStatus().errors.some((said) => said.startsWith('At start, adding')), gate.getStatus().errors.join(' | '));
 
   // A write that fails at its close, after it wrote, may have left gate.json part-written too.

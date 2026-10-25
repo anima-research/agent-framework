@@ -145,8 +145,10 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
     setStateJson: (_id: string, value: unknown) => { frameworkState = value; },
   };
   framework.agents = new Map([['sol', agentStub()]]);
-  // Conversation agents by their home channel; sol isn't one.
+  // Conversation agents by their home channel, and ephemeral runs by name;
+  // sol is neither.
   framework.conversationAgentHomes = new Map();
+  framework.ephemeralRuns = new Map();
   const windowMessages: string[] = [];
   /** Whose window each of those was addressed to: addMessage's forAgent, or
    *  undefined for the primary agent's. */
@@ -857,11 +859,8 @@ test("a sleep announced into a channel the agent or a module closed says the age
   assert.deepEqual(published.splice(0), [{ channelId: 'discord:g1:343434', text: quiet }]);
   routing.locus = ref(channelId);
 
-  // A conversation agent's announcement reads the same: the words follow the channel.
-  framework.conversationAgentHomes.set('sol', channelId);
-  slept = await sleep({ seconds: 600 });
-  framework.conversationAgentHomes.delete('sol');
-  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+  // A conversation agent announces nothing: its sleep is refused before the
+  // announcement (dispatchSleepToolCall; event-gate-sleep.test.ts).
 
   // Hybrid routing announces to the locus as locus mode does.
   framework.agents.set('sol', agentStub({ proseRouting: 'hybrid' }));

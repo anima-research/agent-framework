@@ -1817,6 +1817,7 @@ describe('present while acting', () => {
     framework.emitTrace = () => {};
     framework.pushEvent = () => {};
     framework.conversationAgentHomes = new Map();
+    framework.ephemeralRuns = new Map();
     framework.lastAnnouncedLocus = new Map();
     framework.activeTurnTriggers = new Map();
     framework.openLogical = new Map();
