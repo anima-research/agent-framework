@@ -263,46 +263,57 @@ export interface AgentConfig {
     dropBlock?: boolean;
     /**
      * Whether this agent's model binds its signed thinking to the
-     * conversation before it, as the host knows from its own model records.
-     * A context manager that keeps a record of what each branch sent can
-     * then leave out thinking whose earlier conversation changed before the
-     * provider sees it. Set:
-     * - each compile the agent sends tells the context manager so
-     *   (`thinkingBinding`: `binds`, `dropBlock` as set here, and the agent's
-     *   name as the `participant` whose replies are its own), with digests
-     *   of what the request carries ahead of its messages (`identity`: the
-     *   system text with its system-position injections, the tools in the
-     *   order sent, the model, and the thinking config, `maxTokens`,
-     *   `providerParams` and `prefillUserMessage`);
-     * - each framework stream tells the context manager which stored rows
-     *   its later rounds and its last reply carried as stored
-     *   (`noteRequestSent`), naming the compile it was built from, so their
-     *   thinking is kept at the next compile. The direct API
-     *   (`runInference`) notes nothing, so each of its replies' thinking is
-     *   left out at the compile after it's stored;
-     * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
-     *   starts a new stream mid-turn, since the new stream's compile can take
-     *   the turn's earlier reasoning out of the request;
-     * - with `dropBlock` set too, where a compile reports where the branch's
-     *   record began (`thinkingRecordedAfter`), a block the provider drops
-     *   that the record doesn't account for raises the
-     *   `thinking-binding-loss` ops alert, once per incident and again if a
-     *   call drops more. The provider reports drops only on a request that
-     *   carries the drop control; without it, such a block is refused.
-     * The record and the notes
-     * vouch for requests as agent-framework hands them to membrane, so a
-     * membrane `beforeRequest` hook that changes a request must change every
-     * request alike. Default false: compiles and streams are as they were.
+     * conversation before it, so that a change to anything before a thinking
+     * block sets it aside, as the host knows from its own model records. One
+     * fact with three states, each feature taking its own safe side where
+     * it's left out:
+     * - `true`: the host declares that the model binds. What relies on the
+     *   declaration is on (`declaresBinding`, agent.ts):
+     *   - each compile the agent sends tells the context manager so
+     *     (`thinkingBinding`: `binds`, `dropBlock` as set here, and the
+     *     agent's name as the `participant` whose replies are its own), with
+     *     digests of what the request carries ahead of its messages
+     *     (`identity`: the system text with its system-position injections,
+     *     the tools in the order sent, the model, and the thinking config,
+     *     `maxTokens`, `providerParams` and `prefillUserMessage`). Under
+     *     `toolDeclarations: 'entries'` these are the recorded head's, which
+     *     the request carries, so a declared change leaves them as they were,
+     *     and a move of the head changes them, so the compile for the new
+     *     head leaves out every thinking block;
+     *   - each framework stream tells the context manager which stored rows
+     *     its later rounds and its last reply carried as stored
+     *     (`noteRequestSent`), naming the compile it was built from, so their
+     *     thinking is kept at the next compile. The direct API
+     *     (`runInference`) notes nothing, so each of its replies' thinking is
+     *     left out at the compile after it's stored;
+     *   - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
+     *     starts a new stream mid-turn, since the new stream's compile can
+     *     take the turn's earlier reasoning out of the request;
+     *   - with `dropBlock` set too, where a compile reports where the
+     *     branch's record began (`thinkingRecordedAfter`), a block the
+     *     provider drops that the record doesn't account for raises the
+     *     `thinking-binding-loss` ops alert, once per incident and again if a
+     *     call drops more. The provider reports drops only on a request that
+     *     carries the drop control; without it, such a block is refused.
      *
-     * Consolidation reads it as true unless it's false, since a change to
-     * earlier bytes sets bound thinking aside. Under
-     * `toolDeclarations: 'entries'` a binding model consolidates for free
-     * only where no thinking sits before the compile's `firstChanged` (the
-     * first message that compile renders differently from the last one;
-     * thinking from there on is set aside by the compile's own change). Past
-     * a fifth of the input, or when a compile is refused over budget with
-     * changes kept, it consolidates anyway, setting that thinking aside. The
-     * host's model records carry it, beside "takes entries".
+     *   The record and the notes vouch for requests as agent-framework hands
+     *   them to membrane, so a membrane `beforeRequest` hook that changes a
+     *   request must change every request alike.
+     * - `false`: the host says the model doesn't bind. Compiles and streams
+     *   are as they were, and nothing is held back to keep thinking.
+     * - Left out: not declared. What relies on the declaration stays off, as
+     *   with `false`, and a choice that could set kept thinking aside is made
+     *   as for a model that binds (`mayBindThinking`, agent.ts), as with
+     *   `true`.
+     *
+     * The choice that reads `mayBindThinking` is consolidation under
+     * `toolDeclarations: 'entries'`: a model that may bind consolidates for
+     * free only where no thinking sits before the compile's `firstChanged`
+     * (the first message that compile renders differently from the last
+     * one; thinking from there on is set aside by the compile's own change).
+     * Past a fifth of the input, or when a compile is refused over budget
+     * with changes kept, it consolidates anyway, setting that thinking
+     * aside. The host's model records carry `binds`, beside "takes entries".
      */
     binds?: boolean;
   };

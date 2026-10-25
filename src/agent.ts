@@ -169,6 +169,24 @@ const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
+ * `thinkingBinding.binds` as a choice that could set kept thinking aside
+ * reads it: the model may bind unless the host says it doesn't (`false`), so
+ * left out, it counts as binding (AgentConfig.thinkingBinding.binds).
+ */
+export function mayBindThinking(config: Pick<AgentConfig, 'thinkingBinding'>): boolean {
+  return (config.thinkingBinding || undefined)?.binds !== false;
+}
+
+/**
+ * `thinkingBinding.binds` as what relies on the declaration reads it: on only
+ * where the host says the model binds (`true`), so left out, it's off
+ * (AgentConfig.thinkingBinding.binds).
+ */
+export function declaresBinding(config: Pick<AgentConfig, 'thinkingBinding'>): boolean {
+  return (config.thinkingBinding || undefined)?.binds === true;
+}
+
+/**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
  * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
@@ -207,7 +225,8 @@ export function assertAgentSwitches(config: AgentConfig): void {
       `${agent} thinkingBinding.binds`,
       config.thinkingBinding.binds,
       'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
-        'and false or leaving it out compiles as before',
+        'false says it doesn\'t, and leaving it out declares neither: compiles are as before, and a choice that could set kept ' +
+        'thinking aside is made as for a model that binds',
     );
   }
   if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
@@ -304,9 +323,9 @@ export class Agent {
   /** Whether requests ask the provider to drop signed thinking whose earlier
    *  conversation changed (see AgentConfig.thinkingBinding.dropBlock). */
   private readonly thinkingDropBlock: boolean;
-  /** Whether the model binds its signed thinking to the conversation before
-   *  it (see AgentConfig.thinkingBinding.binds). */
-  private readonly thinkingBinds: boolean;
+  /** Whether the host declares that the model binds its signed thinking, so
+   *  compiles tell the context manager (declaresBinding). */
+  private readonly declaresBinding: boolean;
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
@@ -327,8 +346,9 @@ export class Agent {
   readonly promptCaching: boolean;
   /** How requests declare tools and system text (see AgentConfig.toolDeclarations). */
   readonly toolDeclarations: NonNullable<AgentConfig['toolDeclarations']>;
-  /** Whether the model binds its thinking to everything before it (AgentConfig.thinkingBinding). */
-  readonly bindsThinking: boolean;
+  /** Whether the model may bind its thinking, as a choice that could set kept
+   *  thinking aside reads it (mayBindThinking). */
+  readonly mayBindThinking: boolean;
   /** Set by the framework's fail-safe once the provider refused a system
    *  change: this agent then declares on its head until it's built again. */
   private headUntilRestart = false;
@@ -462,7 +482,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.thinkingDropBlock = config.thinkingBinding?.dropBlock === true;
-    this.thinkingBinds = config.thinkingBinding?.binds === true;
+    this.declaresBinding = declaresBinding(config);
     this.refusalHandling = config.refusalHandling;
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
@@ -472,7 +492,7 @@ export class Agent {
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.toolDeclarations = config.toolDeclarations ?? 'head';
-    this.bindsThinking = (config.thinkingBinding || undefined)?.binds !== false;
+    this.mayBindThinking = mayBindThinking(config);
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -1426,9 +1446,9 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const binding = this.bindingCompileOptions(tools, (injections ?? [])
+    const binding = this.bindingCompileOptions(this.currentHead(tools, (injections ?? [])
       .filter((injection) => injection.position === 'system')
-      .flatMap((injection) => injection.content));
+      .flatMap((injection) => injection.content)));
     const assemble = async (): Promise<NormalizedRequest> => {
       const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
@@ -1604,9 +1624,11 @@ export class Agent {
     // current otherwise or before one is recorded (system-changes.ts).
     const entries = this.declaresEntries();
     let recorded = entries ? this.headDeclarations.read(this.name) : null;
-    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
+    // Each compile is told of the head it's made for: kv-unified's hash of it,
+    // and the thinking binding's digests of it, the head the request carries.
     const compile = (head: HeadDeclaration) => {
       const immutablePrefixHash = kvUnified ? headHash(head) : undefined;
+      const binding = this.bindingCompileOptions(head);
       return this.compileWithInjections(
         budget,
         injections,
@@ -1641,7 +1663,7 @@ export class Agent {
     }
     const settled = await this.settleHead(
       first,
-      kvUnified ? compiledWith : null,
+      kvUnified || this.declaresBinding ? compiledWith : null,
       availableTools,
       recorded,
       entries,
@@ -1733,6 +1755,8 @@ export class Agent {
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
+    // The binding of the compile the request is built from, which was made for its head.
+    const binding = this.bindingCompileOptions(settled.head);
     return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
   }
 
@@ -1795,7 +1819,7 @@ export class Agent {
    * @internal For the framework's preview and its budget rule; not a host API.
    */
   thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
-    return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
+    return this.declaresBinding ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
   /**
@@ -1803,21 +1827,22 @@ export class Agent {
    * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
    * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of
    * its messages, so a changed one can stand for a first difference where the context manager keeps a
-   * thinking-binding record. The system text is the one the request will carry, built from the system-position
-   * injections given to the compile as the kv-unified prefix hash builds it; the tools are the ones it will carry, in
-   * their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
+   * thinking-binding record. The system text and the tools are `head`'s, the head the request will carry (under
+   * `toolDeclarations: 'entries'` its recorded head, whatever the agent advertises now, so a declared change leaves
+   * them as they were and a move of the head changes them), as the kv-unified prefix hash takes it: the system text
+   * as sent, its system-position injections included, and the tools in their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
    * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
    * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
    */
-  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
+  private bindingCompileOptions(head: HeadDeclaration): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
     if (!thinkingBinding) return {};
     const { config, providerParams, prefillUserMessage } = this.requestSettings();
     return {
       thinkingBinding,
       identity: {
-        system: wireDigest(this.buildSystemPrompt(systemInjections)),
-        tools: wireDigest(tools),
+        system: wireDigest(systemTextOf(head.system)),
+        tools: wireDigest(head.tools),
         model: wireDigest(this.model),
         request: wireDigest({
           thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
@@ -2279,9 +2304,11 @@ export class Agent {
    * old head and no changes. The next assembly then declares the difference
    * as one change, or moves the head again for a replacement; never the old
    * changes beside a head that already holds them. The compile runs again
-   * when what it read changed, or when kv-unified hashed another head
-   * (`compiledWith`, null when the compile hashed none). A dry run shows the
-   * same, compiling again (dry) for another hashed head, and changes nothing.
+   * when what it read changed, or when it was made for another head
+   * (`compiledWith`, null when the compile was told nothing of its head):
+   * kv-unified's hash and the thinking binding's digests are both of the
+   * head's tools and system text, which headHash compares. A dry run shows
+   * the same, compiling again (dry) for another head, and changes nothing.
    */
   private async moveHead(
     compiled: CompileResult,
@@ -2344,7 +2371,7 @@ export class Agent {
     // Read only once consolidation is in question: context-manager compares
     // it when it's read.
     const { firstChanged } = compiled;
-    const free = firstChanged != null && firstChanged <= firstChange && !(this.bindsThinking && compiled.messages.slice(0, firstChanged)
+    const free = firstChanged != null && firstChanged <= firstChange && !(this.mayBindThinking && compiled.messages.slice(0, firstChanged)
       .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
     if (free) return { changeTokens, inputTokens };
     return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;

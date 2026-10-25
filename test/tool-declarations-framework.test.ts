@@ -130,31 +130,58 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
-  it('raises an operator line when the changes force the head to move', async () => {
-    // `binds` left out: consolidation reads that as a model that may bind, and the
-    // context manager keeps no record, so the compile keeps the reply's thinking.
-    // With `binds: true` its record would leave out thinking no stream noted as sent.
-    await withFramework([resident('alpha')], async (framework) => {
-      const traces: TraceEvent[] = [];
-      framework.onTrace((event) => { traces.push(event); });
+  it('raises an operator line when the changes force the head to move, naming the thinking it sets aside as `binds` says', async () => {
+    const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
+    // Left out, `binds` counts as a model that may bind, and the context manager keeps no
+    // record, so the compile keeps the reply's thinking. With `binds: true` and the drop
+    // control, the record keeps a reply stored before it began, and a move of the head
+    // changes the digests the compile is told, so that compile leaves the thinking out.
+    for (const [binding, clause] of [
+      [undefined, /: one whole write, and the thinking the request held set aside if its model binds it$/],
+      [{ binds: true, dropBlock: true }, /: one whole write, and the thinking the request held set aside$/],
+    ] as const) {
+      await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
+        const traces: TraceEvent[] = [];
+        framework.onTrace((event) => { traces.push(event); });
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        // A reply's thinking before the change, so no compile is free for a binding model.
+        alpha.getContextManager().addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+        await alpha.buildActivationRequest([tool('a')]);
+        const declared = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.ok(hasThinking(declared.messages), `${JSON.stringify(binding)}: a declared change keeps the thinking before it`);
+        alpha.noteResponseInput(10);
+        const request = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools?.map((t) => t.name), ['a', 'b'], 'past a fifth, the head moved');
+        assert.equal(hasThinking(request.messages), !binding, `${JSON.stringify(binding)}: with binds, the compile for the new head leaves the thinking out`);
+        const moved = traces.filter((t) => t.type === 'head:moved' && (t as { why: string }).why === 'consolidated');
+        assert.equal(moved.length, 1);
+        assert.equal((moved[0] as { forced?: string }).forced, 'share');
+        const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: { inputTokens?: number; forced?: string } }[];
+        assert.equal(alerts.length, 1);
+        assert.match(alerts[0]!.message, /a fifth of the last response's 10/);
+        assert.match(alerts[0]!.message, clause);
+        assert.equal(alerts[0]!.data?.inputTokens, 10);
+        assert.equal(alerts[0]!.data?.forced, 'share');
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      });
+    }
+  });
+
+  it('leaves out the thinking a replacement of the head sets aside, with `binds: true`, and keeps it past a declared change', async () => {
+    const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
+    await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
+      const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
       say(alpha, 'user', 'hello');
-      // A reply's thinking before the change, so no compile is free for a binding model.
       alpha.getContextManager().addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
-      await alpha.buildActivationRequest([tool('a')]);
-      await alpha.buildActivationRequest([tool('a'), tool('b')]);
-      alpha.noteResponseInput(10);
-      const request = await alpha.buildActivationRequest([tool('a'), tool('b')]);
-      assert.deepEqual(request.tools?.map((t) => t.name), ['a', 'b'], 'past a fifth, the head moved');
-      const moved = traces.filter((t) => t.type === 'head:moved' && (t as { why: string }).why === 'consolidated');
-      assert.equal(moved.length, 1);
-      assert.equal((moved[0] as { forced?: string }).forced, 'share');
-      const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: { inputTokens?: number; forced?: string } }[];
-      assert.equal(alerts.length, 1);
-      assert.match(alerts[0]!.message, /a fifth of the last response's 10/);
-      assert.match(alerts[0]!.message, /the thinking the request held set aside/);
-      assert.equal(alerts[0]!.data?.inputTokens, 10);
-      assert.equal(alerts[0]!.data?.forced, 'share');
+      say(alpha, 'user', 'and then');
+      assert.ok(hasThinking((await alpha.buildActivationRequest([tool('a')], system('v1'))).messages), 'adopted');
+      assert.ok(hasThinking((await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'))).messages), 'a declared change');
+      const replaced = await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
+      assert.equal(replaced.system, 'You are alpha.\nv2', 'the head moved');
+      assert.equal(hasThinking(replaced.messages), false, 'and the compile for it left the thinking out');
+      await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
     });
   });
 

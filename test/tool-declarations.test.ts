@@ -9,6 +9,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import type { ContextManager } from '@animalabs/context-manager';
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, Membrane, NormalizedMessage, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
@@ -87,6 +88,18 @@ const changeRow = (tools: ToolDefinition[]): Row => ({
   metadata: { system: true, kind: 'system-change', agent: 'agent' },
 });
 const lastMessage = (messages: NormalizedMessage[]) => messages.at(-1)!;
+/** A digest as a request's JSON carries the value, each object's keys sorted, as the agent takes one. */
+function digest(wire: unknown): string {
+  const encode = (item: unknown): string => {
+    if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`;
+    if (item && typeof item === 'object') {
+      const record = item as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${encode(record[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(item) ?? 'null';
+  };
+  return createHash('sha256').update(encode(JSON.parse(JSON.stringify(wire) ?? 'null'))).digest('hex');
+}
 const changesIn = (messages: readonly NormalizedMessage[]) =>
   messages.filter((m) => m.content.some((b) => (b as { type: string }).type === 'system_change')).map((m) => m.content);
 
@@ -684,7 +697,46 @@ describe('toolDeclarations', () => {
     assert.throws(() => agentOn(context, { toolDeclarations: 'sk-pasted-secret' as never }), (e: Error) => /Agent "agent" toolDeclarations must be 'head' or 'entries', not another string:/.test(e.message) && !e.message.includes('sk-pasted-secret'));
     assert.throws(() => agentOn(context, { thinkingBinding: true as never }), /Agent "agent" thinkingBinding/);
     assert.throws(() => agentOn(context, { thinkingBinding: { binds: 'false' as never } }), /Agent "agent" thinkingBinding.binds must be true or false, unquoted, not a string/);
-    assert.equal(agentOn(context, { thinkingBinding: null as never }).bindsThinking, true);
-    assert.equal(agentOn(context, { thinkingBinding: { binds: false } }).bindsThinking, false);
+  });
+
+  it('reads `thinkingBinding.binds` in three states: left out, a model that may bind with nothing declared', () => {
+    const context = fakeContext();
+    const read = (thinkingBinding: unknown) => {
+      const agent = agentOn(context, { thinkingBinding: thinkingBinding as never });
+      return [agent.mayBindThinking, agent.thinkingBindingOption() !== undefined];
+    };
+    assert.deepEqual(read({ binds: true }), [true, true], 'true: may bind, and declared');
+    assert.deepEqual(read({ binds: false }), [false, false], 'false: neither');
+    for (const left of [undefined, null, {}, { dropBlock: true }]) {
+      assert.deepEqual(read(left), [true, false], `${JSON.stringify(left)}: may bind, nothing declared`);
+    }
+  });
+
+  it("tells a compile with `binds: true` the head the request carries under 'entries': a declared change keeps its digests, a move changes them", async () => {
+    const context = fakeContext([said('user', 'hello')]);
+    const agent = agentOn(context, { toolDeclarations: 'entries', thinkingBinding: { binds: true } });
+    type Identity = Record<'system' | 'tools' | 'model' | 'request', string>;
+    const assemble = (tools: ToolDefinition[], system: string) => (agent as unknown as {
+      assembleActivationRequest(t: ToolDefinition[], i: unknown[]): Promise<{ request: NormalizedRequest; binding: { identity?: Identity } }>;
+    }).assembleActivationRequest(tools, [systemInjection(system)]);
+    const lastIdentity = () => (context.compiles.at(-1) as { identity?: Identity }).identity!;
+    const carried = (request: NormalizedRequest, identity: Identity, what: string) => {
+      assert.equal(identity.system, digest(request.system), `${what}: the system text the request carries`);
+      assert.equal(identity.tools, digest(request.tools ?? []), `${what}: the tools it carries`);
+    };
+    const adopted = await assemble([tool('a')], 'v1');
+    carried(adopted.request, lastIdentity(), 'adopted');
+    const declared = await assemble([tool('a'), tool('b')], 'v1');
+    assert.deepEqual(lastIdentity(), adopted.binding.identity, 'a declared change: the head, and its digests, as they were');
+    carried(declared.request, lastIdentity(), 'declared');
+    const moved = await assemble([tool('a'), tool('b')], 'v2');
+    carried(moved.request, lastIdentity(), 'moved');
+    assert.notEqual(lastIdentity().tools, adopted.binding.identity!.tools, 'a move: the new head\'s digests');
+    // A replacement that takes no change row still compiles again for the new head.
+    const replaced = await assemble([tool('a'), tool('b')], 'v3');
+    carried(replaced.request, lastIdentity(), 'replaced, with no change row to take');
+    for (const { binding } of [adopted, declared, moved, replaced]) assert.ok(binding.identity, 'the stream notes with the binding');
+    assert.deepEqual(moved.binding.identity, (context.compiles.at(-3) as { identity?: Identity }).identity, "and the stream's binding is the compile's the request was built from");
+    assert.deepEqual(replaced.binding.identity, lastIdentity());
   });
 });

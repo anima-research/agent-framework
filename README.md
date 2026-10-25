@@ -100,9 +100,11 @@ record and its change rows gone, so an unrelated 400, such as one for an
 oversized image, ends its `'entries'` too. A consolidation waits for a compile that
 already rewrites the changes; past a fifth of the input, or when a compile
 is refused over budget with changes kept, it happens anyway, with an
-operator line. `thinkingBinding.binds` (default `true`) says the model binds
-its thinking to everything before it, so such a compile must keep no
-thinking before the changes, and a forced move sets that thinking aside. The host chooses both settings from what it knows
+operator line. `thinkingBinding.binds` says whether the model binds its
+thinking to everything before it. Unless it's `false`, such a compile must
+keep no thinking before the changes, and a forced move sets that thinking
+aside; with `true`, each compile is told the head the request carries, so
+the context manager leaves out the thinking a move of the head sets aside. The host chooses both settings from what it knows
 of the model; neither is a runtime setting.
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified

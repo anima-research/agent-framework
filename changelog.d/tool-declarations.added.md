@@ -9,8 +9,12 @@
   recognises, whatever caused it, goes again on the agent's current head,
   which it keeps to until it's built again. A consolidation waits for a
   compile that already rewrites
-  the changes, which `thinkingBinding.binds` (default `true`) narrows for
-  models that bind their thinking; past a fifth of the input, or when a
+  the changes, which `thinkingBinding.binds` narrows for a model that binds
+  its thinking: left out, it counts as one here, and only `false` says it
+  doesn't (what relies on the declaration, the context manager's record,
+  takes `true` alone). Under `'entries'`, the digests a compile with
+  `binds: true` is told are the recorded head's, so a declared change keeps
+  them and a move of the head changes them. Past a fifth of the input, or when a
   compile is refused over budget with changes kept, it happens anyway,
   raising an operator line (`head-consolidated`). The default,
   `'head'`, sends requests as before, leaving any system changes out. New

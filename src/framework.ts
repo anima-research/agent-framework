@@ -12417,6 +12417,15 @@ export class AgentFramework {
    * retries the turn at once (attempt + 1, so it continues the same turn:
    * no second undo checkpoint, the turn's tool-call count kept).
    */
+  /** What an operator line says of the thinking a move of an agent's head
+   *  sets aside: `said` outright where the host declares that the model binds
+   *  its thinking (`thinkingBinding.binds: true`), on that condition where
+   *  `binds` is left out, and nothing where the host says it doesn't. */
+  private thinkingSetAside(agent: Agent, said: string): string {
+    if (!agent.mayBindThinking) return '';
+    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
+  }
+
   private keepToHeadAfterRefusal(agent: Agent, error: Error, request: NormalizedRequest | undefined): boolean {
     if (!agent.declaresEntries() || !request?.messages.some(isSystemChangeMessage)) return false;
     const recognised = isMembraneError(error) && error.systemChangeRefused === true;
@@ -12426,7 +12435,7 @@ export class AgentFramework {
     console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until a restart: ${error.message}`);
     if (!recognised) {
       this.opsAlert('head-resend', agent.name,
-        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${agent.bindsThinking ? ', which sets aside the thinking the request held' : ''}. The 400 may not be about the change. The agent keeps to its head until a restart, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
+        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which sets aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until a restart, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
         { data: { httpStatus: 400 } });
     }
     this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
@@ -12447,7 +12456,7 @@ export class AgentFramework {
           ? `a compile was refused over budget with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
           : `the system changes reached ${event.changeTokens} tokens, a fifth of the last response's ${event.inputTokens}, with no compile that rewrote them already, so the head took them`;
         this.opsAlert('head-consolidated', agent.name,
-          `${why}: one whole write${agent.bindsThinking ? ', and the thinking the request held set aside' : ''}`,
+          `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
           { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });
       }
     });
