@@ -199,10 +199,14 @@ export interface MountConfig {
    * A path in a nested mount's directory is that mount's, whatever this
    * include covers: every tool gives the answer that names the mount holding
    * it and the path to use there. Through a link a mount follows, a place in
-   * that directory is named only where it's a directory, or a file that
-   * mount's own include covers with no file on its way, and is otherwise
-   * refused as leaving the mount. On a mount that doesn't follow links, a
-   * link on a path's way is refused, as on any such mount (followSymlinks).
+   * that directory is named only where it's a directory, or a file covered,
+   * with no file on its way, by that mount's own include and by the include
+   * of each other nested mount whose directory may hold it, from the
+   * innermost out to the first that surely holds it, and is otherwise
+   * refused as leaving the mount. A listing, or a pass, names a file there
+   * only where those includes cover it. On a mount that doesn't follow
+   * links, a link on a path's way is refused, as on any such mount
+   * (followSymlinks).
    * Every check compares a path with a nested mount's directory level by
    * level, as any disk may compare names: in either Unicode normalization
    * form and in any case, as fully as a disk that folds names may compare
@@ -213,9 +217,7 @@ export interface MountConfig {
    * directory in any spelling a disk may take for it reaches that mount,
    * whether or not the directory is on disk yet, and so does a link whose
    * target spells it otherwise. Where a link leads into the directory, the
-   * place beneath it is judged by that mount's include, and by the include
-   * of each other nested mount that may hold it, and named, as disk spells
-   * it. A path that names the directory itself keeps what lies
+   * place beneath it is judged, and named, as disk spells it. A path that names the directory itself keeps what lies
    * beneath as given, since that is the nested mount's to name. Where a disk
    * keeps apart two names the comparison joins, it errs toward the nested
    * mount, in where start places a mount as in every check: a name in

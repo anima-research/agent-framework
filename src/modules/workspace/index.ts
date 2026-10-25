@@ -178,7 +178,9 @@ class WorkspaceImageReadError extends Error {
  * (`other_mount`), whose message names the mount that holds it, or may hold
  * it, and the path to use there. A symlink leading into such a directory is
  * `other_mount` only where its refusal names that mount: a directory, or a
- * file that mount's include covers. Anywhere else, on a mount that doesn't follow
+ * file that mount's include covers, and so does the include of each other
+ * nested mount whose directory may hold it, out to the first that surely
+ * does. Anywhere else, on a mount that doesn't follow
  * symlinks, it gets the code of a link where it stands, `symlink` at the
  * path itself and `parent_symlink` on its way, and on one that does,
  * `escape`, as a path that leaves the mount. On a mount with an include, a

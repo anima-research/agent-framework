@@ -588,27 +588,29 @@ test('on a disk that tells case apart, a directory spelled otherwise than a nest
     assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
   });
 
-/** `work` holding history at `a/Bin/secret.md` from before `alpha` (include `keep.md`) was nested at `a` and `bin` at `a/bin`, started; links at `l` and `m` lead to the secret file and to `a/keep.md`. */
-async function twoDeepRig(t: TestContext, followSymlinks: boolean) {
+async function twoDeepRig(t: TestContext, followSymlinks: boolean, alphaInclude: string[] = ['keep.md']) {
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-two-deep-'));
   const dir = join(root, 'mount');
-  mkdirSync(join(dir, 'a', 'Bin'), { recursive: true });
-  mkdirSync(join(dir, 'a', 'bin'), { recursive: true });
+  for (const d of [['a', 'Bin'], ['a', 'bin'], ['A', 'Bin']]) mkdirSync(join(dir, ...d), { recursive: true });
   writeFileSync(join(dir, 'a', 'Bin', 'secret.md'), 'taken in before the nesting\n');
+  writeFileSync(join(dir, 'a', 'bin', 'x.md'), "bin's\n");
+  writeFileSync(join(dir, 'A', 'Bin', 'hidden.md'), 'taken in before the nesting\n');
   writeFileSync(join(dir, 'a', 'keep.md'), 'kept\n');
   const store = JsStore.openOrCreate({ path: join(root, 'store') });
   const work: MountConfig = { name: 'work', path: dir, mode: 'read-write', watch: 'never', ...(followSymlinks ? { followSymlinks: true } : {}) };
   const before = new WorkspaceModule({ mounts: [work] });
   before.initStore(store);
   await before.start(ctx);
-  await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  const synced = await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(synced.success, true, String(synced.error));
+  const held = await before.handleToolCall({ id: 'ls', name: 'ls', input: { path: 'work', recursive: true } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.deepEqual((held.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path).sort(), ['A/Bin/hidden.md', 'a/Bin/secret.md', 'a/bin/x.md', 'a/keep.md']);
   await before.stop();
-  symlinkSync(join('a', 'Bin', 'secret.md'), join(dir, 'l'));
-  symlinkSync(join('a', 'keep.md'), join(dir, 'm'));
+  for (const [link, target] of [['l', 'a/Bin/secret.md'], ['m', 'a/keep.md'], ['b', 'a/bin/x.md'], ['h', 'A/Bin/hidden.md'], ['d', 'a/Bin']]) symlinkSync(target!, join(dir, link!));
   const workspace = new WorkspaceModule({ mounts: [
     work,
-    { name: 'alpha', path: join(dir, 'a'), mode: 'read-write', watch: 'never', include: ['keep.md'] },
+    { name: 'alpha', path: join(dir, 'a'), mode: 'read-write', watch: 'never', include: alphaInclude },
     { name: 'bin', path: join(dir, 'a', 'bin'), mode: 'read-write', watch: 'never' },
   ] });
   workspace.initStore(store);
@@ -618,27 +620,51 @@ async function twoDeepRig(t: TestContext, followSymlinks: boolean) {
   return { workspace, tool };
 }
 
-test('on a disk that tells case apart, a place that surely lies in a nested mount whose include leaves it out is named by no listing, though a deeper nested mount may hold it', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
+test('on a disk that tells case apart, a place in a nested mount\'s directory is named by a listing only where each nested mount that may hold it names it, out to the first that surely holds it', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
   const { tool } = await twoDeepRig(t, false);
   const listed = await tool('ls', { path: 'work', recursive: true });
   assert.equal(listed.success, true, String(listed.error));
+  const entries = (listed.data as { entries: Array<{ path: string; note?: string }> }).entries;
+  assert.deepEqual(entries.map((e) => e.path), ['a/bin/x.md', 'a/keep.md', 'b', 'd', 'h', 'l', 'm']);
+  assert.equal(entries[0]!.note, 'it lies in mount "bin", nested in this one: use "bin/x.md"');
   const inA = await tool('ls', { path: 'work/a' });
+  assert.deepEqual((inA.data as { entries: Array<{ name: string }> }).entries.map((e) => e.name), ['bin', 'keep.md']);
   const status = await tool('status', { mount: 'work' });
-  const answers = JSON.stringify([listed.data, inA.data, status.data]);
-  assert.ok(!answers.includes('secret') && !answers.includes('Bin'), answers);
+  assert.equal((status.data as { work: { fileCount: number } }).work.fileCount, 2);
 });
 
-test('on a disk that tells case apart, a link to a place that surely lies in a nested mount whose include leaves it out names it nowhere, followed or not, though a deeper nested mount may hold it', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
+test('on a disk that tells case apart, a link into a nested mount\'s directory names the place only where each nested mount that may hold it names it, out to the first that surely holds it, followed or not', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
+  const code = (read: Promise<unknown>) => read.then(() => 'read', (err: unknown) => (err as WorkspaceReadError).code);
   const unfollowed = await twoDeepRig(t, false);
-  const notFollowed = await unfollowed.tool('read', { path: 'work/l' });
-  assert.equal(notFollowed.error, 'work/l: "work/l" is a symlink, which this mount does not follow');
-  assert.match(String((await unfollowed.tool('read', { path: 'work/m' })).error), /lies in mount "alpha", nested in mount "work": use "alpha\/keep\.md" in place of "work\/m"/);
+  const u = async (link: string) => String((await unfollowed.tool('read', { path: `work/${link}` })).error);
+  for (const link of ['l', 'h']) {
+    assert.equal(await u(link), `work/${link}: "work/${link}" is a symlink, which this mount does not follow`);
+    assert.equal(await code(unfollowed.workspace.readFileFromDisk(`work/${link}`)), 'symlink', link);
+  }
+  assert.match(await u('m'), /lies in mount "alpha", nested in mount "work": use "alpha\/keep\.md" in place of "work\/m"$/);
+  assert.match(await u('b'), /lies in mount "bin", nested in mount "work": use "bin\/x\.md" in place of "work\/b"$/);
+  assert.match(await u('d'), /may lie in mount "bin", nested in mount "work".*use "bin" in place of "work\/d"/);
+  for (const link of ['m', 'b', 'd']) assert.equal(await code(unfollowed.workspace.readFileFromDisk(`work/${link}`)), 'other_mount', link);
   const followed = await twoDeepRig(t, true);
-  await assert.rejects(followed.workspace.readFileFromDisk('work/l'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'escape' && err.message === 'Symlink escape detected: work/l');
-  const read = await followed.tool('read', { path: 'work/l' });
-  assert.equal(read.success, false);
-  assert.ok(!String(read.error).includes('secret') && !String(read.error).includes('mount "bin"'), String(read.error));
-  assert.match(String((await followed.tool('read', { path: 'work/m' })).error), /leads into mount "alpha", nested in mount "work".*use "alpha\/keep\.md"/);
+  const f = async (link: string) => String((await followed.tool('read', { path: `work/${link}` })).error);
+  for (const link of ['l', 'h']) {
+    assert.equal(await f(link), `Symlink escape detected: work/${link}`);
+    assert.equal(await code(followed.workspace.readFileFromDisk(`work/${link}`)), 'escape', link);
+  }
+  assert.equal(await f('m'), '"work/m" leads into mount "alpha", nested in mount "work", which neither reads nor writes it: use "alpha/keep.md".');
+  assert.equal(await f('b'), '"work/b" leads into mount "bin", nested in mount "work", which neither reads nor writes it: use "bin/x.md".');
+  assert.match(await f('d'), /^"work\/d" may lead into mount "bin", nested in mount "work".*use "bin"\./);
+  for (const link of ['m', 'b', 'd']) assert.equal(await code(followed.workspace.readFileFromDisk(`work/${link}`)), 'other_mount', link);
+});
+
+test('on a disk that tells case apart, each nested mount that may hold a place judges it by the place\'s own path beneath that mount\'s root', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
+  const unfollowed = await twoDeepRig(t, false, ['keep.md', 'Bin/**']);
+  const listed = await unfollowed.tool('ls', { path: 'work', recursive: true });
+  const secret = (listed.data as { entries: Array<{ path: string; note?: string }> }).entries.find((e) => e.path === 'a/Bin/secret.md');
+  assert.match(String(secret?.note), /^it may lie in mount "bin", nested in this one: .*use "bin\/secret\.md"/, JSON.stringify(listed.data));
+  assert.match(String((await unfollowed.tool('read', { path: 'work/l' })).error), /may lie in mount "bin", nested in mount "work".*use "bin\/secret\.md" in place of "work\/l"/);
+  const followed = await twoDeepRig(t, true, ['keep.md', 'Bin/**']);
+  assert.match(String((await followed.tool('read', { path: 'work/l' })).error), /^"work\/l" may lead into mount "bin", nested in mount "work".*use "bin\/secret\.md"/);
 });
 
 test('a nested mount\'s directory is matched level by level as any disk may compare names: in either normalization form and in any case, as fully as a disk that folds names may, at every level', () => {

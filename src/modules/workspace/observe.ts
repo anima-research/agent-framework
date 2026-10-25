@@ -296,12 +296,6 @@ function mayHold<T>(holders: readonly T[], depth: (holder: T) => number, sure: (
   return surely === -1 ? sorted : sorted.slice(0, surely + 1);
 }
 
-/**
- * Whether a link's refusal names the nested mount whose directory holds the
- * link's target: a directory, or a file the include of each nested mount
- * whose directory may hold it covers. A refusal's code follows the same test
- * (linkReadError's `other_mount`), so the code says no more than the message.
- */
 export function namesHolder(leads: { target: string; directory: boolean }, nested: readonly NestedMount[]): boolean {
   return nestedHolders(leads.target, nested).every((holder) => namesNestedPlace(restBeneath(leads.target, holder), holder.include, leads.directory));
 }
@@ -322,15 +316,6 @@ export function namesNestedPlace(rest: string, include: readonly string[] | unde
   return directory || insideMount(rest, include);
 }
 
-/**
- * Whether a path of a mount is one its passes decide and its listings may
- * name: inside its include, and, in a nested mount's directory, a place
- * each nested mount whose directory may hold it names (namesNestedPlace),
- * its directory included. History the
- * mount took in before another was nested there, which that mount's
- * include leaves out, is no mount's, so no pass decides it, and no listing
- * names it or a directory only it implies.
- */
 export function withinIncludes(view: Pick<MountView, 'include' | 'nested'>, path: string): boolean {
   if (!insideMount(path, view.include)) return false;
   return nestedHolders(path, view.nested ?? []).every((holder) => {
@@ -502,13 +487,11 @@ function nestedRootsAtReal(real: string, nested: readonly NestedMount[]): Array<
 
 /**
  * The nested mount whose root holds `real`, a canonical path, the innermost,
- * with the path to use there, the path beneath its root (`rest`), and
- * whether the include of each nested mount whose root may hold the place
- * names it (`names`); undefined when none does. A path the lexical checks
- * pass (inOtherMount, the tools' holderOf) reaches another mount's directory
- * this way through a symlink the mount follows, so each check that resolves
- * a path canonically asks this too, and names the mount only where `names`
- * says the place is that mount's.
+ * with the path to use there and the path beneath its root (`rest`);
+ * undefined when none does. A path the lexical checks pass
+ * (inOtherMount, the tools' holderOf) reaches another mount's directory this
+ * way through a symlink the mount follows, so each check that resolves a
+ * path canonically asks this too.
  */
 export async function nestedAtReal(real: string, nested: readonly NestedMount[] = [], at?: { name: string; rootReal: string }): Promise<{ name: string; use: string; rest: string; judgedByInclude: boolean; names: (directory: boolean) => boolean; guess?: NestedGuess } | undefined> {
   const holders = nestedRootsAtReal(real, nested);
