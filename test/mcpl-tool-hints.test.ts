@@ -590,6 +590,39 @@ test('a selector given as null reads as left out', async () => {
   } finally { await t.done(); }
 });
 
+test('an open or close whose outcome the host can\'t know is reported as unconfirmed, with look named; one known not sent, as not done', async () => {
+  const dropped = await setup((msg, peer) => {
+    if (msg.method !== 'toolsets/open') return false;
+    peer.ws.terminate();
+    return true;
+  }, { reconnect: true, reconnectIntervalMs: 60_000 });
+  try {
+    const r = await callTool(dropped.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
+    assert.ok(r.isError);
+    assert.match(resultText(r), /^arc didn't confirm opening build: The connection to the "arc" server closed before it answered/);
+    assert.match(resultText(r), /toolsets--look \{server:"arc"\} asks it what's open\.$/);
+    const again = await callTool(dropped.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
+    assert.ok(again.isError);
+    assert.equal(resultText(again), 'arc did not open build: arc is not connected right now; try again later', 'with the connection gone, an open is known not sent');
+  } finally { await dropped.done(); }
+
+  const refused = await setup((msg, peer, state) => {
+    if (msg.method === 'toolsets/open') {
+      state.open = [{ toolset: 'build', title: 'B' }];
+      peer.reply(msg.id, { toolset: 'build', title: 'B', _meta: { 'mcpl/hints': state.hint([{ name: 'place', visible: true }]) } });
+      return true;
+    }
+    if (msg.method === 'toolsets/close') { peer.error(msg.id, -32000, 'the board is locked'); return true; }
+    return false;
+  });
+  try {
+    await callTool(refused.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
+    const r = await callTool(refused.fw.framework, 'toolsets--close', { server: 'arc', toolset: 'build' });
+    assert.ok(r.isError);
+    assert.match(resultText(r), /^arc didn't confirm closing build: .*the board is locked\. toolsets--look \{server:"arc"\} asks it what's open\.$/);
+  } finally { await refused.done(); }
+});
+
 test('the host\'s argument check is bounded: no server pattern runs, and deep or wide schemas are left to the server', async () => {
   const { checkArgs } = await import('../src/mcpl/tool-signature.js');
   // A pattern that backtracks catastrophically is never evaluated.

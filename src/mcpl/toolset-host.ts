@@ -23,7 +23,7 @@
  * which the toolsets module gathers at its next start as a stored
  * `afterUser` injection.
  */
-import type { McplServerConnection, HintRead } from './server-connection.js';
+import { McplRequestError, type McplServerConnection, type HintRead } from './server-connection.js';
 import type { McplServerConfig } from './types.js';
 import { isToolAllowed } from './tool-policy.js';
 import {
@@ -141,7 +141,7 @@ export class ToolsetController {
   /** The live connection, for a request. */
   private live(): McplServerConnection {
     const c = this.connection;
-    if (!c || !c.isConnected) throw new Error(`${this.serverId} is not connected right now; try again later`);
+    if (!c || !c.isConnected) throw new McplRequestError(`${this.serverId} is not connected right now; try again later`, 'not-sent');
     this.sync(c.transportEpoch, c);
     return c;
   }

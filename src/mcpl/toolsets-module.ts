@@ -28,6 +28,7 @@ import { unknownToolMessage } from '../modules/unknown-tool.js';
 import { META_TOOL_NAMES, TOOLSETS_MODULE, type ToolsetController, type ToolsetHub } from './toolset-host.js';
 import { keyOf, type ChangeSet } from './tool-presence.js';
 import { checkArgs, jsonText, renderToolDefinition, type HintedTool } from './tool-signature.js';
+import { McplRequestError } from './server-connection.js';
 
 /** The namespace a reminder's stored injection carries. */
 export const TOOLSETS_REMINDER_NAMESPACE = 'mcpl-toolsets';
@@ -107,6 +108,18 @@ function checkSelectors(args: Record<string, unknown>): void {
     const got = typeof v === 'string' ? 'a blank string' : Array.isArray(v) ? 'a list' : typeof v === 'object' ? 'an object' : `a ${typeof v}`;
     fail(`${key} must be a name, or left out; got ${got}, so nothing was done`);
   }
+}
+
+/** A failure whose outcome is unknown, with how to find it out. */
+export function withLookHint(serverId: string, text: string): string {
+  const said = text.trimEnd();
+  return `${said}${/[.!?]$/.test(said) ? '' : '.'} ${META_TOOL_NAMES.look} {server:"${serverId}"} asks it what's open.`;
+}
+
+function requestFailure(serverId: string, did: string, unconfirmed: string, error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof McplRequestError && error.outcome === 'not-sent') return fail(`${serverId} ${did}: ${message}`);
+  return fail(withLookHint(serverId, `${serverId} ${unconfirmed}: ${message}`));
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -302,7 +315,7 @@ export class ToolsetsModule implements Module {
       try {
         opened = await c.open(toolset, instance, options);
       } catch (error) {
-        return fail(`${c.serverId} did not open ${toolset}: ${error instanceof Error ? error.message : String(error)}`);
+        return requestFailure(c.serverId, `did not open ${toolset}`, `didn't confirm opening ${toolset}`, error);
       }
       // RFC §5.2: opening what is open adopts it; its content says which options weren't applied.
       const blocks: Block[] = [
@@ -466,7 +479,8 @@ export class ToolsetsModule implements Module {
       try {
         closed = await c.close(toolset!, instance);
       } catch (error) {
-        return fail(`${c.serverId} did not close ${toolset}${instance ? `:${instance}` : ''}: ${error instanceof Error ? error.message : String(error)}`);
+        const what = `${toolset}${instance ? `:${instance}` : ''}`;
+        return requestFailure(c.serverId, `did not close ${what}`, `didn't confirm closing ${what}`, error);
       }
       const key = keyOf(toolset!, instance);
       const change = p.render(closed.change) || `${p.label(key)} closed.`;
