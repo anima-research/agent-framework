@@ -1405,6 +1405,7 @@ for (const privateTurn of [true, false]) {
         await waitFor(fw, () => membrane.primary >= 3, 'the retry after the wait');
         await fw.runUntilIdle();
         if (privateTurn) assert.match(texts(membrane.calls[2]!), /zz-operator/, "control: the retry read the operator's message");
+        assert.ok(JSON.stringify(fw.getAgent('resident')!.getContextManager().getAllMessages()).includes('zz-answer-3'), 'control: the retry answered');
         const first = routed.find((r) => r.text === 'zz-answer-1');
         assert.ok(first?.locus, `control: the first turn spoke in a channel: ${JSON.stringify(routed)}`);
         assert.deepEqual(routed.filter((r) => r.text === 'zz-answer-3').map((r) => r.locus), privateTurn ? [] : [first!.locus]);

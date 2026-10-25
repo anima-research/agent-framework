@@ -952,9 +952,14 @@ describe('private wins, one way', () => {
   it("channel_publish's description says a turn that has taken in private input names its channel", async () => {
     const registry = new ChannelRegistry({ getServer: () => undefined } as never, {} as never, () => {}, () => {});
     const publish = registry.getChannelTools().find((t) => t.name === 'channel_publish')!;
-    for (const fact of [/must name a channel/, /private input/, /a script such a turn started/]) assert.match(publish.description, fact);
+    const negated = /\b(not|needn't|optional|may omit|may leave)\b/;
+    const rule = publish.description.split(/(?<=\.)\s+/).find((sentence) => sentence.includes('private input')) ?? '';
+    for (const fact of [/\bmust\b/, /private input/, /a script such a turn started/]) assert.match(rule, fact);
+    assert.doesNotMatch(rule, negated);
     const channelId = (publish.inputSchema as unknown as { properties: { channelId: { description: string } } }).properties.channelId;
-    for (const fact of [/required of/, /private input/, /a script such a turn started/]) assert.match(channelId.description, fact);
+    const clause = channelId.description.split(';').find((part) => part.includes('private input')) ?? '';
+    for (const fact of [/\brequired of\b/, /private input/, /a script such a turn started/]) assert.match(clause, fact);
+    assert.doesNotMatch(clause, negated);
   });
 
   it("a private turn's channel_publish that names no channel is refused, and says how to name one", async () => {
@@ -1199,9 +1204,9 @@ describe('private wins, one way', () => {
     };
     const nudge = async (rig: Rig) => {
       const before = rig.routed.length;
-      const starts = rig.starts.length;
+      const streams = rig.streams.length;
       assert.ok(rig.framework.nudgeAgent('scout', 'host-console').ok);
-      await rig.until(() => rig.starts.length > starts && idle(rig), 'the nudged turn');
+      await rig.until(() => rig.streams.length > streams && idle(rig), 'the nudged turn to run');
       await rig.framework.runUntilIdle();
       return rig.routed.slice(before);
     };
@@ -1213,10 +1218,10 @@ describe('private wins, one way', () => {
       };
       internalsOf.postToChannel = async (_server, channelId) => { posted.push(channelId); };
       const before = rig.routed.length;
-      const starts = rig.starts.length;
+      const streams = rig.streams.length;
       const asked = await internalsOf.handleHostCommand('discord', { command: 'unstick', agentName: 'scout', channelId: ROOM, maxRewinds: 1 });
       assert.ok(asked.ok, JSON.stringify(asked));
-      await rig.until(() => rig.starts.length > starts && idle(rig), 'the unstick turn');
+      await rig.until(() => rig.streams.length > streams && idle(rig), 'the unstick turn to run');
       await rig.framework.runUntilIdle();
       assert.deepEqual(posted, [ROOM], "the outcome is the operator's notice, posted where it was asked");
       return rig.routed.slice(before);
@@ -1368,6 +1373,25 @@ describe('private wins, one way', () => {
       }
     });
 
+    it("a nudge after the operator hides a range across a channel turn that followed a private exchange speaks in no channel", async () => {
+      const rig = await surfaceRig();
+      try {
+        await privateTurn(rig);
+        const store = (rig.framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage
+          .bind(rig.framework);
+        store('bob', [{ type: 'text', text: 'how is the build?' }], { messageId: 'd1', channelId: ROOM });
+        await roomTurn(rig);
+        store('bob', [{ type: 'text', text: 'thanks' }], { messageId: 'd2', channelId: ROOM });
+        const hidden = await (rig.framework as unknown as {
+          handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; hidden?: number; error?: string }>;
+        }).handleHostCommand('discord', { command: 'hide', agentName: 'scout', fromMessageId: 'd1', toMessageId: 'd2' });
+        assert.ok(hidden.ok && (hidden.hidden ?? 0) >= 3, `control: the range took the channel turn's reply too: ${JSON.stringify(hidden)}`);
+        assert.deepEqual(await nudge(rig), []);
+      } finally {
+        await rig.close();
+      }
+    });
+
     for (const step of ['undo', 'redo'] as const) {
       it(`another agent's ${step} on the shared store leaves this agent's nudge after its channel turn in no channel`, async () => {
         const rig = await surfaceRig({ otherAgents: ['ranger'] });
@@ -1391,9 +1415,9 @@ describe('private wins, one way', () => {
             assert.ok(rig.framework.redo('scout').redone);
           }
           const before = rig.routed.length;
-          const starts = rig.starts.length;
+          const streams = rig.streams.length;
           assert.ok(rig.framework.nudgeAgent('ranger', 'host-console').ok);
-          await rig.until(() => rig.starts.length > starts && settled(), "ranger's nudged turn");
+          await rig.until(() => rig.streams.length > streams && settled(), "ranger's nudged turn to run");
           await rig.framework.runUntilIdle();
           assert.deepEqual(rig.routed.slice(before), []);
         } finally {
@@ -1456,9 +1480,10 @@ describe('private wins, one way', () => {
         await privateTurn(rig);
         const before = rig.routed.length;
         const starts = rig.starts.length;
+        const streams = rig.streams.length;
         rig.i.pendingRequests.push(roomWake());
         assert.ok(rig.framework.nudgeAgent('scout', 'host-console').ok);
-        await rig.until(() => rig.starts.length > starts && idle(rig), 'the merged turn');
+        await rig.until(() => rig.streams.length > streams && idle(rig), 'the merged turn to run');
         await rig.framework.runUntilIdle();
         assert.equal(rig.starts.length, starts + 1, 'control: one start took both');
         assert.deepEqual(rig.routed.slice(before), []);

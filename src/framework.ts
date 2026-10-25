@@ -10558,6 +10558,7 @@ export class AgentFramework {
           const hidden = messagesIn(runs);
           const rangeIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
           for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
+          this.retakeBasis.clear();
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hidden} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -10587,6 +10588,7 @@ export class AgentFramework {
         const hidden = messagesIn(runs);
         const hiddenIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
         for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
+        this.retakeBasis.clear();
         console.error(
           `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
