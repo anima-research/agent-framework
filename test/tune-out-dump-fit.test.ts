@@ -38,7 +38,7 @@ const FIVE = stored(5);
  *  shown `room` characters whole in one message (no cap when left out), and
  *  returns the dump's text, the report notice's, the rows after the notice
  *  and whose inference was requested. */
-function cancelWith(opts: { backlogCap?: number; room?: number; source?: string; stored?: Row[]; held?: Row[]; note?: string }) {
+function cancelWith(opts: { backlogCap?: number; room?: number; source?: string; stored?: Row[]; note?: string }) {
   const added: Added[] = [];
   const inferences: string[] = [];
   const registry = {
@@ -57,7 +57,6 @@ function cancelWith(opts: { backlogCap?: number; room?: number; source?: string;
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => opts.stored ?? [],
-    getDeferredMessages: () => opts.held ?? [],
     ...(opts.room !== undefined ? { residentMessageChars: () => opts.room } : {}),
     emitTrace: () => {},
   };
@@ -190,27 +189,24 @@ test('a newest message too long to fit alone is shown cut to the room left and m
   assert.ok(notice!.includes('5 of 6 diverted messages, the oldest,'), 'and the report is told of them');
 });
 
-test('a held newest message shown cut follows the notice with its content, as its view lacks it; a stored one is in its view', () => {
+// Every held message is stored as it arrives (#291), so the subconscious's
+// view holds each whole: no row follows the notice for one the dump shows
+// cut or leaves out. (Before #291 one still queued at the cancel did.)
+test("a newest message shown cut is in the subconscious's view, stored, so no row follows the notice for it", () => {
   const longText = `NEWEST ${'y'.repeat(500)}`;
   const room = lengthShowing(1) + 100;
-  const held = cancelWith({ room, stored: FIVE, held: [row('Bo', longText)] });
-  assert.ok(held.dump.includes(CUT_MARK), 'the held newest is shown cut');
-  assert.ok(held.notice!.includes('the 1 message after this one'), 'the notice counts it');
-  assert.deepEqual(held.held, [[text('Bo:'), text(longText)]], 'and it follows the notice with its content');
-
   const storedCut = cancelWith({ room, stored: [...FIVE, row('Bo', longText)] });
-  assert.ok(storedCut.dump.includes(CUT_MARK), 'a stored newest is shown cut too');
-  assert.deepEqual(storedCut.held, [], 'but no row follows the notice for it');
+  assert.ok(storedCut.dump.includes(CUT_MARK), 'the newest is shown cut');
+  assert.deepEqual(storedCut.held, [], 'and no row follows the notice for it');
 });
 
-test('held messages the fit leaves out follow the notice as rows, and stored ones do not', () => {
-  const storedTwo = [row('Ann', `S1 ${'x'.repeat(40)}`), row('Ann', `S2 ${'x'.repeat(40)}`)];
-  const held = [row('Bo', `H1 ${'x'.repeat(40)}`), row('Bo', `H2 ${'x'.repeat(40)}`)];
-  const roomForOne = cancelWith({ backlogCap: 1, stored: storedTwo, held }).dump.length;
-  const { dump, notice, held: rows } = cancelWith({ room: roomForOne, stored: storedTwo, held });
+test("messages the fit leaves out are in the subconscious's view, stored, and none follows the notice as a row", () => {
+  const four = [row('Ann', `S1 ${'x'.repeat(40)}`), row('Ann', `S2 ${'x'.repeat(40)}`), row('Bo', `H1 ${'x'.repeat(40)}`), row('Bo', `H2 ${'x'.repeat(40)}`)];
+  const roomForOne = cancelWith({ backlogCap: 1, stored: four }).dump.length;
+  const { dump, notice, held: rows } = cancelWith({ room: roomForOne, stored: four });
   assert.ok(dump.includes('Bo: H2 ') && !dump.includes('H1 ') && !dump.includes('S1 ') && !dump.includes('S2 '), 'only the newest fits');
   assert.ok(notice!.includes("3 of 4 diverted messages, the oldest, weren't delivered raw to the resident."), 'the report is told of the three');
-  assert.deepEqual(rows, [[text('Bo:'), text(`H1 ${'x'.repeat(40)}`)]], 'the held one left out follows the notice; the stored ones are in its view');
+  assert.deepEqual(rows, [], 'no row follows the notice: its view has them');
 });
 
 test('without a per-message cap the dump is not fitted', () => {

@@ -213,8 +213,10 @@ function toolResultsOf(messages: Array<{ content: ContentBlock[] }>): Map<string
 async function primeCompletedWhileSpillHeld(): Promise<{
   framework: AgentFramework;
   prime: Agent;
-  /** Each block in prime's window, in order. */
+  /** Each block of prime's record, in the order it was stored. */
   blocks: () => string[];
+  /** Each block in prime's window, in its order (#291: a row stored during a turn enters it at a point). */
+  windowBlocks: () => string[];
   finish: () => Promise<void>;
   cleanup: () => Promise<void>;
 }> {
@@ -274,6 +276,7 @@ async function primeCompletedWhileSpillHeld(): Promise<{
     framework,
     prime,
     blocks,
+    windowBlocks: () => blocksOf(prime.getContextManager().getPresentedMessages()),
     finish: async () => {
       spills.open();
       await within('the spill write to finish', spills.written);
@@ -367,29 +370,31 @@ describe('a stream that completes while its tools run', () => {
     }
   });
 
-  it('stores a message for prime that comes in while its results are built after the round and its results', async () => {
+  // Ported for #291: the message is stored at once, so the record has it
+  // before the round, whose rows are stored once the spill is written; the
+  // window, which the requests carry, has it after them. This test once
+  // read the record, the message having been deferred until the round was
+  // stored.
+  it('presents a message for prime that comes in while its results are built after the round and its results', async () => {
     const run = await primeCompletedWhileSpillHeld();
-    const { framework, blocks } = run;
-    const queued = (framework as unknown as { deferredMessages: Array<{ content: ContentBlock[] }> }).deferredMessages;
-    const said = (content: ContentBlock[]) => content.some((b) => b.type === 'text' && b.text === 'a word for prime');
+    const { framework, blocks, windowBlocks } = run;
     try {
       // A message for prime (CannedModule's onProcess stores an event that
       // names no agent as a message for prime, and wakes prime), taken in
-      // while the spill is held: it is in the slot or waiting to be, which is
-      // all this waits for. Where it lands is checked once the turns end.
+      // while the spill is held: it is stored at once. Where it enters the
+      // window is checked once the turns end.
       framework.pushEvent({
         type: 'external-message', source: 'test', content: [{ type: 'text', text: 'a word for prime' }],
         metadata: {}, triggerInference: true,
       } as unknown as ProcessEvent);
-      await waitFor('the message for prime to be taken in', () =>
-        blocks().includes('text:a word for prime') || queued.some((m) => said(m.content)));
+      await waitFor('the message for prime to be taken in', () => blocks().includes('text:a word for prime'));
 
       await run.finish();
       // It woke prime, whose next turn read it.
       await waitFor("prime's turn on the message to end", () =>
         blocks().includes('text:prime again') && framework.getHostModeStatus().activeTurns === 0);
 
-      const all = blocks();
+      const all = windowBlocks();
       const round = all.indexOf('text:Fetching both.');
       assert.ok(round >= 0, "the round's text is stored");
       assert.deepEqual(all.slice(round, round + 3), ['text:Fetching both.', 'tool_use:call_fetch', 'tool_use:call_slow'],

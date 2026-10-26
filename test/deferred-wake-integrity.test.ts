@@ -11,15 +11,19 @@
  * confabulated an apology for a choice it never made) and a KV bust (every
  * later compile diverged from the live prefix at the inserted message).
  *
+ * Since #291 a write is stored at once, and the presentation index keeps it
+ * out of the agent's window until the agent's next presentation point; the
+ * deferral queue these invariants were first written against is gone, and
+ * the tests read the window instead.
+ *
  * Invariants under test:
- *  1. A turn started by a queued wake CONTAINS the deferred message that woke
- *     it (turn-start flush runs before the locus announcement and compile).
- *  2. addMessage defers on turn-alive (activeTurnTokens), not merely
- *     stream-alive — the compile window between dequeue and stream
- *     registration is closed to cross-turn writers: what they write is
- *     deferred, and what is deferred before the turn's checkpoint lands as
- *     the turn's input through its own flushes (flushForStart), unless the
- *     host is quiesced by then, when it waits for resume().
+ *  1. A turn started by a queued wake CONTAINS the message that woke it (the
+ *     start presents it before the locus announcement and compile).
+ *  2. addMessage keeps a write out of the window on turn-alive
+ *     (activeTurnTokens), not merely stream-alive: the compile window
+ *     between dequeue and stream registration is closed to cross-turn
+ *     writers. What they write is stored, and enters the window at the
+ *     turn's next point.
  *  3. endTurn edge: a message stored at an endTurn tool boundary (collected
  *     for injection but never delivered — the stream is cancelled) is seen by
  *     the follow-up turn its own wake starts, positioned AFTER the turn that
@@ -86,7 +90,7 @@ class DmModule implements Module {
           metadata: { channelId: 'dm-antra' },
         } as unknown as ProcessEvent);
         // Let the run loop process the queued message while this tool round
-        // is still pending, so it lands in deferredMessages with its wake
+        // is still pending, so it is stored out of the window with its wake
         // queued behind the busy agent.
         await new Promise((r) => setTimeout(r, 30));
       }
@@ -190,17 +194,18 @@ describe('deferred-message wake integrity', () => {
   }
 
   type Internals = {
-    deferredMessages: Array<{ participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     pendingRequests: Array<Record<string, unknown>>;
     activeTurnTokens: Map<string, number>;
     activeStreams: Map<string, unknown>;
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => string;
   };
   const internals = (f: AgentFramework) => f as unknown as Internals;
+  const inWindow = (f: AgentFramework, needle: string): boolean => f.getAgent('assistant')!.getContextManager()
+    .getPresentedMessages().some((m) => JSON.stringify(m.content).includes(needle));
 
   // -------------------------------------------------------------------------
 
-  it('a turn started by a queued wake contains the deferred message that woke it', async () => {
+  it('a turn started by a queued wake contains the message that woke it', async () => {
     scheduleTurns(membrane, [
       [createMockResponse([{ type: 'text', text: 'answering the DM' }] as ContentBlock[])],
     ]);
@@ -208,15 +213,15 @@ describe('deferred-message wake integrity', () => {
     stubChannelRegistry(framework);
     const fw = internals(framework);
 
-    // The incident state, seeded directly: payload deferred, wake queued,
-    // agent idle. (Live, this arises when a message lands during another
-    // turn's stream: addMessage defers the body, the wake pushes anyway.)
-    const dmText = 'and then the restaurant, and the hike — the deferred DM';
-    fw.deferredMessages.push({
-      participant: 'Antra',
-      content: [{ type: 'text', text: dmText }],
-      metadata: { channelId: 'dm-antra', triggered: true },
-    });
+    // The incident state: the payload stored while a turn was alive, out of
+    // the window, its wake queued, the agent idle. (Live, this arises when a
+    // message lands during another turn's stream: addMessage stores the body
+    // out of the window, the wake pushes anyway.)
+    const dmText = 'and then the restaurant, and the hike — the DM stored mid-turn';
+    fw.activeTurnTokens.set('assistant', 999999);
+    fw.addMessage('Antra', [{ type: 'text', text: dmText }], { channelId: 'dm-antra', triggered: true });
+    fw.activeTurnTokens.delete('assistant');
+    assert.equal(inWindow(framework, dmText), false, 'precondition: out of the window');
     fw.pendingRequests.push({
       agentName: 'assistant',
       reason: 'mcpl:channel-incoming',
@@ -232,31 +237,29 @@ describe('deferred-message wake integrity', () => {
     const flat = flatten(membrane.calls[0]);
     assert.ok(
       indexContaining(flat, dmText) >= 0,
-      'the compiled request contains the message that woke the turn (turn-start flush)',
+      'the compiled request contains the message that woke the turn (presented at its start)',
     );
-    assert.equal(fw.deferredMessages.length, 0, 'deferred queue drained');
     assert.equal(fw.activeTurnTokens.size, 0, 'no turn token leaked');
 
     await framework.stop();
   });
 
-  it('addMessage defers on turn-alive even when no stream is registered (compile window)', async () => {
+  it('addMessage keeps a write out of the window on turn-alive even when no stream is registered (compile window)', async () => {
     const framework = await createFramework();
     stubChannelRegistry(framework);
     const fw = internals(framework);
 
     // Simulate the dequeue→stream gap: a turn is alive (token set) but its
     // stream has not registered yet. This is exactly when the incident's
-    // deferred flush wrote into the window mid-compile.
+    // flush wrote into the window mid-compile.
     fw.activeTurnTokens.set('assistant', 999999);
     assert.equal(fw.activeStreams.size, 0, 'precondition: no live stream');
 
     const id = fw.addMessage('Antra', [{ type: 'text', text: 'arrives mid-compile' }]);
-    assert.equal(id, '', 'message was deferred, not appended');
-    assert.equal(fw.deferredMessages.length, 1, 'message waits in the deferred queue');
+    assert.notEqual(id, '', 'message was stored');
+    assert.equal(inWindow(framework, 'arrives mid-compile'), false, 'and waits outside the window');
 
     fw.activeTurnTokens.delete('assistant');
-    fw.deferredMessages.length = 0; // don't leak state into stop()
 
     await framework.stop();
   });
@@ -312,7 +315,7 @@ describe('deferred-message wake integrity', () => {
     assert.equal(indexContaining(flatA, dmText), -1, "turn A's request predates the DM");
 
     assert.equal(fw.activeTurnTokens.size, 0, 'no turn token leaked across the sequence');
-    assert.equal(fw.deferredMessages.length, 0, 'no message stranded in the deferred queue');
+    assert.equal(inWindow(framework, dmText), true, 'no message stranded outside the window');
 
     await framework.stop();
   });

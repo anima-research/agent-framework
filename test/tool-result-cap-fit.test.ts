@@ -174,8 +174,11 @@ test("a resident's cap is the smallest bound among the shared slot's readers, so
     assert.equal(capProvenance(framework, 'ward').tool_result_inline_max_chars_clamped_by, 'strategy-bound');
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
     assert.match(stored, /full content: workspace file files\/tool-results\//);
-    assert.equal(await shownTo('ward'), stored, 'ward is shown the stored copy whole, its notice included');
-    assert.equal(await shownTo('scout'), stored);
+    // Since #291 scout's round is its own row, in no window but scout's, so
+    // ward is never shown it; the cap still takes the bound of every reader
+    // of the slot. This test once had ward shown the stored copy whole.
+    assert.equal(await shownTo('ward'), null, "ward isn't shown scout's own round");
+    assert.equal(await shownTo('scout'), stored, 'scout is shown the stored copy whole, its notice included');
   });
 });
 
@@ -208,7 +211,8 @@ test('without a writable workspace, the stored copy fits the smallest reader\'s 
   await withResidents({ agents: [{ name: 'scout', maxMessageTokens: 10_000 }, { name: 'ward', maxMessageTokens: 1000 }] }, async ({ stored, shownTo }) => {
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
     assert.match(stored, /\n\n\[truncated — original was \d+ chars; no writable workspace mount without an include, full content not retained\]$/);
-    assert.equal(await shownTo('ward'), stored);
+    // scout's own round, shown to scout alone (#291; once ward was shown it).
+    assert.equal(await shownTo('scout'), stored);
   });
 });
 
@@ -231,7 +235,8 @@ test("a resident with no bound of its own takes another reader's, so its cut res
     assert.equal(cap.tool_result_inline_max_chars_clamped_by, 'reader-bound');
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
     assert.match(stored, /full content: workspace file files\/tool-results\//);
-    assert.equal(await shownTo('ward'), stored);
+    // scout's own round, shown to scout alone (#291; once ward was shown it).
+    assert.equal(await shownTo('scout'), stored);
   });
 });
 

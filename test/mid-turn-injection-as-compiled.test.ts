@@ -80,10 +80,11 @@ class InterjectingModule implements Module {
   }
 }
 
-// Each case runs twice: as before, and with the presentation index (#291),
-// where the boundary presents what it injects before it renders it, since a
-// render places only what the agent's window holds.
-for (const presentationIndex of [false, true]) describe(`a message injected at a tool boundary${presentationIndex ? ', with the presentation index' : ''}`, () => {
+// With the presentation index (#291), the boundary presents what it injects
+// before it renders it, since a render places only what the agent's window
+// holds. (Each case ran twice before presentation was mandatory, without the
+// index too; AF-6 took that run away with the flag.)
+describe('a message injected at a tool boundary', () => {
   let tempDir: string;
   let membrane: MockMembrane;
   let module: InterjectingModule;
@@ -106,7 +107,6 @@ for (const presentationIndex of [false, true]) describe(`a message injected at a
       membrane: membrane.asMembrane(),
       agents: [{ name: agentName, model: 'test-model', systemPrompt: 'You are a robot pilot.', strategy: strategy as never }],
       modules: [module, ...modules],
-      ...(presentationIndex ? { presentationIndex: true } : {}),
     });
     module.framework = framework;
     return framework;
@@ -246,11 +246,10 @@ for (const presentationIndex of [false, true]) describe(`a message injected at a
     } as never));
     const cm = framework.getAgent('assistant')!.getContextManager();
     for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
-    // With the presentation index, rows written into the context past the
-    // framework enter the window at the agent's next point: here, before the
-    // reset presents its transition after them, as the history before a new
-    // topic is.
-    if (presentationIndex) (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('assistant'));
+    // Rows written into the context past the framework enter the window at
+    // the agent's next point: here, before the reset presents its transition
+    // after them, as the history before a new topic is.
+    (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('assistant'));
     await cm.resetHeadWindow('A new topic.');
     const nulls: number[] = [];
     renderWith((ids, real) => { const r = real(ids)!; nulls.push(r.filter((c) => c === null).length); return r; });

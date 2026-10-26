@@ -479,9 +479,8 @@ export type TraceEvent =
        *  gate hands the line to the wake when its message is the newest at
        *  the fire, EventGate isNewestEntry, and the turn's start decides).
        *  `reason`: `newest`, on the delivery agent's start the message was
-       *  still the newest entry in the window; `held`, the host was quiesced
-       *  or another reader of the residents' shared slot had a turn alive,
-       *  so no line could be written then. */
+       *  still the newest entry in the window; `held`, the host was
+       *  quiesced, so no line could be written then. */
       type: 'gate:wake-line-omitted';
       reason: 'newest' | 'held';
       policyNames: string[];
@@ -509,21 +508,6 @@ export type TraceEvent =
       totals: SessionUsage;
       agentName: string;
       inferenceCount: number;
-    })
-
-  // Undo/redo lifecycle
-  | (TraceEventBase & {
-      type: 'undo:completed';
-      agentName: string;
-      turnIndex: number;
-      fromBranch: string;
-      toBranch: string;
-    })
-  | (TraceEventBase & {
-      type: 'redo:completed';
-      agentName: string;
-      fromBranch: string;
-      toBranch: string;
     })
 
   // Operator-initiated mutation (rollback/suppress/undo/hide/settings/quiesce…).
@@ -650,10 +634,6 @@ export type TraceEvent =
       toolUseId: string;
       isError: boolean;
       durationMs: number;
-      /** The pair was queued behind a turn that replaced the puppet's
-       *  reservation (provider-admission re-entry) instead of stored
-       *  directly; it lands at that turn's end flush. */
-      deferred?: boolean;
     })
 
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
@@ -881,10 +861,8 @@ export type TraceEvent =
       channelId: string;
       epochId: string;
       trigger: 'cadence' | 'wake' | 'cancel';
-      /** Held messages the fork was handed, stored and queued. */
+      /** Held messages the fork was handed. */
       held: number;
-      /** Of those, the ones still queued behind the resident's turn. */
-      queued: number;
     })
 
   /**
@@ -970,7 +948,7 @@ export type TraceEvent =
       by?: string;
       reason?: string;
     })
-  /** The message entered the recipient's store (not merely queued for it). */
+  /** The message entered the recipient's store (not merely held for it). */
   | (TraceEventBase & {
       type: 'dendrite:mail-delivered';
       mailId: string;
@@ -978,7 +956,8 @@ export type TraceEvent =
       from: string;
       to: string;
     })
-  /** Queued for the recipient's next boundary; `mail-delivered` follows when it lands. */
+  /** Held in memory behind a live surgery (the operator's switch awaited);
+   *  `mail-delivered` follows when the hold's release stores it. */
   | (TraceEventBase & {
       type: 'dendrite:mail-deferred';
       mailId: string;
@@ -1028,7 +1007,6 @@ export type TraceEvent =
 
   // The presentation index (#291, src/presentation.ts): which stored rows
   // each agent's window holds, in the order its requests carried them.
-  // Emitted only by a host with FrameworkConfig.presentationIndex on.
   | (TraceEventBase & {
       /**
        * Rows entered an agent's window (context-manager's presentRows), at

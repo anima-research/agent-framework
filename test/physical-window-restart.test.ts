@@ -687,11 +687,19 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
   });
 
-  it("prices a mid-turn image at its tokenEstimate stamp", async () => {
+  // Since #291 a message is stored at once and a boundary injects the stored
+  // copy, and the store keeps an inline image as its source alone (no
+  // tokenEstimate stamp: context-manager's blob round trip). So the stamp
+  // reaches no injection, and the image is priced at 1,600, as the store's
+  // later compiles price it; an overestimate, which costs one early restart.
+  // This test once had the stamp price the injection, from the deferral
+  // queue's copy as it was written.
+  it("prices a mid-turn image as the store keeps it: a stamp the stored copy doesn't carry prices nothing", async () => {
     const stamped = { ...image(), tokenEstimate: 100 } as ContentBlock;
-    const { restarted, carried } = await photosRound([stamped, stamped, stamped]);
-    assert.ok(!restarted, 'three images stamped at 100 tokens fit, where three unstamped cross');
-    assert.ok(carried, 'the message rode into the next round');
+    const { restarted, appended, carried } = await photosRound([stamped, stamped, stamped]);
+    assert.ok(restarted, 'three images cross the window, as three unstamped do');
+    assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
+    assert.ok(carried, 'the restarted request carries the message');
   });
 
   for (const stamp of [Number.NaN, -1_600]) {

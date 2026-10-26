@@ -11,7 +11,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
-import { QuiesceBlockedError, ResumeBlockedError } from '../framework.js';
+import { ResumeBlockedError } from '../framework.js';
 import { isReleaseModel } from '../provider-waits.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
@@ -651,16 +651,10 @@ export class ApiServer {
 
     const result = this.framework.undoLastTurn(params.agentName);
 
-    // An undo on the agent's window (#291, presentationIndex) moves no
-    // branch, so it says so as a window event, not a branch switch.
+    // An undo is on the agent's window (#291) and moves no branch, so it
+    // says so as a window event, not a branch switch.
     if (result.undone && result.window) {
       this.broadcast('window:undone', { agentName: params.agentName, ...result.window, reason: 'undo' });
-    } else if (result.undone) {
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'undo',
-      });
     }
 
     return result;
@@ -675,12 +669,6 @@ export class ApiServer {
 
     if (result.redone && result.window) {
       this.broadcast('window:undone', { agentName: params.agentName, ...result.window, reason: 'redo' });
-    } else if (result.redone) {
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'redo',
-      });
     }
 
     return result;
@@ -1080,9 +1068,6 @@ export class ApiServer {
               verdicts: error.verdicts,
               hostMode: this.framework.getHostModeStatus(),
             });
-          } else if (error instanceof QuiesceBlockedError) {
-            // A refusal, as resume()'s is: the host's mode is as it was.
-            respond(409, { error: error.message, hostMode: this.framework.getHostModeStatus() });
           } else {
             respond(500, { error: error instanceof Error ? error.message : String(error) });
           }

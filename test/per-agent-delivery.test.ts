@@ -4,8 +4,11 @@
  * framework.addMessage historically hardcoded the primary agent: the
  * deferral queue, turn-alive guard, and every flush point evaluated the
  * primary's turn state. The seam adds an optional forAgent target with the
- * guard evaluated against THAT agent's state, flushed at THAT agent's
- * boundaries. Default behavior (no forAgent) is byte-identical.
+ * guard evaluated against THAT agent's state. Since #291 a write is stored
+ * at once, and the guard decides only when it enters the target's window:
+ * at once while the target is at rest, at the target's own next point while
+ * its turn is alive. These tests once read the deferral queue; they read the
+ * target's window now.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,7 +27,6 @@ function internals(framework: AgentFramework) {
       metadata?: Record<string, unknown>,
       opts?: { forAgent?: string },
     ): string;
-    deferredMessages: Array<{ participant: string; forAgent?: string }>;
     activeTurnTokens: Map<string, number>;
   };
 }
@@ -43,6 +45,13 @@ function channelIncoming(text: string, targetAgents: string[]): ProcessEvent {
     targetAgents,
   } as unknown as ProcessEvent;
 }
+
+const textsOf = (rows: Array<{ content: Array<{ type: string }> }>): string[] =>
+  rows.map((m) => m.content.map((b) => (b.type === 'text' ? (b as unknown as { text: string }).text : '')).join(''));
+const inWindow = (framework: AgentFramework, agent: string, text: string): boolean =>
+  textsOf(framework.getAgent(agent)!.getContextManager().getPresentedMessages()).includes(text);
+const inRecord = (framework: AgentFramework, agent: string, text: string): boolean =>
+  textsOf(framework.getAgent(agent)!.getContextManager().getAllMessages()).includes(text);
 
 describe('per-agent message delivery', () => {
   let tempDir: string;
@@ -69,7 +78,7 @@ describe('per-agent message delivery', () => {
     });
   }
 
-  it('a targeted message defers on the TARGET\'s busy turn, even with the primary idle', async () => {
+  it('a targeted message waits on the TARGET\'s busy turn, even with the primary idle', async () => {
     const framework = await makeFramework();
     const i = internals(framework);
 
@@ -79,48 +88,45 @@ describe('per-agent message delivery', () => {
     const id = i.addMessage('user', [{ type: 'text', text: 'for shade' }], undefined, {
       forAgent: 'shade',
     });
-    assert.equal(id, '', 'deferred, not stored');
-    assert.equal(i.deferredMessages.length, 1);
-    assert.equal(i.deferredMessages[0].forAgent, 'shade');
+    assert.notEqual(id, '', 'stored at once');
+    assert.equal(inWindow(framework, 'shade', 'for shade'), false, "out of shade's live turn");
 
-    // An untargeted message with the primary idle stores immediately —
-    // shade's busyness must not defer primary-bound traffic.
+    // An untargeted message with the primary idle enters its window at
+    // once: shade's busyness must not hold primary-bound traffic.
     const id2 = i.addMessage('user', [{ type: 'text', text: 'for scout' }]);
-    assert.notEqual(id2, '', 'primary delivery unaffected by shade\'s turn');
-    assert.equal(i.deferredMessages.length, 1, 'still only shade\'s entry queued');
+    assert.notEqual(id2, '');
+    assert.equal(inWindow(framework, 'scout', 'for scout'), true, 'primary delivery unaffected by shade\'s turn');
+    assert.equal(inWindow(framework, 'shade', 'for shade'), false, 'shade\'s message still waits');
 
     i.activeTurnTokens.delete('shade');
     await framework.stop();
   });
 
-  it('a queued targeted message survives the PRIMARY\'s boundary and flushes at the target\'s', async () => {
+  it('a targeted message waits across the PRIMARY\'s boundary and enters the target\'s window at its own', async () => {
     const framework = await makeFramework();
     const i = internals(framework);
 
-    // Queue a message for shade while shade is busy.
+    // Write a message for shade while shade is busy.
     i.activeTurnTokens.set('shade', 7);
     i.addMessage('user', [{ type: 'text', text: 'note for shade' }], undefined, {
       forAgent: 'shade',
     });
-    assert.equal(i.deferredMessages.length, 1);
+    assert.equal(inWindow(framework, 'shade', 'note for shade'), false);
 
-    // Scout (primary) runs a full turn: its turn-start flush must NOT
-    // deliver shade's message.
+    // Scout (primary) runs a full turn: its points present nothing into
+    // shade's window.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout says hi' }]));
     framework.pushEvent(channelIncoming('wake scout', ['scout']));
     await framework.runUntilIdle();
-    assert.equal(
-      i.deferredMessages.length,
-      1,
-      'shade\'s entry must survive the primary\'s boundary',
-    );
+    assert.equal(inWindow(framework, 'shade', 'note for shade'), false, 'shade\'s message waits past the primary\'s boundary');
 
-    // Shade's own turn flushes it (turn-start flush at its boundary).
+    // Shade's own turn presents it (at its turn's start).
     i.activeTurnTokens.delete('shade');
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'shade replies' }]));
     framework.pushEvent(channelIncoming('wake shade', ['shade']));
     await framework.runUntilIdle();
-    assert.equal(i.deferredMessages.length, 0, 'flushed at the target\'s boundary');
+    assert.equal(inWindow(framework, 'shade', 'note for shade'), true, 'in shade\'s window at its own boundary');
+    assert.ok(JSON.stringify(membrane.calls.at(-1)!.messages).includes('note for shade'), 'and in its request');
 
     await framework.stop();
   });
@@ -133,7 +139,7 @@ describe('per-agent message delivery', () => {
       forAgent: 'nobody-home',
     });
     assert.equal(id, '');
-    assert.equal(i.deferredMessages.length, 0, 'not queued for a ghost');
+    assert.equal(inRecord(framework, 'scout', 'lost'), false, 'not stored for a ghost');
 
     await framework.stop();
   });

@@ -21,7 +21,7 @@ import type { AgentConfig, Module, ModuleContext, ToolCall, ToolDefinition, Tool
 import { TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
 import { PassthroughStrategy } from '@animalabs/context-manager';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { heldHandle } from '../src/held-writes.js';
+import { withAudience } from '../src/dendrite/audience.js';
 import { MembraneError, NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
@@ -29,7 +29,7 @@ class ToolModule implements Module {
   readonly name = 'tools';
   calls: ToolCall[] = [];
   /** A message someone sends while the next call runs: the agent's turn is
-   * alive, so it is deferred to the tool boundary. */
+   * alive, so it enters its window at the tool boundary. */
   arrive: string | null = null;
   /** The next call's result ends the turn. */
   endTurn = false;
@@ -627,14 +627,15 @@ describe('replies to a [Continue] turn', () => {
     const x = await make({ deliver: false });
     try {
       await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
-      // A render still queued (for another resident) keeps its wake to read
-      // it, which starts a turn with nothing new for this agent: [Continue].
+      // A render stored for another resident, never in this agent's window,
+      // keeps its wake to read it (#291: no request of this agent's carried
+      // it), which starts a turn with nothing new for this agent: [Continue].
       const internals = x.framework as any;
-      internals.deferredMessages.push({ id: 'render-x', seq: 1, participant: 'editor', forAgent: 'ghost', content: [{ type: 'text', text: 'elsewhere' }], heldAt: Date.now() });
+      const render = x.framework.getAgent('assistant')!.getContextManager()
+        .addMessage('editor', [{ type: 'text', text: 'elsewhere' }], withAudience(undefined, ['ghost']));
       x.membrane.pushResponse(createMockResponse(signed('sig-c', 'continued reply'), 'end_turn'));
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-x') });
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: render });
       await x.framework.runUntilIdle();
-      internals.deferredMessages.splice(0);
       assert.equal(textOf(x.membrane.calls[1]!.messages.at(-1)!), '[Continue]');
       assert.equal(rowWith(x.framework, 'continued reply').metadata?.promptedBy?.text, '[Continue]', 'the reply carries the prompt it followed');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
@@ -796,11 +797,16 @@ describe('replies to a [Continue] turn', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
-  it('a reply resumed after a provider cooldown follows the message that arrived during it, not [Continue]', async () => {
+  it("a reply resumed after a provider cooldown is its [Continue] turn's next round, and a message that arrived during the cooldown follows it", async () => {
     // A reply to [Continue] stores a tool round and restarts at its boundary,
     // and the restart meets a 429 that holds the turn. A message arrives
-    // during the cooldown, so the resumed compile ends on it, while the
-    // round, still in the window, renders [Continue] earlier.
+    // during the cooldown. The restart continues its logical turn, which
+    // takes no new input (#291's presentation index: the message is stored
+    // and enters the window at the turn's end), so the resumed compile ends
+    // on the round, which, still in the window, renders [Continue] earlier,
+    // and the resumed reply follows [Continue] with nothing new between.
+    // (Before #291 the message was stored in the shared record during the
+    // cooldown, the resumed compile ended on it, and the reply followed it.)
     const membrane = new QueuedStreamsMembrane();
     const strategy = new OmitToolExchange();
     strategy.omit = false;
@@ -825,18 +831,22 @@ describe('replies to a [Continue] turn', () => {
       assert.equal(membrane.calls.length, 4, 'first, the continued reply, its held restart, the resumed attempt');
 
       const resumed = membrane.calls[3]!.messages;
-      assert.equal(textOf(resumed.at(-1)!), 'arrived during the cooldown');
+      assert.ok(resumed.at(-1)!.content.some((b) => b.type === 'tool_result'), 'the resumed compile ends on its round');
+      assert.ok(!resumed.some((m) => textOf(m) === 'arrived during the cooldown'), 'a restart takes no new input');
       assert.ok(resumed.some((m) => textOf(m) === '[Continue]'), 'the round renders its [Continue]');
-      assert.equal(rowWith(x.framework, 'resumed reply').metadata?.promptedBy, undefined);
+      assert.equal(rowWith(x.framework, 'resumed reply').metadata?.promptedBy?.text, '[Continue]', 'the reply is a round of the [Continue] turn');
 
-      // Later, the window folds the round: no [Continue] is left to render.
+      // Later, the window folds the round: the reply is the turn's first
+      // surviving row, so [Continue] renders before it, and the message that
+      // arrived during the cooldown after it.
       strategy.omit = true;
       membrane.queues.push([createMockResponse(signed('sig-later', 'later reply'))]);
       await wake(x, ordinaryEvent('later'));
       const later = membrane.calls[4]!.messages;
       const replyAt = later.findIndex((m) => textOf(m) === 'resumed reply');
-      assert.equal(textOf(later[replyAt - 1]!), 'arrived during the cooldown');
-      assert.ok(!later.some((m) => textOf(m) === '[Continue]'));
+      assert.equal(textOf(later[replyAt - 1]!), '[Continue]');
+      assert.equal(textOf(later[replyAt + 1]!), 'arrived during the cooldown', "which entered the window at the turn's end");
+      assert.equal(later.filter((m) => textOf(m) === '[Continue]').length, 1);
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 

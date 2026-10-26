@@ -12,17 +12,23 @@
  *     and a row from before the start was presented again past the held
  *     rows, sets the start back to the older tune-out's ordinal exactly. (c)
  *     The start is the same after a restart, over the same window. (d)
- *     Without the index the start
- *     is set by sequence, as before. (e) A kept ordinal past a shorter
- *     window is clamped and traced. (f) A tune-out active at the upgrade
- *     gets its ordinal right after the window is written down, in record
- *     order. (g) A cancel forgets the tune-out's start.
+ *     While the window is the record (an earlier release's, or one whose
+ *     write-down failed, which pins it so for the process) the start is set
+ *     by sequence, as before. (e) A kept ordinal past a shorter window is
+ *     clamped and traced. (f) A tune-out active at the upgrade gets its
+ *     ordinal right after the window is written down, in record order. (g)
+ *     A cancel forgets the tune-out's start.
+ *
+ * Since #291 every framework presents, so the tests stand in for an earlier
+ * release's process by one whose write-down fails (boot's `legacy`), which keeps
+ * each window the record for that process, as that release kept it.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { ContextManager } from '@animalabs/context-manager';
 import type { MessageId, MessageMetadata, StoredMessage, WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
@@ -70,8 +76,20 @@ function place() {
   return dir;
 }
 
-/** scout and the persistent subconscious over the tune-out fixture's channel, on `dir`'s store. */
-async function boot(dir: string, presentationIndex: boolean) {
+/**
+ * scout and the persistent subconscious over the tune-out fixture's channel,
+ * on `dir`'s store. `legacy`: each window's write-down fails at its
+ * registration, so the process keeps every window the record, as a release
+ * before #291 did (presentation.adopt pins it).
+ */
+async function boot(dir: string, legacy = false) {
+  const presentRows = ContextManager.prototype.presentRows;
+  if (legacy) {
+    ContextManager.prototype.presentRows = function (this: ContextManager, ids: Parameters<typeof presentRows>[0], ...rest: unknown[]) {
+      if (ids.length === 0) throw new Error('the write-down is refused (test: a process as an earlier release ran)');
+      return (presentRows as (...a: unknown[]) => ReturnType<typeof presentRows>).call(this, ids, ...rest);
+    } as typeof presentRows;
+  }
   const membrane = new WireMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'test.chronicle'),
@@ -82,8 +100,7 @@ async function boot(dir: string, presentationIndex: boolean) {
     modules: [],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
-    presentationIndex,
-  } as never);
+  } as never).finally(() => { ContextManager.prototype.presentRows = presentRows; });
   frameworks.push(framework);
   const traces: TraceEvent[] = [];
   framework.onTrace((e) => traces.push(e));
@@ -144,7 +161,7 @@ async function enterDuringItsTurn(h: Booted) {
 
 describe("the persistent subconscious's window start (#291, AF-5)", () => {
   it('(a) leaves out the rows stored before a tune-out began that its window took after, (b) comes back to its kept ordinal after a re-anchor, (g) and goes at the cancel', { timeout: 120_000 }, async () => {
-    const h = await boot(place(), true);
+    const h = await boot(place());
     const { epochId, fixedAtEnter, reply } = await enterDuringItsTurn(h);
     const cm = h.subCm();
     const ordinal = (t: string) => cm.ordinalOf(h.rowOf(t).id)!;
@@ -190,7 +207,7 @@ describe("the persistent subconscious's window start (#291, AF-5)", () => {
 
   it('(c) is the same after a restart, though working it out from the tune-out again would give another', { timeout: 120_000 }, async () => {
     const dir = place();
-    const first = await boot(dir, true);
+    const first = await boot(dir);
     const { epochId, reply } = await enterDuringItsTurn(first);
     const before = first.strategy().getAnchorOrdinal();
     assert.equal(before, first.subCm().ordinalOf(first.rowOf('T1-HELD-1 chatter').id));
@@ -202,13 +219,13 @@ describe("the persistent subconscious's window start (#291, AF-5)", () => {
     await first.framework.stop();
     frameworks.splice(frameworks.indexOf(first.framework), 1);
 
-    const second = await boot(dir, true);
+    const second = await boot(dir);
     assert.equal(second.strategy().getAnchorOrdinal(), before, 'the start it had');
     assert.deepEqual(second.windowStarts(), { [epochId]: before }, 'set from what was kept');
   });
 
-  it('(d) is set by sequence without the presentation index, as before, and keeps no ordinal', { timeout: 120_000 }, async () => {
-    const h = await boot(place(), false);
+  it('(d) is set by sequence while the window is the record, as before, and keeps no ordinal', { timeout: 120_000 }, async () => {
+    const h = await boot(place(), true);
     h.residentRow('before the tune-out');
     const entered = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
     assert.ok(entered.ok);
@@ -220,7 +237,7 @@ describe("the persistent subconscious's window start (#291, AF-5)", () => {
 
   it('(f) gives a tune-out active at the upgrade its ordinal right after the window is written down, in record order', { timeout: 120_000 }, async () => {
     const dir = place();
-    const legacy = await boot(dir, false);
+    const legacy = await boot(dir, true);
     legacy.residentRow('OLD-1 before the tune-out');
     legacy.bump();
     const entered = legacy.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
@@ -235,7 +252,7 @@ describe("the persistent subconscious's window start (#291, AF-5)", () => {
     await legacy.framework.stop();
     frameworks.splice(frameworks.indexOf(legacy.framework), 1);
 
-    const h = await boot(dir, true);
+    const h = await boot(dir);
     const cm = h.subCm();
     assert.equal(cm.windowMode(), 'presented', 'premise: written down at its registration');
     const first = cm.ordinalOf(h.rowOf('NEW-1 held').id)!;

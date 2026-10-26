@@ -39,7 +39,6 @@ async function waitFor(label: string, predicate: () => boolean, timeoutMs = 10_0
 interface Internals {
   providerWaits: { set(agent: string, model: string, ms: number, reason: string): unknown };
   providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[]; emptiedByDrop?: boolean }>;
-  deferredMessages: unknown[];
   processInferenceRequests(): Promise<void>;
   activeTurnTokens: Map<string, number>;
   providerAccelerationRecoveries: Map<string, unknown>;
@@ -260,6 +259,10 @@ const CONTINUATION_DROPPED = "a turn's continuation was dropped before it starte
 
 const storedTexts = (framework: AgentFramework): string =>
   JSON.stringify(framework.getAgent('prime')!.getContextManager().queryMessages({}).messages);
+/** What prime's window holds (#291): a write is stored at once, and enters
+ *  the window at the agent's next presentation point. */
+const windowTexts = (framework: AgentFramework): string =>
+  JSON.stringify(framework.getAgent('prime')!.getContextManager().getPresentedMessages());
 
 function pushMessage(framework: AgentFramework, text: string): void {
   framework.pushEvent({
@@ -366,18 +369,26 @@ describe('a turn whose continuation is on its way', () => {
     }
   });
 
-  it("a message arriving then is in the continuation's request, as on main, and its wake goes with the continuation", async () => {
+  // Ported for #291. A continuation resumes its logical turn, and a resumed
+  // start presents no arrival (only the agent's own rows, before its
+  // compile), so a message stored while the continuation is held waits
+  // outside the window until the turn ends, and its wake starts a turn of
+  // its own. This test once had the message in the continuation's request,
+  // as on main, where the compile read the record.
+  it("a message arriving then waits outside the continuation's request, enters the window as the turn ends, and its wake starts a turn of its own", async () => {
     const h = await restartTurn({ wait: true });
     try {
       await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
       pushMessage(h.framework, MID);
       await waitFor('the message to be stored', () => storedTexts(h.framework).includes(MID));
+      assert.ok(!windowTexts(h.framework).includes(MID), 'it waits outside the window');
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Read it.' }]));
       h.framework.releaseProviderWait('prime');
       await waitFor('the continuation to run once the wait ends', () => h.membrane.calls.length >= 2);
-      assert.ok(requestTexts(h.membrane.calls[1]).includes(MID), "the continuation's request carries the message");
-      await waitFor('the turn to end', () => h.framework.getHostModeStatus().drained);
-      await aPass(h, 'a pass after the turn');
-      assert.equal(h.membrane.calls.length, 2, 'the wake went with the continuation: no second turn');
+      assert.ok(!requestTexts(h.membrane.calls[1]).includes(MID), "the continuation's request leaves it out");
+      await waitFor('the message to enter the window as the turn ends', () => windowTexts(h.framework).includes(MID));
+      await waitFor('the wake to run its own turn', () => h.membrane.calls.length >= 3);
+      assert.ok(requestTexts(h.membrane.calls[2]).includes(MID), "the wake's own turn carries it");
     } finally {
       await h.cleanup();
     }
@@ -828,7 +839,10 @@ describe('a turn whose continuation is dropped ends there', () => {
     }
   });
 
-  it('an abandon while the restarted frame still holds its token ends the turn now, and what that frame deferred lands as it ends', async () => {
+  // Ported for #291: the message is stored at once, not deferred behind the
+  // token as this test once checked, and enters the window once the turn
+  // has ended.
+  it('an abandon while the restarted frame still holds its token ends the turn now, and what was stored meanwhile enters the window once it has', async () => {
     let release!: () => void;
     const h = await restartTurn({ wait: true, holdTeardown: new Promise<void>((r) => { release = r; }) });
     try {
@@ -838,7 +852,8 @@ describe('a turn whose continuation is dropped ends there', () => {
       });
       assert.equal(frameLetGo(h.framework), false, 'its frame still holds the token');
       pushMessage(h.framework, MID);
-      await waitFor('the message to defer behind the token', () => internals(h.framework).deferredMessages.length > 0);
+      await waitFor('the message to be stored', () => storedTexts(h.framework).includes(MID));
+      assert.ok(!windowTexts(h.framework).includes(MID), 'it waits outside the window while the frame holds the token');
       const quiesced = h.framework.quiesce({ timeoutMs: QUIESCE_MS, abandon: true });
       await waitFor('the abandon to drop the continuation', () => abortReasons(h.traces).includes('quiesce_abandoned'));
       release();
@@ -846,14 +861,15 @@ describe('a turn whose continuation is dropped ends there', () => {
       assert.equal(status.drained, true, 'the frame let go of its token');
       assert.equal(abortReasons(h.traces).filter((r) => r === 'quiesce_abandoned').length, 1, "one inference:aborted, the abandon's");
       await h.framework.resume();
-      await waitFor('the deferred message to land', () => storedTexts(h.framework).includes(MID));
+      await waitFor('the message to enter the window', () => windowTexts(h.framework).includes(MID));
     } finally {
       release();
       await h.cleanup();
     }
   });
 
-  it('a drop while the restarted frame still holds its token lands what was deferred as that frame ends', async () => {
+  // Ported for #291, as the test above.
+  it('a drop while the restarted frame still holds its token presents what was stored meanwhile as that frame ends', async () => {
     let release!: () => void;
     const h = await restartTurn({
       wait: true,
@@ -867,12 +883,12 @@ describe('a turn whose continuation is dropped ends there', () => {
       });
       assert.equal(frameLetGo(h.framework), false, 'its frame still holds the token');
       pushMessage(h.framework, MID);
-      await waitFor('the message to defer behind the token', () => internals(h.framework).deferredMessages.length > 0);
+      await waitFor('the message to be stored', () => storedTexts(h.framework).includes(MID));
       h.framework.releaseProviderWait('prime');
       await waitFor('the policy to drop the continuation', () => h.endLines().some((l) => l.includes('the inference policy dropped its continuation')));
-      assert.ok(!storedTexts(h.framework).includes(MID), 'the message waits while the frame holds the token');
+      assert.ok(!windowTexts(h.framework).includes(MID), 'the message waits outside the window while the frame holds the token');
       release();
-      await waitFor('the deferred message to land as the frame ends', () => storedTexts(h.framework).includes(MID));
+      await waitFor('the message to enter the window as the frame ends', () => windowTexts(h.framework).includes(MID));
     } finally {
       release();
       await h.cleanup();

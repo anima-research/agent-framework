@@ -68,6 +68,9 @@ describe('compiles that are never sent', () => {
       const agent = x.framework.getAgent('agent')!;
       const before = agent.getConsumedWatermark();
       const id = agent.getContextManager().addMessage('user', [{ type: 'text', text: 'not yet read' }]);
+      // Written straight to the context manager, it enters the window at a
+      // point (#291), which the compiles below read.
+      (x.framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(agent);
       await x.framework.previewActivation('agent');
       assert.deepEqual(agent.getConsumedWatermark(), before);
       // The control: a request that is sent assembled it, so it's read.

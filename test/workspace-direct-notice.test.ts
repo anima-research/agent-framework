@@ -98,7 +98,7 @@ class Harness {
   traces: TraceEvent[] = [];
   private users = 0;
 
-  constructor(readonly agents: string[] = ['scout'], readonly options: { presentationIndex?: boolean } = {}) {
+  constructor(readonly agents: string[] = ['scout']) {
     mkdirSync(this.work, { recursive: true });
   }
 
@@ -112,7 +112,6 @@ class Harness {
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
       errorPolicy: { maxRetries: 1, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 0 } : { retry: false }) },
-      ...(this.options.presentationIndex ? { presentationIndex: true } : {}),
     });
     // As a host gives the workspace its store (connectome-host's index.ts).
     this.workspace.initStore(this.framework.getStore());
@@ -176,8 +175,8 @@ class Harness {
 
 const carries = (request: NormalizedRequest | undefined) => JSON.stringify(request?.messages ?? []).includes(NOTICE);
 
-async function harness(t: { after: (fn: () => Promise<void>) => void }, agents?: string[], options?: { presentationIndex?: boolean }): Promise<Harness> {
-  const h = new Harness(agents, options);
+async function harness(t: { after: (fn: () => Promise<void>) => void }, agents?: string[]): Promise<Harness> {
+  const h = new Harness(agents);
   await h.open();
   t.after(async () => {
     await h.framework.stop().catch(() => {});
@@ -206,11 +205,11 @@ test("an undo of the turn that wrote a direct mount gives the notice once, at th
   assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
 });
 
-// With the presentation index (#291) an undo moves no branch: it takes the
-// turn out of the agent's window, and the workspace asks the window
-// (useWindow) whether the turn that wrote is still in it.
+// Since #291 an undo moves no branch: it takes the turn out of the agent's
+// window, and the workspace asks the window (useWindow) whether the turn
+// that wrote is still in it.
 test("on the window, an undo of the turn that wrote a direct mount moves no branch and gives the notice once, at the next start, and that start's request carries it", async (t) => {
-  const h = await harness(t, undefined, { presentationIndex: true });
+  const h = await harness(t);
   await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
   const undone = h.framework.undoLastTurn('scout');
   assert.equal(undone.undone, true);
@@ -225,7 +224,7 @@ test("on the window, an undo of the turn that wrote a direct mount moves no bran
 });
 
 test('on the window, a redo of the turn that wrote finds nothing due, and a head that never moved stores no notice', async (t) => {
-  const h = await harness(t, undefined, { presentationIndex: true });
+  const h = await harness(t);
   await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
   await h.turn([say('again')]);
   assert.equal(h.notices().length, 0, "the window holds the turn that wrote");

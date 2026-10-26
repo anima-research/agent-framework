@@ -355,8 +355,8 @@ const describe = (error: unknown): string => (error instanceof Error ? error.mes
 
 /**
  * The presentation index's decisions, over each live agent's context
- * manager. The framework constructs it under FrameworkConfig.presentationIndex
- * and calls it at each presentation point.
+ * manager. The framework constructs it in create() and calls it at each
+ * presentation point.
  */
 export class AgentPresentation {
   private readonly adopted = new WeakMap<WindowManager, Adopted>();
@@ -670,6 +670,13 @@ export class AgentPresentation {
       if (ids.has(rowId) && !inWindow.has(agent)) holders.push({ agent, via: 'framing' });
     }
     return holders;
+  }
+
+  /** Whether a reader fork was handed the row as framing (noteFramed), and
+   *  hasn't been let go since, whether or not its window holds the row. */
+  framedToAny(rowId: MessageId): boolean {
+    for (const ids of this.framed.values()) if (ids.has(rowId)) return true;
+    return false;
   }
 
   /** Whether any live agent but `except` holds the row in a window or as framing: a window that is still the record doesn't count. */

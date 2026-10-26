@@ -17,7 +17,6 @@ type Internals = {
   queue: { isClosed: boolean; close(): void };
   retryWaitWakers: Set<() => void>;
   codeExecution: unknown;
-  deferredMessages: unknown[];
   [field: string]: unknown;
 };
 const internals = (framework: AgentFramework) => framework as unknown as Internals;
@@ -147,7 +146,6 @@ function checkPostponedReleases(framework: AgentFramework): void {
 const ROWS: Row[] = [
   { step: "the push coalescer's suspend()", inject: (fw, e) => throwIn(internals(fw), 'pushCoalescer', 'suspend', e) },
   { step: 'flushing the coalescing snapshot', inject: (fw, e) => patchMethod(fw, 'flushCoalescingSnapshot', e) },
-  { step: 'acking deferred writes', inject: (fw, e) => patchMethod(fw, 'ackDeferredWrites', e) },
   {
     step: "a retry wait's waker",
     inject: (fw, e) => {
@@ -185,20 +183,6 @@ const ROWS: Row[] = [
     inject: (fw, e) => postponedReleases(fw, e, 'before stop()'),
     check: (fw) => checkPostponedReleases(fw),
   },
-  {
-    step: "the drain of what was queued for a postponed release, before the registry forgets its channels",
-    inject: (fw, e) => {
-      (internals(fw).releasesAfterResume as Map<string, { name: string }>).set('first', { name: 'first' });
-      const owner = fw as unknown as Record<string, unknown>;
-      const usual = (owner.readdDrained as (...args: unknown[]) => unknown).bind(fw);
-      owner.readdDrained = (...args: unknown[]) => {
-        if (args[1] === 'stop: postponed releases') throw e;
-        return usual(...args);
-      };
-      return () => { delete owner.readdDrained; };
-    },
-    check: (fw) => assert.equal((internals(fw).releasesAfterResume as Map<string, unknown>).size, 0, 'the postponed releases are cleared'),
-  },
   { step: "the channel registry's stopAll()", inject: (fw, e) => throwIn(internals(fw), 'channelRegistry', 'stopAll', e) },
   { step: "the event gate's dispose()", inject: (fw, e) => throwIn(internals(fw), 'eventGate', 'dispose', e) },
   {
@@ -216,15 +200,6 @@ const ROWS: Row[] = [
     finishing: true,
     inject: (fw, e) => postponedReleases(fw, e, 'while stop() waits'),
     check: (fw) => checkPostponedReleases(fw),
-  },
-  {
-    step: 'the last flush of deferred writes',
-    finishing: true,
-    inject: (fw, e) => {
-      // The resident's, not the run's: the run's own end stores its queue.
-      internals(fw).deferredMessages.push({ forAgent: 'assistant' });
-      return patchMethod(fw, 'readdDrained', e);
-    },
   },
 ];
 
@@ -293,10 +268,15 @@ describe('a step of stop() that throws', () => {
       assert.ok(waited < 10_000, "the resident's stream is being driven");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    // A write for the resident, deferred behind its stream.
+    // A write for the resident while its stream runs. #291 took the deferral
+    // queue away, so it is stored at once and waits outside the resident's
+    // window; this test once waited for it to be queued, and checked that it
+    // stayed queued while the stream ran.
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'a note for later', metadata: {} } as unknown as ProcessEvent);
-    for (let waited = 0; internals(framework).deferredMessages.length === 0; waited += 10) {
-      assert.ok(waited < 10_000, 'the note is deferred behind the stream');
+    const resident = framework.getAgent('assistant')!.getContextManager();
+    const note = () => resident.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'a note for later'));
+    for (let waited = 0; note() === undefined; waited += 10) {
+      assert.ok(waited < 10_000, 'the note is stored while the stream runs');
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const ended = startRun();
@@ -311,7 +291,7 @@ describe('a step of stop() that throws', () => {
     await new Promise((resolve) => setImmediate(resolve));
     assert.match(String(ended()), /refused: the framework is stopping/, "stop()'s sweep ended the pending ephemeral run");
     assert.equal(internals(framework).ownedStoreClosed, false, 'the store stays open while the stream runs');
-    assert.equal(internals(framework).deferredMessages.length, 1, "the resident's deferred write stays queued while its stream runs");
+    assert.ok(note(), "the resident's note is kept while its stream runs");
     // A later stop() waits for the stream the first one left running: its own
     // cancel has run (and thrown), and it hasn't reached the watchdog's stop,
     // which comes after the waits.

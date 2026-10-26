@@ -3,8 +3,9 @@
  * src/dendrite/audience.ts). A write through the framework's addMessage is
  * stamped there. One that stores into a context manager directly, past it,
  * stamps its own row: through storeOwnRow, or with asOwnRow or withAudience
- * on the metadata it passes, or, for an entry flushed from the deferred
- * queue, with the stamp the entry was queued (or restored) with.
+ * on the metadata it passes. (Since #291 there is no deferral queue, whose
+ * three flushes were direct writes listed here; the importer that stores an
+ * earlier release's queue at boot goes through addMessage.)
  *
  * The scenario tests in audience-stamp.test.ts check the rows of the paths
  * they drive, not every writer. This scan reads src as a syntax tree and
@@ -140,13 +141,9 @@ const THROUGH_THE_FRAMEWORK: Array<{ file: RegExp; receiver: string; scope?: Reg
  * How a direct write stamps its row, each checked by the helper the scope
  * that holds it calls:
  * - own: asOwnRow, the agent's own row (storeOwnRow is asOwnRow too);
- * - audience: withAudience, a row for the agents it names;
- * - queued: an entry from the deferred queue, stored with the metadata it
- *   was queued with, which addMessage stamped when it queued it, or restore
- *   stamped when an earlier version left it unstamped (withDeferredWriteId
- *   adds its id only).
+ * - audience: withAudience, a row for the agents it names.
  */
-const STAMPED_BY = { own: 'asOwnRow(', audience: 'withAudience(', queued: 'withDeferredWriteId(' } as const;
+const STAMPED_BY = { own: 'asOwnRow(', audience: 'withAudience(' } as const;
 
 /**
  * Every direct write into a context manager in src, by file and named scope:
@@ -157,9 +154,6 @@ const DIRECT_WRITES: Record<string, { count: number; stamp: keyof typeof STAMPED
   'dendrite/audience.ts storeOwnRow': { count: 1, stamp: 'own', what: "the helper for an agent's own rows" },
   'tool-result-guard.ts ToolResultGuard.storeResults': { count: 2, stamp: 'own', what: 'tool results, guarded or not' },
   'framework.ts AgentFramework.addMessage': { count: 1, stamp: 'audience', what: "the framework's addMessage, its own body" },
-  'framework.ts AgentFramework.handleProcessEvent': { count: 1, stamp: 'queued', what: "the tool boundary's flush" },
-  'framework.ts AgentFramework.flushForStart': { count: 1, stamp: 'queued', what: "a turn start's flush" },
-  'framework.ts AgentFramework.releaseWindow': { count: 1, stamp: 'queued', what: "a released window's flush" },
   // The two channel writes into a fork's store (a correction delivered to
   // it, a message routed to the channel's fork) go through one helper.
   'framework.ts AgentFramework.storeInFork': { count: 1, stamp: 'audience', what: "a channel message stored in a fork's store" },
@@ -315,7 +309,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.noticeHeadMoves': { count: 1, when: 'turn', what: "a start's workspace head-move notice" },
   'framework.ts AgentFramework.writeAutoContinueNotice': { count: 1, when: 'turn', what: "a continuation's [continue] row, at its start" },
   'framework.ts AgentFramework.placeWakeLines': { count: 1, when: 'turn', what: "a batched wake's line, at its start" },
-  'framework.ts AgentFramework.runPuppetToolCall': { count: 4, when: 'held-back', what: "the puppet's pair: under its own reservation, or held back once a turn replaced it" },
+  'framework.ts AgentFramework.runPuppetToolCall': { count: 2, when: 'held-back', what: "the puppet's pair: under its own reservation, or held back once a turn replaced it" },
   'framework.ts AgentFramework.appendProseDeliveryReceipt': { count: 1, when: 'end', what: "a stream's delivery receipt, after its last request" },
   'framework.ts AgentFramework.driveStream': { count: 1, when: 'end', what: 'the contained tool-wrapper prose marker' },
   'framework.ts AgentFramework.updateRewindMarker': { count: 1, when: 'end', what: "a refusal rewind's marker" },

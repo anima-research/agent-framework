@@ -45,9 +45,9 @@
  * a stored row's, say) is replaced, as `deferredWriteId` is. The stamp is
  * metadata only: compiles and requests don't read it, so they are what they
  * were. Rows stored before the stamp existed carry none; `audienceOf` says
- * so by returning undefined. A write an earlier version left in the
- * deferred queue is stamped when the queue is restored at boot, as this
- * version stamps a write it queues, so it isn't stored unstamped after the
+ * so by returning undefined. A write an earlier version left in its
+ * deferred queue is stamped when the importer stores it at boot, as any
+ * write through `addMessage` is, so it isn't stored unstamped after the
  * upgrade.
  */
 import type { ContentBlock } from '@animalabs/membrane';

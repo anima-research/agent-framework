@@ -17,7 +17,7 @@ import { AgentFramework } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { headOf, legacyMarkFrom, rowAt } from './helpers/read-mark-rows.js';
+import { headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
@@ -365,6 +365,8 @@ async function harness(opts: {
     texts: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text),
     messages: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages(),
+    /** The agent's window, in its order (#291): a row stored mid-round enters it at the round's boundary. */
+    window: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getPresentedMessages(),
     /** Text of every tool result the last stream received, in call order
      *  within each round (results arrive in completion order). */
     toolResults: () => (membrane.lastStream?.receivedToolResults ?? []).flatMap((round, i) => {
@@ -416,9 +418,12 @@ describe('held prose drafts, end to end', () => {
       assert.ok(held.every((d) => d.reason === 'explicit-send'));
       const ids = held.map((d) => d.id);
 
-      // Safe in-band ordering: each mid-turn notice is stored after the tool
-      // result it rode with, and was injected into the live stream there.
-      const msgs = h.messages();
+      // Safe in-band ordering: each mid-turn notice enters the window after
+      // the tool result it rode with, and was injected into the live stream
+      // there. (Since #291 the window's order, not the record's: the notice
+      // is stored at once, and presented at the boundary after the round's
+      // own rows.)
+      const msgs = h.window();
       const noticeIdx = msgs.findIndex((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-drafts');
       assert.ok(noticeIdx > 0, 'a held-draft notice was stored');
       assert.ok(msgs[noticeIdx - 1]!.content.some((b) => b.type === 'tool_result'), 'right after the tool result');
@@ -430,11 +435,14 @@ describe('held prose drafts, end to end', () => {
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
-      // needs nothing more of it): nothing yet in room.
+      // needs nothing more of it): nothing yet in room. A mark taken in
+      // presented mode covers a row by its place in the window, so the
+      // checks ask it of real rows.
       const scout = h.framework.getAgent('scout')!;
       const cm = scout.getContextManager();
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
-      assert.equal(scout.publishedAfterReading(room, rowAt(0), cm), false, 'nothing published in room yet');
+      const firstRow = cm.getPresentedMessages()[0]!;
+      assert.equal(scout.publishedAfterReading(room, firstRow, cm), false, 'nothing published in room yet');
 
       // Next turn: list (every field present, nulls), read, then resend all three.
       await h.turn([
@@ -444,7 +452,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       const readThrough = scout.getConsumedWatermark();
-      assert.equal(scout.publishedAfterReading(room, rowAt(headOf(readThrough)), cm), true,
+      assert.equal(scout.publishedAfterReading(room, newestCovered(readThrough, cm), cm), true,
         'the resend is noted as a publish into room, made having read what the turn read');
       assert.equal(scout.publishedAfterReading(room, rowAt(headOf(readThrough) + 1), cm), false, 'and nothing stored since');
       const [list, read, resend] = h.toolResults();
@@ -599,7 +607,7 @@ describe('held prose drafts, end to end', () => {
       const scout = h.framework.getAgent('scout')!;
       const cm = scout.getContextManager();
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
-      assert.equal(scout.publishedAfterReading(room, rowAt(0), cm), false,
+      assert.equal(scout.publishedAfterReading(room, cm.getPresentedMessages()[0]!, cm), false,
         "a background script's resend is not noted");
 
       // Through executeToolCall, as the admin puppet and ephemeral agents call.
@@ -614,7 +622,7 @@ describe('held prose drafts, end to end', () => {
       });
       assert.equal(result.success, true, `the puppet's resend delivered: ${JSON.stringify(result)}`);
       assert.ok(h.publishes().some((p) => p.channelId === ROOM && p.text === 'more words held'));
-      assert.equal(scout.publishedAfterReading(room, rowAt(0), cm), false, "a puppet's resend is not noted");
+      assert.equal(scout.publishedAfterReading(room, cm.getPresentedMessages()[0]!, cm), false, "a puppet's resend is not noted");
     } finally {
       await h.close();
     }
@@ -701,7 +709,7 @@ describe('held prose drafts, end to end', () => {
       const scout = h.framework.getAgent('scout')!;
       const cm = scout.getContextManager();
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
-      const noted = () => scout.publishedAfterReading(room, rowAt(0), cm);
+      const noted = () => scout.publishedAfterReading(room, cm.getPresentedMessages()[0]!, cm);
 
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
@@ -1425,25 +1433,29 @@ describe('draft notices and turn-end settlement', () => {
     }
   });
 
-  it('the catch-up leaves out a draft that a notice still waiting to be written names', async () => {
+  // Ported for #291: the notice this test once queued by hand in the
+  // deferral queue is stored at once while the turn is alive, and waits
+  // outside the window for the agent's next point.
+  it('the catch-up leaves out a draft that a notice stored and not yet presented names', async () => {
     const t = await catchUpFixture();
-    const queue = (t.framework as unknown as { deferredMessages: Array<Record<string, unknown>> }).deferredMessages;
+    const tokens = (t.framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
     try {
       const [waiting, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'waiting' }, { text: 'lost' }], 'bounced').held;
-      // A bounce notice deferred while a turn is alive: not in the history
-      // yet, but on its way.
-      queue.push({
-        id: 'deferred-notice', seq: 1, participant: 'user',
-        content: [{ type: 'text', text: '[prose-routing] …' }],
-        metadata: { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [waiting!.id] },
-        forAgent: 'scout',
-      });
+      // A bounce notice written while a turn is alive: in the record, not in
+      // the window yet.
+      tokens.set('scout', 1);
+      const stored = (t.framework as unknown as {
+        addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata: Record<string, unknown>, opts: { forAgent: string }): string;
+      }).addMessage('user', [{ type: 'text', text: '[prose-routing] …' }],
+        { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [waiting!.id] }, { forAgent: 'scout' });
+      tokens.delete('scout');
+      assert.equal(t.cm.ordinalOf(stored as never), undefined, 'premise: the notice waits outside the window');
       t.internals.noticeUnnoticedDrafts(t.agent);
       const [catchUp] = t.catchUps();
       assert.ok(catchUp?.includes(lost!.id), 'the draft no notice names is named');
       assert.ok(!catchUp!.includes(waiting!.id), `the one a waiting notice names is not: ${catchUp}`);
     } finally {
-      queue.length = 0;
+      tokens.delete('scout');
       await t.close();
     }
   });

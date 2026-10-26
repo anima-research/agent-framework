@@ -57,7 +57,6 @@ interface Internals {
   readDiscordAwarenessDue(serverId?: string): unknown[];
   drainDiscordAwarenessOutbox(serverId: string): Promise<unknown>;
   deliverDiscordAwarenessInBackground(occasion: string, agentName: string): void;
-  flushDeferredWrites(label: string): Promise<void>;
   wireMcplEvents(connection: unknown, config: { id: string }): void;
   operatorOperations: Set<{ label: string; promise: Promise<void> }>;
   moduleRegistry: { getModule(name: string): unknown };
@@ -234,37 +233,6 @@ describe('stop() with an operator operation in flight', () => {
     await framework.stop();
     await assert.rejects(framework.resume(), /^Error: resume refused: the framework is stopping$/);
     assert.equal(await bootsQuiesced(), true, 'the host boots quiesced');
-  });
-
-  it('stop() waits for a resume past its commit point: it completes, its durable clear lands, and its data plane opens', async () => {
-    const framework = await create();
-    const connection = {
-      id: 'srv',
-      isConnected: true,
-      readied: 0,
-      pauseDataPlane(): void {},
-      readyControlPlane(): void {},
-      ready(): void { this.readied++; },
-    };
-    const fw = internals(framework);
-    fw.mcplServerRegistry = { getAllServers: () => [connection], closeAll: async () => {} };
-    framework.start();
-    await framework.quiesce();
-    // Past its commit point, the resume flushes the writes the quiesce held
-    // back; that flush is held while stop() waits.
-    let flushed: (() => void) | undefined;
-    const flush = fw.flushDeferredWrites.bind(framework);
-    fw.flushDeferredWrites = (label: string) => new Promise<void>((resolve) => { flushed = () => resolve(flush(label)); });
-    const resuming = framework.resume().then((status) => { order.push('resume settled'); return status; });
-    await until(() => flushed !== undefined, 'the resume to reach its flush');
-    const stopping = framework.stop();
-    await releaseWhenStopWaits(() => flushed!());
-    await stopping;
-    assert.deepEqual(order, ['resume settled', 'modules stopped']);
-    assert.equal((await resuming).quiesced, false, 'past its commit point the resume completes');
-    assert.equal(connection.readied, 1, 'its data plane opens, so the listeners answer what it held back');
-    assert.equal(await bootsQuiesced(), false, 'its durable clear landed');
-    assert.deepEqual(rejections, []);
   });
 
   it("stop() waits for a host/command, so its answer goes out before the connections close", async () => {
@@ -1010,15 +978,14 @@ describe('stop() with an operator operation in flight', () => {
     });
   }
 
-  for (const action of ['undo', 'redo', 'rollback', 'suppress'] as const) {
+  // An undo or redo is on the agent's window (#291) and moves no branch, so
+  // it materializes no config mount; a rollback and a suppression still do.
+  for (const action of ['rollback', 'suppress'] as const) {
     it(action + "'s config materialization doesn't hold its caller, and stop() waits for it", { timeout: 20_000 }, async () => {
       const framework = await create();
       const fw = internals(framework);
       const cm = framework.getAgent('agent')!.getContextManager();
-      const sequenceBefore = framework.getStore().currentSequence();
       const ids = [1, 2, 3].map((n) => cm.addMessage('user', [{ type: 'text', text: 'm' + n }]));
-      fw.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
-      if (action === 'redo') framework.undoLastTurn('agent');
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
       let materializing = false;
@@ -1026,9 +993,7 @@ describe('stop() with an operator operation in flight', () => {
       fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
         materializeMount: async () => { materializing = true; await held; order.push('config materialized'); },
       } : getModule(name);
-      if (action === 'undo') framework.undoLastTurn('agent');
-      else if (action === 'redo') framework.redo('agent');
-      else if (action === 'rollback') await framework.rollbackToMessage('agent', { messageId: ids[0]! });
+      if (action === 'rollback') await framework.rollbackToMessage('agent', { messageId: ids[0]! });
       else await framework.suppressMessages('agent', { messageIds: [ids[1]!] });
       assert.equal(materializing, true, 'the caller returned before file IO settled');
       const stopping = framework.stop();
@@ -1038,20 +1003,23 @@ describe('stop() with an operator operation in flight', () => {
     });
   }
 
-  it('a config materialization that fails is logged, and its undo still succeeds', async () => {
+  it('an undo and its redo are on the window: they move no branch and materialize no config mount', async () => {
     const framework = await create();
     const fw = internals(framework);
     const cm = framework.getAgent('agent')!.getContextManager();
-    const sequenceBefore = framework.getStore().currentSequence();
+    const record = (fw as unknown as { recordTurnCheckpoint(name: string): void }).recordTurnCheckpoint.bind(fw);
+    record('agent');
     cm.addMessage('user', [{ type: 'text', text: 'a turn' }]);
-    fw.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
+    (fw as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('agent'));
+    let materialized = 0;
     const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
-    fw.moduleRegistry.getModule = (name) => name === 'workspace' ? {
-      materializeMount: async () => { throw new Error('disk full'); },
-    } : getModule(name);
-    assert.equal(framework.undoLastTurn('agent').undone, true);
+    fw.moduleRegistry.getModule = (name) => name === 'workspace' ? { materializeMount: async () => { materialized++; } } : getModule(name);
+    const branch = cm.currentBranch().name;
+    const undone = framework.undoLastTurn('agent');
+    assert.deepEqual([undone.undone, undone.fromBranch, undone.toBranch], [true, branch, branch]);
+    assert.equal(framework.redo('agent').toBranch, branch);
     await framework.stop();
-    assert.ok(logged.some((line) => line.includes('re-materializing the config mount after a branch switch failed') && line.includes('disk full')), logged.join('\n'));
+    assert.equal(materialized, 0, 'neither re-materialized the config mount');
     assert.deepEqual(rejections, []);
   });
 
@@ -1109,7 +1077,7 @@ describe('stop() with an operator operation in flight', () => {
     };
     let stopping: Promise<void> | undefined;
     framework.onTrace((event) => {
-      if (event.type === 'undo:completed') stopping = framework.stop();
+      if (event.type === 'window:undone') stopping = framework.stop();
     });
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
     fw.wireMcplEvents(connection, { id: 'srv' });
@@ -1131,12 +1099,16 @@ describe('stop() with an operator operation in flight', () => {
     const fw = internals(framework);
     const cm = framework.getAgent('agent')!.getContextManager();
     const record = (fw as unknown as { recordTurnCheckpoint(name: string): void }).recordTurnCheckpoint.bind(fw);
+    // A row written past the framework enters the window at the agent's next
+    // point (#291); an undo is on the window.
+    const present = () => (fw as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('agent'));
     record('agent');
     cm.addMessage('user', [{ type: 'text', text: 'a turn' }]);
+    present();
     const drains = holdDrains(framework);
     let stopping: Promise<void> | undefined;
     framework.onTrace((event) => {
-      if (event.type === 'undo:completed' && !stopping) stopping = framework.stop();
+      if (event.type === 'window:undone' && !stopping) stopping = framework.stop();
     });
     const api = new ApiServer(framework) as unknown as {
       cmdUndo(params: { agentName: string }): Promise<{ undone: boolean }>;
@@ -1146,7 +1118,7 @@ describe('stop() with an operator operation in flight', () => {
     assert.equal((await api.cmdUndo({ agentName: 'agent' })).undone, true);
     assert.ok(stopping, "the undo's trace started stop()");
     await stopping;
-    assert.equal(drains.started(), 0, 'a branch move starts no delivery');
+    assert.equal(drains.started(), 0, 'an undo starts no delivery');
     assert.deepEqual(rejections, []);
   });
 
@@ -1156,13 +1128,17 @@ describe('stop() with an operator operation in flight', () => {
     const cm = framework.getAgent('agent')!.getContextManager();
     // Two turns, each checkpointed as a real turn's start records it.
     const record = (fw as unknown as { recordTurnCheckpoint(name: string): void }).recordTurnCheckpoint.bind(fw);
+    // Each row enters the window as a turn's would (#291); the undo is on the window.
+    const present = () => (fw as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('agent'));
     record('agent');
     cm.addMessage('user', [{ type: 'text', text: 'turn one' }]);
+    present();
     record('agent');
     cm.addMessage('user', [{ type: 'text', text: 'turn two' }]);
+    present();
     let stopping: Promise<void> | undefined;
     framework.onTrace((event) => {
-      if (event.type === 'undo:completed' && !stopping) stopping = framework.stop();
+      if (event.type === 'window:undone' && !stopping) stopping = framework.stop();
     });
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
     fw.wireMcplEvents(connection, { id: 'srv' });
@@ -1175,7 +1151,7 @@ describe('stop() with an operator operation in flight', () => {
       respond: (result: typeof answer) => {
         answer = result;
         checkpoints = fw.getTurnCheckpoints('agent');
-        texts = cm.getAllMessages().map((m) => JSON.stringify(m.content));
+        texts = cm.getPresentedMessages().map((m) => JSON.stringify(m.content));
       },
       respondError: () => { order.push('undo failed'); },
     });

@@ -1,14 +1,14 @@
 /**
  * Content context-manager won't store is refused where the framework writes
- * it, whether the write would be stored at once or deferred while a turn
- * runs, as the store's own write and edit refuse it: a module's write, and
- * its edit of a write still held for the turn's end, throw
- * context-manager's MalformedContentError. A process response with such
+ * it, whether a turn runs or not, as the store's own write and edit refuse
+ * it: a module's write, and its edit of a write stored during the turn and
+ * not in the window yet, throw context-manager's MalformedContentError. A process response with such
  * content is refused whole before any response applies, with a line and a
  * trace, and throws nothing; the API's message.send refuses content that
  * isn't text at its call. Before, a deferred write was refused only at a
  * later flush, where the writer never heard of it, and a held write's edit
- * could replace valid content with content the drain then dropped.
+ * could replace valid content with content the drain then dropped; since
+ * #291 every write is stored at once.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -71,9 +71,9 @@ async function harness(modules: Writer[]) {
   framework.onTrace((e) => { traces.push(e as unknown as Record<string, unknown>); });
   const window = () => framework.getAgent('assistant')!.getContextManager().getAllMessages()
     .map((m) => `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
-  const queued = () => (framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length;
+  const stored = () => framework.getAgent('assistant')!.getContextManager().getAllMessages().length;
   return {
-    framework, membrane, errors, traces, window, queued,
+    framework, membrane, errors, traces, window, stored,
     close: async () => {
       console.error = error;
       await framework.stop();
@@ -96,22 +96,23 @@ function catchFrom(f: () => unknown): unknown {
   return undefined;
 }
 
-test("a module's malformed write throws while a turn runs, as it does while the agent is idle, and nothing is queued", async (t) => {
+test("a module's malformed write throws while a turn runs, as it does while the agent is idle, and nothing is stored", async (t) => {
   const writer = new Writer();
   const x = await harness([writer]); t.after(x.close);
   scriptTurn(x.membrane);
   let duringTurn: unknown;
-  let queuedThen = -1;
+  let storedBy = -1;
   writer.during = () => {
+    const before = x.stored();
     duringTurn = catchFrom(() => writer.ctx.addMessage('Antra', MALFORMED));
-    queuedThen = x.queued();
+    storedBy = x.stored() - before;
     writer.ctx.addMessage('Antra', text('look right'));
   };
   x.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
   await x.framework.runUntilIdle();
   assert.ok(duringTurn instanceof MalformedContentError, String(duringTurn));
   assert.match((duringTurn as Error).message, /^Message refused: content\[0\]/);
-  assert.equal(queuedThen, 0, 'the refused write was never queued');
+  assert.equal(storedBy, 0, 'the refused write stored nothing');
   assert.ok(x.window().includes('Antra: look right'), 'the next write landed');
   const idle = catchFrom(() => writer.ctx.addMessage('Antra', MALFORMED));
   assert.ok(idle instanceof MalformedContentError, String(idle));

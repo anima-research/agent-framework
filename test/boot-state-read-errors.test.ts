@@ -2,10 +2,10 @@
  * At boot, a stored state that can't be read, or that reads as something this
  * code doesn't read as that state, is a refusal that names it, not an empty
  * state. Taken as empty, each was lost or ignored: a quiesced host booted
- * serving and landed its deferred writes mid-surgery; a deferred-write queue
- * restored nothing and the next deferral replaced it; a deferred write that
- * had landed before its ack landed again when an agent's context couldn't be
- * scanned; usage totals started at zero and the next inference stored zeros
+ * serving and showed its agents writes mid-surgery; the deferred-write queue
+ * an earlier release left (#291's one-release importer stores it at boot)
+ * stored nothing; a deferred write that had landed before its ack landed
+ * again when an agent's context couldn't be scanned; usage totals started at zero and the next inference stored zeros
  * over them; an agent's settings booted at its recipe's and the next change
  * stored over the record; coalesced work acknowledged before a crash was never
  * delivered, and the next receipt or flush replaced what was stored. Each
@@ -73,6 +73,9 @@ const config = (storePath: string): FrameworkConfig =>
   ({ storePath, membrane: new MockMembrane().asMembrane(), agents, modules: [] }) as unknown as FrameworkConfig;
 const texts = (f: AgentFramework): string[] =>
   f.getAgent('agent')!.getContextManager().getAllMessages().map((m) => (m.content[0] as { text?: string } | undefined)?.text ?? '');
+/** The texts of the agent's window (#291): the rows it was shown. */
+const shown = (f: AgentFramework): string[] =>
+  f.getAgent('agent')!.getContextManager().getPresentedMessages().map((m) => (m.content[0] as { text?: string } | undefined)?.text ?? '');
 
 /** A store directory removed after `body`, which receives its storePath. */
 function inStoreDir(prefix: string, body: (storePath: string) => Promise<void>): () => Promise<void> {
@@ -99,13 +102,14 @@ function readState(storePath: string, stateId: string): unknown {
   try { return store.getStateJson(stateId); } finally { store.close(); }
 }
 
-/** Quiesce with one write deferred, and stop. */
-async function quiescedWithAWrite(storePath: string, text = 'said during surgery'): Promise<void> {
+/** What a release before #291 left when it was stopped quiesced with one
+ *  write deferred: the host quiesced, and the queue in its recovery file
+ *  (`file`, by default the store's), which this release imports at boot. */
+async function quiescedWithAnEarlierQueue(storePath: string, text = 'said during surgery', file = join(storePath, 'recovery', 'deferred-writes.json')): Promise<void> {
   const f = await AgentFramework.create(config(storePath));
-  try {
-    await f.quiesce({ reason: 'surgery' });
-    (f as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text }]);
-  } finally { await f.stop(); }
+  try { await f.quiesce({ reason: 'surgery' }); } finally { await f.stop(); }
+  mkdirSync(join(file, '..'), { recursive: true });
+  writeFileSync(file, JSON.stringify({ version: 2, pending: [{ id: 'w-1', seq: 1, participant: 'user', content: [{ type: 'text', text }] }], scanFrom: {} }));
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +117,7 @@ async function quiescedWithAWrite(storePath: string, text = 'said during surgery
 // ---------------------------------------------------------------------------
 
 test("a host-mode file that can't be read fails create(), and the next boot is quiesced with its writes", inStoreDir('boot-read-hostmode-', async (storePath) => {
-  await quiescedWithAWrite(storePath);
+  await quiescedWithAnEarlierQueue(storePath);
   const file = join(storePath, 'recovery', 'host-mode.json');
   const before = readFileSync(file, 'utf8');
   const restore = failRecoveryRead('host-mode.json');
@@ -128,13 +132,13 @@ test("a host-mode file that can't be read fails create(), and the next boot is q
   const f = await AgentFramework.create(config(storePath));
   try {
     assert.equal(f.getHostModeStatus().quiesced, true);
-    assert.equal(f.getHostModeStatus().deferredWrites, 1);
-    assert.ok(!texts(f).includes('said during surgery'), 'the deferred write waits for resume');
+    assert.ok(texts(f).includes('said during surgery'), 'the queued write is stored at boot');
+    assert.ok(!shown(f).includes('said during surgery'), 'and enters the window only at resume');
   } finally { await f.stop(); }
 }));
 
 test('a host-mode file that holds no record, text that isn\'t JSON, or a record whose quiesced is not a boolean, fails create(), naming what it holds', inStoreDir('boot-read-hostmode-form-', async (storePath) => {
-  await quiescedWithAWrite(storePath);
+  await quiescedWithAnEarlierQueue(storePath);
   const file = join(storePath, 'recovery', 'host-mode.json');
   const literal = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
   for (const [content, holds] of [
@@ -180,11 +184,7 @@ test("a deferred-writes file that can't be reached fails create(), and doesn't r
   // As for the host-mode file: ENOTDIR from a file where the queue file's directory should be.
   const dir = join(storePath, '..', 'deferred-dir');
   const withPath = (): FrameworkConfig => ({ ...config(storePath), deferredWritesPath: join(dir, 'deferred-writes.json') }) as FrameworkConfig;
-  const first = await AgentFramework.create(withPath());
-  try {
-    await first.quiesce({ reason: 'surgery' });
-    (first as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'said during surgery' }]);
-  } finally { await first.stop(); }
+  await quiescedWithAnEarlierQueue(storePath, 'said during surgery', join(dir, 'deferred-writes.json'));
   renameSync(dir, `${dir}.aside`);
   writeFileSync(dir, 'not a directory');
   try {
@@ -194,7 +194,7 @@ test("a deferred-writes file that can't be reached fails create(), and doesn't r
     renameSync(`${dir}.aside`, dir);
   }
   const f = await AgentFramework.create(withPath());
-  try { assert.equal(f.getHostModeStatus().deferredWrites, 1, 'the next reachable boot restores the queue'); } finally { await f.stop(); }
+  try { assert.equal(texts(f).filter((t) => t === 'said during surgery').length, 1, 'the next reachable boot imports the queue'); } finally { await f.stop(); }
 }));
 
 test("with no recovery file, a host mode that can't be read from framework/state fails create()", async () => {
@@ -229,25 +229,25 @@ test("with no recovery file, a host mode that can't be read from framework/state
 // Deferred writes
 // ---------------------------------------------------------------------------
 
-test("a deferred-write queue that can't be read fails create(), and the next boot lands its writes at resume", inStoreDir('boot-read-deferred-', async (storePath) => {
-  await quiescedWithAWrite(storePath);
+test("a deferred-write queue that can't be read fails create(), and the next boot stores its writes, shown at resume", inStoreDir('boot-read-deferred-', async (storePath) => {
+  await quiescedWithAnEarlierQueue(storePath);
   const file = join(storePath, 'recovery', 'deferred-writes.json');
   const before = readFileSync(file, 'utf8');
   const restore = failRecoveryRead('deferred-writes.json');
   try {
-    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them, since the next deferral would replace the stored queue\. The file is unchanged, and the framework starts once it can be read\.$/);
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything newer\. The file is unchanged, and the framework starts once it can be read\.$/);
   } finally { restore(); }
   assert.equal(readFileSync(file, 'utf8'), before, 'the queue is as it was');
   const f = await AgentFramework.create(config(storePath));
   try {
-    assert.equal(f.getHostModeStatus().deferredWrites, 1);
+    assert.equal(texts(f).filter((t) => t === 'said during surgery').length, 1, 'stored at boot');
     await f.resume();
-    assert.deepEqual(texts(f).filter((t) => t === 'said during surgery').length, 1);
+    assert.deepEqual(shown(f).filter((t) => t === 'said during surgery').length, 1, 'and shown at resume');
   } finally { await f.stop(); }
 }));
 
 test("a deferred-write queue that isn't a queue, or isn't JSON, fails create(), naming what it holds", inStoreDir('boot-read-deferred-form-', async (storePath) => {
-  await quiescedWithAWrite(storePath);
+  await quiescedWithAnEarlierQueue(storePath);
   const file = join(storePath, 'recovery', 'deferred-writes.json');
   for (const [content, holds] of [
     ['"pending"', 'hold a string, not a queue of writes'],
@@ -259,10 +259,10 @@ test("a deferred-write queue that isn't a queue, or isn't JSON, fails create(), 
   ] as const) {
     writeFileSync(file, content);
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
-      `^the deferred context writes \\(.*deferred-writes\\.json\\) ${holds}\\. The framework doesn't start without them, since the next ` +
-      `deferral would replace the stored queue\\. The file is unchanged, and the framework starts once it holds a queue of writes, ` +
+      `^the deferred context writes \\(.*deferred-writes\\.json\\) ${holds}\\. The framework doesn't start without them: an earlier ` +
+      `version left them queued, and they are stored at boot, ahead of anything newer\\. The file is unchanged, and the framework starts once it holds a queue of writes, ` +
       `such as \\{"version":1,"pending":\\[\\]\\} for none\\. Removing it reads the queue from framework/deferred-writes instead, ` +
-      `which the file's writes don't keep, so it restores whatever older queue is there, or none\\.$`,
+      `which the file's writes don't keep, so it imports whatever older queue is there, or none\\.$`,
     ), content);
     assert.equal(readFileSync(file, 'utf8'), content, `${content}: the file is as it was`);
   }
@@ -276,18 +276,19 @@ test("with no recovery file, a deferred-write queue that can't be read, or isn't
   try {
     const first = await AgentFramework.create(slotConfig());
     await first.quiesce({ reason: 'surgery' });
-    (first as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'said during surgery' }]);
     await first.stop();
+    // What a release before #291 left in the slot, stopped quiesced with a write deferred.
+    store.setStateJson('framework/deferred-writes', { version: 2, pending: [{ id: 'w-1', seq: 1, participant: 'user', content: [{ type: 'text', text: 'said during surgery' }] }] });
     const queue = store.getStateJson('framework/deferred-writes');
-    const restore = failStoreRead('framework/deferred-writes', 'restorePersistedDeferredWrites');
+    const restore = failStoreRead('framework/deferred-writes', 'importPersistedDeferredWrites');
     try {
-      await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) could not be read: injected EIO reading framework\/deferred-writes\. The framework doesn't start without them, since the next deferral would replace the stored queue\. They're unchanged, and the framework starts once they can be read\.$/);
+      await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) could not be read: injected EIO reading framework\/deferred-writes\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything newer\. They're unchanged, and the framework starts once they can be read\.$/);
     } finally { restore(); }
     assert.deepEqual(store.getStateJson('framework/deferred-writes'), queue, 'the queue is as it was');
     const f = await AgentFramework.create(slotConfig());
-    try { assert.equal(f.getHostModeStatus().deferredWrites, 1); } finally { await f.stop(); }
+    try { assert.equal(texts(f).filter((t) => t === 'said during surgery').length, 1, 'imported'); } finally { await f.stop(); }
     store.setStateJson('framework/deferred-writes', 'pending');
-    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) hold a string, not a queue of writes\. The framework doesn't start without them, since the next deferral would replace the stored queue\. They're unchanged, and starting again won't help until they're repaired\.$/);
+    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) hold a string, not a queue of writes\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything newer\. They're unchanged, and starting again won't help until they're repaired\.$/);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -295,20 +296,20 @@ test("with no recovery file, a deferred-write queue that can't be read, or isn't
 });
 
 test("a deferred write whose agent's context can't be scanned fails create(), and the next boot doesn't land it twice", inStoreDir('boot-read-deferred-landed-', async (storePath) => {
-  // A write that landed before its ack: in the queue, and in the context with its id.
-  await quiescedWithAWrite(storePath);
-  const [queued] = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')).pending as Array<{ id: string }>;
+  // A write that landed before its ack: in the context with its id, and in
+  // the queue an earlier release left, whose receipt, from before the copy
+  // landed, sends the scan back to where the agent's context began.
   const staging = await AgentFramework.create(config(storePath));
   try {
+    await staging.quiesce({ reason: 'surgery' });
     staging.getAgent('agent')!.getContextManager()
-      .addMessage('user', [{ type: 'text', text: 'said during surgery' }], { deferredWriteId: queued!.id } as never);
+      .addMessage('user', [{ type: 'text', text: 'said during surgery' }], { deferredWriteId: 'w-1' } as never);
   } finally { await staging.stop(); }
-  // A crash between a write landing and its ack leaves the receipt its
-  // hand-off recorded, from before the copy landed. Staging's stop handed the
-  // queue off again from after the copy, so the receipt goes back to where
-  // the agent's context began.
   const queueFile = join(storePath, 'recovery', 'deferred-writes.json');
-  writeFileSync(queueFile, JSON.stringify({ ...JSON.parse(readFileSync(queueFile, 'utf8')), scanFrom: { agent: 0 } }));
+  mkdirSync(join(storePath, 'recovery'), { recursive: true });
+  writeFileSync(queueFile, JSON.stringify({
+    version: 2, pending: [{ id: 'w-1', seq: 1, participant: 'user', content: [{ type: 'text', text: 'said during surgery' }] }], scanFrom: { agent: 0 },
+  }));
   const proto = ContextManager.prototype as unknown as { getMessageCount(this: ContextManager): number };
   const original = proto.getMessageCount;
   proto.getMessageCount = function (this: ContextManager) {
@@ -320,9 +321,7 @@ test("a deferred write whose agent's context can't be scanned fails create(), an
   } finally { proto.getMessageCount = original; }
   const f = await AgentFramework.create(config(storePath));
   try {
-    assert.equal(f.getHostModeStatus().deferredWrites, 0, 'the landed write is skipped');
-    await f.resume();
-    assert.equal(texts(f).filter((t) => t === 'said during surgery').length, 1, 'it is in the context once');
+    assert.equal(texts(f).filter((t) => t === 'said during surgery').length, 1, 'the landed write is skipped: it is in the context once');
   } finally { await f.stop(); }
 }));
 
@@ -861,7 +860,7 @@ test('the forms a release wrote boot as before', inStoreDir('boot-read-release-f
   await boot((f) => {
     assert.equal(f.getHostModeStatus().quiesced, true);
     assert.equal(f.getHostModeStatus().reason, 'surgery');
-    assert.equal(f.getHostModeStatus().deferredWrites, 1);
+    assert.deepEqual(texts(f).filter((t) => t === 'queued'), ['queued'], 'the pending write is imported at boot');
   });
 }));
 
@@ -878,7 +877,7 @@ test('a store from before the recovery files boots from its slots, as before', i
   const f = await AgentFramework.create(config(storePath));
   try {
     assert.equal(f.getHostModeStatus().quiesced, true);
-    assert.equal(f.getHostModeStatus().deferredWrites, 1);
+    assert.deepEqual(texts(f).filter((t) => t === 'queued'), ['queued'], "the slot's write is imported at boot");
   } finally { await f.stop(); }
 }));
 

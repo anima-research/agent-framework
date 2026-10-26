@@ -37,7 +37,7 @@ afterEach(async () => {
 });
 
 /** mira and oren on the residents' slot, the subconscious serving mira, with a held row and oren's stored injection in the slot. */
-async function boot(presentationIndex: boolean) {
+async function boot() {
   const dir = mkdtempSync(join(tmpdir(), 'context-options-'));
   dirs.push(dir);
   const framework = await AgentFramework.create({
@@ -48,7 +48,6 @@ async function boot(presentationIndex: boolean) {
     modules: [],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
-    presentationIndex,
   } as never);
   frameworks.push(framework);
   const write = (framework as unknown as { addMessage(p: string, c: ContentBlock[], m?: Record<string, unknown>, o?: { forAgent?: string }): string }).addMessage
@@ -100,20 +99,20 @@ describe('the open shapes of a resident and the subconscious (#291, AF-5)', () =
     assert.notEqual(subconsciousContextOptions({ serves: 'mira' }).strategy, sub.strategy, 'a strategy of its own each time');
   });
 
-  for (const presentationIndex of [false, true]) {
-    it(`a host's open with the exported shapes compiles what the live agents compile${presentationIndex ? ', with the presentation index' : ''}`, async () => {
-      const h = await boot(presentationIndex);
-      const mira = await h.live('mira');
-      assert.ok(mira.includes('a word for both') && !mira.includes('a held word') && !mira.includes("oren's injected context"), `premise: ${JSON.stringify(mira)}`);
-      assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('mira'), strategy: new PassthroughStrategy() })), mira, "mira's");
-      const sub = await h.live('Subconscious');
-      assert.ok(sub.includes('a held word') && !sub.includes("oren's injected context"), `premise: ${JSON.stringify(sub)}`);
-      assert.deepEqual(await h.compiled(await h.open(subconsciousContextOptions({ serves: 'mira' }))), sub, "the subconscious's");
-    });
-  }
+  // Presentation is mandatory since #291 (AF-6), so the case without the
+  // presentation index this test once ran beside this one is gone.
+  it("a host's open with the exported shapes compiles what the live agents compile", async () => {
+    const h = await boot();
+    const mira = await h.live('mira');
+    assert.ok(mira.includes('a word for both') && !mira.includes('a held word') && !mira.includes("oren's injected context"), `premise: ${JSON.stringify(mira)}`);
+    assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('mira'), strategy: new PassthroughStrategy() })), mira, "mira's");
+    const sub = await h.live('Subconscious');
+    assert.ok(sub.includes('a held word') && !sub.includes("oren's injected context"), `premise: ${JSON.stringify(sub)}`);
+    assert.deepEqual(await h.compiled(await h.open(subconsciousContextOptions({ serves: 'mira' }))), sub, "the subconscious's");
+  });
 
   it("an ended agent's context reopens with the view its live one had", async () => {
-    const h = await boot(false);
+    const h = await boot();
     // A reopen of the live agents' records, which is what an ended one's is.
     assert.deepEqual(await h.compiled(await h.reopen('mira')), await h.live('mira'), "a resident's: no other resident's stored injection");
     assert.deepEqual(await h.compiled(await h.reopen('oren')), await h.live('oren'), 'its own injection kept');

@@ -173,7 +173,8 @@ export function conversationKey(source: InboundSource): string | undefined {
  * It expects JSON-shaped values, as the MCPL lanes deliver them (parsed from
  * JSON). Any other object is written by its own enumerable entries, unlike
  * JSON.stringify: a Date becomes `{}`, as the store's own write keeps it, but
- * a deferred write recovered from its JSON file brings it back as a string.
+ * a write an earlier release's deferral queue left in its JSON file, which
+ * the importer stores at boot, brings it back as a string.
  *
  * sourceBodyDigest's serializer, kept out of the package API: serialization
  * and framing both stay inside sourceBodyDigest, so consumers don't

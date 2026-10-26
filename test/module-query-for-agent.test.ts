@@ -224,12 +224,13 @@ test("a module's write for another ordinary resident lands in the shared slot, w
   assert.equal(texts({ messages: [x.reader.ctx!.getMessage(id)!] })[0], 'FOR HELPER');
   x.reader.ctx!.editMessage(id, [text('EDITED')]);
   assert.deepEqual(texts(x.reader.ctx!.queryMessages({ participant: 'user' }, { forAgent: 'helper' })), ['EDITED']);
-  // Held for the helper's turn, its handle is the primary's too: the slot is one.
+  // Stored during the helper's turn, out of its window (#291), its id is the
+  // primary's too: the slot is one.
   const internals = x.framework as unknown as { activeTurnTokens: Map<string, unknown> };
   internals.activeTurnTokens.set('helper', Symbol('turn'));
   try {
     const handle = x.reader.ctx!.addMessage('user', [text('HELD FOR HELPER')], undefined, { forAgent: 'helper' });
-    assert.match(handle, /^held:/);
+    assert.ok(handle && !handle.startsWith('held:'), 'its stored id');
     assert.equal(texts({ messages: [x.reader.ctx!.getMessage(handle)!] })[0], 'HELD FOR HELPER');
     x.reader.ctx!.removeMessage(handle);
     assert.ok(!texts(x.reader.ctx!.queryMessages({ participant: 'user' }, { forAgent: 'helper' })).includes('HELD FOR HELPER'));
@@ -267,7 +268,7 @@ test("a module's write for an unknown agent, the empty name included, throws nam
   assert.deepEqual(texts(x.reader.ctx!.queryMessages({ participant: 'user' })), [], 'nothing was written');
 });
 
-test("a write held for a busy fork lands at its next start, in that start's request; its handle and its row's id aren't the primary's to take, and are refused, never acted on there", async () => {
+test("a write for a busy fork is stored at once and enters its window at its next start, in that start's request; its id isn't the primary's to take, and is refused, never acted on there", async () => {
   const x = await make(['prime'], { conversations: { templateAgent: 'prime', bind: { channel: 'mention' } } });
   const fork = await (x.framework as unknown as {
     createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ name: string }>;
@@ -277,29 +278,31 @@ test("a write held for a busy fork lands at its next start, in that start's requ
   let handle: string;
   try {
     handle = x.reader.ctx!.addMessage('user', [text('HELD FOR THE FORK')], undefined, { forAgent: fork.name });
-    assert.match(handle, /^held:/, 'held while its turn is alive');
+    assert.ok(handle && !handle.startsWith('held:'), "stored at once in the fork's store, out of its live turn's window");
+    const held = x.reader.ctx!.queryMessages({ participant: 'user' }, { forAgent: fork.name }).messages.find((m) => m.id === handle);
+    assert.equal(held?.held, true, "marked held in the fork's read");
     assert.equal(x.reader.ctx!.getMessage(handle), null, "the primary's getMessage doesn't find it");
-    assert.throws(() => x.reader.ctx!.editMessage(handle, [text('EDITED')]), /^Error: Message not found: held:/);
-    assert.throws(() => x.reader.ctx!.removeMessage(handle), /^Error: Message not found: held:/);
+    assert.throws(() => x.reader.ctx!.editMessage(handle, [text('EDITED')]), /^Error: Message not found: /);
+    assert.throws(() => x.reader.ctx!.removeMessage(handle), /^Error: Message not found: /);
   } finally {
     internals.activeTurnTokens.delete(fork.name);
   }
-  // Its boundary: the fork's next start flushes what's held for it, so that
-  // start's own request carries it.
+  // Its next start presents what was stored for it, so that start's own
+  // request carries it.
   x.membrane.pushResponse(createMockResponse([text('fork reply')]));
   (x.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: fork.name, reason: 'timer', source: 'framework', timestamp: Date.now() });
   await x.framework.runUntilIdle();
   const sentTexts = x.membrane.calls.at(-1)!.messages.map((msg) => texts({ messages: [msg] })[0]);
   assert.ok(sentTexts.includes('HELD FOR THE FORK'), JSON.stringify(sentTexts));
   const row = x.reader.ctx!.queryMessages({ participant: 'user' }, { forAgent: fork.name }).messages.find((m) => texts({ messages: [m] })[0] === 'HELD FOR THE FORK');
-  assert.ok(row && !row.held, 'it landed in the fork\'s store');
+  assert.ok(row && !row.held, "it is in the fork's window now");
   assert.equal(x.reader.ctx!.getMessage(row!.id), null, "the primary's getMessage doesn't find the fork's row");
   assert.throws(() => x.reader.ctx!.editMessage(row!.id, [text('EDITED')]), /^Error: Message not found: /);
   assert.throws(() => x.reader.ctx!.removeMessage(row!.id), /^Error: Message not found: /);
   assert.ok(x.reader.ctx!.queryMessages({ participant: 'user' }, { forAgent: fork.name }).messages.some((m) => texts({ messages: [m] })[0] === 'HELD FOR THE FORK'), 'and the row is as written');
 });
 
-test("before its flush, a write held for a busy fork is in the fork's named read and not the primary's, and the primary's held write is in the primary's and not the fork's", async () => {
+test("before its next point, a write for a busy fork is marked held in the fork's named read and not in the primary's, and the primary's is in the primary's and not the fork's", async () => {
   const x = await make(['prime'], { conversations: { templateAgent: 'prime', bind: { channel: 'mention' } } });
   const fork = await (x.framework as unknown as {
     createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ name: string }>;
@@ -310,8 +313,8 @@ test("before its flush, a write held for a busy fork is in the fork's named read
   try {
     const forFork = x.reader.ctx!.addMessage('user', [text('HELD FOR THE FORK')], undefined, { forAgent: fork.name });
     const forPrime = x.reader.ctx!.addMessage('user', [text('HELD FOR THE PRIME')]);
-    assert.match(forFork, /^held:/, 'the premise: held while the fork\'s turn is alive');
-    assert.match(forPrime, /^held:/, 'the premise: held while the primary\'s turn is alive');
+    assert.ok(forFork && !forFork.startsWith('held:'), 'the premise: stored at once while the fork\'s turn is alive');
+    assert.ok(forPrime && !forPrime.startsWith('held:'), 'the premise: stored at once while the primary\'s turn is alive');
     const read = (forAgent?: string) => x.reader.ctx!.queryMessages({ participant: 'user' }, forAgent === undefined ? undefined : { forAgent })
       .messages.filter((m) => m.held).map((m) => texts({ messages: [m] })[0]);
     assert.deepEqual(read(fork.name), ['HELD FOR THE FORK']);
@@ -327,7 +330,7 @@ const deliver = (input: Record<string, unknown>) =>
 const primaryTexts = (x: Awaited<ReturnType<typeof make>>) =>
   x.framework.getAgent('prime')!.getContextManager().getAllMessages().map((msg) => texts({ messages: [msg] })[0]);
 
-test("a module's write held for an ephemeral run that ends without reading it goes to the primary as written, through the primary's ordinary delivery", async () => {
+test("a module's write for an ephemeral run that ends without reading it goes to the primary as written, through the primary's ordinary delivery", async () => {
   const x = await make();
   let release!: () => void;
   const released = new Promise<void>((resolve) => { release = resolve; });
@@ -339,24 +342,24 @@ test("a module's write held for an ephemeral run that ends without reading it go
   await runWorker(x, 'worker', async () => {
     await until(() => x.membrane.calls.length === 1, "the run's stream");
     const handle = x.reader.ctx!.addMessage('courier', [text('LATE RESULT')], { note: 'kept' }, { forAgent: 'worker' });
-    assert.match(handle, /^held:/, "the premise: held for the run's turn");
-    // The primary's turn is alive as the run ends: the write waits for it.
+    assert.ok(handle && !handle.startsWith('held:'), "the premise: stored at once, out of the run's live window");
+    // The primary's turn is alive as the run ends: its window takes the write later.
     internals.activeTurnTokens.set('prime', Symbol('turn'));
     release();
   });
   try {
     const late = x.reader.ctx!.queryMessages({}).messages.find((msg) => texts({ messages: [msg] })[0] === 'LATE RESULT');
-    assert.ok(late?.held, "held for the primary's turn");
+    assert.ok(late?.held, "out of the primary's window while its turn is alive");
     assert.equal(late!.participant, 'courier', 'as the module wrote it, not as a notice');
     assert.equal((late!.metadata as Record<string, unknown>).note, 'kept');
     assert.equal((late!.metadata as Record<string, unknown>).primaryIfUnread, undefined, 'the mark taken off');
   } finally {
     internals.activeTurnTokens.delete('prime');
   }
-  // At the primary's boundary it lands in the primary's store.
-  (x.framework as unknown as { readdDrained(d: unknown[], w: string): unknown }).readdDrained(
-    (x.framework as unknown as { drainDeferredFor(n: string): unknown[] }).drainDeferredFor('prime'), 'test boundary');
-  assert.ok(primaryTexts(x).includes('LATE RESULT'), JSON.stringify(primaryTexts(x)));
+  // At the primary's next point it enters the primary's window.
+  (x.framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(x.framework.getAgent('prime'));
+  const window = x.framework.getAgent('prime')!.getContextManager().getPresentedMessages().map((msg) => texts({ messages: [msg] })[0]);
+  assert.ok(window.includes('LATE RESULT'), JSON.stringify(window));
 });
 
 test("a module's write injected into an ephemeral run's stream at a tool round that declares it carries injections stays in the run's store only", async () => {
@@ -434,30 +437,6 @@ test("a module's write stored at a tool round whose tool ended the turn was neve
   assert.equal((blocks[0] as { text: string }).text, long, 'byte for byte');
 });
 
-test("a run's held write queued again while its turn is alive keeps its mark, so it still reaches the primary", async () => {
-  const x = await make();
-  let release!: () => void;
-  const released = new Promise<void>((resolve) => { release = resolve; });
-  x.membrane.streamYielding = ((request: never) => {
-    x.membrane.calls.push(request);
-    return new HeldStream(released, [createMockResponse([text('done')])]);
-  }) as never;
-  const internals = x.framework as unknown as {
-    deferredMessages: Array<{ forAgent?: string; metadata?: Record<string, unknown> }>;
-    readdDrained(d: unknown[], w: string): unknown;
-    drainDeferredFor(n: string): unknown[];
-  };
-  await runWorker(x, 'worker', async () => {
-    await until(() => x.membrane.calls.length === 1, "the run's stream");
-    x.reader.ctx!.addMessage('courier', [text('REQUEUED')], undefined, { forAgent: 'worker' });
-    // A flush while the run's turn is alive queues it again, from the queue.
-    internals.readdDrained(internals.drainDeferredFor('worker'), 'test flush');
-    assert.equal(internals.deferredMessages.find((m) => m.forAgent === 'worker')?.metadata?.primaryIfUnread, true, 'queued again with its mark');
-    release();
-  });
-  assert.ok(primaryTexts(x).includes('REQUEUED'));
-});
-
 test("a conversation fork's write it never read reaches the primary when the fork is disposed; one its compile sent stays the fork's", async () => {
   const x = await make(['prime'], { conversations: { templateAgent: 'prime', bind: { channel: 'mention' } } });
   const internals = x.framework as unknown as {
@@ -478,10 +457,10 @@ test("a conversation fork's write it never read reaches the primary when the for
   const stored = x.reader.ctx!.addMessage('courier', [text('STORED, NEVER SENT')], undefined, { forAgent: fork.name });
   const forkRows = () => x.reader.ctx!.queryMessages({}, { forAgent: fork.name }).messages;
   assert.equal((forkRows().find((m) => m.id === stored)!.metadata as Record<string, unknown>).primaryIfUnread, true, 'stored with its mark');
-  // Unread, held for a turn that never takes it.
+  // Unread, stored during a turn that never takes it into its window.
   internals.activeTurnTokens.set(fork.name, Symbol('turn'));
   const handle = x.reader.ctx!.addMessage('courier', [text('NEVER READ')], undefined, { forAgent: fork.name });
-  assert.match(handle, /^held:/);
+  assert.ok(handle && !handle.startsWith('held:'));
   internals.activeTurnTokens.delete(fork.name);
   const forkWindow = x.framework.getAgent(fork.name)!.getContextManager();
   internals.disposeConversationAgent(fork.name);
@@ -493,7 +472,7 @@ test("a conversation fork's write it never read reaches the primary when the for
   assert.ok(kept.includes('READ BY THE FORK'), "the one it read stays in the fork's window");
 });
 
-test("a write for an ordinary resident isn't marked, and a mark a module gives a write, stored or held, is taken off", async () => {
+test("a write for an ordinary resident isn't marked, and a mark a module gives a write, its agent busy or not, is taken off", async () => {
   const x = await make(['prime', 'helper']);
   x.reader.ctx!.addMessage('user', [text('FOR HELPER')], undefined, { forAgent: 'helper' });
   x.reader.ctx!.addMessage('user', [text('FOR THE PRIMARY')], { primaryIfUnread: true, note: 'kept' } as never);
@@ -502,13 +481,13 @@ test("a write for an ordinary resident isn't marked, and a mark a module gives a
   assert.equal(row('FOR HELPER')?.primaryIfUnread, undefined);
   assert.equal(row('FOR THE PRIMARY')!.primaryIfUnread, undefined);
   assert.equal(row('FOR THE PRIMARY')!.note, 'kept');
-  // Held for a busy resident, the queued entry has it taken off too.
-  const internals = x.framework as unknown as { activeTurnTokens: Map<string, unknown>; deferredMessages: Array<{ forAgent?: string; metadata?: Record<string, unknown> }> };
+  // Stored for a busy resident, out of its window, it has it taken off too.
+  const internals = x.framework as unknown as { activeTurnTokens: Map<string, unknown> };
   internals.activeTurnTokens.set('helper', Symbol('turn'));
   try {
     const handle = x.reader.ctx!.addMessage('user', [text('HELD')], { primaryIfUnread: true } as never, { forAgent: 'helper' });
-    assert.match(handle, /^held:/);
-    assert.equal(internals.deferredMessages.find((m) => m.forAgent === 'helper')!.metadata?.primaryIfUnread, undefined);
+    assert.ok(handle && !handle.startsWith('held:'));
+    assert.equal((x.reader.ctx!.getMessage(handle)!.metadata as Record<string, unknown> | undefined)?.primaryIfUnread, undefined);
   } finally {
     internals.activeTurnTokens.delete('helper');
   }

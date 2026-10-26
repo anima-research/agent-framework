@@ -637,14 +637,17 @@ describe('Dendrite restart', () => {
     assert.deepEqual((landed[0]!.metadata.dendrite as { from: unknown }).from, { agent: 'job', incarnation: 2 });
   });
 
-  it('delivers a result held across a crash exactly once', async () => {
+  // Ported for #291: mira is mid-turn when the result arrives, and its
+  // message is stored at once, out of her window until her turn's end. This
+  // test once had it deferred in memory, held mail until a boundary stored
+  // it, the window in which a crash would have lost it; now no such window
+  // is left, and the crash below still finds it delivered once.
+  it('delivers a result to a recipient mid-turn at once, out of her window, and exactly once across a crash', async () => {
     const gates1 = new GateModule();
     const first = await process(gates1);
     first.start();
     await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }));
 
-    // mira is mid-turn when the result arrives, so its message is deferred
-    // in memory — exactly the window in which a crash would lose it.
     membrane.script('mira', waitCall('mira-busy'), say('mira done'));
     (first as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
       agentName: 'mira', reason: 'test', source: 'test', timestamp: Date.now(),
@@ -654,17 +657,16 @@ describe('Dendrite restart', () => {
     const traces: TraceEvent[] = [];
     first.onTrace((event) => traces.push(event));
     const delivery = first.deliverAgentResult('job', [{ type: 'text', text: 'survives the crash' }]);
-    assert.equal(delivery.delivered, true, 'queued for mira');
-    assert.equal(first.listHeldMail().length, 1, 'still held: the message has not entered the store');
-    // Published is not delivered: queued for a boundary is a deferral.
+    assert.equal(delivery.delivered, true, 'delivered to mira');
+    assert.equal(first.listHeldMail().length, 0, 'released: the message has entered the store');
     assert.deepEqual(
       traces.filter((t) => t.type.startsWith('dendrite:mail-')).map((t) => t.type),
-      ['dendrite:mail-deferred'],
+      ['dendrite:mail-delivered'],
     );
-    assert.equal(
-      textsIn(first, 'mira').some((m) => m.metadata.kind === 'agent-result'),
-      false,
-    );
+    const stored = first.getAgent('mira')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-result');
+    assert.equal(stored.length, 1, 'stored while her turn runs');
+    assert.equal(first.getAgent('mira')!.getContextManager().ordinalOf(stored[0]!.id), undefined, 'out of her window until it ends');
 
     const second = await process(new GateModule());
     const results = (framework: AgentFramework) =>

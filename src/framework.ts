@@ -23,7 +23,7 @@ import {
   type PersistentReaderConfig,
   type ForkReaderConfig,
 } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, type QueuedHeldMessage, type ReaderInvocation } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
 import { residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
@@ -83,7 +83,8 @@ import type {
   AgentSettingsExtension,
   SameRoundThinkTextPolicy,
   ModuleMessage, AutoContinueRun } from './types/index.js';
-import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
+import { asModuleRow, heldWriteId } from './held-writes.js';
+import { deferredWritesRefusal, isToolBlockEntry, readPersistedDeferredWrites, type PersistedDeferredWrite } from './deferred-import.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
@@ -403,8 +404,9 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
  * names those drafts, `tuneOut` a message a tune-out holds from the
  * residents, `coalescingSubject` (beside the occurrence's `eventId`) the
  * delivery of a coalesced occurrence, `firstView` the coalescer's mark that
- * no version of the message was shown, `deferredWriteId` the landed copy of
- * a deferred write, `external` a module's own row for an outside message,
+ * no version of the message was shown, `deferredWriteId` the copy of a write
+ * an earlier release queued, stored by the importer at boot, `external` a
+ * module's own row for an outside message,
  * `openaiResponsesItems` membrane's mark of an imported Responses
  * history, `contextInjection` an agent's stored context injection
  * (stored-injections.ts), which every other agent's view leaves out, and
@@ -433,8 +435,8 @@ const HOST_METADATA_KEYS = [
  * neither clear explicit-send suppression nor re-pin a turn's locus at a tool
  * boundary. An edit can also be the first version of a message the agent
  * sees: when the coalescer delivers a version of a message of which no
- * version may have been shown to the agent (still queued, or stored above
- * every reader's shown watermark), the host marks the delivery
+ * version may have been shown to the agent (stored above every reader's
+ * shown watermark, its isUnshown), the host marks the delivery
  * (`firstView`), and an edit so marked counts as the message it
  * replaced. A doubt counts as shown, so a message a scalar watermark covers
  * without having been shown gets no mark. A reaction or deletion so marked
@@ -862,13 +864,11 @@ const AGENT_REGISTRY_STATE_ID = 'framework/dendrite';
 const AGENT_REGISTRY_ENDED_ID = 'framework/dendrite/ended';
 /** How many ended agent records are reloaded for inspection at boot. */
 const AGENT_REGISTRY_ENDED_RELOAD = 256;
-/** Snapshot slot mirroring context writes deferred while quiesced (#122). */
+/** The store's slot where a release before #291's presentation index
+ *  mirrored its deferred-write queue when it had no recovery file (#122):
+ *  read once at boot by the importer (importPersistedDeferredWrites), for
+ *  one release. */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
-/** What a write of the deferred-write queue did: wrote the record (the
- *  queue, or an empty one over a record that held one), had nothing to
- *  write, or wrote nothing for a queue over the cap
- *  (DEFERRED_WRITES_PERSIST_CAP_CHARS). */
-type DeferredWritesOutcome = 'written' | 'nothing' | 'over-cap';
 /** The event a coalesced occurrence delivers through — one per lane. */
 interface CoalescedChannelEvent {
   type: 'mcpl:channel-incoming';
@@ -886,9 +886,8 @@ interface CoalescedChannelEvent {
   coalescingSubject?: string;
   /** Occurrence id (RFC-006 §3.1); channel messages carry it only when coalesced. */
   eventId?: string;
-  /** RFC-006 assembly: materialized for this agent's turn, stored directly
-   *  while its assembly runs, after what is queued for it (addMessage's
-   *  bypassDeferralFor). */
+  /** RFC-006 assembly: materialized for this agent's turn while its
+   *  assembly runs, which presents it before the turn's compile. */
   assemblingFor?: string;
   /** RFC-006 §3.2: deliver into this agent only (replacement / notice audience). */
   deliverTo?: string;
@@ -908,46 +907,12 @@ type CoalescedDelivery =
 const COALESCING_STATE_ID = 'mcpl/coalescing';
 /** Receipts written since the last snapshot flush (bridges the throttle window). */
 const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
-/** When the deferred-write queue's JSON is longer than this, counted as the
- *  string's length (UTF-16 code units, which the messages call characters),
- *  its record isn't written at all and keeps what it last held, rather than
- *  rewriting a multi-MB snapshot per deferral. quiesce() refuses a queue
- *  over it, unless the call has `abandon` (writeDeferredWritesForQuiesce). */
-const DEFERRED_WRITES_PERSIST_CAP_CHARS = 4 * 1024 * 1024;
-
 /** Requests that CONTINUE a turn whose token is already held — a context-
  *  budget restart, or the non-streaming path's tool-results round. The
  *  quiesce wake gate lets these through: the drain is exactly the phase
  *  where such a turn must be allowed to finish, and parking them would hold
  *  the token until the drain timed out (and `abandon` could not clear a turn
  *  with no stream). */
-/** One entry of the deferred-write queue (see AgentFramework.deferredMessages). */
-interface DeferredWrite {
-  /** Durable identity, stamped on the stored message as its
-   *  deferredWriteId: a flush interrupted by a crash replays its batch at
-   *  the next boot, which skips each entry that already landed by it. */
-  id: string;
-  /** Order stamp (see deferredSeq). */
-  seq: number;
-  participant: string;
-  content: ContentBlock[];
-  metadata?: MessageMetadata;
-  /** The agent the entry is for. Absent means the primary: addMessage
-   *  records any other agent it defers a write for. */
-  forAgent?: string;
-  /** When the framework first held the write, in ms since the epoch: a
-   *  module reads it as the held row's timestamp (heldRows). */
-  heldAt: number;
-  /** Set when a write of this entry threw and its store couldn't be read
-   *  to tell whether it landed (writeDrainedInOrder): before it's
-   *  written again, the store is searched for its id, and a path that reads
-   *  or changes held writes settles it first (settleUnknownLandings).
-   *  Persisted with the entry, so after a restart it's still looked up
-   *  first. */
-  landing?: 'unknown';
-}
-const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
-
 /** A server configuration refused before anything was spawned or dialed:
  *  only a corrected configuration helps, so nothing retries it. */
 class McpConfigurationRefusal extends Error {
@@ -964,27 +929,15 @@ type InboundResponder = {
   respondError: (code: number, message: string, data?: unknown) => void;
 };
 
-/** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
- *  (empty when addMessage deferred it again; a sharded body's first shard)
- *  and the content to carry for it: as given, or for a sharded body read
- *  back from its store, its shards joined as later compiles render them.
- *  For an entry whose write threw after storing it, found in the store and
- *  counted as written, it is what landed, joined the same way, which for a
- *  sharded body can be its first shards alone. A store that can't be read
- *  back (storedCopiesOf logs it) leaves a sharded body as given. */
-interface DrainedWrite {
-  id: MessageId;
-  content: ContentBlock[];
-}
-
-/** One stored copy of a deferred write, as the drain reads it back: a
+/** One stored copy of a row, as a read-back finds it (storedSince, and the
+ *  importer's lookup of a queued write by its id: landedCopiesById): a
  *  sharded body's copies carry its `bodyGroupId`. */
 type StoredCopy = { id: MessageId; content: ContentBlock[]; bodyGroupId?: string };
 const storedCopy = (m: { id: MessageId; content: ContentBlock[]; bodyGroupId?: string }): StoredCopy =>
   ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) });
 
-/** Messages per window when a store is scanned for deferred writes by their
- *  ids (landedPositions). */
+/** Messages per window when a store is scanned for an earlier release's
+ *  queued writes by their ids (landedPositions). */
 const LANDED_SCAN_WINDOW = 500;
 
 /** The message at `position` on `cm`'s current branch, with its blobs
@@ -1005,18 +958,18 @@ type ReleasedWindow = {
   /** Each unread message the primary takes in its place, in store order,
    *  with what it says: a sharded body's shards' content joined. */
   unread: Array<{ participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
-  held: Map<string, { copies: StoredCopy[]; unread: boolean }>;
 };
 
-/** Stamp a deferred write's durable id into the metadata it is stored with
- *  (boot recovery dedups replays by it). Idempotent for an already-stamped
- *  message. */
+/** Stamp a queued write's durable id into the metadata it is stored with:
+ *  the importer stores an earlier release's queued write under it, and a
+ *  later boot's dedup finds it by it (importPersistedDeferredWrites).
+ *  Idempotent for an already-stamped message. */
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
 /**
- * Whether a row, stored or queued, is a copy of `mail` for its recipient: it
+ * Whether a row is a copy of `mail` for its recipient: it
  * carries the mail's id, and names the mail's recipient as the one it is for
  * (`dendrite.to`) or names none, as a copy stored before mail named its
  * recipient does, which counts by its id. In the residents' shared slot a
@@ -1029,10 +982,10 @@ function isMailCopyFor(metadata: MessageMetadata | undefined, mail: Pick<HeldMai
   return stamp?.mailId === mail.id && (stamp.to === undefined || stamp.to === mail.to);
 }
 
-/** A deferred entry as a log line names it: its id, participant and block
- *  types. A block that isn't an object is named by its JavaScript type, and
- *  an object whose type isn't a string as untyped, so the line names whatever
- *  a queued entry holds. */
+/** A queued write an earlier release left, as the importer's log lines name
+ *  it: its id, participant and block types. A block that isn't an object is
+ *  named by its JavaScript type, and an object whose type isn't a string as
+ *  untyped, so the line names whatever an entry holds. */
 function describeDeferredWrite(msg: { id: string; participant: string; content: ContentBlock[] }): string {
   const kind = (b: unknown): string => {
     if (b === null) return 'null';
@@ -1313,14 +1266,12 @@ interface TurnRouting {
   /**
    * The messages that would re-pin the locus (repinChannel) that no tool
    * boundary of the turn weighed, in the order they were stored
-   * (noteArrival). A message stored for this agent is one when none of the
-   * turn's streams was running: stored during a capacity hold or the wait
-   * for a re-inference, flushed at the end of a stream that didn't settle
-   * the turn, or stored by the start that continues it. So is one a boundary
-   * drained but couldn't re-pin for, being over budget or without a live
-   * stream. A message stored for another ordinary resident is one whenever
-   * it lands, since residents read one message slot and a boundary weighs
-   * only the messages drained for its own agent (noteForOtherResidents). A
+   * (noteArrival). A message is one when it enters the agent's window at
+   * a point that isn't a tool boundary of one of its streams (#291's
+   * presentation index: at a start, at a stream's end that didn't settle the
+   * turn, or at rest during a capacity hold or the wait for a
+   * re-inference), whoever it was stored for. So is one a boundary presented
+   * but couldn't re-pin for, being over budget or without a live stream. A
    * message tune-out diverted isn't one, since a resident's compiled view
    * leaves it out. A boundary that re-pins clears them, since what it injects
    * is newer. The turn's next start clears them all, and in locus or hybrid
@@ -1563,9 +1514,8 @@ interface TurnCheckpoint {
    * The agent's window index length before the turn (#291), recorded only
    * where the presentation index presents for the agent: an undo on the
    * window takes out the rows presented at this ordinal and after. Absent
-   * otherwise, so a checkpoint without the flag is what it was, and in
-   * checkpoints an earlier version recorded (an undo converts those:
-   * checkpointLength).
+   * otherwise, and in checkpoints an earlier version recorded (an undo
+   * converts those: checkpointLength).
    */
   indexLengthBefore?: number;
   /** The branch whose window `indexLengthBefore` is a length of: the store's branch then, as `branchName` is. */
@@ -1573,7 +1523,7 @@ interface TurnCheckpoint {
 }
 
 /**
- * A write a surgery's hold kept out of every store, with the flag on
+ * A write a surgery's hold kept out of every store
  * (AgentFramework.surgeryHeldWrites): what addMessage was given, or, for a
  * write straight into a fork's store (`direct`), the fork's name and the row.
  */
@@ -1939,8 +1889,15 @@ export interface HostModeStatus {
    * they hold no turn token, so drain doesn't wait for them. Reported so the
    * operator sees what is still acting during the window. */
   backgroundScripts: number;
-  /** Context writes (module events, api message.send) withheld because the
-   * host is quiesced. Persisted while quiesced and flushed by resume(). */
+  /**
+   * Context writes a live operator surgery's hold keeps in memory, to be
+   * stored at its release; 0 otherwise. Before #291 it counted the writes
+   * held in the deferred queue, which this release no longer keeps: a write
+   * made while quiesced is stored at once, and no agent is shown another's
+   * until resume.
+   *
+   * @deprecated Kept for one release; removed in the next.
+   */
   deferredWrites: number;
   /** Agents whose turn `abandon` had not ended when its grace ran out: a
    * turn token held with no stream to cancel and no check ahead to stop it
@@ -1971,12 +1928,13 @@ export class ResumeBlockedError extends Error {
 }
 
 /**
- * Thrown by `quiesce()` without `abandon` when the queue of deferred context
- * writes can't reach disk: it's over its cap, so its record can't hold it, or
- * its write failed, and that error is the `cause`. So the queue as it
- * stands isn't on disk. The host's mode is as it was, and the
- * message names the ways out, among them quiescing with `abandon: true`,
- * which goes on with the queue in memory.
+ * Was thrown by `quiesce()` when the queue of deferred context writes couldn't
+ * reach disk. Since #291 the framework keeps no such queue (a write is stored
+ * at once, and enters each agent's window at that agent's presentation
+ * points), so quiesce() never throws it.
+ *
+ * @deprecated Never thrown since #291; kept exported for one release so a
+ * host that tests for it still builds.
  */
 export class QuiesceBlockedError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -2013,44 +1971,33 @@ export class ProviderWaitNotSleptError extends Error {
  */
 interface FrameworkWriteOptions {
   /**
-   * Deliver into this registry agent's window instead of the primary's,
-   * with the deferral/turn-alive guard evaluated against THAT agent's
-   * turn state. Default (absent) is byte-identical to the historical
-   * primary-only behavior. Unknown names log and drop (loud, non-fatal:
-   * this is reachable from timer callbacks that may outlive an agent).
+   * Deliver into this registry agent's store instead of the primary's,
+   * with that agent's turn state deciding where the row enters its window
+   * (presented at once while no turn of it is alive, else at its next
+   * presentation point). Default (absent) is the primary. Unknown names log
+   * and drop (loud, non-fatal: this is reachable from timer callbacks that
+   * may outlive an agent).
    */
   forAgent?: string;
   /**
-   * Set when the message comes back from the deferred queue: the entry's
-   * one durable identity and its place in arrival order. A write stamps
-   * the id into `metadata.deferredWriteId` (boot dedup). A re-deferral
-   * moves the same logical entry back to pending under the same id and
-   * seq, instead of minting a second, independently replayable one, or
-   * moving it behind entries that arrived after it, and keeps the time
-   * it was first held.
+   * Set by the importer alone (importPersistedDeferredWrites), for one
+   * release: the write is one an earlier release left queued, stored under
+   * its durable id (`metadata.deferredWriteId`), so a later boot's dedup
+   * finds it. The deferredWriteId and PRIMARY_IF_UNREAD_KEY marks it
+   * carries are kept, as is an audience stamp; a surgery's hold doesn't
+   * hold it (there is none at boot); and it isn't presented at its write:
+   * the boot's pass after the import does that (repairAndRest).
    */
-  fromQueue?: { id: string; seq: number; heldAt: number };
+  imported?: { writeId: string };
   /** Set by addModuleMessage for a write it marked for a run or a fork
    *  (PRIMARY_IF_UNREAD_KEY): any other write has the mark taken off. */
   markedForRun?: true;
   /** Out-param: where the message landed (RFC-006 needs to find it
    *  again), and, for the wake that goes with it (readsRowFor), whether
-   *  it was held for its agent's live turn (`deferredId`) or stored and
-   *  not presented to that agent (`presented: false`, which only a
-   *  presenting store path sets). */
+   *  it was stored and not presented to that agent (`presented: false`):
+   *  stored while a turn of the agent's was alive, outside its start's
+   *  assembly. A write a surgery's hold keeps names only its agent. */
   placement?: WritePlacement;
-  /**
-   * RFC-006 assembly: the named agent's turn is alive but its compile has
-   * not run yet (the same window the turn-start deferred flush writes
-   * in). While that agent's assembly runs (`assembling`), a message for
-   * THAT agent is stored directly instead of deferred, after what is
-   * queued for the agent, which is written first (flushForStart). When
-   * some of that stays queued, because a write that failed cut it or the
-   * host is quiesced, the message is deferred behind it. Outside the
-   * assembly it counts only for a write from the queue (stop()'s drain):
-   * any other write is weighed as if it weren't set.
-   */
-  bypassDeferralFor?: string;
   /**
    * Who the message is for, when that is decided before it gets here:
    * the recipients admission delivered an inbound message to, or none
@@ -2064,16 +2011,18 @@ interface FrameworkWriteOptions {
   audience?: readonly string[];
 }
 
+/** What an undo on the window (#291, decision 4) keeps for its redo. */
 interface RedoEntry {
+  /** The store's branch at the undo. */
   branchName: string;
   checkpoint: TurnCheckpoint;
   /**
-   * Set by an undo on the window (#291, decision 4): the rows it took out of
-   * the agent's window, in window order, by the id that names each body and
-   * whether it was the agent's own; and the index length right after the
-   * undo, from which a redo first takes out what was presented since.
+   * The rows the undo took out of the agent's window, in window order, by
+   * the id that names each body and whether it was the agent's own; and the
+   * index length right after the undo, from which a redo first takes out
+   * what was presented since.
    */
-  window?: { tail: Array<{ id: MessageId; own: boolean }>; lengthAfterUndo: number };
+  window: { tail: Array<{ id: MessageId; own: boolean }>; lengthAfterUndo: number };
 }
 
 interface InferenceToolSnapshot {
@@ -3130,10 +3079,6 @@ export class AgentFramework {
    * clear failed, or a quiesce whose write failed partway, memory can say
    * serving while the record says quiesced, until a resume() clears it. */
   private hostModeRecordMayBeQuiesced = false;
-  /** Whether a resume() is between serving and clearing the record: it has
-   * cleared `quiesced` and is flushing the deferred writes, then clearing the
-   * record. A resume() on the serving host leaves the record to it. */
-  private resumeInFlight = false;
   private quiesceReason?: string;
   private quiescedAt?: number;
   private traceListeners: TraceRegistration[] = [];
@@ -3367,8 +3312,6 @@ export class AgentFramework {
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
-  // Messages deferred while an agent is waiting_for_tools (to preserve
-  // tool_use → tool_result adjacency required by the Anthropic API).
   /** The subconscious resident's registry name (issue #77), or null. */
   private subconsciousAgentName: string | null = null;
   /** Its windowed strategy — the coordinator moves the anchor on tune-out entry. */
@@ -3400,20 +3343,6 @@ export class AgentFramework {
   /** Agents an abandon could not cancel (token held, no stream) — surfaced
    *  in HostModeStatus until the next quiesce/resume. */
   private lastUnabandonable: string[] = [];
-  /** True while the deferred-write queue is mirrored to its record, so each
-   *  change of it writes it: from a write of it that reached or may reach
-   *  the record, one that failed or met the cap unless quiesce() rejected
-   *  for it (deferredWritesFellBehind), or a boot that restored it, until a
-   *  write clears the record once the queue drains. */
-  private deferredWritesPersisted = false;
-  /** True from a write of the queue that failed or met the cap, unless
-   *  quiesce() rejected for it, until one succeeds: a run of failures
-   *  (deferredWritesFellBehind). A quiesce({ abandon: true }) over the cap
-   *  goes on rather than rejecting, so its write begins a run too. */
-  private deferredWritesBehind = false;
-  /** True once the cap has been met in the current run, so its line is
-   *  logged once a run, whatever began the run. */
-  private deferredWritesCapLogged = false;
   /** The agent registry and its ended log, as recovery files beside the store
    *  (nissa's #546 finding 3): Chronicle state follows the store's branch, and
    *  an undo or an operator's surgery must not erase a result held for
@@ -3423,39 +3352,19 @@ export class AgentFramework {
   private agentRegistryEndedPath: string | undefined;
   /** The ended log as the recovery file keeps it: the newest records, bounded. */
   private endedRecovery: AgentRecord[] = [];
-  /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
-   *  deferredWritesPath). Undefined → branch-local slot fallback. */
+  /** Branch-independent recovery file for the host's mode (see
+   *  FrameworkConfig.hostModePath). Undefined → branch-local slot fallback. */
   private hostModePath: string | undefined;
+  /** Where a release before #291 mirrored its deferred-write queue (see
+   *  FrameworkConfig.deferredWritesPath), read once at boot by the importer
+   *  (importPersistedDeferredWrites), for one release. Undefined → the
+   *  store's slot. */
   private deferredWritesPath: string | undefined;
+  /** The writes the importer left queued for the next boot, its agent's
+   *  store having failed (importPersistedDeferredWrites): reconcile doesn't
+   *  deliver again the mail one of them carries. One release. */
+  private importLeftQueued: PersistedDeferredWrite[] = [];
   private recoveryFallbackWarned = false;
-  /**
-   * Deferred writes that have been handed to a context manager but whose
-   * chronicle state is NOT yet durably synced. They stay in the durable
-   * recovery queue until `ackDeferredWrites()` syncs the store — chronicle
-   * persists the slot-chain head only on sync(), so acknowledging on append
-   * alone would let a hard exit forget an accepted message.
-   */
-  private unackedDeferredWrites: DeferredWrite[] = [];
-  /** Monotonic order stamp for deferred writes: the durable queue is always
-   *  written, restored, drained and flushed in `seq` order, whatever the
-   *  pending/un-acked split — a re-deferred entry keeps its place. Boot
-   *  recovery numbers the restored queue 1..N in that order, and the stamp
-   *  goes on from N (restorePersistedDeferredWrites). */
-  private deferredSeq = 0;
-  /**
-   * Per target agent: the store's message count when the OLDEST currently
-   * un-acked entry for it was handed off. Persisted with the queue so a boot
-   * after an interrupted flush knows exactly which slot range the batch
-   * could occupy and dedups against all of it — never a fixed tail.
-   */
-  private deferredScanFrom = new Map<string, number>();
-  private deferredMessages: DeferredWrite[] = [];
-  /** The marked held writes whose store couldn't be searched, each with the
-   *  failure said, said once until a lookup of them succeeds and again when
-   *  the failure changes (landedCopiesById), and those a drain has said it
-   *  holds what's queued behind (writeDrainedInOrder). */
-  private unsearchableSaid = new Map<string, 'search' | 'read'>();
-  private stillUnknownSaid = new Set<string>();
 
   // Turn-alive markers (2026-07-31 Mythos phantom-skip incident): agentName →
   // token of the turn currently in progress. Set at startAgentStream ENTRY —
@@ -3473,7 +3382,9 @@ export class AgentFramework {
   // every subsequent compile diverged from the live prefix at that message
   // (KV bust). Invariant: nothing enters the window between a turn's dequeue
   // and its settle except that turn's own blocks, and, before its checkpoint,
-  // the inputs its start writes (flushForStart).
+  // the inputs its start presents (presentAtStart). Since #291 a write is
+  // stored at once whatever the turn, and the presentation index keeps it
+  // out of the window until the agent's next presentation point.
   private activeTurnTokens: Map<string, number> = new Map();
   /** Each running scheduler pass's requests, which it took from
    *  pendingRequests: it holds those of the agents it hasn't taken up yet
@@ -3491,8 +3402,10 @@ export class AgentFramework {
    *  (beginAgentTurn). */
   private settledTurns: WeakSet<TurnRouting> = new WeakSet();
   /** Agents whose fresh turn's coalescing assembly is running
-   *  (beginAgentTurn): the window in which addMessage honours a write's
-   *  bypassDeferralFor naming that agent. */
+   *  (beginAgentTurn). What is stored for such an agent meanwhile is
+   *  presented before its compile (presentAtStart's 'assembly'), so
+   *  addMessage stores it with the event clock it is due, and doesn't
+   *  mark its placement unpresented. */
   private readonly assembling = new Set<string>();
   /**
    * The InferenceRequest that started each agent's turn in progress — set and
@@ -3598,24 +3511,25 @@ export class AgentFramework {
     onRollback: () => this.rewriteEndedRecovery(this.registry.endedHistory()),
   });
   /**
-   * The presentation index (#291, presentation.ts), under
-   * FrameworkConfig.presentationIndex; null without it. Set once, in
-   * create(), before any agent is created. Each agent is taken on as it is
+   * The presentation index (#291, presentation.ts). Set once, in create(),
+   * before any agent is created; null only on a framework built from its
+   * prototype, as some suites build one. Each agent is taken on as it is
    * registered (adoptPresentation), and from then on, for an agent whose
-   * window is presented (presents), a write is stored at once and enters
-   * the window at the agent's presentation points: its own rows as they
-   * are written, others' at its turn's start, at its tool boundary as the
-   * stream can carry them, at its turn's end, and at once while no turn of
-   * it is alive.
+   * window is presented (presents), a write enters the window at the
+   * agent's presentation points: its own rows as they are written, others'
+   * at its turn's start, at its tool boundary as the stream can carry them,
+   * at its turn's end, and at once while no turn of it is alive. Every
+   * write is stored at once.
    */
   private presentation: AgentPresentation | null = null;
   /** The arrival listener adoptPresentation installed for each agent, by its unsubscribe. */
   private readonly presentationListeners = new Map<Agent, () => void>();
   /**
    * Writes a surgery's hold kept out of every store while the operator's
-   * switch was awaited, with the flag on (addMessage, and the writes into a
-   * fork's store), in arrival order. They are in memory only: the release
-   * replays them through the ordinary write path (releaseSurgeryHeldWrites).
+   * switch was awaited (addMessage, and the writes into a fork's store), in
+   * arrival order. They are in memory only, so a crash during the surgery
+   * loses them: the release replays them through the ordinary write path
+   * (releaseSurgeryHeldWrites).
    */
   private readonly surgeryHeldWrites: SurgeryHeldWrite[] = [];
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
@@ -3645,9 +3559,8 @@ export class AgentFramework {
   /** Group commit: one fsync per event-loop turn, shared by every waiter. */
   /** The windows of forks and runs deregistered while the host was quiesced,
    *  by agent name (releaseWindowNowOrAfterResume); resume() releases them
-   *  (runReleasesAfterResume), or stop() passes on what they left, unread or
-   *  queued, and clears them. While a name is here, no other flush drains
-   *  its queue (drainDeferredFor). */
+   *  (runReleasesAfterResume), or stop() passes on what they left unread,
+   *  and clears them. */
   private readonly releasesAfterResume = new Map<string, Agent>();
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -3951,8 +3864,8 @@ export class AgentFramework {
         failures.push(stopError);
         // A stop can fail after everything it waits on has stopped, as stop()
         // counts it (an MCPL server once its transport has sent the kill):
-        // finishing a guard's storage work, in the last flush of deferred
-        // writes, in its final sync, or closing the store. The message then
+        // finishing a guard's storage work, in its final sync, or closing
+        // the store. The message then
         // doesn't say part of it may still be running.
         unfinished.push(framework.stopFinishedTeardown
           ? 'What it had started stopped, but finishing the stop failed: ' + shutdownErrorMessage(stopError)
@@ -3982,7 +3895,8 @@ export class AgentFramework {
     config: FrameworkConfig,
     building: { framework?: AgentFramework },
   ): Promise<AgentFramework> {
-    // Register framework states
+    // Register framework states. The deferred-write slot is an earlier
+    // release's, which the importer reads and clears (one release).
     ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
     ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID, AGENT_REGISTRY_STATE_ID]) {
@@ -4099,21 +4013,19 @@ export class AgentFramework {
     framework.providerHoldHook = config.providerHold;
     // The presentation index (#291), before any agent exists. It needs a
     // context-manager that keeps a window index per agent (presentRows).
-    if (config.presentationIndex === true) {
-      if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
-        throw new Error('presentationIndex needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent');
-      }
-      framework.presentation = new AgentPresentation({
-        liveAgents: () => framework.agents.values(),
-        registry: framework.registry,
-        turnAlive: (name) => {
-          const agent = framework.agents.get(name);
-          return !!agent && (framework.hasTurn(name) || framework.turnAlive(agent));
-        },
-        frozen: () => framework.quiesced || framework.surgeryHold !== null,
-        emitTrace: (event) => framework.emitTrace(event),
-      });
+    if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
+      throw new Error('agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent');
     }
+    framework.presentation = new AgentPresentation({
+      liveAgents: () => framework.agents.values(),
+      registry: framework.registry,
+      turnAlive: (name) => {
+        const agent = framework.agents.get(name);
+        return !!agent && (framework.hasTurn(name) || framework.turnAlive(agent));
+      },
+      frozen: () => framework.quiesced || framework.surgeryHold !== null,
+      emitTrace: (event) => framework.emitTrace(event),
+    });
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
@@ -4331,19 +4243,19 @@ export class AgentFramework {
     // (control planes come up normally). The gate already exists at this
     // point, so the suppression is wired here too.
     //
-    // Both records live OUTSIDE branch history (recovery/ files next to the
+    // The record lives OUTSIDE branch history (a recovery/ file next to the
     // store): a historical rollback must not be able to erase the marker of
-    // the very surgery it belongs to, nor orphan the writes deferred by it.
+    // the very surgery it belongs to. So did the deferred-write queue an
+    // earlier release kept, which the importer reads from there.
     framework.hostModePath = config.hostModePath
       ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
     framework.deferredWritesPath = config.deferredWritesPath
       ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
     {
       const hostMode = framework.readHostMode();
-      // The quiesced flags first, before anything is stored: a write that
-      // lands below (the boot-recovery flush) is then weighed as a write
-      // to a quiesced host is, and, with the presentation index, enters no
-      // window of another agent's until resume.
+      // The quiesced flags first, before anything is stored: a write the
+      // importer stores below is then one to a quiesced host, which takes no
+      // clock row and enters no window of another agent's until resume.
       if (hostMode?.quiesced) {
         framework.hostModeRecordMayBeQuiesced = true;
         framework.quiesced = true;
@@ -4351,20 +4263,15 @@ export class AgentFramework {
         framework.quiescedAt = hostMode.since;
         framework.eventGate?.setQuiesced(true);
       }
-      // Deferred writes are recovered REGARDLESS of the mode flag: a crash
-      // between a resume's flag clear and the end of its flush must not
-      // strand accepted messages. A flush acknowledges its batch once, after
-      // the chronicle syncs, and boot skips each entry that already landed
-      // (by its deferredWriteId), so only the remainder replays (see
-      // flushDeferredWrites). Serving boot with a remainder → flush it right
-      // now (no turn is alive yet, so this is a safe boundary).
-      const restoredWrites = framework.restorePersistedDeferredWrites();
-      if (!hostMode?.quiesced && restoredWrites > 0) {
-        console.error(
-          `[host-mode] ${restoredWrites} deferred context write(s) found at a serving boot ` +
-          `(an earlier resume did not finish its flush) — landing them now`,
-        );
-        await framework.flushDeferredWrites('boot-recovery');
+      // A queue of deferred writes an earlier release left (#291, one
+      // release): each write is stored once, in the order it arrived, and
+      // the record cleared, whatever the host's mode. Each agent's window was
+      // written down at its registration, before this, so what is imported
+      // enters windows at the pass below (repairAndRest), or at resume for a
+      // quiesced host.
+      const imported = framework.importPersistedDeferredWrites();
+      if (!hostMode?.quiesced && imported.imported > 0) {
+        console.error(`[host-mode] ${imported.imported} context write(s) an earlier version left queued were stored at boot`);
       }
       if (hostMode?.quiesced) {
         console.error(
@@ -4375,8 +4282,8 @@ export class AgentFramework {
           `[host-mode] until resume() — via host/command, the API server, or the\n` +
           `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
           `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
-          `[host-mode] ${restoredWrites} deferred context write(s) restored from the store;\n` +
-          `[host-mode] they land at resume().\n` +
+          `[host-mode] ${imported.imported} context write(s) an earlier version left queued were stored at boot;\n` +
+          `[host-mode] they enter the agents' windows at resume().\n` +
           `[host-mode] ============================================================`,
         );
         framework.emitTrace({
@@ -4388,17 +4295,18 @@ export class AgentFramework {
     }
 
     // Initialize MCPL subsystems if configured
-    // Configuration has now declared its agents, and host mode and the
-    // deferred-write queue are restored: settle what the previous process
-    // left unfinished (interrupted bounded work, persistent agents no longer
-    // configured, results still held for delivery). After the restore, so a
-    // quiesced host holds the restart notices and redelivered mail as it
-    // holds any write, and mail an entry of the restored queue carries is
-    // left to that entry's landing (nissa's #546 finding 4).
-    // With the presentation index, first a pass over every agent taken on
-    // (repairAndRest): its own rows stored and not in its window, then what
-    // it is owed at rest, now that the stored rows are in. Each agent's
-    // window was written down at its registration, before them.
+    // Configuration has now declared its agents, host mode is restored and an
+    // earlier release's queued writes are stored: settle what the previous
+    // process left unfinished (interrupted bounded work, persistent agents no
+    // longer configured, results still held for delivery). After the import,
+    // so mail an imported write carries is released by then, and the store
+    // holds its copy (nissa's #546 finding 4); on a quiesced host the
+    // restart notices and redelivered mail are stored and enter no other
+    // agent's window until resume, as any write.
+    // First a pass over every agent taken on (repairAndRest): its own rows
+    // stored and not in its window, then what it is owed at rest, now that
+    // the stored rows are in. Each agent's window was written down at its
+    // registration, before them.
     framework.presentation?.repairAndRest();
     framework.reconcileAgentRegistry(interruptedAgents);
 
@@ -4466,15 +4374,6 @@ export class AgentFramework {
           },
           commitDeliveries: () => framework.commitDeliveries(),
           historyTool: () => framework.residentHistoryTool(),
-          getDeferredMessages: () => {
-            const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName;
-            // Settled first, so a write that landed is in the stored rows
-            // alone (settleUnknownLandings).
-            framework.settleUnknownLandings(forPrimary);
-            return framework.deferredMessages.filter(forPrimary)
-              .sort(bySeq)
-              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
-          },
           // Every reader of the shared slot compiles the dump with its own
           // strategy, so the dump fits the smallest of their bounds.
           residentMessageChars: () => {
@@ -4663,14 +4562,11 @@ export class AgentFramework {
    * stop() fails with the cancel's error: that stop() doesn't wait for it,
    * even with no budget, and a later stop() waits for it as for anything an
    * earlier one left running (the last point below). After either:
-   * - an agent still registered whose stream is still running keeps its
-   *   deferred writes queued, since the stream may still write. The stream's
-   *   own turn-end flush takes them when it settles, if the process lives on,
-   *   and a later stop() takes what that leaves; a memory-only queue loses
-   *   them if the process exits first.
+   * - an agent still registered whose stream is still running may still
+   *   write; what it writes is stored as it is written, as every write is.
    * - every ephemeral run still registered is ended, as after any stop(), and
-   *   its end stores what is queued for it, as at any run's end, whatever its
-   *   stream is doing: once a run has left, its stream's late events are
+   *   its release passes on what it never read, as at any run's end, whatever
+   *   its stream is doing: once a run has left, its stream's late events are
    *   dropped, though a write the stream already had under way can still
    *   land in the run's namespace after them.
    * - an event loop still in a call, such as a module's onProcess, finishes
@@ -4683,8 +4579,7 @@ export class AgentFramework {
    * Each conversation fork still live ends, as a closing fork's end does,
    * whatever its stream is doing, as each run does: its channel unbinds, and
    * its window's release passes on to the primary the notices it left that
-   * the primary takes in its place, unread in its window, or still queued
-   * for it unless it read the copy that landed there. Its end settles a
+   * the primary takes in its place, unread in its window. Its end settles a
    * tool-result batch its stream still held and removes the stream's
    * entries, and once it has left, its stream's late events are dropped.
    */
@@ -4852,9 +4747,6 @@ export class AgentFramework {
     // `host-restart` and tells its result recipient — the same as a crash
     // (first live run, 2026-10-12, finding D: a reader fork ended silently).
     for (const run of this.ephemeralRuns.values()) run.endReason ??= 'host-stop';
-    // Flushed-but-unsynced deferred writes: sync and ack now, while the
-    // store is still open, rather than leaving them to a reboot replay.
-    step(() => this.ackDeferredWrites());
     this.providerAdmissionClosed = true;
     for (const wake of [...this.retryWaitWakers]) step(wake);
     this.lifecycleGeneration++;
@@ -4948,23 +4840,13 @@ export class AgentFramework {
       return [...all].map(([promise, label]) => ({ label, promise }));
     };
 
-    // Wait for all stream iteration handles to settle. An agent whose handle
-    // hasn't settled by the final flush keeps its entries queued there. Its
-    // activeStreams entry alone doesn't say that a stream is still running:
-    // a restart whose compile failed after taking the stream id leaves the
-    // old frame's entry, which that frame no longer owns.
-    const stillStreaming = new Set<string>();
-    for (const [name, stream] of this.activeStreams) {
-      stillStreaming.add(name);
-      const settled = () => { stillStreaming.delete(name); };
-      void stream.then(settled, settled);
-    }
+    // Wait for all stream iteration handles to settle.
     // A stream whose cancel threw may run on until it ends of its own accord,
     // which a stop() with no budget would wait for, holding the rest of the
     // teardown. So it counts as a wait that ran out: this stop() doesn't wait
-    // for it, its agent's deferred writes stay queued (stillStreaming), the
-    // cancel's error keeps the store open, and a later stop() waits for it
-    // (leftRunning). The list waited for is taken before it is left running.
+    // for it, the cancel's error keeps the store open, and a later stop()
+    // waits for it (leftRunning). The list waited for is taken before it is
+    // left running.
     const streams = [...this.activeStreams].map(([name, promise]) => ({ name, label: `stream:${name}`, promise }));
     const waited = withLeftovers('stream', streams.filter(({ name }) => !uncancelled.has(name)));
     leaveRunning(streams.filter(({ name }) => uncancelled.has(name)), 'stream');
@@ -5001,8 +4883,8 @@ export class AgentFramework {
     // running, and every run is ended all the same: the caller asked for a
     // bounded stop(), or for one that a stream nothing could stop doesn't
     // hold, and a run whose stream is still running would otherwise wait for
-    // its idle watchdog. Its end stores its queue, as at any run's end; that
-    // stream's late events are dropped once the run has left, and a later
+    // its idle watchdog. What was written for it is stored already (#291);
+    // that stream's late events are dropped once the run has left, and a later
     // stop() waits for the stream itself (leftRunning). (A start() is refused
     // until this stop() settles, so no new lifecycle begins beside it.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
@@ -5036,7 +4918,7 @@ export class AgentFramework {
     // fork ends here as a closing fork's end disposes it, and its release
     // passes on what it left unread, as any release does. Its channel unbinds
     // first, as the idle sweep's does: a start() after this stop() would
-    // otherwise route a message still queued for it to a name that's gone. A
+    // otherwise route a message for it to a name that's gone. A
     // fork whose spawn is still waiting for its creation to return has no
     // binding yet, and its spawn binds nothing once it has ended
     // (spawnConversationAgent).
@@ -5046,7 +4928,7 @@ export class AgentFramework {
     // (disposeConversationAgent), its stream's late events are dropped once
     // it has left (driveStream), a reply of its that fails then is passed on
     // by name (onRouteFailure), and its release, or the pass below, passes on
-    // what it left, unread or queued. A turn of its that hasn't streamed yet
+    // what it left unread. A turn of its that hasn't streamed yet
     // can still record its checkpoint before it drops, a key nothing reads,
     // since the name is never used again. These releases, and the pass after
     // them, come before the registry forgets its channels, since a notice
@@ -5059,50 +4941,19 @@ export class AgentFramework {
       });
     }
     // A window release the quiesce postponed (releasesAfterResume) never runs
-    // once the host stops, so its pass to the primary runs here, deferred
-    // while quiesced like any write, so it waits in the queue with the rest:
-    // each notice stored unread in that window that the primary takes in its
-    // place (a failed reply, a channel notice its reader could act on, or a
-    // module's write for a run or a fork: passesToPrimary), and each such
-    // notice still queued for that agent, under its own id,
-    // unless the agent read a copy of it that landed in its window
-    // (passOnFromReleasedWindow). What else was queued for it goes as boot
-    // would send it (readdDrained): dropped, logged, since nothing lands
-    // while quiesced. So no flush that comes later meets such a notice of an
-    // agent that has gone, not even one that writes into that agent's own
-    // window, as a turn of the fork's still assembling or at a tool boundary
-    // does (flushForStart). Each release's pass is a step of its own, and so
-    // is the drain: one that throws fails the stop() and leaves the others,
-    // and the final flush, to run, and the drain sends a queue whose pass
-    // threw as boot would, its notices to the primary whether read or not,
-    // un-acked ones included. It runs again after the waits below, for a
-    // release an end they let settle postpones.
+    // once the host stops, so its pass to the primary runs here: each notice
+    // stored unread in that window that the primary takes in its place (a
+    // failed reply, a channel notice its reader could act on, or a module's
+    // write for a run or a fork: passesToPrimary) goes on to the primary,
+    // stored now and entering no window while quiesced (releaseWindow).
+    // Each release's pass is a step of its own:
+    // one that throws fails the stop() and leaves the others to run. It runs
+    // again after the waits below, for a release an end they let settle
+    // postpones.
     const passPostponedReleases = () => {
       const agents = [...this.releasesAfterResume.values()];
-      // Each pass reads its window, and what is queued for it, before the
-      // drain below moves its pending entries into the un-acked set.
-      const passes = new Map<string, ReturnType<AgentFramework['passOnFromReleasedWindow']>>();
-      for (const agent of agents) step(() => { passes.set(agent.name, this.passOnFromReleasedWindow(agent)); });
       this.releasesAfterResume.clear();
-      if (agents.length === 0) return;
-      step(() => {
-        const entries: DeferredWrite[] = [];
-        for (const agent of agents) {
-          const pass = passes.get(agent.name);
-          // A pass that threw passed on none of the agent's un-acked entries,
-          // which the ack below would drop, so their notices go too: taken
-          // before the drain hands its pending entries to the un-acked set.
-          const unacked = pass ? [] : this.unackedDeferredWrites
-            .filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agent.name && passesToPrimary(msg.metadata));
-          for (const msg of this.drainDeferredFor(agent.name)) {
-            if (pass && passesToPrimary(msg.metadata)) pass.passOn(msg);
-            else entries.push(msg);
-          }
-          entries.push(...(pass ? pass.forPrimary : unacked));
-        }
-        this.readdDrained(entries, 'stop: postponed releases');
-        this.ackDeferredWrites();
-      });
+      for (const agent of agents) step(() => this.releaseWindow(agent));
     };
     passPostponedReleases();
 
@@ -5192,73 +5043,6 @@ export class AgentFramework {
     // is passed on now. The registry has forgotten its channels, so these
     // notices name a channel by its bare id.
     passPostponedReleases();
-
-    // No stream is left, unless its wait above ran out or its cancel threw:
-    // from the start of stop() none registers and no agent turn starts
-    // (providerAdmissionClosed, checked for every agent), and every stream
-    // registered before was cancelled and awaited above. (A start(), which
-    // would reopen admission, is refused until this stop() settles.)
-    // What is still deferred (a message held for a turn's end whose flush
-    // found the target busy again, or one deferred behind its target's own
-    // state) would wait for a flush that may never come. Land each at its
-    // registered target now, while the store is open; a memory-only queue
-    // would otherwise lose it at exit. Every registered agent's entries go in
-    // queue order (residents share one message slot), each target cut at its
-    // own first entry that can't be stored (writeDrainedInOrder). They go
-    // past the deferral: a frame stop() doesn't wait for (a turn started
-    // outside the event loop) can still hold its target's turn token, but no
-    // reply can follow an entry in any stream.
-    //
-    // A puppet call in flight is one of the operator operations stop() waited
-    // for above, so its pair and the flush after it have landed by now. If
-    // that wait timed out, the call may still be running and holding its
-    // target's turn: its pair lands after these entries, on the store a
-    // timed-out wait leaves open.
-    //
-    // A quiesced host defers each entry again instead, into the persisted
-    // queue, for boot recovery. Past the deferral, a write that throws stays
-    // queued with what follows it for its target, unless context-manager
-    // refuses it as malformed, when it is dropped (writeDrainedInOrder).
-    // A memory-only queue still loses queued entries at exit. An entry for a target no longer registered,
-    // such as one a release postponed after the pass above leaves, or one a
-    // quiesced boot restored for an agent gone before a crash, is left for
-    // the flush that meets it, which passes a failed reply, or a channel
-    // notice its reader could act on, on to the primary and drops anything
-    // else, logged (readdDrained): with a persisted queue, the boot or resume
-    // flush. A memory-only queue loses it at exit.
-    //
-    // A registered agent's stream that outlasted its wait, or whose cancel
-    // threw, may still write, so that agent's entries stay queued, said once
-    // for it: no entry lands ahead of a stream that may still write. The
-    // stream counts as running while the handle this stop() found for it
-    // hasn't settled (stillStreaming). When it settles in a process that
-    // lives on, its own turn-end flush takes them, as at any turn's end, and a
-    // later stop() takes what that leaves. Until then a persisted queue keeps
-    // them for boot, and a memory-only one loses them at exit.
-    // Like a guard's storage work above and the final sync below, this flush
-    // comes once everything else has stopped (teardownSucceeded): if it throws,
-    // stop() fails with that, the final sync still runs, and an owned store
-    // still closes unless something before it failed.
-    step(() => {
-      if (this.deferredMessages.length === 0) return;
-      const registered = [...this.agents.keys()];
-      const entries = registered
-        .filter((name) => !stillStreaming.has(name))
-        .flatMap((name) => this.drainDeferredFor(name));
-      this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
-      this.ackDeferredWrites();
-      for (const name of registered.filter((agent) => stillStreaming.has(agent))) {
-        const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
-        if (held > 0) {
-          console.error(
-            `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream is still running and may still write; ` +
-            (this.deferredWritesPersisted || this.quiesced
-              ? 'the persisted queue keeps them for boot'
-              : 'this memory-only queue loses them if the process exits before that stream settles'),
-          );
-        }
-      }
-    });
 
     // Final sync before closing
     try {
@@ -7715,7 +7499,9 @@ export class AgentFramework {
       parkedAdmissions,
       gatedRequests: this.pendingRequests.filter((r) => !passesQuiesce(r)).length,
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
-      deferredWrites: this.deferredMessages.length,
+      // Deprecated (#291): no queue is kept. What a live surgery's hold
+      // keeps in memory, to land at its release.
+      deferredWrites: this.surgeryHeldWrites?.length ?? 0,
       ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
     };
   }
@@ -7728,17 +7514,15 @@ export class AgentFramework {
   static readonly QUIESCE_TIMEOUT_DEFAULT_MS = 120_000;
 
   /**
-   * Enter quiesce mode: write the deferred-write queue, persist the flag,
-   * suppress gate deliveries, pause all MCPL data planes, and wait for
-   * in-flight turns to settle (turn-alive is a turn token, which spans
-   * dequeue → settled teardown, a continuation of the turn on its way to its
-   * start, or the turn's retry, which a provider hold keeps or which waits
-   * to start: turnHolders). Idempotent, but for the queue's write, which
-   * every call makes first: when the queue can't reach disk, because its
-   * write fails or it's over the cap, the call rejects with a
-   * QuiesceBlockedError and the host's mode as it was, unless it has
-   * `abandon`, which goes on with the queue in memory and an alert
-   * (writeDeferredWritesForQuiesce).
+   * Enter quiesce mode: persist the flag, suppress gate deliveries, pause all
+   * MCPL data planes, and wait for in-flight turns to settle (turn-alive is
+   * a turn token, which spans dequeue → settled teardown, a continuation of
+   * the turn on its way to its start, or the turn's retry, which a provider
+   * hold keeps or which waits to start: turnHolders). Idempotent. While
+   * quiesced a write is stored at once, as always, and the presentation
+   * index presents no agent another's row until resume (#291): every
+   * window is frozen but for each agent's own rows, a draining turn's tool
+   * boundaries included.
    *
    * On drain timeout the host STAYS quiesced (`drained: false` in the
    * result); with `abandon: true` the undrained streams are cancelled via a
@@ -7762,11 +7546,6 @@ export class AgentFramework {
     timeoutMs?: number;
     abandon?: boolean;
   }): Promise<HostModeStatus> {
-    // The deferred-write queue first, as a quiesced host keeps it, on a first
-    // call and a repeat alike: what it holds is on disk before the record says
-    // quiesced, including a write held only in memory, such as one deferred
-    // behind a turn still alive, unless an abandon goes on without it.
-    this.writeDeferredWritesForQuiesce(opts?.abandon === true);
     if (this.quiesced) {
       // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
       // out undrained must be escalatable with a second quiesce({abandon})
@@ -7982,10 +7761,11 @@ export class AgentFramework {
       // A resume whose record clear failed, or a quiesce whose write failed
       // partway, can leave memory serving and the record quiesced: this
       // resume clears the record, rather than answer as if it had. It
-      // writes the store, so it waits out a surgery as the clear below does,
-      // and it leaves the record to a resume() still flushing, which clears
-      // it once its flush is done.
-      if (this.hostModeRecordMayBeQuiesced && !this.resumeInFlight) {
+      // writes the store, so it waits out a surgery as the clear below does.
+      // (No other resume() can be between serving and clearing the record:
+      // that stretch below has no await since #291, which took its flush of
+      // the deferred writes away.)
+      if (this.hostModeRecordMayBeQuiesced) {
         this.refuseResumeUnderSurgery();
         this.persistHostMode(null);
         this.hostModeRecordMayBeQuiesced = false;
@@ -8056,38 +7836,29 @@ export class AgentFramework {
     }
 
     const releasedRequests = this.pendingRequests.length;
-    // In-memory first: addMessage must stop deferring so the flush below can
-    // land. The DURABLE flag is cleared only after the flush completes — a
-    // crash in between then boots quiesced with the un-acked remainder
-    // restored (and a serving boot recovers any remainder anyway).
+    // In memory first, so the windows the quiesce froze take what was stored
+    // meanwhile below. The DURABLE flag is cleared only after that: a crash
+    // in between boots quiesced, and its resume presents the same rows.
     this.quiesced = false;
     this.quiesceReason = undefined;
     this.quiescedAt = undefined;
     this.lastUnabandonable = [];
     this.eventGate?.setQuiesced(false);
 
-    this.resumeInFlight = true;
     try {
       // The windows of forks and runs deregistered during the window are
-      // released first, each landing its queued writes and passing on its
-      // unread failed replies, the channel notices it could act on, and a
-      // run's unread module writes, as at any release. Then flush context writes
-      // deferred by the quiesce window (module events, api message.send) —
-      // with no turn alive there is no other flush point. The batch is
-      // stored in queue order and acknowledged once, after the chronicle
-      // syncs (see flushDeferredWrites); nothing here may reach the plane
-      // reopen below.
+      // released first, each passing on its unread failed replies, the
+      // channel notices it could act on, and a run's unread module writes,
+      // as at any release. Nothing here may reach the plane reopen below.
       this.runReleasesAfterResume();
-      await this.flushDeferredWrites('resume');
-      // With the presentation index the quiesce froze every window but for
-      // each agent's own rows: what was stored meanwhile enters the window of
-      // each agent with no turn alive now; a draining turn's is presented at
-      // its own points.
+      // The quiesce froze every window but for each agent's own rows: what
+      // was stored meanwhile (module events, api message.send) enters the
+      // window of each agent with no turn alive now; a draining turn's is
+      // presented at its own points.
       for (const agent of [...this.agents.values()]) this.presentAtEndOf(agent);
       this.persistHostMode(null);
       this.hostModeRecordMayBeQuiesced = false;
     } finally {
-      this.resumeInFlight = false;
       // Reopen MCPL data planes (quiesced is already false). In `finally`
       // so that nothing above can leave the host un-quiesced with every data
       // plane still paused.
@@ -8101,9 +7872,7 @@ export class AgentFramework {
       // NOTE: parked wakes and gate buffers are in-memory only — a restart
       // mid-quiesce boots quiesced but with these queues empty (sources like
       // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
-      // Deferred context WRITES are persisted while quiesced and survive,
-      // apart from any whose write failed or met the cap and that no later
-      // write carried (persistDeferredWrites).
+      // Context WRITES made while quiesced are in the store, and survive.
       console.error(this.queue?.isClosed
         ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
         : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
@@ -8112,121 +7881,15 @@ export class AgentFramework {
   }
 
   /**
-   * Land every deferred write whose target has no turn alive, as one batch
-   * acknowledged once: the chronicle is synced, then the persisted queue is
-   * rewritten without the batch (ackDeferredWrites). Until then the batch
-   * stays in the durable queue, so a crash mid-flush replays it at the next
-   * boot, which skips each entry that already landed, by its deferredWriteId —
-   * no loss, no duplicates. The batch is stored in queue order, whatever its
-   * targets (writeDrainedInOrder). A write the store rejects stays queued,
-   * logged, with what is queued behind it for its target, so the flush never
-   * stores that target's later entries ahead of it, and other targets' entries
-   * go on. One the store refuses as malformed, which it would at every flush,
-   * is logged and dropped instead, and what is behind it goes on. (A write
-   * that isn't deferred can still land ahead of it, such as one for an idle
-   * agent once the host has resumed.) A boot that meets it again logs it and
-   * goes on.
-   *
-   * Per-target: an agent whose turn is still alive keeps ITS messages
-   * deferred for its own turn boundary; everyone else's flush now.
-   */
-  private async flushDeferredWrites(label: string): Promise<void> {
-    if (this.deferredMessages.length === 0) {
-      this.persistDeferredWrites();
-      return;
-    }
-    const keep: typeof this.deferredMessages = [];
-    const flush: typeof this.deferredMessages = [];
-    for (const msg of this.deferredMessages) {
-      const target = msg.forAgent ?? this.primaryAgentName;
-      (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
-    }
-    // Hand-off: the batch leaves the pending queue and enters the un-acked
-    // set. The DURABLE queue (pending + un-acked) is unchanged by this, so a
-    // crash anywhere below replays the whole batch, and the deferredWriteId
-    // stamped on each stored message lets boot skip the ones that did land.
-    flush.sort(bySeq);
-    this.deferredMessages = keep;
-    this.handOffDeferredWrites(flush);
-    // A write for a target no longer registered, such as a fork or a run gone
-    // before a crash that left it to boot recovery, goes as readdDrained
-    // sends it: a failed reply, a channel notice its reader could act on, or
-    // a module's write for a run or a fork, to the primary (passesToPrimary),
-    // anything else dropped, logged.
-    const stored = this.readdDrained(flush, `host-mode ${label}`).length;
-    // Ack = sync the chronicle FIRST, then rewrite the durable queue without
-    // the batch. Never the other way round.
-    this.ackDeferredWrites();
-    console.error(
-      `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
-      (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
-    );
-  }
-
-  /**
-   * Acknowledge every deferred write that has been handed to a context
-   * manager: sync the chronicle so the appended slots are durable, and only
-   * then drop them from the recovery queue. If the sync fails they stay in
-   * the durable queue (the next ack, or stop(), retries); a reboot in that
-   * state replays them, deduplicated by `deferredWriteId` for any that did
-   * reach disk. Idempotent and cheap when nothing is un-acked.
-   */
-  private ackDeferredWrites(): void {
-    if (this.unackedDeferredWrites.length === 0) return;
-    // Nothing durable to reconcile against unless the queue was persisted.
-    if (!this.deferredWritesPersisted && !this.quiesced) {
-      this.unackedDeferredWrites = [];
-      return;
-    }
-    try {
-      this.store.sync();
-    } catch (err) {
-      console.error(
-        `[host-mode] chronicle sync failed — ${this.unackedDeferredWrites.length} flushed deferred ` +
-        `write(s) stay in the recovery queue until a sync succeeds:`,
-        err,
-      );
-      return;
-    }
-    this.unackedDeferredWrites = [];
-    this.deferredScanFrom.clear();
-    this.persistDeferredWrites();
-  }
-
-  /**
-   * Move drained entries into the un-acked set and record, per target
-   * agent, the store position they will be appended after — then persist
-   * that receipt BEFORE any of them is written. Boot recovery scans from the
-   * recorded position to the tail, so every member of an interrupted batch
-   * is visible to the dedup, however large the batch.
-   */
-  private handOffDeferredWrites(entries: DeferredWrite[]): void {
-    if (entries.length === 0) return;
-    const durable = this.deferredWritesPersisted || this.quiesced;
-    if (!durable) return; // memory-only deferrals: nothing to reconcile at boot
-    for (const entry of entries) {
-      const target = entry.forAgent ?? this.primaryAgentName;
-      const agent = target ? this.agents.get(target) : undefined;
-      if (!agent) continue;
-      let count = 0;
-      try {
-        const cm = agent.getContextManager() as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
-        count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
-      } catch { count = 0; }
-      const prev = this.deferredScanFrom.get(target!);
-      this.deferredScanFrom.set(target!, prev === undefined ? count : Math.min(prev, count));
-    }
-    this.unackedDeferredWrites.push(...entries);
-    this.persistDeferredWrites();
-  }
-
-  /**
-   * Which of `ids` already exist in some agent's store as a landed deferred
-   * write (`metadata.deferredWriteId`). Scans each context manager's recent
-   * tail blob-free — an interrupted flush is always within the last few
-   * hundred slots — and tolerates facades without windowed reads. A context
-   * that can't be read throws, naming its agent: counted as holding none, a
-   * write that landed there before its ack would land a second time.
+   * Which of `ids`, an earlier release's queued writes, already exist in
+   * some agent's store as a landed write (`metadata.deferredWriteId`): one an
+   * interrupted flush of that release stored before its ack, or one this
+   * importer stored at a boot that ended before it cleared the record. Scans
+   * each context manager from the record's per-agent position (the whole
+   * store where it names none) to the tail, blob-free, and tolerates facades
+   * without windowed reads. A context that can't be read throws, naming its
+   * agent: counted as holding none, a write that landed there would land a
+   * second time.
    */
   private landedDeferredWriteIds(ids: Set<string>, scanFrom: Map<string, number>): Set<string> {
     const landed = new Set<string>();
@@ -8357,258 +8020,74 @@ export class AgentFramework {
     if (this.recoveryFallbackWarned) return;
     this.recoveryFallbackWarned = true;
     console.error(
-      '[host-mode] no storePath / hostModePath / deferredWritesPath: quiesce state and deferred ' +
-      'writes persist in the branch-local framework/state slot — a historical rollback while ' +
-      'quiesced can erase them; configure the recovery paths',
+      '[host-mode] no storePath / hostModePath: quiesce state persists in the branch-local ' +
+      'framework/state slot — a historical rollback while quiesced can erase it; configure the ' +
+      'recovery path',
     );
   }
 
   /**
-   * Mirror the deferred-write queue durably while quiesced (and until an
-   * already-persisted queue drains). The quiesce flag itself is persisted
-   * because a crash mid-surgery is an expected event; the messages withheld
-   * BECAUSE of that surgery would otherwise die with the process — and the
-   * window is operator-length, not turn-length. Lives in the
-   * branch-independent recovery file so a rollback cannot orphan it.
-   * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
-   * mirrored only while such a queue is still persisted; otherwise they are
-   * memory-only: they land within the turn, at a tool boundary or at its
-   * end, and a crash before then loses them. That window runs to the turn's
-   * end for a message held there and what is queued behind it, and, on a
-   * stream that declares it can't carry injected messages (membrane's XML
-   * prefill path, from 0.6.0), for every message deferred during the turn.
+   * Store, once, the context writes a release before #291 left queued
+   * (src/deferred-import.ts reads its record), and clear the record. One
+   * release only: the release after this one deletes it.
    *
-   * A write that fails, or a queue over the cap, which writes nothing,
-   * leaves the record as it last held it, except that store only, a write
-   * whose sync failed is in the store, where a later sync can still put it
-   * on disk (writeDeferredWritesSlot). The queue stays in memory and
-   * mirrored, so its next change writes it again. Until a write succeeds, a
-   * restart restores what the record holds, or doesn't start if it can't
-   * read the record: it loses writes queued since, and brings back an entry
-   * withdrawn since (removePlacement, RFC-006's removal of an unread
-   * deferred write) that it still lists. The callers go on: a
-   * deferral's caller has already answered its source, so failing it would
-   * lose a write that can still land at resume. The first such write after
-   * one that succeeded raises an ops alert, and a line says when a write
-   * succeeds again (deferredWritesFellBehind). quiesce() writes the queue
-   * itself before it changes the host's mode, and refuses instead, unless
-   * the call has `abandon` (writeDeferredWritesForQuiesce).
+   * Such a release held a write while its agent's turn was alive or the host
+   * was quiesced, and mirrored the queue to its recovery file (or the
+   * store's slot) while quiesced, or from a flush that might not have
+   * reached disk, until the queue drained. This release keeps no queue, so
+   * create() calls this once, after the quiesced flags are restored and
+   * every agent's window was written down at its registration, and before
+   * the boot's pass over the windows (repairAndRest) and the registry's
+   * reconcile:
+   *
+   * - A record that can't be read, or that isn't a queue, fails create()
+   *   (deferredWritesRefusal), and so does a context that can't be checked
+   *   for writes that already landed: taken as empty, the writes would never
+   *   be stored, or would be stored twice.
+   * - Each write is stored in the order it arrived, across agents, under
+   *   its own id (`metadata.deferredWriteId`, addMessage's `imported`), so a
+   *   later boot finds it. One that already landed is skipped by that id: an
+   *   interrupted flush of the earlier release stored it before its ack, or
+   *   a boot of this one stored it and ended before it cleared the record.
+   *   One whose earlier write may have landed (`landing: 'unknown'`) is
+   *   looked up across its agent's whole branch first: found, it isn't
+   *   stored again; where the branch can't be searched, that agent is cut
+   *   there.
+   * - A write keeps the audience it was queued with. One queued with none,
+   *   by a release before the stamp, is stamped as addMessage stamps any
+   *   write, and a tool-block pair (the puppet's) as its agent's own row.
+   * - A write for an agent no longer registered goes to the primary, as its
+   *   by-name notice under the write's own id, when it is a failed reply, a
+   *   channel notice its reader could act on, or a module's write for a run
+   *   or a fork (passesToPrimary); anything else is dropped, logged.
+   * - A write that can't be stored cuts its agent: it and that agent's later
+   *   writes stay in the record for the next boot, and the other agents' go
+   *   on. One context-manager refuses as malformed, which it would at every
+   *   boot, is dropped, logged.
+   * - A tune-out's release (`kind: 'tune-out-cancel'`) stored here owes its
+   *   agent the wake its cancel requested (#232 gap 6).
+   * - Mail an imported write carries is released as it is stored
+   *   (releaseLandedMail), so reconcile doesn't deliver it again.
+   *
+   * What is stored is presented to no window here: the pass after the
+   * import presents each agent its own rows and what it is owed at rest, and
+   * a quiesced host's other rows wait for resume. Once every write is stored
+   * the store is synced, and only then is the record cleared, or written
+   * again with the writes cut for the next boot; a sync that fails leaves
+   * the record as it was, and the next boot skips what landed.
    */
-  private persistDeferredWrites(): void {
-    let outcome: DeferredWritesOutcome;
-    try {
-      outcome = this.writeDeferredWrites(this.quiesced);
-    } catch (err) {
-      console.error('[host-mode] failed to persist deferred context writes:', err);
-      this.deferredWritesFellBehind({ error: err });
-      return;
-    }
-    if (outcome === 'over-cap') {
-      this.deferredWritesFellBehind('over-cap');
-    } else if (outcome !== 'nothing') {
-      this.deferredWritesCaughtUp();
-    }
-  }
-
-  /**
-   * Write the queue to its record as it stands, when the host is quiesced
-   * (`quiesced`, which quiesce() passes before it sets the flag) or the
-   * queue is mirrored: the queue when it holds anything, and an empty one
-   * over a record that held one. What the write throws is thrown. A queue
-   * whose JSON is longer than the cap writes nothing.
-   */
-  private writeDeferredWrites(quiesced: boolean): DeferredWritesOutcome {
-    // The durable queue is everything not yet acked: writes still pending
-    // AND writes handed to a context manager whose sync has not happened.
-    // Always in original deferral order, whatever the pending/un-acked
-    // split: a re-deferred entry must not jump the queue.
-    const durable = this.durableDeferredWrites();
-    if ((quiesced || this.deferredWritesPersisted) && durable.length > 0) {
-      if (JSON.stringify(durable).length > DEFERRED_WRITES_PERSIST_CAP_CHARS) return 'over-cap';
-      const queue = { version: 2, pending: durable, scanFrom: Object.fromEntries(this.deferredScanFrom) };
-      if (this.deferredWritesPath) {
-        this.writeRecoveryFile(this.deferredWritesPath, queue);
-      } else {
-        this.warnRecoveryFallbackOnce();
-        // The slot may hold this queue from here on, even if the write
-        // throws: its sync can fail after the slot is set.
-        this.deferredWritesPersisted = true;
-        this.writeDeferredWritesSlot(queue);
-      }
-      this.deferredWritesPersisted = true;
-      return 'written';
-    }
-    if (!this.deferredWritesPersisted) return 'nothing';
-    if (this.deferredWritesPath) {
-      this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
-    } else {
-      this.writeDeferredWritesSlot([]);
-    }
-    this.deferredWritesPersisted = false;
-    return 'written';
-  }
-
-  /** Store only, the slot is the record, and a write isn't on disk until the
-   *  store syncs, so a sync that fails is the write's failure, as in
-   *  persistHostMode. The slot is set by then, and a later sync can still
-   *  put it on disk, so writeDeferredWrites marks the queue mirrored before
-   *  it writes; a boot that restores such a queue skips each entry that
-   *  already landed. */
-  private writeDeferredWritesSlot(value: unknown): void {
-    this.store.setStateJson(DEFERRED_WRITES_ID, value);
-    this.store.sync();
-  }
-
-  /** The durable queue: every deferred write not yet acked, pending and
-   *  un-acked, in deferral order. */
-  private durableDeferredWrites(): DeferredWrite[] {
-    return [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
-  }
-
-  /** Where the queue is recorded, as an operator would look for it. */
-  private deferredWritesRecord(): string {
-    return this.deferredWritesPath ?? `the store's ${DEFERRED_WRITES_ID} slot`;
-  }
-
-  /**
-   * quiesce()'s write of the queue, before it changes the host's mode, as a
-   * quiesced host keeps it: a write held only in memory, such as one
-   * deferred behind a turn still alive, is on disk before quiesce() goes on,
-   * as its record is. When the queue can't reach disk, because its write
-   * fails or it's over the cap, which writes nothing, a call with `abandon`
-   * goes on with the queue in memory and the failure's or the cap's alert.
-   * Any other throws a QuiesceBlockedError naming the ways out, so quiesce()
-   * rejects with the host's mode as it was (store only, the slot set before
-   * a sync that failed leaves the queue mirrored: writeDeferredWritesSlot).
-   * Writes a flush landed stay in the queue until a store sync acks them, so
-   * it first retries an ack whose sync failed: once a sync succeeds they're
-   * on disk, and they leave the queue rather than count against the cap.
-   */
-  private writeDeferredWritesForQuiesce(abandon: boolean): void {
-    this.ackDeferredWrites();
-    // Abandon is the call for a turn that won't end. The queue stays in
-    // memory whichever way the call goes, and writes held for such a turn
-    // don't land until it does, so refusing it would leave only a restart,
-    // which loses them: it goes on, with the alert as everywhere else.
-    let outcome: DeferredWritesOutcome;
-    try {
-      outcome = this.writeDeferredWrites(true);
-    } catch (error) {
-      if (abandon) {
-        console.error(
-          '[host-mode] failed to persist deferred context writes; quiesce goes on with them in memory, so resume ' +
-          'before any restart:',
-          error,
-        );
-        this.deferredWritesFellBehind({ error }, true);
-        return;
-      }
-      throw new QuiesceBlockedError(
-        `quiesce refused: writing ${this.deferredWritesRecord()} failed: ${thrownText(error)}. So the queue as it ` +
-        `stands, ${this.durableDeferredWrites().length} deferred context write(s), isn't on disk. Once the record ` +
-        'can be written, quiesce again, or quiesce with abandon: true, which cancels the turns still streaming, to ' +
-        'go on with the queue in memory, and resume before any restart.',
-        { cause: error },
-      );
-    }
-    if (outcome === 'over-cap') {
-      if (abandon) {
-        this.deferredWritesFellBehind('over-cap', true);
-        return;
-      }
-      throw new QuiesceBlockedError(
-        `quiesce refused: the queue's ${this.durableDeferredWrites().length} deferred context write(s) come to ` +
-        `more than ${DEFERRED_WRITES_PERSIST_CAP_CHARS} characters of JSON, the cap, so ` +
-        `${this.deferredWritesRecord()} can't hold them, and a restart would lose them. ` +
-        (this.quiesced
-          ? 'Resume so they land, then quiesce again. A write held for a turn still alive stays queued through ' +
-            'a resume, so to end a turn that won\'t, quiesce with abandon: true before resuming. '
-          : 'Quiesce again once they have landed, or quiesce with abandon: true to end the turns they ' +
-            'wait for, then resume so they land, and quiesce again. ') +
-        'The abandon\'s answer lists a turn it hasn\'t ended within its grace as unabandonable, and its writes ' +
-        'land once it has ended and the host is serving.',
-      );
-    }
-    if (outcome !== 'nothing') this.deferredWritesCaughtUp();
-  }
-
-  /**
-   * A write of the queue failed, or met the cap, and quiesce() didn't reject
-   * for it. The queue stays mirrored, so its next change writes it again.
-   * The first such write since one that succeeded raises an ops alert naming
-   * the record, and the rest of the run raises none. A failed write's own
-   * line is logged each time (persistDeferredWrites), and the cap's line the
-   * first time the cap is met in a run, whatever began it. On a host that is
-   * or is about to be quiesced, both say to resume before any restart, since
-   * a quiesced host lands its deferred writes only at a resume.
-   */
-  private deferredWritesFellBehind(cause: { error: unknown } | 'over-cap', quiesced = this.quiesced): void {
-    this.deferredWritesPersisted = true;
-    const startsRun = !this.deferredWritesBehind;
-    this.deferredWritesBehind = true;
-    const record = this.deferredWritesRecord();
-    const queued = this.durableDeferredWrites().length;
-    const resumeFirst = quiesced ? '. Resume before any restart' : '';
-    if (cause === 'over-cap') {
-      if (this.deferredWritesCapLogged) return;
-      this.deferredWritesCapLogged = true;
-      const message = `the queue's ${queued} deferred context write(s) come to more than ` +
-        `${DEFERRED_WRITES_PERSIST_CAP_CHARS} characters of JSON, the cap, so ${record} isn't written, ` +
-        `and a restart before the queue is under the cap and written restores what it last held${resumeFirst}`;
-      console.error(`[host-mode] ${message}`);
-      if (startsRun) {
-        this.opsAlert('deferred-writes', 'framework', message,
-          { data: { record, queued, capCharacters: DEFERRED_WRITES_PERSIST_CAP_CHARS } });
-      }
-      return;
-    }
-    if (!startsRun) return;
-    const { error } = cause;
-    const reason = error instanceof Error ? error.message : String(error);
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    this.opsAlert('deferred-writes', 'framework',
-      `writing ${record} failed: ${reason}. The queue's next change writes it again, and until a write of it ` +
-      `succeeds, the queue as it stands, ${queued} deferred context write(s), isn't on disk${resumeFirst}`,
-      { data: { record, queued, ...(code ? { code } : {}) } });
-  }
-
-  /** A write of the queue succeeded after a run of failures: say that the
-   *  record has caught up. */
-  private deferredWritesCaughtUp(): void {
-    if (!this.deferredWritesBehind) return;
-    this.deferredWritesBehind = false;
-    this.deferredWritesCapLogged = false;
-    console.error(
-      `[host-mode] ${this.deferredWritesRecord()} written again: it holds the queue's ` +
-      `${this.durableDeferredWrites().length} deferred context write(s)`,
-    );
-  }
-
-  /**
-   * Restore the deferred-write queue a crash or a stop left durable. Nothing
-   * stored is an empty queue. A queue that can't be read, or that reads as
-   * anything but a queue, throws, since taken as empty the next deferral
-   * would replace the stored one; so does a context that can't be checked
-   * for writes that already landed (see landedDeferredWriteIds).
-   */
-  private restorePersistedDeferredWrites(): number {
+  private importPersistedDeferredWrites(): {
+    imported: number;
+    alreadyLanded: number;
+    passedToPrimary: number;
+    dropped: number;
+    keptForNextBoot: number;
+  } {
+    const outcome = { imported: 0, alreadyLanded: 0, passedToPrimary: 0, dropped: 0, keptForNextBoot: 0 };
     // The recovery file wins whenever it exists. Stores that predate it (or
-    // store-only configs) keep the queue in the store's slot.
+    // store-only configs) kept the queue in the store's slot.
     let file = this.deferredWritesPath;
-    const refuse = (problem: string, cause?: unknown): Error => new Error(
-      `the deferred context writes (${file ?? DEFERRED_WRITES_ID}) ${problem}. The framework doesn't start without them, ` +
-        `since the next deferral would replace the stored queue. ` +
-        (file
-          ? `The file is unchanged, and the framework starts once ${cause === undefined
-            ? 'it holds a queue of writes, such as {"version":1,"pending":[]} for none. Removing it reads the queue ' +
-              `from ${DEFERRED_WRITES_ID} instead, which the file's writes don't keep, so it restores whatever older ` +
-              `queue is there, or none`
-            : 'it can be read'}.`
-          : cause === undefined
-            ? `They're unchanged, and starting again won't help until they're repaired.`
-            : `They're unchanged, and the framework starts once they can be read.`),
-      cause === undefined ? undefined : { cause },
-    );
+    const record = () => ({ ...(file ? { file } : {}), slotId: DEFERRED_WRITES_ID });
     let raw: unknown;
     try {
       raw = file ? this.readRecoveryFile(file) : undefined;
@@ -8618,128 +8097,18 @@ export class AgentFramework {
       }
     } catch (error) {
       throw error instanceof StoredFormError
-        ? refuse(`hold text that isn't JSON: ${error.message}`)
-        : refuse(`could not be read: ${thrownText(error)}`, error);
+        ? deferredWritesRefusal(record(), `hold text that isn't JSON: ${error.message}`)
+        : deferredWritesRefusal(record(), `could not be read: ${thrownText(error)}`, error);
     }
-    // Nothing stored is an empty queue: no file, and nothing in the slot. A
-    // file that holds null isn't a queue (no release writes one).
-    if (!file && (raw === null || raw === undefined)) return 0;
-    // v1 slot payloads were a bare array; v1/v2 files and v2 slots are
-    // `{ pending, scanFrom? }`.
-    const doc = (Array.isArray(raw) ? { pending: raw } : raw !== null && typeof raw === 'object' ? raw : undefined) as
-      { pending?: unknown; scanFrom?: unknown } | undefined;
-    if (!doc || !Array.isArray(doc.pending)) {
-      throw refuse(doc
-        ? `hold an object whose pending is ${doc.pending === undefined ? 'missing' : jsonKind(doc.pending)}, not a list of writes`
-        : `hold ${jsonKind(raw)}, not a queue of writes`);
+    const queue = readPersistedDeferredWrites(raw, record(), (line) => console.error(line));
+    if (queue.entries.length === 0) {
+      // Only malformed or repeated entries: the record no longer names them.
+      if (queue.changed) this.writeImportedRecord(file, []);
+      return outcome;
     }
-    const data = doc.pending;
-    if (data.length === 0) return 0;
-    const scanFrom = new Map<string, number>();
-    if (doc.scanFrom && typeof doc.scanFrom === 'object') {
-      for (const [k, v] of Object.entries(doc.scanFrom as Record<string, unknown>)) {
-        if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
-      }
-    }
-    // An entry the queue's readers can't handle has no place in it: one whose
-    // participant isn't text, whose content isn't an array, that holds a block
-    // that isn't an object, or whose `forAgent` is present but not a name, is
-    // dropped here with a line naming it, rather than held. Reading a null
-    // block's type throws, at the tool boundary and in the store. From
-    // context-manager 0.16.0 the store refuses a string or number block and
-    // its reads leave one out; an older store kept it as given, and since the
-    // context manager's token estimate keys a WeakMap on each block, every
-    // compile for that agent then threw, and a restart didn't clear it. What a
-    // block holds, such as a tool result's content, isn't checked here: a
-    // recovered write whose content context-manager refuses is dropped at the
-    // flush that meets it (writeDrainedInOrder). The framework writes
-    // `forAgent` only as a non-empty name, so another value comes from damage
-    // or a hand edit, and the agent it meant can't be known: sent to the
-    // primary, as a falsy one would be, it could put another agent's message
-    // in the primary's window.
-    const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq' | 'heldAt'> & { id?: unknown; seq?: unknown; heldAt?: unknown } => {
-      if (!m || typeof m !== 'object') return false;
-      const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
-      return typeof participant === 'string'
-        && Array.isArray(content) && content.every((b) => !!b && typeof b === 'object')
-        && (forAgent === undefined || (typeof forAgent === 'string' && forAgent !== ''));
-    };
-    const malformed = data.filter((m) => !wellFormed(m));
-    for (const m of malformed) {
-      // What the entry holds there: a value that isn't text by its type.
-      const field = (key: string): string => {
-        const value = m && typeof m === 'object' ? (m as Record<string, unknown>)[key] : undefined;
-        if (typeof value === 'string') return value;
-        if (value === undefined) return `no ${key}`;
-        return `${key} ${value === null ? 'null' : `of type ${typeof value}`}`;
-      };
-      console.error(
-        `[host-mode] a recovered deferred context write is malformed and was dropped: ` +
-        `${field('id')} (${field('participant')})`,
-      );
-    }
-    // One entry per id: the boot dedup and the ack each take an id as one
-    // write, so an id that comes again is dropped with a line, and the first
-    // entry with it is kept. An entry with no id is given a fresh one, with
-    // a line: a copy of it that already landed carries the id it lost, so
-    // the boot dedup can't find it, and it may be stored again.
-    const seen = new Set<string>();
-    const kept: Array<Omit<DeferredWrite, 'id' | 'seq'> & { id: string; seq?: unknown }> = [];
-    let duplicates = 0;
-    // The time a write was first held, which a module reads as its held
-    // row's timestamp. An entry that has none (written by a release before
-    // it) or one that isn't a time (damage or a hand edit: a Date holds
-    // times within 8.64e15 ms of the epoch) takes the time it's read back
-    // here.
-    const readAt = Date.now();
-    const heldAt = (value: unknown): number =>
-      typeof value === 'number' && Math.abs(value) <= 8.64e15 ? value : readAt;
-    for (const m of data.filter(wellFormed)) {
-      const hasId = typeof m.id === 'string' && m.id !== '';
-      const id = hasId ? (m.id as string) : randomUUID();
-      if (!hasId) {
-        console.error(`[host-mode] a recovered deferred context write (${m.participant}) has no id; it is given ${id}`);
-      }
-      if (seen.has(id)) {
-        duplicates++;
-        console.error(
-          `[host-mode] a recovered deferred context write repeats id ${id} (${m.participant}) and was dropped; ` +
-          `the first entry with that id is kept`,
-        );
-        continue;
-      }
-      seen.add(id);
-      kept.push({ ...m, id, heldAt: heldAt(m.heldAt) });
-    }
-    // A seq says only where its entry came in arrival order. The queue is
-    // restored in the order the file gives: entries whose seq is a positive
-    // whole number up to Number.MAX_SAFE_INTEGER by seq, then, in file
-    // order, any without one (a file that predates seq, which is in write
-    // order already) or with another value (damage or a hand edit: JSON's
-    // 1e400 reads as Infinity). Then it is numbered 1..N in that order, so
-    // the counter starts again from N at every boot, wherever the file's
-    // seqs had got to.
-    const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
-    const unnumbered = kept.filter((m) => !validSeq(m.seq));
-    for (const m of unnumbered) {
-      if (m.seq === undefined) continue;
-      // A value that isn't a number is named by its type: it could be
-      // any size.
-      const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
-      console.error(
-        `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
-        `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
-      );
-    }
-    const ordered = [...kept.filter((m) => validSeq(m.seq)).sort((a, b) => (a.seq as number) - (b.seq as number)), ...unnumbered];
-    // Exactly-once: a message that landed before its ack was written is
-    // already in the store under its deferredWriteId — do not replay it.
-    // The scan covers every slot the interrupted batch could occupy (from
-    // the receipt's per-agent position), or the whole store when the
-    // receipt predates the position field.
     let landed: Set<string>;
     try {
-      landed = this.landedDeferredWriteIds(new Set(ordered.map((m) => m.id)), scanFrom);
+      landed = this.landedDeferredWriteIds(new Set(queue.entries.map((m) => m.id)), queue.scanFrom);
     } catch (error) {
       throw new Error(
         `the deferred context writes (${file ?? DEFERRED_WRITES_ID}) can't be checked for writes that already landed: ` +
@@ -8749,59 +8118,146 @@ export class AgentFramework {
         { cause: error },
       );
     }
-    // An entry a version before the audience stamp (#291) queued carries
-    // none: the stamp is written when a write is queued (addMessage), and
-    // that version wrote none. The tool boundary's, a turn start's and a
-    // released window's flushes store an entry with the metadata it was
-    // queued with, straight into the store, so unstamped here it would be
-    // stored unstamped after the upgrade, and read as a row stored before
-    // it. It is stamped as addMessage stamps a write it queues
-    // (defaultAudience): for nobody when it carries a tune-out's hold,
-    // since no resident is shown it (inboundAudience); for the agent it is
-    // queued for; and, when it names none, as a write that named no agent,
-    // for the agents that take untargeted inbound in its delivery agent's
-    // slot (untargetedAudience). That version, as this one, queued a write
-    // that named an agent, the primary included, naming it, so an entry
-    // that names none was a write that named none. The entry doesn't say
-    // who stored it, so it isn't taken for anyone's own row: a puppeted
-    // pair that version queued is stamped as for its agent. An entry that
-    // has a stamp keeps it, and so does one with no agent to be for, on a
-    // host with none, where addMessage stores nothing. The queue's next
-    // write carries the stamps; until then each boot stamps the same
-    // entries the same way.
-    const stamped = (m: (typeof ordered)[number]): typeof m => {
-      if (audienceOf(m.metadata)) return m;
-      const audience = this.defaultAudience(m.forAgent, m.metadata as MessageMetadata | undefined);
-      return audience === undefined ? m : { ...m, metadata: withAudience(m.metadata, audience) };
+    const primary = this.primaryAgentName;
+    // Agents whose writes stop here: what is left for them stays queued.
+    const cut = new Set<string>();
+    const kept: PersistedDeferredWrite[] = [];
+    const keep = (entry: PersistedDeferredWrite): void => {
+      kept.push(entry);
+      outcome.keptForNextBoot++;
     };
-    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({ ...stamped(m), seq: i + 1 }));
-    this.deferredSeq = Math.max(this.deferredSeq, restored.length);
-    if (landed.size > 0) {
-      console.error(
-        `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
-        `(interrupted flush) — skipped, not replayed`,
-      );
-    }
-    this.deferredMessages.push(...restored);
-    this.deferredWritesPersisted = true;
-    // A tune-out release that was still deferred at the crash owes the
-    // resident the wake its cancel requested (#232 gap 6).
-    for (const m of restored) {
-      if ((m.metadata as { kind?: unknown } | undefined)?.kind !== 'tune-out-cancel') continue;
-      const target = m.forAgent ?? this.primaryAgentName;
-      if (target) {
-        this.pendingRequests.push({ agentName: target, reason: 'tune-out released (restored)', source: 'tune-out', timestamp: Date.now() });
+    for (const entry of queue.entries) {
+      if (landed.has(entry.id)) {
+        outcome.alreadyLanded++;
+        continue;
+      }
+      // Where it goes: its agent while registered (none named is the
+      // primary), or, for an agent gone, the primary's notice in its place.
+      const gone = entry.forAgent !== undefined && !this.agents.has(entry.forAgent);
+      const notice = gone && passesToPrimary(entry.metadata) ? this.noticeForPrimary(entry.forAgent!, entry.metadata, entry) : null;
+      if (gone && !notice) {
+        outcome.dropped++;
+        console.error(
+          `[host-mode] a context write an earlier version queued for ${entry.forAgent}, which is no longer registered, ` +
+            `was dropped: ${describeDeferredWrite(entry)}`,
+        );
+        continue;
+      }
+      const target = this.deliveryAgent(notice ? undefined : entry.forAgent);
+      if (!target) {
+        outcome.dropped++;
+        console.error(`[host-mode] a context write an earlier version queued has no agent to be stored for, and was dropped: ${describeDeferredWrite(entry)}`);
+        continue;
+      }
+      if (cut.has(target.name)) {
+        keep(entry);
+        continue;
+      }
+      if (entry.landing === 'unknown') {
+        const found = this.landedCopiesById(target, entry.id);
+        if (found === undefined) {
+          console.error(
+            `[host-mode] a context write an earlier version queued may already be stored in ${target.name}'s store, ` +
+              `which can't be searched to tell, so it and what follows it for ${target.name} stay queued for the next ` +
+              `boot: ${describeDeferredWrite(entry)}`,
+          );
+          cut.add(target.name);
+          keep(entry);
+          continue;
+        }
+        if (found.length > 0) {
+          outcome.alreadyLanded++;
+          this.releaseLandedMail(entry.metadata, target.name);
+          continue;
+        }
+      }
+      const write = notice
+        ? { participant: notice.participant, content: notice.content, metadata: notice.metadata }
+        : {
+          participant: entry.participant,
+          content: entry.content,
+          // A release before the audience stamp queued none: addMessage
+          // stamps it as any write, but a tool-block pair, the puppet's
+          // round, is its agent's own.
+          metadata: !audienceOf(entry.metadata) && isToolBlockEntry(entry)
+            ? asOwnRow(entry.metadata, target.name)
+            : entry.metadata,
+        };
+      let id: MessageId;
+      try {
+        id = this.addMessage(write.participant, write.content, write.metadata, {
+          imported: { writeId: entry.id },
+          ...(!notice && entry.forAgent !== undefined ? { forAgent: entry.forAgent } : {}),
+          ...(notice && primary ? { audience: [primary] } : {}),
+        });
+      } catch (error) {
+        if (error instanceof MalformedContentError) {
+          outcome.dropped++;
+          console.error(`[host-mode] a context write an earlier version queued was refused as malformed, and dropped: ${describeDeferredWrite(entry)}: ${thrownText(error)}`);
+          continue;
+        }
+        console.error(
+          `[host-mode] a context write an earlier version queued could not be stored, so it and what follows it for ` +
+            `${target.name} stay queued for the next boot: ${describeDeferredWrite(entry)}:`,
+          error,
+        );
+        cut.add(target.name);
+        keep(entry);
+        continue;
+      }
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-import' });
+      if (notice) outcome.passedToPrimary++;
+      else outcome.imported++;
+      if ((entry.metadata as { kind?: unknown } | undefined)?.kind === 'tune-out-cancel') {
+        this.pendingRequests.push({ agentName: target.name, reason: 'tune-out released (restored)', source: 'tune-out', timestamp: Date.now() });
       }
     }
-    // Rewrite the durable queue without the already-landed entries so a
-    // second interrupted boot does not re-scan them, without the malformed
-    // and repeated ones, and with a seq for each entry that came without a
-    // valid one, so the next boot doesn't name it again. The numbers given
-    // here aren't a reason to rewrite it: every write of the queue writes
-    // it whole, with them, and a boot before that numbers the same entries
-    // the same way.
-    if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || unnumbered.length > 0) this.persistDeferredWrites();
-    return restored.length;
+    if (outcome.alreadyLanded > 0) {
+      console.error(`[host-mode] ${outcome.alreadyLanded} context write(s) an earlier version left queued had already landed, and were skipped`);
+    }
+    if (outcome.passedToPrimary > 0) {
+      console.error(`[host-mode] ${outcome.passedToPrimary} notice(s) queued for an agent that has ended were passed to the primary`);
+    }
+    // What was stored reaches the disk before the record forgets it.
+    try {
+      this.store.sync();
+    } catch (error) {
+      const reason = thrownText(error);
+      this.importLeftQueued = kept;
+      console.error(`[host-mode] the store did not sync after the deferred-write import, so ${file ?? DEFERRED_WRITES_ID} is left as it was; the next boot skips the writes that landed:`, error);
+      this.opsAlert('deferred-import', 'framework',
+        `the store did not sync after importing an earlier version's deferred writes, so their record is left as it was: ${reason}`,
+        { data: { record: file ?? DEFERRED_WRITES_ID } });
+      return outcome;
+    }
+    this.importLeftQueued = kept;
+    this.writeImportedRecord(file, kept);
+    return outcome;
+  }
+
+  /**
+   * Write the deferred-write record the importer read once it is done:
+   * empty, or holding the writes it left for the next boot, in their order.
+   * The file where it was read from the file, else the store's slot. A
+   * write that fails is logged and alerted: the next boot imports the
+   * record again, and skips what landed by its id.
+   */
+  private writeImportedRecord(file: string | undefined, kept: PersistedDeferredWrite[]): void {
+    try {
+      if (file) {
+        this.writeRecoveryFile(file, kept.length > 0 ? { version: 2, pending: kept } : { version: 1, pending: [] });
+      } else {
+        this.store.setStateJson(DEFERRED_WRITES_ID, kept.length > 0 ? { version: 2, pending: kept } : []);
+        this.store.sync();
+      }
+    } catch (error) {
+      const record = file ?? DEFERRED_WRITES_ID;
+      const reason = thrownText(error);
+      console.error(`[host-mode] the deferred-write record ${record} could not be cleared after its import; the next boot reads it again and skips what landed:`, error);
+      this.opsAlert('deferred-import', 'framework',
+        `the deferred-write record ${record} could not be cleared after its import: ${reason}`,
+        { data: { record } });
+    }
   }
 
   /**
@@ -8971,12 +8427,12 @@ export class AgentFramework {
     // What a start would store (storeInjections) is appended after the
     // compile, as the start would have stored it before its compile, and
     // what it would skip, being in view already, isn't placed. While the
-    // window is held, the start would have compile() place what it would
+    // host is quiesced, the start would have compile() place what it would
     // store, and so does the preview. Nothing is stored: a preview writes no
     // row. Its stand-in rows aren't weighed against the budget, as stored
     // rows are at the next compile.
     const plan = this.planInjectionStores(agent, injections);
-    const held = plan !== undefined && this.slotHeldFrom(agent);
+    const held = plan !== undefined && this.quiesced;
     const placed = new Set(plan ? (held ? [...plan.leftAt, ...plan.rows.map((row) => row.at)] : plan.leftAt) : []);
     return capture(await agent.buildActivationRequest(
       tools, plan ? (injections ?? []).filter((_, at) => placed.has(at)) : injections, opts?.budget, presentation?.available ?? tools, {
@@ -10541,7 +9997,7 @@ export class AgentFramework {
       });
       return false;
     }
-    const placement: { agent?: string; messageId?: MessageId; deferredId?: string } = {};
+    const placement: { agent?: string; messageId?: MessageId } = {};
     this.addMessage(
       // The sender's own name: its words stay its own.
       mail.from.agent,
@@ -10566,9 +10022,10 @@ export class AgentFramework {
       { forAgent: mail.to, placement },
     );
     if (!placement.messageId) {
-      // Queued for the recipient's next boundary. `mail-delivered` fires
-      // when the message actually enters its store (releaseLandedMail):
-      // published is not delivered.
+      // Held behind a live surgery, in memory (surgeryHeldWrites), to be
+      // stored at its release. `mail-delivered` fires when the message
+      // actually enters its store (releaseLandedMail): published is not
+      // delivered.
       this.emitTrace({
         type: 'dendrite:mail-deferred',
         mailId: mail.id,
@@ -10999,13 +10456,14 @@ export class AgentFramework {
           continue;
         }
       }
-      // A write the restored deferred queue still holds for this mail lands
-      // at the next flush and releases it then (releaseLandedMail); a second
-      // delivery here would put it in the window twice under one mail id. A
-      // queued copy for another recipient is not that write, as a stored one
-      // isn't: it neither lands for this recipient nor releases the mail.
-      const queued = this.deferredMessages.some((m) => isMailCopyFor(m.metadata, mail));
-      if (queued) continue;
+      // A write an earlier release queued for this mail, which the importer
+      // stored, was released as it was stored (releaseLandedMail), and one
+      // whose release missed its sync is found above. One the importer left
+      // queued for the next boot (importLeftQueued) lands then and releases
+      // the mail then; a second delivery here would put it in the window
+      // twice under one mail id. A copy for another recipient is not that
+      // write, as a stored one isn't.
+      if (this.importLeftQueued.some((m) => isMailCopyFor(m.metadata, mail))) continue;
       this.attemptMailDelivery(mail);
     }
   }
@@ -11327,15 +10785,11 @@ export class AgentFramework {
       }
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
-        // What is still queued for the run, such as a message held for its
-        // turn's end, is left to its window's release below
-        // (releaseWindowNowOrAfterResume), as for a disposed fork: it lands
-        // there in the run's store, which keeps the run's namespace for
-        // investigation, now or, while quiesced, at resume. A failed reply, or
-        // a channel notice the run could act on, among it goes on to the
-        // primary as the same queue entry, so no ack comes between the entry
-        // and the primary's notice, unless the run read the copy of it that
-        // landed in its window.
+        // What the run's store holds that it never read is left to its
+        // window's release below (releaseWindowNowOrAfterResume), as for a
+        // disposed fork: a failed reply, or a channel notice the run could
+        // act on, goes on to the primary, now or, while quiesced, at resume.
+        // The run's store keeps its namespace for investigation.
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched. A fork's
@@ -12309,20 +11763,12 @@ export class AgentFramework {
     if (params.command === 'quiesce') {
       // quiesce() clamps timeoutMs to [1s, 10m] itself — one clamp for every ingress.
       console.error(`[host-command] quiesce by=${requester} (server=${serverId})`);
-      try {
-        const hostMode = await this.quiesce({
-          reason: params.reason ?? `host/command by ${requester}`,
-          ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-          ...(params.abandon ? { abandon: true } : {}),
-        });
-        return { ok: true, hostMode };
-      } catch (error) {
-        // A refusal, as resume()'s is below: the host's mode is as it was.
-        if (error instanceof QuiesceBlockedError) {
-          return { ok: false, error: error.message, hostMode: this.getHostModeStatus() };
-        }
-        throw error;
-      }
+      const hostMode = await this.quiesce({
+        reason: params.reason ?? `host/command by ${requester}`,
+        ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+        ...(params.abandon ? { abandon: true } : {}),
+      });
+      return { ok: true, hostMode };
     }
     if (params.command === 'resume') {
       console.error(`[host-command] resume by=${requester} (server=${serverId})`);
@@ -12999,27 +12445,21 @@ export class AgentFramework {
   }
 
   /**
-   * Undo the last inference turn for an agent.
-   *
-   * Creates a new branch at the Chronicle sequence recorded before that turn
-   * and switches to it, atomically rolling back all state (messages, context
-   * log, inference log, MCPL checkpoints).
-   *
-   * The undone branch is saved so `redo()` can restore it.
-   * Returns the checkpoint that was undone, or null if nothing to undo.
-   *
-   * With the presentation index (FrameworkConfig.presentationIndex), for an
-   * agent whose window is presented, an undo is the window's alone (#291,
+   * Undo the last inference turn for an agent, on its window (#291,
    * decision 4): the rows the turn's checkpoint saw enter the window after
    * it leave it, the agent's own as undone and others' as arrived and not
    * yet presented, which its next start presents again. Nothing is written
    * to the record and no branch moves, so `fromBranch` and `toBranch` are
    * both the store's branch, `window` says how many rows left, and a
-   * `window:undone` trace is emitted instead of `undo:completed`. The
-   * record, the workspace and `_config` mounts, MCPL checkpoints and the
-   * inference log are left as they are: rollbackToMessage is the
-   * record-level revert. It is refused while a turn of the agent's is
-   * alive, and allowed while another agent's is.
+   * `window:undone` trace is emitted. The record, the workspace and
+   * `_config` mounts, MCPL checkpoints and the inference log are left as
+   * they are: rollbackToMessage is the record-level revert. `redo()` puts
+   * the rows back. It is refused while a turn of the agent's is alive, and
+   * allowed while another agent's is, and refused for an agent whose window
+   * isn't presented (its write-down failed when it was registered), which
+   * has no window of its own to undo on.
+   *
+   * Returns `{ undone: false }` when there is nothing to undo.
    */
   undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
@@ -13052,57 +12492,14 @@ export class AgentFramework {
     if (this.surgeryHold) {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
-    if (this.presents(agent)) return this.undoOnWindow(agent, requester);
-
-    const checkpoints = this.getTurnCheckpoints(agentName);
-    if (checkpoints.length === 0) {
-      return { undone: false };
+    if (!this.presents(agent)) {
+      throw new OperatorActionError('failed', `Cannot undo: ${agentName}'s window isn't presented (its write-down failed when it was registered), so it has no window to undo on; rollbackToMessage reverts the record`);
     }
-
-    const checkpoint = checkpoints.pop()!;
-    this.saveTurnCheckpoints(agentName, checkpoints);
-
-    const currentBranch = this.store.currentBranch();
-    const undoBranchName = this.newOperatorBranchName(`undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`);
-
-    this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
-    this.store.switchBranch(undoBranchName);
-
-    this.materializeConfigMountAfterBranchSwitch();
-
-    // Push onto redo stack
-    let redoStack = this.redoStacks.get(agentName);
-    if (!redoStack) {
-      redoStack = [];
-      this.redoStacks.set(agentName, redoStack);
-    }
-    redoStack.push({ branchName: currentBranch.name, checkpoint });
-
-    this.emitTrace({
-      type: 'undo:completed',
-      agentName,
-      turnIndex: checkpoint.turnIndex,
-      fromBranch: currentBranch.name,
-      toBranch: undoBranchName,
-    });
-    this.recordOperatorAction({
-      kind: 'undo-turn',
-      agent: agentName,
-      ...(requester ? { requester } : {}),
-      params: { turnIndex: checkpoint.turnIndex },
-      result: { sourceBranch: currentBranch.name, targetBranch: undoBranchName },
-    });
-
-    return {
-      undone: true,
-      turnIndex: checkpoint.turnIndex,
-      fromBranch: currentBranch.name,
-      toBranch: undoBranchName,
-    };
+    return this.undoOnWindow(agent, requester);
   }
 
   /**
-   * An undo on the window (undoLastTurn, with the presentation index): the
+   * An undo on the window (undoLastTurn): the
    * agent's newest checkpoint's tail of its window, the rows at the index
    * length it recorded and after (checkpointLength), leaves it. The agent's
    * own rows leave as undone, so no presentation point presents them again
@@ -13196,7 +12593,7 @@ export class AgentFramework {
    * the undo took out enter it again, in their window order, but for one
    * the store no longer holds. The checkpoint goes back.
    */
-  private redoOnWindow(agent: Agent, entry: RedoEntry & { window: NonNullable<RedoEntry['window']> }, requester?: OperatorRequester): {
+  private redoOnWindow(agent: Agent, entry: RedoEntry, requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
@@ -13226,16 +12623,11 @@ export class AgentFramework {
   }
 
   /**
-   * Redo a previously undone turn for an agent.
-   *
-   * Switches back to the branch that was active before the last undo.
-   * Returns false if there's nothing to redo.
-   *
-   * An undo on the window (undoLastTurn, with the presentation index) is
-   * redone on the window: no branch moves, the rows presented since the
-   * undo leave the window, and the rows it took out enter it again, in
-   * their order, with `window` saying how many of each and a
-   * `window:undone` trace in place of `redo:completed`.
+   * Redo a previously undone turn for an agent, on its window (undoLastTurn):
+   * no branch moves, the rows presented since the undo leave the window,
+   * and the rows it took out enter it again, in their order, with `window`
+   * saying how many of each and a `window:undone` trace. Returns
+   * `{ redone: false }` if there's nothing to redo.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
@@ -13261,48 +12653,15 @@ export class AgentFramework {
       return { redone: false };
     }
     const top = redoStack[redoStack.length - 1]!;
-    if (top.window) {
-      if (!this.presents(agent)) {
-        throw new OperatorActionError('failed', `Cannot redo: ${agentName}'s undo was on its window, which isn't presented now`);
-      }
-      if (this.hasTurn(agentName) || this.turnAlive(agent)) {
-        throw new OperatorActionError('agent-busy', `Cannot redo: a turn of ${agentName}'s is alive`);
-      }
-      const result = this.redoOnWindow(agent, top as RedoEntry & { window: NonNullable<RedoEntry['window']> }, requester);
-      redoStack.pop();
-      return result;
+    if (!this.presents(agent)) {
+      throw new OperatorActionError('failed', `Cannot redo: ${agentName}'s undo was on its window, which isn't presented now`);
     }
-
-    const { branchName, checkpoint } = redoStack.pop()!;
-    const currentBranch = this.store.currentBranch();
-
-    this.store.switchBranch(branchName);
-
-    this.materializeConfigMountAfterBranchSwitch();
-
-    // Restore the checkpoint
-    const checkpoints = this.getTurnCheckpoints(agentName);
-    checkpoints.push(checkpoint);
-    this.saveTurnCheckpoints(agentName, checkpoints);
-
-    this.emitTrace({
-      type: 'redo:completed',
-      agentName,
-      fromBranch: currentBranch.name,
-      toBranch: branchName,
-    });
-    this.recordOperatorAction({
-      kind: 'redo-turn',
-      agent: agentName,
-      ...(requester ? { requester } : {}),
-      result: { sourceBranch: currentBranch.name, targetBranch: branchName },
-    });
-
-    return {
-      redone: true,
-      fromBranch: currentBranch.name,
-      toBranch: branchName,
-    };
+    if (this.hasTurn(agentName) || this.turnAlive(agent)) {
+      throw new OperatorActionError('agent-busy', `Cannot redo: a turn of ${agentName}'s is alive`);
+    }
+    const result = this.redoOnWindow(agent, top, requester);
+    redoStack.pop();
+    return result;
   }
 
   // ---------------------------------------------------------------------------
@@ -13377,9 +12736,11 @@ export class AgentFramework {
    * Passing the gate RESERVES the store for the caller: a turn token is
    * held for every agent until the returned release runs, so no wake — via
    * the scheduler or a parked provider admission, both of which re-test
-   * turn-alive — can start a turn while the switch is awaited. Release also
-   * flushes messages that deferred behind the reservation, as the puppet
-   * does. Always release in `finally`: a token nobody clears wedges the fleet.
+   * turn-alive — can start a turn while the switch is awaited, and every
+   * write made meanwhile is held in memory (surgeryHeldWrites). Release
+   * stores what the hold kept, in arrival order, and presents each reserved
+   * agent what it is owed, as at a turn's end. Always release in `finally`:
+   * a token nobody clears wedges the fleet.
    */
   private reserveStoreForSurgery(verb: string, agentName: string): () => void {
     if (this.surgeryHold) {
@@ -13442,20 +12803,11 @@ export class AgentFramework {
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
-      // Writers that deferred behind the reservation land now, on the branch
-      // the operator chose (or the restored source) — the same end-of-turn
-      // flush driveStream/puppet perform, under the same guard — for every
-      // agent free to take them, in queue order (writeDrainedInOrder).
-      if (this.deferredMessages.length > 0) {
-        const free = [...reserved.keys()]
-          .filter((name) => !this.activeTurnTokens.has(name) && !this.pendingAssistantBlocks.has(name));
-        this.readdDrained(free.flatMap((name) => this.drainDeferredFor(name)), 'post-surgery flush');
-        this.ackDeferredWrites();
-      }
-      // With the presentation index, what the hold kept in memory is
-      // replayed through the ordinary write path, in arrival order, so each
-      // idle reader takes it as it is stored; then each agent the hold
-      // reserved is presented what it is owed, as at a turn's end.
+      // What the hold kept in memory is replayed through the ordinary write
+      // path, in arrival order, on the branch the operator chose (or the
+      // restored source), so each idle reader takes it as it is stored; then
+      // each agent the hold reserved is presented what it is owed, as at a
+      // turn's end.
       this.releaseSurgeryHeldWrites();
       for (const name of reserved.keys()) this.presentAtEndOf(this.agents.get(name));
     };
@@ -14523,9 +13875,7 @@ export class AgentFramework {
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     // Reads the shared slot through its merged view: its bound counts toward
-    // a cancel's dump (residentMessageChars), and while its window is the
-    // record its live turn holds the framework's own rows for the slot
-    // (sharedSlotBusy), which a presented window doesn't need.
+    // a cancel's dump (residentMessageChars).
     this.sharedSlotAgents.add(agent);
     // An attention tenant of the resident it serves: reads the shared slot
     // through its merged view (held traffic included), never a broadcast
@@ -14629,9 +13979,7 @@ export class AgentFramework {
 
     void (async () => {
       try {
-        // The queued messages are rows of the backlog a framing reads, after
-        // the stored ones, so any framing that shows `backlog` shows them.
-        const backlog = [...invocation.backlog, ...this.queuedReaderRows(primary, invocation.queued)];
+        const backlog = invocation.backlog;
         const content = (cfg.framing ?? defaultReaderFraming)({
           resident: primary,
           fork: name,
@@ -14642,7 +13990,6 @@ export class AgentFramework {
           notice: invocation.notice,
           dispositions: invocation.dispositions,
           backlog,
-          queuedCount: invocation.queued.length,
         });
         const fork = await this.deriveAgent({
           name,
@@ -14681,15 +14028,13 @@ export class AgentFramework {
           metadata: { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger },
         });
         // The held rows the framing hands the fork are presented to it
-        // (#291, AF-5): with the presentation index they enter its window
-        // when its run takes it on, after its framing row, and it holds them
-        // while it lives (presentedToAnyone), so no module or coalescer takes
-        // out a row a reader was handed. Its view filter, the residents' it
-        // inherits, keeps them out of its compiles, where the framing shows
-        // them. A row still queued behind a quiesce or a surgery, named by
-        // its held handle, is stored later, and isn't handed this way.
+        // (#291, AF-5): they enter its window when its run takes it on, after
+        // its framing row, and it holds them while it lives
+        // (presentedToAnyone), so no module or coalescer takes out a row a
+        // reader was handed. Its view filter, the residents' it inherits,
+        // keeps them out of its compiles, where the framing shows them.
         this.presentation?.noteFramed(fork.agent, backlog
-          .filter((m) => heldWriteId(m.id) === undefined && heldFromResidents(m.metadata as Record<string, unknown> | undefined))
+          .filter((m) => heldFromResidents(m.metadata as Record<string, unknown> | undefined))
           .map((m) => m.id));
         this.emitTrace({
           type: 'tune-out:reader-fork',
@@ -14698,8 +14043,7 @@ export class AgentFramework {
           channelId: invocation.channelId,
           epochId: invocation.epochId,
           trigger: invocation.trigger,
-          held: invocation.backlog.length + invocation.queued.length,
-          queued: invocation.queued.length,
+          held: invocation.backlog.length,
         });
         const outcome = await this.runEphemeralToCompletion(fork.agent, fork.contextManager);
         // The report is the fork's whole job. A reader that ends in prose
@@ -14747,26 +14091,6 @@ export class AgentFramework {
     })();
   }
 
-  /**
-   * Held messages still queued behind the resident's turn, as rows of a
-   * reader fork's backlog: each named by its held handle, as module rows name
-   * it until it lands (heldRows), at a provisional sequence past the
-   * resident's last stored message, and timed when it was first held.
-   */
-  private queuedReaderRows(primary: string, queued: QueuedHeldMessage[]): StoredMessage[] {
-    if (queued.length === 0) return [];
-    const cm = this.agents.get(primary)!.getContextManager();
-    const count = cm.getMessageCount();
-    const last = count > 0 ? cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-    return queued.map((m, i) => ({
-      id: heldHandle(m.writeId),
-      sequence: last + 1 + i,
-      participant: m.participant,
-      content: m.content,
-      metadata: m.metadata as MessageMetadata | undefined,
-      timestamp: new Date(m.heldAt ?? Date.now()),
-    }));
-  }
 
   /** A reader fork's own words to the resident: attributed mail when it has a route, else under its name. */
   private deliverFromReader(reader: string, content: ContentBlock[], metadata: Record<string, unknown>): void {
@@ -15006,129 +14330,61 @@ export class AgentFramework {
           );
           const resultsId = agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
-          // Flush any messages that were deferred while this turn was in
-          // flight: this agent's own entries, those addressed to it and, for
-          // the primary, those addressed to no one (module messages, push
-          // events, subagent return notifications).
-          //
-          // Hear-while-acting: messages flushed into THIS agent's own window
-          // are also collected for mid-turn injection — passed to the membrane
-          // with the tool results below, so the NEXT inference round of the
-          // live turn sees them instead of the agent staying deaf until the
-          // turn ends. The window stores them here, right after the
-          // tool_result message, which is exactly where the membrane appends
-          // them in the live conversation — same participant, and neither
-          // carries the row's metadata — and each goes in as the next compile
-          // will send it, which the strategy renders (renderForInjection): cut
-          // by the per-message cap, a sharded body joined, and its images as
-          // the image limits leave them at the newest position. So the next
-          // turn's compiled prefix matches the live request (prompt-cache
-          // safe), up to what came after them: a later message can still
-          // take an earlier one past an image limit, as for any message, and
-          // the next compile then strips that image where the live rounds
-          // carried it. One the render gives null goes in as stored (see the
-          // boundary's null below). A write that threw after it was stored,
-          // whose readback can't say whether it landed, is looked up by its
-          // id here, and carried here, where it landed. One that can be
-          // neither read back nor looked up is the exception, a known limit:
-          // it waits, marked, and the flush that later finds it counts it
-          // where it was stored, ahead of what was stored since without it.
-          // There the store and the live request differ, and a reply stored
-          // after it whose request didn't carry it was made without it. On
-          // an account where the provider enforces that binding, a later
-          // request replaying that reply's signed thinking is refused with a
-          // 400 (context-manager #155). It's injected at the boundary that
-          // finds it, after what was stored since (writeDrainedInOrder). A
-          // recompile before that boundary, such as a retry, has already
-          // carried it where it was stored, so it's carried twice there, as
-          // in 0.26.0, and a reply made after it meets the same refusal.
-          //
-          // The queue is drained ONLY at the target agent's own boundary:
-          // draining at another agent's boundary would store the messages
-          // mid-turn in the target's window without injecting them into the
-          // target's live stream (deaf agent + window/live divergence). Left
-          // queued, they flush at the target's own next boundary — with
-          // injection — or in driveStream's finally when its turn ends.
-          //
-          // Only what can be injected is drained here. Tool blocks would
-          // corrupt the tool-cycle structure the membrane enforces, and a
-          // message named as the agent itself would render as an ASSISTANT
-          // turn on the wire (an unintended prefill the model would
-          // continue). Stored here without being injected, such a message
-          // would sit in the window before the turn's later replies although
-          // their requests never held it: the divergence above, and a reply
-          // whose signed thinking the provider then refuses, since it binds
-          // thinking to the prefix it was minted under (context-manager
-          // #155). So the drain stops at the first such message, which waits
-          // with everything queued behind it — the queue keeps its order —
-          // for the turn-end flush, where no reply follows it in this stream.
-          //
-          // A message a tune-out holds from the residents is drained and
-          // stored like any other, but not injected: every resident's
-          // viewFilter leaves it out of the next compile as well, so the
-          // window's compiled prefix and the live request still match without
-          // it (#232 gap 5).
-          //
-          // A stream that declares it can't carry injected messages
-          // (supportsInjectedMessages false: membrane's XML prefill path,
-          // from membrane 0.6.0) gets none, so nothing is drained here.
-          // Everything queued for the agent waits for the turn-end flush, as
-          // a held message does, rather than sitting in the window between
-          // rounds the stream never showed it.
-          //
-          // With the presentation index (#291) nothing is queued: what arrived
-          // for the agent during the round is stored already, and out of its
+          // Hear-while-acting (#291's presentation index): what arrived for
+          // the agent during the round is stored already, and out of its
           // window. Here its window takes the round's rows (its reply, its
           // results and the clock below, each presented as it was stored),
           // then, unless the host is quiesced or the stream can't carry
           // injected messages, its arrivals as a prefix cut at the first that
-          // can't join a live stream, by the same rule as the drain's, each
-          // body whole (presentAtBoundary). Those are what it hears, rendered
-          // after they are presented, since a render places only what the
-          // window holds. What the cut kept out waits for the turn's end. A
-          // held message is no resident's arrival, so it is never presented
-          // to one, nor heard. The mail a message carries was released, and
-          // the other residents weighed it, when it was stored.
+          // can't join a live stream, each body whole (presentAtBoundary).
+          // Those are what it hears: passed to the membrane with the tool
+          // results below, so the NEXT inference round of the live turn sees
+          // them instead of the agent staying deaf until the turn ends. The
+          // window holds them right after the tool_result message, which is
+          // exactly where the membrane appends them in the live conversation,
+          // and each goes in as the next compile will send it, which the
+          // strategy renders (renderForInjection), after they are presented,
+          // since a render places only what the window holds. So the next
+          // turn's compiled prefix matches the live request (prompt-cache
+          // safe), up to what came after them: a later message can still
+          // take an earlier one past an image limit, as for any message, and
+          // the next compile then strips that image where the live rounds
+          // carried it.
+          //
+          // The cut: tool blocks would corrupt the tool-cycle structure the
+          // membrane enforces, and a message named as the agent itself would
+          // render as an ASSISTANT turn on the wire (an unintended prefill the
+          // model would continue). Presented here without being heard, such a
+          // message would sit in the window before the turn's later replies
+          // although their requests never held it, and a reply whose signed
+          // thinking the provider then refuses, since it binds thinking to
+          // the prefix it was minted under (context-manager #155). So the
+          // boundary stops at the first such message, which waits with what
+          // arrived after it for the turn's end, where no reply follows it in
+          // this stream.
+          //
+          // A held message is no resident's arrival, so it is never presented
+          // to one, nor heard (#232 gap 5). The mail a message carries was
+          // released when it was stored. A stream that declares it can't carry
+          // injected messages (supportsInjectedMessages false: membrane's XML
+          // prefill path, from membrane 0.6.0) hears nothing: what arrived
+          // waits for the turn's end. A quiesce freezes the boundary too: it
+          // presents nothing of others' until the quiesce lifts.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
-          // What this boundary stored or presented for the agent to hear, in
-          // order, for a boundary that leaves it to the turn's next start as
-          // arrivals: that start's compile sends it.
+          // What this boundary presented for the agent to hear, in order. An
+          // agent whose window isn't presented (its write-down failed at its
+          // registration) hears nothing here: its window is the record.
           const heard: Array<{ id: MessageId; participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           const presentsWindow = this.presents(agent);
           const injects = currentState.supportsInjectedMessages !== false;
           // A clock row due (storeDueClock) goes right after the round's
-          // results, ahead of what is drained below, and joins the stream
+          // results, ahead of the arrivals presented below, and joins the stream
           // the same way. A boundary that passed during the round can't
           // stand between a tool's call and its results, so this clock
           // reads the time it's written (clock-rows.ts).
           const clock = injects ? this.storeDueClock(agent, 'tool-boundary') : undefined;
           if (presentsWindow) {
             heard.push(...this.presentation!.presentAtBoundary(agent, [replyId, resultsId, clock?.id], { injects }).heard);
-          } else if (injects) {
-            const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent));
-            // Stored in queue order, cut at the first that can't be stored: it
-            // and what follows wait for the turn's end, and only what was
-            // stored is injected (the round's results go on either way). One
-            // the store refuses as malformed is dropped instead, and what
-            // follows goes on. What was stored is injected as the next compile
-            // will send it (renderForInjection). Where the strategy can't say,
-            // a sharded body read back from its store is injected as later
-            // compiles join it, and a write that threw after storing, which
-            // counts as stored, as what landed of it (writeDrainedInOrder).
-            const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
-              agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
-            for (const [msg, { id, content }] of stored) {
-              this.releaseLandedMail(msg.metadata, agent.name);
-              // Every other resident reads what this boundary stores; for its
-              // own agent, the boundary weighs what it injects below.
-              this.noteForOtherResidents(agent, msg.metadata, id);
-              // A held message is stored (the reader has it) and filtered
-              // from the resident's view (admission's predicate); injecting it
-              // here would put in the live turn what the next compile hides
-              // (#232 gap 5).
-              if (heldFromResidents(msg.metadata as Record<string, unknown> | undefined)) continue;
-              heard.push({ id, participant: msg.participant, content, ...(msg.metadata ? { metadata: msg.metadata } : {}) });
-            }
           }
           if (injects) {
             // Rendered in one call: a render prepares as a compile does, so
@@ -15156,15 +14412,12 @@ export class AgentFramework {
             // compile sends it in more than one piece.
             // That rests on two things. The only view filter this framework
             // gives a store is the tune-out stamp (createAgent's; the other
-            // stores it opens have none), and a stamped message is skipped
-            // above, so no null here means a message the view hides. And the
-            // store and the render run with nothing between them, so nothing
-            // can put a summary in place of what this flush stored, or move
-            // windowed passthrough's anchor past it, before the render. A
-            // write found here that landed at an earlier flush
-            // (writeDrainedInOrder) is the exception: by now a summary may
-            // stand in for it, or the anchor be past it, and then it goes in
-            // where the next compile doesn't send it.
+            // stores it opens have none), and a stamped message is never
+            // heard, so no null here means a message the view hides. And the
+            // presentation and the render run with nothing between them, so
+            // nothing can put a summary in place of what this boundary
+            // presented, or move windowed passthrough's anchor past it, before
+            // the render.
             // Another agent's row goes in as the agent's compiles send it
             // (Agent.injectedAsSent: the subconscious is sent a resident's
             // rows without their thinking, #291).
@@ -15179,10 +14432,6 @@ export class AgentFramework {
               });
             });
           }
-
-          // Deferred writes handed to the store above: sync, then drop them
-          // from the durable recovery queue (no-op unless one is persisted).
-          this.ackDeferredWrites();
 
           // A newly injected CONVERSATIONAL message begins a new
           // conversational round inside the same provider inference. Remember
@@ -15486,9 +14735,9 @@ export class AgentFramework {
             // or not, since there a doubt counts as shown.
             // The mark is the store's head, a scalar, as a compile's is: it
             // also covers what was stored since the compile without being
-            // carried, such as another slot's messages, and a write that
-            // bypassed deferral into this slot (a fresh tool_result, a
-            // routed channel message). That over-cover can't be left out.
+            // carried, such as another slot's messages, and a write stored
+            // into this slot since (a fresh tool_result, a routed channel
+            // message). That over-cover can't be left out.
             // Under a context manager's thinking-binding record
             // (`thinkingBinding.binds`), such a write sits in the next
             // compile where the stream's notes named other rows, so the
@@ -15575,9 +14824,8 @@ export class AgentFramework {
     // apply. process:completed and the process log list the responses that
     // passed that check, so a view built on them doesn't show a refused
     // response's messages as the event's. A response that throws as it
-    // applies, such as at an edit of a held write while its store can't be
-    // searched (refuseUnsettled), a shard the store refuses when a
-    // strategy's chunking makes one, or any store error, stops there: what
+    // applies, such as at a shard the store refuses when a strategy's
+    // chunking makes one, or any store error, stops there: what
     // it asked for before the throw stays applied, the operation that threw
     // may have taken effect in part or whole, and the rest of it isn't.
     // A line names the module and where it threw, and process:completed and
@@ -15955,8 +15203,9 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.registry.homeChannel(target.name) !== undefined) {
         metadata.triggered = event.triggerInference ?? false;
-        // A fork's channel messages are stored past its deferral; a clock goes
-        // ahead of one only while the fork has no turn alive (storeDueClock).
+        // A fork's channel messages are stored straight into its store; a
+        // clock goes ahead of one only while the fork has no turn alive
+        // (storeDueClock).
         if (!this.turnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
@@ -16026,7 +15275,7 @@ export class AgentFramework {
     // The row is for the recipients admission delivered it to, and for none
     // of them when a tune-out holds it (inboundAudience).
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
-      placement, bypassDeferralFor: event.assemblingFor, audience: AgentFramework.inboundAudience(decision),
+      placement, audience: AgentFramework.inboundAudience(decision),
     });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
     if (decision.locus) this.noteDeliveredOrPark(event);
@@ -16509,9 +15758,9 @@ export class AgentFramework {
    */
   private sweepExpiredConversations(): void {
     if (!this.conversationRouter) return;
-    // With the presentation index no write reaches a store while a
-    // surgery holds it: the sweep waits for the release.
-    if (this.presentation && this.surgeryHold) return;
+    // No write reaches a store while a surgery holds it: the sweep waits for
+    // the release.
+    if (this.surgeryHold) return;
     const now = Date.now();
     if (now - this.lastConversationSweep < 60_000) return;
     this.lastConversationSweep = now;
@@ -17491,38 +16740,11 @@ export class AgentFramework {
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
   }
 
-  /**
-   * A placement in the deferred queue is upgraded in place once the flush has
-   * stored it: the stored copy carries `metadata.deferredWriteId` (landedRow),
-   * and it is taken only while the agent's consumed watermark doesn't cover
-   * it, so a copy the agent has read, or one a mark can't say of (no mark,
-   * or one on another branch), stays unresolved and reads as read.
-   */
-  private resolvePlacement(p: CoalescingPlacement): void {
-    if (!p.deferredId || this.deferredMessages.some((m) => m.id === p.deferredId)) return;
-    const agent = this.agents.get(p.agent);
-    if (!agent) return;
-    const cm = agent.getContextManager();
-    let row: StoredMessage | null;
-    try {
-      row = this.landedRow(cm, p.deferredId);
-    } catch {
-      return;
-    }
-    if (!row || covers(agent.getConsumedWatermark(), cm, row) !== 'not-covered') return;
-    p.messageId = row.id;
-    delete p.deferredId;
-  }
-
   /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
-   *  shown watermark, never possibly shown (its isUnshown). A placement still
-   *  in the deferred queue is both, once settled (settleUnknownLandings): one
-   *  whose write may already be stored, its store unsearchable, is a doubt,
-   *  which counts as read and as shown. */
+   *  shown watermark, never possibly shown (its isUnshown). A placement with
+   *  no stored row, a write a surgery's hold keeps in memory, counts as read
+   *  and as shown: it can't be found again once it is stored. */
   private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
-    if (p.deferredId) this.settleUnknownLandings((m) => m.id === p.deferredId);
-    this.resolvePlacement(p);
-    if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId && m.landing !== 'unknown');
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
     return !!agent && this.isUnreadStoredMessage(agent, p.messageId, by);
@@ -17596,7 +16818,7 @@ export class AgentFramework {
    * The live agents whose presented window holds a row (the presentation
    * index's holders, #291, leaving out a window that is still the whole
    * record): each one's own place for it, or a reader fork's framing.
-   * None while the index is off, or when it can't be read.
+   * None on a framework built without the index, or when it can't be read.
    */
   private windowHolders(messageId: MessageId): Agent[] {
     if (!this.presentation) return [];
@@ -17611,40 +16833,29 @@ export class AgentFramework {
     }
   }
 
-  /** Whether any live agent's presented window holds a row, or a reader
-   *  fork was handed it as framing (the presentation index's
-   *  presentedToAnyone, #291): false while the index is off, and true when
-   *  it can't be read, so a row that may be in a window isn't removed. */
-  private presentedToAnyone(messageId: MessageId): boolean {
-    if (!this.presentation) return false;
-    try {
-      return this.presentation.presentedToAnyone(messageId);
-    } catch (err) {
-      console.error(`[presentation] could not read whether a window holds ${messageId}, so it stays:`, err);
-      return true;
-    }
+  /** Whether a reader fork was handed a row as framing (the presentation
+   *  index's noteFramed, #291, AF-5): its framing row carries the row's
+   *  text, so the row is read whatever its marks say. False on a framework
+   *  built without the index. */
+  private framedToAReader(messageId: MessageId): boolean {
+    return this.presentation?.framedToAny(messageId) ?? false;
   }
 
   private removePlacement(p: CoalescingPlacement): boolean {
-    // Settled first, so a write that landed is removed as the stored
-    // placement it is; one still a doubt, its store unsearchable, isn't
-    // removed, since it may already be stored.
-    if (p.deferredId) this.settleUnknownLandings((m) => m.id === p.deferredId);
-    this.resolvePlacement(p);
-    if (p.deferredId) {
-      const held = this.deferredMessages.find((m) => m.id === p.deferredId);
-      if (!held || held.landing === 'unknown') return false;
-      this.deferredMessages = this.deferredMessages.filter((m) => m !== held);
-      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-      return true;
-    }
+    // A placement with no stored row (a write a surgery's hold keeps) can't
+    // be removed: it is stored at the hold's release.
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
-    // A row a presented window holds stays (#291): a window only grows, and
-    // the agent it was presented to may have had it in a request whatever
-    // its mark says. The coalescer then places the newer occurrence after it.
-    if (this.presentedToAnyone(p.messageId as MessageId)) return false;
+    // The coalescer removes only what no reader has read (isUnread: the
+    // consumed watermark of every agent whose slot or presented window holds
+    // the row, #291), so a row presented to a window and never consumed there
+    // is taken back as one never presented is, and leaves every window that
+    // held it with the record (context-manager's removal): no request that
+    // carried it was answered, so no later request's prefix needs it. A row
+    // a reader fork was handed as framing stays (AF-5), and the coalescer
+    // places the newer occurrence after it.
+    if (this.framedToAReader(p.messageId as MessageId)) return false;
     try {
       removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
@@ -17794,7 +17005,7 @@ export class AgentFramework {
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
-        placement, bypassDeferralFor: event.assemblingFor, audience: AgentFramework.inboundAudience(decision),
+        placement, audience: AgentFramework.inboundAudience(decision),
       });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
@@ -18075,7 +17286,7 @@ export class AgentFramework {
       // or if a turn is alive at all (activeTurnTokens): the state machine
       // goes idle at endTurn's reset while driveStream teardown is still
       // pending, and a successor turn dequeued in that gap compiles while the
-      // predecessor's deferred flush can still write (2026-07-31 Mythos).
+      // predecessor's teardown can still present rows (2026-07-31 Mythos).
       // Turn-alive spans dequeue → settled teardown; wakes wait it out.
       //
       // EXCEPT a context-budget restart: it CONTINUES the turn whose token is
@@ -18125,9 +17336,8 @@ export class AgentFramework {
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
-          // and a wake for a deferred write is dropped once the agent is
-          // done with that write: neither may absorb an unrelated wake that
-          // would vanish with it.
+          // and a wake that reads a row is its row's (readsRow): neither may
+          // absorb an unrelated wake that would vanish with it.
           const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
@@ -18202,12 +17412,11 @@ export class AgentFramework {
       }
 
       // A wake whose sole cause was a row not presented to this agent at its
-      // write, deferred for it or stored during its turn (readsRow), has
-      // nothing left to do once a request that carried that row was
-      // answered and, if the wake carries a channel and isn't marked
-      // ambient, the agent has published there since, or once the row is
-      // gone from the queue and the store's current branch: it starts no
-      // turn (rowDone). A wake is marked
+      // write, stored during its turn (readsRow), has nothing left to do
+      // once a request that carried that row was answered and, if the wake
+      // carries a channel and isn't marked ambient, the agent has published
+      // there since, or once the row is gone from the store's current
+      // branch: it starts no turn (rowDone). A wake is marked
       // ambient when its message's server tagged it chat:ambient, or for a
       // render, every notice the render stands for: such a message asked
       // nothing of the agent, so reading it was all its wake was for. One
@@ -18264,13 +17473,6 @@ export class AgentFramework {
         this.giveBackAutoContinue(agentName, 'a resumed turn took its wake');
         continuationMark = undefined;
       }
-      // Its row goes into the residents' shared slot, which no write may
-      // enter while another reader's turn is alive (as for a clock row): the
-      // continuation waits until that turn has ended.
-      if (continuationMark && this.sharedSlotBusy(agent)) {
-        this.pendingRequests.push(...requests);
-        continue;
-      }
 
       // Start streaming inference (non-blocking — driveStream runs in background)
       // The request that grants the turn-alive exception must also define the
@@ -18279,6 +17481,27 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      // A start that resumes its logical turn presents no arrival (#291: a
+      // budget restart's or a guard retry's compile presents the agent's own
+      // rows alone). While arrivals wait outside the agent's window, a wake
+      // of its own in that start's batch, such as one for a message stored
+      // while the continuation was on its way, would go with a turn that
+      // never shows the agent what it may be for. Such a wake waits behind
+      // the turn instead, as a wake queued while a turn streams does: the
+      // arrivals enter the window as the turn ends, and the wake then starts
+      // a turn that reads them, or is dropped if its row was read first
+      // (rowDone). Another continuation of the turn, and an autoContinue
+      // wake, which the resumed turn takes in (below), stay in the batch.
+      if (resumesLogicalTurn(trigger.reason) && this.presents(agent)
+        && this.presentation!.arrivalsOf(agent).length > 0) {
+        const waits = requests.filter((r) => r !== trigger && !continuesTurn(r) && !carriesContinuation(r));
+        if (waits.length > 0) {
+          const kept = requests.filter((r) => !waits.includes(r));
+          requests.length = 0;
+          requests.push(...kept);
+          this.pendingRequests.push(...waits);
+        }
+      }
       // The bounce-wake cap (bounceProse) stops a bounce → wake → bounce loop
       // that nothing else feeds. A turn with a cause of its own is not that
       // loop, so the count starts again. Otherwise only a delivered prose
@@ -18450,8 +17673,8 @@ export class AgentFramework {
    * Stamps for the rows the agent's reply stores in its current turn: its
    * assistant responses, its tool_result rows (through `storeResults`), and
    * the contained-wrapper row that stands in for a response. The turn's other
-   * stores (a delivery receipt, a routing notice, a deferred flush) aren't the
-   * reply's, and carry none.
+   * stores (a delivery receipt, a routing notice) aren't the reply's, and
+   * carry none.
    * - A silent heartbeat tick stamps each of them for the whole turn, with the
    *   separator text its request rendered. The stamps keep every row of the
    *   tick identifiable after the turn, for a later retention policy to find
@@ -18784,22 +18007,14 @@ export class AgentFramework {
    * noticed rather than named again: its notice landed after its turn ended,
    * as a bounce does when a delivery runs after a tool ends an explicit turn.
    * It reads only the recent history (draftsNamedInHistory), so its notice
-   * claims no more than that. Left out are the open logical turn's own
-   * drafts, which its receipt names and its settlement records
-   * (settleTurnDrafts), and drafts a notice still waiting in the deferred
-   * queue names.
+   * claims no more than that, a notice stored and not yet presented to the
+   * agent among it, which its next start presents. Left out are the open
+   * logical turn's own drafts, which its receipt names and its settlement
+   * records (settleTurnDrafts).
    */
   private noticeUnnoticedDrafts(agent: Agent): void {
     const cm = agent.getContextManager();
     const leftOut = new Set(this.openLogical.get(agent.name)?.drafts.map((d) => d.id));
-    // A queued notice still waiting names its drafts; one whose write landed
-    // is settled first, so its drafts are judged by its stored row.
-    this.settleUnknownLandings((m) => this.deliveryAgent(m.forAgent) === agent);
-    for (const msg of this.deferredMessages) {
-      const meta = msg.metadata as { draftOwner?: unknown; draftIds?: unknown } | undefined;
-      if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
-      for (const id of meta.draftIds) if (typeof id === 'string') leftOut.add(id);
-    }
     const unnoticed = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null)
       .filter((d) => !leftOut.has(d.id));
     if (unnoticed.length === 0) return;
@@ -19568,10 +18783,13 @@ export class AgentFramework {
   }
 
   /**
-   * Whether the presentation index presents for `agent` (#291): the flag
-   * on, the agent taken on, and its context in presented mode. Every
-   * flag-on path asks this, so a host without the flag, or an agent whose
-   * window stays in legacy mode, keeps the path it had.
+   * Whether the presentation index presents for `agent` (#291): the agent
+   * taken on, and its context in presented mode. Every registered agent is
+   * taken on; one whose window couldn't be written down (another version's
+   * index format, or a failed write) stays in legacy mode for this process,
+   * its window the whole record, and the paths that ask this pass it by:
+   * nothing is presented for it, its tool boundaries hear nothing, and
+   * undo refuses it.
    */
   private presents(agent: Agent | undefined): boolean {
     return !!agent && !!this.presentation?.presenting(agent);
@@ -19644,8 +18862,8 @@ export class AgentFramework {
   }
 
   /**
-   * An agent's turn's end, or a moment its turn may have ended, with the
-   * flag on: what it is owed is presented (presentation.presentAtEnd),
+   * An agent's turn's end, or a moment its turn may have ended: what it is
+   * owed is presented (presentation.presentAtEnd),
    * unless its logical turn is still alive (a token, a continuation or
    * retry on its way, a stream, a tool cycle), whose own points present
    * it. Idempotent; nothing for an agent the index doesn't present for.
@@ -19656,16 +18874,16 @@ export class AgentFramework {
 
   /**
    * A channel message stored straight into a fork's own store, past
-   * addMessage's deferral, as the fork writes are (a correction
+   * addMessage, as the fork writes are (a correction
    * handleMcplChannelIncoming delivers, a message routeConversationIncoming
-   * routes), stamped for the fork alone. With the flag on, while a surgery
-   * holds the store it is held in memory instead (surgeryHeldWrites) and ''
-   * returned; stored, it enters the fork's window at once when no turn of
-   * the fork's is alive, else at the fork's next point (afterStore).
+   * routes), stamped for the fork alone. While a surgery holds the store it
+   * is held in memory instead (surgeryHeldWrites) and '' returned; stored,
+   * it enters the fork's window at once when no turn of the fork's is
+   * alive, else at the fork's next point (afterStore).
    */
   private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata): MessageId {
     const presents = this.presents(target);
-    if (presents && this.surgeryHold) {
+    if (this.surgeryHold) {
       this.surgeryHeldWrites.push({ participant: 'user', content, metadata, direct: { agentName: target.name }, heldAt: Date.now() });
       return '' as MessageId;
     }
@@ -19743,12 +18961,9 @@ export class AgentFramework {
    * the request that follows or before every request still to come, so the
    * window and the live stream keep matching.
    *
-   * None while the host is quiesced (the window is frozen for surgery), and
-   * none in the residents' shared slot while another of its readers (the
-   * subconscious among them, through its merged view) has a turn alive: the
-   * row would sit inside that turn without joining its stream. A reader the
-   * presentation index presents for doesn't count (sharedSlotBusy): the row
-   * is the agent's own, in no window but its own. A clock that
+   * None while the host is quiesced (the window is frozen for surgery). In
+   * the residents' shared slot another reader's turn doesn't matter (#291):
+   * the row is the agent's own, in no window but its own. A clock that
    * can't be planned or stored is logged and skipped: it never holds up what
    * it would have preceded. One whose write threw after it landed is the
    * window's all the same, so it's returned, and a tool boundary injects it.
@@ -19758,7 +18973,7 @@ export class AgentFramework {
     occasion: 'event' | 'turn-start' | 'tool-boundary',
   ): { id: MessageId; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
     const config = agent.clock;
-    if (!config || this.slotHeldFrom(agent)) return undefined;
+    if (!config || this.quiesced) return undefined;
     let planned: ReturnType<typeof planClock>;
     try {
       planned = planClock({ now: Date.now(), ...this.lastClockOf(agent), config, zone: this.timeZone });
@@ -19777,7 +18992,7 @@ export class AgentFramework {
     } catch (err) {
       // A write can throw after its row landed, as when context-manager's own
       // propagation of it fails: what landed is read back from where the
-      // store stood before, as writeDrainedInOrder reads a drained write's.
+      // store stood before (storedSince).
       const at = planned.stamp.at;
       const landed = before === undefined
         ? undefined
@@ -19801,10 +19016,9 @@ export class AgentFramework {
    * that couldn't be stored (stored-injections.ts, #155 part 5). Which are
    * stored, and which skipped, is planInjectionStores'.
    *
-   * Nothing is stored while the window is held (slotHeldFrom: the host is
-   * quiesced, or another reader of the residents' shared slot has a turn
-   * alive, as for a clock row): `compile()` places what the plan would have
-   * stored, and what it skips, being in view already, isn't placed again.
+   * Nothing is stored while the host is quiesced, as for a clock row:
+   * `compile()` places what the plan would have stored, and what it skips,
+   * being in view already, isn't placed again.
    * Rows are written in the order gathered. A row whose write throws is
    * placed by `compile()` instead, with every row after it, unless the
    * read-back shows it landed; where the read-back fails, a row whose write
@@ -19816,7 +19030,7 @@ export class AgentFramework {
     if (!plan) return injections;
     // By position, as the plan is: what compile() places, in the order given.
     const placed = new Set<number>(plan.leftAt);
-    if (this.slotHeldFrom(agent)) {
+    if (this.quiesced) {
       for (const row of plan.rows) placed.add(row.at);
     } else {
       const before = this.storedCountOf(agent);
@@ -19928,18 +19142,6 @@ export class AgentFramework {
     };
   }
 
-  /**
-   * Whether a write the framework makes into `agent`'s window of its own
-   * accord (a clock row, a batched wake's line) waits: while the host is
-   * quiesced, or, for a reader of the residents' shared slot (the
-   * subconscious, which reads it through a merged view, included), while
-   * another reader of it that the presentation index doesn't present for
-   * has a turn alive, where it would land inside that turn.
-   */
-  private slotHeldFrom(agent: Agent): boolean {
-    return this.quiesced || this.sharedSlotBusy(agent);
-  }
-
   /** Rows isNewestIn reads back past clock rows and stored injections. */
   private static readonly NEWEST_SCAN_ROWS = 32;
 
@@ -20012,22 +19214,6 @@ export class AgentFramework {
    */
   private isOrdinaryResident(agent: Agent): boolean {
     return sameSlot(this.registry.ownSlotOf(agent.name), RESIDENTS_SLOT);
-  }
-
-  /**
-   * Weigh a message just stored in an ordinary resident's store for every
-   * other ordinary resident's open turn, running or not: residents read one
-   * message slot, and a tool boundary weighs only the messages drained for
-   * its own agent, so no boundary of another resident's turn weighs it.
-   */
-  private noteForOtherResidents(agent: Agent, metadata: MessageMetadata | undefined, messageId: MessageId): void {
-    if (!this.isOrdinaryResident(agent)) return;
-    for (const name of this.registry.slotOwners(RESIDENTS_SLOT)) {
-      const reader = this.agents.get(name);
-      // One the presentation index presents for weighs it as it enters its
-      // window, at its own boundary among them (noteStored).
-      if (reader && reader !== agent && !this.presents(reader)) this.noteArrival(reader.name, metadata, messageId);
-    }
   }
 
   /**
@@ -20205,13 +19391,12 @@ export class AgentFramework {
    * can't be written is logged, and the rest are still written. A reader's
    * notice that says the primary was told comes after the primary's, and is
    * written in its `untold` words where the primary's write failed, so it
-   * never says the primary was told of a notice that wasn't written. A write
-   * addMessage defers to the primary's next boundary, as it does any write
-   * to an agent mid-turn, counts as written: a memory-only queue loses it at
-   * exit, as it loses any deferred write. Through
-   * framework.addMessage for mid-turn safety (deferral + hear-while-acting
-   * injection): an open a delivery forces happens inside a live turn, and a
-   * direct context-manager append there would store the notice out of order.
+   * never says the primary was told of a notice that wasn't written. A
+   * write is stored at once (#291), and one for an agent mid-turn enters its
+   * window at its next point (its tool boundary hears it, or its turn's end
+   * presents it). Through framework.addMessage, so a notice an open forces
+   * inside a live turn is stored and presented as any write is, rather than
+   * appended to the context manager straight.
    */
   private writeChannelNotices(notices: readonly ChannelNotice[], what: string, writer: string): void {
     let allWritten = true;
@@ -20729,18 +19914,6 @@ export class AgentFramework {
     this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
     console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
     return true;
-  }
-
-  /** Whether another reader of the residents' shared slot has a turn alive,
-   *  so no row may be written there now (as storeDueClock checks). A reader
-   *  the presentation index presents for doesn't count (#291): what is
-   *  stored during its turn stays out of its window until its next point. */
-  private sharedSlotBusy(agent: Agent): boolean {
-    if (!this.sharedSlotAgents.has(agent)) return false;
-    for (const reader of this.sharedSlotAgents) {
-      if (reader !== agent && !this.presents(reader) && this.turnAlive(reader)) return true;
-    }
-    return false;
   }
 
   /** A continuation whose turn doesn't run: the run's count goes back to
@@ -21654,10 +20827,11 @@ export class AgentFramework {
       }
     }
     // Mark the turn alive before ANYTHING awaits (hooks, compile, stream
-    // setup): from here until this turn's teardown, cross-turn writers defer
-    // (addMessage guard) instead of appending — nothing may enter the window
-    // between a turn's dequeue and its settle except the turn's own blocks,
-    // and, before its checkpoint, the inputs its start writes (flushForStart).
+    // setup): from here until this turn's teardown, what other writers store
+    // stays out of the agent's window (#291's presentation index) — nothing
+    // may enter the window between a turn's dequeue and its settle except the
+    // turn's own blocks, the arrivals its tool boundaries present, and,
+    // before its checkpoint, the inputs its start presents (presentAtStart).
     // A retry re-enters with a fresh token; teardown clears token-matched.
     //
     // The try/finally is the leak-proofing: a token whose owner never clears
@@ -21720,22 +20894,10 @@ export class AgentFramework {
         this.activeTurnTriggers.delete(agent.name);
       }
       if (!tokenHandedOff && ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
-      // A start that ends before its stream exists lands what was deferred
-      // during it, as a stream's teardown does. Left queued, those messages
-      // would land only at the agent's next start, after any stored meanwhile.
-      // In queue order and cut at the first that can't be stored, as every
-      // flush is (readdDrained), so a store failure neither lands the
-      // messages behind it out of order nor replaces the start's own error.
-      // One refused as malformed is dropped, not cut at.
-      // Gated on this agent's own tool cycle, as the turn-end flush is.
-      if (!tokenHandedOff && !this.activeTurnTokens.has(agent.name)
-        && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
-        this.readdDrained(this.drainDeferredFor(agent.name), 'failed-start flush');
-        this.ackDeferredWrites();
-      }
-      // With the presentation index, the start's end is its turn's: what
-      // arrived during it enters its window, unless its turn lives on (a
-      // retry on its way).
+      // A start that ends before its stream exists is its turn's end: what
+      // arrived during it enters its window, as at a stream's teardown,
+      // unless its turn lives on (a retry on its way). Left out, it would
+      // enter only at the agent's next start.
       if (!tokenHandedOff) this.presentAtEndOf(agent);
     }
   }
@@ -21837,12 +20999,8 @@ export class AgentFramework {
       if (routing) this.endDroppedTurn(agentName, routing);
       this.eventGate?.onInferenceEnded(agentName);
     }
-    if (!this.activeTurnTokens.has(agentName) && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agentName)) {
-      this.readdDrained(this.drainDeferredFor(agentName), 'continuation-drop flush');
-      this.ackDeferredWrites();
-    }
-    // With the presentation index, the turn's end; a frame that still holds
-    // its token presents at its own end instead.
+    // The turn's end; a frame that still holds its token presents at its
+    // own end instead.
     this.presentAtEndOf(this.agents.get(agentName));
   }
 
@@ -21986,55 +21144,35 @@ export class AgentFramework {
     const lifecycle = this.lifecycleGeneration;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
-    // Flush messages deferred during the PREVIOUS turn — before the
-    // checkpoint, the locus announcement, and the compile — so a turn started
-    // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
-    // Mythos: a DM's wake fired a turn whose compile ran before the deferred
-    // DM flushed; the model saw only the routing-shift notice, reasonably
+    // The turn's inputs enter its window here (#291's presentation index),
+    // before the checkpoint, the locus announcement, and the compile, so a
+    // turn started by a wake actually CONTAINS the message that woke it.
+    // (2026-07-31 Mythos: a DM's wake fired a turn whose compile ran before
+    // the DM landed; the model saw only the routing-shift notice, reasonably
     // skipped, and the DM then landed before the skip in the window — false
-    // "saw it and ignored it" history plus KV divergence. Flushed here, the
+    // "saw it and ignored it" history plus KV divergence. Presented here, the
     // payload rides its own wake, and the notice/payload can never split.)
-    // This agent's own entries: those addressed to it, and, for the primary,
-    // those addressed to no one (the same target rule as the tool-boundary
-    // flush). Fresh turns only: a context-budget restart continues the same logical
-    // turn, and flushing there would insert messages between its rounds.
+    // Fresh turns only: a context-budget restart continues the same logical
+    // turn, and presenting there would insert messages between its rounds.
     // Before recordTurnCheckpoint: these are the turn's inputs, not its
-    // products — undoing the turn must not destroy them.
+    // products — undoing the turn must not take them out.
     // A clock row due (storeDueClock) goes ahead of the turn's inputs, so a
     // turn starts with a current clock, a silent heartbeat's tick (which
     // stores no row of its own) included, unless storeDueClock writes none:
-    // while the host is quiesced, while another reader of the residents'
-    // shared slot has a turn alive, or when its write fails without landing.
+    // while the host is quiesced, or when its write fails without landing.
     // Then a later event, turn start or tool boundary takes it. Fresh turns
-    // only, as the flush below: a turn that resumes continues its logical
-    // turn, which took its clock at its start or at a tool boundary that
-    // could carry one.
+    // only: a turn that resumes continues its logical turn, which took its
+    // clock at its start or at a tool boundary that could carry one.
     if (attempt === 0 && !resumesTurn) this.storeDueClock(agent, 'turn-start');
-    if (
-      attempt === 0 &&
-      !resumesTurn &&
-      this.deferredMessages.length > 0
-    ) {
-      // One poison message, or a transient store-write failure, must not
-      // abort the turn or drop the messages behind it in the queue: the
-      // drain cuts there, and it and what follows stay queued, in order
-      // (writeDrainedInOrder). A message the store refuses as malformed,
-      // which it would at every flush, is dropped instead, and what follows
-      // goes on.
-      this.flushForStart(agent, 'turn-start');
-    }
-    // With the presentation index (#291) the turn's inputs are stored as they
-    // arrive, and enter its window here, before its checkpoint: its own rows
-    // not in it yet and its arrivals, in the order they were stored (a queue
-    // a flag-off run left is written first, above). Each arrival is weighed
-    // for the turn as the flush weighed what it stored (adoptPresentation).
-    // Fresh starts only, as the flush: a resumed turn takes in no new input
-    // but at its tool boundaries.
+    // Its own rows not in its window yet and its arrivals, in the order they
+    // were stored. Each arrival is weighed for the turn as it enters
+    // (adoptPresentation).
     if (attempt === 0 && !resumesTurn && this.presents(agent)) this.presentation!.presentAtStart(agent, 'turn-start');
 
     // RFC-006 §5: deferred batches for this agent render now, at the assembly
-    // boundary — after the deferred flush (same window: turn alive, compile
-    // not yet run) and before the checkpoint (they are the turn's inputs).
+    // boundary — after the turn-start presentation (same window: turn alive,
+    // compile not yet run) and before the checkpoint (they are the turn's
+    // inputs).
     // Not on a context-budget restart: that continues the same logical turn.
     // A turn whose only causes are deferred batches assembles even when no
     // batch is pending: its batch may have been withdrawn after its wake was
@@ -22048,7 +21186,8 @@ export class AgentFramework {
       assembled = true;
       // An assembly that throws can leave renders it started running: their
       // deliveries come after this window closes, as ordinary writes during
-      // the turn (addMessage's bypassDeferralFor counts only within it).
+      // the turn (what is stored for the agent within it is presented
+      // before its compile, presentAtStart's 'assembly').
       this.assembling.add(agent.name);
       try {
         assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects);
@@ -22063,7 +21202,7 @@ export class AgentFramework {
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
     // render-start that could not be made durable, whose batch then waits for
     // its recovery wake; a batch whose audience doesn't include the agent; a
-    // render placed in another agent's deferred queue; a batch another
+    // render placed where another agent's turn doesn't read it; a batch another
     // assembly froze, or one withdrawn, displaced or consumed by another
     // request before this assembly), has nothing new to show: running it would
     // wake the model to `[Continue]` or an older message, an uncaused wake.
@@ -22076,31 +21215,21 @@ export class AgentFramework {
       && batchSubjects.every((s) => assembly.settled.has(s))) {
       console.error(`[coalescing] ${agent.name}: its deferred batches gave this turn nothing to read; turn not started (no wake cause left)`);
       this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: agent.name, subjects: batchSubjects });
-      // Release the turn and land anything deferred while assembly awaited
-      // the render, as a torn-down turn would.
+      // Release the turn; what arrived while the assembly awaited the render
+      // enters its window, as at a torn-down turn's end.
       if (this.activeTurnTokens.get(agent.name) === turnToken) {
         this.activeTurnTokens.delete(agent.name);
         this.activeTurnTriggers.delete(agent.name);
       }
-      if (!this.activeTurnTokens.has(agent.name)
-        && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
-        this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
-        this.ackDeferredWrites();
-      }
-      // With the presentation index, the turn's end: what it is owed now.
       this.presentAtEndOf(agent);
       return false;
     }
-    // What was deferred for this agent while its assembly awaited renders is
-    // among this turn's inputs, before its checkpoint, so it lands in this
-    // request, in order, as a turn-start flush a moment later would have
-    // written it: among it, a render this assembly joined that another
-    // agent's assembly placed in this agent's queue (freeze's `joined`,
-    // vector 25). Not once the host is quiesced, when it waits for resume().
-    if (assembled && !this.quiesced && this.deferredMessages.length > 0) this.flushForStart(agent, 'assembly');
-    // With the presentation index, what the assembly stored for this start,
-    // and what arrived for it meanwhile, enters its window now, as the
-    // flush stored it. Not while quiesced, when others' rows are frozen.
+    // What the assembly stored for this start, and what arrived for it while
+    // the assembly awaited renders, is among this turn's inputs: it enters
+    // its window now, before its checkpoint, so it is in this request, in
+    // the order it was stored: among it, a render this assembly joined that
+    // another agent's assembly placed for this agent (freeze's `joined`,
+    // vector 25). Not while quiesced, when others' rows are frozen.
     if (assembled && !this.quiesced && this.presents(agent)) this.presentation!.presentAtStart(agent, 'assembly');
 
     // The batched-wake lines the gate left to this start (WakeLine), decided
@@ -22128,20 +21257,13 @@ export class AgentFramework {
       const mark = trigger.autoContinueRun;
       const { autoContinueRun: _mark, ...unmarked } = trigger;
       trigger = unmarked;
-      // Another reader's turn may have started since the scheduler checked.
-      const busy = this.sharedSlotBusy(agent);
-      if (busy || !this.writeAutoContinueNotice(agent, mark)) {
-        this.giveBackAutoContinue(agent.name, busy ? "another resident's turn is alive in the shared slot" : 'its row could not be stored');
+      if (!this.writeAutoContinueNotice(agent, mark)) {
+        this.giveBackAutoContinue(agent.name, 'its row could not be stored');
         if (mark.sole) {
           console.error(`[continue] ${agent.name}: turn not started (the continuation was its only cause)`);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
-          }
-          if (!this.activeTurnTokens.has(agent.name)
-            && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
-            this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
-            this.ackDeferredWrites();
           }
           this.presentAtEndOf(agent);
           return false;
@@ -24993,41 +24115,24 @@ export class AgentFramework {
       }
 
       // The turn is torn down — release the turn-alive marker BEFORE the
-      // deferred flush below, so the flush appends at the settled tail.
+      // presentation below, so it presents at the settled tail.
       // Token-matched: if a successor turn already owns the agent (endTurn
       // reset the state machine before this finally ran — the 2026-07-31
-      // interleave), leave its marker alone; the guarded addMessage below
-      // then re-defers, and the successor's own turn-start flush / boundary
-      // injection / teardown delivers the messages at a correct position.
+      // interleave), leave its marker alone; the successor's own turn-start,
+      // boundary or teardown presents what arrived, at a correct position.
       if (myTurnToken !== undefined && this.activeTurnTokens.get(agent.name) === myTurnToken) {
         this.activeTurnTokens.delete(agent.name);
         this.activeTurnTriggers.delete(agent.name);
       }
 
-      // Flush any deferred messages (e.g. if stream failed while tools were
-      // pending). Only THIS agent's messages: other targets' entries wait
-      // for their own boundaries (re-adding via addMessage re-defers if the
-      // target has meanwhile started a turn). Gated on this agent's own tool
-      // cycle, not every agent's: messages held for this turn's end depend on
-      // this flush, and another agent's pending tools say nothing about this
-      // window. addMessage judges each entry by the same rule, so the drained
-      // prefix is stored in order, or goes back into the queue whole under
-      // its ids when a successor turn has already taken the agent. A fork or
-      // run deregistered while the host is quiesced leaves its queue to its
-      // window's release at resume (drainDeferredFor).
-      // A frame that handed its turn to a continuation since dropped
-      // (endContinuedTurn, which couldn't land it while this frame held the
-      // token) lands it too: the turn is over.
+      // The turn's end: what arrived during it, and what its boundaries cut,
+      // enters its window now, in the order it was stored (e.g. if the stream
+      // failed while tools were pending). Keyed on the logical turn
+      // (presentAtEndOf): a successor that holds the token already, or a
+      // continuation on its way, keeps it for its own points. A frame that
+      // handed its turn to a continuation since dropped (endContinuedTurn)
+      // presents too: the turn is over.
       const handedOffTurnOver = preserveEventGateForSuccessor && !this.hasTurn(agent.name);
-      if ((frameReachedTerminal || handedOffTurnOver) && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
-        this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
-        this.ackDeferredWrites();
-      }
-      // With the presentation index, the turn's end: what arrived during it,
-      // and what its boundaries cut, enters its window now, in the order it
-      // was stored. Keyed on the logical turn (presentAtEndOf): a successor
-      // that holds the token already, or a continuation on its way, keeps
-      // it for its own points.
       if (frameReachedTerminal || handedOffTurnOver) this.presentAtEndOf(agent);
 
       // The logical turn has ended and its notices are written: record the
@@ -25222,35 +24327,15 @@ export class AgentFramework {
       // Defensive: no path replaces a live token any more (the provider-
       // admission re-entry re-tests turn-alive and requeues instead), but
       // if one ever does, the side effect has happened and the pair must
-      // still be stored — not under that turn: queue it as a unit for the
-      // next flush (drainDeferredFor keeps order; the tool_result entry is
-      // never split from its tool_use because both ride the same drain).
-      // One exception: a tool_use context-manager refuses as malformed is
-      // dropped at the drain, and the tool_result behind it is then stored
-      // alone (writeDrainedInOrder).
-      // The finally below flushes it itself if that turn is already over.
+      // still be stored — not under that turn: it is stored now, back to
+      // back, and kept out of the window of the turn that replaced the
+      // reservation (present false). That turn's end presents it, as its own
+      // rows not yet in its window, both in one presentation; the finally
+      // below does if that turn is already over.
       ownedToEnd = this.activeTurnTokens.get(agentName) === turnToken;
-      // The pair is the agent's own, queued or not (asOwnRow).
-      if (ownedToEnd) {
-        storeOwnRow(agent, agentName, toolUse);
-        storeOwnRow(agent, 'user', blocks);
-      } else if (this.presents(agent)) {
-        // With the presentation index the pair is stored now, back to back,
-        // and kept out of the window of the turn that replaced the
-        // reservation (present false): that turn's end presents it, as its
-        // own rows not yet in its window, both in one presentation.
-        storeOwnRow(agent, agentName, toolUse, undefined, undefined, false);
-        storeOwnRow(agent, 'user', blocks, undefined, undefined, false);
-      } else {
-        const heldAt = Date.now();
-        this.deferredMessages.push(
-          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, metadata: asOwnRow(undefined, agentName), forAgent: agentName, heldAt },
-          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, metadata: asOwnRow(undefined, agentName), forAgent: agentName, heldAt },
-        );
-        // As addMessage's own deferral does: a crash before the next persist
-        // must not lose the pair from a persisted queue.
-        if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-      }
+      // The pair is the agent's own either way (storeOwnRow).
+      storeOwnRow(agent, agentName, toolUse, undefined, undefined, ownedToEnd);
+      storeOwnRow(agent, 'user', blocks, undefined, undefined, ownedToEnd);
 
       this.emitTrace({
         type: 'puppet:tool-call',
@@ -25259,30 +24344,21 @@ export class AgentFramework {
         toolUseId,
         isError: !!result.isError,
         durationMs,
-        ...(ownedToEnd ? {} : { deferred: true }),
       });
       console.log(
         `[puppet] ${agentName}: ${toolName} → ${result.isError ? 'ERROR' : 'ok'} ` +
-        `in ${durationMs}ms (${toolUseId})${ownedToEnd ? '' : ' — deferred behind a live turn'}`,
+        `in ${durationMs}ms (${toolUseId})${ownedToEnd ? '' : ' — out of the window of the live turn that replaced it'}`,
       );
       return { toolUseId, result: checked.usable ? returned : result };
     } finally {
       if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
-      // Messages deferred while we held the token land now, after the pair
-      // — the same end-of-turn flush driveStream performs, under the same
-      // guard: this agent's own tool cycle. (No wake is requested: the agent
-      // sees the pair, and anything that arrived meanwhile, on its next
-      // turn.) Keyed on "no turn alive", not on token ownership: if a turn
-      // did replace us and has already ended, its flush ran before our pair
-      // was queued — nobody else will flush it, so we do.
-      if (!this.activeTurnTokens.has(agentName)
-        && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agentName)) {
-        this.readdDrained(this.drainDeferredFor(agentName), 'puppet flush');
-        this.ackDeferredWrites();
-      }
-      // With the presentation index, the puppet's end: what arrived while it
-      // held the agent enters the window after the pair, and a pair a turn
-      // that replaced it left unpresented enters at that turn's end.
+      // The puppet's end, as a turn's end: what arrived while it held the
+      // agent enters the window after the pair. (No wake is requested: the
+      // agent sees the pair, and anything that arrived meanwhile, on its
+      // next turn.) Keyed on the logical turn (presentAtEndOf), not on token
+      // ownership: if a turn did replace us and has already ended, the pair
+      // it left unpresented enters now; one still alive presents it at its
+      // own end.
       this.presentAtEndOf(this.agents.get(agentName));
     }
   }
@@ -27283,14 +26359,15 @@ export class AgentFramework {
     // What the caller gave, for a write a surgery's hold keeps (below),
     // which its release replays as it came.
     const given = metadata;
-    // `deferredWriteId` is the framework's: a write from the queue is stored
-    // under its own (withDeferredWriteId), and boot's dedup and a module's
-    // handle (landedRow) find the write by it. Any other write through here
-    // drops one its metadata carries, such as one a module or a process
-    // answer copied from a stored row. The channel writes that go straight to
-    // a conversation fork's store keep their metadata as given: no handle
-    // reads a fork's store, which is isolated.
-    if (!opts?.fromQueue && metadata && 'deferredWriteId' in metadata) {
+    // `deferredWriteId` is the framework's: a write an earlier release left
+    // queued is stored under its own (the importer's `imported`), and a later
+    // boot's dedup and a module's `held:` handle (landedRow) find the write
+    // by it. Any other write through here drops one its metadata carries,
+    // such as one a module or a process answer copied from a stored row. The
+    // channel writes that go straight to a conversation fork's store keep
+    // their metadata as given: no handle reads a fork's store, which is
+    // isolated.
+    if (!opts?.imported && metadata && 'deferredWriteId' in metadata) {
       const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
       metadata = rest as MessageMetadata;
     }
@@ -27298,14 +26375,14 @@ export class AgentFramework {
     // (PRIMARY_IF_UNREAD_KEY), which only addModuleMessage sets: a module's
     // process response, or an event an API module passes on, can't send a
     // write to the primary by carrying it.
-    if (!opts?.fromQueue && !opts?.markedForRun && metadata && PRIMARY_IF_UNREAD_KEY in metadata) {
+    if (!opts?.imported && !opts?.markedForRun && metadata && PRIMARY_IF_UNREAD_KEY in metadata) {
       const { [PRIMARY_IF_UNREAD_KEY]: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
       metadata = rest as MessageMetadata;
     }
     // Content context-manager won't store is refused here, as the store's own
-    // write refuses it, whether this write is stored now or deferred: the
-    // writer learns at once, not from a line at a drain it never sees. Content
-    // the store mends, such as a tool_use whose input isn't an object, passes.
+    // write refuses it, whether this write is stored now or held by a
+    // surgery: the writer learns at once. Content the store mends, such as a
+    // tool_use whose input isn't an object, passes.
     const malformed = malformedContentPlaces(content);
     if (malformed.length > 0) throw new MalformedContentError('Message refused', malformed);
     const agent = this.deliveryAgent(opts?.forAgent);
@@ -27327,20 +26404,20 @@ export class AgentFramework {
     // agent is for the agents that take untargeted inbound in the slot it
     // lands in (untargetedAudience), not for the agent it is delivered to,
     // so the record tells it from a write for the primary. A stamp the
-    // metadata carried is replaced, as a deferredWriteId is, except on a
-    // write from the queue, which carries the stamp it was queued with.
-    if (!(opts?.fromQueue && audienceOf(metadata))) {
+    // metadata carried is replaced, as a deferredWriteId is, except on an
+    // imported write, which carries the stamp it was queued with.
+    if (!(opts?.imported && audienceOf(metadata))) {
       metadata = withAudience(metadata, opts?.audience ?? this.defaultAudience(opts?.forAgent, metadata) ?? [agent.name]);
     }
-    // With the presentation index (#291), a write isn't deferred: it is
-    // stored at once, and each reader's window takes it at that reader's
-    // points (presentation.afterStore below). Only a surgery's hold keeps a
-    // write out of the store while the operator's switch is awaited: it is
-    // held in memory, as given, and its release replays it through here
-    // (releaseSurgeryHeldWrites). It goes in no window and no store before
-    // then, so its placement names only its agent.
-    const presents = this.presents(agent);
-    if (presents && this.surgeryHold && !opts?.fromQueue) {
+    // A write is stored at once (#291): each reader's window takes it at
+    // that reader's points (presentation.afterStore below), so a write
+    // stored while a turn of its agent's is alive stays out of that turn.
+    // Only a surgery's hold keeps a write out of the store while the
+    // operator's switch is awaited: it is held in memory, as given, and its
+    // release replays it through here (releaseSurgeryHeldWrites). It goes in
+    // no window and no store before then, so its placement names only its
+    // agent.
+    if (this.surgeryHold && !opts?.imported) {
       const { placement, ...rest } = opts ?? {};
       this.surgeryHeldWrites.push({
         participant, content,
@@ -27353,146 +26430,52 @@ export class AgentFramework {
     }
 
     // A stamp no reader of the slot can read is a routing fault, traced once
-    // for the write (not again when it comes back from the queue). The row
-    // is stored as named.
-    if (!opts?.fromQueue) this.presentation?.checkAudience(metadata, agent.name);
+    // for the write (not for an imported one, which was traced, if at all,
+    // when it was queued). The row is stored as named.
+    if (!opts?.imported) this.presentation?.checkAudience(metadata, agent.name);
 
-    // Defer non-tool_result messages while a tool cycle is mid-flight
-    // (pendingAssistantBlocks: preserves tool_use → tool_result adjacency)
-    // OR while the target agent has a turn in progress AT ALL. A message
-    // stored mid-turn lands BEFORE the turn's assistant blocks in the window
-    // even though the live conversation never saw it — so the next compile
-    // diverges from the live prefix (prompt-cache bust), the message misses
-    // mid-turn injection, and the window falsely testifies the agent saw it
-    // and moved on. Turn-alive (activeTurnTokens) is the guard, not stream-
-    // alive: a turn exists from dequeue through hooks + compile before its
-    // stream registers in activeStreams, and the 2026-07-31 Mythos incident
-    // was precisely a deferred flush landing inside that compile window.
-    // (activeStreams is kept as a belt-and-suspenders backstop.) Deferred
-    // messages flush at the next turn's START (before its compile — riding
-    // their own wake), at the agent's next tool boundary (where they are
-    // ALSO injected into the live stream — hear-while-acting — all but a
-    // message a tune-out holds from the residents), or in driveStream's
-    // finally when the turn ends.
-    // Quiesce (issue #122): the window exists to run compression/refold
-    // against a FROZEN context — module events and api message.send must not
-    // append mid-surgery. Deferred here, flushed by resume(). tool_result
-    // still lands (a draining turn's continuation depends on it).
-    //
-    // A write coming back from the deferred queue (fromQueue) is
-    // re-deferred whatever its content: its tool_use went back into the
-    // queue just before it, in the same drain, and a tool_result stored
-    // without it would split the pair. (A turn-end flush can run after a
-    // successor turn has taken the agent: the 2026-07-31 interleave.)
-    const freshToolResult = opts?.fromQueue === undefined && content.some(b => b.type === 'tool_result');
-    // One rule for every write, primary-bound or targeted: it waits while ITS
-    // TARGET's own tool cycle is pending (pendingAssistantBlocks is keyed by
-    // agent). Another agent's cycle says nothing about this window. The
-    // default path used to check every agent's cycle (efc7e7af, from when
-    // all agents shared one message store), which held the primary's writes
-    // behind a fork's, subagent's or the subconscious's tools, and judged a
-    // drained queue by two rules, so a later targeted entry could land ahead
-    // of an earlier primary-bound one. Residents that share the un-namespaced
-    // slot with overlapping turns put each other's writes inside the other's
-    // live turn whatever this check does: the limit #286 states.
-    const midToolCycle = this.pendingAssistantBlocks.has(agent.name);
-    // A write assembled for the agent's start lands after what is queued for
-    // the agent: the queue is written first, as the turn-start flush writes it
-    // in the same window, and if a write that failed cut it, this write waits
-    // behind what stays queued (writeDrainedInOrder). While the host is
-    // quiesced, what is queued waits for resume(), so this write waits behind
-    // it. A write from the queue belongs to a drain in progress (stop()'s),
-    // whose entries stay un-acked until it has written them all, so it
-    // doesn't flush: the flush's ack would acknowledge them before they're
-    // stored.
-    const bypasses = opts?.bypassDeferralFor === agent.name &&
-      (opts.fromQueue !== undefined || this.assembling.has(agent.name));
-    const assembledForStart = bypasses && !opts?.fromQueue;
-    const behindQueue = assembledForStart && this.deferredMessages.length > 0 &&
-      (this.quiesced ? this.queuedFor(agent.name) : this.flushForStart(agent, 'assembly'));
-    // Where a write waits for its agent's turn: the rule above, but for a
-    // write the agent's start assembled for itself.
-    const deferralHolds = !freshToolResult && !bypasses &&
-      (this.quiesced || midToolCycle || this.activeTurnTokens.has(agent.name) || this.activeStreams.has(agent.name));
-    // A message a tune-out holds from the residents (heldFromResidents) is
-    // stored at once, whatever its target's turn, flag on or off (#291,
-    // AF-5; P1 on #793). No resident is shown it: the residents' view filter
-    // leaves it out, and the presentation index presents it to no resident,
-    // so stored during a resident's turn it lands inside no request that
-    // resident's turn is shown. Its readers read it from the record, the
-    // subconscious through its view of the residents' slot and a reader fork
-    // from the backlog it is handed, so deferred behind the resident's turn
-    // it was missing from the very reader that is there while the resident
-    // is busy. A quiesce, which freezes what every manager holds while its
-    // folds run, and a surgery's hold still keep it out of the store, as
-    // they keep any write; so does a held write still queued for its target
-    // from one, which it waits behind, so held messages land in the order
-    // they arrived.
-    const heldWrite = opts?.fromQueue === undefined && heldFromResidents(metadata as Record<string, unknown> | undefined)
-      && !this.quiesced && this.surgeryHold === null
-      && !this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name
-        && heldFromResidents(m.metadata as Record<string, unknown> | undefined));
-    // With the flag on only a write from the queue that a surgery's hold
-    // meets goes back to it, under its own id: what a flag-off run left
-    // queued, or stop()'s drain. What the rule above would queue is stored.
-    if (presents ? opts?.fromQueue !== undefined && this.surgeryHold !== null : !freshToolResult && !heldWrite && (behindQueue || deferralHolds)) {
-      // A re-deferral of a drained entry keeps its id and seq, and leaves the
-      // un-acked set: one logical message, one durable identity, one place
-      // in arrival order, whether or not the queue is persisted.
-      const id = opts?.fromQueue?.id ?? randomUUID();
-      if (opts?.fromQueue) {
-        this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
-      }
-      // An entry with no target is the primary's. A write with no target that
-      // went to another agent (on a host with no primary, the first one
-      // registered, such as an ephemeral run) names that agent, so the
-      // agent's flushes and its window's release take the entry as they take
-      // a targeted one.
-      const forAgent = opts?.forAgent ?? (agent.name === this.primaryAgentName ? undefined : agent.name);
-      this.deferredMessages.push({
-        id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent,
-        heldAt: opts?.fromQueue?.heldAt ?? Date.now(),
-      });
-      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-      if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
-      return '' as MessageId; // Deferred — flushed at the target's next boundary
-    }
-
-    // A clock row due goes first (storeDueClock). A write that gets here is a
-    // tool result (which takes none), or no turn of the agent's is alive, or
-    // its turn is assembling before its compile, or it comes from stop()'s
-    // drain, once every stream it could join has settled: the clock is in
-    // whatever request comes next. With the flag on, a write stored while a
-    // turn of the agent's is alive takes none either, as a fork's channel
-    // message doesn't: the clock would sit inside that turn. Its tool
-    // boundary or its next start takes the clock due. So does a held write
-    // stored during a turn with the flag off (heldWrite above): the clock is
-    // the resident's own row, and it would sit inside that turn.
-    const heldMidTurn = heldWrite && deferralHolds;
+    // Where the write would once have waited for its agent's turn, and now
+    // stays out of that agent's window until its next point: while the host
+    // is quiesced, a tool cycle of the agent's is mid-flight, or a turn of
+    // the agent's is alive at all (from dequeue through hooks and compile:
+    // the 2026-07-31 Mythos incident was a write landing inside that compile
+    // window), but for a fresh tool_result (a draining turn's continuation
+    // depends on it) and a write while the agent's start is assembling,
+    // which that start presents before its compile.
+    const freshToolResult = content.some(b => b.type === 'tool_result');
+    const midTurn = !freshToolResult && !this.assembling.has(agent.name) &&
+      (this.quiesced || this.pendingAssistantBlocks.has(agent.name)
+        || this.activeTurnTokens.has(agent.name) || this.activeStreams.has(agent.name));
+    // A clock row due goes first (storeDueClock), when no turn of the agent's
+    // is alive or its turn is assembling before its compile: the clock is in
+    // whatever request comes next. A write stored while a turn of the agent's
+    // is alive takes none, as a fork's channel message doesn't: the clock
+    // would sit inside that turn. Its tool boundary or its next start takes
+    // the clock due.
     if (takesClockBefore(participant, content, metadata, agent.name)
-      && (presents ? !this.turnAlive(agent) || this.assembling.has(agent.name) : !heldMidTurn)) {
+      && (!this.turnAlive(agent) || this.assembling.has(agent.name))) {
       this.storeDueClock(agent, 'event');
     }
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
-      opts?.fromQueue ? withDeferredWriteId(metadata, opts.fromQueue.id) : metadata,
+      opts?.imported ? withDeferredWriteId(metadata, opts.imported.writeId) : metadata,
     );
     if (opts?.placement) {
       opts.placement.agent = agent.name;
       opts.placement.messageId = stored;
-      // Stored where the rule above would have queued it for its agent's
-      // turn: not in that agent's window until the turn's next point, so a
-      // wake for it reads it (readsRowFor), and a render placed for that
-      // turn isn't materialized by it. Never for a write a start assembled
-      // for itself, which its start presents before its compile.
-      if (presents && deferralHolds) opts.placement.presented = false;
+      // Stored mid-turn: not in that agent's window until the turn's next
+      // point, so a wake for it reads it (readsRowFor), and a render placed
+      // for that turn isn't materialized by it. Never for a write a start
+      // assembled for itself, which its start presents before its compile.
+      if (midTurn && this.presents(agent)) opts.placement.presented = false;
     }
     this.releaseLandedMail(metadata, agent.name);
-    this.noteStored(agent, metadata, stored, opts?.bypassDeferralFor);
+    this.noteStored(agent, metadata, stored);
     // Each reader of the row's slot whose turn isn't alive is presented it
-    // now (present at rest); the others at their next point.
-    if (presents) this.presentation!.afterStore(agent, [stored]);
+    // now (present at rest); the others at their next point. An imported
+    // write is presented by the boot's pass after the import (repairAndRest).
+    if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, [stored]);
     return stored;
   }
 
@@ -27500,11 +26483,11 @@ export class AgentFramework {
    * Whether an MCPL event's own stored entry is the newest entry in the window
    * a batched wake's line is written to (deliveryAgent(): the primary's), with
    * no turn alive there (turnAlive: started, streaming, or waiting on its
-   * tools) and nothing waiting to be written (deferred). The gate then hands
-   * the line to the wake (WakeLine) instead of writing it, and the turn's
-   * start decides it (placeWakeLines). A channel message is found by its
-   * server, channel and message id, a push event by its server and event id.
-   * A message a tune-out holds from the residents is never "newest" here.
+   * tools). The gate then hands the line to the wake (WakeLine) instead of
+   * writing it, and the turn's start decides it (placeWakeLines). A channel
+   * message is found by its server, channel and message id, a push event by
+   * its server and event id. A message a tune-out holds from the residents
+   * is never "newest" here.
    */
   private isNewestContextEntry(entry: GateEntryRef): boolean {
     const agent = this.deliveryAgent();
@@ -27512,43 +26495,37 @@ export class AgentFramework {
     // A turn starting, streaming or waiting on its tools writes after the
     // message, and the line says which message the wake is for.
     if (this.turnAlive(agent)) return false;
-    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name)) return false;
     return this.isNewestIn(agent, entry);
   }
 
   /**
    * Write the batched-wake lines the gate left to this turn's start (WakeLine)
-   * into the window they name, the delivery agent's (the residents' shared
-   * slot where it is one), on that agent's own start only. Called by a fresh
-   * start that doesn't resume a logical turn, after the turn's own inputs (a
-   * due clock row, the deferred-write and assembly flushes) and before its
-   * checkpoint, so a line lands after whatever arrived since the gate's
-   * decision, before the notices the turn's start writes itself (the locus
-   * notice among them), and before the agent's answer to the wake.
+   * into the starting agent's own window, as its own rows (#291). Called by
+   * a fresh start that doesn't resume a logical turn, after the turn's own
+   * inputs (a due clock row, and the rows its start presents) and before its
+   * checkpoint, so a line lands after whatever entered the window since the
+   * gate's decision, before the notices the turn's start writes itself (the
+   * locus notice among them), and before the agent's answer to the wake.
    *
-   * - A wake's one line whose event is still the newest entry is left out:
-   *   no message follows the wake's, so it is the wake's whole cause, and the
-   *   start's token defers an arrival into the window past its request. (The
-   *   start's own notices, written after this, aren't messages a reply could
-   *   be meant for.)
-   * - A co-resident's start places nothing. Every resident gets every
-   *   batched wake, so a co-resident writing the line would put it under the
-   *   message, the line #727 left out, or after the delivery agent's answer,
-   *   a wake line for a message already answered. Its request shows what the
-   *   slot holds, as on `main`: a reply after the message is in the message's
-   *   own channel, but a message from another channel that lands between the
-   *   gate's decision and its compile follows the message with no line.
-   *   With the presentation index (#291) each resident's start writes its
-   *   own line, its own row, which enters its own window alone.
+   * - A wake's one line whose event is still the newest entry of the
+   *   agent's window is left out: no message follows the wake's, so it is
+   *   the wake's whole cause, and an arrival stored past the start enters
+   *   the window at a later point, after its request. (The start's own
+   *   notices, written after this, aren't messages a reply could be meant
+   *   for.)
+   * - Every resident gets every batched wake, and each resident's start
+   *   decides and writes its own line: a co-resident's line, and her reply,
+   *   are her own rows and enter no other window, so neither can land under
+   *   the message or after another resident's answer. For an agent whose
+   *   window isn't presented (its write-down failed, so its window is the
+   *   record), only the delivery agent's start writes the slot's one line,
+   *   and a co-resident's start places nothing.
    * - Two or more lines are all written, each naming its message, its age
    *   counted to now.
-   * - None is written while the host is quiesced or another reader of the
-   *   slot has a turn alive (slotHeldFrom, as for a clock row): written, a
-   *   line would land inside that turn, and deferred, it would wait for the
-   *   delivery agent's next boundary, never reaching this request
-   *   (overlapping turns in the slot, #286). They stay undecided, and are
-   *   written only if another fresh start of the wake comes (a provider
-   *   hold's release, a requeue): this start's request goes without them.
+   * - None is written while the host is quiesced, as for a clock row. They
+   *   stay undecided, and are written only if another fresh start of the
+   *   wake comes (a provider hold's release, a requeue): this start's
+   *   request goes without them.
    *
    * A line left out is traced. Each line is written once (placedWakeLines),
    * across the wake's retries and holds, whichever copy of its trigger a
@@ -27556,15 +26533,15 @@ export class AgentFramework {
    * left out, or whose write fails, stays undecided for a later fresh start.
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
-    // With the presentation index (#291) each resident the wake was for
-    // writes the line into its own window, as its own row, at its own start:
-    // a co-resident's line enters no other window, so it can't land under
-    // the message or after another resident's answer. Without it, the
+    // Each resident the wake was for writes the line into its own window, as
+    // its own row, at its own start (#291): a co-resident's line enters no
+    // other window, so it can't land under the message or after another
+    // resident's answer. For an agent whose window isn't presented, the
     // delivery agent's start alone writes the slot's one line.
     const slot = this.deliveryAgent();
     if (!slot || (agent !== slot && !this.presents(agent))) return;
     const open = lines.filter((line) => !this.placedWakeLines.get(line)?.has(agent.name));
-    const held = this.slotHeldFrom(agent);
+    const held = this.quiesced;
     const leftOut = held
       || (lines.length === 1 && open.length === 1 && this.isNewestIn(agent, open[0].entry));
     if (leftOut) {
@@ -27715,27 +26692,26 @@ export class AgentFramework {
     return owners.length > 0 ? owners : [delivery.name];
   }
 
-  /** The notes addMessage takes for a message it stored: an arrival for the
-   *  agent when none of its turns is alive or the message was assembled for
-   *  the start now beginning (no tool boundary will weigh it), and one for
-   *  every other resident's open turn. */
-  private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId, bypassDeferralFor?: string): void {
-    // An agent the presentation index presents for weighs the row as it
-    // enters its window (adoptPresentation's listener), or at the tool
-    // boundary that hears it, not here.
-    if (!this.presents(agent) && (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name)) {
+  /** The note addMessage takes for a message it stored, for an agent whose
+   *  window isn't presented (its write-down failed at its registration),
+   *  whose window is the record: an arrival for its open turn when none of
+   *  its turns is alive or its start is assembling (no tool boundary will
+   *  weigh it). An agent the presentation index presents for weighs the row
+   *  as it enters its window (adoptPresentation's listener), or at the tool
+   *  boundary that hears it, not here. */
+  private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId): void {
+    if (!this.presents(agent) && (!this.activeTurnTokens.has(agent.name) || this.assembling.has(agent.name))) {
       this.noteArrival(agent.name, metadata, stored);
     }
-    this.noteForOtherResidents(agent, metadata, stored);
   }
 
   /**
    * Held agent mail is released only when its message has actually entered
-   * the recipient's store, as a copy for that recipient — never on a
-   * deferral. Called at every site that writes a message into a context: the
-   * direct path above and the two deferred-write flushes (turn start, tool
-   * boundary). Both writes reach disk in the same sync, so a crash keeps
-   * either both or neither.
+   * the recipient's store, as a copy for that recipient — never while a
+   * surgery's hold keeps the write. Called where the framework stores a
+   * message (addMessage, and the importer's lookup of a write that landed).
+   * Both writes reach disk in the same sync, so a crash keeps either both or
+   * neither.
    */
   private releaseLandedMail(metadata: MessageMetadata | undefined, recipient: string): void {
     const stamp = (metadata as { dendrite?: { mailId?: unknown; kind?: unknown; from?: { agent?: unknown } } } | undefined)?.dendrite;
@@ -27769,58 +26745,6 @@ export class AgentFramework {
   }
 
   /**
-   * Splice out the deferred messages addressed to `agentName` (explicitly
-   * via forAgent, or implicitly when it is the primary), leaving other
-   * targets' messages queued for their own boundaries. With `stopAt`, the
-   * drain ends at the first of them (in queue order) that it matches: that
-   * message and every later one stay queued, so what is drained is always a
-   * prefix of the agent's queue.
-   */
-  private drainDeferredFor(agentName: string, stopAt?: (msg: DeferredWrite) => boolean): DeferredWrite[] {
-    if (this.deferredMessages.length === 0) return [];
-    // A fork or run deregistered while the host is quiesced leaves its queue
-    // to its window's release at resume (runReleasesAfterResume, which clears
-    // the name first), which stores its writes in that window, or to stop()'s
-    // pass for postponed releases, which clears the name, passes its notices
-    // and marked module writes on as that release would (as boot would,
-    // where its pass throws), and drops the rest, logged. Drained by any
-    // other flush meanwhile, they would meet no registered agent and be
-    // dropped, or written into a window no one reads.
-    if (this.releasesAfterResume.has(agentName)) return [];
-    const mine: typeof this.deferredMessages = [];
-    const rest: typeof this.deferredMessages = [];
-    for (const msg of this.deferredMessages) {
-      const target = msg.forAgent ?? this.primaryAgentName;
-      (target === agentName ? mine : rest).push(msg);
-    }
-    mine.sort(bySeq);
-    const stop = stopAt ? mine.findIndex(stopAt) : -1;
-    const drained = stop === -1 ? mine : mine.slice(0, stop);
-    this.deferredMessages = stop === -1 ? rest : [...rest, ...mine.slice(stop)];
-    // The drained messages are about to be written by the caller; they stay
-    // in the DURABLE queue (as un-acked) until the caller's
-    // ackDeferredWrites() has synced the chronicle. Removing them here would
-    // acknowledge before the write is durable.
-    this.handOffDeferredWrites(drained);
-    return drained;
-  }
-
-  /**
-   * Put drained entries back into the queue under their ids and seq: out of
-   * the un-acked set, and persisted when the queue is. A memory-only queue
-   * keeps them while the framework runs.
-   */
-  private requeueDrained(entries: DeferredWrite[]): void {
-    if (entries.length === 0) return;
-    const ids = new Set(entries.map((m) => m.id));
-    this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => !ids.has(m.id));
-    for (const msg of entries) {
-      if (!this.deferredMessages.some((m) => m.id === msg.id)) this.deferredMessages.push(msg);
-    }
-    if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-  }
-
-  /**
    * What the next compile sends for each of `ids`, messages a tool boundary
    * has just stored, as the agent's strategy renders them as the newest of
    * its window (ContextManager.renderAsNewest): cut by the per-message cap,
@@ -27842,193 +26766,6 @@ export class AgentFramework {
     }
   }
 
-  /**
-   * Write drained entries in queue (seq) order, whatever their targets:
-   * residents share one message slot, so the order entries arrived in is the
-   * order they're stored. Each target is cut at its own first entry that
-   * can't be stored: that entry and every later one for the same target go
-   * back into the queue under their ids and seq (requeueDrained) before
-   * anything is logged, and other targets' entries go on. Left in the
-   * un-acked set, the next ack would drop them from the durable queue.
-   *
-   * So none of a target's entries lands ahead of an earlier one, and a queued
-   * tool_use that can't be stored keeps the tool_result queued behind it from
-   * being stored alone, unless context-manager refused it as malformed
-   * (below). (A tool_use that is stored, followed by a tool_result that
-   * can't be, stays stored without it until the tool_result lands at a later
-   * flush, or for good when the store refuses the tool_result as malformed.
-   * The only queued pair is puppetToolCall's, queued only when its turn's
-   * token is no longer its own once the pair is built, which its comment
-   * calls defensive.) An entry that keeps failing is logged by id at each
-   * flush, and holds its target's later queued writes rather than letting
-   * them land out of order.
-   *
-   * An entry context-manager refuses as malformed (MalformedContentError) is
-   * the exception for the store's own validation: context-manager checks
-   * content and every shard before writing. A custom synchronous strategy
-   * hook can throw the same class after append (context-manager #288);
-   * unreadable landing in that callback escape remains a limitation until
-   * the CM follow-up lands. A copy actually found still counts first. Other
-   * ambiguous errors remain queued for ID reconciliation before retry. A
-   * malformed refusal would fail every flush and hold its target's later
-   * writes for good, so it's logged and dropped instead, and its
-   * target isn't cut: left in the un-acked set, the next ack drops it from
-   * the durable queue. A tool_use dropped this way leaves a tool_result
-   * queued behind it to be stored alone. context-manager mends a tool_use
-   * whose input isn't an object, so it refuses one only when that input has
-   * no JSON form or the block itself is malformed. addMessage refuses such
-   * content before it's queued, so an entry meets this here from a queue an
-   * earlier process persisted, as puppetToolCall's pair, which it queues
-   * itself, or when the strategy's chunking splits well-formed content into a
-   * shard the store refuses, which the store's error names.
-   *
-   * From a fresh turn's start to the end of its coalescing assembly, before
-   * its checkpoint, every write deferred for its agent lands in that
-   * request, in arrival order, up to one that can't be stored and unless the
-   * host is quiesced (flushForStart). The turn-start flush writes the queue;
-   * while the assembly runs, each write it makes into the agent's own window
-   * (addMessage's bypassDeferralFor) first writes what was deferred since;
-   * and what was deferred during the assembly is written once it ends. A
-   * write the assembly makes while an entry is held waits behind it in the
-   * queue, so the hold covers the assembly's writes too, and so does one
-   * made while the host is quiesced with anything queued for the agent: a
-   * quiesce that begins while an assembly awaits a render lets that turn
-   * drain, and what is queued waits for resume(). Outside that window the
-   * hold is the queue's alone: a write that isn't deferred is stored at once
-   * and can land ahead of a held entry, as a fresh tool_result does whatever
-   * its agent's state, and any write does while its agent's turn, stream and
-   * tool cycle are all idle and the host isn't quiesced. So an entry that
-   * keeps failing holds what is deferred behind it and the assembly's writes
-   * for its agent.
-   *
-   * A write can throw after its message is stored: a store listener, the
-   * strategy's handling of the add, or a later shard of a sharded body can
-   * throw once a record is written. Before an entry that threw is put back,
-   * its target's store is read from where it stood before the write, for
-   * messages carrying the entry's `deferredWriteId`. What it finds counts as
-   * written, at most once: the entry isn't requeued and stored a second
-   * time, and what landed, as later compiles render it (asCompiled), is what
-   * it returns as the entry's content. For a sharded body, that can be its
-   * first shards alone if rollback could not remove them; context-manager
-   * from 0.15 otherwise removes shards from a failed append. (Requeued, the
-   * landed shards would be stored twice, and only the rest could not be
-   * appended later without splitting the body.) Boot's scan for landed
-   * writes counts a landed shard the same way. When the store can't be read
-   * back (storedCopiesOf logs it), or couldn't say how many messages it held
-   * before the write, the store is searched for the entry's id at once
-   * (landedCopiesById): found, it counts as written, as above. When that
-   * can't be done either, whether the entry landed is unknown: it's put back
-   * marked so (`landing`), and before it's written again the store is
-   * searched for its id. Found then, it counts as written where it was
-   * stored, ahead of what was stored since without it, a known limit
-   * (context-manager #155, named at the tool boundary's drain); not found,
-   * it's written. While the store can't be searched, it stays queued,
-   * holding what's behind it.
-   *
-   * Returns what was written (stored, or deferred again by addMessage, whose
-   * id is then empty), in queue order: for one target, its entries up to the
-   * first that couldn't be stored, less entries refused as malformed and dropped. Each comes
-   * with its content: as given, unless the store took it as more than one
-   * message (a sharded body) and can be read back, when its copies are
-   * returned joined, as later compiles render them (asCompiled), or its write
-   * threw after storing it (above). `onLanded` hears an entry whose write
-   * threw after storing it, with the id it landed under, as soon as it's
-   * found: before the writes after it, so whatever it records keeps their
-   * order.
-   */
-  private writeDrainedInOrder(
-    entries: DeferredWrite[],
-    where: string,
-    write: (msg: DeferredWrite) => MessageId,
-    onLanded?: (msg: DeferredWrite, id: MessageId) => void,
-  ): Map<DeferredWrite, DrainedWrite> {
-    const ordered = [...entries].sort(bySeq);
-    // An entry's target as addMessage resolves it, keyed by name for the cut.
-    const targetOf = (msg: DeferredWrite): string | null => msg.forAgent ?? this.deliveryAgent()?.name ?? null;
-    const cut = new Set<string | null>();
-    const written = new Map<DeferredWrite, DrainedWrite>();
-    for (let i = 0; i < ordered.length; i++) {
-      const msg = ordered[i]!;
-      const target = targetOf(msg);
-      if (cut.has(target)) continue;
-      const agent = this.deliveryAgent(msg.forAgent);
-      // An earlier write of this entry threw, and its store could neither
-      // be read back nor searched to tell whether it landed. It's looked up
-      // by its id before it's written again. Found, it counts as written
-      // where that write stored it, as when the readback works, a known
-      // limit (above, and at the tool boundary's drain). Not found, it's
-      // written. While the store can't be searched, it stays queued,
-      // holding what's behind it. An entry whose agent isn't registered has
-      // no store to look in: it's written, and addMessage drops it, as it
-      // does an unmarked one.
-      if (msg.landing === 'unknown' && agent) {
-        const found = this.landedCopiesById(agent, msg.id);
-        if (found === undefined) {
-          cut.add(target);
-          this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
-          // Said once until a lookup of it succeeds, as the search's own
-          // line is: every drain tries again.
-          if (!this.stillUnknownSaid.has(msg.id)) {
-            this.stillUnknownSaid.add(msg.id);
-            this.logDeferredWriteError(msg, where, undefined, 'still-unknown');
-          }
-          continue;
-        }
-        if (found.length > 0) {
-          written.set(msg, { id: found[0]!.id, content: asCompiled(found) });
-          this.logDeferredWriteError(msg, where, undefined, { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
-          onLanded?.(msg, found[0]!.id);
-          continue;
-        }
-        delete msg.landing;
-      }
-      const before = agent ? this.storedCountOf(agent) : undefined;
-      try {
-        const id = write(msg);
-        // A body the store took as more than one message (a sharded body) is
-        // returned as later compiles render it: its copies, joined
-        // (asCompiled). The store is read for them only when it grew by more
-        // than one message. One that can't be read back is carried as given.
-        const copies = agent && before !== undefined && (this.storedCountOf(agent) ?? before) - before > 1
-          ? this.storedCopiesOf(agent, before, msg.id) ?? []
-          : [];
-        written.set(msg, { id, content: copies.length > 1 ? asCompiled(copies) : msg.content });
-      } catch (error) {
-        // What landed, read back from where the store stood before the
-        // write, or, where that can't say, before the write or after it,
-        // looked up by its id here, at the boundary that wrote it: found,
-        // it counts as written here, where it landed, so what this boundary
-        // carries is what's stored. Undefined when the store can be neither
-        // read back nor searched. With no agent there's no store it could
-        // have landed in.
-        let landed = !agent ? [] : before === undefined ? undefined : this.storedCopiesOf(agent, before, msg.id);
-        if (landed === undefined && agent) landed = this.landedCopiesById(agent, msg.id);
-        if (landed && landed.length > 0) {
-          written.set(msg, { id: landed[0]!.id, content: asCompiled(landed) });
-          this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
-          onLanded?.(msg, landed[0]!.id);
-          continue;
-        }
-        // The store's own validation refuses content/shards before append.
-        // A synchronous custom strategy can escape after append (CM #288);
-        // this is not a guarantee for that callback when readback also fails.
-        // Any copy readback did find was already handled above.
-        if (error instanceof MalformedContentError) {
-          this.logDeferredWriteError(msg, where, error, 'dropped');
-          continue;
-        }
-        // Requeued as unstored, a write that had landed would be stored a
-        // second time; so one whose landing is unknown is marked, and looked
-        // up by its id before it's written again (above).
-        if (landed === undefined) msg.landing = 'unknown';
-        cut.add(target);
-        this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
-        this.logDeferredWriteError(msg, where, error, landed === undefined ? 'unknown' : undefined);
-      }
-    }
-    return written;
-  }
-
   /** How many messages the agent's store holds: undefined when its store
    *  can't say. */
   private storedCountOf(agent: Agent): number | undefined {
@@ -28037,16 +26774,6 @@ export class AgentFramework {
     } catch {
       return undefined;
     }
-  }
-
-  /** The messages carrying `deferredWriteId` among those the agent's store
-   *  gained from position `from` on, in store order, with their blobs
-   *  resolved, as a request carries them. A sharded body's carry its
-   *  `bodyGroupId`. Undefined when the store can't be read back, which is
-   *  logged: not the same as nothing found. */
-  private storedCopiesOf(agent: Agent, from: number, deferredWriteId: string): StoredCopy[] | undefined {
-    return this.storedSince(
-      agent, from, (m) => m.metadata?.deferredWriteId === deferredWriteId, 'deferral', `deferred write ${deferredWriteId}`);
   }
 
   /** The messages `match` picks among those the agent's store gained from
@@ -28097,29 +26824,22 @@ export class AgentFramework {
   /**
    * The messages carrying `deferredWriteId` anywhere on the agent's current
    * branch, in store order with their blobs resolved, as a request carries
-   * them, so no position is needed. They're found with queryMessages, over
-   * context-manager's cached view, as landedRow finds a held write's row.
-   * Where that throws, as one blob missing anywhere on the branch makes it
-   * do, the branch is scanned blob-free instead (landedPositions), and only
-   * the rows that match are read with their blobs. Undefined when the store
-   * can be searched neither way, or the scan finds the write's rows but one
-   * of them can't be read. Each write whose lookup fails is said once until
-   * a lookup of it succeeds, since every path that reads held writes looks
-   * again.
+   * them, so no position is needed: where an earlier release's queued write
+   * whose landing it couldn't tell may have landed (the importer's lookup).
+   * They're found with queryMessages, over context-manager's cached view,
+   * as landedRow finds a held write's row. Where that throws, as one blob
+   * missing anywhere on the branch makes it do, the branch is scanned
+   * blob-free instead (landedPositions), and only the rows that match are
+   * read with their blobs. Undefined when the store can be searched neither
+   * way, or the scan finds the write's rows but one of them can't be read,
+   * which is logged.
    */
   private landedCopiesById(agent: Agent, deferredWriteId: string): StoredCopy[] | undefined {
     const cm = agent.getContextManager();
-    // Each failure is said once until a lookup of the write succeeds, and
-    // again when the failure changes. It names the query's own error, which
-    // names a missing blob, as well as the scan's.
-    const say = (kind: 'search' | 'read', what: string, queryError: unknown, error: unknown): void => {
-      if (this.unsearchableSaid.get(deferredWriteId) === kind) return;
-      this.unsearchableSaid.set(deferredWriteId, kind);
-      console.error(
-        `[deferral] ${what}; context-manager's query threw first (${errorMessage(queryError)}); this is said once ` +
-        `until a lookup succeeds:`,
-        error,
-      );
+    // The line names the query's own error, which names a missing blob, as
+    // well as the scan's.
+    const say = (what: string, queryError: unknown, error: unknown): void => {
+      console.error(`[deferral] ${what}; context-manager's query threw first (${errorMessage(queryError)}):`, error);
     };
     let found: StoredCopy[];
     try {
@@ -28129,158 +26849,18 @@ export class AgentFramework {
       try {
         at = this.landedPositions(cm, deferredWriteId);
       } catch (error) {
-        say('search', `could not search ${agent.name}'s store for deferred write ${deferredWriteId}, to tell whether it was stored`, queryError, error);
+        say(`could not search ${agent.name}'s store for deferred write ${deferredWriteId}, to tell whether it was stored`, queryError, error);
         return undefined;
       }
       try {
         found = at.map((position) => storedCopy(messageAt(cm, position)));
       } catch (error) {
         // The scan found its rows; one of them can't be read whole.
-        say('read', `found deferred write ${deferredWriteId} in ${agent.name}'s store, but could not read its stored copy`, queryError, error);
+        say(`found deferred write ${deferredWriteId} in ${agent.name}'s store, but could not read its stored copy`, queryError, error);
         return undefined;
       }
     }
-    this.unsearchableSaid.delete(deferredWriteId);
-    this.stillUnknownSaid.delete(deferredWriteId);
     return found;
-  }
-
-  /** The line naming a drained write that threw: one that couldn't be stored,
-   *  which is already back in the queue; with 'dropped', a malformed refusal
-   *  from the store's pre-write validation (see the CM #288 caveat above);
-   *  with a count, one stored before the
-   *  throw (for a sharded body, how many of its shards), or, with
-   *  `foundLater`, one an earlier write of which landed and was found by its
-   *  id; with `'unknown'`, one whose store couldn't be read to tell
-   *  whether it landed, back in the queue to be looked up first; and with
-   *  `'still-unknown'`, one that still can't be looked up. Logging mustn't
-   *  fail the flush that met it, so a thrown value that has no text is
-   *  named as such. */
-  private logDeferredWriteError(
-    msg: DeferredWrite,
-    where: string,
-    error: unknown,
-    outcome?: { count?: number; sharded: boolean; foundLater?: boolean; named?: true } | 'unknown' | 'still-unknown' | 'dropped',
-  ): void {
-    let reason: string;
-    try {
-      reason = error instanceof Error ? error.message : String(error);
-    } catch {
-      reason = 'a thrown value that has no text';
-    }
-    const held = 'it stays queued, holding what is queued behind it for that agent';
-    const stored = (landed: { count?: number; sharded: boolean }): string => !landed.sharded
-      ? 'it was stored'
-      : landed.count === undefined
-        ? 'a shard of its body was stored'
-        : `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`;
-    // What a copy found later costs where it stays (writeDrainedInOrder).
-    const stays = `; it stays where that write stored it, and a reply stored after it whose request didn't ` +
-      `carry it was made without it: on an account where the provider enforces that binding, a later request ` +
-      `replaying that reply's signed thinking is refused with a 400 (context-manager #155)`;
-    let what: string;
-    if (outcome === 'dropped') {
-      what = `was refused as malformed, so it's dropped rather than queued again, and what is queued behind it for that agent goes on: ${reason}`;
-    } else if (outcome === 'unknown') {
-      what = `threw, and its store couldn't be read to tell whether it was stored; ${held}, and is looked up ` +
-        `by its id before it's written again: ${reason}`;
-    } else if (outcome === 'still-unknown') {
-      what = `still can't be found and read by its id, to tell whether an earlier write of it was stored; ${held}`;
-    } else if (outcome?.foundLater) {
-      what = `${outcome.named ? 'was found through the copy a module named' : 'was found by its id'}: ` +
-        `${stored(outcome)} by an earlier write whose landing was unknown; what ` +
-        `was stored counts as written and isn't stored again${stays}`;
-    } else if (outcome) {
-      what = `threw after ${stored(outcome)}; what was stored counts as written and isn't stored again: ${reason}`;
-    } else {
-      what = `could not be stored; ${held}: ${reason}`;
-    }
-    console.error(
-      `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
-      `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ${what}`,
-    );
-  }
-
-  /**
-   * Write what is queued for `agent` into its window past its deferral, in
-   * queue order and cut at a write that fails, though one the store refuses
-   * as malformed is dropped and what follows goes on (writeDrainedInOrder),
-   * between a fresh turn's start and its checkpoint, where what is stored is
-   * the turn's input: at the start, before each write the coalescing
-   * assembly makes for the agent, and once the assembly ends, the last two
-   * not while the host is quiesced, when what is queued waits for resume().
-   * What is stored is weighed for the start now beginning and for every
-   * other resident's open turn. Returns whether anything is still queued for
-   * the agent.
-   */
-  private flushForStart(agent: Agent, occasion: 'turn-start' | 'assembly'): boolean {
-    const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `${occasion} flush for ${agent.name}`, (msg) =>
-      agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
-    for (const [msg, { id }] of stored) {
-      // Held mail whose message just landed is released (Dendrite).
-      this.releaseLandedMail(msg.metadata, agent.name);
-      this.emitTrace({ type: 'message:added', messageId: id, source: `deferred-flush:${occasion}` });
-      // Weighed as assembled for this start: an arrival for the agent, and
-      // for every other resident's open turn.
-      this.noteStored(agent, msg.metadata, id, agent.name);
-    }
-    this.ackDeferredWrites();
-    return this.queuedFor(agent.name);
-  }
-
-  /** Whether anything is queued for `agentName`, by drainDeferredFor's
-   *  target rule. */
-  private queuedFor(agentName: string): boolean {
-    return this.deferredMessages.some((msg) => (msg.forAgent ?? this.primaryAgentName) === agentName);
-  }
-
-  /** Re-add drained entries through addMessage, which stores each or defers
-   *  it again, in queue order and cut per target (writeDrainedInOrder). With
-   *  `bypassDeferral`, each is stored past its target's deferral (stop()). A
-   *  write that threw after storing missed the notes addMessage takes after a
-   *  store, so they're taken for what landed as soon as it's found, before
-   *  the writes after it: an open turn's arrivals keep the order the writes
-   *  landed in, and its newest stays the newest (remainingArrival).
-   *
-   *  A target no longer registered (a fork or a run that has ended, here or
-   *  before a crash) has no window to land in: a failed reply queued for it,
-   *  or a channel notice it could have acted on, becomes the primary's
-   *  by-name notice, and a module's write for a run or a fork goes to it as
-   *  written, each under the entry's own id and place in the queue
-   *  (passesToPrimary, queuedNoticeForPrimary), written with the rest; any
-   *  other write is dropped, logged, by addMessage. Nothing here reads the gone agent's
-   *  window, so such a notice an earlier write of which landed there, and
-   *  which the agent read, goes on too. */
-  private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
-    let passed = 0;
-    let writes = 0;
-    const entries = drained.flatMap((msg) => {
-      if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
-      if (!passesToPrimary(msg.metadata)) return [msg];
-      const forPrimary = this.queuedNoticeForPrimary(msg.forAgent, msg);
-      if (!forPrimary) return [];
-      if (isPrimaryIfUnread(msg.metadata)) writes++;
-      else passed++;
-      return [forPrimary];
-    });
-    if (passed > 0) {
-      console.error(`[deferred-flush] ${where}: ${passed} notice${passed === 1 ? '' : 's'} of an agent that has ended passed to the primary`);
-    }
-    if (writes > 0) {
-      console.error(`[deferred-flush] ${where}: ${writes} module write${writes === 1 ? '' : 's'} queued for a run or fork that has ended passed to the primary`);
-    }
-    const bypassFor = (msg: DeferredWrite): string | undefined =>
-      opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
-    const written = this.writeDrainedInOrder(entries, where, (msg) =>
-      this.addMessage(msg.participant, msg.content, msg.metadata, {
-        fromQueue: { id: msg.id, seq: msg.seq, heldAt: msg.heldAt },
-        ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
-        ...(bypassFor(msg) ? { bypassDeferralFor: bypassFor(msg) } : {}),
-      }), (msg, id) => {
-      const agent = this.deliveryAgent(msg.forAgent);
-      if (agent) this.noteStored(agent, msg.metadata, id, bypassFor(msg));
-    });
-    return [...written.keys()];
   }
 
   /**
@@ -28291,8 +26871,9 @@ export class AgentFramework {
    * waits on that agent's own turn, stream and tool cycle: a conversation
    * fork or an ephemeral run reads only its isolated slot, and a resident's
    * notice would otherwise wait on the primary's turn rather than its own.
-   * Residents share one message slot, so a resident's notice can land there
-   * while another resident's turn is alive; agent-framework #291 covers that.
+   * Residents share one message slot, so a resident's notice can be stored
+   * there while another resident's turn is alive; since #291 it is for its
+   * agent alone, and enters no other resident's window.
    *
    * null when the agent is no longer registered (a fork or a run already
    * released): there is no window to write, so the caller writes nothing,
@@ -28311,158 +26892,61 @@ export class AgentFramework {
   /**
    * A conversation fork or an ephemeral run has been deregistered. A release
    * never runs while the host is quiesced: it waits for resume()
-   * (releaseWindowNowOrAfterResume), since a write could land mid-surgery.
+   * (releaseWindowNowOrAfterResume), or, when stop() comes first, stop()
+   * runs it.
    *
    * The agent never reads its window again, so every failed-reply notice it
    * never read, and every channel notice it could act on and never read, is
    * passed to the primary, by name, once, and so is every module write for
    * it that it never read, as the write itself (passesToPrimary,
-   * passOnFromReleasedWindow): each one stored in its window above its
-   * consumed watermark (flushed there at its turn's end, or stored while it
-   * was idle) and not heard at a tool boundary, and each one still queued
-   * for it, pending or un-acked. One with an entry still in the durable
-   * queue goes on only as that entry, under its own id and seq, so a crash
-   * before the ack below replays it once; a copy of it in the window decides
-   * only whether the agent read it. Writes still queued would wait for a
-   * boundary it never reaches, and a flush that finds it gone would drop all
-   * but the notices it passes on, so they land in its own window now, which
-   * Chronicle keeps for investigation. One whose earlier write may have
-   * landed (`landing` unknown) is looked up there by its id first, or, where
-   * the store can't be searched, in the window's own read: found, it isn't
-   * stored again; where neither can see the store, it's stored anyway, with
-   * a line saying it may now be stored twice, or, where storing it fails
-   * too, that it may be stored once, twice or not at all. Its stream is over
-   * or cancelled, or, when stop() ends it, may still run past its cancel, and
-   * then drops each event that comes after the agent has left (driveStream);
-   * a turn of its still assembling or compiling, as when stop() ends it,
-   * drops before it sends anything. One path still stores after these
-   * writes: a `complete` that arrived while the agent still waited for tools
-   * awaits the spill of its last tool results, and stores them once that
-   * resolves, even if a watchdog has ended the run meanwhile. A tool boundary
-   * stores nothing for a round whose turn was stopped while its results were
-   * prepared.
+   * passNoticeToPrimary): each one stored in its store and not covered by
+   * its consumed watermark (releasedWindow): presented at its turn's end and
+   * never consumed, stored while it was idle, or never presented. A message
+   * a tool boundary injected is covered once its stream says it carried it.
+   * Its stream is over or cancelled, or, when stop() ends it, may still run
+   * past its cancel, and then drops each event that comes after the agent
+   * has left (driveStream); a turn of its still assembling or compiling, as
+   * when stop() ends it, drops before it sends anything. One path still
+   * stores after the release: a `complete` that arrived while the agent
+   * still waited for tools awaits the spill of its last tool results, and
+   * stores them once that resolves, even if a watchdog has ended the run
+   * meanwhile. A tool boundary stores nothing for a round whose turn was
+   * stopped while its results were prepared. The agent's store stays in
+   * Chronicle for investigation.
    */
   private releaseWindow(agent: Agent): void {
-    const { window, passOn, forPrimary, unacked } = this.passOnFromReleasedWindow(agent);
-    const queued = this.drainDeferredFor(agent.name);
-    // Nothing of its in the durable queue: nothing to store, pass on or ack.
-    if (queued.length === 0 && unacked === 0) return;
-    const cm = agent.getContextManager();
-    for (const msg of queued) {
-      // An entry whose earlier write may have landed (landing unknown) is
-      // looked up by its id, as settleUnknownLandings looks one up
-      // elsewhere, but in the released agent's own store. Where the store
-      // can't be searched, a copy the window's read saw tells the same.
-      // Found, it landed, and it isn't stored again. When neither can see
-      // it, it's stored anyway where the store takes it, since no later
-      // flush will try again, and a copy its deferredWriteId tells apart
-      // costs less than a write lost without a trace.
-      const lookedUp = msg.landing === 'unknown' ? this.landedCopiesById(agent, msg.id) : [];
-      const found = lookedUp ?? window?.held.get(msg.id)?.copies;
-      if (found && found.length > 0) {
-        this.logDeferredWriteError(msg, `release of ${agent.name}`, undefined,
-          { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
-        passOn(msg);
-        continue;
-      }
-      try {
-        cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
-        if (found === undefined) {
-          console.error(
-            `[deferral] release of ${agent.name}: deferred write ${describeDeferredWrite(msg)} was stored though its ` +
-            `store couldn't be searched for an earlier copy, so it may now be stored twice`,
-          );
-        }
-      } catch (err) {
-        console.error(
-          `[deferred-flush] ${agent.name}: failed to store a queued write before release ` +
-          `(participant=${msg.participant})` +
-          (found === undefined
-            ? `; its store couldn't be searched for an earlier copy of deferred write ${describeDeferredWrite(msg)} either, ` +
-              `so it may be stored once, twice or not at all:`
-            : ':'),
-          err,
-        );
-      }
-      passOn(msg);
+    for (const { metadata, ...written } of this.releasedWindow(agent)?.unread ?? []) {
+      this.passNoticeToPrimary(agent.name, metadata, written);
     }
-    if (forPrimary.length > 0) this.readdDrained(forPrimary, `release of ${agent.name}`);
-    this.ackDeferredWrites();
   }
 
   /**
-   * The part of a released agent's pass to the primary that its release and
-   * stop() share (stop() runs it for a release the quiesce postponed). Each
-   * notice stored in its window that it never read and the primary takes in
-   * its place (passesToPrimary: a failed reply, a channel notice its reader
-   * could act on, or a module's write for a run or a fork, which goes as
-   * the write itself) goes on as stored, by name (passNoticeToPrimary),
-   * except a copy of an entry for it still in the durable queue, pending or
-   * un-acked: that entry is the notice's one identity until its ack, the one
-   * boot's check for landed writes knows, so it's the entry that goes on, as
-   * the primary's by-name notice under its own id and seq (`passOn`,
-   * queuedNoticeForPrimary), and a crash before the ack replays it once, not
-   * twice. A queued notice goes on unless the agent read a copy of it that
-   * landed in its window; where the window can't be read, it goes on, since
-   * telling the primary of a notice the agent may have read costs less than
-   * telling no one. Both callers run this before their drain, which hands
-   * pending entries to the un-acked set, so the un-acked entries for the
-   * agent here have all landed (their write went through, or a lookup found
-   * it: settleFound), and they go on here; the pending ones are the
-   * caller's. Returns the window's read, `passOn`, what it has queued so far
-   * for the primary, and how many un-acked entries the agent had.
-   */
-  private passOnFromReleasedWindow(agent: Agent): {
-    window: ReleasedWindow | null;
-    passOn: (msg: DeferredWrite) => void;
-    forPrimary: DeferredWrite[];
-    unacked: number;
-  } {
-    const mine = (msg: DeferredWrite): boolean => (msg.forAgent ?? this.primaryAgentName) === agent.name;
-    const unacked = this.unackedDeferredWrites.filter(mine);
-    const window = this.releasedWindow(agent, new Set([...this.deferredMessages.filter(mine), ...unacked].map((m) => m.id)));
-    for (const { metadata, ...written } of window?.unread ?? []) this.passNoticeToPrimary(agent.name, metadata, written);
-    const forPrimary: DeferredWrite[] = [];
-    const passOn = (msg: DeferredWrite): void => {
-      if (!passesToPrimary(msg.metadata)) return;
-      if (window?.held.get(msg.id)?.unread === false) return;
-      const passed = this.queuedNoticeForPrimary(agent.name, msg);
-      if (passed) forPrimary.push(passed);
-    };
-    for (const msg of unacked) passOn(msg);
-    return { window, passOn, forPrimary, unacked: unacked.length };
-  }
-
-  /**
-   * What a released agent's window holds that its pass to the primary reads
-   * (passOnFromReleasedWindow): `unread`, the notices stored there that it
+   * What a released agent's window holds that its release passes to the
+   * primary (releaseWindow): `unread`, the notices stored there that it
    * never read and the primary takes in its place (passesToPrimary: its
    * failed replies, the channel notices it was told it could act on, and a
    * run's or a fork's module writes), each with its participant and
    * content, a sharded body's shards joined into one text, as the
-   * autobiographical strategy joins them (asCompiled), other than
-   * copies of the entries `held` names; and `held`, for each of
-   * those entries with a copy there, its copies and whether any of them is
-   * unread. A notice is read when the agent's consumed watermark covers it
-   * (covers): once its context presents rows (#291), when it was in the
-   * agent's window as of the mark, so a notice never presented to it, or
-   * presented and never consumed, is unread; in legacy mode, when it is at
-   * or below the mark, or, for a mark on another branch, at or below the
-   * lower of the mark and the point where the two branches part
-   * (branchesPartAt). A mark taken in presented mode can't say on another
-   * branch, and there, as everywhere for an agent with no watermark, every
-   * notice is unread. The
-   * watermark is set when the agent is created, and moves at a compile, and
-   * at a tool boundary whose stream declares it carries the messages
+   * autobiographical strategy joins them (asCompiled). A notice is read
+   * when the agent's consumed watermark covers it (covers): once its context
+   * presents rows (#291), when it was in the agent's window as of the mark,
+   * so a notice never presented to it, or presented and never consumed, is
+   * unread; for an agent whose window isn't presented, when it is at or
+   * below the mark, or, for a mark on another branch, at or below the lower
+   * of the mark and the point where the two branches part (branchesPartAt).
+   * A mark taken in presented mode can't say on another branch, and there,
+   * as everywhere for an agent with no watermark, every notice is unread.
+   * The watermark is set when the agent is created, and moves at a compile,
+   * and at a tool boundary whose stream declares it carries the messages
    * injected there (markContextConsumed). So a notice such a stream carried
-   * is under it. One a boundary stored without sending (a turn a tool ended,
-   * a budget restart) is above it, and so is one injected into a stream that
-   * doesn't declare it carries injections, which may have dropped it:
-   * counted as unread, it goes to the primary even if the agent heard it,
-   * rather than to no one where the stream dropped it. null when the window
-   * can't be read, which is logged.
+   * is under it. One a boundary presented without sending (a turn a tool
+   * ended, a budget restart) is above it, and so is one injected into a
+   * stream that doesn't declare it carries injections, which may have
+   * dropped it: counted as unread, it goes to the primary even if the agent
+   * heard it, rather than to no one where the stream dropped it. null when
+   * the window can't be read, which is logged.
    */
-  private releasedWindow(agent: Agent, held: ReadonlySet<string>): ReleasedWindow | null {
+  private releasedWindow(agent: Agent): ReleasedWindow | null {
     try {
       const cm = agent.getContextManager();
       const watermark = agent.getConsumedWatermark();
@@ -28480,33 +26964,23 @@ export class AgentFramework {
       // content joins the body's, which a module's write passes on. Which
       // messages make up a body is context-manager's rule (continuesBody,
       // pairwise in store order): a group id names the text, so the same text
-      // stored twice is two bodies under one id. A held entry's copies are
-      // kept whole, each shard among them, as its lookup by id finds them.
-      const read: ReleasedWindow = { unread: [], held: new Map() };
+      // stored twice is two bodies under one id.
       const messages = cm.getAllMessages();
       const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
       let lastUnread = -1;
       messages.forEach((m, i) => {
-        const id = (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
-        if (typeof id === 'string' && held.has(id)) {
-          const copies = read.held.get(id) ?? { copies: [], unread: false };
-          copies.copies.push(storedCopy(m));
-          copies.unread ||= unread(m);
-          read.held.set(id, copies);
-        } else if (passesToPrimary(m.metadata) && unread(m)) {
-          if (!continuesBody(messages[i - 1], m)) {
-            bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
-            lastUnread = i;
-          } else if (lastUnread === i - 1) {
-            bodies.at(-1)!.shards.push(m);
-            lastUnread = i;
-          }
+        if (!passesToPrimary(m.metadata) || !unread(m)) return;
+        if (!continuesBody(messages[i - 1], m)) {
+          bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
+          lastUnread = i;
+        } else if (lastUnread === i - 1) {
+          bodies.at(-1)!.shards.push(m);
+          lastUnread = i;
         }
       });
       // A body's shards joined into one text, as the strategy joins them
       // (asCompiled), whole: a compile may also cut each shard to its cap.
-      read.unread = bodies.map(({ shards, ...body }) => ({ ...body, content: asCompiled(shards) }));
-      return read;
+      return { unread: bodies.map(({ shards, ...body }) => ({ ...body, content: asCompiled(shards) })) };
     } catch (err) {
       // A release must complete whatever its window's read meets.
       console.error(`[route-failure] ${agent.name}: could not read its window for unread notices the primary would take:`, err);
@@ -28547,15 +27021,14 @@ export class AgentFramework {
 
   /**
    * Release a deregistered fork's or run's window (releaseWindow) now, or,
-   * while the host is quiesced, when it resumes. A release lands the agent's
-   * queued writes in its window, and while quiesced a write could land
-   * mid-surgery; dropping them instead would lose them from both the window
-   * and the recovery queue. Only the window waits: the agent is already
-   * deregistered, so its stream can't dispatch anything more and resume
-   * doesn't weigh its context, and a write addressed to it meanwhile is
-   * treated as for any agent no longer registered (dropped, or passed to the
-   * primary if it's a failed reply, a channel notice its reader could act
-   * on, or a module's write for a run or a fork: passesToPrimary).
+   * while the host is quiesced, when it resumes: what the release passes to
+   * the primary is judged on the window as the quiesce leaves it. Only the
+   * window waits: the agent is already deregistered, so its stream can't
+   * dispatch anything more and resume doesn't weigh its context, and a
+   * write addressed to it meanwhile is treated as for any agent no longer
+   * registered (dropped, or passed to the primary if it's a failed reply, a
+   * channel notice its reader could act on, or a module's write for a run or
+   * a fork: passesToPrimary).
    */
   private releaseWindowNowOrAfterResume(agent: Agent): void {
     if (this.quiesced) this.releasesAfterResume.set(agent.name, agent);
@@ -28579,9 +27052,9 @@ export class AgentFramework {
    * A fork or an ephemeral run ended before reading a notice the primary
    * takes in its place (passesToPrimary): it was released with the notice
    * stored in its window unread, or, for a failed reply, its delivery failed
-   * after release. (A notice still queued for it, at release or restored at
-   * boot, goes on as the queue entry itself: queuedNoticeForPrimary.) Tell
-   * the primary instead, naming the speaker, so an agent who can still act
+   * after release. (One an earlier release left queued for it goes on at
+   * boot, under the queued write's own id: importPersistedDeferredWrites.)
+   * Tell the primary instead, naming the speaker, so an agent who can still act
    * learns of it (noticeForPrimary). The notice is the primary's alone
    * (#291's audience stamp): a co-resident sharing the primary's slot isn't
    * the agent who takes the speaker's place. On a host with no primary it
@@ -28602,29 +27075,6 @@ export class AgentFramework {
     } catch (err) {
       console.error(`[route-failure] failed to tell the primary ${notice.about}:`, err);
     }
-  }
-
-  /**
-   * A queued entry for `speaker`, who is gone, that the primary takes in its
-   * place, as the primary's by-name notice (noticeForPrimary): the same
-   * entry, under its own id and seq, now addressed to the primary. Written
-   * through the drain, it lands stamped with that id, or waits in the queue
-   * under it, so boot's exactly-once holds for it: a crash before the
-   * original's ack replays one entry, never the original and a separate
-   * notice. An entry marked as one whose earlier write may have landed
-   * (`landing`) keeps the mark, so before it's written it's looked up by its
-   * id in the primary's window, where it would land now
-   * (writeDrainedInOrder). A release has looked in the speaker's own window
-   * first (releaseWindow). null when no one is told (logged where it's
-   * decided).
-   */
-  private queuedNoticeForPrimary(speaker: string, msg: DeferredWrite): DeferredWrite | null {
-    const notice = this.noticeForPrimary(speaker, msg.metadata, msg);
-    if (!notice) return null;
-    return {
-      id: msg.id, seq: msg.seq, participant: notice.participant, content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt,
-      ...(msg.landing ? { landing: msg.landing } : {}),
-    };
   }
 
   /**
@@ -28793,26 +27243,23 @@ export class AgentFramework {
 
   /**
    * A module's write through its context (ModuleContext.addMessage):
-   * addMessage's, except that a write the framework holds is answered by its
-   * handle (heldHandle) rather than '', so the module can find, read, edit
-   * and remove what it wrote before the write lands, through getMessage,
-   * editMessage and removeMessage, which read the delivery agent's window: a
-   * handle for a write held for a fork or a sub-agent isn't found there. The
-   * framework's own callers keep the '' they've always had, which their
-   * traces and checks take as a write not stored yet.
+   * addMessage's. The write is stored at once whatever its agent's turn
+   * (#291), and its stored id returned; it enters the agent's window at the
+   * agent's next presentation point, or at once while no turn of it is
+   * alive. Only while a surgery's hold keeps the write in memory is the id
+   * '', and the write is stored at the hold's release.
    *
    * With `forAgent`, the write is for the named agent's window, which must
    * be registered when the write is made: a name that isn't, or the empty
    * one, which addMessage would read as none (deliveryAgent), throws, naming
    * the registered ones, as queryMessages does. The framework's own writes
-   * log and drop instead, as a held write does whose agent is gone by its
-   * flush. A write for an ephemeral run or a conversation fork, whose
-   * window nothing reads after its release, is marked (PRIMARY_IF_UNREAD_KEY),
-   * so the release passes it to the primary if its target never read it,
-   * as it passes a notice (passOnFromReleasedWindow). A write that names no
-   * agent is stamped for the agents that take untargeted inbound in the
-   * slot it lands in (untargetedAudience, #291); one with `forAgent` for
-   * that agent.
+   * log and drop instead. A write for an ephemeral run or a conversation
+   * fork, whose window nothing reads after its release, is marked
+   * (PRIMARY_IF_UNREAD_KEY), so the release passes it to the primary if its
+   * target never read it, as it passes a notice (releaseWindow). A write
+   * that names no agent is stamped for the agents that take untargeted
+   * inbound in the slot it lands in (untargetedAudience, #291); one with
+   * `forAgent` for that agent.
    */
   private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId {
     if (opts?.forAgent !== undefined && (opts.forAgent === '' || !this.agents.has(opts.forAgent))) {
@@ -28824,63 +27271,17 @@ export class AgentFramework {
     // other write.
     const forRun = opts?.forAgent !== undefined
       && (this.ephemeralRuns.has(opts.forAgent) || this.registry.homeChannel(opts.forAgent) !== undefined);
-    const placement: { deferredId?: string } = {};
-    const id = this.addMessage(participant, content, forRun ? { ...metadata, [PRIMARY_IF_UNREAD_KEY]: true } as MessageMetadata : metadata, {
-      placement, ...(opts?.forAgent !== undefined ? { forAgent: opts.forAgent } : {}), ...(forRun ? { markedForRun: true as const } : {}),
+    return this.addMessage(participant, content, forRun ? { ...metadata, [PRIMARY_IF_UNREAD_KEY]: true } as MessageMetadata : metadata, {
+      ...(opts?.forAgent !== undefined ? { forAgent: opts.forAgent } : {}), ...(forRun ? { markedForRun: true as const } : {}),
     });
-    return placement.deferredId === undefined ? id : heldHandle(placement.deferredId);
   }
 
-  /**
-   * The writes the framework holds for the store `reader` reads, in queue
-   * order: those addressed to it and, when it's an ordinary resident, those
-   * addressed to any ordinary resident, since residents share one message
-   * slot (their `ownSlot` in the registry). A write whose target is gone isn't among them:
-   * no module reads that agent's store, and the write waits for its window's
-   * release (drainDeferredFor) or, at its flush, is dropped (addMessage), a
-   * failed reply, or a channel notice its reader could act on, passing to the
-   * primary as its notice, and a module's write for a run as written
-   * (passesToPrimary, queuedNoticeForPrimary).
-   */
-  private heldWritesFor(reader: Agent): DeferredWrite[] {
-    const heldFor = (m: DeferredWrite): boolean => {
-      const target = this.deliveryAgent(m.forAgent);
-      return !!target && (target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)));
-    };
-    this.settleUnknownLandings(heldFor);
-    return this.deferredMessages.filter(heldFor).sort(bySeq);
-  }
-
-  /**
-   * The writes held for `reader`'s store (heldWritesFor) as the rows a
-   * module's context reads: each under its handle, marked `held`, and
-   * `heldFromResidents` too when its metadata carries a tune-out's stamp
-   * (asModuleRow), with the participant, content and metadata it was
-   * written with, the time it was first held as its timestamp, and a
-   * sequence after every row the store holds, in queue order. The sequence
-   * and timestamp are provisional: the stored row has the store's own.
-   */
-  private heldRows(reader: Agent): ModuleMessage[] {
-    const writes = this.heldWritesFor(reader);
-    if (writes.length === 0) return [];
-    const cm = reader.getContextManager();
-    const count = cm.getMessageCount();
-    const last = count > 0 ? cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-    return writes.map((m, i) => asModuleRow({
-      id: heldHandle(m.id),
-      sequence: last + 1 + i,
-      participant: m.participant,
-      content: m.content,
-      metadata: m.metadata,
-      timestamp: new Date(m.heldAt),
-      held: true as const,
-    }));
-  }
-
-  /** The row a held write landed as, found by the id it's stored with
-   *  (`metadata.deferredWriteId`): the first, for a body stored in shards,
-   *  as addMessage answers a stored write. Null when it hasn't landed, or is
-   *  no longer in the store. */
+  /** The row a write an earlier release held landed as, found by the id
+   *  it's stored with (`metadata.deferredWriteId`): the first, for a body
+   *  stored in shards, as addMessage answers a stored write. Null when it
+   *  hasn't landed, or is no longer in the store. A module that kept the
+   *  `held:` handle such a release gave it reaches the row through it, for
+   *  one release (heldWriteId). */
   private landedRow(cm: ContextManager, writeId: string): StoredMessage | null {
     try {
       return cm.queryMessages({ metadata: { deferredWriteId: writeId } }).messages[0] ?? null;
@@ -28903,90 +27304,9 @@ export class AgentFramework {
   }
 
   /**
-   * Settle held writes whose landing is unknown (DeferredWrite.landing),
-   * among those `which` picks, before a path reads or changes held writes:
-   * each is looked up by its id in its target's store (landedCopiesById).
-   * Found, the write landed (settleFound), where its copy sits, a known
-   * limit (writeDrainedInOrder). Not found, the mark goes, and it's an
-   * ordinary held write, which is persisted as an edit is. Where the store
-   * can't be searched, it stays marked, a doubt each path reads by its own
-   * rule.
-   */
-  private settleUnknownLandings(which: (msg: DeferredWrite) => boolean): void {
-    let unmarked = false;
-    for (const msg of this.deferredMessages.filter((m) => m.landing === 'unknown' && which(m))) {
-      // No registered agent: no store it could have landed in. A flush
-      // writes it, and addMessage drops it.
-      const agent = this.deliveryAgent(msg.forAgent);
-      if (!agent) continue;
-      const found = this.landedCopiesById(agent, msg.id);
-      if (found === undefined) continue;
-      if (found.length > 0) {
-        this.settleFound(msg, agent, found[0]!.id, { count: found.length, sharded: found[0]!.bodyGroupId !== undefined });
-      } else {
-        delete msg.landing;
-        unmarked = true;
-      }
-    }
-    if (unmarked && (this.quiesced || this.deferredWritesPersisted)) this.persistDeferredWrites();
-  }
-
-  /**
-   * A marked held write found to have landed, as `stored`: it leaves the
-   * pending queue for the un-acked set, as a drained write does, so it stays
-   * in the durable queue until the next ack has synced the store that holds
-   * it, and it's a stored write from then on, so the paths for a landed
-   * write apply to it. It takes the notes a store takes (noteStored), which
-   * its first write missed when it threw, as a flush that finds such a write
-   * takes them (readdDrained), and is logged by its id. It isn't carried
-   * into a turn, as a flush that finds it carries it: the agent reads it at
-   * its next compile, where the store holds it.
-   */
-  private settleFound(msg: DeferredWrite, agent: Agent, stored: MessageId, landed: { count?: number; sharded: boolean; named?: true }): void {
-    this.deferredMessages = this.deferredMessages.filter((m) => m !== msg);
-    this.unackedDeferredWrites.push(msg);
-    this.noteStored(agent, msg.metadata, stored);
-    this.logDeferredWriteError(msg, `held writes for ${agent.name}`, undefined, { ...landed, foundLater: true });
-  }
-
-  /**
-   * A stored row a module names by its id: where it carries the
-   * deferredWriteId of a marked held write the reader's store holds, it's
-   * that write's copy, so the write landed, and it's settled as found
-   * (settleFound) before the row is read or changed. A lookup by the id
-   * can't be needed then, so this holds where the store can't be searched
-   * too. One row of a sharded body says it's a shard, without a count,
-   * since one row doesn't tell how many landed.
-   */
-  private settleByCopy(reader: Agent, row: { id: MessageId; metadata?: unknown; bodyGroupId?: string } | null): void {
-    const writeId = (row?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
-    if (!row || typeof writeId !== 'string') return;
-    const msg = this.deferredMessages.find((m) => m.id === writeId && m.landing === 'unknown');
-    const target = msg ? this.deliveryAgent(msg.forAgent) : undefined;
-    if (!msg || !target || !(target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)))) return;
-    const sharded = row.bodyGroupId !== undefined;
-    this.settleFound(msg, target, row.id, { ...(sharded ? {} : { count: 1 }), sharded, named: true });
-  }
-
-  /** A held write whose landing stays unknown after settling, its store
-   *  unsearchable, can't be edited or removed: it may already be stored, and
-   *  changing only the queued entry could leave its stored copy as it was.
-   *  Throws with nothing changed. */
-  private refuseUnsettled(msg: DeferredWrite): void {
-    if (msg.landing !== 'unknown') return;
-    throw new Error(
-      `held write ${heldHandle(msg.id)} may already be stored, and its store can't be searched to tell, so ` +
-      `nothing was changed. It's refused the same way while the store can't be searched; the host log names ` +
-      `the store's error`,
-    );
-  }
-
-  /**
    * Whether a wake for a row it reads (InferenceRequest.readsRow) has
-   * nothing left for the agent to do, on evidence only. A held handle
-   * (heldHandle) names a write still in the deferred queue when its wake was
-   * queued, judged by deferredWriteDone. Any other id names a stored row: it
-   * is done once it is gone from the agent's store on its current branch
+   * nothing left for the agent to do, on evidence only. The row is done once
+   * it is gone from the agent's store on its current branch
    * (removed, or left on a branch the agent has switched from, where a turn
    * now would find nothing of it), or once an answered request's consumed
    * watermark covers it and the agent has spoken where the wake asks
@@ -28995,8 +27315,6 @@ export class AgentFramework {
    * the wake, such as a store that can't be read.
    */
   private rowDone(agent: Agent, readsRow: string, to: PublishDestination | undefined): boolean {
-    const writeId = heldWriteId(readsRow as MessageId);
-    if (writeId !== undefined) return this.deferredWriteDone(agent, writeId, to);
     try {
       const cm = agent.getContextManager();
       const row = cm.getMessage(readsRow as MessageId);
@@ -29022,85 +27340,48 @@ export class AgentFramework {
     return to === undefined || agent.publishedAfterReading(destinationKey(to), row, cm);
   }
 
-  /** Whether a wake for a deferred write has nothing left for the agent to
-   *  do, on evidence only (the queue arm of rowDone). The write's row is
-   *  covered by an answered request's watermark, and the agent has spoken
-   *  where the wake asks (answeredCovers). Or the
-   *  write is in neither the queue (drained entries not yet stored
-   *  included) nor the store's current branch: removed, or left on a
-   *  branch the agent has switched from, where a turn now would find
-   *  nothing of it (switching back brings it back unread, with no wake, as
-   *  main's wake spent on this branch leaves it). Any doubt keeps the
-   *  wake, such as a watermark that a branch switch or an undo left on
-   *  another branch, or a store that can't be read: a turn that finds
-   *  nothing new costs less than a write no wake brings the agent to read
-   *  or answer. */
-  private deferredWriteDone(agent: Agent, writeId: string, to: PublishDestination | undefined): boolean {
-    // Settled first, so a write that landed is judged by its stored row; one
-    // still a doubt stays queued, which keeps the wake.
-    this.settleUnknownLandings((m) => m.id === writeId);
-    if (this.deferredMessages.some((m) => m.id === writeId)) return false;
-    try {
-      const cm = agent.getContextManager();
-      const row = this.landedRow(cm, writeId);
-      // No row yet for a write drained from the queue and still to be stored
-      // (un-acked); one stored and awaiting a sync is judged by its row.
-      if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
-      return this.answeredCovers(agent, cm, row, to);
-    } catch (error) {
-      console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
-      return false;
-    }
-  }
-
   /**
    * The mark a wake for `agentName` takes for the row it was queued with
    * (`placement`, addMessage's out-param), so the scheduler can drop the
    * wake once the row needs nothing more of the agent (rowDone). Set only
-   * when the row wasn't presented to that agent at its write: a write
-   * deferred for it (`deferredId`, as its held handle, until the queue
-   * goes), or one stored and not presented to it (`presented: false`, set
-   * where the agent's turn was alive). A row stored for an agent with no
-   * turn alive is read by the turn its wake starts, so that wake stays
-   * plain; so does another agent's wake.
+   * when the row wasn't presented to that agent at its write (`presented:
+   * false`, set where the agent's turn was alive). A row stored for an agent
+   * with no turn alive is read by the turn its wake starts, so that wake
+   * stays plain; so does another agent's wake.
    */
   private readsRowFor(placement: WritePlacement | undefined, agentName: string): { readsRow?: string } {
     if (!placement || placement.agent !== agentName) return {};
-    if (placement.deferredId) return { readsRow: heldHandle(placement.deferredId) };
     if (placement.messageId && placement.presented === false) return { readsRow: placement.messageId };
     return {};
   }
 
   // A module context's reads, edits and removals, and a process answer's,
-  // go to the store addMessage writes by default, and take a held write's
-  // handle as well as a stored id. A handle reaches the write while it's
-  // held for that store, and its stored row once it lands. A handle whose
-  // write the framework dropped names nothing, as an unknown id does: the
+  // go to the store addMessage writes by default, by a stored id. For one
+  // release they also take the `held:` handle a release before #291 gave a
+  // write it held (heldWriteId), which reaches the row the write landed as
+  // (landedRow), as a module may have kept one across the upgrade. A handle
+  // whose write was never stored names nothing, as an unknown id does: the
   // store answers it.
+
+  /** A module's id as the store knows it: a stored id as it is, and an
+   *  earlier release's `held:` handle as the row its write landed as, or
+   *  the handle itself, which the store doesn't hold, when it never landed. */
+  private storedIdOf(cm: ContextManager, id: MessageId): MessageId {
+    const writeId = heldWriteId(id);
+    if (writeId === undefined) return id;
+    return this.landedRow(cm, writeId)?.id ?? id;
+  }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {
     const agent = this.deliveryAgent();
     if (!agent) {
       throw new Error('No agents configured');
     }
-    // As the store's own edit does, and before a held write's content is
-    // replaced: a malformed edit leaves the write as it was.
+    // As the store's own edit does: a malformed edit changes nothing.
     const malformed = malformedContentPlaces(content);
     if (malformed.length > 0) throw new MalformedContentError(`Edit of ${id} refused`, malformed);
-    // The held writes are settled first (heldWritesFor), and by a stored id
-    // the row it names too (settleByCopy): a held write that landed is a
-    // stored row from then on, and the edit reaches it as one.
-    const writeId = heldWriteId(id);
-    const held = this.heldWritesFor(agent).find((m) => writeId !== undefined && m.id === writeId);
-    if (writeId === undefined) this.settleByCopy(agent, agent.getContextManager().getMessage(id));
-    if (held) {
-      this.refuseUnsettled(held);
-      held.content = content;
-      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-      return;
-    }
-    const landed = writeId !== undefined ? this.landedRow(agent.getContextManager(), writeId) : null;
-    agent.getContextManager().editMessage(landed?.id ?? id, content);
+    const cm = agent.getContextManager();
+    cm.editMessage(this.storedIdOf(cm, id), content);
   }
 
   private removeMessage(id: MessageId): void {
@@ -29108,21 +27389,8 @@ export class AgentFramework {
     if (!agent) {
       throw new Error('No agents configured');
     }
-    // The held writes are settled first (heldWritesFor), and by a stored id
-    // the row it names too (settleByCopy), so a held write that landed is
-    // removed as the stored row it is, and isn't written again at the next
-    // flush.
-    const writeId = heldWriteId(id);
-    const held = this.heldWritesFor(agent).find((m) => writeId !== undefined && m.id === writeId);
-    if (writeId === undefined) this.settleByCopy(agent, agent.getContextManager().getMessage(id));
-    if (held) {
-      this.refuseUnsettled(held);
-      this.deferredMessages = this.deferredMessages.filter((m) => m.id !== writeId);
-      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-      return;
-    }
-    const landed = writeId !== undefined ? this.landedRow(agent.getContextManager(), writeId) : null;
-    removeStoredMessage(agent.getContextManager(), landed?.id ?? id);
+    const cm = agent.getContextManager();
+    removeStoredMessage(cm, this.storedIdOf(cm, id));
   }
 
   private getMessage(id: MessageId): ModuleMessage | null {
@@ -29130,15 +27398,10 @@ export class AgentFramework {
     if (!agent) {
       return null;
     }
+    const cm = agent.getContextManager();
     const writeId = heldWriteId(id);
-    // By a handle, heldRows settles the held writes first; by a stored id,
-    // the row's own write is settled by it (settleByCopy).
-    const stored = writeId === undefined ? agent.getContextManager().getMessage(id) : null;
-    if (writeId === undefined) this.settleByCopy(agent, stored);
-    const row = writeId === undefined
-      ? stored
-      : this.heldRows(agent).find((held) => held.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
-    return row ? asModuleRow(row) : null;
+    const row = writeId === undefined ? cm.getMessage(id) : this.landedRow(cm, writeId);
+    return row ? asModuleRow(row, cm) : null;
   }
 
   /** The refusal of a module's `forAgent` that names no registered agent:
@@ -29158,9 +27421,12 @@ export class AgentFramework {
   }
 
   /** A module's query (ModuleContext.queryMessages): the delivery agent's
-   *  window (the primary's, or the first agent's when none is primary), or
+   *  store (the primary's, or the first agent's when none is primary), or
    *  the named agent's, which must be registered: an unknown name, or the
-   *  empty one, throws, naming the registered ones, as a write's does. */
+   *  empty one, throws, naming the registered ones, as a write's does. The
+   *  rows come in store order, each marked `held` where it isn't in that
+   *  agent's window (#291: stored and not yet presented to it, or taken out
+   *  of it as an undone turn's), and the count is the store's. */
   private queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): { messages: ModuleMessage[]; totalCount: number } {
     // A name given is a name: it doesn't fall back to the primary, as
     // deliveryAgent's would for the empty one, which is refused, as a
@@ -29172,20 +27438,8 @@ export class AgentFramework {
       return { messages: [], totalCount: 0 };
     }
     const cm = agent.getContextManager();
-    const held = this.heldRows(agent).filter((row) => matchesMessageQuery(row, filter));
-    if (held.length === 0) {
-      const stored = cm.queryMessages(filter);
-      return { ...stored, messages: stored.messages.map(asModuleRow) };
-    }
-    // The stored rows, then the held ones, reversed and cut to the limit as
-    // the store's own query does it: it matches every row, then reverses,
-    // then cuts.
-    const { limit, reverse, ...match } = filter;
-    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages.map(asModuleRow), ...held];
-    const totalCount = messages.length;
-    if (reverse) messages = messages.reverse();
-    if (limit !== undefined && limit < messages.length) messages = messages.slice(0, limit);
-    return { messages, totalCount };
+    const stored = cm.queryMessages(filter);
+    return { ...stored, messages: stored.messages.map((row) => asModuleRow(row, cm)) };
   }
 
   private createFrameworkState(): FrameworkState {
@@ -33664,8 +31918,8 @@ export class AgentFramework {
    * open again as a cancel leaves it, under the tune-out's own source, so an
    * agent's tune-out keeps the agent's provenance (the housekeeping guard
    * reads it). A log line names the channel and says how many of the
-   * messages it diverted are held here, stored or still queued to be
-   * written, which nothing will now deliver as its backlog.
+   * messages it diverted are stored here, which nothing will now deliver as
+   * its backlog.
    */
   private endTuneOutsWithoutCoordinator(): void {
     const registry = this.channelRegistry;
@@ -33675,9 +31929,7 @@ export class AgentFramework {
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
     for (const { serverId, channelId, params, source } of registry.tuneOutsOnRecord()) {
       const diverted = typeof params.epochId !== 'string' ? 0
-        : (primary?.getContextManager().getAllMessages() ?? []).filter(ofEpoch(params.epochId)).length +
-          this.deferredMessages.filter((m) => (m.forAgent ?? this.primaryAgentName) === this.primaryAgentName)
-            .filter(ofEpoch(params.epochId)).length;
+        : (primary?.getContextManager().getAllMessages() ?? []).filter(ofEpoch(params.epochId)).length;
       const held = diverted === 0 ? ''
         : diverted === 1 ? ' The 1 message it diverted stays here, and nothing will deliver it as its backlog.'
         : ` The ${diverted} messages it diverted stay here, and nothing will deliver them as its backlog.`;
@@ -34335,15 +32587,12 @@ export class AgentFramework {
   }
 
   /**
-   * Make delivered messages durable now, including those the delivery left
-   * in the deferred queue: a tune-out release flips durable epoch state
-   * first, so its dump must not be lost to a crash in between (#232 gap 6).
+   * Make delivered messages durable now: a tune-out release flips durable
+   * epoch state first, so its dump, stored at once, must not be lost to a
+   * crash in between (#232 gap 6). A dump a surgery's hold keeps is in
+   * memory until the hold's release.
    */
   private commitDeliveries(): void {
-    if (this.deferredMessages.length > 0) {
-      this.deferredWritesPersisted = true;
-      this.persistDeferredWrites();
-    }
     try {
       this.store.sync();
     } catch (err) {

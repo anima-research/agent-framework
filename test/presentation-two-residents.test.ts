@@ -1,6 +1,6 @@
 /**
  * #291's reproduction: two residents of one slot whose turns overlap. With
- * the presentation index (FrameworkConfig.presentationIndex), each
+ * the presentation index, which every framework has since AF-6, each
  * resident's window is the rows its own requests carried, in the order they
  * carried them, whatever the shared record's order: a row another writer
  * stored during a resident's turn enters its window at its tool boundary,
@@ -131,7 +131,6 @@ describe("two residents' overlapping turns, each in a window of its own (#291)",
       modules: [gates, surface],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
-      presentationIndex: true,
     } as never);
     const cmOf = (name: string): ContextManager => framework.getAgent(name)!.getContextManager();
     const names = ['mira', 'oren'] as const;

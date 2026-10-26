@@ -574,15 +574,13 @@ export interface InferenceRequest {
    *  to its agent at its write, because a turn of the agent's was alive: a
    *  coalesced render its turn being assembled doesn't read (wakeToRead), or
    *  a message, notice or event whose wake was queued with it. It is the
-   *  stored row's id, or, while the write still waits in the framework's
-   *  deferred queue, its held handle (`held:` and the queue entry's id).
-   *  Once a request that carried the row was answered (an answered
-   *  request's consumed watermark covers it, in the agent's window once its
-   *  context presents rows) and, for a wake that carries a channel, the
-   *  agent has since published into that channel having read it, or once
-   *  the row is in neither the agent's queue nor its store's current
-   *  branch, the wake starts no turn. A row stored and not yet presented to
-   *  the agent keeps its wake. */
+   *  stored row's id. Once a request that carried the row was answered (an
+   *  answered request's consumed watermark covers it, in the agent's window
+   *  once its context presents rows) and, for a wake that carries a
+   *  channel, the agent has since published into that channel having read
+   *  it, or once the row is not on its store's current branch, the wake
+   *  starts no turn. A row stored and not yet presented to the agent keeps
+   *  its wake. */
   readsRow?: string;
   agentName: string;
   reason: string;

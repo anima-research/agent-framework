@@ -11,14 +11,13 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import { GateModule } from './helpers/dendrite.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import {
-  type Stored, SUB, internals, textOf, stored, held, has, find, AMBIENT, MENTION,
+  type Stored, SUB, internals, textOf, stored, held, has, find, inWindow, AMBIENT, MENTION,
   incoming, dm, registerOpen, enter, settle, channellessTurnLocus, blockInTool,
 } from './helpers/admission.js';
 
@@ -126,9 +125,9 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  // A held message is stored at once, whatever the resident's turn (#291,
-  // AF-5): it was deferred behind the turn and stored at its tool boundary,
-  // and is now in the store while the tool still waits, so its reader has it.
+  // A held message is stored at once, whatever the resident's turn (#291):
+  // it was deferred behind the turn and stored at its tool boundary, and is
+  // now in the store while the tool still waits, so its reader has it.
   it('gap 5 — a held message arriving mid-turn is stored at once, not injected into the live turn', async () => {
     const gate = new GateModule();
     const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
@@ -138,7 +137,6 @@ describe('admission: the hold is decided once, before any side effect', () => {
       const { loop } = await blockInTool(f, gate);
       await incoming(f, 'noisy', 'n1', 'held while acting');
       await eventually(() => has(f, 'held while acting'), 'held message stored while the tool waits');
-      assert.ok(!internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('held while acting')), 'and nothing of it is queued');
       gate.release('g1');
       await loop;
       assert.ok(held(find(f, 'held while acting')), 'stored with the hold record');
@@ -151,9 +149,9 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  // A held message arriving mid-turn is stored at once now (#291, AF-5), so
-  // the release reads it from the record; one a quiesce queues is still read
-  // from the queue (the twin below), until the queue goes (AF-6).
+  // A held message arriving mid-turn is stored at once now (#291), so the
+  // release reads it from the record, as it does one stored while quiesced
+  // (the twin below).
   it('gap 7 — a held message stored mid-turn, before the cancel, is in the release', async () => {
     const gate = new GateModule();
     const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
@@ -175,7 +173,9 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  it('gap 7 (quiesce) — a held message a quiesce queues is in a release made during it', async () => {
+  // Ported for #291: a write while quiesced is stored at once, where this
+  // test once had the quiesce queue it and the release read the queue.
+  it('gap 7 (quiesce) — a held message stored while quiesced is in a release made during it', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'work', 'noisy');
@@ -185,54 +185,45 @@ describe('admission: the hold is decided once, before any side effect', () => {
       // As admission stores a held message (a quiesce pauses the MCPL data
       // plane, so this one comes in past it), for the primary.
       (f.framework as unknown as { addMessage(p: string, c: unknown[], m: Record<string, unknown>): string })
-        .addMessage('antra', [{ type: 'text', text: 'queued by the quiesce' }], {
+        .addMessage('antra', [{ type: 'text', text: 'stored while quiesced' }], {
           tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
         });
-      assert.ok(internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('queued by the quiesce')), 'premise: the quiesce queued it');
+      assert.ok(has(f, 'stored while quiesced'), 'premise: stored at once');
       assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
       f.alwaysRespond();
       await f.framework.resume();
       await eventually(() => has(f, '<tuned-out-backlog'), 'the release lands at resume');
       const release = textOf(find(f, '<tuned-out-backlog'));
-      assert.match(release, /messages=1/, 'the queued message is counted');
-      assert.match(release, /antra: queued by the quiesce/, 'and listed');
+      assert.match(release, /messages=1/, 'the message is counted');
+      assert.match(release, /antra: stored while quiesced/, 'and listed');
     } finally { await f.close(); }
   });
 
-  it('gap 6 — a release deferred behind a live turn is durable, and a boot that finds it re-wakes the resident', async () => {
+  // Ported for #291: a release made behind a live turn is stored at once, so
+  // nothing waits in memory for a crash to lose, and no queue file is
+  // written. This test once checked the release was persisted in the
+  // deferral queue's recovery file and re-woke the resident at the boot
+  // that found it; such a file an earlier release left is the importer's
+  // now (deferred-import-boot.test.ts).
+  it('gap 6 — a release made behind a live turn is stored at once, with no queue file, and enters the window once the turn ends', async () => {
     const gate = new GateModule();
     const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
     const recovery = join(f.dir, 'store', 'recovery', 'deferred-writes.json');
-    let saved: string;
     try {
       await registerOpen(f, 'work', 'noisy');
       enter(f, 'noisy', { backlogCap: 10 });
       const { loop } = await blockInTool(f, gate);
       await incoming(f, 'noisy', 'n1', 'held before the crash');
-      // Stored at once (#291, AF-5), where it was deferred behind the turn;
-      // the release itself, for the resident, still waits for the turn.
       await eventually(() => has(f, 'held before the crash'), 'held message stored');
       assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
-      // The epoch is ended durably; the release, still deferred, is too.
-      assert.ok(existsSync(recovery), 'the deferred queue was persisted by the cancel');
-      saved = readFileSync(recovery, 'utf8');
-      assert.match(saved, /tune-out-cancel/, 'the release is in the durable queue');
+      assert.match(textOf(find(f, '<tuned-out-backlog')), /antra: held before the crash/, 'the release is stored while the tool waits');
+      assert.equal(inWindow(f, '<tuned-out-backlog'), false, "out of the live turn's window");
+      assert.equal(existsSync(recovery), false, 'no queue file is written');
       f.alwaysRespond();
       gate.release('g1');
       await loop;
+      await eventually(() => inWindow(f, '<tuned-out-backlog'), 'the release enters the window once the turn ends');
     } finally { await f.close(); }
-
-    // A fresh process over a store that never saw the release land: the
-    // same file, found at boot.
-    const dir = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
-    const deferredWritesPath = join(dir, 'deferred-writes.json');
-    writeFileSync(deferredWritesPath, saved!);
-    const g = await fixture({ framework: { subconscious: SUB, deferredWritesPath } as Partial<FrameworkConfig>, dir });
-    try {
-      const pending = (g.framework as unknown as { pendingRequests: Array<{ agentName: string; reason: string }> }).pendingRequests;
-      assert.ok(pending.some((r) => r.agentName === 'agent' && /tune-out released/.test(r.reason)), 'the restored release owes the resident its wake');
-      assert.match(textOf(find(g, '<tuned-out-backlog')), /antra: held before the crash/, 'the release landed at boot');
-    } finally { await g.close(); }
   });
 
   it('gap 9 — channel_close on a tuned-out channel is refused: its cancel is what ends the hold, and the release follows', async () => {

@@ -7,10 +7,10 @@
  * it in; a tool boundary of a turn alive when it arrived injected it into
  * that turn; and a cancel's backlog left it out while it was still held. It
  * is stored at once, whatever the residents' turns (#291, AF-5), so its
- * readers have it while a resident is busy, and none of the cases here
- * meets it queued: a quiesce or a surgery's hold still queues one, which
- * tune-out-cancel-held and admission-e2e cover. The channel and its traffic
- * come from test/tune-out-e2e.test.ts's MCPL fixture.
+ * readers have it while a resident is busy. Since #291 a module's reads also
+ * mark `held` a row that isn't in the window of the agent the read is for
+ * (AF-6), which a message a tune-out holds from the residents never is. The
+ * channel and its traffic come from test/tune-out-e2e.test.ts's MCPL fixture.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -61,7 +61,6 @@ interface Internals {
     getAllMessages(): Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     compile(): Promise<{ messages: Array<{ content: ContentBlock[] }> }>;
   } }>;
-  deferredMessages: Array<{ seq: number; content: ContentBlock[] }>;
   channelRegistry: {
     listChannelsRaw(): unknown[];
     getDesiredState(serverId: string, channelId: string): string | undefined;
@@ -179,7 +178,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       const heldRow = rowWith(rows, 'T1-HELD')!;
       assert.ok(heldRow.metadata?.tuneOut, 'the stored message carries the tune-out stamp');
       assert.equal(heldRow.heldFromResidents, true, 'queryMessages marks it');
-      assert.equal(heldRow.held, undefined, 'a stored row, not a held write');
+      assert.equal(heldRow.held, true, "and, in no resident's window, held from the one the read is for");
       assert.equal(ctx.getMessage(heldRow.id)?.heldFromResidents, true, 'getMessage marks it');
       const ordinary = rows.find((m) => m.id === ordinaryId)!;
       assert.equal('heldFromResidents' in ordinary, false, 'an ordinary row from queryMessages has no mark');
@@ -224,8 +223,9 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
   // A held message arriving during a turn is stored at once (#291, AF-5):
   // until AF-5 it was deferred behind the turn as a held write, read through
   // its held handle, and stored at the turn's tool boundary. A module's own
-  // write during the turn is still held, and still reaches the live turn.
-  it("stores a tuned-out message that arrives during a turn at once, keeps it out of that turn, and marks it; a module's own write is still held", async () => {
+  // write during the turn is stored at once too (AF-6), marked held until
+  // the live turn's boundary presents it, and reaches the live turn.
+  it("stores a tuned-out message that arrives during a turn at once, keeps it out of that turn, and marks it; a module's own write is held until the boundary", async () => {
     const { framework, ctx, module, membrane, internals, emit, close } = await open();
     let release: () => void = () => {};
     try {
@@ -248,11 +248,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       await within("the resident's tool", inTool);
       const stream = membrane.lastStream!;
       emit('t2b', 'T2-HELD chatter while the turn is alive');
-      await waitFor('the held message stored', () => {
-        const row = rowWith(ctx.queryMessages({}).messages, 'T2-HELD');
-        return !!row && row.held === undefined;
-      });
-      assert.ok(!internals.deferredMessages.some((m) => textOf(m).includes('T2-HELD')), 'none of it is queued');
+      await waitFor('the held message stored', () => !!rowWith(ctx.queryMessages({}).messages, 'T2-HELD'));
       const plainHandle = ctx.addMessage('user', [{ type: 'text', text: 'T2-PLAIN a module write while the turn is alive' }]);
 
       // The stored held row is marked as any stored held row is; the module's
@@ -260,14 +256,14 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       const rows = ctx.queryMessages({}).messages;
       const heldRow = rowWith(rows, 'T2-HELD')!;
       assert.ok(heldRow.metadata?.tuneOut, 'the stored message carries the stamp');
-      assert.equal(heldRow.held, undefined, 'a stored row, not a held write');
       assert.equal(heldRow.heldFromResidents, true, 'marked');
       assert.equal(rowWith(rows, 'T2-STORED')?.heldFromResidents, true, 'as is the one stored before the turn');
       assert.equal(ctx.getMessage(heldRow.id)?.heldFromResidents, true, 'getMessage marks it by its stored id');
       const plain = rowWith(rows, 'T2-PLAIN')!;
-      assert.equal(plain.held, true, "the module's own write is held");
-      assert.equal('heldFromResidents' in plain, false, 'a held write without the stamp has no mark');
-      assert.equal('heldFromResidents' in ctx.getMessage(plainHandle)!, false, 'nor by its handle');
+      assert.equal(plain.id, plainHandle, "the module's own write is answered by its stored id");
+      assert.equal(plain.held, true, 'held: out of the live turn\'s window');
+      assert.equal('heldFromResidents' in plain, false, 'a write without the stamp has no such mark');
+      assert.equal('heldFromResidents' in ctx.getMessage(plainHandle)!, false, 'nor by its id');
 
       // At the tool boundary the module's write is stored and handed to the
       // live turn; the tuned-out one, stored already, isn't, as its compiled
@@ -320,8 +316,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       emit('t3d', 'T3-HELD-2 more chatter while the turn is alive');
       await waitFor('both held messages stored', () => {
         const rows = ctx.queryMessages({}).messages;
-        return rowWith(rows, 'T3-HELD-1')?.held === undefined && rowWith(rows, 'T3-HELD-2')?.held === undefined
-          && !!rowWith(rows, 'T3-HELD-1') && !!rowWith(rows, 'T3-HELD-2');
+        return !!rowWith(rows, 'T3-HELD-1') && !!rowWith(rows, 'T3-HELD-2');
       });
       ctx.addMessage('user', [{ type: 'text', text: 'T3-PLAIN a module write while the turn is alive' }]);
 
@@ -335,7 +330,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       assert.ok(dumpText.includes('T3-STORED-2'), 'the dump carries the newer message stored before the turn');
       assert.ok(dumpText.includes('T3-HELD-1') && dumpText.includes('T3-HELD-2'), 'and both stored during it');
       assert.ok(!dumpText.includes('T3-STORED-1'), 'the cap cuts the oldest');
-      assert.ok(!dumpText.includes('T3-PLAIN'), 'a held write without the stamp stays out');
+      assert.ok(!dumpText.includes('T3-PLAIN'), 'a write without the stamp stays out');
       const sub = internals.agents.get('Subconscious')!.getContextManager();
       const noticeOf = (): string | undefined =>
         sub.getAllMessages().map(textOf).find((t) => t.includes('[Tune-out cancelled:'));
@@ -390,8 +385,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       emit('t4b', 'T4-HELD-2 more chatter while the turn is alive');
       await waitFor('both held messages stored', () => {
         const rows = ctx.queryMessages({}).messages;
-        return rowWith(rows, 'T4-HELD-1')?.held === undefined && rowWith(rows, 'T4-HELD-2')?.held === undefined
-          && !!rowWith(rows, 'T4-HELD-1') && !!rowWith(rows, 'T4-HELD-2');
+        return !!rowWith(rows, 'T4-HELD-1') && !!rowWith(rows, 'T4-HELD-2');
       });
 
       // The cap of 1 shows the newest raw; the subconscious reports on the rest.
@@ -437,17 +431,21 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as never);
       await within("the resident's tool", inTool);
+      // The subconscious's own turn is alive while they arrive, as when it
+      // writes its note: they stay out of its window until that turn's end
+      // (#291). This token stands in for that turn.
+      const turns = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
+      turns.set('Subconscious', -1);
       emit('t5a', 'T5-HELD-1 chatter while the turn is alive');
       emit('t5b', 'T5-HELD-2 more chatter while the turn is alive');
       await waitFor('both held messages stored', () => {
         const rows = ctx.queryMessages({}).messages;
-        return rowWith(rows, 'T5-HELD-1')?.held === undefined && rowWith(rows, 'T5-HELD-2')?.held === undefined
-          && !!rowWith(rows, 'T5-HELD-1') && !!rowWith(rows, 'T5-HELD-2');
+        return !!rowWith(rows, 'T5-HELD-1') && !!rowWith(rows, 'T5-HELD-2');
       });
 
       // The cancel cancel_tuneout makes, with the subconscious as its source
-      // and a note, though called here while only the resident's turn runs:
-      // the note was written before the held messages could be seen.
+      // and a note: the note was written before the held messages could be
+      // seen.
       assert.ok(internals.tuneOutCoordinator!.cancel('disc', CHANNEL, 'subconscious', 'subconscious judgment', 'Someone needs you here.').ok);
       await waitFor('the dump', () => !!rowWith(ctx.queryMessages({}).messages, '<tuned-out-backlog'));
       const dumpText = textOf(rowWith(ctx.queryMessages({}).messages, '<tuned-out-backlog')!);
@@ -459,6 +457,9 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       await waitFor("the subconscious's report notice", () => noticeOf() !== undefined);
       assert.ok(noticeOf()!.includes('2 of its held messages came in after you last looked; your view has them now.'), noticeOf());
       assert.deepEqual(reportOf(internals)!.held, [], 'no held row follows it');
+      // Its turn's end presents them.
+      turns.delete('Subconscious');
+      (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('Subconscious'));
       const view = (await sub.compile()).messages.map(textOf).join('\n');
       assert.ok(view.includes('T5-HELD-1') && view.includes('T5-HELD-2'), "the subconscious's view holds both");
       const pending = (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
@@ -496,10 +497,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       const filler = 'chatter while the turn is alive, '.repeat(6).trim();
       for (const n of [1, 2, 3, 4]) {
         emit(`t6${n}`, `T6-HELD-${n} ${filler}`);
-        await waitFor(`held message ${n} stored`, () => {
-          const row = rowWith(ctx.queryMessages({}).messages, `T6-HELD-${n}`);
-          return !!row && row.held === undefined;
-        });
+        await waitFor(`held message ${n} stored`, () => !!rowWith(ctx.queryMessages({}).messages, `T6-HELD-${n}`));
       }
 
       assert.ok(internals.tuneOutCoordinator!.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
@@ -515,26 +513,4 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
     }
   });
 
-  it("the cancel's backlog of held writes settles one whose landing was unknown first, so a write that landed is in the stored rows alone", async () => {
-    const { framework, internals, close } = await open();
-    try {
-      // A held write whose first write landed, though its store couldn't be
-      // read to tell (agent-framework's DeferredWrite.landing).
-      framework.getAgent('scout')!.getContextManager().addMessage('Antra', [{ type: 'text', text: 'T7-LANDED' }], { deferredWriteId: 'w-tune' } as never);
-      (internals.deferredMessages as unknown as Array<Record<string, unknown>>).push({
-        id: 'w-tune', seq: 1, participant: 'Antra', content: [{ type: 'text', text: 'T7-LANDED' }], heldAt: Date.now(), landing: 'unknown',
-      });
-      const hooks = (internals.tuneOutCoordinator as unknown as { hooks: { getDeferredMessages(): Array<{ content: ContentBlock[] }> } }).hooks;
-      const error = console.error;
-      console.error = () => {};
-      let held: string[];
-      try { held = hooks.getDeferredMessages().map(textOf); } finally { console.error = error; }
-      assert.ok(!held.includes('T7-LANDED'), 'not among the held writes');
-      const stored = internals.agents.get('scout')!.getContextManager().getAllMessages().filter((m) => textOf(m) === 'T7-LANDED');
-      assert.equal(stored.length, 1, 'in the stored rows, once');
-      assert.ok(!(internals.deferredMessages as unknown as Array<{ id: string }>).some((m) => m.id === 'w-tune'), 'and no longer queued');
-    } finally {
-      await close();
-    }
-  });
 });

@@ -1,25 +1,28 @@
 /**
- * A module reads, edits and removes the writes the framework holds for it
- * (F198). addMessage holds a write while its agent's turn is alive or the
- * host is quiesced, and stores it at a later boundary. Before, the module's
- * context answered such a write's id as '', its queries didn't see it, and
- * its edits and removals threw "Message not found", so a Discord delete
- * during the hold left the message in the agent's history, an edit was
- * lost, and a history sync stored a second copy. These run through the real
- * ModuleContextImpl, holding writes by quiescing the host, which takes the
- * same branch of addMessage as a live turn.
+ * A module reads, edits and removes its writes by their stored ids, whether
+ * or not the agent has been shown them yet (F198, #291). A write is stored at
+ * once, whatever the agent's turn, and enters the agent's window at its next
+ * presentation point; until then a module's reads mark it `held`, so a
+ * Discord delete or edit before anyone is shown the message changes what the
+ * agent is shown, and a history sync finds the row it already stored. These
+ * run through the real ModuleContextImpl, keeping writes out of the window by
+ * quiescing the host, which a live turn does too.
+ *
+ * Before #291 such a write waited in a deferred queue and the module was
+ * answered a `held:` handle for it. For one release a handle a module kept
+ * across the upgrade still reaches the row its write was stored as, which
+ * the boot import of an earlier release's queue stores under the write's id.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import type { MessageQuery, StoredMessage } from '@animalabs/context-manager';
+import type { MessageQuery } from '@animalabs/context-manager';
 import type { AgentConfig, EventResponse, Module, ModuleContext, ModuleMessage, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { matchesMessageQuery } from '../src/held-writes.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 class ProbeModule implements Module {
@@ -99,82 +102,74 @@ async function waitFor(description: string, predicate: () => boolean, timeoutMs 
 
 const notFound = (id: string) => (error: unknown) => error instanceof Error && error.message === `Message not found: ${id}`;
 
-test('a module reads a held write: addMessage answers a handle, and getMessage and queryMessages answer its row, marked held, after the stored rows, until the write lands', async () => {
+/** The queue a release before #291 left beside the store, as its recovery file held it. */
+function writeEarlierQueue(storePath: string, pending: unknown[]): void {
+  mkdirSync(join(storePath, 'recovery'), { recursive: true });
+  writeFileSync(join(storePath, 'recovery', 'deferred-writes.json'), JSON.stringify({ version: 2, pending }));
+}
+
+const present = (framework: AgentFramework): void =>
+  (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('assistant'));
+
+test('a module\'s write while quiesced is stored at once: addMessage answers its stored id, and getMessage and queryMessages answer its row, marked held until the agent is shown it', async () => {
   await withProbe(async ({ framework, ctx }) => {
     const storedId = ctx.addMessage('user', text('stored first'), external('s1'));
-    assert.ok(!storedId.startsWith('held:'), `a write that isn't held is stored: ${storedId}`);
     assert.equal(
       (ctx.getState<{ externalIdMap: Record<string, string> }>()!).externalIdMap['probe:s1'],
       storedId,
       "a stored write's entry is its id",
     );
     await framework.quiesce({ reason: 'test' });
-    const before = Date.now();
-    const handle = ctx.addMessage('user', text('held'), { external: { source: 'probe', id: 'h1' }, channelId: 'c1' } as never);
-    const after = Date.now();
-    assert.match(handle, /^held:./);
+    const id = ctx.addMessage('user', text('held'), { external: { source: 'probe', id: 'h1' }, channelId: 'c1' } as never);
+    assert.ok(id && !id.startsWith('held:'), `a stored id, not a handle: ${id}`);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    assert.ok(cm.getMessage(id as never), 'stored at once');
 
     const all = ctx.queryMessages({ source: 'probe' });
-    assert.equal(all.totalCount, 2);
+    assert.equal(all.totalCount, 2, "the store's count");
     const [stored, held] = all.messages as [ModuleMessage, ModuleMessage];
-    assert.equal(stored.id, storedId);
-    assert.equal(stored.held, undefined, 'a stored row is not marked');
-    assert.equal(held.id, handle);
-    assert.equal(held.held, true);
-    assert.equal(held.participant, 'user');
+    assert.deepEqual([stored.id, held.id], [storedId, id], 'in store order, by their stored ids');
+    assert.equal(stored.held, undefined, 'a row the window holds is not marked');
+    assert.equal(held.held, true, "a row out of the agent's window is");
     assert.deepEqual(held.content, text('held'));
-    assert.equal((held.metadata?.external as { id: string }).id, 'h1');
-    assert.ok(held.sequence > stored.sequence, 'after the stored rows');
-    const heldAt = held.timestamp.getTime();
-    assert.ok(heldAt >= before && heldAt <= after, 'the time the write was held');
-    const again = ctx.queryMessages({ source: 'probe' }).messages[1]!;
-    assert.deepEqual([again.sequence, again.timestamp.getTime()], [held.sequence, heldAt], 'the same on every read');
-    assert.deepEqual(ctx.getMessage(handle), held);
-
-    // A filter applies to held rows as to stored ones.
-    assert.deepEqual(ctx.queryMessages({ source: 'probe', externalIds: ['s1'] }).messages.map((m) => m.id), [storedId]);
-    assert.deepEqual(ctx.queryMessages({ metadata: { 'external.id': 'h1' } }).messages.map((m) => m.id), [handle]);
-    assert.deepEqual(ctx.queryMessages({ participant: 'someone else' }).messages, []);
-    assert.equal(ctx.findMessageByExternalId('probe', 'h1'), handle);
+    assert.ok(held.sequence > stored.sequence);
+    assert.deepEqual(ctx.getMessage(id), held);
+    assert.deepEqual(ctx.queryMessages({ metadata: { 'external.id': 'h1' } }).messages.map((m) => m.id), [id]);
+    assert.equal(ctx.findMessageByExternalId('probe', 'h1'), id);
     assert.equal(
       (ctx.getState<{ externalIdMap: Record<string, string> }>()!).externalIdMap['probe:h1'],
-      '',
-      'the persisted entry keeps the \'\' an earlier release can read back, not the handle',
+      id,
+      'the persisted entry is the stored id',
     );
 
     await framework.resume();
-    const landed = ctx.getMessage(handle);
-    assert.ok(landed && !landed.id.startsWith('held:'), 'once the write lands, the handle names its stored row');
-    assert.equal(landed.held, undefined);
-    assert.deepEqual(landed.content, text('held'));
+    const shown = ctx.getMessage(id)!;
+    assert.equal(shown.held, undefined, 'once the agent is shown it, it is not marked');
     assert.deepEqual(
       ctx.queryMessages({ source: 'probe' }).messages.map((m) => [m.id, m.held]),
-      [[storedId, undefined], [landed.id, undefined]],
-    );
-    assert.equal(ctx.findMessageByExternalId('probe', 'h1'), landed.id);
-    assert.equal(
-      (ctx.getState<{ externalIdMap: Record<string, string> }>()!).externalIdMap['probe:h1'],
-      landed.id,
-      'the entry now holds the stored id',
+      [[storedId, undefined], [id, undefined]],
     );
   });
 });
 
-test('a write held for a live turn is answered by a handle as well', async () => {
+test('a write during a live turn is answered by its stored id as well, marked held until the turn\'s end presents it', async () => {
   await withProbe(async ({ framework, ctx }) => {
     const turns = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
     turns.set('assistant', 1);
+    let id: string;
     try {
-      const handle = ctx.addMessage('user', text('during a turn'));
-      assert.match(handle, /^held:./);
-      assert.equal(ctx.getMessage(handle)?.held, true);
+      id = ctx.addMessage('user', text('during a turn'));
+      assert.ok(id && !id.startsWith('held:'), id);
+      assert.equal(ctx.getMessage(id)?.held, true);
     } finally {
       turns.delete('assistant');
     }
+    present(framework);
+    assert.equal(ctx.getMessage(id)?.held, undefined);
   });
 });
 
-test('removing a held write drops it, so it is never stored, and editing one stores it as edited', async () => {
+test('removing a write before the agent is shown it takes it out of the store, and editing one changes what the agent is shown', async () => {
   await withProbe(async ({ framework, ctx }) => {
     await framework.quiesce({ reason: 'test' });
     const gone = ctx.addMessage('user', text('taken back'));
@@ -188,12 +183,15 @@ test('removing a held write drops it, so it is never stored, and editing one sto
     );
 
     await framework.resume();
-    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages().map(textOf);
-    assert.deepEqual(texts.filter((t) => ['taken back', 'as first sent', 'as edited'].includes(t)), ['as edited']);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const shown = (rows: Array<{ content: ContentBlock[] }>) =>
+      rows.map(textOf).filter((t) => ['taken back', 'as first sent', 'as edited'].includes(t));
+    assert.deepEqual(shown(cm.getAllMessages()), ['as edited'], 'the store');
+    assert.deepEqual(shown(cm.getPresentedMessages()), ['as edited'], 'and the window');
   });
 });
 
-test("a process answer's removals and edits reach held writes too", async () => {
+test("a process answer's removals and edits reach a write the agent isn't shown yet too", async () => {
   await withProbe(async ({ framework, ctx, module }) => {
     framework.start();
     await framework.quiesce({ reason: 'test' });
@@ -205,7 +203,7 @@ test("a process answer's removals and edits reach held writes too", async () => 
     assert.equal(textOf(ctx.getMessage(kept)!), 'the answer edited');
 
     await framework.resume();
-    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages().map(textOf);
+    const texts = framework.getAgent('assistant')!.getContextManager().getPresentedMessages().map(textOf);
     assert.deepEqual(
       texts.filter((t) => t.startsWith('the answer')),
       ['the answer edited'],
@@ -213,40 +211,54 @@ test("a process answer's removals and edits reach held writes too", async () => 
   });
 });
 
-test('once a held write has landed, an edit or removal by its handle reaches its stored row', async () => {
-  await withProbe(async ({ framework, ctx }) => {
-    await framework.quiesce({ reason: 'test' });
-    const handle = ctx.addMessage('user', text('lands'));
-    await framework.resume();
+test('for one release, the held: handle an earlier release answered reaches the row the boot import stored its write as', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
+  const storePath = join(dir, 'store');
+  await (await open(storePath)).framework.stop();
+  writeEarlierQueue(storePath, [{ id: 'w1', seq: 1, participant: 'user', content: text('queued before the upgrade') }]);
+  const probe = await open(storePath);
+  try {
+    const { framework, ctx } = probe;
+    const handle = 'held:w1';
     const cm = framework.getAgent('assistant')!.getContextManager();
-    const landedId = ctx.getMessage(handle)!.id;
-    ctx.editMessage(handle, text('edited once it landed'));
-    assert.equal(textOf(cm.getMessage(landedId)!), 'edited once it landed');
+    const row = ctx.getMessage(handle);
+    assert.ok(row && !row.id.startsWith('held:'), 'the handle names the stored row');
+    assert.equal(textOf(row), 'queued before the upgrade');
+    ctx.editMessage(handle, text('edited by its handle'));
+    assert.equal(textOf(cm.getMessage(row.id)!), 'edited by its handle');
     ctx.removeMessage(handle);
-    assert.equal(cm.getMessage(landedId), null);
-    assert.equal(ctx.getMessage(handle), null);
-  });
+    assert.equal(cm.getMessage(row.id), null);
+    assert.equal(ctx.getMessage(handle), null, 'and nothing once its row is gone');
+  } finally {
+    await probe.framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test("a write whose metadata a module copied from a stored row doesn't carry the framework's deferredWriteId, so a handle never names the copy", async () => {
-  await withProbe(async ({ framework, ctx }) => {
-    await framework.quiesce({ reason: 'test' });
-    const handle = ctx.addMessage('user', text('the original'), external('c1'));
-    await framework.resume();
+test("a write whose metadata a module copied from an imported row doesn't carry the framework's deferredWriteId, so a handle never names the copy", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
+  const storePath = join(dir, 'store');
+  await (await open(storePath)).framework.stop();
+  writeEarlierQueue(storePath, [{ id: 'c1', seq: 1, participant: 'user', content: text('the original'), metadata: { external: { source: 'probe', id: 'c1' } } }]);
+  const probe = await open(storePath);
+  try {
+    const { ctx } = probe;
+    const handle = 'held:c1';
     const original = ctx.getMessage(handle)!;
-    assert.equal(typeof original.metadata?.deferredWriteId, 'string');
+    assert.equal(original.metadata?.deferredWriteId, 'c1');
     const copy = ctx.addMessage('user', text('a copy'), { ...original.metadata } as never);
     assert.equal(ctx.getMessage(copy)!.metadata?.deferredWriteId, undefined, 'the copy is stored without it');
     ctx.removeMessage(original.id);
     assert.equal(ctx.getMessage(handle), null, 'the handle names nothing once its row is gone');
-  });
+  } finally {
+    await probe.framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test('a handle whose write is gone names nothing, as an unknown id does', async () => {
-  await withProbe(async ({ framework, ctx }) => {
-    await framework.quiesce({ reason: 'test' });
-    const handle = ctx.addMessage('user', text('gone'));
-    ctx.removeMessage(handle);
+test('a handle whose write was never stored names nothing, as an unknown id does', async () => {
+  await withProbe(async ({ ctx }) => {
+    const handle = 'held:never-stored';
     assert.equal(ctx.getMessage(handle), null);
     assert.throws(() => ctx.editMessage(handle, text('too late')), notFound(handle));
     assert.throws(() => ctx.removeMessage(handle), notFound(handle));
@@ -254,24 +266,23 @@ test('a handle whose write is gone names nothing, as an unknown id does', async 
   });
 });
 
-test("an external id's entry of '' that a release before handles left is looked up in the store and repaired, and one with nothing stored answers null", async () => {
+test("an external id's entry of '' that an earlier release left is looked up in the store and repaired, and one with nothing stored answers null", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
   const storePath = join(dir, 'store');
   let probe = await open(storePath);
   try {
     const stored = probe.ctx.addMessage('user', text('landed'), external('e1'));
-    await probe.framework.quiesce({ reason: 'test' });
-    const handle = probe.ctx.addMessage('user', text('still held'), external('e2'));
     await probe.framework.stop();
 
-    // What a release before handles left in the module's state: '' for
-    // each write it held, whether it has landed since (e1), is still held
-    // (e2), or was taken back (gone).
+    // What an earlier release left: '' in the module's state for each write
+    // it held, whether it had landed since (e1), was still queued (e2, in its
+    // queue's record), or was taken back (gone).
     const store = JsStore.openOrCreate({ path: storePath });
     const stateId = 'modules/probe/state';
     const state = (store.getStateJson(stateId) ?? {}) as Record<string, unknown>;
     store.setStateJson(stateId, { ...state, externalIdMap: { 'probe:e1': '', 'probe:e2': '', 'probe:gone': '' } });
     store.close();
+    writeEarlierQueue(storePath, [{ id: 'q2', seq: 1, participant: 'user', content: text('still queued'), metadata: { external: { source: 'probe', id: 'e2' } } }]);
 
     probe = await open(storePath);
     const { ctx } = probe;
@@ -281,44 +292,43 @@ test("an external id's entry of '' that a release before handles left is looked 
       'the entries as that release left them',
     );
     assert.equal(ctx.findMessageByExternalId('probe', 'e1'), stored);
-    assert.equal(ctx.findMessageByExternalId('probe', 'e2'), handle, 'a held write answers its handle, which a restart keeps');
+    const imported = ctx.findMessageByExternalId('probe', 'e2');
+    assert.ok(imported && !imported.startsWith('held:'), 'the queued write, stored at boot, by its stored id');
+    assert.equal(textOf(ctx.getMessage(imported)!), 'still queued');
     assert.equal(ctx.findMessageByExternalId('probe', 'gone'), null);
     assert.deepEqual(
       ctx.getState<{ externalIdMap: Record<string, string> }>()!.externalIdMap,
-      { 'probe:e1': stored, 'probe:e2': '', 'probe:gone': '' },
-      'set to the stored id, and kept as \'\' while held or with nothing found',
+      { 'probe:e1': stored, 'probe:e2': imported, 'probe:gone': '' },
+      "set to the stored id, and kept as '' with nothing found",
     );
-
-    await probe.framework.resume();
-    const landed = ctx.findMessageByExternalId('probe', 'e2');
-    assert.ok(landed && !landed.startsWith('held:'));
-    assert.equal(textOf(ctx.getMessage(landed)!), 'still held');
   } finally {
     await probe.framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("in a module's start(), a write the last process held doesn't show yet, so a lookup there answers null and keeps its entry, and finds the write once create() is done", async () => {
+test("in a module's start(), a write an earlier release left queued isn't stored yet, so a lookup there answers null and keeps its entry, and finds the write once create() is done", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
   const storePath = join(dir, 'store');
   let probe = await open(storePath);
   try {
-    await probe.framework.quiesce({ reason: 'test' });
-    const handle = probe.ctx.addMessage('user', text('held at the stop'), external('b1'));
     await probe.framework.stop();
+    const store = JsStore.openOrCreate({ path: storePath });
+    const stateId = 'modules/probe/state';
+    const state = (store.getStateJson(stateId) ?? {}) as Record<string, unknown>;
+    store.setStateJson(stateId, { ...state, externalIdMap: { 'probe:b1': '' } });
+    store.close();
+    writeEarlierQueue(storePath, [{ id: 'q1', seq: 1, participant: 'user', content: text('held at the stop'), metadata: { external: { source: 'probe', id: 'b1' } } }]);
 
     const inStart: { found?: string | null; entry?: string } = {};
     probe = await open(storePath, {}, (ctx) => {
       inStart.found = ctx.findMessageByExternalId('probe', 'b1');
       inStart.entry = ctx.getState<{ externalIdMap: Record<string, string> }>()!.externalIdMap['probe:b1'];
     });
-    assert.deepEqual(inStart, { found: null, entry: '' }, 'create() restores the queue after start(), and the entry stays');
-    assert.equal(probe.ctx.findMessageByExternalId('probe', 'b1'), handle, 'the held write, once create() is done');
-    await probe.framework.resume();
-    const landed = probe.ctx.findMessageByExternalId('probe', 'b1');
-    assert.ok(landed && !landed.startsWith('held:'), 'its stored id once it lands');
-    assert.equal(textOf(probe.ctx.getMessage(landed)!), 'held at the stop');
+    assert.deepEqual(inStart, { found: null, entry: '' }, 'create() imports the queue after start(), and the entry stays');
+    const found = probe.ctx.findMessageByExternalId('probe', 'b1');
+    assert.ok(found && !found.startsWith('held:'), 'its stored id once create() is done');
+    assert.equal(textOf(probe.ctx.getMessage(found)!), 'held at the stop');
   } finally {
     await probe.framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -329,12 +339,11 @@ test("a lookup by external id doesn't answer the id of a row that's gone, whatev
   await withProbe(async ({ framework, ctx, module }) => {
     framework.start();
     await framework.quiesce({ reason: 'test' });
-    const handle = ctx.addMessage('user', text('held, then stored'), external('r1'));
+    const id = ctx.addMessage('user', text('stored while quiesced'), external('r1'));
     await framework.resume();
-    const landed = ctx.findMessageByExternalId('probe', 'r1');
-    assert.ok(landed && !landed.startsWith('held:'), 'the entry is set to the stored id');
-    // Removed through the handle the module kept, which names that row.
-    ctx.removeMessage(handle);
+    assert.equal(ctx.findMessageByExternalId('probe', 'r1'), id, 'the entry is the stored id');
+    // Removed through the context, by the id it answered.
+    ctx.removeMessage(id);
     assert.equal(ctx.findMessageByExternalId('probe', 'r1'), null);
 
     // Removed by a process answer, which doesn't go through the context.
@@ -346,27 +355,26 @@ test("a lookup by external id doesn't answer the id of a row that's gone, whatev
   });
 });
 
-test('with two rows under one external id, a lookup for a held write answers the first, and an entry whose row is gone answers null', async () => {
+test('with two rows under one external id, a lookup answers the one its entry names, and an entry whose row is gone answers null', async () => {
   await withProbe(async ({ framework, ctx, module }) => {
     framework.start();
     const first = ctx.addMessage('user', text('stored first'), external('d1'));
     await framework.quiesce({ reason: 'test' });
-    const second = ctx.addMessage('user', text('held second'), external('d1'));
-    assert.equal(ctx.findMessageByExternalId('probe', 'd1'), first, 'while the second is held');
+    const second = ctx.addMessage('user', text('stored second, not shown yet'), external('d1'));
+    assert.equal(ctx.findMessageByExternalId('probe', 'd1'), second, 'the entry names the newest write under the id');
     await framework.resume();
-    assert.ok(!ctx.getMessage(second)!.id.startsWith('held:'), 'the second has landed');
-    assert.equal(ctx.findMessageByExternalId('probe', 'd1'), first, 'once the second has landed');
-    // The entry names the first row now, and once that row is gone the entry
-    // goes, though the second is still stored under the external id.
-    module.answer = { removeMessages: [first] };
+    // Once that row is gone the entry goes, though the first is still stored
+    // under the external id.
+    module.answer = { removeMessages: [second] };
     ctx.pushEvent({ type: 'module-event', source: 'probe', eventType: 'answer', payload: null });
-    await waitFor('the answer to be applied', () => ctx.getMessage(first) === null);
+    await waitFor('the answer to be applied', () => ctx.getMessage(second) === null);
     assert.equal(ctx.findMessageByExternalId('probe', 'd1'), null);
     assert.equal(ctx.getState<{ externalIdMap: Record<string, string> }>()!.externalIdMap['probe:d1'], undefined);
+    assert.ok(ctx.getMessage(first), 'the first row stays');
   });
 });
 
-test("a module sees the writes held for every ordinary resident, which share its store, and not those held for an isolated one's", async () => {
+test("a module reading the primary's store sees a write stored for another ordinary resident, which shares it, marked held, and not one for an isolated agent's store", async () => {
   await withProbe(async ({ framework, ctx }) => {
     await framework.quiesce({ reason: 'test' });
     const add = (framework as unknown as {
@@ -374,8 +382,8 @@ test("a module sees the writes held for every ordinary resident, which share its
     }).addMessage.bind(framework);
     add('user', text('for shade'), undefined, { forAgent: 'shade' });
     add('user', text('for the subconscious'), undefined, { forAgent: 'Subconscious' });
-    assert.equal(framework.getHostModeStatus().deferredWrites, 2, 'both writes are held');
-    assert.deepEqual(ctx.queryMessages({}).messages.filter((m) => m.held).map(textOf), ['for shade']);
+    assert.deepEqual(ctx.queryMessages({}).messages.filter((m) => m.held).map(textOf), ['for shade'],
+      "stored in the residents' slot, and not in scout's window");
   }, {
     agents: [
       { name: 'scout', model: 'test-model', systemPrompt: 'test' },
@@ -385,115 +393,7 @@ test("a module sees the writes held for every ordinary resident, which share its
   });
 });
 
-test('edits and removals of held writes reach the persisted queue, so a restart finds them as the module left them, with the time each was held', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
-  const storePath = join(dir, 'store');
-  let probe = await open(storePath);
-  try {
-    await probe.framework.quiesce({ reason: 'test' });
-    const gone = probe.ctx.addMessage('user', text('taken back'));
-    const kept = probe.ctx.addMessage('user', text('as first sent'));
-    const heldAt = probe.ctx.getMessage(kept)!.timestamp.getTime();
-    // What a crash leaves after each: the queue file as it stands.
-    const file = join(storePath, 'recovery', 'deferred-writes.json');
-    const queued = () => (JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ content: ContentBlock[] }> }).pending.map(textOf);
-    probe.ctx.removeMessage(gone);
-    assert.deepEqual(queued(), ['as first sent'], 'the removal reaches the file');
-    probe.ctx.editMessage(kept, text('as edited'));
-    assert.deepEqual(queued(), ['as edited'], 'and so does the edit');
-    await probe.framework.stop();
-
-    probe = await open(storePath);
-    const { ctx } = probe;
-    assert.deepEqual(ctx.queryMessages({}).messages.filter((m) => m.held).map((m) => [m.id, textOf(m)]), [[kept, 'as edited']]);
-    assert.equal(ctx.getMessage(kept)!.timestamp.getTime(), heldAt, 'the time it was first held, kept with the queue');
-
-    await probe.framework.resume();
-    const texts = probe.framework.getAgent('assistant')!.getContextManager().getAllMessages().map(textOf);
-    assert.deepEqual(texts.filter((t) => ['taken back', 'as first sent', 'as edited'].includes(t)), ['as edited']);
-  } finally {
-    await probe.framework.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('while a live turn holds a write in a queue that is persisted, an edit or removal of it reaches the file', async () => {
-  await withProbe(async ({ framework, ctx, storePath }) => {
-    await framework.quiesce({ reason: 'test' });
-    const kept = ctx.addMessage('user', text('held for the turn'));
-    const gone = ctx.addMessage('user', text('taken back'));
-    // resume() flushes what no live turn holds, and keeps these for the turn.
-    const turns = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
-    turns.set('assistant', 1);
-    try {
-      await framework.resume();
-      assert.equal(framework.getHostModeStatus().quiesced, false);
-      assert.equal(framework.getHostModeStatus().deferredWrites, 2);
-      const file = join(storePath, 'recovery', 'deferred-writes.json');
-      const queued = () => (JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ content: ContentBlock[] }> }).pending.map(textOf);
-      ctx.removeMessage(gone);
-      assert.deepEqual(queued(), ['held for the turn']);
-      ctx.editMessage(kept, text('edited in the turn'));
-      assert.deepEqual(queued(), ['edited in the turn']);
-    } finally {
-      turns.delete('assistant');
-    }
-  });
-});
-
-test('a held write that a queue written before held times has no time for, or a time that is no time, reads as held when the queue was read back', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
-  const storePath = join(dir, 'store');
-  let probe = await open(storePath);
-  try {
-    await probe.framework.quiesce({ reason: 'test' });
-    for (const t of ['no time', 'not a time', 'past a Date', 'before a Date', 'its own time']) probe.ctx.addMessage('user', text(t));
-    await probe.framework.stop();
-
-    const file = join(storePath, 'recovery', 'deferred-writes.json');
-    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
-    const own = doc.pending[4]!.heldAt;
-    assert.equal(typeof own, 'number');
-    delete doc.pending[0]!.heldAt;
-    doc.pending[1]!.heldAt = 'yesterday';
-    // A Date holds times within 8.64e15 ms of the epoch, either side.
-    doc.pending[2]!.heldAt = 9e15;
-    doc.pending[3]!.heldAt = -9e15;
-    writeFileSync(file, JSON.stringify(doc));
-
-    const before = Date.now();
-    probe = await open(storePath);
-    const after = Date.now();
-    const times = probe.ctx.queryMessages({}).messages.filter((m) => m.held).map((m) => [textOf(m), m.timestamp.getTime()] as const);
-    assert.equal(times.length, 5);
-    for (const [t, time] of times.slice(0, 4)) assert.ok(time >= before && time <= after, `${t}: read back at boot, not ${time}`);
-    assert.deepEqual(times[4], ['its own time', own]);
-  } finally {
-    await probe.framework.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('a held write that goes back into the queue keeps the time it was first held', async () => {
-  await withProbe(async ({ framework, ctx }) => {
-    await framework.quiesce({ reason: 'test' });
-    const handle = ctx.addMessage('user', text('held twice'));
-    const heldAt = ctx.getMessage(handle)!.timestamp.getTime();
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    // A drain whose write is held again, as a turn-end flush is when a
-    // successor turn has begun: here the host is still quiesced.
-    const internals = framework as unknown as {
-      drainDeferredFor(agentName: string): unknown[];
-      readdDrained(entries: unknown[], where: string): unknown[];
-    };
-    internals.readdDrained(internals.drainDeferredFor('assistant'), 'test');
-    const row = ctx.getMessage(handle)!;
-    assert.equal(row.held, true);
-    assert.equal(row.timestamp.getTime(), heldAt);
-  });
-});
-
-test('a query over stored and held rows reverses and cuts to its limit as the store does', async () => {
+test('a query reverses and cuts to its limit as the store does, over rows shown and not', async () => {
   await withProbe(async ({ framework, ctx }) => {
     const s1 = ctx.addMessage('user', text('s1'), external('s1'));
     const s2 = ctx.addMessage('user', text('s2'), external('s2'));
@@ -503,48 +403,8 @@ test('a query over stored and held rows reverses and cuts to its limit as the st
     // The context takes the store's query, which has `limit` and `reverse`.
     const query = (filter: MessageQuery) => ctx.queryMessages(filter as never);
     const newest = query({ source: 'probe', reverse: true, limit: 3 });
-    assert.deepEqual(newest.messages.map((m) => m.id), [h2, h1, s2]);
+    assert.deepEqual(newest.messages.map((m) => [m.id, m.held]), [[h2, true], [h1, true], [s2, undefined]]);
     assert.equal(newest.totalCount, 4);
     assert.deepEqual(query({ source: 'probe', limit: 1 }).messages.map((m) => m.id), [s1]);
-  });
-});
-
-test("held rows match a filter as context-manager's own query matches stored rows", async () => {
-  await withProbe(async ({ framework }) => {
-    const cm = framework.getAgent('assistant')!.getContextManager();
-    const rows: Array<[string, Record<string, unknown> | undefined]> = [
-      ['alice', { external: { source: 'discord', id: 'm1' }, channelId: 'c1', nested: { a: { b: 1 } } }],
-      ['bob', { external: { source: 'discord', id: 'm2' }, channelId: 'c2' }],
-      ['alice', { external: { source: 'slack', id: '' } }],
-      ['carol', { flag: null, zero: 0, external: 'not an object' }],
-      ['dave', undefined],
-    ];
-    for (const [participant, metadata] of rows) cm.addMessage(participant, text(participant), metadata as never);
-    const filters: MessageQuery[] = [
-      {},
-      { source: 'discord' },
-      { source: 'slack' },
-      { externalIds: [] },
-      { externalIds: ['m1', 'm2'] },
-      { externalIds: [''] },
-      { participant: 'alice' },
-      { source: 'discord', participant: 'bob' },
-      { metadata: { channelId: 'c1' } },
-      { metadata: { 'nested.a.b': 1 } },
-      { metadata: { 'nested.a': { b: 1 } } },
-      { metadata: { flag: null } },
-      { metadata: { zero: 0 } },
-      { metadata: { missing: undefined } },
-      { metadata: { 'external.source': 'discord', channelId: 'c2' } },
-      { metadata: { 'external.length': 12 } },
-    ];
-    const stored: StoredMessage[] = cm.getAllMessages();
-    for (const filter of filters) {
-      assert.deepEqual(
-        stored.filter((m) => matchesMessageQuery(m, filter)).map((m) => m.id),
-        cm.queryMessages(filter).messages.map((m) => m.id),
-        JSON.stringify(filter),
-      );
-    }
   });
 });
