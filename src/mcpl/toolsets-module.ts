@@ -482,9 +482,9 @@ export class ToolsetsModule implements Module {
     const p = c.presence;
     if (!p.tool(tool)) fail(`${c.serverId} has no tool "${tool}": ${META_TOOL_NAMES.look} {server:"${c.serverId}"} shows what's available`);
     const ts = p.toolsetOf(tool);
-    const where = [...p.view().entries()].filter(([, e]) => e.tools.has(tool)).map(([k]) => k);
     // The definition act would check, wherever act would take the tool.
-    const key = !p.shownAs(tool, 'dynamic') ? undefined : instance && ts ? keyOf(ts, instance) : where[0] ?? actKey(p, tool, undefined);
+    const open = !instance && hasInstances(p, ts) ? p.openRecords(ts) : [];
+    const key = !p.shownAs(tool, 'dynamic') ? undefined : actKey(p, tool, instance ?? (open.length === 1 ? open[0]!.instance : undefined));
     const def = key ? p.defOf(key, tool) : p.tool(tool)!;
     return textResult(`${renderToolDefinition(def)}\n${p.toolStatus(tool)}`);
   }

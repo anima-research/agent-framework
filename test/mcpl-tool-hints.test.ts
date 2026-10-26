@@ -1492,6 +1492,42 @@ async function movingServer(moved: Json[]) {
   return { t, moveAndHold, release: () => release?.() };
 }
 
+test('look naming a tool with no instance shows the definition act checks: the sole open instance\'s own', async () => {
+  const own = { name: 'play', instance: 'g1', visible: false, definition: { name: 'play', description: 'Play one of the legal points.', inputSchema: { type: 'object', properties: { point: { enum: ['C3'] } }, required: ['point'] } } };
+  const t = await setup((msg, peer, state) => {
+    if (msg.method !== 'toolsets/open') return false;
+    state.open.push({ toolset: 'game', instance: 'g1', title: 'Game g1' });
+    const hints = state.hint([own]);
+    // The statement restates the definition (RFC §6.1), so look's re-read keeps it.
+    state.statement = [own];
+    peer.reply(msg.id, { toolset: 'game', instance: 'g1', title: 'Game g1', _meta: { 'mcpl/hints': hints } });
+    return true;
+  });
+  try {
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game', instance: 'g1' });
+    const refused = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'play', args: { point: 'D4' } });
+    assert.match(resultText(refused), /must be one of "C3"/, 'act checks g1\'s own definition');
+    assert.match(await look(t.fw, { server: 'arc', tool: 'play' }), /Play one of the legal points\./, 'look shows the same one');
+  } finally { await t.done(); }
+});
+
+test('RFC-014 §4.2: a rebuild whose listing of a server breaks off tells none of that server\'s moves, and the tool list doesn\'t show them', async () => {
+  const moved = withPresence('peek', 'static');
+  const { t, moveAndHold, release } = await movingServer([moved[0]!, null as unknown as Json, ...moved.slice(1)]);
+  try {
+    await moveAndHold();
+    release();
+    // A rebuild that changes nothing a caller sees has no public sign of its end: this waits on the framework's own flag.
+    await waitFor(() => !(t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight, 'the rebuild ended');
+    await nextMacrotask();
+    assert.ok(!t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the tool list doesn\'t show peek');
+    assert.equal(notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length, 0, 'so the move isn\'t told');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
 test('RFC-014 §4.2: a tool a list moves to static is called both ways until the tool list shows it, then by its listed name', async () => {
   const { t, moveAndHold, release } = await movingServer(withPresence('peek', 'static'));
   try {

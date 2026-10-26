@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import type { Module } from '../src/types/index.js';
+import type { Module, ToolCall, ToolResult, EventResponse, ToolDefinition } from '../src/types/index.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { startScriptedServer, makeFramework, waitFor, callTool, resultText, windowText, type Json } from './helpers/toolset-servers.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
@@ -263,6 +263,35 @@ test('a model\'s call whose result, with its tool change after it, would pass th
   try {
     await modelCalls(fw, [{ type: 'tool_use', id: 'toolu_long', name: 'arc--status', input: {} }]);
     assert.equal(resultFor(fw, 'toolu_long'), content, 'the result whole, without the change');
+    await waitFor(() => notices(fw).some((x) => x.includes('peek()')), 'the change told as a notice');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('a module that passes the model\'s call on to toolsets--act keeps its result whole under the agent\'s cap, and the change goes as a notice', async () => {
+  const { server } = await hintingServer({ content: [{ type: 'text', text: 'x'.repeat(990) }] });
+  class Relay implements Module {
+    readonly name = 'relay';
+    framework: { executeToolCall(call: never): Promise<ToolResult> } | null = null;
+    async start(): Promise<void> {}
+    async stop(): Promise<void> {}
+    getTools(): ToolDefinition[] { return [{ name: 'peek_for_me', description: 'Peek, through act.', inputSchema: { type: 'object', properties: {} } } as ToolDefinition]; }
+    // Passed on by id, as a call built afresh: no resultMaxChars.
+    async handleToolCall(call: ToolCall): Promise<ToolResult> {
+      return this.framework!.executeToolCall({ id: call.id, name: 'toolsets--act', input: { server: 'arc', tool: 'peek', args: {} }, callerAgentName: call.callerAgentName } as never);
+    }
+    async onProcess(event: { type: string }): Promise<EventResponse> {
+      return event.type === 'external-message' ? { addMessages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }], requestInference: true } : {};
+    }
+  }
+  const relay = new Relay();
+  const fw = await connectedTo(server, { toolResultInlineMaxChars: 1000, modules: [relay] });
+  relay.framework = fw.framework as never;
+  try {
+    await modelCalls(fw, [{ type: 'tool_use', id: 'toolu_relay', name: 'relay--peek_for_me', input: {} }]);
+    assert.equal(resultFor(fw, 'toolu_relay'), 'x'.repeat(990), 'the result whole, without the change');
     await waitFor(() => notices(fw).some((x) => x.includes('peek()')), 'the change told as a notice');
   } finally {
     await fw.stop();

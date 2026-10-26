@@ -22470,8 +22470,9 @@ export class AgentFramework {
 
   private withWholeChange(agentName: string, call: ToolCall, result: ToolResult, change: string, maxChars: number | undefined): ToolResult | null {
     const joined = withChangeText(result, change);
-    const { text } = this.storedToolResultText(agentName, { id: call.id, name: call.name, input: call.input, result: joined, durationMs: 0 }, maxChars);
-    return text.endsWith(change.toWellFormed()) && (maxChars === undefined || text.length <= maxChars) ? joined : null;
+    const cap = maxChars ?? this.resultMaxCharsFor(agentName, call.id);
+    const { text } = this.storedToolResultText(agentName, { id: call.id, name: call.name, input: call.input, result: joined, durationMs: 0 }, cap);
+    return text.endsWith(change.toWellFormed()) && text.length <= cap ? joined : null;
   }
 
   private withActStateHint(call: ToolCall, serverId: string, error: unknown, text: string): string {
@@ -29794,9 +29795,9 @@ export class AgentFramework {
         // The static↔dynamic moves the lists made since the last rebuild
         // reach the tool list here (§4.2). The agent is told where each tool
         // went once this refresh publishes the list, and not by a refresh that
-        // doesn't: the moves stay pending for one that does.
+        // doesn't, or whose listing of the server breaks off: the moves stay
+        // pending for one that does.
         const presence = this.toolsetHub?.get(server.id);
-        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, moves: presence.presence.moves() });
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -29835,6 +29836,7 @@ export class AgentFramework {
           }
         }
         if (repeated.length > 0) repeats.push({ serverId: server.id, tools: repeated });
+        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, moves: presence.presence.moves() });
       } catch {
         // Server may not support tools/list — skip silently. A live server
         // whose handshake advertised no MCP `tools` has, in effect, listed
