@@ -96,7 +96,7 @@ export type Physical = Agreed | Pending | Interrupted;
 
 /**
  * Which directory a mount root is: its device and inode, and its birth time
- * in nanoseconds as Node reports it, where that is above zero, as decimal
+ * in nanoseconds as the runtime reports it, where that is above zero, as decimal
  * strings.
  */
 export interface RootIdentity {
@@ -115,8 +115,8 @@ function sameRootPath(a: string, b: string): boolean {
  * Whether two identities name the same directory: the same device and inode,
  * or the same inode and birth time on another device, since macOS can give a
  * volume another device number after a reboot. A birth time in whole seconds
- * doesn't count across devices: filesystems made in the same second give
- * their roots one inode (2 on ext4 and HFS+) and one birth time.
+ * doesn't count across devices: filesystems made in the same second can give
+ * their roots one inode (2 on ext4) and one birth time.
  */
 export function sameRootIdentity(a: RootIdentity, b: RootIdentity): boolean {
   if (a.ino !== b.ino) return false;

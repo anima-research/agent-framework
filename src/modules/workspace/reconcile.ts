@@ -1595,7 +1595,7 @@ export async function pushPaths(
   // chmod has no guard: stopped before it, disk keeps whatever mode it found,
   // which the next observation reads as disk's, and forced again, it applies
   // the store's.
-  if (plans.length > 0 || agreement.rootIdentity(mount.name) !== undefined) agreement.recordRootIdentity(mount.name, root.identity);
+  if (plans.length > 0) agreement.recordRootIdentity(mount.name, root.identity);
   const announced = plans.filter((step) => step.kind !== 'chmod');
   announced.forEach((step, i) => {
     agreement.intend(mount.name, step.path, {
