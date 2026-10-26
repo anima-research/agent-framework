@@ -28,7 +28,7 @@ import { heldWriteId } from './held-writes.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
-import { toolArgsProblems } from './tool-args.js';
+import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -317,11 +317,17 @@ export class ModuleRegistry {
    * A call whose input isn't an object, or lacks a key the tool's schema
    * requires, is answered before the module runs, with an error result that
    * opens "Nothing was done:" and names what to send (toolArgsProblems).
+   * So is a call membrane marked `unparseableInput`, unless its text is JSON
+   * `null`, which reaches the module as a call with no arguments
+   * (markedInputRefusal).
    * A caller that has already resolved the tool's definition, as the `utils`
    * tool has a utility's, passes it as `definition`, and it's checked against
    * that one.
    */
-  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+  async handleToolCall(given: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    const marked = markedInputRefusal(given);
+    if (marked !== undefined) return { success: false, error: marked, isError: true };
+    const call = asCalled(given);
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
