@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
 import type { Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 
 /**
@@ -129,24 +129,41 @@ const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentB
 
 class Surface implements Module {
   readonly name = 'surface';
+  framework?: AgentFramework;
+  heardWhileLooking?: string;
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] { return [{ name: 'look', description: 'Look at something.', inputSchema: { type: 'object', properties: {} } }]; }
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: 'what the tool saw' }; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    if (this.heardWhileLooking) {
+      this.framework!.pushEvent({ type: 'external-message', source: 'tui', content: this.heardWhileLooking, metadata: {}, triggerInference: false } as never);
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    return { success: true, data: 'what the tool saw' };
+  }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
-    return { addMessages: [{ participant: 'user', content: [text(String(event.content))] }], requestInference: true };
+    const wakes = (event as { triggerInference?: boolean }).triggerInference !== false;
+    return { addMessages: [{ participant: 'user', content: [text(String(event.content))] }], requestInference: wakes };
   }
 }
 
 async function rewindRig(
   script: NormalizedResponse[][],
   refusalHandling: Record<string, unknown>,
-  setup: { strategy?: unknown; onRequest?: (count: number, framework: AgentFramework) => void } = {},
+  setup: {
+    strategy?: unknown;
+    onRequest?: (count: number, framework: AgentFramework) => void;
+    heardWhileLooking?: string;
+  } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'refusal-rewind-'));
   const membrane = new MockMembrane();
+  if (setup.heardWhileLooking) membrane.supportsInjectedMessages = true;
+  const surface = new Surface();
+  surface.heardWhileLooking = setup.heardWhileLooking;
   const requests: NormalizedRequest[] = [];
+  const streams: MockYieldingStream[] = [];
   const streamYielding = membrane.streamYielding.bind(membrane);
   let replies = 0;
   membrane.streamYielding = (request, options) => {
@@ -154,13 +171,16 @@ async function rewindRig(
     setup.onRequest?.(requests.length, framework);
     const scripted = script.shift() ?? [];
     for (const response of scripted.length > 0 ? scripted : [createMockResponse([text(`reply ${++replies}`)])]) membrane.pushResponse(response);
-    return streamYielding(request, options);
+    const stream = streamYielding(request, options) as MockYieldingStream;
+    streams.push(stream);
+    return stream;
   };
   const framework: AgentFramework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
     agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout', refusalHandling, ...(setup.strategy ? { strategy: setup.strategy } : {}) }],
-    modules: [new Surface()],
+    modules: [surface],
   } as never);
+  surface.framework = framework;
   const say = async (content: string, until: number) => {
     framework.pushEvent({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true } as never);
     for (let i = 0; i < 200 && requests.length < until; i++) { await framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
@@ -169,7 +189,7 @@ async function rewindRig(
   const texts = (request: NormalizedRequest) => request.messages.map((m) => JSON.stringify(m.content));
   const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
   return {
-    framework, requests, say, texts, stored,
+    framework, requests, streams, say, texts, stored,
     close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
   };
 }
@@ -230,6 +250,7 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
       await rig.say('first question', 1);
       await rig.say('look at it', 3);
       assert.equal(rig.requests.length, 3, 'the turn, the stream whose tool round was refused, and the retry');
+      assert.match(JSON.stringify(rig.streams[1]!.receivedToolResults), /what the tool saw/, "the premise: the refused round's stream was given the tool's result");
       const retry = rig.requests[2]!;
       const sent = JSON.stringify(retry.messages);
       assert.doesNotMatch(sent, /what the tool saw/, "the tool's result is gone");
@@ -240,6 +261,42 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
     } finally { await rig.close(); }
   });
 }
+
+test('a message injected into the refused round is the newest turn it carried, and is shed first', async () => {
+  const call = { type: 'tool_use', id: 'look-1', name: 'surface--look', input: {} } as ContentBlock;
+  const toolCall = createMockResponse([text('let me look'), call], 'tool_use');
+  const refusedRound = {
+    ...createMockResponse([text('let me look'), call, { type: 'tool_result', toolUseId: 'look-1', content: 'what the tool saw' } as ContentBlock], 'refusal'),
+    toolCalls: [],
+  };
+  const rig = await rewindRig([[], [toolCall, refusedRound]], { autoRewind: true, maxRewinds: 3 }, { heardWhileLooking: 'a message heard while the tool ran' });
+  try {
+    await rig.say('first question', 1);
+    await rig.say('look at it', 3);
+    const injected = rig.streams[1]!.receivedToolResultOptions.flatMap((o) => (o as { injectedMessages?: unknown[] } | undefined)?.injectedMessages ?? []);
+    assert.match(JSON.stringify(injected), /heard while the tool ran/, 'the premise: the refused round carried the injected message');
+    const retry = rig.requests[2]!;
+    assert.ok(!rig.texts(retry).some((t) => t.includes('heard while the tool ran')), 'the injected message is gone');
+    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+  } finally { await rig.close(); }
+});
+
+test('an exchange the refused request carried only by its call is shed whole', async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });
+  try {
+    await rig.say('first question', 1);
+    const cm = rig.framework.getAgent('scout')!.getContextManager();
+    cm.addMessage('scout', [text('let me look'), { type: 'tool_use', id: 'look-9', name: 'surface--look', input: {} } as ContentBlock]);
+    cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'look-9', content: 'what the tool saw' } as ContentBlock], { tuneOut: { epochId: 'held' } } as never);
+    await rig.say('second question', 4);
+    const refusedRequest = JSON.stringify(rig.requests[1]!.messages);
+    assert.ok(refusedRequest.includes('look-9') && !refusedRequest.includes('what the tool saw'), 'the premise: the refused request carried the call and not its stored result');
+    const retry = rig.requests[3]!;
+    assert.ok(!JSON.stringify(retry.messages).includes('look-9'), 'the call is gone');
+    assert.ok(!rig.stored().some((m) => JSON.stringify(m.content).includes('what the tool saw')), 'and so is its result');
+    assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+  } finally { await rig.close(); }
+});
 
 test('a row no refused request carried, such as tuned-out traffic, is neither removed nor counted', async () => {
   const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });
@@ -276,11 +333,13 @@ test('a message stored after the refused request was sent is neither removed nor
   } finally { await rig.close(); }
 });
 
-test('when no turn the refused request carried is left, no later request carries the refused reply', async () => {
+test('when no turn the refused request carried is left, the rewind removes only the refused reply, and no later request carries it', async () => {
   const partial = 'Here is the start of an answer';
   const rig = await rewindRig([[refused()], [refused(partial)]], { autoRewind: true, maxRewinds: 3 });
   try {
+    rig.framework.getAgent('scout')!.getContextManager().addMessage('scout', [text('   ')]);
     await rig.say('the only question', 2);
+    assert.ok(rig.stored().some((m) => /"text":"   "/.test(JSON.stringify(m.content))), 'an older row that carries nothing stays');
     assert.ok(!rig.texts(rig.requests[1]!).some((t) => t.includes('the only question')), 'the premise: the retry carried no turn but the marker');
     await rig.say('a new question', 3);
     assert.equal(rig.requests.length, 3, 'the refused request, its refused retry, and the next turn');

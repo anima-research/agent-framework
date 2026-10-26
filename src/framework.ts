@@ -10201,6 +10201,12 @@ export class AgentFramework {
     // `thinking` block — which the API rejects with a 400 ("thinking blocks in
     // the latest assistant message cannot be modified"). We do NOT add a marker
     // here; the caller keeps one consolidated marker (updateRewindMarker).
+    const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
+    const callCarried = (start: number) => {
+      if (start <= 0) return false;
+      const turn = bodyRangeIn(all, start - 1);
+      return all.slice(turn.from, turn.to + 1).some((m) => hasBlock(m, 'tool_use')) && wasCarried(turn.from, turn.to);
+    };
     const uncounted: Array<{ from: number; to: number }> = [];
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
@@ -10211,13 +10217,14 @@ export class AgentFramework {
       if ((refusedReply !== undefined && body.some((m) => m.id === refusedReply))
         || body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)) {
         uncounted.push({ from: start, to: i });
-      } else if (!carried || body.some((m) => carried.has(m.id))) {
+      } else if (wasCarried(start, i) || (body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start))) {
         idx = i; break;
       }
       i = start;
     }
     if (idx < 0) {
-      for (const { from: start, to } of uncounted) removeStoredMessages(cm, all[start], all[to]);
+      const reply = uncounted.find(({ from: start, to }) => all.slice(start, to + 1).some((m) => m.id === refusedReply));
+      if (reply) removeStoredMessages(cm, all[reply.from], all[reply.to]);
       return null;
     }
     // The newest message can be the last shard of a body (a document stored
