@@ -22627,12 +22627,17 @@ export class AgentFramework {
       };
       // A server's error is a failure here too, as the model's dispatch
       // reads it: its text (mcplToolFailure), without its other blocks, and
-      // its structured content, kept by presence. A success is the server's
-      // own blocks and structured content, for the caller to use in process.
+      // its structured content, kept by presence; where a change joins an
+      // error that is structured content alone, that content's JSON, as below.
+      // A success is the server's own blocks and structured content, for the
+      // caller to use in process.
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
-        const { data: _blocks, ...failure } = direct;
-        return withChange(failure);
+        const { data: blocks, ...failure } = direct;
+        const shown: ToolResult = taken && !(Array.isArray(blocks) && blocks.length) && Object.prototype.hasOwnProperty.call(direct, 'structured')
+          ? { ...failure, error: JSON.stringify(direct.structured) ?? 'null' }
+          : failure;
+        return withChange(shown, failure);
       }
       // RFC-005 §6.2: register an MCPL peer's references with this server, so
       // a stub later made of them is bound and fetch_reference can fetch

@@ -462,7 +462,10 @@ framework registers a `toolsets` module with four constant tools:
   notice;
 - `toolsets--close {server?, toolset?, instance?}` closes it.
 
-`server` can be left out when only one server has the name. Hint changes apply
+`server` can be left out when only one server has the name. A server with no
+toolsets stops presenting them once its latest `tools/list` has no dynamic
+tool, so until the rebuild, act takes its last one only with `server` named.
+Hint changes apply
 as their message is read, in `rev` order, whatever becomes of the message (a
 refused push, a result that came after its timeout). A move between static and
 dynamic takes effect when the server's `tools/list` states it, and the tool

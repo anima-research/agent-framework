@@ -190,6 +190,28 @@ test('a server without toolHints keeps 0.27.0\'s reading of a structured-only re
   }
 });
 
+test('a server without toolHints keeps 0.27.0\'s reading of a structured-only error: the puppet stores the error\'s text, not the content', async () => {
+  const server = await startScriptedServer({
+    advert: { featureSets: ADVERT.featureSets },
+    tools: [STATUS],
+    on: (msg, peer) => {
+      if (msg.method === 'tools/call') { peer.reply(msg.id, { content: [], structuredContent: { reason: 'jammed' }, isError: true }); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url } as McplServerConfig]);
+  try {
+    await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'static tools listed');
+    const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
+    const text = storedResult(fw, toolUseId);
+    assert.match(text, /without saying what went wrong/);
+    assert.doesNotMatch(text, /jammed/);
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
 test('the puppet stores a result that is structured content alone as that content\'s JSON, then the tool change', async () => {
   const { server } = await hintingServer({ content: [], structuredContent: { score: 42 } });
   const fw = await connectedTo(server);
@@ -199,6 +221,21 @@ test('the puppet stores a result that is structured content alone as that conten
     assert.match(text, /\\"score\\":42/);
     assert.match(text, /peek\(\)/);
     assert.ok(text.indexOf('score') < text.indexOf('peek()'), 'the change after the content');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('the puppet stores a server\'s error that is structured content alone as that content\'s JSON, then the tool change', async () => {
+  const { server } = await hintingServer({ content: [], structuredContent: { reason: 'jammed' }, isError: true });
+  const fw = await connectedTo(server);
+  try {
+    const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
+    const text = storedResult(fw, toolUseId);
+    assert.match(text, /\\"reason\\":\\"jammed\\"/);
+    assert.match(text, /peek\(\)/);
+    assert.ok(text.indexOf('jammed') < text.indexOf('peek()'), 'the change after the content');
   } finally {
     await fw.stop();
     await server.close();
