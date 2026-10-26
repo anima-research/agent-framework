@@ -2353,6 +2353,116 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
+interface SyncMoveReinit {
+  again: boolean;
+  after: 'undo' | 'redo';
+  done: Promise<void>;
+}
+
+export interface ReinitAlertText {
+  opening: string;
+  message: string;
+}
+
+export const REINIT_MOVES = ['undo', 'redo', 'rollback', 'suppression', 'branch switch'] as const;
+export type ReinitMove = (typeof REINIT_MOVES)[number];
+
+const RECOVERY = 're-initializes it and stores its queued writes, at resume on a quiesced host; a restart can lose them.';
+
+export function refusedWorkAlert(move: ReinitMove, cause: string): ReinitAlertText {
+  const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
+    `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+  return { opening, message: `${opening} Its re-initialization failed: ${cause}.` };
+}
+
+export function restoreAlert(restore: {
+  source: string;
+  now: string;
+  selected: boolean;
+  cause: string;
+} & ({ move: 'rollback'; managerCurrent?: false } | { move: 'suppression'; managerCurrent: boolean })): ReinitAlertText {
+  const { move, source, now, selected, managerCurrent, cause } = restore;
+  if (selected) {
+    const opening = `The ${move} failed and the store was put back, but this agent's context manager failed to re-initialize. ` +
+      `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+    return { opening, message: `${opening} The store is on ${source}. Its re-initialization failed: ${cause}.` };
+  }
+  const where = ` The store is on ${now}, and the restore to ${source} failed: ${cause}.`;
+  if (managerCurrent) {
+    const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager is current on the ` +
+      `branch the ${move} made: it serves from there, which may be partly suppressed, until switchBranch() to the ` +
+      'branch it should run on moves it.';
+    return { opening, message: `${opening}${where}` };
+  }
+  const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager refuses its work ` +
+    `until switchBranch() to the branch it should run on ${RECOVERY}`;
+  return { opening, message: `${opening}${where}` };
+}
+
+export function disposalAlert(disposal: {
+  move: ReinitMove;
+  heldWrites?: number;
+  reinitFailed?: string;
+  cleanupFailed?: string;
+}): ReinitAlertText {
+  const { move, heldWrites = 0, reinitFailed, cleanupFailed } = disposal;
+  const opening = `The ${move} left this conversation agent with no messages of its own, so ` +
+    (cleanupFailed
+      ? 'it was unregistered and its channel unbound, but its cleanup failed (below). '
+      : 'it was disposed and its channel unbound. ') +
+    "Its channel's next qualifying message spawns a new fork from the template, under a new name, which needs the " +
+    "template's own context manager to be working.";
+  const held = heldWrites === 0
+    ? ''
+    : ` ${heldWrites === 1 ? '1 write was' : `${heldWrites} writes were`} held for it while the store was held.`;
+  return {
+    opening,
+    message: `${opening}${held} Its messages stay on the branches that hold them, but no agent reads them again, ` +
+      "so a redo to a branch that holds them doesn't bring this one back." +
+      (reinitFailed ? ` Its re-initialization had failed: ${reinitFailed}.` : '') +
+      (cleanupFailed ? ` Its cleanup failed: ${cleanupFailed}.` : ''),
+  };
+}
+
+export function longHoldAlert(hold: {
+  move: string;
+  agentName: string;
+  heldSeconds: number;
+  queued: number;
+  reinitializing?: string;
+  waitingForMaintenance: boolean;
+}): ReinitAlertText {
+  const { move, agentName, heldSeconds, queued, reinitializing, waitingForMaintenance } = hold;
+  const opening = `The ${move} has held the store for ${heldSeconds} s, so no turn starts and the writes it defers wait in ` +
+    `the deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). A restart ends the ${move}, the ` +
+    'conversation agents and the runs, and re-initializes the configured agents; writes still queued at exit ' +
+    'survive only in a persisted deferral queue.';
+  const on = reinitializing !== undefined
+    ? `, and is re-initializing ${reinitializing}'s context manager now`
+    : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
+  return { opening, message: `${opening} The ${move} is for ${agentName}${on}.` };
+}
+
+const HOLD_ALERT_MS = 60_000;
+
+const MOVE_NOUNS: Readonly<Record<string, string>> = {
+  'roll back': 'rollback',
+  suppress: 'suppression',
+  'switch branch': 'branch switch',
+};
+
+type ManagerReinitFailure =
+  | { agentName: string; error: string }
+  | { agentName: string; disposed: { heldWrites: number; reinitFailed?: string; cleanupFailed?: string } };
+
+// context-manager refuses work on a manager whose store has moved to another branch generation with a plain Error,
+// with no class or code, whose message carries one of these texts.
+const MOVED_BRANCH_REFUSALS = ['requires reinitialization for the current branch generation', 'refused stale branch-scoped mutation'];
+
+function refusedForMovedBranch(message: string): boolean {
+  return MOVED_BRANCH_REFUSALS.some((text) => message.includes(text));
+}
+
 /** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
 function scriptResultBrief(content: unknown[]): string {
   for (const block of content) {
@@ -2475,6 +2585,10 @@ function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): s
   let tailStart = text.length - tailLength;
   if (splitsPair(text, tailStart)) tailStart++;
   return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+export function opsWebhookText(message: string): string {
+  return boundFailureText(message, OPS_WEBHOOK_MESSAGE_MAX_CHARS);
 }
 
 /** A provider error code, verbatim when token-sized; otherwise bounded. */
@@ -3526,7 +3640,16 @@ export class AgentFramework {
    * agent admitted mid-switch, a wake for an agent created later — at the
    * scheduler, ephemeral admission and puppet entry points.
    */
-  private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
+  private surgeryHold: {
+    verb: string;
+    agentName: string;
+    since: number;
+    released?: Promise<void>;
+    reinitializing?: string;
+  } | null = null;
+  private readonly conversationSpawnsInFlight = new Set<string>();
+  private syncMoveReinit: SyncMoveReinit | null = null;
+  private holdAlertMs = HOLD_ALERT_MS;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** The servers whose running pass a later trigger joined
@@ -4888,14 +5011,27 @@ export class AgentFramework {
         .flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
       this.ackDeferredWrites();
+      const keptWhere = (persisted: boolean, memoryOnly: string): string => !persisted
+        ? memoryOnly
+        : this.deferredWritesBehind
+          ? "the persisted queue's record is behind, since its last write failed or met the cap, so a restart can lose them"
+          : 'the persisted queue keeps them for boot';
+      for (const name of this.quiesced ? [] : registered.filter((agent) => !stillStreaming.has(agent))) {
+        const kept = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
+        if (kept > 0) {
+          console.error(
+            `[deferral] stop: ${kept} deferred write(s) for ${name} stay queued, not stored by the flush above; ` +
+            keptWhere(this.deferredWritesPersisted, 'this memory-only queue loses them at exit'),
+          );
+        }
+      }
       for (const name of registered.filter((agent) => stillStreaming.has(agent))) {
         const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
         if (held > 0) {
           console.error(
             `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream is still running and may still write; ` +
-            (this.deferredWritesPersisted || this.quiesced
-              ? 'the persisted queue keeps them for boot'
-              : 'this memory-only queue loses them if the process exits before that stream settles'),
+            keptWhere(this.deferredWritesPersisted || this.quiesced,
+              'this memory-only queue loses them if the process exits before that stream settles'),
           );
         }
       }
@@ -5802,6 +5938,9 @@ export class AgentFramework {
           if (error instanceof MaintenanceWithdrawnError) {
             withdrawn = true;
             console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
+          } else if (this.syncMoveReinit && error instanceof Error && refusedForMovedBranch(error.message)) {
+            withdrawn = true;
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${error.message}`);
           } else {
             this.reportMaintenanceFailure(
               agent.name,
@@ -5815,7 +5954,9 @@ export class AgentFramework {
           if ('error' in state) {
             // A run records an agent's first failure: a readiness refusal
             // after a tick that failed is read again by the next pass.
-            if (record.error === undefined && !withdrawn) this.reportMaintenanceFailure(agent.name, record, state.error);
+            if (record.error === undefined && !withdrawn && !(this.syncMoveReinit && refusedForMovedBranch(state.error))) {
+              this.reportMaintenanceFailure(agent.name, record, state.error);
+            }
           } else {
             record.readyAfter = state.ready;
             if (state.pending) record.pendingAfter = state.pending;
@@ -7167,6 +7308,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     // Feasibility preflight — only a budget-bearing patch can wedge, and only
     // on the immediate path (a paced descent leaves the compile budget alone
     // and converges only as far as the folded floor allows). Boot restore
@@ -7235,6 +7377,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     const result = agent.resetRuntimeSettings(keys);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
@@ -7255,6 +7398,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     const result = agent.cancelRuntimeSettingsTransition();
     this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     this.recordOperatorAction({
@@ -7263,6 +7407,14 @@ export class AgentFramework {
       ...(opts?.requester ? { requester: opts.requester } : {}),
     });
     return result;
+  }
+
+  private refuseRuntimeSettingsChangeUnderHold(agentName: string): void {
+    if (!this.surgeryHold) return;
+    throw new OperatorActionError(
+      'agent-busy',
+      `Cannot change ${agentName}'s runtime settings: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}; nothing was changed. Try again once it finishes.`,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -10921,11 +11073,13 @@ export class AgentFramework {
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
     let undone = 0;
+    let settled: Promise<void> | undefined;
     try {
       for (let i = 0; i < requested; i++) {
         const r = this.runUndoLastTurn(agentName, hostCommandRequester(serverId, params));
         if (!r.undone) break;
         undone++;
+        settled = r.settled;
       }
     } catch (error) {
       // e.g. "Cannot undo while agent is streaming" — report what happened,
@@ -10943,6 +11097,8 @@ export class AgentFramework {
     if (undone === 0) {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
+
+    await settled;
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -11264,20 +11420,34 @@ export class AgentFramework {
    * turn alive (no continuation or held retry of one on its way), or it is
    * refused (OperatorActionError 'agent-busy'), and no turn starts until the
    * switch is done.
+   *
+   * Every agent's context manager is re-initialized for the branch before
+   * the store is released (reinitializeManagers). One whose
+   * re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`), and the switch still resolves. A switch to the
+   * branch the store is already on re-initializes them too, which is how a
+   * manager left refusing by a failed re-initialization is recovered without
+   * a restart.
    */
   async switchBranch(name: string): Promise<void> {
     this.refuseOperatorAfterStop('switch branch');
     const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+    let reinitializing: Promise<ManagerReinitFailure[]> | undefined;
     try {
       // A maintenance tick already running finishes before the switch.
       if (this.maintenanceRunning()) await this.settleMaintenancePass();
       this.store.switchBranch(name);
+      reinitializing = this.reinitializeManagers();
       const ws = this.moduleRegistry.getModule('workspace');
       if (ws && 'materializeMount' in ws) {
         await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
       }
     } finally {
-      release();
+      try {
+        if (reinitializing) this.reportReinitFailures('branch switch', this.disposeEmptiedForks(await reinitializing));
+      } finally {
+        release();
+      }
     }
   }
 
@@ -11290,12 +11460,30 @@ export class AgentFramework {
    *
    * The undone branch is saved so `redo()` can restore it.
    * Returns the checkpoint that was undone, or null if nothing to undo.
+   *
+   * The branch moves under every agent sharing the store, so an undo
+   * reserves the store as a surgery does: every agent must be idle, or it is
+   * refused (OperatorActionError 'agent-busy'). It returns once the store has
+   * moved, and the store stays reserved until every agent's context manager
+   * is re-initialized for the new branch, so no turn starts before then. One
+   * whose re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`). An undo or redo made before the managers are
+   * done moves the store again under the same reservation, and they are
+   * re-initialized for the branch the last one leaves.
+   *
+   * `settled`, present when the store moved, settles once that reservation
+   * is released, every manager re-initialized or its failure alerted, and
+   * never rejects. Await it before work that needs the store free: a
+   * compile on an agent's own context manager, or a write meant to land at
+   * once, which the reservation would defer. An undo or redo that moves the
+   * store again under the same reservation settles with it.
    */
   undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     this.refuseOperatorAfterStop('undo');
     return this.runUndoLastTurn(agentName, requester);
@@ -11308,16 +11496,17 @@ export class AgentFramework {
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     const agent = this.agents.get(agentName);
     if (!agent) {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot undo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot undo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -11327,13 +11516,23 @@ export class AgentFramework {
     }
 
     const checkpoint = checkpoints.pop()!;
-    this.saveTurnCheckpoints(agentName, checkpoints);
-
     const currentBranch = this.store.currentBranch();
     const undoBranchName = this.newOperatorBranchName(`undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`);
 
-    this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
-    this.store.switchBranch(undoBranchName);
+    const move = this.beginSyncMove('undo', agentName);
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+      this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
+      this.store.switchBranch(undoBranchName);
+    } catch (error) {
+      try {
+        this.saveTurnCheckpoints(agentName, [...checkpoints, checkpoint]);
+      } finally {
+        move.abandon();
+      }
+      throw error;
+    }
+    const settled = move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -11365,6 +11564,7 @@ export class AgentFramework {
       turnIndex: checkpoint.turnIndex,
       fromBranch: currentBranch.name,
       toBranch: undoBranchName,
+      settled,
     };
   }
 
@@ -11373,11 +11573,15 @@ export class AgentFramework {
    *
    * Switches back to the branch that was active before the last undo.
    * Returns false if there's nothing to redo.
+   *
+   * It reserves the store and re-initializes every agent's context manager
+   * as undoLastTurn() does, and its result's `settled` is undoLastTurn()'s.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     this.refuseOperatorAfterStop('redo');
     const agent = this.agents.get(agentName);
@@ -11385,10 +11589,10 @@ export class AgentFramework {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot redo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot redo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -11397,10 +11601,30 @@ export class AgentFramework {
       return { redone: false };
     }
 
-    const { branchName, checkpoint } = redoStack.pop()!;
     const currentBranch = this.store.currentBranch();
-
-    this.store.switchBranch(branchName);
+    const move = this.beginSyncMove('redo', agentName);
+    const entry = redoStack.pop()!;
+    const { branchName, checkpoint } = entry;
+    try {
+      this.store.switchBranch(branchName);
+    } catch (error) {
+      let gone = false;
+      try {
+        gone = !this.store.listBranches().some((b) => b.name === branchName);
+      } catch {
+      }
+      if (!gone) redoStack.push(entry);
+      move.abandon();
+      if (!gone) throw error;
+      const left = redoStack.length;
+      throw new OperatorActionError(
+        'failed',
+        `Cannot redo: the branch this redo returns to, ${branchName}, no longer exists, so that step is dropped. ` +
+          (left === 0 ? 'No redo steps remain.' : left === 1 ? '1 redo step remains.' : `${left} redo steps remain.`),
+        { cause: error },
+      );
+    }
+    const settled = move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -11426,6 +11650,7 @@ export class AgentFramework {
       redone: true,
       fromBranch: currentBranch.name,
       toBranch: branchName,
+      settled,
     };
   }
 
@@ -11532,6 +11757,7 @@ export class AgentFramework {
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
     }
+    for (const name of this.conversationSpawnsInFlight) busy.push(`${name} is being created`);
     if (busy.length > 0) {
       throw new OperatorActionError(
         'agent-busy',
@@ -11547,8 +11773,11 @@ export class AgentFramework {
     }
     // The token snapshot only covers agents that exist now; the hold covers
     // arrivals during the awaited switch (see surgeryHold).
-    const hold = { verb, agentName, since: Date.now() };
+    let resolveHold!: () => void;
+    const hold = { verb, agentName, since: Date.now(), released: new Promise<void>((resolve) => { resolveHold = resolve; }) };
     this.surgeryHold = hold;
+    const watchdog = setTimeout(() => this.reportLongHold(hold), this.holdAlertMs);
+    watchdog.unref?.();
     // Maintenance calls parked at a provider gate wake, find the hold and are
     // withdrawn, so the wait for running maintenance can't wait on them.
     for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -11560,9 +11789,11 @@ export class AgentFramework {
     return () => {
       if (released) return;
       released = true;
+      clearTimeout(watchdog);
       // The release runs to its end before stop() can go on.
       settle();
       if (this.surgeryHold === hold) this.surgeryHold = null;
+      resolveHold();
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
@@ -11573,10 +11804,139 @@ export class AgentFramework {
       if (this.deferredMessages.length > 0) {
         const free = [...reserved.keys()]
           .filter((name) => !this.activeTurnTokens.has(name) && !this.pendingAssistantBlocks.has(name));
-        this.readdDrained(free.flatMap((name) => this.drainDeferredFor(name)), 'post-surgery flush');
+        this.readdDrained(free.flatMap((name) => this.drainDeferredFor(name)), 'post-surgery flush',
+          { traceAs: 'deferred-flush:surgery-release' });
         this.ackDeferredWrites();
       }
     };
+  }
+
+  private async reinitializeManagers(except?: string): Promise<ManagerReinitFailure[]> {
+    const failures: ManagerReinitFailure[] = [];
+    const hold = this.surgeryHold;
+    for (const [agentName, agent] of [...this.agents]) {
+      if (agentName === except) continue;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (hold) hold.reinitializing = agentName;
+      try {
+        const cm = agent.getContextManager();
+        await cm.setStrategy(cm.getStrategy());
+      } catch (error) {
+        if (this.agents.get(agentName) === agent) {
+          failures.push({ agentName, error: failureDescription(error) });
+        }
+      } finally {
+        if (hold) delete hold.reinitializing;
+      }
+    }
+    return failures;
+  }
+
+  private reportLongHold(hold: { verb: string; agentName: string; since: number; reinitializing?: string }): void {
+    const heldMs = Date.now() - hold.since;
+    const queued = this.deferredMessages.length;
+    const reinitializing = hold.reinitializing;
+    const waitingForMaintenance = reinitializing === undefined && this.maintenanceRunning();
+    this.opsAlert('store-held-long', hold.agentName,
+      longHoldAlert({
+        move: MOVE_NOUNS[hold.verb] ?? hold.verb, agentName: hold.agentName, heldSeconds: Math.round(heldMs / 1000),
+        queued, reinitializing, waitingForMaintenance,
+      }).message,
+      {
+        data: {
+          verb: hold.verb,
+          heldMs,
+          queued,
+          ...(reinitializing !== undefined ? { reinitializing } : {}),
+          ...(waitingForMaintenance ? { waitingForMaintenance } : {}),
+        },
+      });
+  }
+
+  private disposeEmptiedForks(failures: ManagerReinitFailure[]): ManagerReinitFailure[] {
+    const disposals: ManagerReinitFailure[] = [];
+    for (const [agentName, channelId] of [...this.conversationAgentHomes]) {
+      const agent = this.agents.get(agentName);
+      if (!agent || agent.getContextManager().getMessageCount() > 0) continue;
+      const heldWrites = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agentName).length;
+      let cleanupFailed: string | undefined;
+      try {
+        if (this.conversationRouter?.getBinding(channelId)?.agentName === agentName) {
+          this.conversationRouter.unbind(channelId);
+        }
+        this.disposeConversationAgent(agentName);
+      } catch (error) {
+        cleanupFailed = failureDescription(error);
+      }
+      const failed = failures.find((f) => f.agentName === agentName && 'error' in f);
+      disposals.push({ agentName, disposed: {
+        heldWrites,
+        ...(failed && 'error' in failed ? { reinitFailed: failed.error } : {}),
+        ...(cleanupFailed !== undefined ? { cleanupFailed } : {}),
+      } });
+    }
+    const disposed = new Set(disposals.map((d) => d.agentName));
+    return [...failures.filter((f) => !disposed.has(f.agentName)), ...disposals];
+  }
+
+  private reportReinitFailures(after: ReinitMove, failures: ManagerReinitFailure[]): void {
+    for (const failure of failures) {
+      if ('disposed' in failure) {
+        this.reportReinitFailure(failure.agentName, after, disposalAlert({ move: after, ...failure.disposed }).message, 'disposed');
+      } else {
+        this.reportReinitFailure(failure.agentName, after, refusedWorkAlert(after, failure.error).message);
+      }
+    }
+  }
+
+  private reportReinitFailure(agentName: string, after: string, message: string, key?: string): void {
+    console.error(`[operator] agent=${agentName} ${boundFailureText(message)}`);
+    this.opsAlert('context-reinit-failed', agentName, message, { data: { after }, ...(key === undefined ? {} : { key }) });
+  }
+
+  private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): Promise<void>; abandon(): void } {
+    const running = this.syncMoveReinit;
+    if (running) {
+      const busy = [...this.agents].filter(([, a]) => a.state.status !== 'idle').map(([name, a]) => `${name} is ${a.state.status}`);
+      if (busy.length > 0) {
+        throw new OperatorActionError(
+          'agent-busy',
+          `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+        );
+      }
+      return {
+        landed: () => { running.again = true; running.after = verb; return running.done; },
+        abandon: () => {},
+      };
+    }
+    const release = this.reserveStoreForSurgery(verb, agentName);
+    return {
+      landed: () => this.reinitializeAfterSyncMove(verb, release),
+      abandon: release,
+    };
+  }
+
+  private reinitializeAfterSyncMove(after: 'undo' | 'redo', release: () => void): Promise<void> {
+    const state: SyncMoveReinit = { again: false, after, done: Promise.resolve() };
+    this.syncMoveReinit = state;
+    state.done = (async () => {
+      try {
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
+        let failures: ManagerReinitFailure[];
+        do {
+          state.again = false;
+          failures = await this.reinitializeManagers();
+        } while (state.again);
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
+        this.reportReinitFailures(state.after, this.disposeEmptiedForks(failures));
+      } finally {
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
+        release();
+      }
+    })().catch((error: unknown) => {
+      console.error(`[operator] the ${state.after}'s re-initialization or its release of the store failed: ${boundFailureText(failureDescription(error))}`);
+    });
+    return state.done;
   }
 
   /**
@@ -11663,10 +12023,12 @@ export class AgentFramework {
    * throws — the caller reports the original failure with this appended.
    */
   private async restoreSourceBranch(
+    move: 'rollback' | 'suppression',
     cm: ContextManager,
     sourceBranch: string,
     failedBranch: string,
     agentName: string,
+    managerCurrent = false,
   ): Promise<string> {
     const current = this.store.currentBranch().name;
     if (current !== failedBranch) return `active branch is ${current}`;
@@ -11675,8 +12037,25 @@ export class AgentFramework {
       return `active branch restored to ${sourceBranch}`;
     } catch (restoreError) {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
-      const status = `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); agent is still on ${failedBranch}`;
+      const now = this.store.currentBranch().name;
+      const selected = now === sourceBranch;
+      const status = selected
+        ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
+          'the agent refuses its work until switchBranch() to the current branch re-initializes it'
+        : managerCurrent
+          ? `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, where the agent's ` +
+            'context manager is current, so the agent serves from that branch until switchBranch() moves it'
+          : `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, ` +
+            `and the agent refuses its work until switchBranch() to ${sourceBranch} re-initializes it`;
       console.error(`[operator] agent=${agentName} ${status}`);
+      try {
+        const named = move === 'suppression' ? { move, managerCurrent } : { move };
+        this.reportReinitFailure(agentName, `restore to ${sourceBranch}`, restoreAlert({
+          ...named, source: sourceBranch, now, selected, cause: detail,
+        }).message);
+      } catch (reportError) {
+        console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
+      }
       return status;
     }
   }
@@ -11756,6 +12135,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         // A maintenance tick already running finishes before the switch.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -11778,12 +12158,14 @@ export class AgentFramework {
         try {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
           await cm.switchBranch(branchName);
+          moved = true;
         } catch (error) {
           // switchBranch moves the chronicle branch BEFORE awaiting strategy
           // initialization, so a rejection here can leave the store on the
           // new branch with an uninitialized strategy. Retire the batch and
           // go back to the source; keep the branch for diagnosis.
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          moved = this.store.currentBranch().name !== sourceBranch;
+          const restored = await this.restoreSourceBranch('rollback', cm, sourceBranch, targetBranch, agentName);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11804,7 +12186,11 @@ export class AgentFramework {
         this.deliverDiscordAwarenessInBackground('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
-        release();
+        try {
+          if (moved) this.reportReinitFailures('rollback', this.disposeEmptiedForks(await this.reinitializeManagers(agentName)));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -11911,6 +12297,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         // A maintenance tick already running finishes before the fork.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -11937,11 +12324,13 @@ export class AgentFramework {
 
         try {
           createdBranch = await cm.fork(targetBranch);
+          moved = true;
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
           // branch. Go back to the source, then retire the batch.
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          moved = this.store.currentBranch().name !== sourceBranch;
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, targetBranch, agentName);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11958,7 +12347,7 @@ export class AgentFramework {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
           // say honestly whether that restore happened.
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, createdBranch, agentName);
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, createdBranch, agentName, true);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11985,7 +12374,11 @@ export class AgentFramework {
         this.deliverDiscordAwarenessInBackground('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
-        release();
+        try {
+          if (moved) this.reportReinitFailures('suppression', await this.reinitializeManagers(agentName));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -13655,14 +14048,14 @@ export class AgentFramework {
         if (!this.turnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
-        const id = target.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(metadata, event.content));
+        const placement = this.writeToFork(target, event.content, AgentFramework.withStoredDigest(metadata, event.content));
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         const channel: ChannelRef = { serverId: event.serverId, channelId: event.channelId };
         if (this.conversationRouter.getBinding(channel)?.agentName === target.name) {
           this.conversationRouter.touch(channel);
         }
-        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
@@ -13672,7 +14065,7 @@ export class AgentFramework {
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
-        return { agent: target.name, messageId: id };
+        return placement;
       }
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       event = { ...event, targetAgents: [target.name] };
@@ -13850,9 +14243,9 @@ export class AgentFramework {
     if (!this.turnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
-    const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
+    const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(channel);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
 
     if (trigger) {
       this.pendingRequests.push({
@@ -13868,7 +14261,16 @@ export class AgentFramework {
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
-    return { agent: agent.name, messageId: id };
+    return placement;
+  }
+
+  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>): CoalescingPlacement {
+    if (this.surgeryHold) {
+      const placement: CoalescingPlacement = { agent: '' };
+      this.addMessage('user', content, metadata as MessageMetadata, { forAgent: agent.name, placement });
+      return placement;
+    }
+    return { agent: agent.name, messageId: agent.getContextManager().addMessage('user', content, metadata) };
   }
 
   /**
@@ -13880,6 +14282,10 @@ export class AgentFramework {
    * event loop like any agent — but never primary.
    */
   private async createConversationAgent(name: string, home: ChannelRef): Promise<Agent> {
+    for (let hold = this.surgeryHold; hold?.released; hold = this.surgeryHold) await hold.released;
+    if (this.stopPromise || (!this.running && this.queue?.isClosed)) {
+      throw new Error(`conversation agent "${name}" not created: the framework is stopping`);
+    }
     const router = this.conversationRouter!;
     const templateConfig = this.agentConfigs.get(router.templateAgent);
     const template = this.agents.get(router.templateAgent);
@@ -13890,6 +14296,7 @@ export class AgentFramework {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
     this.usedEphemeralAgentNames.set(name, 'conversation');
+    this.conversationSpawnsInFlight.add(name);
     const release: ManagerRelease = { released: false, calls: new Set() };
     try {
 
@@ -14002,6 +14409,8 @@ export class AgentFramework {
       if (release.manager) this.closeManager(release.manager);
       this.usedEphemeralAgentNames.delete(name);
       throw error;
+    } finally {
+      this.conversationSpawnsInFlight.delete(name);
     }
   }
 
@@ -14043,13 +14452,15 @@ export class AgentFramework {
    * Store the router's counters with the spawn's generation, create the fork
    * the decision names and bind its channel to it, registered in
    * conversationSpawns under the channel until it settles. The store runs
-   * inside the spawn's promise, still in routeConversation's synchronous
-   * step, so a store that throws rejects the spawn, which each caller reports
-   * as a failed spawn, rather than throwing out of routeConversation before
-   * the caller's try. routeConversation registers a spawn only when none is
-   * in flight for the channel, and only this spawn's settlement removes it,
-   * so the entry it removes is its own. It's removed before anyone waiting
-   * on it resumes, so a waiter that decides again doesn't find it.
+   * inside the spawn's promise, after it waits out a move's hold, so the
+   * counter lands on the branch the fork is created on; with no hold up, it
+   * runs in routeConversation's synchronous step. Either way a store that
+   * throws rejects the spawn, which each caller reports as a failed spawn,
+   * rather than throwing out of routeConversation before the caller's try.
+   * routeConversation registers a spawn only when none is in flight for the
+   * channel, and only this spawn's settlement removes it, so the entry it
+   * removes is its own. It's removed before anyone waiting on it resumes, so
+   * a waiter that decides again doesn't find it.
    *
    * It binds only while the fork it created is still the agent registered
    * under its name. stop() ends each live fork and unbinds the channels
@@ -14063,6 +14474,7 @@ export class AgentFramework {
   private spawnConversationAgent(channel: ChannelRef, decision: { agentName: string; generation: number }): Promise<Agent> {
     const key = destinationKey(channel);
     const spawn = (async () => {
+      for (let hold = this.surgeryHold; hold?.released; hold = this.surgeryHold) await hold.released;
       // The router's counters are kept by bare id (ConversationRouter.generations).
       this.storeConversationGeneration(channel.channelId, decision.generation);
       const agent = await this.createConversationAgent(decision.agentName, channel);
@@ -14259,8 +14671,8 @@ export class AgentFramework {
         this.conversationAgentHomes.delete(binding.agentName);
         continue;
       }
-      agent.getContextManager().addMessage(
-        'user',
+      this.writeToFork(
+        agent,
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
         { channelId: binding.channelId, conversationClosure: true },
       );
@@ -15256,6 +15668,7 @@ export class AgentFramework {
       return true;
     }
     if (!p.messageId) return false;
+    if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {
@@ -25466,7 +25879,7 @@ export class AgentFramework {
    *  other write is dropped, logged, by addMessage. Nothing here reads the gone agent's
    *  window, so such a notice an earlier write of which landed there, and
    *  which the agent read, goes on too. */
-  private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
+  private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean; traceAs?: string }): DeferredWrite[] {
     let passed = 0;
     let writes = 0;
     const entries = drained.flatMap((msg) => {
@@ -25495,6 +25908,9 @@ export class AgentFramework {
       const agent = this.deliveryAgent(msg.forAgent);
       if (agent) this.noteStored(agent, msg.metadata, id, bypassFor(msg));
     });
+    if (opts?.traceAs) {
+      for (const { id } of written.values()) if (id) this.emitTrace({ type: 'message:added', messageId: id, source: opts.traceAs });
+    }
     return [...written.keys()];
   }
 
@@ -26683,7 +27099,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${opsWebhookText(wholeMessage)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
@@ -26947,6 +27363,8 @@ export class AgentFramework {
         } catch (err) {
           if (err instanceof MaintenanceWithdrawnError) {
             console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);
+          } else if (this.syncMoveReinit && err instanceof Error && refusedForMovedBranch(err.message)) {
+            console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${err.message})`);
           } else {
             console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
           }

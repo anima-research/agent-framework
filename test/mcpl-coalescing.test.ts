@@ -70,6 +70,42 @@ test('vector 28: retraction of never-read content leaves no trace and no turn', 
   assert(!f.context().includes('unread_original') && !f.context().includes('deletion_notice'));
 });
 
+for (const shape of ['an update', 'a retraction with a notice', 'a retraction with no notice'] as const) {
+  test(`while a branch switch holds the store, ${shape} of an unread coalesced push keeps the stored message, and ${shape === 'a retraction with no notice' ? 'appends nothing' : 'its text lands after the release'}`, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    await f.send('push/event', f.params('1', 'unread_original', { initial: true }));
+    assert(f.context().includes('unread_original'));
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const before = cm.getMessageCount();
+    const spied = cm as unknown as { setStrategy: (strategy: unknown) => Promise<void> };
+    const setStrategy = spied.setStrategy.bind(cm);
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => { entered = resolve; });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    spied.setStrategy = async (strategy: unknown) => { entered(); await gate; return setStrategy(strategy); };
+    const switching = f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+    const text = shape === 'an update' ? 'held_update' : shape === 'a retraction with a notice' ? 'held_notice' : '';
+    const bounded = <T>(work: Promise<T>, what: string): Promise<T> => Promise.race([
+      work,
+      new Promise<never>((_, reject) => { setTimeout(() => reject(new Error(`${what} didn't come within 10 s`)), 10_000).unref(); }),
+    ]);
+    try {
+      await bounded(reached, "the switch's re-initialization");
+      await bounded(f.send('push/event', f.params('2', text, shape === 'an update' ? {} : { retract: true })), 'the push\'s reply');
+      assert(f.context().includes('unread_original'), 'the stored message stays while the store is held');
+      assert(!f.context().includes('held_update') && !f.context().includes('held_notice'), 'nothing lands while the store is held');
+    } finally {
+      open();
+    }
+    await switching;
+    spied.setStrategy = setStrategy;
+    assert(f.context().includes('unread_original'), 'the stored message stays after the release');
+    if (text) assert(f.context().includes(text), `${text} lands after the release`);
+    else assert.equal(cm.getMessageCount(), before, 'nothing is appended');
+  });
+}
+
 test('vectors 29/34: read original → unread edit → delete keeps the original and appends only the notice', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'read_original', { initial: true }));
@@ -1824,7 +1860,7 @@ test("a wake to read a render starts its turn until the render's row is at or be
   // the agent's answered requests stays on the old one until a request on
   // the new one is answered. The render lands at or below that watermark's
   // sequence, so only the branch tells it unread.
-  f.framework.undoLastTurn('agent');
+  await f.framework.undoLastTurn('agent').settled;
   const afterUndo = land('render_1');
   const mark = agent.getAnsweredWatermark();
   assert(mark && mark.branch !== agent.getContextManager().currentBranch().name && afterUndo.sequence <= mark.sequence,
