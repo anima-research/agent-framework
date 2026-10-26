@@ -522,22 +522,34 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a budget restart of a private turn is private, and a room's wake that arrived meanwhile gives it no channel", async () => {
-    let framework: AgentFramework | undefined;
-    const tool = robot(() => { internals(framework!).pendingRequests.push(roomWake()); });
-    const rig = await surfaceRig({ maxStreamTokens: 5, modules: [tool] });
-    framework = rig.framework;
-    try {
-      rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
-      rig.framework.pushEvent(tuiMessage());
-      await rig.until(() => rig.starts.length >= 2, 'the turn and its restart');
-      await rig.framework.runUntilIdle();
-      assert.deepEqual(rig.starts.map((s) => s.reason), ['external-message', 'context_budget_restart'], `control: the turn restarted: ${JSON.stringify(rig.starts)}`);
-      assert.deepEqual(rig.routed, [], "the private turn's speech stayed on its surface");
-    } finally {
-      await rig.close();
-    }
-  });
+  for (const [turn, quiesced] of [['a private', false], ['a private', true], ['a channel', false]] as const) {
+    it(`a room's wake that arrives while ${turn} turn runs ${quiesced ? 'during a quiesce ' : ''}waits for its budget restart, then starts a turn of its own that ${turn === 'a private' ? 'speaks in no channel' : 'speaks in its channel, as on main'}`, async () => {
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => {
+        if (quiesced) void framework!.quiesce();
+        internals(framework!).pendingRequests.push(roomWake());
+      });
+      const rig = await surfaceRig({ maxStreamTokens: 5, modules: [tool] });
+      framework = rig.framework;
+      try {
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+        if (turn === 'a private') rig.framework.pushEvent(tuiMessage()); else rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => rig.starts.length >= 2, 'the turn and its restart');
+        await rig.framework.runUntilIdle();
+        if (quiesced) await rig.framework.resume();
+        await rig.until(() => rig.starts.length >= 3 && rig.framework.getAgent('scout')!.state.status === 'idle', "the room wake's own turn");
+        await rig.framework.runUntilIdle();
+        assert.deepEqual(rig.starts.map((s) => s.reason), [turn === 'a private' ? 'external-message' : 'mcpl:channel-incoming', 'context_budget_restart', 'mcpl:channel-incoming'], `control: the restart ran alone: ${JSON.stringify(rig.starts)}`);
+        if (turn === 'a private') {
+          assert.deepEqual(rig.routed, [], 'neither the private turn nor the wake that waited on it reached a channel');
+        } else {
+          assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM, ROOM], `the restart and the wake's own turn each speak in the channel: ${JSON.stringify(rig.routed)}`);
+        }
+      } finally {
+        await rig.close();
+      }
+    });
+  }
 
   it("a boundary that injects a private surface's message makes the room's turn private from there, and its notice rides the injections", async () => {
     let framework: AgentFramework | undefined;

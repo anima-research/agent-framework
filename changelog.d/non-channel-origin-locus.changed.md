@@ -9,38 +9,40 @@
   private, whatever else the batch holds: directly, through one gate debounce
   window, after a quiesce or a provider hold. So is a start that is the first
   to read a private surface's message stored before it, though the message's
-  own wake may still wait in a gate window, or the message woke nothing. A
-  turn that takes in private input stays private for the rest of it: a start
-  that continues it with a private wake or stored private input, or a tool
-  boundary that injects a private surface's message, removes its locus, its
-  trigger channel and its sticky `>>` or `>>>` destination, and a `[routing]`
-  notice says why, whatever destination the turn had, unless the turn is a
-  silent heartbeat tick, which has no speech to place. While a turn is
-  private, a `>>>` or `>>` envelope posts its own body where it names but sets
-  no destination for the turn's later speech. What a private turn causes is
-  private too: its budget restart, its tool results' re-inference, a ` !`
-  continuation, its auto-continuation (`autoContinue`), a bounce's wake, a
-  rewind's retry, a self-wake it arms with `skip_reply`'s `wake_in_seconds`, a
-  `sleep`'s wake, the resident's turn after a tune-out cancel it asked for,
-  and the wakes of a script it started (`wake_agent()`, and a script left
-  running reporting its end). Each goes by the turn that caused it as that
-  turn stands when its start reads it, so a turn that took in private input
-  after causing it counts, even after the wake was queued. An operator's
-  `nudge` or `unstick`, or an `inference.request` through the API server or
-  its MCP tool (`agent_request_inference`), answers the agent's context as it
-  stands, so it is private exactly when, as it starts, the agent's stored
-  history holds private input: a private surface's message, or a script's wake
-  message that counts as private input. That holds however the context came to
-  end where it does, through the framework's `undo`, `redo` or operator
-  surgery, a host's own move of its branch, or a restart. A retake whose
-  history holds none speaks as before, so on a host with no private surface it
-  always does. Otherwise it is private, even after a channel turn, and even
-  where the context now shows that input only in a summary, and its delivery
-  receipt says how to publish with a send. A script's wake message is private
-  input, as a private surface's message is, when the script's start turn is
-  private as the message is stored or injected: a turn that reads it is
-  private, and a tool boundary that injects it makes its turn private from
-  there.
+  own wake may still wait in a gate window, or the message woke nothing. So is
+  the turn of its own that a wake starts after waiting on a private turn,
+  because that turn's continuation (a budget restart or a held retry) starts
+  alone, or a quiesce parked the wake while the turn ran. A turn that takes in
+  private input stays private for the rest of it: a start that continues it
+  with a private wake or stored private input, or a tool boundary that injects
+  a private surface's message, removes its locus, its trigger channel and its
+  sticky `>>` or `>>>` destination, and a `[routing]` notice says why,
+  whatever destination the turn had, unless the turn is a silent heartbeat
+  tick, which has no speech to place. While a turn is private, a `>>>` or `>>`
+  envelope posts its own body where it names but sets no destination for the
+  turn's later speech. What a private turn causes is private too: its budget
+  restart, its tool results' re-inference, a ` !` continuation, its
+  auto-continuation (`autoContinue`), a bounce's wake, a rewind's retry, a
+  self-wake it arms with `skip_reply`'s `wake_in_seconds`, a `sleep`'s wake,
+  the resident's turn after a tune-out cancel it asked for, and the wakes of a
+  script it started (`wake_agent()`, and a script left running reporting its
+  end). Each goes by the turn that caused it as that turn stands when its
+  start reads it, so a turn that took in private input after causing it
+  counts, even after the wake was queued. An operator's `nudge` or `unstick`,
+  or an `inference.request` through the API server or its MCP tool
+  (`agent_request_inference`), answers the agent's context as it stands, so it
+  is private exactly when, as it starts, the agent's stored history holds
+  private input: a private surface's message, or a script's wake message that
+  counts as private input. That holds however the context came to end where it
+  does, through the framework's `undo`, `redo` or operator surgery, a host's
+  own move of its branch, or a restart. A retake whose history holds none
+  speaks as before, so on a host with no private surface it always does.
+  Otherwise it is private, even after a channel turn, and even where the
+  context now shows that input only in a summary, and its delivery receipt
+  says how to publish with a send. A script's wake message is private input,
+  as a private surface's message is, when the script's start turn is private
+  as the message is stored or injected: a turn that reads it is private, and a
+  tool boundary that injects it makes its turn private from there.
 
   In locus and hybrid mode, a private turn that holds a channel's message
   tells its resident which channels' messages it holds and that its plain

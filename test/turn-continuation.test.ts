@@ -1411,6 +1411,22 @@ describe('a batch that carries a continuation of the turn', () => {
     }
   });
 
+  it("starts a wake held ahead of a private turn's guard retry as a private turn of its own", async () => {
+    const h = await guardRetryHeld((fw) => {
+      internals(fw).pendingRequests.push(aliceWake());
+    }, { ...BOB, nonChannelOrigin: true });
+    try {
+      assert.deepEqual(heldReasons(h.framework), ['mcpl:channel-incoming', 'tool_result_guard_retry'], 'control: the wake is held ahead of the retry');
+      h.framework.releaseProviderWait('prime');
+      await waitFor('the wake to start a turn of its own', () => h.starts.length > 2);
+      assert.equal(h.starts[1]?.reason, 'tool_result_guard_retry', 'control: the retry resumes the private turn alone');
+      assert.equal(h.starts[2]?.reason, 'mcpl:channel-incoming');
+      assert.equal(h.starts[2]?.nonChannelOrigin, true, 'the wake that waited on the private turn starts a private turn');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("leaves a coalesced batch whose wake a provider hold took ahead of a guard retry to the wake's own turn, which assembles it", async () => {
     let coalescer!: ReturnType<typeof standInCoalescer>;
     const h = await guardRetryHeld((fw) => {

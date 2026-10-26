@@ -12416,6 +12416,11 @@ export class AgentFramework {
     return request;
   }
 
+  private markWaitedOnTurn(agentName: string, requests: readonly InferenceRequest[]): void {
+    const turnId = this.turnRouting?.get(agentName)?.turnId;
+    for (const request of requests) Object.assign(request, continuesTurns(...callerTurnsOf(request), turnId));
+  }
+
   private retakeIsPrivate(agent: Agent): boolean {
     return agent.getContextManager().getAllMessages().some((m) => this.isPrivateInput(m.metadata));
   }
@@ -15751,6 +15756,7 @@ export class AgentFramework {
         // a turn alive at the quiesce can finish; everything else parks.
         const passThrough = requests.filter((r) => passesQuiesce(r));
         const parked = requests.filter((r) => !passesQuiesce(r));
+        if (passThrough.length > 0) this.markWaitedOnTurn(agentName, parked);
         // Coalesce per (reason, addressed): every channel wake shares one
         // reason, so keying on reason alone would let an ambient message
         // parked later evict a DM/mention parked earlier — and the
@@ -15796,6 +15802,7 @@ export class AgentFramework {
       if (requests.some((r) => resumesLogicalTurn(r.reason))) {
         const siblings = requests.filter((r) => !isTurnContinuation(r.reason));
         if (siblings.length > 0) {
+          this.markWaitedOnTurn(agentName, siblings);
           this.pendingRequests.push(...siblings);
           const continuations = requests.filter((r) => isTurnContinuation(r.reason));
           requests.length = 0;
