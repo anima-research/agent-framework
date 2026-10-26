@@ -1202,10 +1202,19 @@ describe('a round whose run or wait call watches a script that can change its ro
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {}, options: { codeExecution?: boolean; toolCallTimeoutMs?: number } = {}) {
+    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {},
+    options: { codeExecution?: boolean; toolCallTimeoutMs?: number; serveWakes?: boolean } = {}) {
     const { tempDir, storePath } = tempStorePath('ce-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
+    if (options.serveWakes) {
+      const streamYielding = membrane.streamYielding.bind(membrane);
+      (membrane as unknown as { streamYielding: typeof streamYielding }).streamYielding = (request, opts) => {
+        const internals = membrane as unknown as { responses: unknown[]; responseIndex: number };
+        if (internals.responseIndex >= internals.responses.length) membrane.pushResponse(createMockResponse([]));
+        return streamYielding(request, opts);
+      };
+    }
     const log: string[] = [];
     const module = new RoundToolModule(log);
     const framework = await AgentFramework.create({
@@ -1552,7 +1561,7 @@ describe('a round whose run or wait call watches a script that can change its ro
   // send_message does: called from the round's script too. This one names a
   // draft there isn't, so it's refused and sends nothing, as a direct one
   // would be, and still counts, as a direct one does.
-  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a drafts resend inside the script holds its round and the turn's later prose as drafts`, async () => {
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a drafts resend inside the script keeps its round's prose private and holds the turn's later prose as drafts`, async () => {
     const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: 'sending the earlier reply again' },
@@ -1565,9 +1574,8 @@ describe('a round whose run or wait call watches a script that can change its ro
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
         'the resend silences the round and what follows, as a direct resend does');
       assert.deepStrictEqual(heldDrafts(h.framework), [
-        { text: 'sending the earlier reply again', reason: 'explicit-send' },
         { text: 'done', reason: 'explicit-send' },
-      ], 'and their words are held as drafts');
+      ], "the later prose is held as a draft; the drafts round's own is kept private");
     } finally { await h.done(); }
   });
 
@@ -1585,6 +1593,55 @@ describe('a round whose run or wait call watches a script that can change its ro
       assert.ok(h.log.includes('tool:send_message') && h.log.includes('tool:skip_reply'), 'the script sent and skipped');
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [], 'nothing is published');
       assert.deepStrictEqual(heldDrafts(h.framework), [], 'and the round is kept private, not held as a draft');
+    } finally { await h.done(); }
+  });
+
+  it("explicit: a drafts call inside the script holds its round's unprefixed line with no notice rather than bouncing it, as a direct one does (#701)", async () => {
+    const h = await scriptRound('explicit', [
+      createMockResponse([
+        { type: 'text', text: 'checking my drafts' },
+        scriptCall({ code: 'try { await tools.drafts({ action: "list" }); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: '>>#alpha the answer' }] as ContentBlock[]),
+    ], {}, { serveWakes: true });
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha'],
+        'the next round is delivered');
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'no-destination' }],
+        "the drafts round's line is held, not bounced");
+    } finally { await h.done(); }
+  });
+
+  it("explicit: a script whose only drafts call the bridge refuses makes no drafts round, so its round's unprefixed line bounces (#701)", async () => {
+    const h = await scriptRound('explicit', [
+      createMockResponse([
+        { type: 'text', text: 'checking my drafts' },
+        scriptCall({ code: 'try { await tools.drafts("not an object"); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: '>>#alpha the answer' }] as ContentBlock[]),
+    ], {}, { serveWakes: true });
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha']);
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'bounced' }],
+        'a refused drafts call counts for nothing, so the line bounces as on main');
+    } finally { await h.done(); }
+  });
+
+  it("explicit: a drafts call the bridge refuses doesn't hide a later permitted one in the same script (#701)", async () => {
+    const h = await scriptRound('explicit', [
+      createMockResponse([
+        { type: 'text', text: 'checking my drafts' },
+        scriptCall({ code: 'try { await tools.drafts("not an object"); } catch {} try { await tools.drafts({ action: "list" }); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: '>>#alpha the answer' }] as ContentBlock[]),
+    ], {}, { serveWakes: true });
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha']);
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'no-destination' }],
+        'the permitted drafts call makes a drafts round, so the line is held, not bounced');
     } finally { await h.done(); }
   });
 
@@ -2276,7 +2333,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     }
   });
 
-  it("a drafts list and then a resend in one script are both kept in its round's count: the resend still holds the round", async () => {
+  it("a drafts list and then a resend in one script are both kept in its round's count: the resend still silences the turn's later prose", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'checking the drafts, then sending one' },
@@ -2289,9 +2346,8 @@ describe('a round whose run or wait call watches a script that can change its ro
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
         'the resend silences the round and what follows, though a call of the same tool that sends nothing came first');
       assert.deepStrictEqual(heldDrafts(h.framework), [
-        { text: 'checking the drafts, then sending one', reason: 'explicit-send' },
         { text: 'done', reason: 'explicit-send' },
-      ], 'and their words are held as drafts');
+      ], "the later prose is held, so the resend was counted; the drafts round's own prose is kept private (#701)");
     } finally { await h.done(); }
   });
 

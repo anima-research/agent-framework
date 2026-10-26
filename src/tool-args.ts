@@ -67,6 +67,34 @@ function shown(value: unknown): string {
   return head;
 }
 
+function notAnObject(input: unknown, field = 'input'): string {
+  return `its ${field} must be an object, and this call gave ${withArticle(kindOf(input))}`;
+}
+
+export function markedInputRefusal(call: { name: string; unparseableInput?: string }): string | undefined {
+  const text = call.unparseableInput;
+  if (text === undefined) return undefined;
+  // When a stream ends before a call's block stops, membrane marks the call
+  // with what had arrived of its arguments: nothing, a part, or a whole
+  // object. A block still open when a stream breaks the API's block order
+  // is marked the same way, and one that had stopped with its object's JSON,
+  // so the arguments may be another call's (ToolUseContent.unparseableInput).
+  if (/^[ \t\n\r]*$/.test(text)) return `Nothing was done: ${call.name} its arguments never arrived; call it again with them whole.`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return `Nothing was done: ${call.name} its arguments must be one JSON object, and this call gave text that isn't JSON, which may have been cut off: ${shown(text)}; call it again with one JSON object.`;
+  }
+  if (parsed === null) return undefined;
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) return `Nothing was done: ${call.name} ${notAnObject(parsed)}.`;
+  return `Nothing was done: ${call.name} its arguments came in a response that didn't arrive whole and in order, so they can't be taken as this call's; call it again.`;
+}
+
+export function asCalled<T extends { name: string; input?: unknown; unparseableInput?: string }>(call: T): T {
+  return call.unparseableInput !== undefined && markedInputRefusal(call) === undefined ? { ...call, input: {} } : call;
+}
+
 /** A list in prose: `a`, `a or b`, `a, b or c`. */
 function oneOf(items: string[]): string {
   return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`;
@@ -169,7 +197,7 @@ export function toolArgsProblems(
   if (!schema) return [];
   const absent = input === undefined || input === null;
   if (!absent && (typeof input !== 'object' || Array.isArray(input))) {
-    return [`its ${options.field ?? 'input'} must be an object, and this call gave ${withArticle(kindOf(input))}`];
+    return [notAnObject(input, options.field)];
   }
   const obj = (absent ? {} : input) as Record<string, unknown>;
   const properties = (isMap(schema.properties) ? schema.properties : {}) as Record<string, { type?: unknown; nullable?: unknown; enum?: unknown } | undefined>;
