@@ -4058,13 +4058,13 @@ export class WorkspaceModule implements Module {
       this.ctx?.notifyOps?.('workspace-contents-restored', 'workspace',
         `Blob ${version.blobHash}: ${subject} were ${inTheStore(stored)}, and were stored again from disk's copy, whose bytes have their hash.`, data);
     } else {
-      const unstored = thrown ?? ('missing' in now ? 'the store still has no file for them' : `the store still can't read its file for them (${now.unreadable})`);
+      const unstored = thrown ?? ('missing' in now ? 'the store has no file for them' : `the store can't read its file for them (${now.unreadable})`);
       this.ctx?.notifyOps?.('workspace-contents-unstored', 'workspace',
-        `Blob ${version.blobHash}: ${subject} are ${inTheStore(stored)}. Disk's copy has their hash, so reads are answered from it, but storing it again didn't take: ${unstored}. `
+        `Blob ${version.blobHash}: ${subject} are ${inTheStore(now)}. Disk's copy has their hash, so reads are answered from it, but storing it again didn't take: ${unstored}. `
           + ('unreadable' in now
             ? "Each read does this again while that lasts. Chronicle keeps a blob file it can't read in place, so where the file is damaged, removing it lets the next read store them."
             : 'Each read does this again until the store takes them.'),
-        { ...data, unstored });
+        { mount: mount.config.name, path, blobHash: version.blobHash, ...('unreadable' in now ? { storeError: now.unreadable } : {}), unstored });
     }
     return { bytes };
   }
@@ -4077,9 +4077,11 @@ export class WorkspaceModule implements Module {
   }
 
   private async diskLacks(mount: MountState, relativePath: string, path: string, err: unknown): Promise<LostContents['disk']> {
-    const absent = err instanceof WorkspaceReadError && (err.errno === 'ENOENT' || err.errno === 'ENOTDIR');
+    const absent = err instanceof WorkspaceReadError && err.code !== 'mount_unavailable' && (err.errno === 'ENOENT' || err.errno === 'ENOTDIR');
     if (!absent) return { unreadable: containedRefusal(err, path) };
-    const { view, rootReal } = await this.runtime(mount);
+    const root = resolve(mount.config.path);
+    const rootReal = await realpath(root).catch(() => root);
+    const view = this.viewOf(mount, this.agreementOrThrow().rootIdentityForRead(mount.config.name));
     const proof = await confirmAbsent(view, rootReal, relativePath);
     if (typeof proof !== 'string') return 'none';
     return { unreadable: proof === CHANGED ? containedRefusal(err, path) : proof };

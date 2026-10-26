@@ -252,7 +252,8 @@ describe('contents the store lost, where disk holds the same bytes', () => {
     assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
     assert.deepEqual(env.kinds(), ['workspace-contents-unstored']);
     assert.equal(env.alerts[0]!.data!.unstored, 'No space left on device');
-    assert.match(env.alerts[0]!.message, new RegExp(`^Blob ${hash}: .*storing it again didn't take: No space left on device\\. .*where the file is damaged, removing it lets the next read store them\\.$`));
+    assert.match(env.alerts[0]!.message, new RegExp(`^Blob ${hash}: the saved contents of work/a\\.txt are unreadable in the workspace's store \\(.+\\)\\. .*storing it again didn't take: No space left on device\\. .*where the file is damaged, removing it lets the next read store them\\.$`));
+    assert.equal(typeof env.alerts[0]!.data!.storeError, 'string');
 
     store.storeBlob = storeBlob;
     rmSync(blob);
@@ -598,6 +599,39 @@ describe('contents the store lost, where disk holds no copy of them', () => {
       "The workspace's copy of work/p.png is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/p.png), so it can't be restored or read. Write the file again, or delete it.");
   });
 
+  test("read_image tells a loss while the disk-agreement evidence awaits reopening, since its read checks the root as before", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    assert.equal((await m.writeBinary('work/p.png', PNG, 'image/png')).success, true);
+    await ok(m, 'materialize', { path: 'work/p.png' });
+    m = await env.lose(m, env.hashOf('p.png'));
+    rmSync(join(env.dir, 'p.png'));
+
+    const store = env.store as unknown as { appendJson: (type: string, payload: unknown) => unknown };
+    const append = store.appendJson;
+    let fired = false;
+    store.appendJson = function (this: unknown, type: string, payload: unknown) {
+      const record = append.call(this, type, payload);
+      if (!fired && type === 'workspace/disk-agreement') {
+        fired = true;
+        throw new Error('injected: the append landed, then the store failed');
+      }
+      return record;
+    };
+    try {
+      await call(m, 'write', { path: 'work/b.txt', content: 'b\n' });
+      await call(m, 'materialize', { path: 'work/b.txt' });
+    } finally {
+      store.appendJson = append;
+    }
+    assert.equal(fired, true);
+    assert.match(await refused(m, 'ls', { path: 'work' }), /evidence is unavailable until the store is reopened/);
+
+    assert.equal(await refused(m, 'read_image', { path: 'work/p.png' }),
+      "The workspace's copy of work/p.png is missing from the store, and disk has no copy, so it can't be restored or read. Write the file again, or delete it.");
+    assert.deepEqual(env.kinds().filter((kind) => kind.startsWith('workspace-contents-')), ['workspace-contents-lost']);
+  });
+
   test("on a mount configured direct that runs as 'chronicle', the answer names the sync it takes, not a write", async (t) => {
     const env = new Env(t);
     let m = await env.open({ backend: 'chronicle' });
@@ -643,7 +677,7 @@ describe("contents whose blob file the store can't read", () => {
     assert.equal(await textOf(m, 'work/a.txt'), 'needle a\n');
     assert.deepEqual(env.kinds(), ['workspace-contents-unstored', 'workspace-contents-unstored']);
     assert.equal(typeof env.alerts[0]!.data!.storeError, 'string');
-    assert.match(env.alerts[0]!.message, /unreadable in the workspace's store .*reads are answered from it, but storing it again didn't take: the store still can't read its file for them/);
+    assert.match(env.alerts[0]!.message, /unreadable in the workspace's store .*reads are answered from it, but storing it again didn't take: the store can't read its file for them/);
     assert.equal(env.alerts[0]!.data!.blobHash, a);
   });
 
@@ -671,6 +705,58 @@ describe("contents whose blob file the store can't read", () => {
     await ok(m, 'delete', { path: 'work/a.txt' });
     assert.match(await refused(m, 'read', { path: 'work/a.txt' }), /^File not found/);
   });
+  test("files sharing contents whose blob the store can't read are all answered from the one file whose disk copy has them, told once", async (t) => {
+    for (const [unrestorable, restoring] of [['a.txt', 'b.txt'], ['b.txt', 'a.txt']]) {
+      for (const tool of ['grep', 'edit_many']) {
+        const env = new Env(t);
+        let m = await env.open();
+        const hash = await draft(env, m, unrestorable!, 'other\n', 'the same needle\n');
+        assert.equal(await synced(env, m, restoring!, 'the same needle\n'), hash);
+        m = await env.damage(m, hash);
+
+        if (tool === 'grep') {
+          const found = await ok(m, 'grep', { pattern: 'needle' });
+          assert.deepEqual(found.results.map((r: { file: string }) => r.file), ['work/a.txt', 'work/b.txt']);
+          assert.equal(found.skipped, undefined);
+        } else {
+          await ok(m, 'edit_many', {
+            edits: [
+              { path: 'work/a.txt', oldString: 'needle', newString: 'NEEDLE' },
+              { path: 'work/b.txt', oldString: 'needle', newString: 'NEEDLE' },
+            ],
+          });
+          assert.equal(await textOf(m, 'work/a.txt'), 'the same NEEDLE\n');
+          assert.equal(await textOf(m, 'work/b.txt'), 'the same NEEDLE\n');
+        }
+        assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [['workspace-contents-unstored', `work/${restoring}`]], `${tool}, ${unrestorable} first`);
+      }
+    }
+  });
+
+  test("files sharing contents whose blob the store can't read, each with the matching copy on disk, are read from disk and told once", async (t) => {
+    for (const tool of ['grep', 'edit_many']) {
+      const env = new Env(t);
+      let m = await env.open();
+      const hash = await synced(env, m, 'a.txt', 'the same needle\n');
+      assert.equal(await synced(env, m, 'b.txt', 'the same needle\n'), hash);
+      m = await env.damage(m, hash);
+
+      if (tool === 'grep') {
+        const found = await ok(m, 'grep', { pattern: 'needle' });
+        assert.deepEqual(found.results.map((r: { file: string }) => r.file), ['work/a.txt', 'work/b.txt']);
+      } else {
+        await ok(m, 'edit_many', {
+          edits: [
+            { path: 'work/a.txt', oldString: 'needle', newString: 'NEEDLE' },
+            { path: 'work/b.txt', oldString: 'needle', newString: 'NEEDLE' },
+          ],
+        });
+        assert.equal(await textOf(m, 'work/b.txt'), 'the same NEEDLE\n');
+      }
+      assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [['workspace-contents-unstored', 'work/a.txt']], tool);
+    }
+  });
+
   test('edit and edit_many plan from disk\'s matching copy and store their change', async (t) => {
     const env = new Env(t);
     let m = await env.open();
