@@ -211,8 +211,6 @@ test('RFC-005: dispatch pre-registration and stub share ONE record (reviewer pro
   // then serialize the block the way the history lane does.
   const { referenceRegistry, classifyBlock } = await import('../src/mcpl/references.js');
   const uri = 'https://host/files?path=%2Fprobe-' + Date.now() + '.wav';
-  // A `ref` reference: a `never` one's stub names no saved copy
-  // (rfc005-never-payload.test.ts).
   const block = { ...RFC005_REF, uri, disposition: 'ref' };
   const c = classifyBlock(block);
   assert.equal(c.kind, 'reference');

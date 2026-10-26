@@ -696,8 +696,6 @@ describe('save_recent_image provenance (issue #104)', () => {
   });
 
   it("a reference whose payload a `never` marked refuses with that reason, not fetch_reference's, its copy kept nowhere", async () => {
-    // Bound to their server, as a tool result's references are, so only the
-    // mark tells them apart: one a `never` marked, then delivered plain.
     const register = (name: string, extra: Record<string, unknown> = {}) => {
       const c = classifyBlock({ type: 'image', uri: `https://example.invalid/${name}`, mimeType: 'image/png', ...extra });
       assert.strictEqual(c.kind, 'reference');

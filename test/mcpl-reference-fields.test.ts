@@ -12,9 +12,6 @@ referenceRegistry.setServerAddress('srv', { url: 'wss://example.test' }, {});
 
 const fields = ['name', 'mimeType', 'expiresAt'] as const;
 const types = ['resource', 'image', 'audio'] as const;
-// A `never` marks its uri's record for good, and its stub then says so in
-// place of what these tests read, so the tests that keep a `never` through a
-// rejected field use a uri of their own.
 const NEVER_URI = 'https://example.test/optional-fields-never';
 function reference(type: string, extra: Record<string, unknown> = {}) {
   const block = { type, uri: 'https://example.test/optional-fields', ...extra };

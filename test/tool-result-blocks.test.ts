@@ -1023,9 +1023,6 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     const claims = scriptViewClaims([sealed, link], false);
     assert.equal(claims.get(SEALED_URI)?.never, true);
     assert.equal('uri' in (referenceBlockForScript(link, undefined, claims) as object), false);
-    // The controls take a uri of their own: the never above also marked the
-    // payload of the record SEALED_URI has, and a marked record's link shows
-    // no uri while it lives (rfc005-never-payload.test.ts).
     const OPEN_URI = 'https://zz-docs.example/open-796.txt';
     const open = { ...sealed, resource: { ...sealed.resource, uri: OPEN_URI } };
     const openLink = { ...PLAIN_LINK, uri: OPEN_URI };
@@ -1392,11 +1389,6 @@ describe('one answer for every block of a result', () => {
       const uri = `https://zz-elsewhere.example/lifted-${order}.csv`;
       // An earlier result marks the uri never.
       toolResultDataToHistoryString([{ type: 'resource', uri, name: 'lifted.csv', disposition: 'never' }]);
-      // The later result's reference is its server's latest word on the
-      // uri's testimony (#527's I14), but the earlier never marked the uri's
-      // payload, and a shown uri is a door around that: any tool that can
-      // fetch it brings the payload in (Ada-1017, room-203 #205582). So the
-      // link is a stub that says why, as the reference is.
       const lines = toolResultDataToHistoryString(blocks(
         { type: 'resource_link', uri, name: 'lifted.csv' }, { type: 'resource', uri, name: 'lifted.csv' })).split('\n');
       assert.ok(!lines.some((line) => line.includes(uri)), `${order}: ${lines.join('\n')}`);
