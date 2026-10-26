@@ -79,10 +79,7 @@ function captureRouting(framework: AgentFramework) {
   return routed;
 }
 
-/** XML tool mode, as an older membrane streams it: no round carries its
- *  roundContent, so none is routed live, and the turn's completion holds the
- *  tool round, its prose, its call and its result before the final text. */
-function asXmlTurn(membrane: MockMembrane, call: ContentBlock): void {
+function asTurnWithNoLiveRound(membrane: MockMembrane, call: ContentBlock): void {
   const streamYielding = membrane.streamYielding.bind(membrane);
   membrane.streamYielding = (request, options) => {
     const stream = streamYielding(request, options);
@@ -219,12 +216,12 @@ test('a refused marked send counts for nothing: its round goes out, and so does 
   } finally { await h.close(); }
 });
 
-test('in XML tool mode, where no round is routed live, a refused marked skip_reply silences nothing after its round', async () => {
+test('in a turn where no round was routed live, a refused marked skip_reply silences nothing after its round', async () => {
   const h = await harness();
   try {
     const routed = captureRouting(h.framework);
     const call = marked('{"reason": "done', 'skip_reply');
-    asXmlTurn(h.membrane, call);
+    asTurnWithNoLiveRound(h.membrane, call);
     const results = await h.turn([{ type: 'text', text: 'Public round prose' } as ContentBlock, call]);
     assert.equal(results[0]!.isError, true);
     assert.ok(routed.includes('Public trailing prose'), 'the refused call silences nothing after it');
