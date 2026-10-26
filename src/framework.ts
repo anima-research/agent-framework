@@ -16208,7 +16208,7 @@ export class AgentFramework {
       try {
         if (target) this.addMessage(
           'user',
-          [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason, opts.because, opts.target) }],
+          [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
           { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
           target,
         );
@@ -16231,11 +16231,21 @@ export class AgentFramework {
     bounced: 'routing prefix bounced',
   };
 
-  private draftsHeldNotice(agentName: string, held: Draft[], reason: DraftReason, because?: string, target?: ChannelRef): string {
+  private draftsHeldNotice(
+    agentName: string, held: Draft[], reason: DraftReason, because?: string, target?: ChannelRef, own: readonly ChannelRef[] = [],
+  ): string {
     const ids = held.map((d) => d.id);
     const many = held.length > 1;
     const quoted = (ds: Draft[]): string => ds.map((d) => `"${d.id}"`).join(', ');
-    const destination = JSON.stringify(target ? this.channelRegistry?.proseTargetFor(target) ?? qualifiedChannelName(target) : '#channel');
+    const registry = this.channelRegistry;
+    const resent = (name: string | undefined): string | undefined => {
+      if (!name || !registry || !target) return undefined;
+      const r = registry.resolveProseTarget(name, { forSpeech: true, own });
+      return 'channelId' in r && sameChannel(r, target) ? name : undefined;
+    };
+    const destination = JSON.stringify(
+      (target && (resent(registry?.proseTargetFor(target)) ?? resent(qualifiedChannelName(target)))) ?? '#channel',
+    );
     // Words copied from a draft that may already have been posted resend
     // only with the resident's confirmation; the rest resend freely.
     const free = held.filter((d) => draftState(d) !== 'unconfirmed');
