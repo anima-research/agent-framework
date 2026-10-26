@@ -60,7 +60,8 @@ export interface BranchIntent {
    * Why a recorded intent can't be read (its blob missing from the store,
    * a blob chronicle can't read, or not an intent): a tombstone or conflict
    * it held is unknown, never absent.
-   * Never written; a put replaces the damaged record.
+   * Never written; a put replaces the damaged record, unless it puts the same
+   * contents over a blob file chronicle can't read, which chronicle keeps.
    */
   unreadable?: string;
 }

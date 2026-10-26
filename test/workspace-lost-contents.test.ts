@@ -141,7 +141,7 @@ describe('contents the store lost, where disk holds the same bytes', () => {
     assert.deepEqual(env.alerts.map(({ kind, agent, data }) => ({ kind, agent, data })), [
       { kind: 'workspace-contents-restored', agent: 'workspace', data: { mount: 'work', path: 'work/a.txt', blobHash: hash } },
     ]);
-    assert.match(env.alerts[0]!.message, /work\/a\.txt.*missing.*stored again from disk's copy/);
+    assert.ok(env.alerts[0]!.message.startsWith(`Blob ${hash}: the saved contents of work/a.txt were missing from the workspace's store, and were stored again from disk's copy`), env.alerts[0]!.message);
 
     assert.equal(await textOf(m, 'work/a.txt'), 'alpha\nneedle\n');
     assert.equal(env.alerts.length, 1, 'contents back in the store need no restore');
@@ -233,6 +233,32 @@ describe('contents the store lost, where disk holds the same bytes', () => {
     assert.equal(env.store.getBlob(hash), null);
     assert.deepEqual(env.kinds(), ['workspace-contents-unstored']);
     assert.equal(env.alerts[0]!.data!.unstored, 'No space left on device');
+    assert.ok(env.alerts[0]!.message.startsWith(`Blob ${hash}: the saved contents of work/a.txt are missing from the workspace's store.`), env.alerts[0]!.message);
+  });
+
+  test("a store write that leaves a file it can't read is told with the store's error, and removing that file lets a read store the contents", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    const hash = await synced(env, m, 'a.txt', 'alpha\n');
+    const blob = join(env.storePath, 'blobs', hash.slice(0, 2), hash);
+    m = await env.lose(m, hash);
+    const store = env.store as unknown as { storeBlob: (content: Buffer, type: string) => string };
+    const storeBlob = store.storeBlob.bind(env.store);
+    store.storeBlob = () => {
+      writeFileSync(blob, 'CHB');
+      throw new Error('No space left on device');
+    };
+
+    assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
+    assert.deepEqual(env.kinds(), ['workspace-contents-unstored']);
+    assert.equal(env.alerts[0]!.data!.unstored, 'No space left on device');
+    assert.match(env.alerts[0]!.message, new RegExp(`^Blob ${hash}: .*storing it again didn't take: No space left on device\\. .*where the file is damaged, removing it lets the next read store them\\.$`));
+
+    store.storeBlob = storeBlob;
+    rmSync(blob);
+    assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
+    assert.equal(env.storedText(hash), 'alpha\n');
+    assert.deepEqual(env.kinds(), ['workspace-contents-unstored', 'workspace-contents-restored']);
   });
 
   test("a copy disk holds only through a link the mount doesn't follow isn't taken", async (t) => {
@@ -253,7 +279,7 @@ describe('contents the store lost, where disk holds the same bytes', () => {
     assert.equal(await textOf(m, 'work/a.txt'), 'alpha again\n');
   });
 
-  test("on a read-only mount, the answer asks for a change on disk rather than a write, and once disk's copy can be read a read restores it", async (t) => {
+  test("on a read-only mount, the answer says what a read or a sync does once disk's copy can be read, rather than offering a write, and a read then restores it", async (t) => {
     const env = new Env(t);
     let m = await env.open({ mode: 'read-only' });
     env.writeDisk('a.txt', 'alpha\n');
@@ -266,7 +292,7 @@ describe('contents the store lost, where disk holds the same bytes', () => {
 
     assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
       "The workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/a.txt), so it can't be restored or read. "
-        + "Only a change on disk can end this: once disk's copy can be read, read the file again, which restores it from a copy with the same contents, or sync the path to keep disk's copy and give up the workspace's.");
+        + "Once disk's copy can be read, read the file again, which reads it from disk's copy if that copy has the same contents, or sync the path to keep disk's copy and give up the workspace's.");
     rmSync(join(env.dir, 'a.txt'));
     env.writeDisk('a.txt', 'alpha\n');
     assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
@@ -274,20 +300,38 @@ describe('contents the store lost, where disk holds the same bytes', () => {
     assert.deepEqual(env.kinds(), ['workspace-contents-lost', 'workspace-contents-restored']);
   });
 
-  test('grep searches contents two files share once either restores them, whichever comes first', async (t) => {
+  test('grep searches contents two files share once either restores them, whichever comes first, and tells no loss', async (t) => {
+    for (const [unrestorable, restoring] of [['a.txt', 'b.txt'], ['b.txt', 'a.txt']]) {
+      const env = new Env(t);
+      let m = await env.open();
+      const hash = await draft(env, m, unrestorable!, 'other\n', 'needle\n');
+      assert.equal(await synced(env, m, restoring!, 'needle\n'), hash);
+      m = await env.lose(m, hash);
+
+      const found = await ok(m, 'grep', { pattern: 'needle' });
+      assert.deepEqual(found.results.map((r: { file: string }) => r.file), ['work/a.txt', 'work/b.txt']);
+      assert.equal(found.skipped, undefined);
+      assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [['workspace-contents-restored', `work/${restoring}`]]);
+      assert.equal(env.storedText(hash), 'needle\n');
+    }
+  });
+
+  test('edit_many edits files that share contents once either restores them, and tells no loss', async (t) => {
     const env = new Env(t);
     let m = await env.open();
-    const hash = await draft(env, m, 'a.txt', 'other\n', 'needle\n');
-    assert.equal(await synced(env, m, 'b.txt', 'needle\n'), hash);
+    const hash = await draft(env, m, 'a.txt', 'other\n', 'the same\n');
+    assert.equal(await synced(env, m, 'b.txt', 'the same\n'), hash);
     m = await env.lose(m, hash);
 
-    const found = await ok(m, 'grep', { pattern: 'needle' });
-    assert.deepEqual(found.results.map((r: { file: string }) => r.file), ['work/a.txt', 'work/b.txt']);
-    assert.equal(found.skipped, undefined);
-    assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [
-      ['workspace-contents-lost', 'work/a.txt'],
-      ['workspace-contents-restored', 'work/b.txt'],
-    ]);
+    await ok(m, 'edit_many', {
+      edits: [
+        { path: 'work/a.txt', oldString: 'same', newString: 'SAME' },
+        { path: 'work/b.txt', oldString: 'same', newString: 'SAME' },
+      ],
+    });
+    assert.equal(await textOf(m, 'work/a.txt'), 'the SAME\n');
+    assert.equal(await textOf(m, 'work/b.txt'), 'the SAME\n');
+    assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [['workspace-contents-restored', 'work/b.txt']]);
   });
 
   test("edit_many that restores one file still says what it took in from disk for another", async (t) => {
@@ -419,6 +463,75 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     ]);
   });
 
+  test("grep tells each file's own state when files share contents the store lost", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    const hash = await draft(env, m, 'a.txt', 'v1\n', 'needle\n');
+    assert.equal(await draft(env, m, 'b.txt', 'v1\n', 'needle\n'), hash);
+    rmSync(join(env.dir, 'b.txt'));
+    m = await env.lose(m, hash);
+
+    const found = await ok(m, 'grep', { pattern: 'needle' });
+    assert.deepEqual(found.results, []);
+    assert.deepEqual(found.skipped, [
+      { file: 'work/a.txt', reason: "the workspace's copy is missing from the store, and disk's copy holds other contents, so it was not searched" },
+      { file: 'work/b.txt', reason: "the workspace's copy is missing from the store, and disk has no copy, so it was not searched" },
+    ]);
+    assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [
+      ['workspace-contents-lost', 'work/a.txt'],
+      ['workspace-contents-lost', 'work/b.txt'],
+    ]);
+    assert.match(env.alerts[0]!.message, /: disk's copy holds other contents\. /);
+    assert.match(env.alerts[1]!.message, /: disk has no copy\. /);
+  });
+
+  test('disk bytes of the same size but other contents are not taken', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    const hash = await draft(env, m, 'a.txt', 'abcdef\n', 'ghijkl\n');
+    m = await env.lose(m, hash);
+
+    assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
+      "The workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored or read. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
+    assert.equal(env.store.getBlob(hash), null);
+    assert.deepEqual(env.kinds(), ['workspace-contents-lost']);
+  });
+
+  test("on a mount that follows links, a copy disk holds through a link leading nowhere is one it can't read, not one it lacks", async (t) => {
+    const env = new Env(t);
+    let m = await env.open({ followSymlinks: true });
+    const leaf = await draft(env, m, 'a.txt', 'v1\n', 'a draft\n');
+    const beneath = await draft(env, m, 'dir/b.txt', 'v1\n', 'b draft\n');
+    m = await env.restartAfter(m, (blobFile) => {
+      rmSync(blobFile(leaf));
+      rmSync(blobFile(beneath));
+    }, { followSymlinks: true });
+    rmSync(join(env.dir, 'a.txt'));
+    symlinkSync(join(env.dir, 'gone.txt'), join(env.dir, 'a.txt'));
+    rmSync(join(env.dir, 'dir'), { recursive: true });
+    symlinkSync(join(env.dir, 'nowhere'), join(env.dir, 'dir'));
+
+    assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
+      "The workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (File not found: work/a.txt), so it can't be restored or read. Write the file again, or delete it.");
+    assert.equal(await refused(m, 'read', { path: 'work/dir/b.txt' }),
+      "The workspace's copy of work/dir/b.txt is missing from the store, and disk's copy can't be read (beneath a symlink that does not lead to a directory inside the mount), so it can't be restored or read. Write the file again, or delete it.");
+  });
+
+  test("a store closed while a read restores contents fails the read with the store's own error, and tells no damaged blob", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    const hash = await synced(env, m, 'a.txt', 'alpha\n');
+    m = await env.lose(m, hash);
+    const store = env.store as unknown as { storeBlob: (content: Buffer, type: string) => string };
+    store.storeBlob = () => {
+      env.store.close();
+      throw new Error('Store has been closed');
+    };
+
+    assert.match(await refused(m, 'read', { path: 'work/a.txt' }), /Store has been closed/);
+    assert.deepEqual(env.kinds(), []);
+  });
+
   test("read_image serves disk's other image saying whose it is, and with none on disk says the copy is lost", async (t) => {
     const env = new Env(t);
     let m = await env.open();
@@ -471,6 +584,20 @@ describe('contents the store lost, where disk holds no copy of them', () => {
       "The workspace's copy of work/p.png is missing from the store, and disk's copy holds other contents, so it can't be restored, and disk's copy can't be shown (Unsupported image format: work/p.png). Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
   });
 
+  test("read_image gives disk's reason once where disk's copy can't be read", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    assert.equal((await m.writeBinary('work/p.png', PNG, 'image/png')).success, true);
+    await ok(m, 'materialize', { path: 'work/p.png' });
+    m = await env.lose(m, env.hashOf('p.png'));
+    writeFileSync(join(env.outside, 'p.png'), PNG);
+    rmSync(join(env.dir, 'p.png'));
+    symlinkSync(join(env.outside, 'p.png'), join(env.dir, 'p.png'));
+
+    assert.equal(await refused(m, 'read_image', { path: 'work/p.png' }),
+      "The workspace's copy of work/p.png is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/p.png), so it can't be restored or read. Write the file again, or delete it.");
+  });
+
   test("on a mount configured direct that runs as 'chronicle', the answer names the sync it takes, not a write", async (t) => {
     const env = new Env(t);
     let m = await env.open({ backend: 'chronicle' });
@@ -495,7 +622,7 @@ describe('contents the store lost, where disk holds no copy of them', () => {
 
     await refused(m, 'read', { path: 'work/a.txt' });
     assert.deepEqual(env.kinds(), ['workspace-contents-lost']);
-    assert.match(env.alerts[0]!.message, new RegExp(`\\(blob ${hash}\\)`));
+    assert.ok(env.alerts[0]!.message.startsWith(`Blob ${hash}: the saved contents of work/a.txt are missing from the workspace's store, and no copy`), env.alerts[0]!.message);
     assert.match(env.alerts[0]!.message, /Putting back the store's blob file for that hash, from a copy of the store, brings them back\.$/);
     writeFileSync(blob, saved);
     assert.equal(await textOf(m, 'work/a.txt'), 'v2, a draft\n');
@@ -584,6 +711,20 @@ describe("contents whose blob file the store can't read", () => {
     assert.equal(done.skipped.length, 1);
     assert.match(done.skipped[0].reason, /^a\.txt: the workspace copy is unreadable in the store \(.+\)$/);
     assert.deepEqual([env.readDisk('a.txt'), env.readDisk('b.txt')], ['v1\n', 'b draft\n']);
+  });
+
+  test("a forced materialize over disk's newer copy skips a file whose blob it can't read, saying why, and leaves disk's copy", async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    const a = await synced(env, m, 'a.txt', 'v1\n');
+    m = await env.damage(m, a);
+    env.writeDisk('a.txt', 'v2, on disk\n');
+
+    const done = await ok(m, 'materialize', { path: 'work/a.txt', force: true });
+    assert.deepEqual(done.materialized ?? [], []);
+    assert.equal(done.skipped.length, 1);
+    assert.match(done.skipped[0].reason, /^a\.txt: the workspace copy is unreadable in the store \(.+\)$/);
+    assert.equal(env.readDisk('a.txt'), 'v2, on disk\n');
   });
 
   test("a branch intent whose blob the store can't read leaves its path unverified, saying why, rather than failing the listing", async (t) => {
