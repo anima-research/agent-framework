@@ -132,8 +132,16 @@ export const heldFromResidents = (metadata: Record<string, unknown> | undefined)
  * - An owner's own row (its rounds, results, clock rows, notices about its
  *   own turn), and a row whose audience names an owner (channel traffic,
  *   mail, module rows): yes.
- * - Anything else, such as a row stamped only for an agent that doesn't read
- *   the slot, or for a derived agent on another branch: no.
+ * - A row whose audience names the observer itself, and that is nobody's
+ *   own row (an operator's message or a module's write addressed to the
+ *   subconscious alone, which lands in the residents' slot it watches):
+ *   yes. The edge is how the observer reads that slot, and the merged view
+ *   showed the row before the presentation index, so no window would hold
+ *   it otherwise (#291).
+ * - Anything else, such as the own row of an agent that doesn't own the
+ *   slot (the observer's own included), a row stamped only for an agent
+ *   that neither owns nor observes the slot, or one for a derived agent on
+ *   another branch: no.
  */
 export function observedRowFor(
   edge: Pick<ObserveEdge, 'includeHeld'>,
@@ -145,8 +153,8 @@ export function observedRowFor(
   if (heldFromResidents(row.metadata as Record<string, unknown> | undefined)) return edge.includeHeld === true;
   const stamp = audienceOf(row.metadata);
   if (!stamp) return true;
-  if (stamp.ownRowOf !== undefined && context.owners.includes(stamp.ownRowOf)) return true;
-  return stamp.audience.some((name) => context.owners.includes(name));
+  if (stamp.ownRowOf !== undefined) return context.owners.includes(stamp.ownRowOf);
+  return stamp.audience.some((name) => name === context.observer || context.owners.includes(name));
 }
 
 /** What `storeOwnRow` writes through: an agent, or anything that names one and holds its context. */

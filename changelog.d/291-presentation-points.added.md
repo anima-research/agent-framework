@@ -5,9 +5,13 @@
   writer's rows meant for it at its turn's start, at its tool boundary as a prefix its stream can carry (each body
   whole, cut at the first row the stream can't take, rendered after it is presented) and at its turn's end, and at
   once while no turn of it is alive. A boundary hands its stream exactly the rows its window took, in order, or
-  notes the stream's later rounds as unvouched (`presentation:hand-off-mismatch`). Two residents of one slot whose
-  turns overlap each keep a window that is what their requests carried, so each request starts with the one before
-  it and their rounds' signed thinking is sent again. A wake for a row stored where it would have been queued reads
+  notes the stream's later rounds as unvouched (`presentation:hand-off-mismatch`). An own row whose presentation
+  at its write failed is presented ahead of the agent's next own row, so a round's reply never lands after its own
+  results; a boundary or hand-off whose read of the store throws is traced as `presentation:failed`, hears
+  nothing or vouches for nothing, and the turn goes on; and a window write-down that throws once its record is
+  written (a snapshot after the write failing) leaves the window presented rather than the agent in legacy mode.
+  Two residents of one slot whose turns overlap each keep a window that is what their requests carried, so each
+  request starts with the one before it and their rounds' signed thinking is sent again. A wake for a row stored where it would have been queued reads
   that row (`WritePlacement.presented` false); a write stored during a turn takes no clock row, which the turn's
   boundary or next start takes; each resident a batched wake is for writes its own line, at its own start; and
   another reader's live turn no longer holds back an agent's clock rows, `[continue]` rows or stored injections.

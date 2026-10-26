@@ -5,15 +5,23 @@
  * One case per kind of row, over a real AgentRegistry: two residents (mira,
  * the primary, and oren), the subconscious serving mira, an observer of the
  * residents' slot that doesn't see held traffic, a shared task fork of mira
- * on its own branch, and a worker.
+ * on its own branch, and a worker. Then, through a real framework with the
+ * subconscious, a message addressed to it alone.
  */
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { MessageMetadata } from '@animalabs/context-manager';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { MessageId, MessageMetadata } from '@animalabs/context-manager';
+import type { ContentBlock } from '@animalabs/membrane';
 import {
-  AgentRegistry, RESIDENTS_SLOT, asOwnRow, observedRowFor, residentSpec, subconsciousSpec, taskForkSpec, withAudience, workerSpec,
+  AgentFramework, AgentRegistry, RESIDENTS_SLOT, asOwnRow, audienceOf, observedRowFor, residentSpec, subconsciousSpec, taskForkSpec,
+  withAudience, workerSpec,
 } from '../src/index.js';
+import type { EventResponse, Module, ProcessEvent, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { audienceFault, bearingOf, readerFacts, recordedReaderFacts } from '../src/presentation.js';
+import { RoutedMembrane, say, until } from './helpers/dendrite.js';
 
 const FORKED_AT = 10;
 
@@ -136,6 +144,20 @@ describe("the presentation index's audience rule", () => {
     assert.equal(bearingOf(row(asOwnRow(undefined, 'kid'), 31, 'mira'), kid, true), 'own', "its own row, though named as its parent's voice");
   });
 
+  it("a row addressed to the subconscious alone is its arrival through its edge, no resident's, and no fault", () => {
+    const forSub = row(withAudience({ kind: 'module-note' } as MessageMetadata, ['Subconscious']));
+    assert.equal(bearingOf(forSub, sub, false), 'arrival', 'its edge shows a row meant for it, as the merged view did');
+    assert.equal(bearingOf(forSub, mira, true), 'elsewhere');
+    assert.equal(bearingOf(forSub, oren, true), 'elsewhere');
+    assert.equal(bearingOf(forSub, watcher, false), 'elsewhere', 'another observer of the slot is not named');
+    assert.equal(observedRowFor({}, forSub, { observer: 'Subconscious', owners: ['mira', 'oren'] }), true, 'whatever the edge shows of held traffic');
+    assert.equal(audienceFault(['Subconscious'], RESIDENTS_SLOT, reg), false, 'readable through the edge, so no fault');
+    assert.equal(bearingOf(row(asOwnRow(undefined, 'Subconscious')), sub, false), 'elsewhere',
+      'a row in the slot it watches stamped as its own is its own delivery, which its round holds');
+    assert.equal(bearingOf(row(withAudience(undefined, ['Subconscious']), 20, 'Subconscious'), sub, false), 'elsewhere',
+      'nor a row stored under its own name');
+  });
+
   it("a row stamped only for an agent that can't read the slot reaches no window, and is a routing fault", () => {
     const fault = row(withAudience(undefined, ['worker-9']));
     assert.equal(bearingOf(fault, mira, true), 'elsewhere');
@@ -154,5 +176,74 @@ describe("the presentation index's audience rule", () => {
     const worker = readerFacts(reg, 'worker-1');
     assert.equal(bearingOf(row(withAudience(undefined, ['worker-1'])), worker, false), 'elsewhere');
     assert.equal(bearingOf(row(withAudience(undefined, ['worker-1'])), worker, true), 'arrival');
+  });
+});
+
+/** A surface's module: an `external-message` event's text becomes a message, read by the agents its metadata names. */
+class SurfaceModule implements Module {
+  readonly name = 'surface';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'no tools' }; }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    const { content, metadata } = event as unknown as { content: ContentBlock[]; metadata: { ask: string[] } };
+    return { addMessages: [{ participant: 'user', content }], requestInference: metadata.ask };
+  }
+}
+
+describe('a message addressed to the subconscious alone, through the framework', () => {
+  const dirs: string[] = [];
+  const frameworks: AgentFramework[] = [];
+  afterEach(async () => {
+    while (frameworks.length) { try { await frameworks.pop()!.stop(); } catch { /* stopped */ } }
+    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  it("reaches the subconscious's window and the request of the wake it asked for; only a write no reader can read is traced", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-audience-subconscious-'));
+    dirs.push(dir);
+    const membrane = new RoutedMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: ['mira', 'oren'].map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, proseRouting: 'disabled' as const })),
+      modules: [new SurfaceModule()],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+      subconscious: { enabled: true, systemPrompt: 'You notice.' },
+    });
+    frameworks.push(framework);
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => { traces.push(event); });
+    const SUB = 'Subconscious';
+    membrane.script(SUB, say('noted'));
+    framework.start();
+    // An operator's message, or a module's process response, that names the
+    // subconscious alone: delivered to the primary, so stored in the
+    // residents' slot, which the subconscious reads through its edge.
+    const note = 'AN OPERATOR NOTE FOR THE SUBCONSCIOUS';
+    framework.pushEvent({ type: 'external-message', source: 'test', content: [{ type: 'text', text: note }], metadata: { ask: [SUB] } } as unknown as ProcessEvent);
+    await until(() => membrane.callsFor(SUB).length > 0, "the subconscious's wake");
+    await framework.runUntilIdle();
+
+    const cm = (name: string) => framework.getAgent(name)!.getContextManager();
+    const row = cm('mira').getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === note));
+    assert.ok(row, "stored in the residents' slot");
+    assert.deepEqual(audienceOf(row.metadata)?.audience, [SUB], 'stamped for the subconscious alone, never widened');
+    assert.equal(cm(SUB).windowStatusOf(row.id), 'in', "in the subconscious's window, through its observe edge");
+    assert.equal(cm('mira').windowStatusOf(row.id), 'out', "in no resident's");
+    assert.equal(cm('oren').windowStatusOf(row.id), 'out');
+    assert.ok(JSON.stringify(membrane.callsFor(SUB).at(-1)!.messages).includes(note), "the subconscious's request carries it");
+    assert.deepEqual(traces.filter((t) => t.type === 'presentation:unreadable-audience'), [], 'a row its addressee reads is no fault');
+
+    // A write stamped only for an agent that reads no slot it lands in still is one.
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { audience?: readonly string[] }): MessageId;
+    };
+    internals.addMessage('someone', [{ type: 'text', text: 'for a worker' }], undefined, { audience: ['worker-9'] });
+    const faults = traces.filter((t): t is Extract<TraceEvent, { type: 'presentation:unreadable-audience' }> => t.type === 'presentation:unreadable-audience');
+    assert.deepEqual(faults.map((t) => [t.audience, t.deliveredTo]), [[['worker-9'], 'mira']]);
   });
 });

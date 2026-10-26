@@ -48,8 +48,8 @@
   "author": "Anima Research",
   "license": "MIT",
   "dependencies": {
-    "@animalabs/chronicle": "^0.4.0",
-    "@animalabs/context-manager": "^0.22.0",
+    "@animalabs/chronicle": "^0.5.0",
+    "@animalabs/context-manager": "^0.23.0",
     "@animalabs/membrane": "^0.7.1",
     "@modelcontextprotocol/client": "^2.3.1",
     "chokidar": "^4.0.3",

@@ -185,6 +185,7 @@ import {
   type ShownRanges,
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import {
   describeCodeExecution,
   CODE_EXECUTION_TOOL_NAME,
@@ -2216,6 +2217,38 @@ const MAINTENANCE_TICKS_PER_PASS = 8;
  *  startup's delivery. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
 
+/** The ops alert kind create() raises for a store handle with no batched identity append (perRowWindowWrites). */
+const PER_ROW_WINDOW_WRITES_KIND = 'chronicle-per-row-window-writes';
+
+/** The version of @animalabs/chronicle this package loads, as its package.json says, or undefined where that can't be read. */
+function chronicleVersion(): string | undefined {
+  try {
+    const version = (createRequire(import.meta.url)('@animalabs/chronicle/package.json') as { version?: unknown }).version;
+    return typeof version === 'string' ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What an operator is told when the store handle has no
+ * appendManyToStateJsonWithIdentity, chronicle's identity-stamped batched
+ * append (chronicle 0.5.0), or undefined when it has it. Context-manager
+ * then writes each window write one record per row: every agent's
+ * write-down at its registration (#291) takes one record for each row of
+ * its record, and a presentation of several rows that fails partway leaves
+ * the rows before the failure presented, where one record is kept or lost
+ * whole.
+ */
+function perRowWindowWrites(store: JsStore): string | undefined {
+  if (typeof (store as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity === 'function') return undefined;
+  return `the store handle has no appendManyToStateJsonWithIdentity (chronicle ${chronicleVersion() ?? 'of a version it does not say'} is loaded; ` +
+    'the batched form is in chronicle 0.5.0), so every window write is one record per row: each agent\'s window is ' +
+    'written down at its registration one record for each stored row, about 23 s and 63 MB of log for a 200,000-row ' +
+    'namespace on one synthetic store, against a quarter of a second as one record, and a presentation of several rows ' +
+    'that fails partway leaves the rows before it presented. Install @animalabs/chronicle ^0.5.0, which this package declares';
+}
+
 /** Local per-residence provider admission (AF #114 bounded first slice). */
 interface LocalProviderGate {
   primaryDepth: number;
@@ -4072,6 +4105,18 @@ export class AgentFramework {
     // branch generation of its own.
     if (typeof (ContextManager.prototype as { reinitializeOnStoreBranch?: unknown }).reinitializeOnStoreBranch !== 'function') {
       throw new Error('agent-framework needs @animalabs/context-manager with ContextManager.reinitializeOnStoreBranch: a context-manager whose managers can follow a branch move made through another');
+    }
+    // A store handle without the batched identity append (a chronicle
+    // before 0.5.0, or a host's handle from one) still works, one record per
+    // row: an operator hears of its cost once, before any agent's window is
+    // written down.
+    const perRow = perRowWindowWrites(store);
+    if (perRow !== undefined) {
+      console.warn(`[presentation] ${perRow}`);
+      const version = chronicleVersion();
+      framework.opsAlert(PER_ROW_WINDOW_WRITES_KIND, 'framework', perRow, {
+        data: { ...(version !== undefined ? { chronicle: version } : {}), missing: 'appendManyToStateJsonWithIdentity' },
+      });
     }
     framework.presentation = new AgentPresentation({
       liveAgents: () => framework.agents.values(),

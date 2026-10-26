@@ -591,3 +591,145 @@ describe('the presentation module', () => {
     assert.equal(r.presentation.presenting(r.oren), false);
   });
 });
+
+describe('the presentation module when a store call fails', () => {
+  /** Run `body` with console.error and console.warn silenced, as the module logs each failure it traces. */
+  const quietly = <T>(body: () => T): T => {
+    const { error, warn } = console;
+    console.error = () => {};
+    console.warn = () => {};
+    try { return body(); } finally { console.error = error; console.warn = warn; }
+  };
+
+  it("an own row whose presentation at its write failed enters ahead of the next own row written: a round's reply before its results, and the hand-off vouches", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    // A row held back from the sink (present: false) is never kept for the
+    // next write: it waits for the next point's sweep.
+    const held = storeOwnRow(r.mira, 'user', text('held back'), undefined, undefined, false);
+    const real = r.mira.cm.presentRows.bind(r.mira.cm);
+    let failNext = true;
+    r.mira.cm.presentRows = (ids) => {
+      if (failNext) { failNext = false; throw new Error('a transient write failure'); }
+      return real(ids);
+    };
+    const reply = quietly(() => storeOwnRow(r.mira, 'mira', [...text('calling'), toolUse('c1')]));
+    assert.equal(r.mira.has(reply), false, 'the reply missed its write');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'write']]);
+    const results = storeOwnRow(r.mira, 'user', [toolResult('c1')]);
+    assert.deepEqual([r.mira.has(reply), r.mira.has(results), r.mira.has(held)], [true, true, false],
+      'the reply enters with its results; the row held back still waits');
+    assert.deepEqual(r.mira.cm.getPresentedMessages().slice(-2).map((m) => m.id), [reply, results],
+      'the reply ahead of its results, as the record has them');
+    // The boundary, as the framework runs it: the round on the wire, then
+    // what the stream hears (the held row, an own row due at this point),
+    // then the hand-off of all of them in that order.
+    const { heard } = r.presentation.presentAtBoundary(r.mira, [reply, results], { injects: true });
+    assert.deepEqual(heard.map((h) => h.id), [held]);
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results, ...heard.map((h) => h.id)]), { vouched: true });
+    assert.deepEqual(ofType(r.traces, 'presentation:hand-off-mismatch'), []);
+    const compiled = await r.mira.cm.compile(undefined, undefined, { dryRun: true });
+    assert.deepEqual(compiled.messages.slice(-3).map((m) => m.content.map((b) => b.type).join(',')), ['text,tool_use', 'tool_result', 'text'],
+      'a compile sends the call before its result');
+  });
+
+  it("an own row kept after a failed write that enters at another point first isn't presented again, nor one an undo took out", async () => {
+    const r = await rig();
+    r.adoptAll();
+    const real = r.mira.cm.presentRows.bind(r.mira.cm);
+    let fail = true;
+    r.mira.cm.presentRows = (ids) => {
+      if (fail) throw new Error('a transient write failure');
+      return real(ids);
+    };
+    const note = quietly(() => storeOwnRow(r.mira, 'user', text('a notice')));
+    assert.equal(r.mira.has(note), false);
+    fail = false;
+    r.presentation.presentAtEnd(r.mira);
+    assert.equal(r.mira.has(note), true, "the turn's end sweeps it in");
+    const ordinal = r.mira.cm.ordinalOf(note);
+    const failures = ofType(r.traces, 'presentation:failed').length;
+    const next = storeOwnRow(r.mira, 'mira', text('a reply'));
+    assert.equal(r.mira.cm.ordinalOf(note), ordinal, 'not presented again');
+    assert.equal(r.mira.has(next), true);
+    assert.equal(ofType(r.traces, 'presentation:failed').length, failures, 'the next write presented cleanly');
+
+    fail = true;
+    const undone = quietly(() => storeOwnRow(r.mira, 'mira', text('an undone reply')));
+    fail = false;
+    r.presentation.presentAtEnd(r.mira);
+    r.mira.cm.retractRows([undone], { undone: true });
+    assert.equal(r.mira.cm.windowStatusOf(undone), 'undone');
+    const after = storeOwnRow(r.mira, 'mira', text('after the undo'));
+    assert.equal(r.mira.cm.windowStatusOf(undone), 'undone', 'an undone row stays out');
+    assert.equal(r.mira.has(after), true);
+  });
+
+  it("an own row kept after a failed write is the next turn start's to sweep: when that fails too, the next own row enters alone", async () => {
+    const r = await rig();
+    r.adoptAll();
+    const real = r.mira.cm.presentRows.bind(r.mira.cm);
+    let fail = true;
+    r.mira.cm.presentRows = (ids) => {
+      if (fail) throw new Error('a transient write failure');
+      return real(ids);
+    };
+    const note = quietly(() => storeOwnRow(r.mira, 'user', text('a notice at rest')));
+    r.alive.add('mira');
+    // The turn's compile goes ahead without the notice: its sweep failed.
+    quietly(() => r.presentation.presentAtStart(r.mira, 'compile'));
+    fail = false;
+    const reply = storeOwnRow(r.mira, 'mira', text('a reply its request had no notice before'));
+    assert.deepEqual([r.mira.has(note), r.mira.has(reply)], [false, true], 'the notice is not put ahead of the reply');
+    r.alive.delete('mira');
+    r.presentation.presentAtEnd(r.mira);
+    assert.deepEqual(r.mira.window().slice(-2), ['a reply its request had no notice before', 'a notice at rest'], "the notice at the turn's end");
+  });
+
+  it('a write-down that throws once its record is written leaves the agent presented, its sink installed, and nothing failed', async () => {
+    const r = await rig();
+    const before = storeOwnRow(r.mira, 'mira', text('a reply before the index'));
+    const real = r.mira.cm.presentRows.bind(r.mira.cm);
+    r.mira.cm.presentRows = (ids) => {
+      const ordinals = real(ids);
+      // As a write the store recorded and whose own snapshot then failed.
+      if (ids.length === 0) throw new Error('the snapshot after the write failed');
+      return ordinals;
+    };
+    quietly(() => r.adoptAll());
+    assert.equal(r.mira.cm.windowMode(), 'presented', 'the write-down landed');
+    assert.equal(r.presentation.presenting(r.mira), true, 'and the module presents for mira');
+    assert.ok(r.mira.sink, 'her own-row sink is installed');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed'), [], 'nothing pinned her in legacy mode');
+    assert.equal(r.mira.has(before), true);
+    r.alive.add('mira');
+    const reply = storeOwnRow(r.mira, 'mira', text('a reply after it'));
+    assert.equal(r.mira.has(reply), true, 'an own row enters at its write');
+  });
+
+  it("a read that throws at a tool boundary hears nothing and is traced, and so is a hand-off's, which vouches for nothing", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const reply = storeOwnRow(r.mira, 'mira', [...text('calling'), toolUse('c1')]);
+    const results = storeOwnRow(r.mira, 'user', [toolResult('c1')]);
+    const arrival = r.write(r.oren, 'someone', text('heard later'), ['mira']);
+    const cm = r.mira.cm as unknown as { getUnpresentedMessages: () => unknown; getPresentedMessages: () => unknown };
+    cm.getUnpresentedMessages = () => { throw new Error('the store could not be read'); };
+    const boundary = quietly(() => r.presentation.presentAtBoundary(r.mira, [reply, results], { injects: true }));
+    delete (cm as { getUnpresentedMessages?: unknown }).getUnpresentedMessages;
+    assert.deepEqual(boundary, { heard: [] }, 'nothing heard, and no throw into the boundary');
+    assert.equal(r.mira.has(arrival), false, 'the arrival waits');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'tool-boundary']]);
+
+    cm.getPresentedMessages = () => { throw new Error('the store could not be read'); };
+    const handOff = quietly(() => r.presentation.handOff(r.mira, [reply, results]));
+    delete (cm as { getPresentedMessages?: unknown }).getPresentedMessages;
+    assert.deepEqual(handOff, { vouched: false }, 'the check could not be made');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'tool-boundary'], ['mira', 'hand-off']]);
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results]), { vouched: true }, 'and the window it checks is as it was');
+    r.alive.delete('mira');
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [arrival], "the arrival at the turn's end");
+  });
+});

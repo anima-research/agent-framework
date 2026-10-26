@@ -245,8 +245,12 @@ export function bearingOf(
 /**
  * Whether a row stamped for `audience` and stored in `slot` is meant only for
  * agents that can't read it: its audience names someone, and none of them
- * reads the slot. Such a row is stored as named, never widened (no window
- * presents it by its audience), and traced as a routing fault.
+ * reads the slot, as an owner or through an observe edge (registry
+ * readersOf). Such a row is stored as named, never widened (no window
+ * presents it by its audience), and traced as a routing fault. A row whose
+ * audience names an observer of the slot is no fault: its edge shows it
+ * (observedRowFor), as one naming an owner is presented in that owner's
+ * window.
  */
 export function audienceFault(
   audience: readonly AgentName[],
@@ -291,7 +295,7 @@ export type PresentationOccasion =
 
 /** A context manager as the module uses it. */
 export type WindowManager = Pick<ContextManager,
-  'presentRows' | 'getUnpresentedMessages' | 'getPresentedMessages' | 'ordinalOf' | 'indexLength'
+  'presentRows' | 'getUnpresentedMessages' | 'getPresentedMessages' | 'ordinalOf' | 'indexLength' | 'windowStatusOf'
   | 'windowMode' | 'getMessage' | 'currentBranch' | 'isClosed' | 'retractRemoved' | 'retractAbsentRows'>;
 
 /** An agent as the module presents to it. The framework's Agent is one. */
@@ -395,6 +399,8 @@ export class AgentPresentation {
   /** Rows handed each reader fork as framing (noteFramed), in memory. */
   private readonly framed = new Map<AgentName, Set<MessageId>>();
   private readonly listeners = new Map<AgentName, Set<(event: PresentedEvent) => void>>();
+  /** Own rows whose presentation at their write failed, per manager (presentOwn), until they enter its window. */
+  private readonly failedOwn = new WeakMap<WindowManager, Set<MessageId>>();
 
   constructor(private readonly host: PresentationHost) {}
 
@@ -414,12 +420,13 @@ export class AgentPresentation {
    * write-down cut short), and the agent's own rows stored and not in its
    * window are presented to it, in record order (an undone turn's rows are
    * not: getUnpresentedMessages leaves them out). A window that can't be
-   * written down (another version's index format, or a failed write) leaves
-   * the agent in legacy mode, traced once, until a move of the store's
-   * branch writes its window down on the new branch (rebase): its window is
-   * the whole record, as before the index. Then, every time, the agent's
-   * own-row sink is installed, and every scan memo is dropped, since a
-   * registration can change who reads a slot.
+   * written down (another version's index format, or a failed write; not a
+   * write-down that threw once its record was written, which reads as
+   * presented: writeDown) leaves the agent in legacy mode, traced once,
+   * until a move of the store's branch writes its window down on the new
+   * branch (rebase): its window is the whole record, as before the index.
+   * Then, every time, the agent's own-row sink is installed, and every scan
+   * memo is dropped, since a registration can change who reads a slot.
    */
   adopt(agent: PresentedAgent): void {
     const cm = agent.getContextManager();
@@ -488,8 +495,12 @@ export class AgentPresentation {
    * whether the window is presented after it. A write-down that fails, or
    * leaves the manager in legacy mode, pins the agent in legacy mode
    * (`state.pinnedLegacy`), traced as presentation:failed at `occasion`. A
-   * write-down at a rebase is traced as presented, with the bodies the
-   * window holds.
+   * write-down that throws once its record is written (the store's own work
+   * after a write, such as a snapshot, failing) has written the window
+   * down: the manager reads its index again after any throw, so a window
+   * that reads as presented then is taken as one, and the agent is
+   * presented for, with a log line. A write-down at a rebase is traced as
+   * presented, with the bodies the window holds.
    */
   private writeDown(agent: PresentedAgent, state: Adopted, occasion: 'adopt' | 'rebase'): boolean {
     const cm = agent.getContextManager();
@@ -499,9 +510,13 @@ export class AgentPresentation {
         cm.presentRows([]);
         wrote = true;
       } catch (error) {
-        state.pinnedLegacy = describe(error);
-        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
-        return false;
+        if (!readsPresented(cm)) {
+          state.pinnedLegacy = describe(error);
+          this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
+          return false;
+        }
+        console.warn(`[presentation] ${agent.name}: writing its window down at ${occasion} threw after the window was written (${describe(error)}); its window is presented`);
+        wrote = true;
       }
     }
     if (cm.windowMode() !== 'presented') {
@@ -522,6 +537,7 @@ export class AgentPresentation {
     const cm = agent.getContextManager();
     this.adopted.delete(cm);
     this.memos.delete(cm);
+    this.failedOwn.delete(cm);
     this.framed.delete(agent.name);
     this.generation++;
   }
@@ -561,17 +577,32 @@ export class AgentPresentation {
    * last request, or one written while it has no turn alive: any other row
    * would enter a live window its requests don't carry, so its writer holds
    * it back (storeOwnRow's `present: false`) for the next point's sweep.
-   * Never throws.
+   *
+   * An own row whose presentation here failed (a transient store error) is
+   * kept, and presented ahead of the rows given at the agent's next call,
+   * in record order, while it is still out of the window: its window's
+   * ordinals never move, so a row written after it and presented first
+   * would stay ahead of it for good (a round's results ahead of its reply,
+   * which every later compile would send so). It is kept until the agent's
+   * next turn start or tool boundary, whose own-row sweep presents it by
+   * that point's rule, or leaves it for the next point when that fails
+   * too: a request compiled, or a stream handed its rows, without it
+   * mustn't find it in the window ahead of a reply it didn't come before.
+   * A row its writer held back is never kept: it waits for the next point's
+   * sweep. Never throws.
    */
   presentOwn(agent: PresentedAgent, ids: ReadonlyArray<MessageId | undefined>): void {
+    let tried: readonly MessageId[] = unique(ids);
     try {
       if (!this.presenting(agent)) return;
       const cm = agent.getContextManager();
-      const missing = unique(ids).filter((id) => cm.ordinalOf(id) === undefined);
-      this.present(agent, missing, 'write');
+      tried = unique([...this.failedOwnOf(agent), ...ids]).filter((id) => cm.ordinalOf(id) === undefined);
+      this.present(agent, tried, 'write');
+      this.keepFailedOwn(agent, tried);
       this.afterStore(agent, ids);
     } catch (error) {
       this.failed(agent, 'write', error);
+      this.keepFailedOwn(agent, tried);
     }
   }
 
@@ -614,6 +645,8 @@ export class AgentPresentation {
    */
   presentAtStart(agent: PresentedAgent, occasion: 'turn-start' | 'assembly' | 'compile'): StoredMessage[] {
     if (!this.presenting(agent)) return [];
+    // The sweep below decides the own rows a failed write left (presentOwn).
+    this.failedOwn.delete(agent.getContextManager());
     return this.presentPending(agent, occasion, occasion !== 'compile' && !this.host.frozen());
   }
 
@@ -628,34 +661,47 @@ export class AgentPresentation {
    * whole, named by its first shard not in the window. Those are what the
    * stream carries next (`heard`); the cut body and those after it wait for
    * the turn's end. A presentation cut short hears only the bodies wholly in
-   * the window.
+   * the window. A read of the window or the record that throws is traced as
+   * presentation:failed, and the stream hears nothing: what wasn't presented
+   * waits for the next point, and the hand-off that follows checks the
+   * window as it then stands. Never throws, so the boundary goes on to hand
+   * the stream its results.
    */
   presentAtBoundary(agent: PresentedAgent, wire: ReadonlyArray<MessageId | undefined>, options: { injects: boolean }): BoundaryPresentation {
-    if (!this.presenting(agent)) return { heard: [] };
-    const cm = agent.getContextManager();
-    const missing = unique(wire).filter((id) => cm.ordinalOf(id) === undefined);
-    if (missing.length > 0 && this.present(agent, missing, 'tool-boundary').error !== undefined) return { heard: [] };
-    if (this.host.frozen() || !options.injects) return { heard: [] };
-    const bodies = this.pending(agent, true);
-    const cut = bodies.findIndex((body) => body.shards.some((shard) => !isInjectableMidTurn(shard, agent)));
-    const prefix = cut === -1 ? bodies : bodies.slice(0, cut);
-    const cutAt = cut === -1 ? undefined : bodies[cut]!.shards[0]!.id;
-    const { entered } = this.present(agent, prefix.map((body) => body.shards[0]!.id), 'tool-boundary', {
-      unstamped: prefix.filter((body) => body.unstamped).length,
-      ...(cutAt !== undefined ? { cutAt } : {}),
-    }, prefix);
-    const heard = prefix
-      .filter((body) => entered.has(body.shards[0]!.id) && body.shards.every((shard) => cm.ordinalOf(shard.id) !== undefined))
-      .map((body): HeardRow => {
-        const head = body.shards[0]!;
-        return {
-          id: head.id,
-          participant: head.participant,
-          content: asCompiled(body.shards),
-          ...(head.metadata !== undefined ? { metadata: head.metadata } : {}),
-        };
-      });
-    return { heard, ...(cutAt !== undefined ? { cutAt } : {}) };
+    try {
+      if (!this.presenting(agent)) return { heard: [] };
+      const cm = agent.getContextManager();
+      const missing = unique(wire).filter((id) => cm.ordinalOf(id) === undefined);
+      // The round's rows are presented here, in order, and the own rows a
+      // failed write left (presentOwn) are this boundary's to sweep, or the
+      // next point's: none is put ahead of the next round's reply.
+      this.failedOwn.delete(cm);
+      if (missing.length > 0 && this.present(agent, missing, 'tool-boundary').error !== undefined) return { heard: [] };
+      if (this.host.frozen() || !options.injects) return { heard: [] };
+      const bodies = this.pending(agent, true);
+      const cut = bodies.findIndex((body) => body.shards.some((shard) => !isInjectableMidTurn(shard, agent)));
+      const prefix = cut === -1 ? bodies : bodies.slice(0, cut);
+      const cutAt = cut === -1 ? undefined : bodies[cut]!.shards[0]!.id;
+      const { entered } = this.present(agent, prefix.map((body) => body.shards[0]!.id), 'tool-boundary', {
+        unstamped: prefix.filter((body) => body.unstamped).length,
+        ...(cutAt !== undefined ? { cutAt } : {}),
+      }, prefix);
+      const heard = prefix
+        .filter((body) => entered.has(body.shards[0]!.id) && body.shards.every((shard) => cm.ordinalOf(shard.id) !== undefined))
+        .map((body): HeardRow => {
+          const head = body.shards[0]!;
+          return {
+            id: head.id,
+            participant: head.participant,
+            content: asCompiled(body.shards),
+            ...(head.metadata !== undefined ? { metadata: head.metadata } : {}),
+          };
+        });
+      return { heard, ...(cutAt !== undefined ? { cutAt } : {}) };
+    } catch (error) {
+      this.failed(agent, 'tool-boundary', error);
+      return { heard: [] };
+    }
   }
 
   /**
@@ -676,24 +722,31 @@ export class AgentPresentation {
    * mismatch it traces presentation:hand-off-mismatch and the rows are not
    * vouched for, so the stream's later thinking is left out at the next
    * compile rather than sent under a prefix its window doesn't hold. An
-   * agent the module doesn't present for is vouched for as before.
+   * agent the module doesn't present for is vouched for as before. A read
+   * of the window that throws is traced as presentation:failed, and the
+   * rows are not vouched for: the check couldn't be made. Never throws.
    */
   handOff(agent: PresentedAgent, sent: ReadonlyArray<MessageId | undefined>): { vouched: boolean } {
-    if (!this.presenting(agent)) return { vouched: true };
-    const cm = agent.getContextManager();
-    const expected = unique(sent);
-    if (expected.length === 0) return { vouched: true };
-    const missing = expected.filter((id) => cm.ordinalOf(id) === undefined);
-    if (missing.length > 0 && this.present(agent, missing, 'hand-off').error !== undefined) {
-      this.host.emitTrace({ type: 'presentation:hand-off-mismatch', agentName: agent.name, expected, tail: lastBodyHeads(cm.getPresentedMessages(), expected.length) });
+    try {
+      if (!this.presenting(agent)) return { vouched: true };
+      const cm = agent.getContextManager();
+      const expected = unique(sent);
+      if (expected.length === 0) return { vouched: true };
+      const missing = expected.filter((id) => cm.ordinalOf(id) === undefined);
+      if (missing.length > 0 && this.present(agent, missing, 'hand-off').error !== undefined) {
+        this.host.emitTrace({ type: 'presentation:hand-off-mismatch', agentName: agent.name, expected, tail: lastBodyHeads(cm.getPresentedMessages(), expected.length) });
+        return { vouched: false };
+      }
+      const tail = lastBodyHeads(cm.getPresentedMessages(), expected.length);
+      if (tail.length !== expected.length || tail.some((id, i) => id !== expected[i])) {
+        this.host.emitTrace({ type: 'presentation:hand-off-mismatch', agentName: agent.name, expected, tail });
+        return { vouched: false };
+      }
+      return { vouched: true };
+    } catch (error) {
+      this.failed(agent, 'hand-off', error);
       return { vouched: false };
     }
-    const tail = lastBodyHeads(cm.getPresentedMessages(), expected.length);
-    if (tail.length !== expected.length || tail.some((id, i) => id !== expected[i])) {
-      this.host.emitTrace({ type: 'presentation:hand-off-mismatch', agentName: agent.name, expected, tail });
-      return { vouched: false };
-    }
-    return { vouched: true };
   }
 
   /** A read of the agent's arrivals not yet presented, one per body, in record order (for previews and a release). */
@@ -888,6 +941,38 @@ export class AgentPresentation {
   // Internals
   // --------------------------------------------------------------------------
 
+  /**
+   * The own rows whose presentation at their write failed (presentOwn) and
+   * that are still out of the agent's window, in record order. A row that
+   * entered by another point since, was undone, or left the record (a
+   * branch move, a removal) is dropped.
+   */
+  private failedOwnOf(agent: PresentedAgent): MessageId[] {
+    const cm = agent.getContextManager();
+    const kept = this.failedOwn.get(cm);
+    if (!kept || kept.size === 0) return [];
+    const owed: Array<{ id: MessageId; sequence: number }> = [];
+    for (const id of kept) {
+      const row = cm.windowStatusOf(id) === 'out' ? cm.getMessage(id) : null;
+      if (row) owed.push({ id, sequence: row.sequence });
+    }
+    if (owed.length === 0) this.failedOwn.delete(cm);
+    return owed.sort((a, b) => a.sequence - b.sequence).map((row) => row.id);
+  }
+
+  /** Keep, of the own rows presentOwn tried, those still out of the window, for its next call; forget the rest. */
+  private keepFailedOwn(agent: PresentedAgent, tried: readonly MessageId[]): void {
+    const cm = agent.getContextManager();
+    try {
+      const left = tried.filter((id) => cm.ordinalOf(id) === undefined);
+      if (left.length > 0) this.failedOwn.set(cm, new Set(left));
+      else this.failedOwn.delete(cm);
+    } catch {
+      // A window that can't be read now: keep every row tried.
+      if (tried.length > 0) this.failedOwn.set(cm, new Set(tried));
+    }
+  }
+
   /** presentAtEnd under a named occasion. */
   private presentAtRest(agent: PresentedAgent, occasion: 'turn-end' | 'at-rest'): StoredMessage[] {
     if (!this.presenting(agent) || this.host.turnAlive(agent.name)) return [];
@@ -1061,6 +1146,15 @@ export class AgentPresentation {
   private failed(agent: PresentedAgent, occasion: PresentationOccasion, error: unknown): void {
     console.error(`[presentation] ${agent.name}: presenting at ${occasion} failed; what it didn't present waits for the next point:`, error);
     this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: describe(error) });
+  }
+}
+
+/** Whether `cm`'s window reads as presented; a mode that can't be read is not. */
+function readsPresented(cm: Pick<WindowManager, 'windowMode'>): boolean {
+  try {
+    return cm.windowMode() === 'presented';
+  } catch {
+    return false;
   }
 }
 

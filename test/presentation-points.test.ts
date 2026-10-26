@@ -132,6 +132,45 @@ describe('presentation points (#291)', () => {
     assert.deepEqual(h.traces.filter((e) => e.type === 'presentation:hand-off-mismatch'), [], 'the boundary handed its stream the rows its window took');
   });
 
+  // A boundary that threw into its handler left the stream unresumed, and
+  // the turn hung: the timeout fails it fast.
+  it("a tool boundary whose read of the record throws hears nothing, and the turn goes on to its answer; the row waits for the turn's end", { timeout: 60_000 }, async () => {
+    const h = await boot();
+    h.membrane.script('mira', round('c1', [text('looking')], 'wait', { gate: 'm' }), final([text('done')]));
+    h.framework.start();
+    h.framework.pushEvent(input('go', ['mira']));
+    await until(() => h.gates.entered.has('m'), "mira's round waiting on its tool");
+    h.internals.addMessage('user', [text('would be heard')], undefined, { forAgent: 'mira' });
+    // The boundary's read of what mira is owed (getUnpresentedMessages)
+    // fails once, as a store read error would.
+    const cm = h.cm('mira') as unknown as { getUnpresentedMessages: (...args: unknown[]) => unknown };
+    const real = cm.getUnpresentedMessages.bind(cm);
+    let armed = true;
+    cm.getUnpresentedMessages = (...args: unknown[]) => {
+      if (armed) { armed = false; throw new Error('the store could not be read'); }
+      return real(...args);
+    };
+    const error = console.error;
+    console.error = () => {};
+    try {
+      h.gates.release('m');
+      await h.framework.runUntilIdle();
+    } finally {
+      console.error = error;
+      delete (cm as { getUnpresentedMessages?: unknown }).getUnpresentedMessages;
+    }
+    assert.equal(armed, false, 'the read failed');
+    const stream = h.membrane.streams[0]!.stream;
+    assert.equal(stream.receivedToolResults.length, 1, 'the stream was handed its results');
+    assert.deepEqual(stream.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []), [], 'and heard nothing with them');
+    assert.ok(h.traces.some((e) => e.type === 'presentation:failed' && (e as { occasion?: string }).occasion === 'tool-boundary'),
+      'the failure is traced');
+    assert.ok(h.traces.some((e) => e.type === 'inference:completed' && (e as { agentName?: string }).agentName === 'mira'), 'the turn completed');
+    const window = h.windowTexts('mira');
+    assert.deepEqual(window.slice(window.indexOf('looking')), ['looking', 'tool_result', 'done', 'would be heard'],
+      "the answer after its results, and the row at the turn's end");
+  });
+
   it("a write stored during a turn takes no clock that is due; the turn's tool boundary takes it, ahead of what it hears", async () => {
     const h = await boot({ clock: { intervalSeconds: 1 } });
     h.membrane.script('mira', round('c1', [text('looking')], 'wait', { gate: 'm' }), final([text('done')]));
