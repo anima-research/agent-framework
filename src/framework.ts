@@ -21662,12 +21662,13 @@ export class AgentFramework {
             if (thinkingDropped) thinkingDroppedInStream = true;
             // Against the branch's binding record, when the context manager keeps one: a drop it can't account
             // for tells the operators (noteThinkingLoss), and a call with no report shows no such drop.
+            const placedDrops = thinkingDrops && thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [];
             if (thinkingDrops?.recordedAfter !== undefined) {
-              this.noteThinkingLoss(agent.name, thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], thinkingDrops.recordedAfter);
+              this.noteThinkingLoss(agent.name, placedDrops, thinkingDrops.recordedAfter);
             }
             if (thinkingDrops) {
               this.tellReasoningLoss(agent, () => this.reasoningLoss.forDrops(agent.name, thinkingDrops.branch ?? '',
-                thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], streamRouting, agent.getContextManager()));
+                placedDrops, streamRouting, agent.getContextManager()));
             }
             try {
               if (!thinkingDroppedInStream) {

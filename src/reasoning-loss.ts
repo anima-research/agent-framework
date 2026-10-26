@@ -15,7 +15,11 @@ export interface ReasoningLossTurn {
   start?: { branch: string; sequence: number };
 }
 
-const HEAD_CAUSES: Partial<Record<string, ReasoningLossCause>> = { tools: 'tools', system: 'system', model: 'model' };
+const HEAD_CAUSES: Partial<Record<NonNullable<ThinkingStrip['changed']>[number], ReasoningLossCause>> = {
+  tools: 'tools',
+  system: 'system',
+  model: 'model',
+};
 
 export class ReasoningLossTeller {
   private readonly told = new Map<string, Map<string, Set<MessageId>>>();
