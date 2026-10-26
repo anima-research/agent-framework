@@ -49,7 +49,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { continuesBody, type ContextManager, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
 import { audienceOf, heldFromResidents, observedRowFor } from './dendrite/audience.js';
 import { RESIDENTS_SLOT, sameSlot, type AgentRegistry } from './dendrite/registry.js';
-import type { AgentName, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
+import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
 import type { WindowOrdinal } from './read-marks.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
 import { nameAsStored } from './text-as-stored.js';
@@ -157,8 +157,31 @@ export type ReaderRegistry = Pick<AgentRegistry, 'get' | 'ownSlotOf' | 'observed
 
 /** A reader's facts as the registry has them now. An agent it doesn't know has no slot and observes nothing. */
 export function readerFacts(registry: ReaderRegistry, name: AgentName): ReaderFacts {
-  const record = registry.get(name);
-  const ownSlot = registry.ownSlotOf(name);
+  return factsOf(registry, name, registry.get(name), registry.ownSlotOf(name));
+}
+
+/**
+ * A reader's facts as the registry recorded them: its live record, else its
+ * newest ended one (registry.inspect). For a reader that has left, as a
+ * released fork or run has by the time its window is read for what it
+ * never read (AgentFramework.releasedWindow): readerFacts reads live
+ * records only, and would know nothing of it.
+ */
+export function recordedReaderFacts(
+  registry: Pick<AgentRegistry, 'inspect' | 'observedSlotOf' | 'slotOwners'>,
+  name: AgentName,
+): ReaderFacts {
+  const record = registry.inspect(name);
+  return factsOf(registry, name, record, record?.ownSlot ? { ...record.ownSlot } : undefined);
+}
+
+/** A reader's facts from its record and its own slot (readerFacts, recordedReaderFacts). */
+function factsOf(
+  registry: Pick<AgentRegistry, 'observedSlotOf' | 'slotOwners'>,
+  name: AgentName,
+  record: AgentRecord | undefined,
+  ownSlot: MessageSlotRef | undefined,
+): ReaderFacts {
   const observed: ObservedSlot[] = [];
   for (const edge of record?.relationships.observes ?? []) {
     const slot = registry.observedSlotOf(edge);

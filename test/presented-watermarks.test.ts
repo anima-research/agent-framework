@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import type { ContextInjection, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, asOwnRow, audienceOf, withAudience, type Agent } from '../src/index.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { HeldStream, MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { storedInjectionMarkOf } from '../src/stored-injections.js';
 import { removeStoredMessage } from '../src/stored-removal.js';
@@ -309,5 +309,210 @@ describe('read marks once windows are presented (#291)', () => {
     const unsent = h.mira.unsentInjection('lessons');
     assert.ok(unsent?.whole, 'her own copy since the point is unsent, whole');
     assert.equal(unsent.contentHash, storedInjectionMarkOf(ownCopies().at(-1)!.metadata)!.contentHash);
+  });
+});
+
+/**
+ * What a released fork or run passes to the primary is what was meant for
+ * it and it never read (releasedWindow), not every unread row of a record it
+ * shares (#291, J-AF7). A shared fork reads its parent's slot on a branch of
+ * its own and inherits its parent's window, and a resident reads the slot
+ * every resident writes. A notice there for the parent or a co-resident
+ * never entered this agent's window, so its mark never covers it, and
+ * before this fix every shared fork's release told the primary of it again,
+ * in the fork's name.
+ */
+describe('a released agent passes on only what was meant for it (#291)', () => {
+  /** Held streams a case left waiting, let go before its host stops, so a failed case doesn't hang the stop. */
+  const holds: Array<() => void> = [];
+  afterEach(() => { while (holds.length) holds.pop()!(); });
+  const FAILED = { system: true, kind: 'discord-send-failed', channelId: 'c-1', serverId: 'discord', reason: 'x', textLen: 5 } as unknown as MessageMetadata;
+  type ReleaseInternals = Internals & {
+    releasedWindow(agent: Agent): { unread: Array<{ metadata: MessageMetadata }> } | null;
+    activeTurnTokens: Map<string, unknown>;
+    invokeReaderFork(invocation: {
+      serverId: string; channelId: string; epochId: string; trigger: 'wake'; notice: string; backlog: []; dispositions: null;
+    }): void;
+  };
+
+  /** A started host of residents, mira the primary; with `readerForks`, the subconscious reads by forks of mira. */
+  async function host(options: { residents?: readonly string[]; readerForks?: boolean } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'af-released-window-'));
+    dirs.push(dir);
+    const membrane = new MockMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: (options.residents ?? ['mira', 'oren']).map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.` })),
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+      ...(options.readerForks ? { subconscious: { enabled: true, reader: 'forks', model: 'test-model', voice: 'Read for mira.' } } : {}),
+    } as never);
+    frameworks.push(framework);
+    framework.start();
+    const internals = framework as unknown as ReleaseInternals;
+    const mira = framework.getAgent('mira')!;
+    /** A failed reply's notice for `agent`, stored for it alone. */
+    const notice = (agent: string): MessageId => internals.addMessage('user',
+      text(`[discord-send-failed] ${agent}'s reply could not be delivered.`), FAILED, { forAgent: agent });
+    /** Every failed-reply notice in the residents' slot. */
+    const failures = () => mira.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === 'discord-send-failed');
+    /** The notices the primary was told in place of `speaker`. */
+    const toldFor = (speaker: string) => failures().filter((m) => JSON.stringify(m.content).includes(`A reply by ${speaker} (`));
+    /** A shared fork of `from` (deriveAgent's default mode). */
+    const derive = (name: string, from = 'mira') =>
+      framework.deriveAgent({ name, from, framing: [{ participant: 'user', content: text('[FRAMING] do a thing') }] });
+    /** A shared fork of `from` that runs one plain reply and is released. */
+    const runFork = async (name: string, from = 'mira') => {
+      const fork = await derive(name, from);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${name} done` }]));
+      await framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+      assert.equal(framework.getAgent(name), null, `${name} is released`);
+    };
+    /** A run of `fork` whose one stream waits, once sent, until `finish` lets it end and the run is released. */
+    const heldRun = (fork: Awaited<ReturnType<typeof derive>>) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      holds.push(release);
+      let sent!: () => void;
+      const streaming = new Promise<void>((resolve) => { sent = resolve; });
+      membrane.streamYielding = (request) => {
+        membrane.calls.push(request);
+        sent();
+        return new HeldStream(released, [createMockResponse([{ type: 'text', text: `${fork.agent.name} done` }])]);
+      };
+      const run = framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+      return {
+        streaming,
+        finish: async () => {
+          release();
+          await run;
+          assert.equal(framework.getAgent(fork.agent.name), null, `${fork.agent.name} is released`);
+        },
+      };
+    };
+    return { framework, internals, membrane, mira, notice, failures, toldFor, derive, runFork, heldRun };
+  }
+
+  /** oren's failed reply's notice, in his window and read: his consumed and answered marks cover it. */
+  async function orensNoticeRead(h: Awaited<ReturnType<typeof host>>): Promise<MessageId> {
+    const id = h.notice('oren');
+    const oren = h.framework.getAgent('oren')!;
+    assert.notEqual(oren.getContextManager().ordinalOf(id), undefined, 'presented to oren at rest');
+    await oren.compileContext();
+    oren.markAnswered(oren.getConsumedWatermark()!);
+    assert.equal(h.internals.isUnreadStoredMessage(oren, id), false, 'oren read it');
+    return id;
+  }
+
+  it("a shared fork of the primary passes on nothing of a co-resident's notice it inherited and never had in its window", async () => {
+    const h = await host();
+    const id = await orensNoticeRead(h);
+    const fork = await h.derive('kid');
+    const kcm = fork.contextManager;
+    assert.notEqual(kcm.getMessage(id), null, "the notice is in the fork's record, the residents' slot on its branch");
+    assert.equal(kcm.ordinalOf(id), undefined, 'and not in its window, which it inherited from mira');
+    assert.deepEqual(h.internals.releasedWindow(fork.agent)!.unread, [], "oren's notice isn't the fork's to pass on");
+
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'kid done' }]));
+    await h.framework.runEphemeralToCompletion(fork.agent, kcm);
+
+    assert.deepEqual(h.toldFor('kid'), [], 'the primary is told nothing in the fork\'s name');
+    assert.deepEqual(h.failures().map((m) => m.id), [id], "oren's notice alone, once");
+  });
+
+  it('three successive shared forks pass nothing on', async () => {
+    const h = await host();
+    const id = await orensNoticeRead(h);
+    for (const name of ['kid-1', 'kid-2', 'kid-3']) await h.runFork(name);
+    for (const name of ['kid-1', 'kid-2', 'kid-3']) assert.deepEqual(h.toldFor(name), [], `nothing in ${name}'s name`);
+    assert.deepEqual(h.failures().map((m) => m.id), [id]);
+  });
+
+  it("a reader fork the subconscious spawns passes on nothing of a co-resident's notice", async () => {
+    const h = await host({ readerForks: true });
+    const id = await orensNoticeRead(h);
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Nothing new in the channel.' }]));
+    h.internals.invokeReaderFork({
+      serverId: 'discord', channelId: 'c-1', epochId: 'epoch-0001', trigger: 'wake',
+      notice: '[tune-out] someone asked for you', backlog: [], dispositions: null,
+    });
+    const fork = () => h.framework.listAgents({ includeEnded: true }).find((r) => r.kind === 'subconscious-fork');
+    const deadline = Date.now() + 20_000;
+    while (!fork()?.ended) {
+      assert.ok(Date.now() < deadline, 'the reader fork ends');
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const name = fork()!.name;
+    assert.match(name, /^reader\/mira\//, "a fork of mira's");
+    assert.deepEqual(h.toldFor(name), [], "the primary is told nothing in the reader's name");
+    assert.deepEqual(h.failures().map((m) => m.id), [id]);
+  });
+
+  it("the single-resident race: the parent's own notice, stored during its live turn and not presented at the fork, is its own to read, once", async () => {
+    const h = await host({ residents: ['mira'] });
+    h.internals.activeTurnTokens.set('mira', Symbol('turn'));
+    const id = h.notice('mira');
+    assert.equal(h.mira.getContextManager().ordinalOf(id), undefined, 'out of her live turn\'s window');
+    const fork = await h.derive('kid');
+    assert.notEqual(fork.contextManager.getMessage(id), null, "in the fork's record");
+    assert.deepEqual(h.internals.releasedWindow(fork.agent)!.unread, [], "not the fork's");
+    h.internals.activeTurnTokens.delete('mira');
+    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'kid done' }]));
+    await h.framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+
+    assert.deepEqual(h.toldFor('kid'), [], 'the primary is not told it again in the fork\'s name');
+    assert.deepEqual(h.failures().map((m) => m.id), [id], 'her notice, once');
+    assert.equal(h.internals.isUnreadStoredMessage(h.mira, id), true, 'still unread by her: her next point presents it');
+  });
+
+  it("a co-resident parent's own notice, unread at its fork, goes on once, in the parent's name, when the parent ends", async () => {
+    const h = await host();
+    h.internals.activeTurnTokens.set('oren', Symbol('turn'));
+    const orens = h.notice('oren');
+    const miras = h.notice('mira');
+    h.internals.activeTurnTokens.delete('oren');
+    await h.runFork('kid', 'oren');
+    assert.deepEqual(h.toldFor('kid'), [], "oren's fork passes on neither oren's notice nor mira's");
+
+    h.framework.stopAgent('oren');
+    assert.equal(h.toldFor('oren').length, 1, "oren's own unread notice goes on at his release, once; mira's isn't his to pass on");
+    assert.match(JSON.stringify(h.toldFor('oren')[0]!.content), /oren has ended/);
+    assert.equal(h.failures().filter((m) => m.id === orens || m.id === miras).length, 2, 'the two notices stay where they were stored');
+  });
+
+  it("an unstamped notice, as a host's direct writer stores one, is a shared fork's only when stored after its derivation", async () => {
+    const h = await host();
+    const unstamped = (cm: ReturnType<Agent['getContextManager']>, tag: string) =>
+      cm.addMessage('user', text(`[discord-send-failed] ${tag}`), { ...FAILED, tag } as unknown as MessageMetadata);
+    unstamped(h.mira.getContextManager(), 'inherited');
+    const fork = await h.derive('kid');
+    const run = h.heldRun(fork);
+    await run.streaming;
+    unstamped(fork.contextManager, 'its own');
+    assert.deepEqual(h.internals.releasedWindow(fork.agent)!.unread.map((m) => (m.metadata as { tag?: unknown }).tag), ['its own'],
+      "one stored at or before its derivation point is its parent's inheritance");
+    await run.finish();
+    assert.equal(h.toldFor('kid').length, 1, 'its own goes on, once');
+  });
+
+  it('a notice for the fork itself, stored after its derivation and never read, still goes on once, in its name', async () => {
+    const h = await host();
+    await orensNoticeRead(h);
+    const fork = await h.derive('kid');
+    const run = h.heldRun(fork);
+    await run.streaming;
+    // Stored during its turn, which never reads it: the turn's request was sent.
+    const id = h.notice('kid');
+    assert.notEqual(fork.contextManager.getMessage(id), null, "stored in the fork's record");
+    assert.deepEqual(audienceOf(fork.contextManager.getMessage(id)!.metadata)?.audience, ['kid']);
+    await run.finish();
+
+    const told = h.toldFor('kid');
+    assert.equal(told.length, 1, "the fork's own unread notice goes on, once");
+    assert.match(JSON.stringify(told[0]!.content), /kid has ended/);
+    assert.deepEqual(audienceOf(told[0]!.metadata)?.audience, ['mira'], 'for the primary alone');
   });
 });

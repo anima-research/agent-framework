@@ -13,7 +13,7 @@ import type { MessageMetadata } from '@animalabs/context-manager';
 import {
   AgentRegistry, RESIDENTS_SLOT, asOwnRow, observedRowFor, residentSpec, subconsciousSpec, taskForkSpec, withAudience, workerSpec,
 } from '../src/index.js';
-import { audienceFault, bearingOf, readerFacts } from '../src/presentation.js';
+import { audienceFault, bearingOf, readerFacts, recordedReaderFacts } from '../src/presentation.js';
 
 const FORKED_AT = 10;
 
@@ -55,6 +55,22 @@ describe("the presentation index's audience rule", () => {
     assert.equal(kid.hidesHeld, true, "a shared fork of a resident carries the residents' filter");
     assert.equal(kid.derivedAt, FORKED_AT);
     assert.equal(readerFacts(reg, 'nobody').ownSlot, undefined, "an agent the registry doesn't know has no slot");
+  });
+
+  it("reads an agent that has ended from its newest ended record, as its release does; the live facts know nothing of it", () => {
+    const ending = registry();
+    const live = recordedReaderFacts(ending, 'kid');
+    assert.deepEqual(live, kid, 'a live agent: the facts readerFacts gives');
+    ending.end('kid', 'completed');
+    ending.end('oren', 'stopped');
+    assert.equal(readerFacts(ending, 'kid').ownSlot, undefined, 'readerFacts reads live records only');
+    assert.deepEqual(recordedReaderFacts(ending, 'kid'), kid, 'its slot, its filter and its derivation point, as recorded');
+    assert.deepEqual(recordedReaderFacts(ending, 'oren'), oren, "a stopped resident still reads the residents' slot");
+    assert.equal(bearingOf(row(withAudience(undefined, ['mira'])), recordedReaderFacts(ending, 'oren'), true), 'elsewhere',
+      "the primary's notice is not the stopped resident's");
+    assert.equal(bearingOf(row(undefined, FORKED_AT), recordedReaderFacts(ending, 'kid'), true), 'elsewhere',
+      "an unstamped row at its derivation point is its parent's inheritance");
+    assert.equal(recordedReaderFacts(ending, 'nobody').ownSlot, undefined, "an agent the registry never knew has no slot");
   });
 
   it("an agent's own row is its own, and elsewhere for a co-resident (decision 1)", () => {

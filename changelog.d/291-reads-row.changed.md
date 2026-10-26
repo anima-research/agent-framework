@@ -4,11 +4,15 @@
   another agent alone. A row the presentation index says a window holds is
   read by that window's agent too. The coalescer takes back a row no reader
   consumed, presented to a window or not, as it took back a queued one, and
-  the row leaves every window that held it; it keeps a row a reader fork
-  was handed as framing, and places the newer occurrence after it. A
-  released fork's or run's notice it never had in its window as of its mark
-  goes on to the primary, and one whose mark a branch switch left behind
-  goes on whatever it read. The gate's "newest entry", the next clock row
-  and the drafts catch-up read the window's order: a co-resident's rows in
-  the shared slot aren't in it, and a drafts notice taken out as an undone
+  the row leaves every window that held it; it keeps a row a reader fork was
+  handed as framing, and places the newer occurrence after it. A released
+  fork's or run's notice for it that it never had in its window as of its
+  mark goes on to the primary, and one whose mark a branch switch left
+  behind goes on whatever it read. A notice is for it when its audience
+  names it, or, with no stamp, when it was stored after a shared fork's
+  derivation point: a notice in the record a shared fork or a resident
+  shares, for its parent or a co-resident, is that agent's, and no release
+  of another passes it on. The gate's "newest entry", the next clock row and
+  the drafts catch-up read the window's order: a co-resident's rows in the
+  shared slot aren't in it, and a drafts notice taken out as an undone
   turn's doesn't count.

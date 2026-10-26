@@ -210,7 +210,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn, readerFacts, type PresentationOccasion } from './presentation.js';
+import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, coversByOrdinal, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
@@ -3605,6 +3605,11 @@ export class AgentFramework {
    *  (runReleasesAfterResume), or stop() passes on what they left unread,
    *  and clears them. */
   private readonly releasesAfterResume = new Map<string, Agent>();
+  /** Each released agent's reader facts, as the registry recorded them when
+   *  its release was asked for (releaseWindowNowOrAfterResume), before a
+   *  later agent can take its name: what its release reads as meant for it
+   *  (releasedWindow). */
+  private readonly releasedReaders = new WeakMap<Agent, ReaderFacts>();
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -27482,8 +27487,9 @@ export class AgentFramework {
    * never read, and every channel notice it could act on and never read, is
    * passed to the primary, by name, once, and so is every module write for
    * it that it never read, as the write itself (passesToPrimary,
-   * passNoticeToPrimary): each one stored in its store and not covered by
-   * its consumed watermark (releasedWindow): presented at its turn's end and
+   * passNoticeToPrimary): each one stored in its store for it, not for its
+   * parent or a co-resident whose record it shares, and not covered by its
+   * consumed watermark (releasedWindow): presented at its turn's end and
    * never consumed, stored while it was idle, or never presented. A message
    * a tool boundary injected is covered once its stream says it carried it.
    * Its stream is over or cancelled, or, when stop() ends it, may still run
@@ -27505,12 +27511,22 @@ export class AgentFramework {
 
   /**
    * What a released agent's window holds that its release passes to the
-   * primary (releaseWindow): `unread`, the notices stored there that it
-   * never read and the primary takes in its place (passesToPrimary: its
+   * primary (releaseWindow): `unread`, the notices stored there for it that
+   * it never read and the primary takes in its place (passesToPrimary: its
    * failed replies, the channel notices it was told it could act on, and a
    * run's or a fork's module writes), each with its participant and
    * content, a sharded body's shards joined into one text, as the
-   * autobiographical strategy joins them (asCompiled). A notice is read
+   * autobiographical strategy joins them (asCompiled). A notice is for it
+   * when the audience rule doesn't put it elsewhere (bearingOf, with the
+   * facts the registry recorded for it when its release was asked for:
+   * releasedReaders): its own row, a row whose audience names it, or a row
+   * with no stamp stored after a shared fork's derivation point. Its store
+   * may be a record it shares: a shared fork reads its parent's slot on a
+   * branch of its own, and a resident reads the slot every resident
+   * writes. A notice there for its parent or a co-resident never entered
+   * its window, and is that agent's to read, or to pass on at its own
+   * release: passed on here, it would reach the primary again at each such
+   * release, in this agent's name. A notice for it is read
    * when the agent's consumed watermark covers it (covers): once its context
    * presents rows (#291), when it was in the agent's window as of the mark,
    * so a notice never presented to it, or presented and never consumed, is
@@ -27541,6 +27557,10 @@ export class AgentFramework {
         ? { partAt: this.branchesPartAt(watermark.branch, current) }
         : undefined);
       const unread = (m: MarkedRow): boolean => cover(m) !== 'covered';
+      // Only what was meant for it: every row its store's walk reads is in
+      // its own slot (getAllMessages reads no merged view).
+      const reader = this.releasedReaders.get(agent) ?? recordedReaderFacts(this.registry, agent.name);
+      const forIt = (m: StoredMessage): boolean => bearingOf(m, reader, true) !== 'elsewhere';
       // A body the store took as more than one message (a sharded body)
       // carries the same metadata on each of its shards, and is one notice,
       // so a shard that continues the body before it isn't taken again: its
@@ -27552,7 +27572,7 @@ export class AgentFramework {
       const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
       let lastUnread = -1;
       messages.forEach((m, i) => {
-        if (!passesToPrimary(m.metadata) || !unread(m)) return;
+        if (!passesToPrimary(m.metadata) || !forIt(m) || !unread(m)) return;
         if (!continuesBody(messages[i - 1], m)) {
           bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
           lastUnread = i;
@@ -27614,6 +27634,7 @@ export class AgentFramework {
    * a fork: passesToPrimary).
    */
   private releaseWindowNowOrAfterResume(agent: Agent): void {
+    this.releasedReaders.set(agent, recordedReaderFacts(this.registry, agent.name));
     if (this.quiesced) this.releasesAfterResume.set(agent.name, agent);
     else this.releaseWindow(agent);
   }
