@@ -752,7 +752,8 @@ const utilityOneLiner = (description: string): string => {
 
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
@@ -20918,7 +20919,8 @@ export class AgentFramework {
             // If the agent is still waiting_for_tools when 'complete' fires
             // (shouldn't happen after incomplete-tool-call fix, but guard anyway),
             // flush pending blocks + inject error results for any remaining pending tools.
-            if (agent.state.status === 'waiting_for_tools') {
+            const waitedAtComplete = agent.state.status === 'waiting_for_tools';
+            if (waitedAtComplete) {
               console.warn(
                 `[framework] 'complete' event fired while agent '${agent.name}' is still waiting_for_tools. ` +
                 `Injecting error results for ${agent.getPendingToolIds().length} pending tool(s).`
@@ -20961,6 +20963,46 @@ export class AgentFramework {
               }
             }
 
+            const cut = waitedAtComplete ? undefined : cutOffRound(response);
+            if (cut) response = { ...response, content: cut.content };
+            const cutIds = new Set(cut?.calls.map((call) => call.id));
+            const cutCalls = cut?.calls.map((call) => this.roundCallOf(agent.name, call, true)) ?? [];
+            const cutPrivate = cutCalls.some((call) => call.refused);
+            // Not for XML-built calls: the same-round think policy applies only
+            // to a round with verbatim content, which membrane gives a native
+            // round and never an XML one, so it never reaches an XML round,
+            // cut or not.
+            const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.fromXmlBlock
+              && cut.calls.some((call) => call.name === 'think');
+            const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
+            if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
+              generationLost = true;
+              lifecyclePhase = 'aborted';
+              this.cancelSupersededStream(agent, stream);
+              return;
+            }
+            if (cut && cut.calls.length > 0) {
+              for (const { id, name, result } of cutResults!.completed) {
+                this.emitTrace({ type: 'tool:failed', module: 'framework', tool: name, callId: id, error: result.error ?? '' });
+              }
+              hadToolCalls = true;
+              const cutRound = toolRounds++;
+              if (cutPrivate || (cutThinkPrivate && !liveProseRouting)) refusedWakeRounds.add(cutRound);
+              const cutCause = roundSilenceCause(cutCalls);
+              if (cutCause && liveProseRouting) {
+                turnSilenced = true;
+                silenceCause = cutCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
+              }
+              console.error(
+                `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside ${cut.calls.length} call(s) ` +
+                `(${cut.calls.map((call) => call.name).join(', ')}); stored with refused results, not run`,
+              );
+            } else if (cut?.unnamed) {
+              console.error(
+                `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside a tool-call block before any call was named; nothing ran`,
+              );
+            }
+
             // Add assistant response to context.
             // If we had tool calls, each round's blocks (thinking + text +
             // tool_use) were already stored as pendingAssistantBlocks and
@@ -20969,7 +21011,7 @@ export class AgentFramework {
             // double-store earlier rounds' text/thinking AND detach signed
             // thinking blocks from their tool_use turn (the API requires
             // thinking to precede tool_use in the same assistant turn).
-            const lastToolIdx = response.content.reduce(
+            const lastToolIdx = cutResults ? cut!.start - 1 : response.content.reduce(
               (last: number, b: ContentBlock, i: number) =>
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
@@ -21012,9 +21054,22 @@ export class AgentFramework {
                 // Nothing after the last results: the rows are judged as of now, the last batch settled.
                 this.noteStreamEnd(agent, stream, undefined, false);
               }
+            } else if (cut?.unnamed && terminalContent.length === 0) {
+              this.noteStreamEnd(agent, stream, undefined, false);
             } else {
               const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
               this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+            }
+            if (cutResults) {
+              agent.toolResultGuard.storeResults(cutResults.blocks, cutResults.wire, cutResults.completed,
+                this.silentTurnRowMetadata(agent.name), cutResults.keptCap);
+              agent.toolResultGuard.settleTurnEnded();
+            } else if (cut?.unnamed) {
+              agent.getContextManager().addMessage('user', [{
+                type: 'text',
+                text: '[tool-boundary] Your response was cut off at the output limit inside a tool-call block, before any call in it ' +
+                  'was named, so nothing ran. To make a call, send less in one response.',
+              }], { system: true, kind: 'cut-off-tool-block', ...this.silentTurnRowMetadata(agent.name) });
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
@@ -21095,7 +21150,7 @@ export class AgentFramework {
             if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, {
               stopReason: 'completed',
-              speech: guardedWrapperTool
+              speech: guardedWrapperTool || cutResults
                 ? ''
                 : terminalContent
                     .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
@@ -21323,9 +21378,10 @@ export class AgentFramework {
               // scan to avoid double-posting.
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
-                .map((b) => b as unknown as { name?: unknown; input?: unknown; unparseableInput?: string })
-                .filter((c): c is { name: string; input?: unknown; unparseableInput?: string } =>
-                  typeof c.name === 'string' && markedInputRefusal({ ...c, name: c.name }) === undefined
+                .map((b) => b as unknown as { id?: unknown; name?: unknown; input?: unknown; unparseableInput?: string })
+                .filter((c): c is { id?: unknown; name: string; input?: unknown; unparseableInput?: string } =>
+                  typeof c.name === 'string' && !cutIds.has(c.id as string)
+                  && markedInputRefusal({ ...c, name: c.name }) === undefined
                   && this.canAgentUseTool(agent.name, c.name));
               const toolNames = toolCalls.map((c) => c.name);
               // A refused skip_reply isn't a silencing call; a plain one is.
@@ -21342,7 +21398,13 @@ export class AgentFramework {
               const runs = finalRuns;
               const segments = finalSegments;
 
-              if (turnProseRouting === 'disabled') {
+              if (cutThinkPrivate && liveProseRouting) {
+                if (segments.length > 0) {
+                  console.error(
+                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
+                  );
+                }
+              } else if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
                   console.error(
                     `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
@@ -21369,7 +21431,7 @@ export class AgentFramework {
                   );
                   for (const envelopes of admittedSegments) {
                     try {
-                      await this.deliverAdmittedProse(agent, envelopes, trailingHold);
+                      await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, keepPrivate: liveProseRouting && cutPrivate });
                     } catch (err) {
                       console.error('trailing prose delivery failed:', err);
                     }
@@ -24129,10 +24191,22 @@ export class AgentFramework {
     return this.refusedResult(agentName, call.id, error);
   }
 
+  private async cutOffResults(agent: Agent, calls: readonly CutOffCall[]): Promise<{
+    completed: CompletedToolCall[]; blocks: ContentBlock[]; wire: MembraneToolResult[]; keptCap: number | undefined;
+  }> {
+    const completed: CompletedToolCall[] = calls.map((call) => (
+      { id: call.id, name: call.name, input: call.input, result: this.refusedResult(agent.name, call.id, cutOffRefusal(call)), durationMs: 0 }
+    ));
+    const { blocks, spilled, keptCap } = await this.buildStoredToolResultContent(agent.name, completed, undefined, undefined);
+    const wire = completed.map((tc) => this.toMembraneToolResult(tc.id, tc.result, undefined, spilled.get(tc.id), tc.name));
+    return { completed, blocks, wire, keptCap };
+  }
+
   /**
-   * A dispatched call answered without running its tool. RFC-007's lifecycle
-   * forgets it, and its result says it was refused (`ToolResult.refused`), both
-   * from here, so the two can't disagree.
+   * A call answered without running its tool: one the dispatcher refused, or
+   * one in the last round of a response the output limit cut off. RFC-007's
+   * lifecycle forgets it, and its result says it was refused
+   * (`ToolResult.refused`), both from here, so the two can't disagree.
    */
   private refusedResult(agentName: string, callId: string, error: string): ToolResult {
     this.toolLifecycleEmitter?.refuse(agentName, callId);

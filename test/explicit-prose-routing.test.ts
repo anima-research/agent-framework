@@ -674,6 +674,33 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  it('a round whose skip_reply the output limit cut off keeps its prose private after an earlier round delivered', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first, deliberately' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse({
+      ...createMockResponse([
+        { type: 'text', text: '>>#alpha thoughts I keep to myself' },
+        { type: 'tool_use', id: 'sr3', name: 'skip_reply', input: {}, unparseableInput: '{"wake_in_sec' },
+      ] as ContentBlock[], 'max_tokens'),
+      toolCalls: [],
+    });
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const skip = answerSkipReply(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(skip.calls, 0, 'the cut-off skip_reply never ran');
+    assert.deepEqual(routed, [{ text: 'first, deliberately', locus: 'chan-alpha' }], 'only the earlier round\'s words go out');
+    assert.ok(context(framework).texts.some((t) => t.includes('thoughts I keep to myself')), 'the text stays in the context');
+
+    await framework.stop();
+  });
+
   it('a round that calls skip_reply keeps its unprefixed prose from a sticky destination', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>#alpha first, deliberately' },

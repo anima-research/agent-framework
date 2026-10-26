@@ -211,14 +211,15 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
-   * The dispatcher refused the call before it opened, RFC-007's refusal, so
-   * nothing ran and the call certainly had no effect. Only the dispatcher's
-   * path, the model's calls and a script's, sets it: the caller may not use
-   * the tool (allowedTools), a `skip_reply` wake was refused, the call's MCPL
-   * server is absent or still connecting, the host's policy for that server
-   * denies the tool, or a fork reached outside its channel. RFC-007's
-   * lifecycle refuses the call from the same place, so observers see no
-   * events for it. A check made after the call opened, such as a module's
+   * The call was refused before it opened, RFC-007's refusal, so nothing ran
+   * and the call certainly had no effect. The dispatcher's path, the model's
+   * calls and a script's, sets it: the caller may not use the tool
+   * (allowedTools), a `skip_reply` wake was refused, the call's MCPL server is
+   * absent or still connecting, the host's policy for that server denies the
+   * tool, or a fork reached outside its channel. RFC-007's lifecycle refuses
+   * the call from the same place, so observers see no events for it. So is
+   * each call in the last round of a response the output limit cut off, which
+   * was never dispatched. A check made after the call opened, such as a module's
    * answer for a name it has no tool for or arguments that don't fit a
    * schema, is a failure whose text says nothing was done, as is an MCPL
    * request that couldn't be written. A programmatic call (`executeToolCall`,
