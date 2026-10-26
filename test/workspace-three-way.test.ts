@@ -8162,8 +8162,8 @@ describe('the mount root', () => {
   /** The root's identity now, or a skip where this filesystem reports no birth time to compare. */
   function rootWithBirthTime(t: TestContext, env: Env): { dev: string; ino: string; born: string } | null {
     const now = identityOf(env.dir);
-    if (now.born === undefined) {
-      t.skip('this filesystem reports no birth time');
+    if (now.born === undefined || BigInt(now.born) % 1_000_000_000n === 0n) {
+      t.skip('this filesystem reports no birth time with a fraction of a second');
       return null;
     }
     return now as { dev: string; ino: string; born: string };
@@ -8261,6 +8261,13 @@ describe('the mount root', () => {
     assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '3', ino: '2' }), false);
     assert.equal(sameRootIdentity({ dev: '1', ino: '2', born: '5' }, { dev: '3', ino: '2' }), false);
     assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '3', ino: '2', born: '5' }), false);
+  });
+
+  test('two volume roots on different devices born in the same whole second are different directories', () => {
+    // As two ext4 filesystems an installer made in one second show them: inode 2, and a birth time in whole seconds.
+    const second = '1792560071000000000';
+    assert.equal(sameRootIdentity({ dev: '65028', ino: '2', born: second }, { dev: '65027', ino: '2', born: second }), false);
+    assert.equal(sameRootIdentity({ dev: '65028', ino: '2', born: second }, { dev: '65028', ino: '2', born: second }), true, 'on one device, as before');
   });
 
   test('a root recorded without its birth time gains it at the next pass, which keeps it across a restart', async (t) => {

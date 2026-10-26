@@ -114,11 +114,14 @@ function sameRootPath(a: string, b: string): boolean {
 /**
  * Whether two identities name the same directory: the same device and inode,
  * or the same inode and birth time on another device, since macOS can give a
- * volume another device number after a reboot.
+ * volume another device number after a reboot. A birth time in whole seconds
+ * doesn't count across devices: filesystems made in the same second give
+ * their roots one inode (2 on ext4 and HFS+) and one birth time.
  */
 export function sameRootIdentity(a: RootIdentity, b: RootIdentity): boolean {
   if (a.ino !== b.ino) return false;
-  return a.dev === b.dev || (a.born !== undefined && a.born === b.born);
+  if (a.dev === b.dev) return true;
+  return a.born !== undefined && a.born === b.born && !a.born.endsWith('000000000');
 }
 
 type JournalEntry =
