@@ -166,6 +166,22 @@ test('a change to a path in conflict with disk says so, edit_many says so whiche
   assert.equal(fields(await call('delete', { path: 'drafts/a.txt' })).disk, 'in conflict with disk');
 });
 
+test('edit_many answers waits for materialize when one of its files waits and another is back at the bytes disk agreed it has, in either order', async (t) => {
+  const { call, fields } = await setup(t);
+  await call('edit', { path: 'drafts/a.txt', oldString: 'alpha', newString: 'ALPHA' });
+  const restoredFirst = await call('edit_many', { edits: [
+    { path: 'drafts/a.txt', oldString: 'ALPHA', newString: 'alpha' },
+    { path: 'drafts/b.txt', oldString: 'beta', newString: 'Beta' },
+  ] });
+  assert.equal(fields(restoredFirst).disk, 'waits for materialize', 'the restored file first');
+  const restoredLast = await call('edit_many', { edits: [
+    { path: 'drafts/a.txt', oldString: 'alpha', newString: 'ALPHA' },
+    { path: 'drafts/b.txt', oldString: 'Beta', newString: 'beta' },
+  ] });
+  assert.equal(fields(restoredLast).disk, 'waits for materialize', 'the restored file last');
+  assert.equal(fields(await call('edit', { path: 'drafts/a.txt', oldString: 'ALPHA', newString: 'alpha' })).disk, 'done', 'the edited file is back at the bytes disk agreed it has');
+});
+
 test("a change's disk value is the branch it landed on, when the branch changes during the call", async (t) => {
   const { store, workspace, call, fields } = await setup(t);
   await call('read', { path: 'drafts/a.txt' });
