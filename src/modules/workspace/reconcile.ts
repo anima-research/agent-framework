@@ -915,8 +915,8 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       byDesign = OTHER_MOUNT;
     } else if (!opts.named) {
       const slash = path.lastIndexOf('/');
-      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others);
-      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others) : undefined;
+      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others, true);
+      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others, false) : undefined;
       byDesign = above ?? own;
     } else if (scope.kind === 'dir') {
       byDesign = passedOverBetween(scope.dir, path, ignoreBeneath(scope.dir, mount.view.ignore), mount.view.others);

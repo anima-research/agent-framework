@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, storedBytes, DEFAULT_MAX_FILE_SIZE, type StoredBytes } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { CHANGED, IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, includePatternReadable, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, realSegments, restBeneath, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { CHANGED, IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, directoryAt, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, patternRefusal, readBytes, readPrefix, realSegments, restBeneath, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -100,6 +100,9 @@ const BRANCH_LEFT = 'the workspace had left the branch this file is for';
 const AGENT_ACTION_SCAN_DEADLINE_MAX_MS = TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000;
 /** A direct mount's ignore list when its config names none (MountConfig.ignore). */
 const DIRECT_MOUNT_IGNORE: readonly string[] = ['node_modules', 'dist', '.git', 'build', 'coverage', 'target', '__pycache__', '.venv'];
+const PATTERN_FORMS = 'The list reads these of gitignore\'s forms: a name, matched at any depth, with "*" and "?" within it; '
+  + 'a trailing "/" to match only directories; a leading or inner "/" for a path from the mount\'s root; '
+  + 'a leading "**/" before one name; and a trailing "/**" for what lies beneath a directory.';
 /**
  * How many files a direct mount's grep reads, and its listings look at, at
  * once. Over a layout of seven checkouts, 5,929 files, a direct grep reading
@@ -1040,24 +1043,18 @@ export class WorkspaceModule implements Module {
       if (refused.length > 0) {
         throw new Error(`[workspace] Mount "${mount.name}" is direct, which reads disk as it is with no store, watcher or push: ${refused.join('; ')}`);
       }
-      const include: unknown = mount.include;
-      if (include !== undefined) {
-        // A pattern the matcher can't read would match nothing, and take every
-        // file out of the mount unsaid (includePatternReadable).
-        if (!Array.isArray(include) || include.length === 0) {
-          throw new Error(
-            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, not ${shownValue(include)}`,
-          );
+      for (const list of ['ignore', 'include'] as const) {
+        const patterns: unknown = mount[list];
+        if (patterns === undefined) continue;
+        if (!Array.isArray(patterns) || (list === 'include' && patterns.length === 0)) {
+          throw new Error(`[workspace] Mount "${mount.name}": ${list} must be a ${list === 'include' ? 'non-empty ' : ''}list of patterns, not ${shownValue(patterns)}`);
         }
-        // By index: an entry that is itself undefined, or a hole, is unreadable too.
-        const at = include.findIndex((p) => !includePatternReadable(p));
-        if (at >= 0) {
-          const unreadable: unknown = include[at];
-          throw new Error(
-            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, `
-            + `with no "." or ".." segment${sep === '\\' ? ' and no "\\", which this platform reads as a separator' : ''}; `
-            + `${shownValue(unreadable)} is none of these`,
-          );
+        for (let i = 0; i < patterns.length; i++) {
+          const pattern: unknown = patterns[i];
+          const why = patternRefusal(pattern, list);
+          if (why !== undefined) {
+            throw new Error(`[workspace] Mount "${mount.name}": ${list} pattern ${shownValue(pattern)} isn't read: ${why}. ${PATTERN_FORMS}`);
+          }
         }
       }
     }
@@ -1367,7 +1364,7 @@ export class WorkspaceModule implements Module {
     const { view, rootReal } = mount.direct ? await this.diskView(mount) : await this.runtime(mount);
     let start = base;
     for (const segment of beneath.split('/')) {
-      if (start !== '' && (mount.direct ? inOtherMount(start, view.others) : passedOverAt(start, view.ignore, view.others) !== undefined)) break;
+      if (start !== '' && (mount.direct ? inOtherMount(start, view.others) : passedOverAt(start, view.ignore, view.others, true) !== undefined)) break;
       const here = await checkDir(view, rootReal, start);
       if (here.kind !== 'checked') break;
       const entry = (await readdir(here.dir.real, { withFileTypes: true }).catch(() => [])).find((e) => e.name === segment);
@@ -6185,6 +6182,7 @@ export class WorkspaceModule implements Module {
         allSkipped.push({ mount: name, path: relativePath, reason: DIRECT_SYNC_SKIPPED });
         continue;
       }
+      let namedDirectory = false;
       const pass = await this.withMount(mount, async () => {
         if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
         if (!relativePath) {
@@ -6199,6 +6197,7 @@ export class WorkspaceModule implements Module {
           store.treeList(mount.treeStateId, prefix).length > 0 ||
           this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
           this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
+        namedDirectory = (await directoryAt(join(mount.config.path, relativePath), mount.config.followSymlinks === true)) ?? isDir;
         // named: ignore patterns covering the path asked for don't apply
         // beneath it (a directory scope's walk; a path scope doesn't walk).
         const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn, named: true };
@@ -6257,7 +6256,7 @@ export class WorkspaceModule implements Module {
       // without a path passes over it, so nothing else keeps it current
       // (agent-framework #276). A path in another mount's directory isn't
       // synced at all, and the note says so.
-      const passedOver = passedOverAt(relativePath, this.ignoreOf(mount), this.othersOf(name));
+      const passedOver = passedOverAt(relativePath, this.ignoreOf(mount), this.othersOf(name), namedDirectory);
       if (passedOver !== undefined) {
         allIgnored.push({
           mount: name,
