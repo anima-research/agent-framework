@@ -748,7 +748,7 @@ const utilityOneLiner = (description: string): string => {
 
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
@@ -20316,6 +20316,7 @@ export class AgentFramework {
           }
 
           case 'tool-calls': {
+            const calls = event.calls.map(asCalled);
             // A tool-call response is a clean physical round: admit its
             // preceding results before storing/dispatching this new round.
             agent.toolResultGuard.accept();
@@ -20323,12 +20324,12 @@ export class AgentFramework {
             adoptInjectedRound();
             hadToolCalls = true;
             const toolRound = toolRounds++;
-            this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
-            this.recordEphemeralToolCalls(agent.name, event.calls.length);
+            this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, calls.length);
+            this.recordEphemeralToolCalls(agent.name, calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
               agentName: agent.name,
-              calls: event.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
+              calls: calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
             });
 
             // Build assistant content blocks for this round. Prefer the
@@ -20369,7 +20370,7 @@ export class AgentFramework {
               if (roundText) {
                 assistantBlocks.push({ type: 'text', text: roundText });
               }
-              for (const c of event.calls) {
+              for (const c of calls) {
                 assistantBlocks.push({
                   type: 'tool_use',
                   id: c.id,
@@ -20386,17 +20387,13 @@ export class AgentFramework {
               ? roundContent.filter((b) => b.type !== 'tool_result')
               : null);
 
-            // A call membrane marks with unparseableInput carries an `input`
-            // that isn't the model's arguments; markedInputRefusal decides at
-            // dispatch whether it runs.
-
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
             // prefill path, from membrane 0.6.0, and absent on 0.5.x, which
             // doesn't declare it. The tool boundary reads it from the agent's
             // state.
             agent.enterWaitingForTools(
-              event.calls,
+              calls,
               stream,
               (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages,
             );
@@ -20428,8 +20425,8 @@ export class AgentFramework {
             // script runs doesn't move them.
             // Hybrid's `>>>` targets, sticky pin and hold apply as its delivery
             // runs, as for any queued hybrid delivery.
-            const roundToolNames = event.calls.map((c) => c.name);
-            const roundCalls = event.calls.map((c) => this.roundCallOf(agent.name, c));
+            const roundToolNames = calls.map((c) => c.name);
+            const roundCalls = calls.map((c) => this.roundCallOf(agent.name, c));
             const liveRound = !!this.channelRegistry && !!roundContent && roundContent.length > 0;
             if (liveRound) liveProseRouting = true;
             // Whether this round's tool-result batch (and anything queued
@@ -20558,7 +20555,7 @@ export class AgentFramework {
               this.scriptRounds.delete(agent.name);
               displaced.withhold('a newer round replaced it before its scripts returned');
             }
-            const scriptCallIds = event.calls
+            const scriptCallIds = calls
               .filter((c) => c.name === CODE_EXECUTION_TOOL_NAME
                 && this.scriptMayRoute(agent.name, c, turnProseRouting, requestSnapshot.sameRoundThinkTextPolicy === 'private'))
               .map((c) => c.id);
@@ -20571,7 +20568,7 @@ export class AgentFramework {
               const round: ScriptRound = {
                 agent,
                 streamId: myStreamId,
-                scripts: new Map(event.calls.filter((c) => c.name === CODE_EXECUTION_TOOL_NAME).map((c) => [c.id, []])),
+                scripts: new Map(calls.filter((c) => c.name === CODE_EXECUTION_TOOL_NAME).map((c) => [c.id, []])),
                 pending: new Set(scriptCallIds),
                 route: () => {
                   // Only while this stream still owns the agent and waits on
@@ -20595,7 +20592,7 @@ export class AgentFramework {
               this.scriptRounds.set(agent.name, round);
             }
 
-            for (const call of event.calls) {
+            for (const call of calls) {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
               // `started` goes out once dispatch returns. Refusal sites inside
@@ -21133,9 +21130,10 @@ export class AgentFramework {
               // scan to avoid double-posting.
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
-                .map((b) => b as unknown as { name?: unknown; input?: unknown })
-                .filter((c): c is { name: string; input?: unknown } =>
-                  typeof c.name === 'string' && this.canAgentUseTool(agent.name, c.name));
+                .map((b) => b as unknown as { name?: unknown; input?: unknown; unparseableInput?: string })
+                .filter((c): c is { name: string; input?: unknown; unparseableInput?: string } =>
+                  typeof c.name === 'string' && markedInputRefusal({ ...c, name: c.name }) === undefined
+                  && this.canAgentUseTool(agent.name, c.name));
               const toolNames = toolCalls.map((c) => c.name);
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
@@ -22218,7 +22216,8 @@ export class AgentFramework {
     }
   }
 
-  private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+  private async executeToolCallFrom(given: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+    const call = asCalled(given);
     if (origin.kind === 'agent') {
       // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
       // denial here is a failure. It's this call's end, so it's traced here.
