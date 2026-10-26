@@ -64,8 +64,6 @@ export interface ToolsetHostDeps {
   /** Whether the server's changes may be put into the conversation unasked
    *  (its `pushEvents` grant): notices and reminders. */
   canNotify(serverId: string): boolean;
-  /** Rebuild the model's tool list from the server's (its tools/list_changed path). */
-  refreshTools(serverId: string): void;
   /** The operator's log. */
   log(line: string): void;
   /** How a static tool is named in the tool list (`prefix--tool`). */
@@ -185,7 +183,7 @@ export class ToolsetController {
     if (connection !== this.connection) return;
     this.sync(epoch, connection);
     if (read.kind === 'result') {
-      this.readResult(read.method, read.params, read.result as Record<string, unknown>, read.awaited);
+      this.readResult(read.method, read.params, read.result as Record<string, unknown>, read.awaited, read.straddled === true);
       return;
     }
     if (!this.presence.active || !isObj(read.params)) return;
@@ -220,13 +218,13 @@ export class ToolsetController {
     this.tellUnlessClaimed(p, cs, 'push/event');
   }
 
-  private readResult(method: string, params: Record<string, unknown>, res: Record<string, unknown>, awaited: boolean): void {
+  private readResult(method: string, params: Record<string, unknown>, res: Record<string, unknown>, awaited: boolean, straddled: boolean): void {
     let cs: ChangeSet;
     switch (method) {
       case 'tools/list': {
         if (!Array.isArray(res.tools)) return;
         cs = this.readToolList(res.tools as HintedTool[], res);
-        if (params.straddled === true && !this.recovering) {
+        if (straddled && !this.recovering) {
           this.log('tools/list pages carried different revs, so its earlier pages are older than changes read between them: recovering');
           this.scheduleRecovery();
         }
@@ -414,13 +412,23 @@ export class ToolsetController {
    * are told first, as notices, so no later change is shown before them.
    */
   takeChange(carrier: unknown): ChangeSet {
-    return this.take(carrier);
+    if (!isObj(carrier)) return emptyChange();
+    if (this.unclaimed.has(carrier)) {
+      let before: object | undefined;
+      for (const res of this.unclaimed.keys()) {
+        if (res === carrier) break;
+        before = res;
+      }
+      if (before) this.tellUnclaimed(before);
+    }
+    this.unclaimed.delete(carrier);
+    return this.readChanges.get(carrier) ?? emptyChange();
   }
 
   /** takeChange's change rendered, for a caller that shows it with the carrier
    *  at once, so it counts as told; '' for nothing. */
   takeChangeText(carrier: unknown): string {
-    const cs = this.take(carrier);
+    const cs = this.takeChange(carrier);
     if (isEmptyChange(cs)) return '';
     const text = this.presence.render(cs);
     this.told(cs);
@@ -439,25 +447,6 @@ export class ToolsetController {
   }
 
   private changeOf(carrier: object): ChangeSet {
-    return this.readChanges.get(carrier) ?? emptyChange();
-  }
-
-  /** A carrier's change, taken to be told some other way (a notice this controller sends). */
-  private claim(carrier: unknown): ChangeSet {
-    return this.take(carrier);
-  }
-
-  private take(carrier: unknown): ChangeSet {
-    if (!isObj(carrier)) return emptyChange();
-    if (this.unclaimed.has(carrier)) {
-      let before: object | undefined;
-      for (const res of this.unclaimed.keys()) {
-        if (res === carrier) break;
-        before = res;
-      }
-      if (before) this.tellUnclaimed(before);
-    }
-    this.unclaimed.delete(carrier);
     return this.readChanges.get(carrier) ?? emptyChange();
   }
 
@@ -503,15 +492,10 @@ export class ToolsetController {
     }
   }
 
-  /**
-   * Whether the list was read; the tap applied it and told its change as it
-   * was read. When it moved a tool, the model's tool list is rebuilt now
-   * rather than at the next unrelated refresh.
-   */
+  /** Whether the list was read; the tap applied it and told its change as it was read. */
   private async ownToolList(connection: McplServerConnection): Promise<boolean> {
     try {
       await connection.sendToolsList();
-      if (this.presence.movesOwed) this.deps.refreshTools(this.serverId);
       return true;
     } catch (error) {
       this.log(`tools/list failed: ${this.failure(error)}`);
@@ -522,7 +506,7 @@ export class ToolsetController {
   private async ownToolsetList(connection: McplServerConnection, timeoutMs: number, why: string): Promise<ChangeSet> {
     try {
       const r = await connection.sendToolsetsList(timeoutMs);
-      return this.claim(r);
+      return this.takeChange(r);
     } catch (error) {
       this.log(`toolsets/list (${why}) failed: ${this.failure(error)}`);
       return emptyChange();
@@ -563,7 +547,7 @@ export class ToolsetController {
     try {
       const r = await connection.sendToolsetsList(REFRESH_TIMEOUT_MS);
       if (!isObj(r)) return null;
-      return opts.shown ? this.claim(r) : this.changeOf(r);
+      return opts.shown ? this.takeChange(r) : this.changeOf(r);
     } catch (error) {
       this.log(`toolsets/list (look) failed: ${this.failure(error)}`);
       return null;
@@ -638,10 +622,9 @@ export class ToolsetController {
     this.deliver(this.presence.diff(before, this.presence.view()));
   }
 
-  /** At a rebuild of the model's tool list (RFC §4.2), tell where the tools it moved went: `moves`, those still pending, or every one pending. A move a list has undone since the rebuild listed the server asks for another rebuild, so the tool list follows. */
+  /** At a rebuild of the model's tool list (RFC §4.2), tell where the tools it moved went: `moves`, those still pending, or every one pending. A move a list has undone since the rebuild listed the server isn't told; the next rebuild publishes the undoing. */
   applyMoves(moves?: Array<{ name: string; to: Presence }>): void {
     const moved = this.presence.applyMoves(moves);
-    if (moves?.some(({ name, to }) => this.presence.presenceOf(name) !== to)) this.deps.refreshTools(this.serverId);
     if (!moved.length) return;
     const cs = emptyChange();
     cs.notes.push(...moved.map(({ name, to }) => to === 'dynamic'

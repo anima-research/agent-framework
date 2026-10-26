@@ -27651,7 +27651,6 @@ export class AgentFramework {
     return (this.toolsetHub = new ToolsetHub({
       notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
       canNotify: (serverId) => CapabilityGrant.of(this.mcplServerRegistry?.getServer(serverId)).has('pushEvents'),
-      refreshTools: (serverId) => this.handleToolsListChanged(serverId),
       log: (line) => console.error(`[mcpl] ${line}`),
       listedName,
       published: (serverId, tool) => {

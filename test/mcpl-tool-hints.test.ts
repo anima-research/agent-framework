@@ -891,7 +891,7 @@ test('a hint naming a tool tools/list hasn\'t listed is recovered from tools/lis
   } finally { await t.done(); }
 });
 
-test('a lost move is repaired by the recovery\'s tools/list, and the model\'s tool list follows it without a further list change', async () => {
+test('a lost move is repaired by the recovery\'s tools/list, and the model\'s tool list follows it at the next refresh', async () => {
   const tools: Json[] = TOOLS.map((x) => ({ ...x }));
   const t = await setup(() => false, {}, ADVERT, tools);
   const listed = () => t.fw.framework.getAllTools().map((x) => x.name);
@@ -912,8 +912,12 @@ test('a lost move is repaired by the recovery\'s tools/list, and the model\'s to
     t.state.next();
     const lists = t.methods().filter((m) => m === 'toolsets/list').length;
     t.server.peer.notify('tools/hints', t.state.hint([]));
-    await waitFor(() => !listed().includes('arc--peek'), 'a skipped rev recovered, and the tool list rebuilt from it without peek');
-    assert.doesNotMatch(await actOnPeek(), /is not a dynamic tool/);
+    await waitFor(() => t.methods().filter((m) => m === 'toolsets/list').length > lists, 'a skipped rev recovered');
+    await roundTrip(t);
+    assert.doesNotMatch(await actOnPeek(), /is not a dynamic tool/, 'act takes it at once, where the latest list put it');
+    assert.ok(listed().includes('arc--peek'), 'the tool list waits for the next refresh');
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => !listed().includes('arc--peek'), 'the next refresh moves peek out of the tool list');
     assert.equal(told('peek is in your tool list now'), 1, 'the first move was applied once');
     assert.equal(told('peek left your tool list'), 1, 'and the move back told once');
     assert.ok(notices(t.fw).some((x) => x.includes('peek() — Peek around.')), 'and announced, as the list made it visible');
@@ -936,7 +940,7 @@ test('an entry that moves a tool to dynamic keeps the definition it carries', as
 
 test('reminders restate only servers whose changes may be told unasked', () => {
   const told = (canNotify: boolean) => {
-    const deps = { notify: () => true, canNotify: () => canNotify, refreshTools: () => {}, log: () => {}, listedName: (_s: string, tool: string) => `arc--${tool}` };
+    const deps = { notify: () => true, canNotify: () => canNotify, log: () => {}, listedName: (_s: string, tool: string) => `arc--${tool}` };
     const hub = new ToolsetHub(deps);
     const c = hub.controllerFor({ id: 'arc', toolHints: true } as McplServerConfig);
     c.presence.beginConnection({ toolHints: true, toolsets: { build: { title: 'Building' } } }, true);
@@ -1051,7 +1055,7 @@ function tappedController(writes: () => boolean = () => true, tools: Json[] = TO
   const told: string[] = [];
   const hub = new ToolsetHub({
     notify: (_s: string, text: string) => { if (!writes()) return false; told.push(text); return true; },
-    canNotify: () => true, refreshTools: () => {}, log: () => {}, listedName: (_s: string, tool: string) => `arc--${tool}`,
+    canNotify: () => true, log: () => {}, listedName: (_s: string, tool: string) => `arc--${tool}`,
   });
   const c = hub.controllerFor({ id: 'arc', toolHints: true } as McplServerConfig);
   let tap: (read: unknown, epoch: number) => void = () => {};
@@ -1424,15 +1428,20 @@ test('a ToolsetsModule built as 0.27.0 built it, ToolsetsModule(hub), takes the 
   assert.equal(unshown.told.length, 1, 'a look whose result reaches no agent leaves it to a notice');
 });
 
-test('a tool a recovery\'s list puts in a toolset leaves the model\'s tool list without a further list change', async () => {
+test('a tool a recovery\'s list puts in a toolset leaves the model\'s tool list at the next refresh, and is told so', async () => {
   const tools: Json[] = TOOLS.map((x) => ({ ...x }));
   const t = await setup(() => false, {}, ADVERT, tools);
   const listed = () => t.fw.framework.getAllTools().map((x) => x.name);
   try {
     tools.find((x) => x.name === 'status')!._meta = { 'mcpl/toolset': 'build' };
+    const lists = t.methods().filter((m) => m === 'toolsets/list').length;
     t.state.next();
     t.server.peer.notify('tools/hints', t.state.hint([]));
-    await waitFor(() => !listed().includes('arc--status'), 'the tool list rebuilt from the recovery\'s list');
+    await waitFor(() => t.methods().filter((m) => m === 'toolsets/list').length > lists, 'a skipped rev recovered');
+    await roundTrip(t);
+    assert.ok(listed().includes('arc--status'), 'the tool list waits for the next refresh');
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => !listed().includes('arc--status'), 'the next refresh moves status out of the tool list');
     assert.ok(notices(t.fw).some((x) => x.includes('status left your tool list')));
   } finally { await t.done(); }
 });

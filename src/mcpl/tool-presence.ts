@@ -79,6 +79,8 @@ export interface ChangeSet {
 
 export const emptyChange = (): ChangeSet => ({ changes: [], suggest: [], notes: [] });
 export const isEmptyChange = (c: ChangeSet): boolean => !c.changes.length && !c.suggest.length && !c.notes.length && !c.ended?.length;
+/** Whether a change to one key shows that key's tools in a block: what render prints and markShown counts as shown. */
+const showsBlock = (c: Change): boolean => !c.closed && (c.opened || c.appeared.length > 0 || c.redefined.length > 0 || c.gone.length > 0);
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
@@ -546,10 +548,7 @@ export class ToolPresence {
 
   /** The definitions a change set's tool blocks describe have reached the model. */
   markShown(cs: ChangeSet): void {
-    for (const c of cs.changes) {
-      if (c.closed || !(c.opened || c.appeared.length > 0 || c.redefined.length > 0 || c.gone.length > 0)) continue;
-      for (const t of c.now) this.shown.add(toolDigest(t));
-    }
+    for (const c of cs.changes) if (showsBlock(c)) for (const t of c.now) this.shown.add(toolDigest(t));
   }
 
   /** A set's ended notes whose ids are still untold, each once. */
@@ -569,11 +568,6 @@ export class ToolPresence {
   }
 
   // ── boundaries ──
-
-  /** Whether a move a tools/list made is still to be shown by a rebuild of the model's tool list. */
-  get movesOwed(): boolean {
-    return this.pendingMoves.size > 0;
-  }
 
   /** The static↔dynamic moves the lists made since the last rebuild, still to be shown. */
   moves(): Array<{ name: string; to: Presence }> {
@@ -635,8 +629,7 @@ export class ToolPresence {
         continue;
       }
       const title = (c.opened || c.retitled) && !bare ? c.title : undefined;
-      const setChanged = c.opened || c.appeared.length > 0 || c.redefined.length > 0 || c.gone.length > 0;
-      if (setChanged) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title, seen, describeAll: opts.describeAll }));
+      if (showsBlock(c)) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title, seen, describeAll: opts.describeAll }));
       else if (title) lines.push(`${this.label(c.key)} ${title}`);
       if (c.gone.length) lines.push(`now unavailable: ${c.gone.join(', ')}`);
       if (c.opened && !bare) {

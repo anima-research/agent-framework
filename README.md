@@ -465,9 +465,9 @@ framework registers a `toolsets` module with four constant tools:
 as their message is read, in `rev` order, whatever becomes of the message (a
 refused push, a result that came after its timeout). A move between static and
 dynamic takes effect when the server's `tools/list` states it, and the tool
-list follows at its next rebuild, which the host asks for at once when its own
-re-read (after a reconnect or a lost `rev`) made the move. Until then the tool
-is called at either place, where the tool list shows it or where the server's
+list follows at its next rebuild, whichever refresh brings it (a move is no
+reason to rebuild the tool list early). Until then the tool is called at either
+place, where the tool list shows it or where the server's
 latest list put it (RFC-014 §4.2: it keeps working where it was), and the agent
 is told where it went once that rebuild has published the list.
 A skipped rev re-reads `tools/list` and then `toolsets/list`, which the host

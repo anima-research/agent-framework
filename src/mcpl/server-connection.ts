@@ -242,11 +242,11 @@ export function toolsetDeclarationsOf(advertised: unknown): Record<string, unkno
 export type HintRead =
   /** A response to a request that can carry hints (RFC-014 §6.1 carrier 1),
    *  or a `tools/list`'s whole inventory (§4.1), its pages joined by
-   *  sendToolsList, with `params.straddled` when its pages carry different
-   *  revs. `awaited`: whoever sent it still waits for it; false for a
+   *  sendToolsList, `straddled` when its pages carry different revs.
+   *  `awaited`: whoever sent it still waits for it; false for a
    *  result that arrives after its timeout. A JSON-RPC error carries no state
    *  and isn't tapped. */
-  | { kind: 'result'; method: string; params: Record<string, unknown>; result: unknown; awaited: boolean }
+  | { kind: 'result'; method: string; params: Record<string, unknown>; result: unknown; awaited: boolean; straddled?: boolean }
   /** A push/event (carrier 2), as read, before the plane gate or the grant
    *  admit or refuse it. */
   | { kind: 'push'; params: unknown }
@@ -1728,8 +1728,8 @@ export class McplServerConnection extends EventEmitter {
    * empty inventory published as complete. The read tap (RFC-014) is handed
    * the complete inventory once, with the last page's `_meta`, as the last
    * page's response is read, before anything read after it; a list that
-   * fails or times out hands it nothing. Its params say `straddled` when its
-   * pages carry different `mcpl/rev`s.
+   * fails or times out hands it nothing. It's `straddled` when its pages
+   * carry different `mcpl/rev`s.
    */
   async sendToolsList(): Promise<{ tools: McpToolDefinition[] }> {
     const tools: McpToolDefinition[] = [];
@@ -1741,12 +1741,12 @@ export class McplServerConnection extends EventEmitter {
     const onRead = (result: unknown) => {
       if (!result || typeof result !== 'object' || !Array.isArray((result as { tools?: unknown }).tools)) return;
       const r = result as { tools: McpToolDefinition[]; nextCursor?: unknown; _meta?: unknown };
-      read.push(...r.tools);
+      for (const t of r.tools) read.push(t);
       const rev = (r._meta as Record<string, unknown> | undefined)?.['mcpl/rev'];
       if (typeof rev === 'number') revs.add(rev);
       if (r.nextCursor !== undefined && r.nextCursor !== null) return;
       this.tap({
-        kind: 'result', method: 'tools/list', params: revs.size > 1 ? { straddled: true } : {},
+        kind: 'result', method: 'tools/list', params: {}, ...(revs.size > 1 ? { straddled: true } : {}),
         result: { tools: read, ...(r._meta !== undefined ? { _meta: r._meta } : {}) }, awaited: true,
       });
     };

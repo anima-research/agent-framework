@@ -56,7 +56,7 @@ const META_TOOLS: ToolDefinition[] = [
     description:
       'Call a tool that was announced in the conversation (a tool of an open toolset, or another dynamic tool); they are not in your tool list. ' +
       'args are the arguments its signature shows; instance picks the open copy when several are open; server is needed only when two servers have the tool. ' +
-      'Returns the server\'s result, then any change it made in which tools are available, unless that change already went out as a notice (or was due as one and none could be written). toolsets--look shows what is available now.',
+      'Returns the server\'s result, then any change it made in which tools are available, unless that change already went out as a notice. toolsets--look shows what is available now.',
     inputSchema: {
       type: 'object',
       properties: {
