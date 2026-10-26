@@ -742,4 +742,29 @@ describe('toolDeclarations in the framework', () => {
     }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.' } });
   });
 
+  for (const order of ['a change, then a stored injection', 'a stored injection, then a change', 'a stored injection, then a change a dry run shows'] as const) {
+    it(`ends a resident's request on its own turn past ${order} after it, with its [Continue] last`, async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        const store = (framework as unknown as { storeInjections(agent: Agent, injections: unknown[]): unknown });
+        const lesson = { namespace: 'lessons', position: 'afterUser', content: [{ type: 'text', text: 'LESSON' }] };
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        say(alpha, 'alpha', 'my reply');
+        if (order === 'a change, then a stored injection') {
+          await alpha.buildActivationRequest([tool('a'), tool('b')]);
+          store.storeInjections(alpha, [lesson]);
+        } else {
+          store.storeInjections(alpha, [lesson]);
+        }
+        const request = await alpha.buildActivationRequest([tool('a'), tool('b')], undefined, undefined, undefined, { dryRun: order === 'a stored injection, then a change a dry run shows' });
+        const shown = request.messages.map((m) => (isChange(m) ? 'change' : m.content.map((b) => (b as { text?: string }).text ?? '').join('')));
+        assert.deepEqual(shown.slice(shown.indexOf('my reply')), [
+          'my reply',
+          ...(order === 'a change, then a stored injection' ? ['change', 'LESSON'] : ['LESSON', 'change']),
+          '[Continue]',
+        ]);
+      });
+    });
+  }
 });
