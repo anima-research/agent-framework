@@ -3669,7 +3669,7 @@ test('#277: withheld materialize, sync and delete keep the files they acted on i
     assert.deepEqual(keptLists(materialize), { materialized: [{ mount: 'work', path: 'LOG.md' }] }, materialize);
     const synced = keptLists(sync) as { results: Array<{ mount: string; synced: string[] }> };
     assert.deepEqual(synced.results.map((r) => [r.mount, r.synced]), [['work', ['disk.txt']]], sync);
-    assert.deepEqual(keptLists(del), { path: 'work/LOG.md', deleted: true }, del);
+    assert.deepEqual(keptLists(del), { path: 'work/LOG.md', deleted: true, disk: 'waits for materialize with applyDeletions' }, del);
     for (const stub of [materialize, sync, del]) assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Its result is in workspace file /);
   } finally { await h.framework.stop(); }
 });

@@ -13,7 +13,7 @@
 
 import type { ToolResult } from '../../types/events.js';
 import { type Change, type FilePlan, type Leaves, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
-import { answerText, fieldLine, sectionLead, sectionText, shownValue, textAnswer } from './result-text.js';
+import { answerText, fieldLine, sectionLead, sectionText, shownValue, textAnswer, type DiskState } from './result-text.js';
 import { MAX_LINE_CHARS, numberedLine, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
@@ -548,8 +548,8 @@ function listedFileLine(file: ListedFile): string {
 }
 
 /** edit_many's receipt's text before its changed regions: its counts, and the files it lists. */
-function manyHeadText(data: { edits: number; replacements: number; files: ListedFile[]; filesNotListed?: number }): string {
-  const header = [fieldLine('edits', data.edits), fieldLine('replacements', data.replacements)];
+function manyHeadText(data: { edits: number; replacements: number; disk: DiskState; files: ListedFile[]; filesNotListed?: number }): string {
+  const header = [fieldLine('edits', data.edits), fieldLine('replacements', data.replacements), fieldLine('disk', data.disk)];
   if (data.filesNotListed !== undefined) header.push(fieldLine('filesNotListed', data.filesNotListed));
   return answerText(header, [sectionText('files', data.files.map(listedFileLine).join('\n'))]);
 }
@@ -571,7 +571,7 @@ function manyHeadText(data: { edits: number; replacements: number; files: Listed
  * call answers ResultTooLarge. Otherwise the model reads the text, and a
  * script gets the receipt's fields beside it.
  */
-export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): ToolResult {
+export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number, disk: DiskState): ToolResult {
   const reserve = receiptReserve(tool, files, maxChars);
   const notesOf = ({ plan, notes }: StoredFile): string[] => {
     const lineEnds = lineEndNote(plan);
@@ -595,6 +595,7 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
       path: file.path,
       size: file.plan.bytes.length,
       replacements: file.plan.replacements,
+      disk,
       ...(notes.length ? { note: notes.join(' ') } : {}),
       ...(file.modeKept ? { modeKept: file.modeKept } : {}),
     };
@@ -604,9 +605,10 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
     return textAnswer(answerText(header, [sectionText('changed', changed)]), { ...head, changed });
   }
   const listed: ListedFile[] = [];
-  const data: { edits: number; replacements: number; files: ListedFile[]; filesNotListed?: number; changed: string } = {
+  const data: { edits: number; replacements: number; disk: DiskState; files: ListedFile[]; filesNotListed?: number; changed: string } = {
     edits: editCount,
     replacements: files.reduce((sum, file) => sum + file.plan.replacements, 0),
+    disk,
     files: listed,
     changed: '',
   };

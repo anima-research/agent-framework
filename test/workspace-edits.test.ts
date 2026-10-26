@@ -111,6 +111,7 @@ test('the receipt shows two lines around the change, numbered, and no line past 
     path: 'work/r.txt',
     size: 18,
     replacements: 1,
+    disk: 'waits for materialize',
     changed: '     2\tb\n     3\tc\n     4\tD1\n     5\tD2\n     6\te\n     7\tf',
   });
   const last = dataOf(await call('edit', { path: 'work/r.txt', oldString: 'g\n', newString: 'G\n' }));
@@ -321,7 +322,7 @@ test("a receipt reads the stored bytes of its lines that end in a CR in one walk
       return Reflect.apply(search, this, args) as number;
     },
   });
-  const changed = changedOf(editReceipt('edit', [{ path: 'work/c.txt', plan: last.plan, notes: [] }], 1, 10_000_000));
+  const changed = changedOf(editReceipt('edit', [{ path: 'work/c.txt', plan: last.plan, notes: [] }], 1, 10_000_000, 'done'));
   assert.equal((changed.match(/\ty\r\r/g) ?? []).length, 300);
   assert.ok(finds >= 300 && finds < 3_000, `${finds} searches of the bytes`);
 });
@@ -548,7 +549,7 @@ test('replacing a whole file with nothing stores no bytes, and its receipt shows
   const { call, stored, file } = setup(t);
   await file('e.txt', 'all of it\n');
   assert.deepEqual(dataOf(await call('edit', { path: 'work/e.txt', oldString: 'all of it\n', newString: '' })),
-    { path: 'work/e.txt', size: 0, replacements: 1, changed: '' });
+    { path: 'work/e.txt', size: 0, replacements: 1, disk: 'waits for materialize', changed: '' });
   assert.equal(await stored('e.txt'), '');
   // At a cap that leaves no room for any region, nothing is named either.
   await file('f.txt', 'all of it\n');
@@ -618,6 +619,7 @@ test('edits in one file and across files are stored together, each matched in it
   assert.deepEqual(receipt, {
     edits: 3,
     replacements: 3,
+    disk: 'done',
     files: [
       { path: 'work/b.txt', size: 6, replacements: 1, edits: [1] },
       { path: 'work/a.txt', size: 8, replacements: 2, edits: [2, 3] },
@@ -1513,7 +1515,7 @@ test('a receipt keeps to its cap with the longest notes it adds after its budget
   const plan = markedPlan(lines, Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15));
   const files = [0, 1].map((i) => ({ path: `work/f${i}.txt`, plan, notes: i ? [`Disk's copy of work/f${i}.txt had changed.`] : [] }));
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
-    const length = receiptText(editReceipt('edit_many', files, 50, maxChars)).length;
+    const length = receiptText(editReceipt('edit_many', files, 50, maxChars, 'done')).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
   }
 });
@@ -1530,7 +1532,7 @@ test("a receipt keeps aside the longest note any of its files could add, not its
   const twenty = /lines \d{6}–\d{6}(?:, \d{6}–\d{6}){19}/;
   let named = 0;
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
-    const receipt = editReceipt('edit_many', files, 26, maxChars);
+    const receipt = editReceipt('edit_many', files, 26, maxChars, 'done');
     const length = receiptText(receipt).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
     if (twenty.test(changedOf(receipt))) named++;
@@ -1554,7 +1556,7 @@ test("edit_many's receipt keeps to its cap with a last line that counts each of 
   const allFour = /\[To keep this answer within [\d,]+ characters, it leaves out \d+ of the call's 5 files, the changed regions of \d+ more files?, the notes of \d+ files? and the edit numbers of \d+ files?\.\]$/;
   let counted = 0;
   for (let maxChars = 700; maxChars <= 2_500; maxChars++) {
-    const receipt = editReceipt('edit_many', files, 125, maxChars);
+    const receipt = editReceipt('edit_many', files, 125, maxChars, 'done');
     const length = receiptText(receipt).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
     if (allFour.test(changedOf(receipt))) counted++;
@@ -1572,8 +1574,8 @@ test('a receipt keeps aside only what its own call can add: one edit of a file o
   assert.ok('plan' in planned);
   const files = [{ path: 'work/long.txt', plan: planned.plan, notes: [] }];
   for (const [tool, start] of [['edit', /^ {5}1\ty/], ['edit_many', /^work\/long\.txt\n {5}1\ty/]] as const) {
-    const whole = receiptText(editReceipt(tool, files, 1, 1_000_000)).length;
-    const receipt = editReceipt(tool, files, 1, whole + 300);
+    const whole = receiptText(editReceipt(tool, files, 1, 1_000_000, 'done')).length;
+    const receipt = editReceipt(tool, files, 1, whole + 300, 'done');
     assert.match(changedOf(receipt), start, tool);
     assert.ok(receiptText(receipt).length <= whole + 300);
   }
@@ -1589,7 +1591,7 @@ test("a receipt counts the line feed between each of its region's lines, so a re
   const files = [{ path: 'work/s.txt', plan: planned.plan, notes: [] }];
   let shown = 0;
   for (let maxChars = 2_000; maxChars <= 3_500; maxChars++) {
-    const receipt = editReceipt('edit', files, 1, maxChars);
+    const receipt = editReceipt('edit', files, 1, maxChars, 'done');
     const length = receiptText(receipt).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
     if (!changedOf(receipt).startsWith('[not shown')) shown++;
@@ -1608,9 +1610,9 @@ test("what a receipt keeps aside doesn't grow with a line's length: twenty edits
     const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 20 }, (_, k) => ({ index: k, oldText: `m${k}|`, newText: `M${k}|`, expected: 1 })));
     assert.ok('plan' in planned);
     const files = [{ path: 'work/line.txt', plan: planned.plan, notes: [] }];
-    const whole = receiptText(editReceipt('edit_many', files, 20, 1_000_000)).length;
+    const whole = receiptText(editReceipt('edit_many', files, 20, 1_000_000, 'done')).length;
     // Whether the region shows with `spare` characters past the whole receipt.
-    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(changedOf(editReceipt('edit_many', files, 20, whole + spare)));
+    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(changedOf(editReceipt('edit_many', files, 20, whole + spare, 'done')));
   };
   const short = showsAt(start);
   const long = showsAt(start + 'a'.repeat(1_000_000));
