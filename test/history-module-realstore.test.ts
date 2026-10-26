@@ -465,8 +465,9 @@ describe('HistoryModule on a real store: a search that stops at maxScan with no 
     const tie: Row[] = [{ text: 'm-old', channel: 'x', ms: now - 30 * 24 * 60 * MIN }];
     for (let i = 0; i < 1100; i++) tie.push({ text: `m-tie${i}`, channel: 'd', ms: T });
     for (let i = 0; i < 3; i++) tie.push({ text: `m-late${i}`, channel: 'd', ms: now - (30 - 10 * i) * MIN });
+    tie.push({ text: 'm-backfill', channel: 'd', ms: T - 1000 });
     const b = await call(build(tie).mod, 'search', { query: 'needle', channelId: 'd', order: 'newest', maxScan: 10 });
-    assert.ok(rest(b).includes('; 1093 more in this range were not searched'), b.hint);
+    assert.ok(rest(b).includes('; 1094 more in this range were not searched'), b.hint);
 
     const short: Row[] = [];
     for (let i = 0; i < 6; i++) short.push({ text: `tie${i}`, channel: 'c', ms: T });
@@ -487,12 +488,20 @@ describe('HistoryModule on a real store: a search that stops at maxScan with no 
     }
   });
 
-  it('names only channelId and dates as narrowing when the scan stopped at maxScan, and author too when it stopped at limit', async () => {
+  it('suggests narrowing by author only after a stop at limit, and by channelId only when none was given', async () => {
     const { mod } = build(rows());
-    const scan = await call(mod, 'search', { query: 'tie', channelId: 'c', maxScan: 3 });
-    assert.match(scan.hint, /or narrow with channelId\/dates\.$/);
-    const limit = await call(mod, 'search', { query: 'tie', channelId: 'c', limit: 1 });
-    assert.match(limit.hint, /or narrow with channelId\/author\/dates\.$/);
+    const cases = [
+      [{ channelId: 'c', maxScan: 3 }, 'dates'],
+      [{ maxScan: 3 }, 'channelId/dates'],
+      [{ channelId: 'c', limit: 1 }, 'author/dates'],
+      [{ limit: 1 }, 'channelId/author/dates'],
+    ] as const;
+    for (const regex of kinds) {
+      for (const [input, words] of cases) {
+        const d = await call(mod, 'search', { query: 'tie', regex, ...input });
+        assert.ok(d.hint.endsWith(`, or narrow with ${words}.`), `${JSON.stringify({ regex, ...input })}: ${d.hint}`);
+      }
+    }
   });
 });
 
