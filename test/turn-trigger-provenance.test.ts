@@ -542,6 +542,8 @@ describe('private wins, one way', () => {
         assert.deepEqual(rig.starts.map((s) => s.reason), [turn === 'a private' ? 'external-message' : 'mcpl:channel-incoming', 'context_budget_restart', 'mcpl:channel-incoming'], `control: the restart ran alone: ${JSON.stringify(rig.starts)}`);
         if (turn === 'a private') {
           assert.deepEqual(rig.routed, [], 'neither the private turn nor the wake that waited on it reached a channel');
+          const notices = rig.texts().filter((t) => t.startsWith('[routing] This private turn also holds'));
+          assert.ok(notices.length === 1 && notices[0]!.includes(ROOM), `the wake's own turn names the room, once: ${JSON.stringify(notices)}`);
         } else {
           assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM, ROOM], `the restart and the wake's own turn each speak in the channel: ${JSON.stringify(rig.routed)}`);
         }
