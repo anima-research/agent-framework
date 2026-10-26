@@ -2442,6 +2442,7 @@ export class Agent {
           id: block.id,
           name: block.name,
           input: block.input,
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'text') {
         speechContent.push(block);

@@ -67,6 +67,28 @@ function shown(value: unknown): string {
   return head;
 }
 
+function notAnObject(input: unknown, field = 'input'): string {
+  return `its ${field} must be an object, and this call gave ${withArticle(kindOf(input))}`;
+}
+
+export function markedInputRefusal(call: { name: string; unparseableInput?: string }): string | undefined {
+  const text = call.unparseableInput;
+  if (text === undefined) return undefined;
+  // membrane marks `''` when a stream ended before the call's block did, and
+  // an object's JSON when the stream broke the API's block order, so the
+  // arguments may be another call's (ToolUseContent.unparseableInput).
+  if (text === '') return `Nothing was done: ${call.name} its arguments were cut off before any arrived; call it again with them whole.`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return `Nothing was done: ${call.name} its arguments must be one JSON object, and this call gave text that isn't JSON: ${shown(text)}.`;
+  }
+  if (parsed === null) return undefined;
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) return `Nothing was done: ${call.name} ${notAnObject(parsed)}.`;
+  return `Nothing was done: ${call.name} its arguments came in a response whose parts arrived out of order, so they may not be this call's; call it again.`;
+}
+
 /** A list in prose: `a`, `a or b`, `a, b or c`. */
 function oneOf(items: string[]): string {
   return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`;
@@ -169,7 +191,7 @@ export function toolArgsProblems(
   if (!schema) return [];
   const absent = input === undefined || input === null;
   if (!absent && (typeof input !== 'object' || Array.isArray(input))) {
-    return [`its ${options.field ?? 'input'} must be an object, and this call gave ${withArticle(kindOf(input))}`];
+    return [notAnObject(input, options.field)];
   }
   const obj = (absent ? {} : input) as Record<string, unknown>;
   const properties = (isMap(schema.properties) ? schema.properties : {}) as Record<string, { type?: unknown; nullable?: unknown; enum?: unknown } | undefined>;

@@ -748,7 +748,7 @@ const utilityOneLiner = (description: string): string => {
 
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { toolArgsProblems } from './tool-args.js';
+import { markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
@@ -20386,11 +20386,9 @@ export class AgentFramework {
               ? roundContent.filter((b) => b.type !== 'tool_result')
               : null);
 
-            // Note: max_tokens truncation cannot produce tool-calls events here.
-            // The membrane only yields 'tool-calls' when stop_reason is 'tool_use'
-            // (native API) or the closing </function_calls> tag is found (text parser).
-            // Truncated responses yield 'complete' with stop_reason 'max_tokens' directly.
-            // So all calls here have valid input — {} is legitimate for parameterless tools.
+            // A call membrane marks with unparseableInput carries an `input`
+            // that isn't the model's arguments; markedInputRefusal decides at
+            // dispatch whether it runs.
 
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
@@ -22230,6 +22228,8 @@ export class AgentFramework {
         return failure;
       }
     }
+    const marked = this.markedInputFailure(call.callerAgentName ?? '__ephemeral__', call, false);
+    if (marked) return marked;
 
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
     // Client-side programmatic tool calling for callers that await a tool's
@@ -22521,7 +22521,7 @@ export class AgentFramework {
   ): boolean {
     const ce = this.codeExecution;
     const input = call.input;
-    if (!ce || !this.canAgentUseTool(agentName, CODE_EXECUTION_TOOL_NAME)) return false;
+    if (!ce || !this.canAgentUseTool(agentName, CODE_EXECUTION_TOOL_NAME) || markedInputRefusal(call) !== undefined) return false;
     if (input === null || typeof input !== 'object' || Array.isArray(input)) return false;
     const fields = input as Record<string, unknown>;
     const action = fields.action ?? 'run';
@@ -23926,6 +23926,14 @@ export class AgentFramework {
     return refusal;
   }
 
+  private markedInputFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
+    const error = markedInputRefusal(call);
+    if (error === undefined) return undefined;
+    this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error });
+    if (!reportRefusal) return { success: false, error, isError: true };
+    return this.refusedResult(agentName, call.id, error);
+  }
+
   /**
    * A dispatched call answered without running its tool. RFC-007's lifecycle
    * forgets it, and its result says it was refused (`ToolResult.refused`), both
@@ -23961,15 +23969,16 @@ export class AgentFramework {
    * A call as its round's routing counts it, made directly, or by a script
    * and reaching the host while a run or wait call of the round watches it
    * (ScriptRound). A skip_reply refused, because the agent's allowedTools
-   * doesn't name it or because this host can't set the wake it asks for, is
+   * doesn't name it, because its arguments are refused (markedInputRefusal)
+   * or because this host can't set the wake it asks for, is
    * marked refused: it keeps its own round private and silences nothing after
    * it. A refusal withholds the call's effect, not the model's choice to keep
    * its words private. Any other call the list refuses posted nothing, so it
    * gives no cause. A script's call the bridge refuses before dispatch
    * (`refusedHere`) counts as one the list refuses.
    */
-  private roundCallOf(agentName: string, call: { name: string; input?: unknown }, refusedHere = false): RoundCall {
-    const permitted = !refusedHere && this.canAgentUseTool(agentName, call.name);
+  private roundCallOf(agentName: string, call: { name: string; input?: unknown; unparseableInput?: string }, refusedHere = false): RoundCall {
+    const permitted = !refusedHere && markedInputRefusal(call) === undefined && this.canAgentUseTool(agentName, call.name);
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
     return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused };
   }
@@ -23982,7 +23991,7 @@ export class AgentFramework {
    * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
-    const refusal = this.agentToolPermissionFailure(agentName, call);
+    const refusal = this.agentToolPermissionFailure(agentName, call) ?? this.markedInputFailure(agentName, call);
     if (refusal) {
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
