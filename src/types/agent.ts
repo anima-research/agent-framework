@@ -14,8 +14,9 @@ export type SameRoundThinkTextPolicySource =
 export interface AutoContinueRun {
   /** How the agent stops, as the row puts it ("call skip_reply"). */
   stop: string;
-  /** The turn before ended in words that were held, not sent, because a
-   *  send in it may already have posted where they were going. */
+  /** The turn before ended in words some or all of which were held, not
+   *  sent, because a send in it may already have posted where they were
+   *  going. */
   heldAfterSend?: boolean;
   /** Set by the scheduler: the continuation is the turn's only cause. */
   sole?: boolean;

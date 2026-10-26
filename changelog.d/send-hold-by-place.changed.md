@@ -20,8 +20,7 @@
   their answers too, and a send still out when its `code_execution` call
   returns counts as one that may have posted anywhere; in XML tool mode, which
   routes a turn's speech once at its end, the places of all the turn's sends
-  count. A `drafts` round keeps the speech its resend silenced, as before
-  (#701), and its narration aimed elsewhere now goes.
+  count. A `drafts` round keeps the speech the turn's sends silenced (#701).
 - The costs: a round with a send waits for the send's answer before its speech
   goes, so a send that hangs holds its round's speech until the tool's own
   timeout; narration beside a send to another channel, such as "posting it to
@@ -38,6 +37,8 @@
   in its turn held it back", where each said the send was in the same round.
   The `drafts` tool's description says a draft was held back because an
   explicit send in its turn may already have posted where it was going. An
-  `autoContinue` turn's `[continue]` row, after a turn whose closing words a
-  send held, now says "a send that turn may already have posted where they
-  were going" where it said "that turn had already sent with a send tool".
+  `autoContinue` turn's `[continue]` row, after a turn some or all of whose
+  closing words a send held, now says "Some or all of your closing words last
+  turn were held, not sent: a send that turn may already have posted where
+  they were going" where it said "Your closing words last turn were held, not
+  sent: that turn had already sent with a send tool".

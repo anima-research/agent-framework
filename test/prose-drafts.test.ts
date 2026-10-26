@@ -316,6 +316,7 @@ async function harness(opts: {
   sendTool?: boolean;
   codeExecution?: boolean;
   serverConfig?: Record<string, unknown>;
+  channels?: Array<{ id: string; label: string }>;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -345,7 +346,11 @@ async function harness(opts: {
         id: 'discord',
         command: process.execPath,
         args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
-        env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath, ...(opts.sendTool ? { SEND_TOOL: '1' } : {}) },
+        env: {
+          STATUS_PATH: statusPath, COMMAND_PATH: commandPath,
+          ...(opts.sendTool ? { SEND_TOOL: '1' } : {}),
+          ...(opts.channels ? { CHANNELS: JSON.stringify(opts.channels) } : {}),
+        },
         ...(opts.sendTool ? { toolPrefix: 'discord' } : {}),
         ...opts.serverConfig,
         ...(opts.requestTimeoutMs !== undefined ? { requestTimeoutMs: opts.requestTimeoutMs } : {}),
@@ -3002,12 +3007,12 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       try {
         const sendTo = (to: string) => `await tools["discord--send_message"]({ channelId: ${JSON.stringify(to)}, text: "x" });`;
         await h.turn([
-          createMockResponse([text('One.'), script('ce1', sendTo(GENERAL) + sendTo(GENERAL) + sendTo(ROOM))], 'tool_use'),
+          createMockResponse([text('One.'), script('ce1', sendTo(ROOM) + sendTo(GENERAL) + sendTo(GENERAL))], 'tool_use'),
           createMockResponse([text('Two.'), send('s1', GENERAL)], 'tool_use'),
           createMockResponse([text('Three.'), call('l1', 'channel_list', {})], 'tool_use'),
           createMockResponse([]),
         ]);
-        assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL, GENERAL, ROOM, GENERAL]);
+        assert.deepEqual(h.sends().map((s) => s.channelId), [ROOM, GENERAL, GENERAL, GENERAL]);
         assert.deepEqual(inRoom(h), []);
         assert.deepEqual(held(h), [['One.', 'explicit-send'], ['Two.', 'explicit-send'], ['Three.', 'explicit-send']]);
       } finally {
@@ -3058,6 +3063,39 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       }
     });
 
+    it(`${mode}: a round withheld while its script runs still holds the turn's later speech to where its sends may post`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true, codeExecution: true });
+      try {
+        await h.sendMode('hang');
+        const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
+        const round = [text(LINE), script('ce1', hangs), send('s1', GENERAL)];
+        completeWhileWaiting(h.membrane, { ...createMockResponse([...round, text('After.')]), toolCalls: [] });
+        await h.turn([createMockResponse(round, 'tool_use')]);
+        assert.deepEqual(inRoom(h), []);
+        assert.deepEqual(held(h), [['After.', 'explicit-send']]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it(`${mode}: the resend example names the place exactly when it has no name a prefix can carry`, async () => {
+      const LOUNGE = 'discord:g1:the lounge';
+      const h = await harness({
+        agents: [{ name: 'scout', proseRouting: mode }], sendTool: true,
+        channels: [{ id: ROOM, label: '#room (Guild One)' }, { id: GENERAL, label: '#general (Guild One)' }, { id: LOUNGE, label: 'the lounge' }],
+      });
+      try {
+        h.membrane.pushResponse(createMockResponse([text(LINE), send('s1', LOUNGE)], 'tool_use'));
+        h.membrane.pushResponse(createMockResponse([]));
+        h.command({ op: 'incoming', channelId: LOUNGE, messageId: 'in-lounge', mode: 'addressed', text: 'hello' });
+        await h.until(() => notices(h).length > 0, 'the notice');
+        await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
+        assert.match(notices(h)[0]!, /destination: "[^"]*the lounge"\) delivers it unchanged/);
+      } finally {
+        await h.close();
+      }
+    });
+
     it(`${mode}: a round whose stream ends before its send answers holds its line`, async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true });
       try {
@@ -3085,6 +3123,24 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       assert.equal(h.drafts()[0]!.note, `written for >>>${GENERAL}`);
     } finally {
       await h.close();
+    }
+  });
+
+  it("hybrid: an unprefixed envelope is decided by the sticky target an earlier '>>>' set", async () => {
+    for (const [place, goes] of [[ROOM, true], [GENERAL, false]] as const) {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
+      try {
+        await h.turn([
+          createMockResponse([text(`>>>${GENERAL} first`), call('l1', 'channel_list', {})], 'tool_use'),
+          createMockResponse([text('second'), send('s1', place)], 'tool_use'),
+          createMockResponse([]),
+        ]);
+        const inGeneral = h.publishes().filter((p) => p.event === 'publish' && p.channelId === GENERAL).map((p) => p.text);
+        assert.deepEqual(inGeneral, goes ? ['first', 'second'] : ['first']);
+        assert.deepEqual(held(h), goes ? [] : [['second', 'explicit-send']]);
+      } finally {
+        await h.close();
+      }
     }
   });
 
@@ -3124,8 +3180,8 @@ describe('an explicit send holds plain speech only where it may have posted', ()
   });
 
   it("XML tool mode: a stream that completes while a round's send is still out holds the turn's speech to that place", async () => {
-    const publish = `await tools.channel_publish({ channelId: ${JSON.stringify(GENERAL)}, content: "x" });`;
-    for (const round of [[text(LINE), send('s1', ROOM)], [text(LINE), script('ce1', publish), send('s1', ROOM)]]) {
+    const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
+    for (const round of [[text(LINE), send('s1', ROOM)], [text(LINE), script('ce1', hangs), send('s1', ROOM)]]) {
       const h = await harness({ xml: true, sendTool: true, codeExecution: true });
       try {
         await h.sendMode('hang');

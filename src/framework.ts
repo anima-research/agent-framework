@@ -271,7 +271,8 @@ const SILENCING_TOOLS = new Set(['skip_reply', ...SEND_TOOLS]);
 const WORLD_PUBLICATION_TOOLS = new Set(['say', 'whisper']);
 
 /** True when a tool call (possibly MCPL-prefixed) is an explicit delivery
- *  that silences the round's auto-routed prose, regardless of mode. */
+ *  that silences the round's auto-routed prose where it may have posted,
+ *  regardless of mode. */
 const isSilencingTool = (name: string): boolean => {
   const bare = bareToolName(name);
   return SILENCING_TOOLS.has(bare) || WORLD_PUBLICATION_TOOLS.has(bare);
@@ -1500,8 +1501,8 @@ interface ScriptRound {
    * keep its prose private, so it is neither sent nor held as a draft. A log
    * line names it, and in locus and hybrid mode the turn's delivery receipt
    * counts its segments as suppressed: a turn that a later stream continues
-   * writes its receipt after the withhold. Its sends still count for the
-   * turn's later speech. A round whose routing no longer waits on a script,
+   * writes its receipt after the withhold. The sends it has made still count
+   * for the turn's later speech. A round whose routing no longer waits on a script,
    * one that waits only on its sends or whose scripts returned while its
    * turn waited, is routed instead, a send that hasn't answered counting as
    * one that may have posted anywhere.
@@ -16118,12 +16119,11 @@ export class AgentFramework {
     for (const { hold: sendHold, target, parts } of runs) {
       const because = this.sendHoldText(sendHold, target, when);
       const at = target ? { target } : {};
-      if (draftsCause) {
-        routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
-        this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because, ...at });
-      } else {
-        heldAny = this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because, ...at }).length > 0 || heldAny;
-      }
+      const held = draftsCause
+        ? this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because, ...at })
+        : this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because, ...at });
+      if (draftsCause) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
+      heldAny = held.length > 0 || heldAny;
     }
     // The turn's receipt names them by their state at turn end; each was
     // named when it bounced.
@@ -16150,7 +16150,9 @@ export class AgentFramework {
         ? 'its answer named no channel the framework reads'
         : hold.why === 'unresolved'
           ? "its answer named a channel the framework couldn't match to one it knows"
-          : "it hadn't answered when this speech was routed";
+          : hold.round === when
+            ? "it hadn't answered when this speech was routed"
+            : "it hadn't answered by the end of its round";
     const going = target ? `, and this was going to ${this.channelShown(target)}` : '';
     return `the framework can't tell ${hold.why === 'error' || hold.why === 'no-answer' ? 'whether or where' : 'where'} your ${hold.tool} ${said(hold.round)} posted (${why})${going}${lasts(hold.round, false)}`;
   }
@@ -16233,7 +16235,7 @@ export class AgentFramework {
     const ids = held.map((d) => d.id);
     const many = held.length > 1;
     const quoted = (ds: Draft[]): string => ds.map((d) => `"${d.id}"`).join(', ');
-    const destination = JSON.stringify((target && this.channelRegistry?.proseTargetFor(target)) ?? '#channel');
+    const destination = JSON.stringify(target ? this.channelRegistry?.proseTargetFor(target) ?? qualifiedChannelName(target) : '#channel');
     // Words copied from a draft that may already have been posted resend
     // only with the resident's confirmation; the rest resend freely.
     const free = held.filter((d) => draftState(d) !== 'unconfirmed');
@@ -20964,9 +20966,10 @@ export class AgentFramework {
                 route: () => {
                   // Only while this stream still owns the agent and waits on
                   // the round: a turn replaced, reset or cancelled meanwhile
-                  // can't finish deciding it.
+                  // can't finish deciding a round its scripts could still
+                  // have silenced (withhold).
                   if (!waits()) {
-                    round.withhold(`its turn no longer waits on it (replaced, reset or stopped) while its ${scriptCallIds.length > 0 ? 'scripts' : 'sends'} ran`);
+                    round.withhold(`its turn no longer waits on it (replaced, reset or stopped) while its ${decidable ? 'sends' : 'scripts'} ran`);
                     return;
                   }
                   routeRound(answered());
@@ -21011,6 +21014,7 @@ export class AgentFramework {
 
           case 'complete': {
             streamTerminal = true;
+            this.decideWaitingRound(agent, myStreamId, 'its stream completed');
             adoptInjectedRound();
             // The final request was answered, and the prose routed below was
             // written by it when rounds route live. On the fallback path it's
@@ -21131,7 +21135,6 @@ export class AgentFramework {
                 `[framework] 'complete' event fired while agent '${agent.name}' is still waiting_for_tools. ` +
                 `Injecting error results for ${agent.getPendingToolIds().length} pending tool(s).`
               );
-              this.decideWaitingRound(agent, myStreamId, 'its stream completed before its calls answered');
               // Inject error results for all remaining pending tools
               for (const pendingId of agent.getPendingToolIds()) {
                 agent.provideToolResult(pendingId, {
@@ -21652,7 +21655,7 @@ export class AgentFramework {
             const askedToContinue = finalRouting.continuation;
             this.requestProseContinuation(agent, finalRouting);
             if (!askedToContinue) {
-              // Closing words held, not sent, because a send that turn may
+              // Closing words held, some or all, because a send that turn may
               // already have posted where they were going: the continuation's
               // row says so.
               const heldAfterSend = turnProseRouting !== 'explicit' && closingHeld
@@ -22334,7 +22337,7 @@ export class AgentFramework {
       // undecided is. One left waiting only on its sends, with no script or
       // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
-      this.decideWaitingRound(agent, myStreamId, 'its stream ended before its scripts returned');
+      this.decideWaitingRound(agent, myStreamId, 'its stream ended');
 
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to (completeOutgoing). Every exit path does,
@@ -22898,11 +22901,12 @@ export class AgentFramework {
       });
   }
 
-  private decideWaitingRound(agent: Agent, streamId: number, why: string): void {
+  private decideWaitingRound(agent: Agent, streamId: number, event: string): void {
     const waiting = this.scriptRounds.get(agent.name);
     if (waiting?.agent !== agent || waiting.streamId !== streamId) return;
     this.scriptRounds.delete(agent.name);
-    waiting.withhold(why);
+    const onScripts = [...waiting.pending].some((id) => !waiting.sends.has(id));
+    waiting.withhold(`${event} before its ${onScripts ? 'scripts returned' : 'sends answered'}`);
   }
 
   /**
