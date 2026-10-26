@@ -70,6 +70,38 @@ test('vector 28: retraction of never-read content leaves no trace and no turn', 
   assert(!f.context().includes('unread_original') && !f.context().includes('deletion_notice'));
 });
 
+for (const shape of ['an update', 'a retraction with a notice', 'a retraction with no notice'] as const) {
+  test(`while a branch switch holds the store, ${shape} of an unread coalesced push keeps the stored message, and ${shape === 'a retraction with no notice' ? 'appends nothing' : 'its text lands after the release'}`, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    await f.send('push/event', f.params('1', 'unread_original', { initial: true }));
+    assert(f.context().includes('unread_original'));
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const before = cm.getMessageCount();
+    const spied = cm as unknown as { setStrategy: (strategy: unknown) => Promise<void> };
+    const setStrategy = spied.setStrategy.bind(cm);
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => { entered = resolve; });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    spied.setStrategy = async (strategy: unknown) => { entered(); await gate; return setStrategy(strategy); };
+    const switching = f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+    const text = shape === 'an update' ? 'held_update' : shape === 'a retraction with a notice' ? 'held_notice' : '';
+    try {
+      await reached;
+      await f.send('push/event', f.params('2', text, shape === 'an update' ? {} : { retract: true }));
+      assert(f.context().includes('unread_original'), 'the stored message stays while the store is held');
+      assert(!f.context().includes('held_update') && !f.context().includes('held_notice'), 'nothing lands while the store is held');
+    } finally {
+      open();
+    }
+    await switching;
+    spied.setStrategy = setStrategy;
+    assert(f.context().includes('unread_original'), 'the stored message stays after the release');
+    if (text) assert(f.context().includes(text), `${text} lands after the release`);
+    else assert.equal(cm.getMessageCount(), before, 'nothing is appended');
+  });
+}
+
 test('vectors 29/34: read original → unread edit → delete keeps the original and appends only the notice', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'read_original', { initial: true }));

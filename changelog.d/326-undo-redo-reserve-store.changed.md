@@ -16,10 +16,9 @@
   re-initialized for the branch the last one leaves. The re-initialization
   waits first for maintenance already running, a pass or an over-budget
   drain kick; the move itself is synchronous, so a maintenance tick running
-  at that moment still runs across it, as before. That tick's work was for
-  the branch the store left, so what it meets then isn't reported as a
-  maintenance failure; a lasting failure, such as the provider's, meets the
-  next tick too.
+  at that moment still runs across it, as before. Its work was for the
+  branch the store left, so context-manager's refusal of that work isn't
+  reported as a maintenance failure; any other failure it meets is.
   Creating a conversation agent waits while a move or a surgery holds the
   store, since its context is seeded from the template's, and a move made
   while one is being created is refused as busy. An undo or redo that fails

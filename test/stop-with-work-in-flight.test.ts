@@ -597,12 +597,11 @@ describe('stop() with work still in flight', () => {
           await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
           const outcome = await settledWithin(framework.stop(100), 5_000);
           assert.ok(outcome instanceof ShutdownTimeoutError, String(outcome));
-          assert.ok(logged.includes(
-            "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream is still running and may still write; " +
-            (record === 'current'
-              ? 'the persisted queue keeps them for boot'
-              : "the persisted queue's record is behind, since its last write failed or met the cap, so a restart can lose them")),
-          logged.join('\n'));
+          const facts = record === 'current'
+            ? ['the persisted queue keeps them for boot']
+            : ["the persisted queue's record is behind", 'a restart can lose them'];
+          assert.ok(logged.some((line) => line.includes('1 deferred write(s) for assistant stay queued') && line.includes('its stream is still running')
+            && facts.every((fact) => line.includes(fact))), logged.join('\n'));
         } finally {
           release();
           await framework.stop().catch(() => {});

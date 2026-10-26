@@ -351,9 +351,9 @@ describe('Conversation routing', () => {
     // Every compile on any context manager during the spawn, by instance.
     const proto = (trunk.constructor as { prototype: { compile: (...args: unknown[]) => unknown } }).prototype;
     const original = proto.compile;
-    const compiles: Array<{ cm: unknown; dry: boolean; empty: boolean }> = [];
-    proto.compile = function (this: { getMessageCount(): number }, ...args: unknown[]) {
-      compiles.push({ cm: this, dry: (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true, empty: this.getMessageCount() === 0 });
+    const compiles: Array<{ cm: unknown; dry: boolean }> = [];
+    proto.compile = function (this: unknown, ...args: unknown[]) {
+      compiles.push({ cm: this, dry: (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true });
       return original.apply(this, args);
     };
     let seed: Awaited<ReturnType<typeof seedOf>>;
@@ -368,8 +368,7 @@ describe('Conversation routing', () => {
     const onTrunk = compiles.filter((c) => c.cm === trunk);
     assert.ok(onTrunk.length >= 1, 'the seed compiled the template');
     assert.ok(onTrunk.every((c) => c.dry), "the template's compiles during the spawn are dry runs");
-    assert.equal(compiles.filter((c) => c.cm === fork && c.empty).length, 0,
-      "the new namespace's emptiness check reads its stored messages: nothing compiles it while it holds none");
+    assert.equal(compiles.find((c) => c.cm === fork)?.dry, true, "the new namespace's emptiness check is a dry run");
 
     const types = seeded.flatMap((m) => m.content.map((b) => b.type));
     assert.ok(!types.includes('thinking') && !types.includes('redacted_thinking'), `no thinking in the seed: ${types}`);
