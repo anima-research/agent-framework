@@ -278,12 +278,13 @@ function xmlMode(inner: MockMembrane): MockMembrane {
 }
 
 async function harness(opts: {
-  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private' }>;
+  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean }>;
   xml?: boolean;
   /** The fixture server's requestTimeoutMs (the framework's default when unset). */
   requestTimeoutMs?: number;
   sendTool?: boolean;
   codeExecution?: boolean;
+  serverConfig?: Record<string, unknown>;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -302,6 +303,7 @@ async function harness(opts: {
     name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`,
     ...(a.proseRouting ? { proseRouting: a.proseRouting } : {}),
     ...(a.sameRoundThinkTextPolicy ? { sameRoundThinkTextPolicy: a.sameRoundThinkTextPolicy } : {}),
+    ...(a.autoContinue ? { autoContinue: a.autoContinue } : {}),
   }));
   const create = async () => {
     const framework = await AgentFramework.create({
@@ -314,6 +316,7 @@ async function harness(opts: {
         args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
         env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath, ...(opts.sendTool ? { SEND_TOOL: '1' } : {}) },
         ...(opts.sendTool ? { toolPrefix: 'discord' } : {}),
+        ...opts.serverConfig,
         ...(opts.requestTimeoutMs !== undefined ? { requestTimeoutMs: opts.requestTimeoutMs } : {}),
       }],
       modules: [],
@@ -343,6 +346,13 @@ async function harness(opts: {
       ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Publish)
         .filter((e) => e.event === 'publish' || e.event === 'publish-refused' || e.event === 'publish-error')
       : [],
+    sendMode: async (mode: string, answers?: string) => {
+      const logged = () => existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
+        .filter((l) => (JSON.parse(l) as { event: string }).event === 'send-mode').length : 0;
+      const before = logged();
+      h.command({ op: 'send-mode', mode, ...(answers ? { answers } : {}) });
+      await until(() => logged() > before, 'the send mode');
+    },
     sends: (): Array<{ channelId: string; text: string }> => existsSync(statusPath)
       ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; channelId: string; text: string })
         .filter((e) => e.event === 'send')
@@ -411,7 +421,7 @@ const unplacedSend = (id: string) => call(id, 'discord--send_message', { channel
 describe('held prose drafts, end to end', () => {
   it('a suppressed three-segment reply is held, named, inspected and delivered without retyping', async () => {
     const h = await harness({ sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       const segments = ['First — the actual reply.', 'Second, with  two spaces\nand a newline.', 'Third: trailing words.'];
       await h.turn([
@@ -590,7 +600,7 @@ describe('held prose drafts, end to end', () => {
 
   it("a resend made in no turn, as a background script's or a puppet's is, isn't noted as a publish into its channel", async () => {
     const h = await harness({ sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       await h.turn([
         createMockResponse([text('words held for later'), unplacedSend('s1')], 'tool_use'),
@@ -638,7 +648,7 @@ describe('held prose drafts, end to end', () => {
   // round's wait watches it under the same turn.
   it("a script's resend is noted with what its agent had read when the run call started the script", async () => {
     const h = await harness({ sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       await h.turn([
         createMockResponse([text('words a script will send'), unplacedSend('s1')], 'tool_use'),
@@ -675,7 +685,7 @@ describe('held prose drafts, end to end', () => {
 
   it('drafts belong to their resident: another resident can neither list nor resend them', async () => {
     const h = await harness({ agents: [{ name: 'scout' }, { name: 'other' }], sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       // Direct requests: a channel message would wake both residents.
       await h.turn([
@@ -705,7 +715,7 @@ describe('held prose drafts, end to end', () => {
 
   it('failed and uncertain resends: a refusal stays resendable; an unknown outcome needs confirmDuplicate', async () => {
     const h = await harness({ sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       await h.turn([
         createMockResponse([text('fragile words'), unplacedSend('s1')], 'tool_use'),
@@ -943,7 +953,7 @@ describe('held prose drafts, end to end', () => {
 
   it('June\'s cases: a rollback to before a confirmed resend returns the receipt, no new publish; a dismissal survives it', async () => {
     const h = await harness({ sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       await h.turn([
         createMockResponse([text('to deliver'), unplacedSend('s1')], 'tool_use'),
@@ -1394,7 +1404,7 @@ describe('held prose drafts, end to end', () => {
 
   it("hybrid mode: after a send, a drafts round's refused and malformed envelopes are held with no notice, as the silenced turn holds them (#701)", async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       await h.turn([
         createMockResponse([unplacedSend('s1')], 'tool_use'),
@@ -1412,7 +1422,7 @@ describe('held prose drafts, end to end', () => {
 
   it("hybrid mode: after a send, a drafts round's envelopes still move the router: its ' !' starts a continuation turn (#701)", async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
-    h.command({ op: 'send-mode', mode: 'no-channel' });
+    await h.sendMode('no-channel');
     try {
       const asked: boolean[] = [];
       const fw = h.framework as unknown as { requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void };
@@ -2787,6 +2797,7 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         assert.deepEqual(h.sends().map((s) => [s.channelId, s.text]), [[GENERAL, NOTE]]);
         assert.deepEqual(inRoom(h), [LINE]);
         assert.deepEqual(held(h), []);
+        assert.equal(h.texts().find((t) => t.startsWith('[delivered]')), `[delivered] plain speech → ${ROOM_SHOWN}`);
       } finally {
         await h.close();
       }
@@ -2842,11 +2853,11 @@ describe('an explicit send holds plain speech only where it may have posted', ()
     it(`${mode}: a send that answers with an error holds the line`, async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true });
       try {
-        h.command({ op: 'send-mode', mode: 'error' });
+        await h.sendMode('error');
         await h.turn([createMockResponse([text(LINE), send('s1', GENERAL)], 'tool_use'), createMockResponse([])]);
         assert.deepEqual(inRoom(h), []);
         assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
-        assert.match(notices(h)[0]!, /can't tell where your send_message in this round posted \(it answered with an error\)/);
+        assert.match(notices(h)[0]!, /can't tell whether or where your send_message in this round posted \(it answered with an error\)/);
       } finally {
         await h.close();
       }
@@ -2855,7 +2866,7 @@ describe('an explicit send holds plain speech only where it may have posted', ()
     it(`${mode}: a send whose answer names no channel holds the line`, async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true });
       try {
-        h.command({ op: 'send-mode', mode: 'no-channel' });
+        await h.sendMode('no-channel');
         await h.turn([createMockResponse([text(LINE), send('s1', GENERAL)], 'tool_use'), createMockResponse([])]);
         assert.deepEqual(inRoom(h), []);
         assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
@@ -2931,16 +2942,76 @@ describe('an explicit send holds plain speech only where it may have posted', ()
           assert.deepEqual(h.publishes().filter((p) => p.event === 'publish').map((p) => [p.channelId, p.text]),
             goes ? [[GENERAL, 'Held words.'], [ROOM, 'Resending it now.']] : [[ROOM, 'Held words.']]);
           assert.deepEqual(held(h), []);
+          if (!goes) {
+            assert.ok(h.texts().includes('Resending it now.'), 'the narration stays in context');
+            assert.match(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!, /1 plain-speech segment\(s\) kept private/);
+          }
         } finally {
           await h.close();
         }
       }
     });
 
+    it(`${mode}: where a send posted is read from its answer, not from what it asked for`, async () => {
+      for (const [asked, answered, goes] of [[GENERAL, ROOM, false], [ROOM, GENERAL, true]] as const) {
+        const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true });
+        try {
+          await h.sendMode('delivered', answered);
+          await h.turn([createMockResponse([text(LINE), send('s1', asked)], 'tool_use'), createMockResponse([])]);
+          assert.deepEqual(inRoom(h), goes ? [LINE] : []);
+          assert.deepEqual(held(h), goes ? [] : [[LINE, 'explicit-send']]);
+        } finally {
+          await h.close();
+        }
+      }
+    });
+
+    it(`${mode}: the places of several sends add up, in a script and across rounds`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true, codeExecution: true });
+      try {
+        const sendTo = (to: string) => `await tools["discord--send_message"]({ channelId: ${JSON.stringify(to)}, text: "x" });`;
+        await h.turn([
+          createMockResponse([text('One.'), script('ce1', sendTo(GENERAL) + sendTo(GENERAL) + sendTo(ROOM))], 'tool_use'),
+          createMockResponse([text('Two.'), send('s1', GENERAL)], 'tool_use'),
+          createMockResponse([text('Three.'), call('l1', 'channel_list', {})], 'tool_use'),
+          createMockResponse([]),
+        ]);
+        assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL, GENERAL, ROOM, GENERAL]);
+        assert.deepEqual(inRoom(h), []);
+        assert.deepEqual(held(h), [['One.', 'explicit-send'], ['Two.', 'explicit-send'], ['Three.', 'explicit-send']]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it(`${mode}: a send the dispatcher refuses holds nothing`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true, serverConfig: { disabledTools: ['send_message'] } });
+      try {
+        await h.turn([createMockResponse([text(LINE), send('s1', ROOM)], 'tool_use'), createMockResponse([])]);
+        assert.deepEqual(h.sends(), []);
+        assert.deepEqual(inRoom(h), [LINE]);
+        assert.deepEqual(held(h), []);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it(`${mode}: an answer naming a channel the framework can't match holds the line, and says so`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true });
+      try {
+        await h.sendMode('delivered', 'discord:g1:nowhere');
+        await h.turn([createMockResponse([text(LINE), send('s1', GENERAL)], 'tool_use'), createMockResponse([])]);
+        assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
+        assert.match(notices(h)[0]!, /can't tell where your send_message in this round posted \(its answer named a channel the framework couldn't match to one it knows\)/);
+      } finally {
+        await h.close();
+      }
+    });
+
     it(`${mode}: a round whose stream ends before its send answers holds its line`, async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true });
       try {
-        h.command({ op: 'send-mode', mode: 'hang' });
+        await h.sendMode('hang');
         h.membrane.pushResponse(createMockResponse([text(LINE), send('s1', GENERAL)], 'tool_use'));
         h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-hang', mode: 'addressed', text: 'hello' });
         await h.until(() => h.sends().length === 1, 'the send');
@@ -2962,6 +3033,31 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       assert.deepEqual(inRoom(h), ['For you.']);
       assert.deepEqual(held(h), [['And a word for general.', 'explicit-send']]);
       assert.equal(h.drafts()[0]!.note, `written for >>>${GENERAL}`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('hybrid: envelopes held for several places keep the order they were written in', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
+    try {
+      await h.turn([
+        createMockResponse([text(`>>>${ROOM} first\n>>>${GENERAL} second\n>>>${ROOM} third`), send('s1', ROOM), send('s2', GENERAL)], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(held(h), [['first', 'explicit-send'], ['second', 'explicit-send'], ['third', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid: a closing envelope that only names a destination isn't reported as closing words held", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid', autoContinue: true }], sendTool: true });
+    try {
+      await h.turn([createMockResponse([text(LINE), send('s1', ROOM)], 'tool_use'), createMockResponse([text(`>>>${ROOM}`)])]);
+      await h.until(() => h.texts().some((t) => t.startsWith('[continue]')), 'the continuation row');
+      const row = h.texts().find((t) => t.startsWith('[continue]'))!;
+      assert.doesNotMatch(row, /closing words last turn were held/, row);
     } finally {
       await h.close();
     }

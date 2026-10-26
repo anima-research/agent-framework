@@ -51,8 +51,9 @@ A turn continues when the model ended it (stop reason `end_turn` or
   envelope.
 
 A turn that sent with a send tool and then closed in prose (held, not sent,
-because the turn had already sent) still continues: its closing words can't
-be told from unfinished work. The row tells the agent those words were held.
+because a send that turn may already have posted where they were going) still
+continues: its closing words can't be told from unfinished work. The row tells
+the agent those words were held.
 
 ## What the agent reads
 
@@ -68,9 +69,10 @@ acknowledge themselves and write no receipt):
 It names the agent, since residents read one shared message slot. For the
 same reason it is never written while another resident's turn is alive: the
 continuation waits for that turn to end, as a clock row does. When the
-last turn's closing words were held because that turn had already sent, it
-adds `Your closing words last turn were held, not sent: that turn had already
-sent with a send tool.` The last continuation of a run adds `This is the last
+last turn's closing words were held because a send that turn may already have
+posted where they were going, it adds `Your closing words last turn were held,
+not sent: a send that turn may already have posted where they were going.` The
+last continuation of a run adds `This is the last
 continuation in a row: after this turn you wait for the next event either
 way.` An agent that can't call `skip_reply` is told to end with a
 `>>skip_reply` (explicit) or `>>>skip_reply` (hybrid) envelope instead.

@@ -29,12 +29,15 @@
   still holds its round's speech, since its answer names no channel.
 - The held-draft notice now names the send, where it posted or may have
   posted, and where the speech was going, or says the framework can't tell
-  where the send posted and why; for a send in an earlier round of the turn it
-  says the hold lasts until a new message arrives or the turn ends. Its resend
-  example names the place the speech was going instead of `"#channel"`. A held
-  draft's note now records where it was going, which `drafts` `read` shows.
-  For such a draft, `list` and the catch-up notice now give "explicit send in
-  its turn" as the reason, and `read` "an explicit send in its turn held it
-  back", where each said the send was in the same round. The `drafts` tool's
-  description says a draft was held back because an explicit send in its turn
-  may already have posted where it was going.
+  where, or whether, the send posted, and why; for a send in an earlier round
+  of the turn it says the hold lasts until a new message arrives or the turn
+  ends. Its resend example names the place the speech was going instead of
+  `"#channel"`. A held draft's note now records where it was going, which
+  `drafts` `read` shows. For such a draft, `list` and the catch-up notice now
+  give "explicit send in its turn" as the reason, and `read` "an explicit send
+  in its turn held it back", where each said the send was in the same round.
+  The `drafts` tool's description says a draft was held back because an
+  explicit send in its turn may already have posted where it was going. An
+  `autoContinue` turn's `[continue]` row, after a turn whose closing words a
+  send held, now says "a send that turn may already have posted where they
+  were going" where it said "that turn had already sent with a send tool".

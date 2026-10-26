@@ -12,7 +12,7 @@
 //    "content"? (content blocks, instead of text; [] included)}
 //   {"op":"rename","channelId":…,"label":…}             (channels/changed)
 //   {"op":"publish-mode","mode":"delivered"|"not-delivered"|"no-receipt"|"error"|"hang"}
-//   {"op":"send-mode","mode":"delivered"|"no-channel"|"error"|"hang"}  (SEND_TOOL=1)
+//   {"op":"send-mode","mode":"delivered"|"no-channel"|"error"|"hang","answers"?:channelId}  (SEND_TOOL=1)
 //   {"op":"history","channelId":…,"history":[ChannelIncomingMessage…]}
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL ({event:'publish', channelId, text, messageId}).
@@ -42,6 +42,7 @@ let processedCommands = 0;
 let publishMode = 'delivered';
 let publishErrorData;
 let sendMode = 'delivered';
+let sendAnswers;
 let posted = 0;
 const histories = new Map();
 
@@ -132,6 +133,7 @@ function pollCommands() {
       log('publish-mode', { mode: c.mode });
     } else if (c.op === 'send-mode') {
       sendMode = c.mode;
+      sendAnswers = c.answers;
       log('send-mode', { mode: c.mode });
     } else if (c.op === 'history') {
       histories.set(c.channelId, c.history);
@@ -249,7 +251,7 @@ rl.on('line', (line) => {
     } else if (sendMode === 'no-channel') {
       reply(msg.id, { content: [{ type: 'text', text: 'sent' }] });
     } else {
-      reply(msg.id, { content: [{ type: 'text', text: JSON.stringify({ messageId: `sent-${++posted}`, channelId: args.channelId }) }] });
+      reply(msg.id, { content: [{ type: 'text', text: JSON.stringify({ messageId: `sent-${++posted}`, channelId: sendAnswers ?? args.channelId }) }] });
     }
     return;
   }

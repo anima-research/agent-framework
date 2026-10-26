@@ -1377,10 +1377,12 @@ interface RoundCall {
   reach?: SendReach;
 }
 
+type UnknownReach = 'error' | 'no-channel' | 'unresolved' | 'no-answer';
+
 type SendReach =
   | { kind: 'channel'; to: ChannelRef; delivered: boolean }
   | { kind: 'nowhere' }
-  | { kind: 'unknown'; why: 'error' | 'no-channel' | 'no-answer' };
+  | { kind: 'unknown'; why: UnknownReach };
 
 interface SendPlace {
   to: ChannelRef;
@@ -1391,14 +1393,14 @@ interface SendPlace {
 
 interface SendsReached {
   places: ReadonlyMap<string, SendPlace>;
-  unknown?: { tool: string; why: 'error' | 'no-channel' | 'no-answer'; round: number };
+  unknown?: { tool: string; why: UnknownReach; round: number };
 }
 
 type TurnSilence = 'private' | SendsReached;
 
 type SendHold =
   | { kind: 'place'; place: SendPlace }
-  | { kind: 'unknown'; tool: string; why: 'error' | 'no-channel' | 'no-answer'; round: number };
+  | { kind: 'unknown'; tool: string; why: UnknownReach; round: number };
 
 const sameReach = (a: SendReach | undefined, b: SendReach | undefined): boolean => {
   if (!a || !b) return a === b;
@@ -15988,8 +15990,8 @@ export class AgentFramework {
     privateThink: boolean,
     round: ProseRound,
     at: { target: ChannelRef | null; when: number | 'end' | 'turn' },
-  ): void {
-    if (segments.length === 0) return;
+  ): boolean {
+    if (segments.length === 0) return false;
     const routing = round.routing;
     if (cause === 'private' || cause === 'kept' || privateThink) {
       // Match explicit mode: skip_reply keeps publication private but can
@@ -16003,14 +16005,14 @@ export class AgentFramework {
         }
       }
       routing.keptPrivate += segments.length;
-      return;
+      return false;
     }
     const note = at.target ? `written for ${this.channelShown(at.target)}` : undefined;
-    this.holdProseDrafts(agent, segments.map((text) => ({ text, ...(note ? { note } : {}) })), 'explicit-send', {
+    return this.holdProseDrafts(agent, segments.map((text) => ({ text, ...(note ? { note } : {}) })), 'explicit-send', {
       ...round,
       because: this.sendHoldText(cause, at.target, at.when),
       ...(at.target ? { target: at.target } : {}),
-    });
+    }).length > 0;
   }
 
   private async routeSilencedHybrid(
@@ -16036,12 +16038,11 @@ export class AgentFramework {
     // syntax, and where it was going stays with it as a note.
     let privateCount = 0;
     type Part = { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean };
-    const groups = new Map<string, { hold: SendHold; target: ChannelRef | null; parts: Part[] }>();
+    const runs: Array<{ hold: SendHold; target: ChannelRef | null; parts: Part[] }> = [];
     const hold = (sendHold: SendHold, target: ChannelRef | null, part: Part): void => {
-      const key = target ? destinationKey(target) : '';
-      const group = groups.get(key) ?? { hold: sendHold, target, parts: [] };
-      group.parts.push(part);
-      groups.set(key, group);
+      const last = runs.at(-1);
+      if (last && sameChannel(last.target, target)) last.parts.push(part);
+      else runs.push({ hold: sendHold, target, parts: [part] });
     };
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
@@ -16109,42 +16110,45 @@ export class AgentFramework {
       }
     }
     routing.keptPrivate += privateCount;
-    for (const { hold: sendHold, target, parts } of groups.values()) {
+    let heldAny = false;
+    for (const { hold: sendHold, target, parts } of runs) {
       const because = this.sendHoldText(sendHold, target, when);
       const at = target ? { target } : {};
       if (draftsCause) {
         routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
         this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because, ...at });
       } else {
-        this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because, ...at });
+        heldAny = this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because, ...at }).length > 0 || heldAny;
       }
     }
     // The turn's receipt names them by their state at turn end; each was
     // named when it bounced.
     const drafts = routing.drafts;
     for (const draft of kept) if (!drafts.some((d) => d.id === draft.id)) drafts.push(draft);
-    return groups.size > 0;
+    return heldAny;
   }
 
   private sendHoldText(hold: SendHold, target: ChannelRef | null, when: number | 'end' | 'turn'): string {
     const said = (round: number): string => (when === 'turn' ? 'this turn' : round === when ? 'in this round' : 'earlier this turn');
-    const lasts = (round: number, to: string | undefined): string =>
+    const lasts = (round: number, there: boolean): string =>
       typeof when === 'number' && round !== when
-        ? `; your speech${to ? ` to ${to}` : ''} stays held until a new message reaches you or this turn ends`
+        ? `; your speech${there ? ' there' : ''} stays held until a new message reaches you or this turn ends`
         : '';
     if (hold.kind === 'place') {
       const { place } = hold;
       const where = this.channelShown(place.to);
       return `your ${place.tool} ${said(place.round)} ${place.delivered ? 'delivered' : 'may have posted'} to ${where}, ` +
-        `where this was going${lasts(place.round, where)}`;
+        `where this was going${lasts(place.round, true)}`;
     }
     const why = hold.why === 'error'
       ? 'it answered with an error'
       : hold.why === 'no-channel'
         ? 'its answer named no channel'
-        : "it hadn't answered when this speech was routed";
+        : hold.why === 'unresolved'
+          ? "its answer named a channel the framework couldn't match to one it knows"
+          : "it hadn't answered when this speech was routed";
     const going = target ? `, and this was going to ${this.channelShown(target)}` : '';
-    return `the framework can't tell where your ${hold.tool} ${said(hold.round)} posted (${why})${going}${lasts(hold.round, undefined)}`;
+    return `the framework can't tell ${hold.why === 'error' || hold.why === 'no-answer' ? 'whether or where' : 'where'} your ${hold.tool} ${said(hold.round)} posted (${why})${going}${lasts(hold.round, false)}`;
   }
 
   /**
@@ -16225,9 +16229,7 @@ export class AgentFramework {
     const ids = held.map((d) => d.id);
     const many = held.length > 1;
     const quoted = (ds: Draft[]): string => ds.map((d) => `"${d.id}"`).join(', ');
-    const destination = JSON.stringify(target
-      ? this.channelRegistry?.proseTargetFor(target) ?? this.channelRegistry?.nameShown(target) ?? target.channelId
-      : '#channel');
+    const destination = JSON.stringify((target && this.channelRegistry?.proseTargetFor(target)) ?? '#channel');
     // Words copied from a draft that may already have been posted resend
     // only with the resident's confirmation; the rest resend freely.
     const free = held.filter((d) => draftState(d) !== 'unconfirmed');
@@ -20860,7 +20862,7 @@ export class AgentFramework {
                 if (roundSilence === 'private' || (roundSilence && hasSameRoundPrivateThink)) {
                   const cause = roundSilence === 'private' ? 'private' : 'kept';
                   chainSpeech(
-                    async () => this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts, { target: null, when: toolRound }),
+                    async () => { this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts, { target: null, when: toolRound }); },
                     'mid-turn hybrid prose hold failed:',
                   );
                 } else if (roundSilence) {
@@ -20962,7 +20964,10 @@ export class AgentFramework {
                 },
                 withhold: (why) => {
                   if (scriptCallIds.length === 0) {
-                    console.error(`[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> routed with ${[...round.pending].length} send(s) unanswered, as sends that may have posted anywhere`);
+                    console.error(
+                      `[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> decided early (${why}); ` +
+                      `${round.pending.size} unanswered send(s) count as ones that may have posted anywhere`,
+                    );
                     routeRound(answered());
                     return;
                   }
@@ -21463,8 +21468,7 @@ export class AgentFramework {
                   } else if (turnProseRouting === 'hybrid') {
                     closingHeld = await this.routeSilencedHybrid(agent, speechRuns, silence, false, textOnlyHold, locus, 'end');
                   } else {
-                    this.holdSilencedProse(agent, speechRuns, sendHoldAt(silence, locus)!, false, textOnlyHold, { target: locus, when: 'end' });
-                    closingHeld = true;
+                    closingHeld = this.holdSilencedProse(agent, speechRuns, sendHoldAt(silence, locus)!, false, textOnlyHold, { target: locus, when: 'end' });
                   }
                 } else if (turnProseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
@@ -21585,8 +21589,7 @@ export class AgentFramework {
                   `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold ? 'turn silenced: send' : 'no trailing prose'})`,
                 );
                 if (segments.length > 0) {
-                  this.holdSilencedProse(agent, runs, sendHold ?? 'private', false, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
-                  closingHeld = sendHold !== undefined;
+                  closingHeld = this.holdSilencedProse(agent, runs, sendHold ?? 'private', false, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
                 }
               } else {
                 // The turn's own locus, read from this stream's routing
@@ -21636,8 +21639,9 @@ export class AgentFramework {
             const askedToContinue = finalRouting.continuation;
             this.requestProseContinuation(agent, finalRouting);
             if (!askedToContinue) {
-              // Closing words held, not sent, because the turn had already
-              // sent with a send tool: the continuation's row says so.
+              // Closing words held, not sent, because a send that turn may
+              // already have posted where they were going: the continuation's
+              // row says so.
               const heldAfterSend = turnProseRouting !== 'explicit' && closingHeld
                 && terminalContent.some((b) => b.type === 'text' && (b as { text: string }).text.trim().length > 0);
               this.autoContinueAfterTurn(agent, finalRouting, trigger, response.stopReason, { heldAfterSend });
@@ -22314,7 +22318,8 @@ export class AgentFramework {
       // A round of this stream still waiting for its code_execution calls
       // can't be routed now: whether its scripts would have silenced it is
       // unknown, so its prose is withheld, as text whose routing is
-      // undecided is.
+      // undecided is. One waiting only on its sends is routed, each
+      // unanswered send counting as one that may have posted anywhere.
       const unsettled = this.scriptRounds.get(agent.name);
       if (unsettled?.agent === agent && unsettled.streamId === myStreamId) {
         this.scriptRounds.delete(agent.name);
@@ -30845,12 +30850,14 @@ export class AgentFramework {
 
         if (result.isError !== true && isSilencingTool(toolName)) {
           const answered = extractChannelIdFromToolResult(result.content);
+          let to: ChannelRef | undefined;
           try {
-            const to = answered ? this.channelRegistry?.resolveSendTarget(answered, serverId) : undefined;
-            if (to) SEND_REACH.set(toolResult, { kind: 'channel', to, delivered: true });
+            to = answered ? this.channelRegistry?.resolveSendTarget(answered, serverId) : undefined;
           } catch (err) {
             console.error(`[routing] ${agentName}: where ${toolName} posted couldn't be read: ${err instanceof Error ? err.message : String(err)}`);
           }
+          if (to) SEND_REACH.set(toolResult, { kind: 'channel', to, delivered: true });
+          else if (answered) SEND_REACH.set(toolResult, { kind: 'unknown', why: 'unresolved' });
         }
         this.pushEvent({
           type: 'tool-result',
