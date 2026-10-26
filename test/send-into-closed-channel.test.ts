@@ -235,7 +235,7 @@ test("a send into a channel the agent closed says so, what still reaches the age
   assert.deepEqual(settings.update('sol', { closed_channel_note: false }), { closed_channel_note: false });
   assert.deepEqual(state()?.closedChannelNotes, { sol: false });
   assert.ok(!(await reply()).data.includes('[closed channel]'), 'no note once turned off');
-  assert.throws(() => settings.update('sol', { closed_channel_note: 'off' }), /closed_channel_note must be a boolean/);
+  assert.throws(() => settings.update('sol', { closed_channel_note: 'off' }), /closed_channel_note must be true or false, not "off"/);
 
   // Reset brings the default back.
   assert.deepEqual(settings.reset('sol'), { closed_channel_note: true });
@@ -751,7 +751,7 @@ test("closed_channel_note is an agent_settings key, kept in the framework's stat
     const off = settings(framework, { action: 'update', closed_channel_note: false });
     assert.equal(off.data?.closed_channel_note, false);
     assert.equal(off.data?.tool_result_guard, true, "turning the note off leaves the other setting's value");
-    assert.match(String(settings(framework, { action: 'update', closed_channel_note: 'no' }).error), /closed_channel_note must be a boolean/);
+    assert.match(String(settings(framework, { action: 'update', closed_channel_note: 'no' }).error), /closed_channel_note must be true or false, not "no"/);
 
     await framework.stop();
     framework = await AgentFramework.create(config());

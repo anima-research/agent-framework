@@ -1947,11 +1947,13 @@ describe('explicit prose routing', () => {
     }
   });
 
+  const sendWhereUnknown = { places: new Map(), unknown: { tool: 'send_message', why: 'no-channel', round: 0 } };
+
   it('hybrid: a hold beside a send writes the routing and drafts of its own round, not the live turn\'s', async () => {
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
     const gateway = framework as unknown as {
-      holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
+      routeSilencedHybrid(agent: unknown, segments: string[], sends: unknown, draftsCause: boolean, round: { routing: RoutingState; notice: 'later' }, locus: ChannelRef | null, when: number): Promise<boolean>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
@@ -1961,7 +1963,7 @@ describe('explicit prose routing', () => {
       gateway.turnRouting.set('assistant', live);
       // A held round that a later start has overtaken: its envelopes move
       // its own turn's routing, and its drafts are that turn's.
-      gateway.holdSilencedProse(agent, ['>>>#nowhere held words', 'after it'], 'send', false, { routing: queued, notice: 'later' });
+      await gateway.routeSilencedHybrid(agent, ['>>>#nowhere held words', 'after it'], sendWhereUnknown, false, { routing: queued, notice: 'later' }, null, 0);
       assert.equal(queued.hybridHold, 'failed', 'the round that held it records the failed envelope');
       assert.deepEqual(queued.drafts.map((d) => d.text), ['held words', 'after it'], "and holds the round's words as its drafts");
       assert.equal(live.hybridHold, undefined, 'the live turn is untouched');
@@ -1975,13 +1977,13 @@ describe('explicit prose routing', () => {
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
     const gateway = framework as unknown as {
-      holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
+      routeSilencedHybrid(agent: unknown, segments: string[], sends: unknown, draftsCause: boolean, round: { routing: RoutingState; notice: 'later' }, locus: ChannelRef | null, when: number): Promise<boolean>;
     };
     const agent = framework.getAgent('assistant')!;
     try {
       // An earlier round of the turn pinned #alpha.
       const routing: RoutingState = routingState({ pin: stub('chan-alpha') });
-      gateway.holdSilencedProse(agent, ['>>>#ears for the room', 'after it'], 'send', false, { routing, notice: 'later' });
+      await gateway.routeSilencedHybrid(agent, ['>>>#ears for the room', 'after it'], sendWhereUnknown, false, { routing, notice: 'later' }, null, 0);
       assert.equal(routing.pin, undefined, 'the inbound-only channel is never pinned, and the earlier pin is dropped');
       assert.equal(routing.hybridHold, 'failed', 'the envelope fails as a refused target does at delivery');
       assert.deepEqual(routing.drafts.map((d) => d.text), ['for the room', 'after it'], 'and the words are held as drafts');
@@ -2064,12 +2066,12 @@ describe('explicit prose routing', () => {
       store.hold = ((_agent: string, segments: unknown[]) =>
         ({ held: [], notHeld: { count: segments.length, error: 'the journal refused the write' } })) as typeof store.hold;
       const gateway = framework as unknown as {
-        holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
+        routeSilencedHybrid(agent: unknown, segments: string[], sends: unknown, draftsCause: boolean, round: { routing: RoutingState; notice: 'later' }, locus: ChannelRef | null, when: number): Promise<boolean>;
         appendProseDeliveryReceipt(agent: unknown, routing: RoutingState): void;
       };
       const agent = framework.getAgent('assistant')!;
       const routing: RoutingState = routingState();
-      gateway.holdSilencedProse(agent, ['first words', 'second words'], 'send', false, { routing, notice: 'later' });
+      await gateway.routeSilencedHybrid(agent, ['first words', 'second words'], sendWhereUnknown, false, { routing, notice: 'later' }, null, 0);
       gateway.appendProseDeliveryReceipt(agent, routing);
       const receipt = context(framework).texts.find((t) => t.startsWith('[delivered]'))!;
       assert.ok(receipt.includes('2 plain-speech segment(s) suppressed and NOT held as drafts (the journal refused the write) — ' +
@@ -2896,7 +2898,7 @@ describe('explicit prose routing', () => {
       .proseDrafts.open('assistant').reverse();
     assert.deepEqual(drafts.map(d => [d.text, d.note, d.reason]), [
       ['wrong-locus duplicate', 'written for >>>#cafe', 'explicit-send'],
-      ['tool completed', undefined, 'explicit-send'],
+      ['tool completed', 'written for discord:g:cafe', 'explicit-send'],
     ]);
     await framework.stop();
   });

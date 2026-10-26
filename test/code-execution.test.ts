@@ -1250,6 +1250,10 @@ describe('a round whose run or wait call watches a script that can change its ro
         return { status: 'delivered', destination: { serverId: 'stub', channelId: to.channelId }, at: Date.now() };
       },
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+      publish: async (_agent: string, text: string, to: { channelId: string }) => {
+        log.push(`publish:${text}@${to.channelId}`);
+        return { status: 'delivered', destination: { serverId: 'stub', channelId: to.channelId }, at: Date.now() };
+      },
       // Each delivery hands its stream the destination its publish went to,
       // here the stub's server: a chunk for any other is logged with it, so
       // a delivery that loses its server fails the test.
@@ -1557,11 +1561,10 @@ describe('a round whose run or wait call watches a script that can change its ro
     } finally { await h.done(); }
   });
 
-  // A drafts resend is an explicit send, so it silences its round as
-  // send_message does: called from the round's script too. This one names a
-  // draft there isn't, so it's refused and sends nothing, as a direct one
-  // would be, and still counts, as a direct one does.
-  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a drafts resend inside the script keeps its round's prose private and holds the turn's later prose as drafts`, async () => {
+  // A drafts resend is an explicit send, decided by what it posted, as
+  // send_message is: called from the round's script too. This one names a
+  // draft there isn't, so it's refused and posts nothing, and holds nothing.
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a drafts resend inside the script that posts nothing leaves its round's prose and the turn's later prose free`, async () => {
     const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: 'sending the earlier reply again' },
@@ -1571,11 +1574,11 @@ describe('a round whose run or wait call watches a script that can change its ro
     ]);
     try {
       await h.run();
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
-        'the resend silences the round and what follows, as a direct resend does');
-      assert.deepStrictEqual(heldDrafts(h.framework), [
-        { text: 'done', reason: 'explicit-send' },
-      ], "the later prose is held as a draft; the drafts round's own is kept private");
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [
+        'publish:sending the earlier reply again@world:test',
+        'publish:done@world:test',
+      ]);
+      assert.deepStrictEqual(heldDrafts(h.framework), []);
     } finally { await h.done(); }
   });
 
@@ -2337,14 +2340,17 @@ describe('a round whose run or wait call watches a script that can change its ro
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'checking the drafts, then sending one' },
-        scriptCall({ code: 'try { await tools.drafts({ action: "list" }); } catch {}\ntry { await tools.drafts({ action: "resend", draftIds: ["d-0000000"], destination: "#alpha" }); } catch {}' }),
+        scriptCall({ code: 'const listed = await tools.drafts({ action: "list" });\nconst id = /d-[a-z2-9]{7}/.exec(JSON.stringify(listed))[0];\nawait tools.drafts({ action: "resend", draftIds: [id], destination: "#here" });' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
+    h.directory['#here'] = 'world:test';
+    (h.framework as unknown as { proseDrafts: { hold(agent: string, texts: Array<{ text: string }>, reason: string): unknown } })
+      .proseDrafts.hold('assistant', [{ text: 'earlier words' }], 'explicit-send');
     try {
       await h.run();
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
-        'the resend silences the round and what follows, though a call of the same tool that sends nothing came first');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:earlier words@world:test'],
+        'the resend posts where the round speaks, and silences the round and what follows, though a call of the same tool that sends nothing came first');
       assert.deepStrictEqual(heldDrafts(h.framework), [
         { text: 'done', reason: 'explicit-send' },
       ], "the later prose is held, so the resend was counted; the drafts round's own prose is kept private (#701)");
@@ -2530,7 +2536,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     return {
       asked,
       round: {
-        agent, streamId: -1, scripts: new Map<string, string[]>(), pending: new Set(pending),
+        agent, streamId: -1, scripts: new Map<string, string[]>(), pending: new Set(pending), sends: new Map(),
         route: () => { asked.push('route'); },
         withhold: (why: string) => { asked.push(`withhold: ${why}`); },
       },
