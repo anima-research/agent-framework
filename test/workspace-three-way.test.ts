@@ -8201,6 +8201,37 @@ describe('the mount root', () => {
     assert.equal(accepted.rootsAccepted, undefined, 'acceptRoot finds nothing to accept');
   });
 
+  test('a copy read as the original: a draft over a file it holds older, or lacks, is a conflict, and nothing is written over it', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await seedSynced(env, m, 'b.txt', 'B');
+    const now = rootWithBirthTime(t, env);
+    if (!now) return;
+    await call(m, 'write', { path: 'work/a.txt', content: 'A3, a draft' });
+    await call(m, 'write', { path: 'work/b.txt', content: 'B3, a draft' });
+    // What a replica made before A and B were written leaves at the path: older bytes for a.txt, no b.txt.
+    env.writeDisk('a.txt', 'A0, older');
+    env.rmDisk('b.txt');
+    m = await recordedAs(env, m, { ...now, dev: bumped(now.dev) });
+
+    await call(m, 'sync', {});
+    assert.equal(await stateOf(m, 'a.txt'), 'conflict');
+    assert.equal(await stateOf(m, 'b.txt'), 'conflict');
+    await call(m, 'materialize', {});
+    assert.equal(env.readDisk('a.txt'), 'A0, older', 'nothing was written over the older file');
+    assert.equal(existsSync(env.disk('b.txt')), false, 'nor where the copy lacks one');
+  });
+
+  test('a stat with no birth time leaves a recorded birth time as it is', (t) => {
+    const env = new Env(t);
+    const agreement = new DiskAgreement(env.store);
+    agreement.open([{ name: 'work', root: env.dir }]);
+    agreement.recordRootIdentity('work', { dev: '1', ino: '2', born: '3' });
+    agreement.recordRootIdentity('work', { dev: '1', ino: '2' });
+    assert.deepEqual(agreement.rootIdentity('work'), { dev: '1', ino: '2', born: '3' });
+  });
+
   for (const [what, recorded] of [
     ['another inode', (now: { dev: string; ino: string; born: string }) => ({ ...now, dev: bumped(now.dev), ino: bumped(now.ino) })],
     ['another birth time', (now: { dev: string; ino: string; born: string }) => ({ ...now, dev: bumped(now.dev), born: bumped(now.born) })],
