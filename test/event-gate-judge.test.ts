@@ -1124,6 +1124,17 @@ describe('the framework wires the reply judge', () => {
     assert.match(question, /<if_you_wait>\nIf you answer WAIT and nothing new arrives, scout is next woken by:\n- in 10 min: its own skip_reply timer\n<\/if_you_wait>/);
   });
 
+  it("tells the judge the framework's own upcoming wakes, such as one already queued", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: a wake is already queued' }]));
+    (framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests.push({ agentName: 'scout', reason: 'a queued test wake' });
+    eventGate.evaluate(chat('anyone?'));
+    await until(() => membrane.calls.length >= 1, 'the judge called the membrane');
+    const question = (membrane.calls[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.match(question, /scout is next woken by:\n- [^\n]*: a wake already queued \(a queued test wake\)\n/);
+  });
+
   it('enabled: false leaves the judge unwired, and judge rules run as debounces', async (t) => {
     const { membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { enabled: false } });
     assert.ok(eventGate.getStatus().errors.some((e) => e.includes('wires no reply judge')));
