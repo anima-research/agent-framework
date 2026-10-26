@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
@@ -275,6 +275,37 @@ function xmlMode(inner: MockMembrane): MockMembrane {
   (inner as unknown as { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream }).streamYielding =
     (request, options) => new XmlModeStream(streamYielding(request, options));
   return inner;
+}
+
+/**
+ * The next stream yields its round's tool-calls and then completes at once,
+ * its calls unanswered: a stream that ends while the framework still waits
+ * for tools.
+ */
+function completeWhileWaiting(membrane: MockMembrane, response: NormalizedResponse): void {
+  const streamYielding = membrane.streamYielding.bind(membrane);
+  let used = false;
+  (membrane as unknown as { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream }).streamYielding = (request, options) => {
+    const inner = streamYielding(request, options);
+    if (used) return inner;
+    used = true;
+    return {
+      provideToolResults: (...args: Parameters<YieldingStream['provideToolResults']>) => inner.provideToolResults(...args),
+      cancel: () => inner.cancel(),
+      get isWaitingForTools() { return inner.isWaitingForTools; },
+      get pendingToolCallIds() { return inner.pendingToolCallIds; },
+      get toolDepth() { return inner.toolDepth; },
+      async *[Symbol.asyncIterator]() {
+        for await (const event of inner) {
+          yield event;
+          if (event.type === 'tool-calls') {
+            yield { type: 'complete', response } as StreamEvent;
+            return;
+          }
+        }
+      },
+    } as YieldingStream;
+  };
 }
 
 async function harness(opts: {
@@ -2870,7 +2901,7 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.turn([createMockResponse([text(LINE), send('s1', GENERAL)], 'tool_use'), createMockResponse([])]);
         assert.deepEqual(inRoom(h), []);
         assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
-        assert.match(notices(h)[0]!, /its answer named no channel/);
+        assert.match(notices(h)[0]!, /can't tell where your send_message in this round posted \(its answer named no channel the framework reads\)/);
       } finally {
         await h.close();
       }
@@ -3008,6 +3039,25 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       }
     });
 
+    it(`${mode}: a round whose script returned, its send still out when its stream ends, holds its line`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true, codeExecution: true });
+      try {
+        await h.sendMode('hang');
+        const publish = `await tools.channel_publish({ channelId: ${JSON.stringify(GENERAL)}, content: "x" });`;
+        h.membrane.pushResponse(createMockResponse([text(LINE), script('ce1', publish), send('s1', GENERAL)], 'tool_use'));
+        h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-script', mode: 'addressed', text: 'hello' });
+        const agent = h.framework.getAgent('scout')!;
+        await h.until(() => h.sends().length === 1 && agent.getPendingToolIds().join() === 's1', 'the script returned, the send out');
+        assert.ok(h.framework.abortInference('scout'));
+        await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
+        await h.framework.runUntilIdle();
+        assert.deepEqual(inRoom(h), []);
+        assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
+      } finally {
+        await h.close();
+      }
+    });
+
     it(`${mode}: a round whose stream ends before its send answers holds its line`, async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true });
       try {
@@ -3070,6 +3120,22 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       assert.deepEqual(held(h).map(([, reason]) => reason), ['bounced']);
     } finally {
       await h.close();
+    }
+  });
+
+  it("XML tool mode: a stream that completes while a round's send is still out holds the turn's speech to that place", async () => {
+    const publish = `await tools.channel_publish({ channelId: ${JSON.stringify(GENERAL)}, content: "x" });`;
+    for (const round of [[text(LINE), send('s1', ROOM)], [text(LINE), script('ce1', publish), send('s1', ROOM)]]) {
+      const h = await harness({ xml: true, sendTool: true, codeExecution: true });
+      try {
+        await h.sendMode('hang');
+        completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] });
+        await h.turn([createMockResponse(round, 'tool_use')]);
+        assert.deepEqual(inRoom(h), []);
+        assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
+      } finally {
+        await h.close();
+      }
     }
   });
 

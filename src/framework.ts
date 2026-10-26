@@ -1488,6 +1488,8 @@ interface ScriptRound {
   /** Those calls whose results haven't arrived. */
   pending: Set<string>;
   sends: Map<string, SendReach | undefined>;
+  /** Called when the last of the round's awaited scripts has returned and only its sends remain. */
+  scriptsReturned?: () => void;
   /** Routes the round's prose; called once, when its last awaited result arrives. */
   route: () => void;
   /**
@@ -1498,9 +1500,11 @@ interface ScriptRound {
    * keep its prose private, so it is neither sent nor held as a draft. A log
    * line names it, and in locus and hybrid mode the turn's delivery receipt
    * counts its segments as suppressed: a turn that a later stream continues
-   * writes its receipt after the withhold. A round that waits only on its
-   * sends is routed instead, a send that hasn't answered counting as one
-   * that may have posted anywhere.
+   * writes its receipt after the withhold. Its sends still count for the
+   * turn's later speech. A round whose routing no longer waits on a script,
+   * one that waits only on its sends or whose scripts returned while its
+   * turn waited, is routed instead, a send that hasn't answered counting as
+   * one that may have posted anywhere.
    */
   withhold: (why: string) => void;
 }
@@ -16143,7 +16147,7 @@ export class AgentFramework {
     const why = hold.why === 'error'
       ? 'it answered with an error'
       : hold.why === 'no-channel'
-        ? 'its answer named no channel'
+        ? 'its answer named no channel the framework reads'
         : hold.why === 'unresolved'
           ? "its answer named a channel the framework couldn't match to one it knows"
           : "it hadn't answered when this speech was routed";
@@ -20945,25 +20949,30 @@ export class AgentFramework {
                 ...roundCalls.map((c, i) => (sends.has(calls[i]!.id) ? { ...c, reach: sends.get(calls[i]!.id) } : c)),
                 ...[...round.scripts.values()].flat(),
               ];
+              const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
+                && agent.state.status === 'waiting_for_tools';
+              let decidable = scriptCallIds.length === 0;
               const round: ScriptRound = {
                 agent,
                 streamId: myStreamId,
                 scripts: new Map(calls.filter((c) => c.name === CODE_EXECUTION_TOOL_NAME).map((c) => [c.id, []])),
                 pending: new Set([...scriptCallIds, ...sendCallIds]),
                 sends,
+                scriptsReturned: () => {
+                  if (waits()) decidable = true;
+                },
                 route: () => {
                   // Only while this stream still owns the agent and waits on
                   // the round: a turn replaced, reset or cancelled meanwhile
                   // can't finish deciding it.
-                  if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId
-                    || agent.state.status !== 'waiting_for_tools') {
+                  if (!waits()) {
                     round.withhold(`its turn no longer waits on it (replaced, reset or stopped) while its ${scriptCallIds.length > 0 ? 'scripts' : 'sends'} ran`);
                     return;
                   }
                   routeRound(answered());
                 },
                 withhold: (why) => {
-                  if (scriptCallIds.length === 0) {
+                  if (decidable) {
                     console.error(
                       `[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> decided early (${why}); ` +
                       `${round.pending.size} unanswered send(s) count as ones that may have posted anywhere`,
@@ -20971,6 +20980,9 @@ export class AgentFramework {
                     routeRound(answered());
                     return;
                   }
+                  const reached = sendsOf(answered(), toolRound);
+                  silence = mergeSilence(silence, reached);
+                  turnSends = mergeSends(turnSends, reached);
                   if (roundSegments.length === 0) return;
                   console.error(
                     `[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) withheld: ${why}`,
@@ -21119,6 +21131,7 @@ export class AgentFramework {
                 `[framework] 'complete' event fired while agent '${agent.name}' is still waiting_for_tools. ` +
                 `Injecting error results for ${agent.getPendingToolIds().length} pending tool(s).`
               );
+              this.decideWaitingRound(agent, myStreamId, 'its stream completed before its calls answered');
               // Inject error results for all remaining pending tools
               for (const pendingId of agent.getPendingToolIds()) {
                 agent.provideToolResult(pendingId, {
@@ -22318,13 +22331,10 @@ export class AgentFramework {
       // A round of this stream still waiting for its code_execution calls
       // can't be routed now: whether its scripts would have silenced it is
       // unknown, so its prose is withheld, as text whose routing is
-      // undecided is. One waiting only on its sends is routed, each
+      // undecided is. One left waiting only on its sends, with no script or
+      // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
-      const unsettled = this.scriptRounds.get(agent.name);
-      if (unsettled?.agent === agent && unsettled.streamId === myStreamId) {
-        this.scriptRounds.delete(agent.name);
-        unsettled.withhold('its stream ended before its scripts returned');
-      }
+      this.decideWaitingRound(agent, myStreamId, 'its stream ended before its scripts returned');
 
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to (completeOutgoing). Every exit path does,
@@ -22888,6 +22898,13 @@ export class AgentFramework {
       });
   }
 
+  private decideWaitingRound(agent: Agent, streamId: number, why: string): void {
+    const waiting = this.scriptRounds.get(agent.name);
+    if (waiting?.agent !== agent || waiting.streamId !== streamId) return;
+    this.scriptRounds.delete(agent.name);
+    waiting.withhold(why);
+  }
+
   /**
    * A model-issued tool's result has arrived. When it answers the last of
    * the code_execution calls and sends a round waits on (ScriptRound), the
@@ -22901,7 +22918,9 @@ export class AgentFramework {
     } else if (this.scriptRoundOfResult.get(result) !== round) {
       return;
     }
-    if (!round.pending.delete(callId) || round.pending.size > 0) return;
+    if (!round.pending.delete(callId)) return;
+    if (!round.sends.has(callId) && [...round.pending].every((id) => round.sends.has(id))) round.scriptsReturned?.();
+    if (round.pending.size > 0) return;
     this.scriptRounds.delete(agentName);
     round.route();
   }
