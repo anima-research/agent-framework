@@ -214,8 +214,12 @@ interface JudgingState {
   abort: AbortController;
   /** The judge's time limit, cleared once it's decided or the gate disposed. */
   timer?: ReturnType<typeof setTimeout>;
-  /** The turn count (turnEpoch) when the judge began reading the context. */
-  epoch: number;
+  /** The agents the batch would wake, with each one's turn count
+   *  (turnEpochs) when the judge began reading the context. */
+  epochs: Map<string, number>;
+  /** Whether this is the batch's one re-judgment after a turn (finishJudging):
+   *  its reply wakes the agent whatever ran meanwhile. */
+  rejudge: boolean;
   /** Batches of the same rule that fired meanwhile, judged once this one is
    *  decided: delivered with it on reply, judged afresh on wait. */
   queued: PendingEvent[];
@@ -223,7 +227,7 @@ interface JudgingState {
 
 /** A rule's verdict counts and newest verdict (gate_status judgeState). */
 interface JudgeRecord {
-  verdicts: { reply: number; wait: number; error: number };
+  verdicts: { reply: number; wait: number; error: number; rejudged: number };
   last?: NonNullable<GatePolicyStats['judgeState']>['last'];
 }
 
@@ -2002,12 +2006,12 @@ export class EventGate {
   /** Per rule, a batch that fired while an agent's turn ran or the host was
    *  quiesced, held to be judged once both are clear: the judge reads the
    *  context the turn leaves, which may already answer it. */
-  private judgeHeld = new Map<string, { events: PendingEvent[]; judge: JudgeConfig }>();
+  private judgeHeld = new Map<string, { events: PendingEvent[]; judge: JudgeConfig; rejudge: boolean }>();
   private judgeRecords = new Map<string, JudgeRecord>();
-  /** Turns started or resumed so far: a verdict reached while one ran (the
-   *  count moved) was reached on a context that turn has changed, so its
-   *  batch is judged again once it ends. */
-  private turnEpoch = 0;
+  /** Turns started or resumed so far, per agent: a reply reached while one of
+   *  the batch's agents had a turn (its count moved) was reached on a context
+   *  that turn has changed, so the batch is judged again once it ends. */
+  private turnEpochs = new Map<string, number>();
   /** Lifetime count of events dropped from batches waiting on the judge, at
    *  the inference buffer's cap (MAX_INFERENCE_BUFFER per rule). */
   private droppedJudgeEvents = 0;
@@ -3712,16 +3716,16 @@ export class EventGate {
    * rule's batches, a later one waits for that verdict (finishJudging), so the
    * judge never decides two of a rule's batches at once.
    */
-  private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
+  private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig, rejudge = false): void {
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
     if (deciding) {
       deciding.queued.push(...events);
-      this.capJudgeEvents(deciding.queued, deciding.events.length);
+      this.capJudgeEvents(deciding.queued);
       return;
     }
     if (this.inferring.size > 0 || this.quiesced) {
-      this.holdForJudge(policyName, events, judge);
+      this.holdForJudge(policyName, events, judge, rejudge);
       return;
     }
     const fn = this.judgeFn;
@@ -3730,7 +3734,11 @@ export class EventGate {
       return;
     }
     const abort = new AbortController();
-    const state: JudgingState = { events, judge, started: Date.now(), abort, epoch: this.turnEpoch, queued: [] };
+    const agentNames = this.getAgentNamesFn();
+    const state: JudgingState = {
+      events, judge, started: Date.now(), abort, queued: [], rejudge,
+      epochs: new Map(agentNames.map((name) => [name, this.turnEpochs.get(name) ?? 0])),
+    };
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
@@ -3746,7 +3754,7 @@ export class EventGate {
         policyName,
         ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
         events: events.map((e) => this.judgeEventSummary(e)),
-        agentNames: this.getAgentNamesFn(),
+        agentNames,
         signal: abort.signal,
       });
     } catch (err) {
@@ -3764,16 +3772,18 @@ export class EventGate {
 
   /** Hold a batch for the judge until no turn runs and the host isn't
    *  quiesced, merged with what the rule already holds. */
-  private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
+  private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig, rejudge = false): void {
     const held = this.judgeHeld.get(policyName);
     if (held) {
       held.events.push(...events);
       held.judge = judge;
+      // A re-judgment stays one: what joins it waits for that one verdict.
+      held.rejudge = held.rejudge || rejudge;
       this.capJudgeEvents(held.events);
     } else {
       const fresh = [...events];
       this.capJudgeEvents(fresh);
-      this.judgeHeld.set(policyName, { events: fresh, judge });
+      this.judgeHeld.set(policyName, { events: fresh, judge, rejudge });
     }
   }
 
@@ -3781,14 +3791,13 @@ export class EventGate {
    * Keep a rule's events waiting on the judge to the inference buffer's cap,
    * dropping the oldest, counted and logged as bufferForInference counts its
    * drops: a turn that never ends (the wake-wedge) or a long quiesce on a busy
-   * channel would otherwise grow them without bound. `alongside` is the
-   * events already counted against the cap elsewhere (the batch being
-   * judged, beside its queue).
+   * channel would otherwise grow them without bound. A queue beside a batch
+   * the judge is deciding is capped on its own, so its newest events are never
+   * the ones dropped for the batch ahead of it.
    */
-  private capJudgeEvents(events: PendingEvent[], alongside = 0): void {
-    const over = events.length + alongside - MAX_INFERENCE_BUFFER;
-    if (over <= 0) return;
-    const drop = Math.min(over, events.length);
+  private capJudgeEvents(events: PendingEvent[]): void {
+    const drop = events.length - MAX_INFERENCE_BUFFER;
+    if (drop <= 0) return;
     events.splice(0, drop);
     const before = this.droppedJudgeEvents;
     this.droppedJudgeEvents += drop;
@@ -3849,11 +3858,22 @@ export class EventGate {
     const durationMs = Date.now() - state.started;
     const failed = verdict == null || typeof verdict !== 'object' || typeof verdict.reply !== 'boolean';
     const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
+    // A reply reached while one of the batch's agents had a turn, or before
+    // one that has run since, was reached on a context that turn changed (it
+    // may have answered these very messages), so the batch is judged once
+    // more after it, against what it left, rather than waking the agent
+    // unjudged. Only once: the re-judgment's reply wakes the agent whatever
+    // ran meanwhile, so turns that keep overlapping the judge can't hold a
+    // batch back for good. A failure isn't a verdict on the context, and
+    // decides by onError.
+    const turnMoved = [...state.epochs].some(([name, epoch]) => (this.turnEpochs.get(name) ?? 0) !== epoch || this.inferring.has(name));
+    const rejudging = outcome === 'reply' && !state.rejudge && (turnMoved || this.quiesced);
     const reason = failed
       ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
       : typeof verdict.reason === 'string' ? verdict.reason : '';
-    const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0 } };
+    const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, rejudged: 0 } };
     record.verdicts[outcome]++;
+    if (rejudging) record.verdicts.rejudged++;
     record.last = {
       at: Date.now(),
       verdict: outcome,
@@ -3869,7 +3889,7 @@ export class EventGate {
     } else {
       this.judgeFailStreak = 0;
     }
-    const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
+    const wake = !rejudging && (outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake'));
     if (failed) {
       console.error(
         `[gate] Policy "${policyName}": the reply judge failed (${reason}), so its batch of ${state.events.length} `
@@ -3881,6 +3901,7 @@ export class EventGate {
       policyName,
       verdict: outcome,
       woke: wake,
+      ...(rejudging ? { rejudged: true } : {}),
       reason: safeSlice(reason, 0, 300),
       eventCount: state.events.length,
       durationMs,
@@ -3892,14 +3913,8 @@ export class EventGate {
     });
     if (this.disposed) return;
     const judge = this.currentJudge(policyName, state.judge);
-    // A verdict to wake that was reached while a turn ran, or started before
-    // one that has run since, was reached on a context that turn changed (it
-    // may have answered these very messages): the batch is judged again once
-    // the turn ends, against what it left, rather than waking the agent after
-    // it unjudged. A failure isn't a verdict on the context, and wakes as
-    // onError says.
-    if (outcome === 'reply' && (this.turnEpoch !== state.epoch || this.inferring.size > 0 || this.quiesced)) {
-      this.holdForJudge(policyName, [...state.events, ...state.queued], judge);
+    if (rejudging) {
+      this.holdForJudge(policyName, [...state.events, ...state.queued], judge, true);
       this.flushJudgeHeldIfClear();
       return;
     }
@@ -3938,7 +3953,7 @@ export class EventGate {
     // Deferred, as the inference buffer's flush is, to stay out of the
     // turn-end callback that called this.
     queueMicrotask(() => {
-      for (const [policyName, { events, judge }] of held) this.judgeBatch(policyName, events, judge);
+      for (const [policyName, { events, judge, rejudge }] of held) this.judgeBatch(policyName, events, judge, rejudge);
     });
   }
 
@@ -3948,7 +3963,7 @@ export class EventGate {
 
   onInferenceStarted(agentName: string): void {
     this.inferring.add(agentName);
-    this.turnEpoch++;
+    this.turnEpochs.set(agentName, (this.turnEpochs.get(agentName) ?? 0) + 1);
     // A turn is starting — whatever caused it supersedes any pending
     // self-wake. (Arming happens MID-turn via skip_reply, i.e. after this
     // ran for the arming turn, so a fresh arm always survives its own turn.)
@@ -3968,7 +3983,7 @@ export class EventGate {
    *  still running. */
   onInferenceResumed(agentName: string): void {
     this.inferring.add(agentName);
-    this.turnEpoch++;
+    this.turnEpochs.set(agentName, (this.turnEpochs.get(agentName) ?? 0) + 1);
   }
 
   onInferenceEnded(agentName: string): void {
@@ -3997,7 +4012,7 @@ export class EventGate {
         this.judging.delete(policyName);
         if (state.timer) clearTimeout(state.timer);
         state.abort.abort();
-        this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge);
+        this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge, state.rejudge);
       }
     } else {
       this.flushInferenceBufferIfClear();
@@ -4407,7 +4422,7 @@ export class EventGate {
           pendingCount: debounce?.events.length ?? 0,
           judging: this.judging.has(p.name),
           heldCount: this.judgeHeld.get(p.name)?.events.length ?? 0,
-          verdicts: { ...(record?.verdicts ?? { reply: 0, wait: 0, error: 0 }) },
+          verdicts: { ...(record?.verdicts ?? { reply: 0, wait: 0, error: 0, rejudged: 0 }) },
           ...(record?.last ? { last: { ...record.last } } : {}),
         };
       }

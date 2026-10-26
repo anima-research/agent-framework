@@ -476,11 +476,14 @@ export type TraceEvent =
       /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
        *  `reply` or `wait` as the judge answered, `error` when it failed,
        *  timed out or answered nothing usable; `woke` is whether the batch
-       *  then woke the agent (an error does by the host's onError). */
+       *  then woke the agent (an error does by the host's onError).
+       *  `rejudged`: a reply reached across one of the batch's agents' turns,
+       *  so the batch is judged once more after it instead of waking then. */
       type: 'gate:judge-verdict';
       policyName: string;
       verdict: 'reply' | 'wait' | 'error';
       woke: boolean;
+      rejudged?: boolean;
       reason: string;
       eventCount: number;
       durationMs: number;

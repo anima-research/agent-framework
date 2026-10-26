@@ -266,6 +266,25 @@ describe('reply judge: the document', () => {
     assert.strictEqual(requests.length, 0);
   });
 
+  it('reads a budget under the minimum at the minimum, saying so, rather than at the default', async () => {
+    const { membrane } = fakeMembrane('WAIT: x', 3);
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.join(' ')); };
+    let verdict;
+    try {
+      const judge = new ReplyJudge({
+        membraneFor: () => membrane, options: { maxInputTokens: 5_000 }, chooseAgent: (n) => n[0],
+        preview: async () => ({ messages: conversation(2_000, 600), config: { model: 'x', maxTokens: 1 } }),
+      });
+      verdict = await judge.judge(judgeRequest());
+    } finally {
+      console.error = original;
+    }
+    assert.ok(errors.some((e) => e.includes('maxInputTokens is 5000, under the 8000 minimum')));
+    assert.ok(verdict!.inputTokens! <= 8_000, String(verdict!.inputTokens));
+  });
+
   it('reads the primary agent its chooser names', async () => {
     const { membrane } = fakeMembrane();
     const asked: string[] = [];

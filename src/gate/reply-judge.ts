@@ -33,6 +33,8 @@ import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudge
 export const DEFAULT_JUDGE_MODEL = 'claude-haiku-5-5';
 /** The judge's input budget when the host names none: under Haiku 5.5's 100K price line, with margin. */
 export const DEFAULT_JUDGE_MAX_INPUT_TOKENS = 90_000;
+/** The smallest input budget the judge takes: its instructions, the batch and a little context. */
+export const MIN_JUDGE_INPUT_TOKENS = 8_000;
 
 /** Characters per token the judge assumes before any response has told it better. Low, so a first estimate overshoots. */
 const INITIAL_CHARS_PER_TOKEN = 3;
@@ -252,7 +254,19 @@ export class ReplyJudge {
     this.cacheTtl = deps.options?.cacheTtl === '1h' ? '1h' : '5m';
     this.model = deps.options?.model || DEFAULT_JUDGE_MODEL;
     const max = deps.options?.maxInputTokens;
-    this.maxInputTokens = typeof max === 'number' && Number.isFinite(max) && max >= 8_000 ? max : DEFAULT_JUDGE_MAX_INPUT_TOKENS;
+    if (max === undefined) {
+      this.maxInputTokens = DEFAULT_JUDGE_MAX_INPUT_TOKENS;
+    } else if (typeof max !== 'number' || !Number.isFinite(max)) {
+      this.maxInputTokens = DEFAULT_JUDGE_MAX_INPUT_TOKENS;
+      console.error(`[gate] the reply judge's maxInputTokens isn't a number, so it's read as ${DEFAULT_JUDGE_MAX_INPUT_TOKENS}`);
+    } else if (max < MIN_JUDGE_INPUT_TOKENS) {
+      // At its nearest bound, as the gate reads a value out of range: a small
+      // budget set to save money stays small.
+      this.maxInputTokens = MIN_JUDGE_INPUT_TOKENS;
+      console.error(`[gate] the reply judge's maxInputTokens is ${max}, under the ${MIN_JUDGE_INPUT_TOKENS} minimum, so it's read as ${MIN_JUDGE_INPUT_TOKENS}`);
+    } else {
+      this.maxInputTokens = Math.floor(max);
+    }
     this.effort = deps.options?.effort ?? 'low';
     this.chooseAgent = deps.chooseAgent;
     this.preview = deps.preview;
