@@ -195,10 +195,8 @@ export function canonicalJson(value: unknown): string {
 
 /**
  * blockAsStored throws a `MalformedContentError` for a block the store
- * refuses on write, a caller-supplied `blob_ref` among them. Its name, not
- * its class, marks it, since a host can hold a second copy of
- * context-manager. Such a block has no stored form, and whatever is thrown,
- * it is digested as given.
+ * refuses on write, a caller-supplied `blob_ref` among them. Such a block
+ * has no stored form, and whatever is thrown, it is digested as given.
  */
 function storedBlock(block: unknown): unknown {
   try {

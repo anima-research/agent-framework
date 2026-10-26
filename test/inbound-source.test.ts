@@ -796,17 +796,20 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     }
   });
 
-  it('a body the store refuses still has a digest, and nothing is logged for it', (t) => {
+  it('a body the store refuses is digested as given, and nothing is logged for it', (t) => {
     const logged: string[] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    const document = { type: 'document', title: 'a.pdf', source: { type: 'base64', data: 'JVBERi0xLjQ=' } };
     for (const block of [
-      { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } },
+      document,
       { type: 'image', source: { type: 'base64', data: Buffer.from('<svg/>').toString('base64') } },
       { type: 'blob_ref', blobKind: 'image', hash: 'deadbeef', mediaType: 'image/png' },
     ]) {
       assert.throws(() => blockAsStored(block as never), MalformedContentError, `${block.type}: the store refuses it`);
       assert.match(sourceBodyDigest([block]), /^[0-9a-f]{64}$/, `${block.type}: it has a digest`);
     }
+    const untitled = { type: document.type, source: document.source };
+    assert.notEqual(sourceBodyDigest([document]), sourceBodyDigest([untitled]), 'every field of a refused body counts');
     assert.deepEqual(logged, []);
   });
 
