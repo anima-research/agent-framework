@@ -1699,7 +1699,7 @@ describe('conversation forks and an undo', () => {
       }
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /couldn't be seeded again, so it was unregistered and its channel unbound, but its cleanup failed \(below\)\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The write held for it while the store was held may be in its window, where no agent reads it, still queued under its name, or in neither, as far as that cleanup got\. A flush that meets one still queued passes it on to the primary agent if it's a failed reply, a channel notice the fork could have acted on, or a module write for it, and drops anything else, logged\. .*It couldn't be seeded because its seeding from the template failed: .*injected seed failure\. Its cleanup failed: .*injected release failure\.$/);
+      assert.match(reinit[0]!.message, /couldn't be seeded again, so it was unregistered and its channel unbound, but its cleanup failed \(below\)\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The write held for it while the store was held may be in its window, where no agent reads it, still queued under its name, or in neither, as far as that cleanup got\. A flush that meets one still queued passes it on to the primary agent if it's a failed reply, a channel notice whose channel decision still stands, or a module write for it, and drops anything else, logged\. .*It couldn't be seeded because its seeding from the template failed: .*injected seed failure\. Its cleanup failed: .*injected release failure\.$/);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is unregistered');
       assert.equal(router.getBinding({ serverId: 'world', channelId: 'world:late' }), undefined, 'its channel is unbound');
@@ -2148,7 +2148,7 @@ describe('conversation forks and an undo', () => {
       assert.deepEqual(storedTexts(late), ['FIRST DURING THE UNDO', 'SECOND DURING THE UNDO'], 'the held writes are in its window');
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /so it was disposed and its channel unbound\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The 2 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release stored what its store took of them there and passed on to the primary agent each failed reply, channel notice the fork could have acted on, or module write for it\. Its messages stay on the branches/);
+      assert.match(reinit[0]!.message, /so it was disposed and its channel unbound\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The 2 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release stored what its store took of them there and passed on to the primary agent each failed reply, channel notice whose channel decision still stands, or module write for it\. Its messages stay on the branches/);
     });
   });
 
@@ -2299,7 +2299,7 @@ describe('conversation forks and an undo', () => {
         }
         const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
         assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-        assert.match(reinit[0]!.message, / The 5 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release was postponed to the host's resume, which stores what its store takes of them there and passes on to the primary agent each failed reply, channel notice the fork could have acted on, or module write for it\. A stop\(\) before the resume drops the rest, logged, and those go to the primary at the restarted host's resume; after a crash, that resume does the same\. Its messages stay on the branches/);
+        assert.match(reinit[0]!.message, / The 5 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release was postponed to the host's resume, which stores what its store takes of them there and passes on to the primary agent each failed reply, channel notice whose channel decision still stands, or module write for it\. A stop\(\) before the resume drops the rest, logged, and those go to the primary at the restarted host's resume; after a crash, that resume does the same\. Its messages stay on the branches/);
         if (after === 'cleanup') {
           assert.match(reinit[0]!.message, /, but its cleanup failed \(below\)\. /);
           assert.match(reinit[0]!.message, / Its cleanup failed: .*injected checkpoint eviction failure\.$/);
