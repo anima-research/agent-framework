@@ -7048,24 +7048,40 @@ describe('grep, when the branch or the store changes under it', () => {
     assert.match(JSON.stringify(data.incomplete), /the selected branch kept changing while grep ran/);
   });
 
-  test("a version missing from the store is listed as not searched, not taken for no match", async (t) => {
+  async function conflictWithBothVersionsLost(t: TestContext): Promise<{ env: Env; m: WorkspaceModule }> {
     const env = new Env(t);
-    const m = await env.open();
+    let m = await env.open();
     await seedSynced(env, m, 'conflict.txt', 'nothing');
     env.writeDisk('conflict.txt', 'needle on disk');
     await call(m, 'write', { path: 'work/conflict.txt', content: 'needle in the workspace' });
     const listed = (await call(m, 'ls', { path: 'work' })).entries.find((e: { name: string }) => e.name === 'conflict.txt');
     assert.equal(listed?.conflict?.diskCopy, 'stored');
-    // Both stored versions go missing.
-    const store = env.store as unknown as { getBlob: (hash: string) => Buffer | null };
-    const getBlob = store.getBlob.bind(env.store);
-    const gone = new Set([sha('needle on disk'), sha('needle in the workspace')]);
-    store.getBlob = (hash: string) => (gone.has(hash) ? null : getBlob(hash));
+    await env.shutdown(m);
+    for (const text of ['needle on disk', 'needle in the workspace']) rmSync(join(env.storePath, 'blobs', sha(text).slice(0, 2), sha(text)));
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open();
+    return { env, m };
+  }
+
+  test("a conflict's disk version missing from the store is searched from disk while disk still holds it", async (t) => {
+    const { m } = await conflictWithBothVersionsLost(t);
+    const data = await call(m, 'grep', { pattern: 'needle' });
+    assert.deepEqual(data.results.map((r: { file: string; version: string; matches: Array<{ text: string }> }) => [r.file, r.version, r.matches.map((x) => x.text)]),
+      [['work/conflict.txt', 'conflicting-disk', ['needle on disk']]]);
+    assert.deepEqual(data.skipped, [
+      { file: 'work/conflict.txt', reason: "the workspace's copy is missing from the store, and disk's copy holds other contents, so it was not searched" },
+    ]);
+  });
+
+  test("a version missing from the store that disk can't restore is listed as not searched, not taken for no match", async (t) => {
+    const { env, m } = await conflictWithBothVersionsLost(t);
+    env.rmDisk('conflict.txt');
     const data = await call(m, 'grep', { pattern: 'needle' });
     assert.deepEqual(data.results, []);
-    const reasons = (data.skipped ?? []).map((x: { reason: string }) => x.reason).join('\n');
-    assert.match(reasons, /the workspace copy is missing from the store/);
-    assert.match(reasons, /the disk version recorded with the conflict is missing from the store/);
+    assert.deepEqual((data.skipped ?? []).map((x: { reason: string }) => x.reason), [
+      "the workspace's copy is missing from the store, and disk has no copy, so it was not searched",
+      'conflict: the disk version recorded with the conflict is missing from the store, and disk has no copy, so it was not searched',
+    ]);
   });
 });
 

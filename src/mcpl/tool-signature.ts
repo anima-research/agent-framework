@@ -1,10 +1,10 @@
 /**
  * How a dynamic tool reads to a model when it reaches the conversation
  * instead of the tool list (MCPL RFC-014 §8.3): a compact signature, its
- * first sentence the first time a definition is shown, the whole definition
- * on request. Also the host's own argument check against a tool's current
- * definition (RFC-014 §6.1: "the host checks arguments for that instance
- * against it").
+ * first sentence the first time a definition is shown, and on request its
+ * description, input schema and class. Also the host's own argument check
+ * against a tool's current definition (RFC-014 §6.1: "the host checks
+ * arguments for that instance against it").
  *
  * Ported from mcpl-cc-bridge's tool-render.ts and schema-check.ts, the
  * reference host of RFC-014. Dependency-free.
@@ -24,11 +24,25 @@ export interface HintedTool {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** How deep a server's value may nest and still be written out, the same on every runtime. */
+const DEEPEST = 64;
+
+function nestsWithin(value: unknown, depth = 0): boolean {
+  if (value === null || typeof value !== 'object') return true;
+  return depth <= DEEPEST && Object.values(value).every((v) => nestsWithin(v, depth + 1));
+}
+
+/** A schema's literal value (an enum's, a const or a default) as JSON, or … where it's nested too deeply to write. */
+function literal(value: unknown): string {
+  return nestsWithin(value) ? JSON.stringify(value) ?? 'null' : '…';
+}
+
 function typeSig(schema: JsonSchema | undefined, depth = 0): string {
   if (!schema || typeof schema !== 'object') return 'any';
+  if (depth > 8) return '…';
   if (Array.isArray(schema.enum)) {
     // The enum is often the menu (a decision's options): all of it unless it is long.
-    const vals = (schema.enum as unknown[]).map((v) => JSON.stringify(v));
+    const vals = (schema.enum as unknown[]).map(literal);
     if (vals.length <= 8 || vals.join('|').length <= 400) return vals.join('|');
     let shown = 0;
     let len = 0;
@@ -38,10 +52,12 @@ function typeSig(schema: JsonSchema | undefined, depth = 0): string {
     }
     return `${vals.slice(0, Math.max(shown, 4)).join('|')}|…(${vals.length} in all)`;
   }
-  if (schema.const !== undefined) return JSON.stringify(schema.const);
+  if (schema.const !== undefined) return literal(schema.const);
   const alts = (schema.oneOf ?? schema.anyOf) as JsonSchema[] | undefined;
   if (Array.isArray(alts)) return alts.map((s) => typeSig(s, depth + 1)).join(' | ');
-  const t = Array.isArray(schema.type) ? (schema.type as string[]).join('|') : (schema.type as string | undefined);
+  // Only text names a type: entries that aren't text are left out, and a type with none reads as no type.
+  const types = (Array.isArray(schema.type) ? schema.type : [schema.type]).filter((x): x is string => typeof x === 'string');
+  const t = types.length ? types.join('|') : undefined;
   switch (t) {
     case 'integer':
     case 'number': {
@@ -81,7 +97,7 @@ export function signature(tool: HintedTool): string {
   const props = (isObj(s.properties) ? s.properties : {}) as Record<string, JsonSchema>;
   const req = new Set(Array.isArray(s.required) ? (s.required as string[]) : []);
   const params = Object.entries(props).map(([k, v]) => {
-    const def = isObj(v) && v.default !== undefined ? ` =${JSON.stringify(v.default)}` : '';
+    const def = isObj(v) && v.default !== undefined ? ` =${literal(v.default)}` : '';
     return `${k}${req.has(k) ? '' : '?'}: ${typeSig(v, 1)}${def}`;
   });
   return `${tool.name}(${params.join(', ')})`;
@@ -94,22 +110,23 @@ export function objectSignature(schema: unknown): string {
 }
 
 /** First sentence of a description, bounded. */
-export function firstSentence(text: string | undefined, max = 140): string {
-  const t = (text ?? '').trim().replace(/\s+/g, ' ');
+export function firstSentence(text: unknown, max = 140): string {
+  const t = (typeof text === 'string' ? text : '').trim().replace(/\s+/g, ' ');
   // A sentence ends at . ! ? followed by a capital, a bracket, or the end, so "e.g. \"D4\"" does not end it.
   const m = t.match(/^(.+?[.!?])(?=\s+[A-Z([]|$)/);
-  const s = m ? m[1]! : t;
-  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+  const s = [...(m ? m[1]! : t)];
+  return s.length > max ? s.slice(0, max - 1).join('') + '…' : s.join('');
 }
 
-function canonicalJson(value: unknown): string {
+function canonicalJson(value: unknown, depth = 0): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (depth > DEEPEST) return '"…"';
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v, depth + 1)).join(',')}]`;
   const obj = value as Record<string, unknown>;
   return `{${Object.keys(obj)
     .sort()
     .filter((k) => obj[k] !== undefined)
-    .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`)
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k], depth + 1)}`)
     .join(',')}}`;
 }
 
@@ -121,12 +138,15 @@ export function toolDigest(tool: HintedTool): string {
     .slice(0, 22);
 }
 
+/** The definitions a model has been shown, by digest: has and add are all rendering needs. */
+export type Shown = { has(digest: string): boolean; add(digest: string): void };
+
 /**
  * Tool lines as the model reads them. A definition the model has been shown
  * gets its signature only; a new or changed one also gets its first
  * sentence. `shown` is updated.
  */
-export function renderToolLines(tools: HintedTool[], shown: Set<string>, opts: { describeAll?: boolean; indent?: string } = {}): string[] {
+export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { describeAll?: boolean; indent?: string } = {}): string[] {
   const indent = opts.indent ?? '  ';
   return tools.map((t) => {
     const d = toolDigest(t);
@@ -137,15 +157,26 @@ export function renderToolLines(tools: HintedTool[], shown: Set<string>, opts: {
   });
 }
 
-/** The whole definition, for `look` naming a tool. */
+/** A server's value as JSON, or a note where it's nested too deeply, or too long, to show. */
+export function jsonText(value: unknown, space?: number): string {
+  if (!nestsWithin(value)) return '(nested too deeply to show)';
+  try {
+    return JSON.stringify(value, null, space) ?? '';
+  } catch {
+    return '(too long to show)';
+  }
+}
+
+/** A tool's signature, description, class and input schema, for `look` naming a tool. */
 export function renderToolDefinition(tool: HintedTool): string {
   const cls = tool._meta?.['mcpl/class'];
+  const classes = Array.isArray(cls) ? cls.filter((c): c is string => typeof c === 'string') : [];
   return [
     signature(tool),
-    tool.description ?? '',
-    ...(Array.isArray(cls) ? [`class: ${cls.join(', ')}`] : []),
+    typeof tool.description === 'string' ? tool.description : '',
+    ...(classes.length ? [`class: ${classes.join(', ')}`] : []),
     'inputSchema:',
-    JSON.stringify(tool.inputSchema ?? {}, null, 2),
+    jsonText(tool.inputSchema ?? {}, 2),
   ]
     .filter((l) => l !== '')
     .join('\n');

@@ -260,11 +260,19 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it('a context-budget restart keeps the channel for routing but names no author', async () => {
+  it('a context-budget restart batched with an addressed wake starts alone, naming no author, and the wake then starts a turn of its own', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continuing' }]));
     const framework = await makeFramework();
     const i = internals(framework);
-    const captured = spy(framework);
+    const handed: Array<InferenceRequest | undefined> = [];
+    const orig = i.startAgentStream.bind(framework);
+    i.startAgentStream = async (agent: unknown, trigger?: InferenceRequest) => {
+      handed.push(trigger);
+      // The mock hands a stream every response queued when it's made, so the
+      // second turn's answer is queued as that turn starts.
+      if (handed.length === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi alice' }]));
+      return orig(agent, trigger);
+    };
     const t = Date.now();
     i.pendingRequests.push(
       { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t,
@@ -274,9 +282,12 @@ describe('Turn trigger provenance', () => {
     await i.processInferenceRequests();
     await framework.runUntilIdle();
 
-    assert.equal(captured.handed?.reason, 'context_budget_restart');
-    assert.equal(captured.handed?.channelId, 'discord:g:alice-room', 'routing channel is kept');
-    assert.equal(captured.handed?.counterparty, undefined, 'a restart is its own cause — no borrowed author');
+    assert.deepEqual(handed.map((r) => r?.reason), ['context_budget_restart', 'mcpl:channel-incoming'],
+      'the restart starts alone, and the wake starts a turn of its own after it');
+    assert.equal(handed[0]?.counterparty, undefined, 'a restart is its own cause: no borrowed author');
+    assert.equal(handed[0]?.channelId, undefined, "nor the wake's channel");
+    assert.equal(handed[1]?.channelId, 'discord:g:alice-room');
+    assert.equal(handed[1]?.counterparty, 'discord:user:alice', "the wake's turn names its own author");
     await framework.stop();
   });
 });
