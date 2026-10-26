@@ -203,7 +203,10 @@ describe('present while acting', () => {
 
   // LEGACY (the re-pin rule the re-pin tests run under) is declared below.
   async function createFramework(
-    options: { speech?: { locus: 'delivery' | 'latest-inbound' }; maxStreamTokens?: number; proseRouting?: 'locus' | 'hybrid' } = {},
+    options: {
+      speech?: { locus: 'delivery' | 'latest-inbound' }; maxStreamTokens?: number; proseRouting?: 'locus' | 'hybrid';
+      thinkingBinding?: { binds: boolean };
+    } = {},
   ): Promise<AgentFramework> {
     const { speech, ...agentOptions } = options;
     const frameworkOptions = speech ? { speech } : {};
@@ -599,6 +602,45 @@ describe('present while acting', () => {
     const notice = wired.find((s) => s.includes('[routing] Someone addressed you from discord:dm:antra'));
     assert.ok(notice, 'the agent is told who addressed them and from where');
     assert.ok(notice!.includes('still lands in chan-live-1'), 'and where its plain speech still goes');
+
+    await framework.stop();
+  });
+
+  it("the addressed-from-elsewhere notice a boundary injects is noted by its stored id, so the stream's later thinking is kept", async () => {
+    // #785's notes: noteRoundSent names each row the stream's next request
+    // carries by its stored id. The notice is stored as the agent's own row
+    // and injected with the round; it was returned without its id, so its
+    // row was noted as the unstored marker, after which nothing the stream
+    // sent kept its thinking.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still speaking into the scene.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework({ thinkingBinding: { binds: true } });
+    stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const notes: Array<ReadonlyArray<string | { unstored: true }>> = [];
+    cm.noteRequestSent = ((rows: ReadonlyArray<string | { unstored: true }>) => { notes.push([...rows]); return true; }) as typeof cm.noteRequestSent;
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const notice = cm.getAllMessages().find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice'
+      && m.content.some((b) => b.type === 'text' && (b as { text: string }).text.includes('addressed you from discord:dm:antra')));
+    assert.ok(notice, 'the notice is stored');
+    const wired = membrane.lastStream!.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []);
+    assert.ok(wired.some((m) => JSON.stringify(m.content).includes('addressed you from')), 'and injected at the boundary');
+    assert.ok(notes.length > 0, 'the boundary noted its rows');
+    const atBoundary = notes[0]!;
+    assert.equal(atBoundary.at(-1), notice!.id, 'the injected notice is noted by its stored id, last, as it was sent');
+    assert.ok(!atBoundary.some((row) => typeof row !== 'string'), 'no row of the round is noted unstored');
 
     await framework.stop();
   });

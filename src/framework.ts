@@ -19393,8 +19393,9 @@ export class AgentFramework {
    * never moves the locus and a neutral message carries nothing that names
    * its channel (first live run, 2026-10-12, finding C). Once per channel
    * per turn (TurnRouting.addressedElsewhere); nothing for the turn's own
-   * locus. Stored durably; returned as stored for a live stream to inject
-   * with its boundary's other messages. Undefined when nothing was stored.
+   * locus. Stored durably; returned as stored, with its id, for a live
+   * stream to inject with its boundary's other messages, so the round's note
+   * (noteRoundSent) names the stored row. Undefined when nothing was stored.
    */
   private addressedElsewhereNotice(
     agent: Agent,
@@ -19402,7 +19403,7 @@ export class AgentFramework {
     channel: ChannelRef,
     who: string,
     when = 'while you were busy',
-  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; id: MessageId } | undefined {
     const pin = routing.locus ?? null;
     const key = destinationKey(channel);
     if (sameChannel(channel, pin) || routing.addressedElsewhere.has(key)) return undefined;
@@ -19418,7 +19419,7 @@ export class AgentFramework {
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
-      return { participant: 'user', content, metadata };
+      return { participant: 'user', content, metadata, id };
     } catch (err) {
       console.error('addressed-elsewhere notice: failed to record routing notice:', err);
       return undefined;
