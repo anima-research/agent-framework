@@ -113,9 +113,8 @@ const accelerationLimit = () => new MembraneError({
   rawError: { status: 429 },
 });
 
-/** A failure the default error policy retries at once. */
 const transientFailure = () => new MembraneError({
-  type: 'server', retryable: true, httpStatus: 500, retryAfterMs: 1,
+  type: 'server', retryable: true, httpStatus: 500,
   message: 'internal server error', rawError: { status: 500 },
 });
 
