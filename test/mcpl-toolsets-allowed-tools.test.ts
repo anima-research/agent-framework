@@ -120,46 +120,89 @@ test('a model calling act cannot run a dynamic tool left out of its allowedTools
   });
 });
 
-test('a code_execution script calling act cannot run a dynamic tool left out of its allowedTools', async () => {
-  await withGateFixture(async ({ framework, membrane, serverCalls }) => {
-    const code = [
-      'const control = await tools["arc--status"]({});',
-      'let outcome = "unexpected target success";',
-      'try { await tools["toolsets--act"]({ server: "arc", tool: "peek", args: {} }); }',
-      'catch (error) { outcome = String(error.message); }',
-      'text(control.content[0].text + "\\n" + outcome);',
-    ].join('\n');
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'script', name: 'code_execution', input: { code } },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'script done' }]));
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
-    await framework.runUntilIdle();
-    const cm = framework.getAgent('scout')!.getContextManager();
-    await waitFor(() => cm.getAllMessages().some(message => JSON.stringify(message.content).includes('script done')), 'script turn settled');
-    const outer = resultsOf(membrane).find(result => result.toolUseId === 'script');
-    assert.ok(outer, 'the script answered its model');
-    assert.equal(Boolean(outer.isError), false, outer.content);
-    assert.match(outer.content, /SERVER RAN status/);
-    assert.deepEqual(serverCalls(), ['status'], 'only the permitted script call reached the server');
-    assert.match(outer.content, /arc--peek.*not permitted.*allowedTools/);
-  });
+test('a code_execution script follows its agent allowlist for dynamic act calls', async (t) => {
+  for (const permitted of [false, true]) {
+    await t.test(permitted ? 'permitted dynamic call' : 'denied dynamic call', async () => {
+      await withGateFixture(async ({ framework, membrane, serverCalls }) => {
+        const code = [
+          'const control = await tools["arc--status"]({});',
+          'let outcome;',
+          'try { const result = await tools["toolsets--act"]({ server: "arc", tool: "peek", args: {} }); outcome = result.content[0].text; }',
+          'catch (error) { outcome = String(error.message); }',
+          'text(control.content[0].text + "\\n" + outcome);',
+        ].join('\n');
+        membrane.pushResponse(createMockResponse([
+          { type: 'tool_use', id: 'script', name: 'code_execution', input: { code } },
+        ], 'tool_use'));
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'script done' }]));
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
+        await framework.runUntilIdle();
+        const cm = framework.getAgent('scout')!.getContextManager();
+        await waitFor(() => cm.getAllMessages().some(message => JSON.stringify(message.content).includes('script done')), 'script turn settled');
+        const outer = resultsOf(membrane).find(result => result.toolUseId === 'script');
+        assert.ok(outer, 'the script answered its model');
+        assert.equal(Boolean(outer.isError), false, outer.content);
+        assert.match(outer.content, /SERVER RAN status/);
+        if (permitted) {
+          assert.match(outer.content, /SERVER RAN peek/);
+          assert.deepEqual(serverCalls(), ['status', 'peek']);
+        } else {
+          assert.match(outer.content, /arc--peek.*not permitted.*allowedTools/);
+          assert.deepEqual(serverCalls(), ['status'], 'only the permitted script call reached the server');
+        }
+      }, {
+        allowedTools: permitted
+          ? ['arc--status', 'arc--peek', 'toolsets--act', 'code_execution']
+          : ['arc--status', 'toolsets--act', 'code_execution'],
+      });
+    });
+  }
 });
 
-test('an ephemeral agent calling act cannot run a dynamic tool left out of its allowedTools', async () => {
-  await withGateFixture(async ({ framework, membrane, serverCalls }) => {
-    const created = await framework.createEphemeralAgent({
-      name: 'worker', model: 'test-model', systemPrompt: 'Do the task.',
-      allowedTools: ['arc--status', 'toolsets--act'],
+test('an ephemeral agent uses its own allowlist for dynamic act calls', async (t) => {
+  const scenarios = [
+    {
+      name: 'worker denied while resident permitted',
+      residentAllowed: ['arc--status', 'arc--peek', 'toolsets--act'],
+      workerAllowed: ['arc--status', 'toolsets--act'],
+      permitted: false,
+    },
+    {
+      name: 'worker permitted while resident denied',
+      residentAllowed: ['arc--status', 'toolsets--act'],
+      workerAllowed: ['arc--status', 'arc--peek', 'toolsets--act'],
+      permitted: true,
+    },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      await withGateFixture(async ({ framework, membrane, serverCalls }) => {
+        const created = await framework.createEphemeralAgent({
+          name: 'worker', model: 'test-model', systemPrompt: 'Do the task.',
+          allowedTools: scenario.workerAllowed,
+        });
+        created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+        membrane.pushResponse(createMockResponse(toolCalls(), 'tool_use'));
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ephemeral done' }]));
+        const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+        await framework.runUntilIdle();
+        await run;
+        const results = resultsOf(membrane);
+        if (scenario.permitted) {
+          const status = results.find(result => result.toolUseId === 'gate-status');
+          const target = results.find(result => result.toolUseId === 'gate-act');
+          assert.ok(status, 'the permitted control answered the worker');
+          assert.match(status.content, /SERVER RAN status/);
+          assert.ok(target, 'the dynamic call answered the worker');
+          assert.equal(Boolean(target.isError), false, target.content);
+          assert.match(target.content, /SERVER RAN peek/);
+          assert.deepEqual(serverCalls(), ['status', 'peek']);
+        } else {
+          assertOnlyNamedToolRan(results, serverCalls());
+        }
+      }, { allowedTools: scenario.residentAllowed });
     });
-    created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
-    membrane.pushResponse(createMockResponse(toolCalls(), 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ephemeral done' }]));
-    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
-    await framework.runUntilIdle();
-    await run;
-    assertOnlyNamedToolRan(resultsOf(membrane), serverCalls());
-  });
+  }
 });
 
 test('operator tool policy controls dynamic visibility and act calls', async (t) => {
