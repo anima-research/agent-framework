@@ -501,8 +501,8 @@ stored `afterUser` injection (namespace `mcpl-toolsets`), at that agent's next
 start.
 
 A dynamic tool called by its prefixed name is refused, pointing at
-`toolsets--act`, unless the tool list still offers it while a move waits for
-its rebuild. Calls to an undeclared toolset's tools are refused while the
+`toolsets--act`, unless the tool list or the server's latest list shows it as
+static (a move waiting for its rebuild). Calls to an undeclared toolset's tools are refused while the
 host has that group closed (RFC-014 §5.4). Projection and surface mode are not
 implemented: a `surface` server's static tools are listed like any server's.
 
