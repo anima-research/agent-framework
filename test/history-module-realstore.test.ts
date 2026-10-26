@@ -398,3 +398,52 @@ describe('HistoryModule on a real store: window changes between resume calls (PR
     assert.match(r.error!, /summary/);
   });
 });
+
+describe('HistoryModule on a real store: a search that stops at maxScan with no match', () => {
+  const rows = (): Row[] => {
+    const now = Date.now();
+    const tieMs = now - 20 * MIN;
+    const out: Row[] = [];
+    for (let i = 0; i < 6; i++) out.push({ text: `tie${i}`, channel: 'c', ms: tieMs });
+    for (let i = 0; i < 4; i++) out.push({ text: `later${i}`, channel: 'c', ms: now - (10 - i) * MIN });
+    return out;
+  };
+
+  it('says no message matched among those scanned and that this is not a negative result, with no count when no channel is given', async () => {
+    const { mod } = build(rows());
+    for (const [order, regex] of [['oldest', false], ['newest', false], ['oldest', true], ['newest', true]] as const) {
+      const d = await call(mod, 'search', { query: 'needle', order, regex, maxScan: 3 });
+      assert.equal(d.truncated, true);
+      assert.deepEqual(d.matches, []);
+      assert.equal(
+        d.hint.split('. Continue')[0],
+        `No match among the ${order} 3 messages scanned (maxScan); the rest of this range was not searched, so this is not a negative result for the range`,
+      );
+    }
+  });
+
+  it('gives the exact number of the range\'s messages not searched when a channel is given', async () => {
+    const { mod } = build(rows());
+    for (const [maxScan, rest] of [[3, '7 more in this range were not searched'], [9, '1 more in this range was not searched']] as const) {
+      const d = await call(mod, 'search', { query: 'needle', channelId: 'c', maxScan });
+      assert.equal(d.truncated, true);
+      assert.ok(d.hint.includes(`; ${rest}, so this is not a negative result`), d.hint);
+    }
+  });
+
+  it('counts the messages earlier calls scanned at the resume instant as searched', async () => {
+    const { mod } = build(rows());
+    const first = await call(mod, 'search', { query: 'needle', channelId: 'c', maxScan: 3 });
+    const d = await call(mod, 'search', { query: 'needle', channelId: 'c', maxScan: 3, ...first.resume });
+    assert.equal(d.truncated, true);
+    assert.ok(d.hint.includes('; 4 more in this range were not searched'), d.hint);
+  });
+
+  it('does not say "no match" when the truncated scan found one', async () => {
+    const { mod } = build(rows());
+    const d = await call(mod, 'search', { query: 'tie1', channelId: 'c', maxScan: 3 });
+    assert.equal(d.truncated, true);
+    assert.equal(d.matches.length, 1);
+    assert.doesNotMatch(d.hint, /No match/);
+  });
+});
