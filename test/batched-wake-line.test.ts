@@ -481,7 +481,11 @@ describe('isNewestContextEntry', () => {
     cm.addMessage('system', change('b'), { system: true, kind: 'system-change', agent: 'another' });
     cm.addMessage('system', change('c'));
     cm.addMessage('user', [{ type: 'text', text: '[clock row]' }], { system: true, kind: CLOCK_ROW_KIND, clock: { at: Date.now() } });
-    assert.equal(ask(), true, "a system change isn't a message a reply could be meant for");
+    for (let i = 0; i < 40; i++) {
+      if (i % 2) cm.addMessage('system', change(`d${i}`));
+      else cm.addMessage('user', [{ type: 'text', text: '[clock row]' }], { system: true, kind: CLOCK_ROW_KIND, clock: { at: Date.now() } });
+    }
+    assert.equal(ask(), true, "a system change isn't a message a reply could be meant for, past 32 rows of them too");
     internals().addMessage('someone', [{ type: 'text', text: 'after the changes' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-s-${n}` });
     assert.equal(ask(), false);
   });

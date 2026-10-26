@@ -785,4 +785,32 @@ describe('toolDeclarations in the framework', () => {
       });
     });
   }
+
+  it("ends a resident's request on its own turn on the head, where a host's change row after it is left out, with its [Continue] last", async () => {
+    await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      say(alpha, 'alpha', 'my reply');
+      alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[]);
+      const request = await alpha.buildActivationRequest([tool('a')]);
+      const shown = request.messages.map((m) => (isChange(m) ? 'change' : m.content.map((b) => (b as { text?: string }).text ?? '').join('')));
+      assert.deepEqual(shown.slice(shown.indexOf('my reply')), ['my reply', '[Continue]']);
+    });
+  });
+
+  it("keeps the subconscious's own declared change in its view, so it declares it once", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      const subconscious = framework.getAgent('Subconscious')!;
+      await subconscious.buildActivationRequest([tool('think')]);
+      await subconscious.buildActivationRequest([tool('think'), tool('ponder')]);
+      const request = await subconscious.buildActivationRequest([tool('think'), tool('ponder')]);
+      assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('ponder')] }]], 'its own change, once');
+      const own = subconscious.getContextManager().getAllMessages().filter(isChange).filter((m) => (m.metadata as { agent?: string } | undefined)?.agent === 'Subconscious');
+      assert.equal(own.length, 1, 'stored once');
+    }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.' } });
+  });
 });

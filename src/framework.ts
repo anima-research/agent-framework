@@ -25602,9 +25602,9 @@ export class AgentFramework {
    *  event by its server and event id, and never one a tune-out holds. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
     // A clock row the framework wrote after it (a turn start's, an event's), a
-    // stored context injection (any agent's, a start's) or a system change any
-    // agent's assembly stored isn't a message a reply could be meant for, so
-    // it doesn't count, however many follow it.
+    // stored context injection (any agent's, a start's) or a system change
+    // (any agent's, or a host's) isn't a message a reply could be meant for,
+    // so it doesn't count, however many follow it.
     let newest: { metadata?: unknown } | undefined;
     scanFromTail(agent.getContextManager(), (row) => {
       if ((row.metadata as { kind?: unknown } | undefined)?.kind === CLOCK_ROW_KIND || storedInjectionMarkOf(row.metadata) || isSystemChangeMessage(row)) return false;

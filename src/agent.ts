@@ -103,7 +103,7 @@ export interface StartStreamResult {
   /** The request-only `[Continue]` prompt this request's reply follows, if
    *  any, read from the request: a new one when it ends on `[Continue]`;
    *  else, when it ends on tool results, or on tool results and then
-   *  stored context injections alone, the prompt of the reply that called
+   *  stored context injections and system changes alone, the prompt of the reply that called
    *  those tools (`toolLoopPrompt`); else none. The framework stamps the
    *  reply's rows with it (`metadata.promptedBy`), for later compiles to
    *  render it before them. */

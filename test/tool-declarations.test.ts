@@ -540,9 +540,8 @@ describe('toolDeclarations', () => {
     assert.deepEqual(compiled.provenance?.messages.map((source) => source.bodies?.[0]?.messageId), ['user:hello', 'user:go on'], 'and its source with it');
   });
 
-  it("compiles a dry move again for a head told differently only by a field the hash writes as null and the wire leaves out, with `binds: true`", async () => {
+  it("compiles a dry move again for a head that differs from the record only in a field set to null against one left out, and tells the digests of the head it shows, with `binds: true`", async () => {
     const withExtra = (extra: unknown) => ({ ...tool('x'), extra }) as unknown as ToolDefinition;
-    // The agent's change defines `x` as it's advertised now; the record has `extra: null`.
     const stored: Row = { id: 'c-x', participant: 'system', content: [{ type: 'system_change', defineTools: [JSON.parse(JSON.stringify(withExtra(undefined)))] } as never], metadata: { system: true, kind: 'system-change', agent: 'agent' } };
     const context = fakeContext([said('user', 'hello'), stored]);
     const heads = memoryHeadDeclarations();
