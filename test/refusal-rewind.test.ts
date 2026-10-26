@@ -277,6 +277,7 @@ test('a message injected into the refused round is the newest turn it carried, a
     assert.match(JSON.stringify(injected), /heard while the tool ran/, 'the premise: the refused round carried the injected message');
     const retry = rig.requests[2]!;
     assert.ok(!rig.texts(retry).some((t) => t.includes('heard while the tool ran')), 'the injected message is gone');
+    assert.match(JSON.stringify(retry.messages), /what the tool saw/, 'the tool exchange before it stays');
     assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
   } finally { await rig.close(); }
 });
