@@ -217,9 +217,11 @@ export interface ToolResult {
    * (allowedTools), a `skip_reply` wake was refused, the call's MCPL server is
    * absent or still connecting, the host's policy for that server denies the
    * tool, or a fork reached outside its channel. RFC-007's lifecycle refuses
-   * the call from the same place, so observers see no events for it. So is
-   * each call in the last round of a response the output limit cut off, which
-   * was never dispatched. A check made after the call opened, such as a module's
+   * the call from the same place, so observers see no events for it. The
+   * framework also sets it on the result it stores for each call in the last
+   * round of a response the output limit cut off: such a call was never
+   * dispatched or opened, and its result goes into the context with the reply,
+   * not through a tool-result event. A check made after the call opened, such as a module's
    * answer for a name it has no tool for or arguments that don't fit a
    * schema, is a failure whose text says nothing was done, as is an MCPL
    * request that couldn't be written. A programmatic call (`executeToolCall`,

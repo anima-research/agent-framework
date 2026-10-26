@@ -13,7 +13,7 @@ export interface CutOffRound {
   start: number;
   calls: CutOffCall[];
   unnamed: boolean;
-  fromXmlBlock: boolean;
+  xml: boolean;
 }
 
 /**
@@ -32,24 +32,16 @@ export function cutOffRound(response: NormalizedResponse): CutOffRound | undefin
     if (block.type === 'tool_use') callIds.add(block.id);
     else if (block.type === 'tool_result' && callIds.has(block.toolUseId)) start = index + 1;
   });
-  let content = response.content;
-  let unnamed = false;
-  let fromXmlBlock = false;
-  if (response.details?.stop?.unclosedToolBlock) {
-    const cut = cutToolBlock(content, start);
-    if (cut) {
-      content = cut.content;
-      unnamed = cut.ids.length === 0;
-      fromXmlBlock = true;
-    }
-  }
-  const calls = content.slice(start)
-    .filter((block): block is ContentBlock & { type: 'tool_use' } => block.type === 'tool_use')
-    .map(({ id, name, input, unparseableInput }) => ({
-      id, name, input,
-      ...(unparseableInput !== undefined ? { unparseableInput } : {}),
-    }));
-  return calls.length > 0 || unnamed ? { content, start, calls, unnamed, fromXmlBlock } : undefined;
+  const cut = response.details?.stop?.unclosedToolBlock ? cutToolBlock(response.content, start) : undefined;
+  const content = cut ?? response.content;
+  const uses = content.slice(start).filter((block): block is ContentBlock & { type: 'tool_use' } => block.type === 'tool_use');
+  const calls = uses.map(({ id, name, input, unparseableInput }) => ({
+    id, name, input,
+    ...(unparseableInput !== undefined ? { unparseableInput } : {}),
+  }));
+  const unnamed = !!cut && calls.length === 0;
+  const xml = !!cut || uses.some((block) => (block as { rawXml?: string }).rawXml !== undefined);
+  return calls.length > 0 || unnamed ? { content, start, calls, unnamed, xml } : undefined;
 }
 
 /**
@@ -58,8 +50,10 @@ export function cutOffRound(response: NormalizedResponse): CutOffRound | undefin
  * hasUnclosedToolBlock, endsWithPartialToolBlock, INVOKE_REGEX): a block opens
  * with `<function_calls>` and each call with `<invoke name="…">`, either tag
  * optionally `antml:` prefixed, and a closer ends the innermost block still
- * open. Its parser takes spans such as thinking out of an unclosed block's
- * text, which leaves that text in several text blocks. Only a block's opener
+ * open. Its parser takes spans out of an unclosed block's text, which leaves
+ * that text in several text blocks: thinking, which stays with the round, a
+ * whole inner block its stop sequence didn't end, whose calls are the round's
+ * too, and results, which don't stay. Only a block's opener
  * and each call's name head are read, nothing after a name, and a name that
  * isn't a tool name's characters isn't taken as one: the formatter writes a
  * stored call's name into the next request as it is.
@@ -69,7 +63,7 @@ const CLOSER = /<\/(antml:)?function_calls>/g;
 const NAME_HEAD = /<(antml:)?invoke\s+name=(["'])((?:(?!\2).)+)\2\s*\/?>/g;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/;
 
-function cutToolBlock(content: ContentBlock[], start: number): { content: ContentBlock[]; ids: string[] } | undefined {
+function cutToolBlock(content: ContentBlock[], start: number): ContentBlock[] | undefined {
   const texts = content.map((block, index) => ({ block, index }))
     .filter((entry): entry is { block: ContentBlock & { type: 'text' }; index: number } => entry.index >= start && entry.block.type === 'text');
   const joined = texts.map(({ block }) => block.text).join('');
@@ -97,9 +91,7 @@ function cutToolBlock(content: ContentBlock[], start: number): { content: Conten
     unparseableInput: blockText.slice(head.index, heads[index + 1]?.index),
   }));
   const prose: ContentBlock[] = at > 0 ? [{ type: 'text', text: holder.block.text.slice(0, at) }] : [];
-  const kept = content.slice(holder.index + 1).filter((block) => block.type === 'thinking' || block.type === 'redacted_thinking');
-  return {
-    content: [...content.slice(0, holder.index), ...prose, ...kept, ...calls],
-    ids: calls.map((call) => (call as ContentBlock & { type: 'tool_use' }).id),
-  };
+  const kept = content.slice(holder.index + 1)
+    .filter((block) => block.type === 'thinking' || block.type === 'redacted_thinking' || block.type === 'tool_use');
+  return [...content.slice(0, holder.index), ...prose, ...kept, ...calls];
 }

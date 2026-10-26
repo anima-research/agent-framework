@@ -20972,7 +20972,7 @@ export class AgentFramework {
             // to a round with verbatim content, which membrane gives a native
             // round and never an XML one, so it never reaches an XML round,
             // cut or not.
-            const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.fromXmlBlock
+            const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.xml
               && cut.calls.some((call) => call.name === 'think');
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
             if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
@@ -20987,7 +20987,7 @@ export class AgentFramework {
               }
               hadToolCalls = true;
               const cutRound = toolRounds++;
-              if (cutPrivate || (cutThinkPrivate && !liveProseRouting)) refusedWakeRounds.add(cutRound);
+              if (turnProseRouting !== 'disabled' && (cutPrivate || (cutThinkPrivate && !liveProseRouting))) refusedWakeRounds.add(cutRound);
               const cutCause = roundSilenceCause(cutCalls);
               if (cutCause && liveProseRouting) {
                 turnSilenced = true;
@@ -21398,13 +21398,15 @@ export class AgentFramework {
               const runs = finalRuns;
               const segments = finalSegments;
 
-              if (cutThinkPrivate && liveProseRouting) {
+              const thinkPrivate = cutThinkPrivate && liveProseRouting;
+              const thinkHeld = (): void => {
                 if (segments.length > 0) {
                   console.error(
                     `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
                   );
                 }
-              } else if (turnProseRouting === 'disabled') {
+              };
+              if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
                   console.error(
                     `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
@@ -21413,7 +21415,9 @@ export class AgentFramework {
                 }
               } else if (turnProseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
-                  this.holdSilencedProse(agent, runs, trailingCause, false, trailingHold);
+                  this.holdSilencedProse(agent, runs, trailingCause, thinkPrivate, trailingHold);
+                } else if (thinkPrivate) {
+                  thinkHeld();
                 } else if (segments.length > 0) {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
@@ -21425,7 +21429,9 @@ export class AgentFramework {
                   }
                 }
               } else if (turnProseRouting === 'explicit') {
-                if (segments.length > 0) {
+                if (thinkPrivate) {
+                  thinkHeld();
+                } else if (segments.length > 0) {
                   console.error(
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
                   );
@@ -21443,8 +21449,10 @@ export class AgentFramework {
                   `(${silenced ? `turn silenced: ${trailingCause}` : 'no trailing prose'})`,
                 );
                 if (silenced && segments.length > 0) {
-                  this.holdSilencedProse(agent, runs, trailingCause, false, trailingHold);
+                  this.holdSilencedProse(agent, runs, trailingCause, thinkPrivate, trailingHold);
                 }
+              } else if (thinkPrivate) {
+                thinkHeld();
               } else {
                 // The turn's own locus, read from this stream's routing
                 // state. This dispatch runs AFTER the agent is idle (see PR

@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { AnthropicAdapter, AnthropicXmlFormatter, Membrane } from '@animalabs/membrane';
 
 import { AgentFramework } from '../src/index.js';
+import { TOOL_RESULT_GUARD_AUDIT_STATE } from '../src/tool-result-guard.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 
 type Block = { text: string } | { thinking: string } | { call: string; json: string[]; whole: boolean };
@@ -75,6 +76,8 @@ interface Run {
   rows: Array<{ participant: string; content: Array<Record<string, any>> }>;
   requests: string[];
   boundaryLines: string[];
+  failedTraces: Array<{ callId?: string; tool?: string; error?: string }>;
+  audit: Array<Record<string, any>>;
 }
 
 async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}): Promise<Run> {
@@ -137,6 +140,10 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
     get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
   });
+  const failedTraces: Run['failedTraces'] = [];
+  framework.onTrace((event) => {
+    if (event.type === 'tool:failed') failedTraces.push(event as Run['failedTraces'][number]);
+  });
   const lines: string[] = [];
   const error = console.error;
   console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
@@ -155,6 +162,8 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       rows: cm.getAllMessages(),
       requests,
       boundaryLines: lines.filter((line) => line.startsWith('[tool-boundary]')),
+      failedTraces,
+      audit: settings.toolResultGuard ? framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, any>> : [],
     };
   } finally {
     console.error = error;
@@ -174,6 +183,7 @@ function assertRefusedPair(run: Run, calls: Array<{ name: string; says: string }
   assert.equal(refusals.length, calls.length, 'one refused result for each call of the round, and none for a call that ran');
   const unmatched = [...refusals];
   const next = run.requests[run.requests.length - 1];
+  const occurrences = (text: string) => next.split(text).length - 1;
   for (const { name, says } of calls) {
     const refusal = `Nothing was done: ${name} ${says}`;
     const result = unmatched.find((block) => toolResultText(block).includes(refusal));
@@ -185,9 +195,24 @@ function assertRefusedPair(run: Run, calls: Array<{ name: string; says: string }
     const resultRow = run.rows.findIndex((row) => row.content.includes(result));
     assert.equal(run.rows[useRow]?.content.find((block) => block.id === result.toolUseId)?.name, name, 'the reply stores the call it answers');
     assert.equal(resultRow, useRow + 1, 'its result is stored right after the reply');
-    assert.ok(next.includes(refusal), 'the next request carries it');
-    assert.ok(run.mode === 'native' ? next.includes(`"id":"${result.toolUseId}"`) : next.includes(`invoke name=\\"${name}\\"`),
-      'with the call it answers');
+    if (run.mode === 'native') {
+      assert.ok(next.includes(`"id":"${result.toolUseId}"`), 'the next request carries the call');
+      assert.ok(next.includes(`"tool_use_id":"${result.toolUseId}"`), 'and its result');
+    }
+    const traced = run.failedTraces.filter((trace) => trace.callId === result.toolUseId);
+    assert.equal(traced.length, 1, 'one tool:failed trace for the call');
+    assert.equal(traced[0]!.tool, name);
+    assert.ok(traced[0]!.error?.includes(refusal), 'naming its refusal');
+  }
+  for (const { name, says } of calls) {
+    const refusal = `Nothing was done: ${name} ${says}`;
+    const expected = calls.filter((call) => call.name === name && call.says === says).length;
+    assert.ok(occurrences(refusal) >= expected, `the next request carries each refusal: ${refusal}`);
+    if (run.mode === 'xml') {
+      const stored = run.rows.flatMap((row) => row.content).filter((block) => block.type === 'tool_use' && block.name === name).length;
+      assert.ok(stored >= calls.filter((call) => call.name === name).length);
+      assert.ok(occurrences(`invoke name=\\"${name}\\"`) >= stored, 'with each stored call of that name, an earlier round\'s included');
+    }
   }
   assert.equal(new Set(refusals.map((block) => block.toolUseId)).size, refusals.length, 'each answers a call of its own');
 }
@@ -195,6 +220,12 @@ function assertRefusedPair(run: Run, calls: Array<{ name: string; says: string }
 const EAST_ROUND: Reply = { blocks: [{ text: 'First I step east.' }, { call: 'robot--move', json: ['{"dir": "east"}'], whole: true }], stop: 'tool_use' };
 const XML_EAST_ROUND: Reply = { xml: 'First I step east.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
 const noBlockText = (run: Run) => replyTexts(run).every((text) => !/<(antml:)?(function_calls|invoke|parameter)/.test(text));
+const receipts = (run: Run) => {
+  const next = run.rows.findIndex((row) => row.content.some((block) => block.text === 'And next?'));
+  return run.rows.slice(0, next).filter((row) => row.participant !== 'resident').flatMap((row) => row.content)
+    .map((block) => String(block.text ?? '')).filter((text) => text.startsWith('[delivered]'));
+};
+const THINK_CUT: Reply = { blocks: [{ text: 'Musing to myself.' }, { call: 'think', json: ['{"thought": "is it'], whole: false }], stop: 'max_tokens' };
 
 describe('native tools: a response that ends at the output limit with calls in its last round', () => {
   for (const [label, json] of [['partway through its arguments', ['{"dir": "no']], ['before any argument', []]] as const) {
@@ -265,6 +296,54 @@ describe('native tools: a response that ends at the output limit with calls in i
     assert.equal(run.requests.length, 2);
   });
 
+  it("counts a cut-off private think round's words as suppressed under disabled routing, as the turn's earlier round's are", async () => {
+    const run = await turn('native', [EAST_ROUND, THINK_CUT], { proseRouting: 'disabled', sameRoundThinkTextPolicy: 'private' });
+    assertRefusedPair(run, [{ name: 'think', says: RAN_NOT }]);
+    assert.deepEqual(run.routed, []);
+    assert.match(receipts(run)[0] ?? '', /\b2 plain-speech segment\(s\) kept in the transcript/, receipts(run).join(' | '));
+    assert.equal(run.requests.length, 3);
+  });
+
+  it("counts a cut-off private think round's words as kept private on a turn an earlier send silenced", async () => {
+    const run = await turn('native', [
+      { blocks: [{ text: 'Telling the room.' }, { call: 'robot--send_message', json: ['{"text": "hi"}'], whole: true }], stop: 'tool_use' },
+      THINK_CUT,
+    ], { sameRoundThinkTextPolicy: 'private' });
+    assertRefusedPair(run, [{ name: 'think', says: RAN_NOT }]);
+    assert.deepEqual(run.routed, [NEXT]);
+    assert.match(receipts(run)[0] ?? '', /\b1 plain-speech segment\(s\) kept private/, receipts(run).join(' | '));
+    assert.equal(run.requests.length, 3);
+  });
+
+  for (const [label, reply] of [
+    ['a private think', THINK_CUT],
+    ['a skip_reply', { blocks: [{ text: 'A note to myself.' }, { call: 'skip_reply', json: ['{"wake'], whole: false }], stop: 'max_tokens' } as Reply],
+  ] as const) {
+    it(`counts the words of a turn's first round, cut off with ${label}, as suppressed under disabled routing`, async () => {
+      const run = await turn('native', [reply], { proseRouting: 'disabled', sameRoundThinkTextPolicy: 'private' });
+      assert.deepEqual(run.routed, []);
+      assert.match(receipts(run)[0] ?? '', /\b1 plain-speech segment\(s\) kept in the transcript/, receipts(run).join(' | '));
+      assert.equal(run.requests.length, 2);
+    });
+  }
+
+  it("keeps a cut-off skip_reply's round private under hybrid routing after an earlier round published its words", async () => {
+    const run = await turn('native', [EAST_ROUND, { blocks: [{ text: 'A note to myself, not for the room.' }, { call: 'skip_reply', json: ['{"wake_in_sec'], whole: false }], stop: 'max_tokens' }],
+      { proseRouting: 'hybrid' });
+    assert.equal(run.skipReplies, 0);
+    assertRefusedPair(run, [{ name: 'skip_reply', says: RAN_NOT }]);
+    assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+    assert.match(receipts(run)[0] ?? '', /\b1 plain-speech segment\(s\) kept private/, receipts(run).join(' | '));
+    assert.equal(run.requests.length, 3);
+  });
+
+  it('keeps a cut-off round with a private think from being published under hybrid routing after an earlier round published its words', async () => {
+    const run = await turn('native', [EAST_ROUND, THINK_CUT], { proseRouting: 'hybrid', sameRoundThinkTextPolicy: 'private' });
+    assertRefusedPair(run, [{ name: 'think', says: RAN_NOT }]);
+    assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+    assert.equal(run.requests.length, 3);
+  });
+
   for (const [label, replies, routed, requests] of [
     ['alone', [] as Reply[], ['Telling the room now.', NEXT], 2],
     ['after an earlier round published its words', [EAST_ROUND], ['First I step east.', 'Telling the room now.', NEXT], 3],
@@ -299,6 +378,14 @@ describe('native tools: a response that ends at the output limit with calls in i
     assertRefusedPair(run, [{ name: 'robot--move', says: RAN_NOT }]);
     assert.ok(!run.requests[1].includes('withheld by the guard'), 'not as the guard\'s withheld notice');
     assert.equal(run.requests.length, 2);
+    const cutId = blocks(run, 'tool_use')[0]!.id;
+    const staged = run.audit.find((record) => record.type === 'staged'
+      && (record.originals as Array<{ id: string }>).some((call) => call.id === cutId));
+    assert.ok(staged, 'the guard\'s audit record keeps the cut-off round\'s results');
+    const original = (staged!.originals as Array<{ id: string; result: { refused?: boolean } }>).find((call) => call.id === cutId)!;
+    assert.equal(original.result.refused, true, 'as refused, so the guard reads that nothing ran');
+    const settled = run.audit.slice(run.audit.indexOf(staged!) + 1).find((record) => record.type === 'accepted' || record.type === 'withheld');
+    assert.equal(settled?.type, 'accepted', 'and admits them, since the turn ended');
   });
 });
 
@@ -383,10 +470,54 @@ describe('XML tools: a response that ends at the output limit inside a tool-call
     assert.equal(run.requests.length, 2);
   });
 
+  it('cuts a block whose tags carry the antml: prefix', async () => {
+    const ns = 'an' + 'tml:';
+    const run = await turn('xml', [{ xml: `Heading north now, to the gate.\n\n<${ns}function_calls>\n<${ns}invoke name="robot--move">\n<${ns}parameter name="dir">no`, stop: 'max_tokens' }]);
+    assert.deepEqual(run.moves, []);
+    assertRefusedPair(run, [{ name: 'robot--move', says: RAN_NOT }]);
+    assert.ok(noBlockText(run), replyTexts(run).join(' | '));
+    assert.deepEqual(run.routed, ['Heading north now, to the gate.', NEXT]);
+    assert.equal(replyTexts(run).at(-1), NEXT);
+    assert.equal(run.requests.length, 2);
+  });
+
+  it('refuses a call membrane read whole inside the cut-off block, and keeps a skip_reply\'s round private', async () => {
+    const ns = 'an' + 'tml:';
+    const run = await turn('xml', [{ xml: `A note to myself.\n\n<function_calls>\n<${ns}function_calls>\n<${ns}invoke name="skip_reply">\n</${ns}invoke>\n</${ns}function_calls>`, stop: 'max_tokens' }]);
+    assert.equal(run.skipReplies, 0);
+    assertRefusedPair(run, [{ name: 'skip_reply', says: RAN_NOT }]);
+    assert.ok(!run.rows.some((row) => row.content.some((block) => block.type === 'text' && String(block.text).startsWith(UNNAMED))), 'a call was named');
+    assert.deepEqual(run.routed, [NEXT]);
+    assert.equal(run.requests.length, 2);
+  });
+
+  it('routes the words of a cut-off round whose think membrane read whole as an XML round\'s, outside the private think policy', async () => {
+    const ns = 'an' + 'tml:';
+    const run = await turn('xml', [{ xml: `Words here.\n\n<${ns}function_calls>\n<${ns}invoke name="think">\n<${ns}parameter name="thought">hm</${ns}parameter>\n</${ns}invoke>\n</${ns}function_calls>\nMore words`, stop: 'max_tokens' }],
+      { sameRoundThinkTextPolicy: 'private' });
+    assertRefusedPair(run, [{ name: 'think', says: RAN_NOT }]);
+    assert.ok(run.routed.some((text) => text.includes('Words here.')), JSON.stringify(run.routed));
+    assert.equal(run.routed.at(-1), NEXT);
+    assert.equal(run.requests.length, 2);
+  });
+
+  it('tells the agent nothing ran when an earlier round ran and the next block was cut off before any call was named', async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north to the gate.\n\n<function_calls>\n<invoke name="robo', stop: 'max_tokens' }]);
+    assert.deepEqual(run.moves, [{ dir: 'east' }]);
+    assert.deepEqual(blocks(run, 'tool_use').map((block) => block.name), ['robot--move'], 'only the call that ran is stored');
+    assert.ok(run.rows.some((row) => row.content.some((block) => block.type === 'text' && String(block.text).startsWith(UNNAMED))));
+    assert.ok(replyTexts(run).some((text) => text.includes('Now north to the gate.')), 'the words are stored');
+    assert.ok(noBlockText(run), replyTexts(run).join(' | '));
+    assert.deepEqual(run.routed, ['First I step east.', 'Now north to the gate.', NEXT]);
+    assert.equal(replyTexts(run).at(-1), NEXT);
+    assert.equal(run.requests.length, 3);
+  });
+
   for (const [label, xml, words] of [
     ['right after the block opened', 'Heading north now, to the gate.\n\n<function_calls>\n', ['Heading north now, to the gate.']],
     ['inside the first call\'s name', 'Heading north now, to the gate.\n\n<function_calls>\n<invoke name="robo', ['Heading north now, to the gate.']],
     ['before any words', '<function_calls>\n<invoke name="robo', []],
+    ['inside its own opener, before its \'>\'', 'Heading north now, to the gate.\n\n<function_calls', ['Heading north now, to the gate.']],
   ] as const) {
     it(`tells the agent nothing ran when the block was cut off ${label}, and publishes the words before it`, async () => {
       const run = await turn('xml', [{ xml, stop: 'max_tokens' }]);

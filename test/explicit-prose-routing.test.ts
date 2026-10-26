@@ -155,7 +155,7 @@ describe('explicit prose routing', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(mode: 'explicit' | 'hybrid' | 'disabled' = 'explicit'): Promise<AgentFramework> {
+  async function createFramework(mode: 'explicit' | 'hybrid' | 'disabled' = 'explicit', settings: Record<string, unknown> = {}): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -164,6 +164,7 @@ describe('explicit prose routing', () => {
         model: 'test-model',
         systemPrompt: 'You are a test agent.',
         proseRouting: mode,
+        ...settings,
       }],
       modules: [module],
     });
@@ -697,6 +698,31 @@ describe('explicit prose routing', () => {
     assert.equal(skip.calls, 0, 'the cut-off skip_reply never ran');
     assert.deepEqual(routed, [{ text: 'first, deliberately', locus: 'chan-alpha' }], 'only the earlier round\'s words go out');
     assert.ok(context(framework).texts.some((t) => t.includes('thoughts I keep to myself')), 'the text stays in the context');
+
+    await framework.stop();
+  });
+
+  it('a round with a private think that the output limit cut off keeps its prose after an earlier round delivered', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first, deliberately' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse({
+      ...createMockResponse([
+        { type: 'text', text: '>>#alpha musing I keep to myself' },
+        { type: 'tool_use', id: 't3', name: 'think', input: {}, unparseableInput: '{"thought": "is it' },
+      ] as ContentBlock[], 'max_tokens'),
+      toolCalls: [],
+    });
+
+    const framework = await createFramework('explicit', { sameRoundThinkTextPolicy: 'private' });
+    const routed = stubRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'first, deliberately', locus: 'chan-alpha' }], 'only the earlier round\'s words go out');
+    assert.ok(context(framework).texts.some((t) => t.includes('musing I keep to myself')), 'the text stays in the context');
 
     await framework.stop();
   });
