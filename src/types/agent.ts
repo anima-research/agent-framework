@@ -570,14 +570,20 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
-  /** Host-owned: this wake's sole cause is this write, deferred for its
-   *  agent while a turn was alive: a coalesced render placed in its queue
-   *  (wakeToRead), or a message, notice or event whose wake was queued with
-   *  it. Once a request that carried the write was answered and, for a wake
-   *  that carries a channel, the agent has since published into that
-   *  channel having read it, or once the write is in neither the agent's
-   *  queue nor its store's current branch, the wake starts no turn. */
-  readsDeferredWrite?: string;
+  /** Host-owned: this wake's sole cause is this row, which wasn't presented
+   *  to its agent at its write, because a turn of the agent's was alive: a
+   *  coalesced render its turn being assembled doesn't read (wakeToRead), or
+   *  a message, notice or event whose wake was queued with it. It is the
+   *  stored row's id, or, while the write still waits in the framework's
+   *  deferred queue, its held handle (`held:` and the queue entry's id).
+   *  Once a request that carried the row was answered (an answered
+   *  request's consumed watermark covers it, in the agent's window once its
+   *  context presents rows) and, for a wake that carries a channel, the
+   *  agent has since published into that channel having read it, or once
+   *  the row is in neither the agent's queue nor its store's current
+   *  branch, the wake starts no turn. A row stored and not yet presented to
+   *  the agent keeps its wake. */
+  readsRow?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -625,7 +631,7 @@ export interface InferenceRequest {
    * (`chat:ambient`). A coalesced push's wake carries it only to read a
    * render, and only when every notice the render stands for was. Such a
    * message asked nothing of the agent, so a wake for it that carries
-   * `readsDeferredWrite` is dropped once a request that carried the message
+   * `readsRow` is dropped once a request that carried the message
    * was answered, with no publish asked of the agent. A message with neither
    * tag is in doubt, and is judged as an addressed one.
    */

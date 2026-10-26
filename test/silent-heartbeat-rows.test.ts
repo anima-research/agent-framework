@@ -21,6 +21,7 @@ import type { AgentConfig, Module, ModuleContext, ToolCall, ToolDefinition, Tool
 import { TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
 import { PassthroughStrategy } from '@animalabs/context-manager';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { heldHandle } from '../src/held-writes.js';
 import { MembraneError, NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
@@ -631,7 +632,7 @@ describe('replies to a [Continue] turn', () => {
       const internals = x.framework as any;
       internals.deferredMessages.push({ id: 'render-x', seq: 1, participant: 'editor', forAgent: 'ghost', content: [{ type: 'text', text: 'elsewhere' }], heldAt: Date.now() });
       x.membrane.pushResponse(createMockResponse(signed('sig-c', 'continued reply'), 'end_turn'));
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-x' });
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-x') });
       await x.framework.runUntilIdle();
       internals.deferredMessages.splice(0);
       assert.equal(textOf(x.membrane.calls[1]!.messages.at(-1)!), '[Continue]');

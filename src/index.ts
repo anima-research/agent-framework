@@ -8,6 +8,7 @@ export { Agent } from './agent.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
 export type { PresentationOccasion } from './presentation.js';
+export { covers, coverTest, describeReadMark, markAtOrAfter, type Cover, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';

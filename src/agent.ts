@@ -9,6 +9,7 @@ import { carriedBlock, type SentRow } from './sent-rows.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
+import { covers, markAtOrAfter, readMarkOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
@@ -1110,16 +1111,24 @@ export class Agent {
   }
 
   /**
-   * RFC-006 consumed watermark, per branch: the newest stored message as of
-   * the latest of the agent's creation, a committing compile that returns,
-   * and a tool boundary that injected messages into a live stream declaring
-   * it carries them (`supportsInjectedMessages` true: membrane's native
-   * path, from membrane 0.6.0). A compile counts from when it takes its
-   * value, before it awaits, so one that began before a boundary's mark
-   * doesn't roll the mark back (applyCompileWatermark), and a dry run, such
-   * as previewActivation's, doesn't move it. Each move takes the store's
-   * head, a scalar, so it also covers stored messages the agent wasn't
-   * given, such as another slot's.
+   * RFC-006 consumed watermark, per branch: how far the agent had read as of
+   * the latest of its creation, a committing compile that returns, and a
+   * tool boundary that injected messages into a live stream declaring it
+   * carries them (`supportsInjectedMessages` true: membrane's native path,
+   * from membrane 0.6.0). A compile counts from when it takes its mark,
+   * before it awaits, so one that began before a boundary's mark doesn't
+   * roll the mark back (applyCompileWatermark), and a dry run, such as
+   * previewActivation's, doesn't move it.
+   *
+   * It is a ReadMark (read-marks.ts), read only through `covers`. Once the
+   * agent's context presents rows (#291's presentation index, in presented
+   * mode), it covers exactly the rows in the agent's window as of the mark:
+   * a row stored then and not yet presented to the agent isn't covered.
+   * While the context is in legacy mode, its window is the record, and the
+   * mark covers every row stored on the branch by then, as it always did:
+   * a prefix of the record, so it also covers stored messages the agent
+   * wasn't given, such as another slot's. A mark taken in legacy mode keeps
+   * that meaning after the window is written down.
    *
    * A message above it may still be replaced or withdrawn in place by its
    * sender, though it may already have been in one of the agent's requests.
@@ -1130,30 +1139,31 @@ export class Agent {
    * carries them and its XML path drops them, and either way they stay
    * above it.
    */
-  private consumedWatermark: { branch: string; sequence: number } | null = null;
+  private consumedWatermark: ReadMark | null = null;
   /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
    *  compile that finishes can tell whether one was made while it ran. */
   private watermarkMarks = 0;
   /**
-   * The newest stored message a compile or a tool boundary may have put in
-   * front of the agent, per branch. It moves where the consumed watermark
-   * does, and sooner: when a committing compile takes its value, before it
-   * awaits, and at every tool boundary that injects, whether or not the
-   * stream says it carries injected messages. A message above it may still
-   * have been shown, though: for one, a live stream carries each round's own
-   * content and results, stored at a boundary that injected nothing, into its
-   * next request. A compile that throws assembled nothing, and gives its move
-   * back where it can (unshowFailedCompile). A scalar counts a prefix, so a
-   * message stored below it without having been shown counts as shown, which
-   * errs toward a marker.
+   * How far a compile or a tool boundary may have put the agent's context in
+   * front of it, per branch. It moves where the consumed watermark does,
+   * and sooner: when a committing compile takes its mark, before it awaits,
+   * and at every tool boundary that injects, whether or not the stream says
+   * it carries injected messages. A message above it may still have been
+   * shown, though: for one, a live stream carries each round's own content
+   * and results, stored at a boundary that injected nothing, into its next
+   * request. A compile that throws assembled nothing, and gives its move
+   * back where it can (unshowFailedCompile). A mark taken in legacy mode
+   * counts a prefix of the record, so a message stored below it without
+   * having been shown counts as shown, which errs toward a marker; one taken
+   * in presented mode covers the window as it stood.
    */
-  private shownWatermark: { branch: string; sequence: number } | null = null;
+  private shownWatermark: ReadMark | null = null;
 
-  getConsumedWatermark(): { branch: string; sequence: number } | null {
+  getConsumedWatermark(): ReadMark | null {
     return this.consumedWatermark;
   }
 
-  getShownWatermark(): { branch: string; sequence: number } | null {
+  getShownWatermark(): ReadMark | null {
     return this.shownWatermark;
   }
 
@@ -1165,16 +1175,16 @@ export class Agent {
    * request runs, so a request that fails, ending its stream with an error,
    * leaves this as it was.
    */
-  private answeredWatermark: { branch: string; sequence: number } | null = null;
+  private answeredWatermark: ReadMark | null = null;
 
-  getAnsweredWatermark(): { branch: string; sequence: number } | null {
+  getAnsweredWatermark(): ReadMark | null {
     return this.answeredWatermark;
   }
 
   /** A request that carried `watermark` was answered. Requests are answered
    *  in the order they're sent, and the consumed watermark only advances
    *  within a branch, so the latest is the newest. */
-  markAnswered(watermark: { branch: string; sequence: number } | null): void {
+  markAnswered(watermark: ReadMark | null): void {
     if (watermark) this.answeredWatermark = watermark;
   }
 
@@ -1185,47 +1195,53 @@ export class Agent {
    * draft resend, or a send tool whose channel the framework records), on
    * the branch it was taken on. A wake that carries a channel, unless it's
    * marked ambient (InferenceRequest.ambient), keeps its turn unless the
-   * agent spoke there after reading the write the wake is for. It
+   * agent spoke there after reading the row the wake is for. It
    * lives as long as this Agent: an agent made again starts it empty, and
    * such a wake then stays.
    */
-  private publishedThrough = new Map<string, { branch: string; sequence: number }>();
+  private publishedThrough = new Map<string, ReadMark>();
 
   /** Note a publish into `destination` (its key), made having read through
    *  `readThrough`: the consumed watermark when its words were written, or
-   *  its call made. */
-  notePublished(destination: string, readThrough: { branch: string; sequence: number } | null): void {
+   *  its call made. A later mark on the same branch replaces an earlier one;
+   *  one on another branch replaces whatever was noted. */
+  notePublished(destination: string, readThrough: ReadMark | null): void {
     if (!readThrough) return;
     const noted = this.publishedThrough.get(destination);
-    if (noted && noted.branch === readThrough.branch && noted.sequence >= readThrough.sequence) return;
+    if (noted && markAtOrAfter(noted, readThrough) === true) return;
     this.publishedThrough.set(destination, readThrough);
   }
 
   /** Whether the agent published into `destination` (its key) having read
-   *  the row stored at `sequence` on `branch`. */
-  publishedAfterReading(destination: string, branch: string, sequence: number): boolean {
+   *  `row`, as `cm` (the agent's context, where the row's place in its
+   *  window is read) says: the mark noted for the destination covers it. A
+   *  mark that can't say (one on another branch) says no. */
+  publishedAfterReading(destination: string, row: MarkedRow, cm: MarkCm): boolean {
     const noted = this.publishedThrough.get(destination);
-    return !!noted && noted.branch === branch && noted.sequence >= sequence;
+    return !!noted && covers(noted, cm, row) === 'covered';
   }
 
-  /** Mark everything currently stored as consumed (the agent's creation, at
-   *  boot or later, and a tool boundary that injected messages into a live
-   *  stream declaring it carries them; see consumedWatermark). */
+  /** Mark everything in the agent's window (in legacy mode, everything
+   *  stored) as consumed: the agent's creation, at boot or later, and a tool
+   *  boundary that injected messages into a live stream declaring it carries
+   *  them; see consumedWatermark. */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs). Without a watermark, a reader that looks for one takes its own
     // side: the coalescer counts the message as read, and the framework's
-    // unreadNoticesForPrimary counts it as unread. A deferred write's wake
-    // reads the answered watermark instead (deferredWriteDone).
+    // releasedWindow counts it as unread. A wake for a row it reads
+    // (InferenceRequest.readsRow) reads the answered watermark instead
+    // (rowDone).
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
     this.shownWatermark = this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as possibly shown (a tool boundary
-   *  that injected messages, whatever its stream says it carries). Without
-   *  a watermark the coalescer counts a message as shown, as it counts one
-   *  read without a consumed watermark. */
+  /** Mark everything in the agent's window (in legacy mode, everything
+   *  stored) as possibly shown (a tool boundary that injected messages,
+   *  whatever its stream says it carries). Without a watermark the coalescer
+   *  counts a message as shown, as it counts one read without a consumed
+   *  watermark. */
   markContextShown(): void {
     this.shownWatermark = this.pendingWatermark();
   }
@@ -1239,11 +1255,10 @@ export class Agent {
    *  the second then throws, it restores the first's failed claim. Messages
    *  up to that claim then count as shown, although no request held those
    *  above the watermark the first compile found, which errs toward a marker
-   *  until the next compile or boundary moves the watermark. */
-  private unshowFailedCompile(
-    watermark: { branch: string; sequence: number } | null,
-    before: { branch: string; sequence: number } | null,
-  ): void {
+   *  until the next compile or boundary moves the watermark. Each mark is a
+   *  fresh object (readMarkOf), so the compare by identity is this compile's
+   *  own claim. */
+  private unshowFailedCompile(watermark: ReadMark | null, before: ReadMark | null): void {
     if (watermark && this.shownWatermark === watermark) this.shownWatermark = before;
   }
 
@@ -1254,34 +1269,22 @@ export class Agent {
    * mark's branch, so a boundary's mark is never rolled back by a compile
    * that started before it (a committing compile, such as compileContext's,
    * run during a live turn; a dry run, such as previewActivation's, never
-   * reaches here).
+   * reaches here). Marks are ordered by the store's head, which only grows
+   * on a branch, whatever the context's window mode.
    */
-  private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
+  private applyCompileWatermark(watermark: ReadMark, marksBefore: number): void {
     const current = this.consumedWatermark;
-    if (this.watermarkMarks !== marksBefore && current
-      && (current.branch !== watermark.branch || current.sequence >= watermark.sequence)) return;
+    if (this.watermarkMarks !== marksBefore && current && markAtOrAfter(current, watermark) !== false) return;
     this.consumedWatermark = watermark;
     this.watermarkMarks++;
   }
 
-  /** The watermark a successful compile will establish (taken before, applied after). */
-  private pendingWatermark(): { branch: string; sequence: number } | null {
-    const cm = this.contextManager as Partial<ContextManager>;
-    try {
-      if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return null;
-      // The chronicle head, not this slot's last message: a compile reads
-      // everything stored on the branch so far, including messages merged in
-      // from another slot (the subconscious reads the residents' shared slot).
-      const store = typeof cm.getStore === 'function' ? cm.getStore() as { currentSequence?: () => number } : undefined;
-      let sequence = typeof store?.currentSequence === 'function' ? store.currentSequence() : undefined;
-      if (sequence === undefined) {
-        const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
-        sequence = count > 0 ? cm.getAllMessages().at(-1)?.sequence ?? 0 : 0;
-      }
-      return { branch: cm.currentBranch().name, sequence };
-    } catch {
-      return null;
-    }
+  /** The watermark a successful compile will establish (taken before, applied
+   *  after): where the agent's context stands now (readMarkOf), its window's
+   *  index length with the store's head once it presents rows. Null for a
+   *  context double that can't say. */
+  private pendingWatermark(): ReadMark | null {
+    return readMarkOf(this.contextManager);
   }
 
   /** A committing compile, as for a request that is sent: the context
@@ -1352,8 +1355,16 @@ export class Agent {
    * start and the next (a host's own committing compile, or the compression
    * an over-budget retry waits for) can summarize them all the same: the
    * next request then has the summary's word for them, and the start after
-   * it stores them again, as after any fold. The window is read back 64
-   * rows at a time from the newest, stopping at that point.
+   * it stores them again, as after any fold. The slot's record is read
+   * back 64 rows at a time from the newest, stopping at that point.
+   *
+   * It reads the record, by sequence, not the agent's window, and that
+   * holds once the context presents rows (#291): the rows it counts are
+   * this agent's own stored injections, its own rows, which enter its
+   * window as they are written, so one stored after the point is in no
+   * request yet whatever else has been stored or presented since. Another
+   * agent's rows, stored into a shared slot at once rather than queued, are
+   * passed over, whatever they are.
    */
   unsentInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
     let newest: { contentHash: string; parts: number; held: Set<number> } | undefined;

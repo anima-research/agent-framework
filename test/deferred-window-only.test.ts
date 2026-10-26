@@ -53,6 +53,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { heldHandle } from '../src/held-writes.js';
+import { markAtOrAfter } from '../src/read-marks.js';
 import { AutobiographicalStrategy, MalformedContentError } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -2214,7 +2215,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.deepEqual(agent.getConsumedWatermark(), marked, "the boundary's mark stands");
     (cm as unknown as { compile: typeof compile }).compile = compile;
     await agent.compileContext();
-    assert.ok(agent.getConsumedWatermark()!.sequence >= marked!.sequence, 'a later compile still advances it');
+    assert.equal(markAtOrAfter(agent.getConsumedWatermark()!, marked!), true, 'a later compile still advances it');
     await framework.stop();
   });
 

@@ -130,11 +130,16 @@ interface PendingEvent {
 }
 
 /** Where the host put a message the gate wrote: the agent whose window it
- *  went to and, when it was held for that agent's live turn, the id it waits
- *  under in the host's queue. */
+ *  went to; its stored id, once stored; when it was held for that agent's
+ *  live turn, the id it waits under in the host's queue; and `presented:
+ *  false` when it was stored and not presented to the agent, whose turn was
+ *  alive (#291's presentation index). The host marks the wake that goes
+ *  with it from these. */
 export interface WritePlacement {
   agent?: string;
+  messageId?: string;
   deferredId?: string;
+  presented?: false;
 }
 
 /**

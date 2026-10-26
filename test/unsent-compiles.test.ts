@@ -19,6 +19,7 @@ import type { Membrane } from '@animalabs/membrane';
 import { AgentFramework, ApiServer } from '../src/index.js';
 import { Agent } from '../src/agent.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { covers } from '../src/read-marks.js';
 
 async function make(agent: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'unsent-compiles-'));
@@ -72,7 +73,7 @@ describe('compiles that are never sent', () => {
       // The control: a request that is sent assembled it, so it's read.
       await agent.buildActivationRequest([]);
       const sequence = agent.getContextManager().getMessage(id)!.sequence;
-      assert.ok((agent.getConsumedWatermark()?.sequence ?? -1) >= sequence, 'a sent request moves the watermark past what it assembled');
+      assert.equal(covers(agent.getConsumedWatermark(), agent.getContextManager(), { id, sequence }), 'covered', 'a sent request moves the watermark past what it assembled');
     } finally { await x.close(); }
   });
 

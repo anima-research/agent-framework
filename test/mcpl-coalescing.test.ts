@@ -18,6 +18,8 @@ import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.
 import { fixture, eventually, settles, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
+import { heldHandle } from '../src/held-writes.js';
+import { coverTest, readMarkForTest, type ReadMark } from '../src/read-marks.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -1195,7 +1197,7 @@ test('an assembly for an agent outside the audience of a batch another assembly 
 // another agent's queue (a turn with nothing to read never reaches the model)
 // ---------------------------------------------------------------------------
 
-type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; readsDeferredWrite?: string; channelId?: string };
+type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; readsRow?: string; channelId?: string };
 
 type TurnInternals = {
   startAgentStream: (...a: unknown[]) => Promise<unknown>;
@@ -1726,30 +1728,32 @@ test("a wake to read a render neither carries its mark into a merge with other c
   const wake = (extra: Partial<Wake> = {}): Wake => ({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), ...extra });
   // Parked while quiesced, wakes are kept newest by key; a wake to read the
   // render keys apart from a plain push wake, so neither absorbs the other.
+  // A render still queued is named by its held handle (InferenceRequest.readsRow).
+  const [render1, render2] = [heldHandle('render-1'), heldHandle('render-2')];
   internals.quiesced = true;
   try {
-    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake(), wake({ readsDeferredWrite: 'render-2' }));
+    internals.pendingRequests.push(wake({ readsRow: render1 }), wake(), wake({ readsRow: render2 }));
     await settles(internals.processInferenceRequests(), 'the parked pass');
-    assert.deepEqual(internals.pendingRequests.map((r) => r.readsDeferredWrite), ['render-1', undefined, 'render-2'], 'each wake stays parked, those reading different renders included');
+    assert.deepEqual(internals.pendingRequests.map((r) => r.readsRow), [render1, undefined, render2], 'each wake stays parked, those reading different renders included');
   } finally {
     internals.quiesced = false;
   }
   // Merged into one turn, the trigger keeps the mark only when every wake
   // has it. The wake to read the render comes first, so it is the trigger.
-  const triggers: Array<{ readsDeferredWrite?: string }> = [];
+  const triggers: Array<{ readsRow?: string }> = [];
   const start = internals.startAgentStream;
-  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger as { readsDeferredWrite?: string }); return undefined; };
+  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger as { readsRow?: string }); return undefined; };
   try {
     await settles(internals.processInferenceRequests(), 'the merged pass');
-    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }));
+    internals.pendingRequests.push(wake({ readsRow: render1 }), wake({ readsRow: render2 }));
     await settles(internals.processInferenceRequests(), 'the pass of two renders');
-    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }));
+    internals.pendingRequests.push(wake({ readsRow: render1 }));
     await settles(internals.processInferenceRequests(), 'the lone pass');
   } finally {
     internals.startAgentStream = start;
     internals.deferredMessages.splice(0);
   }
-  assert.deepEqual(triggers.map((r) => r.readsDeferredWrite), [undefined, undefined, 'render-1'], 'merged with a plain wake, or one reading another render, it drops the mark; alone it keeps it');
+  assert.deepEqual(triggers.map((r) => r.readsRow), [undefined, undefined, render1], 'merged with a plain wake, or one reading another render, it drops the mark; alone it keeps it');
 });
 
 test("a wake to read a render starts its turn until the render's row is at or below the watermark of the agent's answered requests on the current branch", async (t) => {
@@ -1758,13 +1762,16 @@ test("a wake to read a render starts its turn until the render's row is at or be
     deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
   };
   const agent = f.framework.getAgent('agent')! as unknown as {
-    getContextManager(): { getAllMessages(): Array<{ sequence: number; metadata?: { deferredWriteId?: string } }>; currentBranch(): { name: string } };
-    getAnsweredWatermark(): { branch: string; sequence: number } | null;
-    answeredWatermark: { branch: string; sequence: number } | null;
+    getContextManager(): { getAllMessages(): Array<{ id: string; sequence: number; metadata?: { deferredWriteId?: string } }>; currentBranch(): { name: string } };
+    getAnsweredWatermark(): ReadMark | null;
+    answeredWatermark: ReadMark | null;
   };
+  // A legacy-mode mark (no index length) at a row's sequence on the current
+  // branch: the store's head when that row was the newest.
+  const markAt = (sequence: number): ReadMark => readMarkForTest(agent.getContextManager().currentBranch().name, sequence, null);
   // A render placed in the agent's queue lands in its store, as a flush
   // stores it, while its wake to read it waits.
-  const land = (id: string): { sequence: number } => {
+  const land = (id: string): { id: string; sequence: number } => {
     internals.deferredMessages.push({ id, seq: 1, participant: 'editor', content: [{ type: 'text', text: `${id}_text` }], heldAt: Date.now() });
     internals.readdDrained(internals.drainDeferredFor('agent'), `${id} lands`);
     internals.ackDeferredWrites();
@@ -1774,7 +1781,7 @@ test("a wake to read a render starts its turn until the render's row is at or be
   };
   // The pass starts whatever turns are left.
   const pass = async (id: string): Promise<number> => {
-    internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: id });
+    internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle(id) });
     let started = 0;
     const start = internals.startAgentStream;
     internals.startAgentStream = async () => { started++; return undefined; };
@@ -1789,17 +1796,17 @@ test("a wake to read a render starts its turn until the render's row is at or be
   // was answered. (The agent's creation answers nothing, so without this the
   // pass would read no watermark at all.)
   const before = land('render_before');
-  agent.answeredWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: before.sequence };
+  agent.answeredWatermark = markAt(before.sequence);
   land('render_0');
   assert.equal(await pass('render_0'), 1, 'above the watermark on its branch, the wake starts the turn');
   // At the watermark itself: read, as a compile whose newest row it was.
   const atMark = land('render_at');
-  agent.answeredWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: atMark.sequence };
+  agent.answeredWatermark = markAt(atMark.sequence);
   assert.equal(await pass('render_at'), 0, 'at the watermark on its branch, the wake starts no turn');
   // Below it: read, by a compile that read what followed it too.
   land('render_below');
   const after = land('render_after');
-  agent.answeredWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: after.sequence };
+  agent.answeredWatermark = markAt(after.sequence);
   assert.equal(await pass('render_below'), 0, 'below the watermark on its branch, the wake starts no turn');
   // Drained from the queue but not yet stored: still queued.
   const pendingWrite = { id: 'render_drained', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'render_drained_text' }], heldAt: Date.now() };
@@ -1810,14 +1817,14 @@ test("a wake to read a render starts its turn until the render's row is at or be
   // judged by its row.
   const unsynced = land('render_unsynced');
   (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.push({ ...pendingWrite, id: 'render_unsynced' });
-  agent.answeredWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: unsynced.sequence };
+  agent.answeredWatermark = markAt(unsynced.sequence);
   assert.equal(await pass('render_unsynced'), 0, 'stored and read, though not yet synced, the wake starts no turn');
   (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.splice(0);
   // With no watermark (a store that couldn't be read when it was taken): in doubt.
   const noMark = land('render_null');
   agent.answeredWatermark = null;
   assert.equal(await pass('render_null'), 1, 'with no watermark, the wake starts the turn');
-  agent.answeredWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: noMark.sequence };
+  agent.answeredWatermark = markAt(noMark.sequence);
   await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
   await f.framework.runUntilIdle();
   // An operator's undo switches the store to a new branch; the watermark of
@@ -1827,15 +1834,18 @@ test("a wake to read a render starts its turn until the render's row is at or be
   f.framework.undoLastTurn('agent');
   const afterUndo = land('render_1');
   const mark = agent.getAnsweredWatermark();
-  assert(mark && mark.branch !== agent.getContextManager().currentBranch().name && afterUndo.sequence <= mark.sequence,
-    `the watermark ${JSON.stringify(mark)} is on another branch, at or past the render's row (${afterUndo.sequence})`);
+  // Read across no branch point, the mark covers the row: its head is at or
+  // past the row's sequence.
+  const atOrPast = coverTest(mark, f.framework.getAgent('agent')!.getContextManager(), { partAt: Number.POSITIVE_INFINITY });
+  assert(mark && mark.branch !== agent.getContextManager().currentBranch().name && atOrPast(afterUndo) === 'covered',
+    `the watermark is on another branch, at or past the render's row (${afterUndo.sequence})`);
   assert.equal(await pass('render_1'), 1, 'with the watermark on another branch, the wake starts the turn');
 });
 
 test("a render's wake to read it is marked ambient only when the coalescer says every notice it folds was", async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
   const internals = f.framework as unknown as {
-    pendingRequests: Array<{ ambient?: true; addressed?: boolean; readsDeferredWrite?: string }>;
+    pendingRequests: Array<{ ambient?: true; addressed?: boolean; readsRow?: string }>;
     pushCoalescer?: { host: CoalescerHost<unknown> };
   };
   // Through the framework's own host for its coalescer, as the coalescer calls it.
@@ -1849,9 +1859,9 @@ test("a render's wake to read it is marked ambient only when the coalescer says 
       retract: false, deferred: true, initial: false, content: [],
       ...(tags ? { tags: [...tags] } : {}),
       event: { lane: 'push', event: { triggerInference: true, origin: {} } },
-    } as unknown as CoalescedOccurrence<unknown>, 'agent', 'render-x', allAmbient);
+    } as unknown as CoalescedOccurrence<unknown>, { agent: 'agent', deferredId: 'render-x' }, allAmbient);
     assert.equal(internals.pendingRequests.length, 1, 'one wake to read the render');
-    assert.equal(internals.pendingRequests[0]!.readsDeferredWrite, 'render-x');
+    assert.equal(internals.pendingRequests[0]!.readsRow, heldHandle('render-x'), "the render's held handle, while it is queued");
     assert.equal(internals.pendingRequests[0]!.ambient, ambient, `latest tags ${JSON.stringify(tags)}, all ambient ${allAmbient}`);
   }
 });
@@ -1866,7 +1876,7 @@ test("a deferred batch is all ambient only while every notice folded into it was
     isUnread: () => true, isUnshown: () => true, remove: () => true,
     // Every delivery lands in the deferred queue of an agent whose turn is alive.
     deliver: async (occ) => ({ agent: 'other', deferredId: `deferred-${occ.eventId}` }),
-    wakeForBatch: async () => {}, wakeToRead: async (occ, _agent, _id, allAmbient) => { seen.set(occ.key, allAmbient); },
+    wakeForBatch: async () => {}, wakeToRead: async (occ, _placement, allAmbient) => { seen.set(occ.key, allAmbient); },
     cancelWake: () => {}, authorized: () => true,
     audience: async () => ['other'],
     render: async () => {
@@ -1966,8 +1976,8 @@ test("a wake to read a render that carries a channel starts its turn until the a
   };
   const agent = f.framework.getAgent('agent')! as unknown as {
     getContextManager(): { getAllMessages(): Array<{ sequence: number; metadata?: { deferredWriteId?: string } }>; currentBranch(): { name: string } };
-    answeredWatermark: { branch: string; sequence: number } | null;
-    notePublished(destination: string, readThrough: { branch: string; sequence: number } | null): void;
+    answeredWatermark: ReadMark | null;
+    notePublished(destination: string, readThrough: ReadMark | null): void;
   };
   internals.deferredMessages.push({ id: 'render_room', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'render_room_text' }], heldAt: Date.now() });
   internals.readdDrained(internals.drainDeferredFor('agent'), 'render_room lands');
@@ -1975,10 +1985,12 @@ test("a wake to read a render that carries a channel starts its turn until the a
   const row = agent.getContextManager().getAllMessages().find((m) => m.metadata?.deferredWriteId === 'render_room');
   assert(row, 'the render landed on the current branch');
   const branch = agent.getContextManager().currentBranch().name;
-  agent.answeredWatermark = { branch, sequence: row.sequence };
+  // Legacy-mode marks (no index length), by branch and the store's head.
+  const at = (onBranch: string, sequence: number): ReadMark => readMarkForTest(onBranch, sequence, null);
+  agent.answeredWatermark = at(branch, row.sequence);
   const pass = async (tagged?: 'addressed' | 'ambient' | 'untagged'): Promise<number> => {
     internals.pendingRequests.push({
-      agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), channelId: 'editor:room', readsDeferredWrite: 'render_room',
+      agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), channelId: 'editor:room', readsRow: heldHandle('render_room'),
       ...(tagged === 'addressed' ? { addressed: true } : tagged === 'ambient' ? { addressed: false, ambient: true } : tagged === 'untagged' ? { addressed: false } : {}),
     });
     let started = 0;
@@ -2000,24 +2012,24 @@ test("a wake to read a render that carries a channel starts its turn until the a
   // Neither tag is doubt: such a render waits for an answer, as an
   // addressed one does.
   assert.equal(await pass('untagged'), 1, 'with neither tag, read but not answered in its channel, the wake starts the turn');
-  agent.notePublished(room, { branch, sequence: row.sequence - 1 });
+  agent.notePublished(room, at(branch, row.sequence - 1));
   assert.equal(await pass(), 1, 'answered in its channel only before reading it, the wake starts the turn');
-  agent.notePublished(destinationKey({ serverId: 'editor', channelId: 'editor:general' }), { branch, sequence: row.sequence });
+  agent.notePublished(destinationKey({ serverId: 'editor', channelId: 'editor:general' }), at(branch, row.sequence));
   assert.equal(await pass(), 1, 'spoken in another channel having read it, the wake starts the turn');
-  agent.notePublished(destinationKey({ serverId: 'other', channelId: 'editor:room' }), { branch, sequence: row.sequence });
+  agent.notePublished(destinationKey({ serverId: 'other', channelId: 'editor:room' }), at(branch, row.sequence));
   assert.equal(await pass(), 1, "spoken in another server's channel of the same id, the wake starts the turn");
-  agent.notePublished(room, { branch, sequence: row.sequence });
+  agent.notePublished(room, at(branch, row.sequence));
   assert.equal(await pass(), 0, 'spoken in its channel having read it, the wake starts no turn');
-  agent.notePublished(room, { branch, sequence: row.sequence - 1 });
+  agent.notePublished(room, at(branch, row.sequence - 1));
   assert.equal(await pass(), 0, "an earlier round's words landing later leave the newer publish standing");
-  agent.notePublished(room, { branch: `${branch}-other`, sequence: row.sequence + 5 });
+  agent.notePublished(room, at(`${branch}-other`, row.sequence + 5));
   assert.equal(await pass(), 1, 'spoken there last on another branch, the wake starts the turn');
-  agent.notePublished(room, { branch, sequence: row.sequence });
+  agent.notePublished(room, at(branch, row.sequence));
   assert.equal(await pass(), 0, 'spoken there again on this branch having read it, the wake starts no turn');
   // A publish on another branch replaces the record whatever its sequence,
   // since a branch an undo made can carry lower sequences than the one it
   // left.
-  agent.notePublished(room, { branch: `${branch}-other`, sequence: row.sequence - 3 });
+  agent.notePublished(room, at(`${branch}-other`, row.sequence - 3));
   assert.equal(await pass(), 1, 'spoken there last on another branch at a lower sequence, the wake starts the turn');
 });
 
@@ -2039,13 +2051,13 @@ test("a turn a wake to read a render started, held by a provider hold, is retrie
   // A render waits in the agent's queue with its wake to read it; the turn
   // the wake starts stores it at its start and compiles it.
   internals.deferredMessages.push({ id: 'render-1', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'queued_render' }], heldAt: Date.now() });
-  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-1' });
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-1') });
   await settles(f.framework.runUntilIdle(), 'the turn that meets the limit');
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('queued_render'), 'its request read the render');
   const hold = internals.providerAccelerationCooldowns.get('agent');
   assert.equal(hold?.heldRequests.length, 1, "the turn's trigger is held");
-  assert.equal(hold!.heldRequests[0].readsDeferredWrite, undefined, 'as an ordinary wake, without the mark');
+  assert.equal(hold!.heldRequests[0].readsRow, undefined, 'as an ordinary wake, without the mark');
   hold!.until = Date.now();
   internals.releaseProviderAccelerationCooldown('agent');
   await settles(f.framework.runUntilIdle(), 'the retry');
@@ -2063,7 +2075,7 @@ test("a wake to read a render starts its turn when the store can't say whether t
   const scanning = f.framework as unknown as { landedPositions?: unknown };
   scanning.landedPositions = () => { throw new Error('a blob the store names is missing, and the scan failed too'); };
   t.after(() => { delete scanning.landedPositions; });
-  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-1' });
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-1') });
   const triggers: unknown[] = [];
   const start = internals.startAgentStream;
   internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger); return undefined; };
@@ -2085,7 +2097,7 @@ test("a wake to read a render that's gone is dropped from a pass whose other wak
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as TurnInternals;
   internals.pendingRequests.push(
-    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-gone' },
+    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-gone') },
     { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
   const triggers: Wake[] = [];
   const start = internals.startAgentStream;
@@ -2099,7 +2111,7 @@ test("a wake to read a render that's gone is dropped from a pass whose other wak
     console.error = error;
     internals.startAgentStream = start;
   }
-  assert.deepEqual(triggers.map((r) => [r.reason, r.readsDeferredWrite]), [['heartbeat', undefined]], 'the turn starts for the heartbeat alone');
+  assert.deepEqual(triggers.map((r) => [r.reason, r.readsRow]), [['heartbeat', undefined]], 'the turn starts for the heartbeat alone');
   assert(errors.some((e) => e.includes('dropped 1 wake(s)')), `the drop is logged: ${JSON.stringify(errors)}`);
 });
 
@@ -2132,7 +2144,7 @@ test("a provider recovery whose released wakes start no turn ends and reopens au
     return admitted;
   };
   // Under a policy that would start a turn for anything, even no cause.
-  assert.equal(await releaseThenPass(true, { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-gone' }),
+  assert.equal(await releaseThenPass(true, { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-gone') }),
     true, "a gone render's wake: the parked auxiliary call is admitted");
   assert.equal(await releaseThenPass(false, { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() }),
     true, 'a wake the policy drops: the parked auxiliary call is admitted');
@@ -2143,7 +2155,7 @@ test("a provider recovery whose released wakes start no turn ends and reopens au
   gate.primaryPending = true;
   internals.providerAccelerationRecoveries.set('agent', { startedAt: Date.now(), failures: 1, heldRequests: 2, reason: 'held', releasedAt: Date.now() });
   internals.pendingRequests.push(
-    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-gone' },
+    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-gone') },
     { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
   let started = 0;
   const start = internals.startAgentStream;
@@ -2172,12 +2184,12 @@ test("a provider hold keeps a wake to read a render, a batch wake, a batch-only 
   // subject: only its subjects tell it from an ordinary wake, or from a
   // merge of other batches.
   const merged = wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'notes'] });
-  internals.pendingRequests.push(merged, wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }),
+  internals.pendingRequests.push(merged, wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsRow: heldHandle('render-1') }), wake({ readsRow: heldHandle('render-2') }),
     wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'other'] }));
   await settles(internals.processInferenceRequests(), 'the held pass');
   const held = internals.providerAccelerationCooldowns.get('agent')?.heldRequests ?? [];
-  assert.deepEqual(held.map((r) => [r.coalescingSubject, r.coalescingBatchSubjects?.join(','), r.readsDeferredWrite]),
-    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, 'render-1'], [undefined, undefined, 'render-2'], [undefined, 'doc,other', undefined]],
+  assert.deepEqual(held.map((r) => [r.coalescingSubject, r.coalescingBatchSubjects?.join(','), r.readsRow]),
+    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, heldHandle('render-1')], [undefined, undefined, heldHandle('render-2')], [undefined, 'doc,other', undefined]],
     'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 

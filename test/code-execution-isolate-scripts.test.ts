@@ -13,6 +13,7 @@ import { ChildCapacity, type CallAnswer } from '../src/code-execution/isolate/ru
 import { AgentScripts, ScriptRefusal, type ScriptCallContext, type ScriptsConfig, type ScriptsHost } from '../src/code-execution/isolate/scripts.js';
 import { renderOutput } from '../src/code-execution/isolate/output.js';
 import { fireNextYieldAsSet } from './helpers/capture-timers.js';
+import { readMarkForTest } from '../src/read-marks.js';
 
 // With this file's own extension, as the runner names its entry, so the runtime runs a file that exists.
 const FAKE_CHILD = fileURLToPath(new URL(`./helpers/fake-child-entry${extname(fileURLToPath(import.meta.url))}`, import.meta.url));
@@ -312,7 +313,8 @@ test("a script's calls carry the turn its run was made in, and what its agent ha
     },
   });
   // The run returns at once, and the script goes on; a later turn waits on it.
-  const atStart = { branch: 'main', sequence: 3 };
+  // A read mark is opaque (read-marks.ts, #291): the scripts pass it through untouched.
+  const atStart = readMarkForTest('main', 3, null);
   const run = await scripts.run('alice', `await tools.slow({}); await tools.echo({});`, 0, { watch: { turnId: 7, endTurn: false }, startReadThrough: atStart });
   for (let i = 0; i < 2_000 && gates.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
   const waiting = scripts.wait('alice', run.scriptId, 30_000, { turnId: 9, endTurn: false });
@@ -322,7 +324,7 @@ test("a script's calls carry the turn its run was made in, and what its agent ha
   const echo = contexts.find((c) => c.name === 'echo');
   assert.equal(echo?.watch?.turnId, 9, 'the call carries the turn watching it');
   assert.equal(echo?.startTurnId, 7, 'and the turn its script was started in');
-  assert.deepEqual(echo?.startReadThrough, atStart, 'and what its agent had read when it started');
+  assert.equal(echo?.startReadThrough, atStart, 'and what its agent had read when it started');
   await scripts.dispose();
 });
 

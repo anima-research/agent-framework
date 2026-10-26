@@ -204,6 +204,7 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn } from './presentation.js';
+import { coverTest, covers, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
@@ -787,7 +788,7 @@ const utilityOneLiner = (description: string): string => {
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
-import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
+import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText, type WritePlacement } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -3580,7 +3581,7 @@ export class AgentFramework {
    *  consumed watermark its agent had when the run call started it, which a
    *  publish the call makes is credited with (publishReadThrough). Kept only
    *  while the dispatch runs (dispatchScriptToolCall). */
-  private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: { branch: string; sequence: number } | null }>();
+  private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: ReadMark | null }>();
   /** Per agent, the unexpected thinking drops its last operator alert counted (noteThinkingLoss). */
   private readonly thinkingLossIncidents = new ThinkingLossIncidents();
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
@@ -4110,7 +4111,7 @@ export class AgentFramework {
         requestInference: (agentName, reason, source, provenance, after) => {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
-            ...framework.readsDeferredFor(after, agentName),
+            ...framework.readsRowFor(after, agentName),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
             // as TELEMETRY fields — the host's stamp reads them.
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
@@ -5350,7 +5351,7 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsDeferredWrite === b.readsDeferredWrite &&
+      a.readsRow === b.readsRow &&
       (a.wakeLines ?? []).map(wakeLineKey).join('\n') === (b.wakeLines ?? []).map(wakeLineKey).join('\n');
   }
   /** Keep `request` among a hold's `held` requests, once by
@@ -15185,7 +15186,7 @@ export class AgentFramework {
     // Add messages. Only the framework writes the inbound envelope: one a
     // module's metadata carries (echoed from a server's event, say) is
     // dropped, and a surface event's messages carry the framework's own.
-    // The wakes below go by the one message a response adds (readsDeferredFor).
+    // The wakes below go by the one message a response adds (readsRowFor).
     // A wake for several stays plain, and so does one for a channel's
     // message (its metadata, or its event's, names the channel), or for
     // console or API input: conversation, whose answer the module or the
@@ -15199,7 +15200,7 @@ export class AgentFramework {
     // inbound in its slot: the agents `true` wakes there. A message that
     // carries a tune-out's hold is for nobody, whatever the request.
     const requested = this.requestedAudience(response.requestInference);
-    let added: { agent?: string; deferredId?: string } | undefined;
+    let added: WritePlacement | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
@@ -15209,7 +15210,7 @@ export class AgentFramework {
           metadata = rest;
         }
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
-        const placement: { agent?: string; deferredId?: string } = {};
+        const placement: WritePlacement = {};
         const audience = requested && !heldFromResidents(metadata) ? requested : undefined;
         const id = this.addMessage(msg.participant, msg.content, metadata, { placement, ...(audience ? { audience } : {}) });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
@@ -15269,7 +15270,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            ...this.readsDeferredFor(added, agentName),
+            ...this.readsRowFor(added, agentName),
           });
         }
       }
@@ -15584,7 +15585,7 @@ export class AgentFramework {
           addressed,
           ...ambientMark(event.tags),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
-          ...this.readsDeferredFor(placement, agentName),
+          ...this.readsRowFor(placement, agentName),
         });
       }
     }
@@ -16506,7 +16507,9 @@ export class AgentFramework {
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
-      wakeToRead: (occ, agentName, deferredId, allAmbient) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }, true, deferredId, allAmbient),
+      wakeToRead: (occ, placement, allAmbient) => this.queueCoalescedWakes(
+        { ...occ, deliverTo: placement.agent }, true, this.readsRowFor(placement, placement.agent).readsRow, allAmbient,
+      ),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -16935,9 +16938,10 @@ export class AgentFramework {
   /** Queue a wake for each agent of the batch's audience, when its latest
    *  occurrence triggers inference. `plain`: an ordinary push wake, without
    *  the subject a withdrawal of the batch's wakes goes by, for a render
-   *  placed in its agent's deferred queue (wakeToRead), at `readsDeferredWrite`,
-   *  marked ambient when every notice the render folds was (`allAmbient`). */
-  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsDeferredWrite?: string, allAmbient = false): Promise<void> {
+   *  its turn being assembled doesn't read (wakeToRead), reading `readsRow`
+   *  (readsRowFor), marked ambient when every notice the render folds was
+   *  (`allAmbient`). */
+  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsRow?: string, allAmbient = false): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const push = occ.event.event;
@@ -16984,9 +16988,9 @@ export class AgentFramework {
         addressed: isAddressedMessage(occ.tags),
         // A render folds the batch's every notice, so it asks nothing of the
         // agent only when each of them was marked ambient, not the latest
-        // alone; only its wake is judged by what was read (readsDeferredWrite).
+        // alone; only its wake is judged by what was read (readsRow).
         ...(plain && allAmbient ? { ambient: true as const } : {}),
-        ...(plain ? (readsDeferredWrite ? { readsDeferredWrite } : {}) : { coalescingSubject: subject, coalescingBatch: true }),
+        ...(plain ? (readsRow ? { readsRow } : {}) : { coalescingSubject: subject, coalescingBatch: true }),
       });
     }
   }
@@ -17014,24 +17018,25 @@ export class AgentFramework {
 
   /**
    * A placement in the deferred queue is upgraded in place once the flush has
-   * stored it: the stored copy carries `metadata.deferredWriteId`, found by
-   * scanning the unread tail (above the watermark) — never below it.
+   * stored it: the stored copy carries `metadata.deferredWriteId` (landedRow),
+   * and it is taken only while the agent's consumed watermark doesn't cover
+   * it, so a copy the agent has read, or one a mark can't say of (no mark,
+   * or one on another branch), stays unresolved and reads as read.
    */
   private resolvePlacement(p: CoalescingPlacement): void {
     if (!p.deferredId || this.deferredMessages.some((m) => m.id === p.deferredId)) return;
     const agent = this.agents.get(p.agent);
     if (!agent) return;
     const cm = agent.getContextManager();
-    const watermark = agent.getConsumedWatermark();
-    const floor = watermark && watermark.branch === cm.currentBranch().name ? watermark.sequence : Number.POSITIVE_INFINITY;
-    const all = cm.getAllMessages();
-    for (let i = all.length - 1; i >= 0 && all[i].sequence > floor; i--) {
-      if (all[i].metadata?.deferredWriteId === p.deferredId) {
-        p.messageId = all[i].id;
-        delete p.deferredId;
-        return;
-      }
+    let row: StoredMessage | null;
+    try {
+      row = this.landedRow(cm, p.deferredId);
+    } catch {
+      return;
     }
+    if (!row || covers(agent.getConsumedWatermark(), cm, row) !== 'not-covered') return;
+    p.messageId = row.id;
+    delete p.deferredId;
   }
 
   /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
@@ -17049,11 +17054,15 @@ export class AgentFramework {
   }
 
   /**
-   * Unread = stored, above the agent's consumed watermark on the current
-   * branch, not a body-group shard (immutable), and not folded into any
-   * summary (compression is consumption, §3.3). Conservative on every doubt.
-   * By the shown watermark (Agent.getShownWatermark), the same test says the
-   * message may never have been shown.
+   * Unread = stored, not covered by the consumed watermark of any agent that
+   * reads it (Agent.getConsumedWatermark, read in that agent's own context:
+   * in its window as of the mark once the context presents rows, else at or
+   * below the mark on the branch), not a body-group shard (immutable), and
+   * not folded into any reader's summary (compression is consumption,
+   * §3.3). Conservative on every doubt: a reader whose mark can't say (none,
+   * or one on another branch) counts it read. By the shown watermark
+   * (Agent.getShownWatermark), the same test says the message may never
+   * have been shown.
    */
   private isUnreadStoredMessage(agent: Agent, messageId: MessageId, by: 'consumed' | 'shown' = 'consumed'): boolean {
     const cm = agent.getContextManager();
@@ -17069,12 +17078,16 @@ export class AgentFramework {
     // slot. A row in an isolated slot, the subconscious's own included, is
     // its owner's alone. A tune-out-diverted message never enters a
     // resident's compiled view; only the subconscious reads it through its
-    // merged view — no subconscious, nobody reads it.
+    // merged view — no subconscious, nobody reads it. Once windows are
+    // presented (#291), an agent whose window holds the row reads it too
+    // (the presentation index's holders, a reader fork's framing among
+    // them), whoever the slot's readers are; an agent the row was never
+    // presented to is judged by its own window all the same, where its mark
+    // doesn't cover the row.
     let readers: Agent[];
     if (heldFromResidents(message.metadata as Record<string, unknown> | undefined)) {
       const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
-      if (!subconscious) return true;
-      readers = [subconscious];
+      readers = subconscious ? [subconscious] : [];
     } else {
       const slot = this.registry.ownSlotOf(agent.name);
       readers = slot
@@ -17083,14 +17096,15 @@ export class AgentFramework {
             .filter((reader): reader is Agent => reader !== undefined)
         : [agent];
     }
-    const branch = cm.currentBranch().name;
+    for (const holder of this.windowHolders(messageId)) if (!readers.includes(holder)) readers.push(holder);
+    if (readers.length === 0) return true;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
     for (const reader of readers) {
+      const rcm = reader.getContextManager();
       const watermark = by === 'shown' ? reader.getShownWatermark() : reader.getConsumedWatermark();
-      if (!watermark || watermark.branch !== branch || message.sequence <= watermark.sequence) return false;
+      if (covers(watermark, rcm, message) !== 'not-covered') return false;
       // Compression is consumption (§3.3): folded into any reader's summary.
       try {
-        const rcm = reader.getContextManager();
         const strategy = rcm.getStrategy() as { getSummary?: (id: string) => { sourceIds?: string[]; sourceLevel?: number } | null };
         for (const summary of rcm.getSummariesInRange({ fromMs: ts, toMs: ts })) {
           const entry = strategy.getSummary?.(summary.id);
@@ -17101,6 +17115,39 @@ export class AgentFramework {
       }
     }
     return true;
+  }
+
+  /**
+   * The live agents whose presented window holds a row (the presentation
+   * index's holders, #291, leaving out a window that is still the whole
+   * record): each one's own place for it, or a reader fork's framing.
+   * None while the index is off, or when it can't be read.
+   */
+  private windowHolders(messageId: MessageId): Agent[] {
+    if (!this.presentation) return [];
+    try {
+      return this.presentation.holders(messageId)
+        .filter((holder) => holder.via !== 'legacy')
+        .map((holder) => this.agents.get(holder.agent))
+        .filter((holder): holder is Agent => holder !== undefined);
+    } catch (err) {
+      console.error(`[presentation] could not read which windows hold ${messageId}:`, err);
+      return [];
+    }
+  }
+
+  /** Whether any live agent's presented window holds a row, or a reader
+   *  fork was handed it as framing (the presentation index's
+   *  presentedToAnyone, #291): false while the index is off, and true when
+   *  it can't be read, so a row that may be in a window isn't removed. */
+  private presentedToAnyone(messageId: MessageId): boolean {
+    if (!this.presentation) return false;
+    try {
+      return this.presentation.presentedToAnyone(messageId);
+    } catch (err) {
+      console.error(`[presentation] could not read whether a window holds ${messageId}, so it stays:`, err);
+      return true;
+    }
   }
 
   private removePlacement(p: CoalescingPlacement): boolean {
@@ -17119,6 +17166,10 @@ export class AgentFramework {
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
+    // A row a presented window holds stays (#291): a window only grows, and
+    // the agent it was presented to may have had it in a request whatever
+    // its mark says. The coalescer then places the newer occurrence after it.
+    if (this.presentedToAnyone(p.messageId as MessageId)) return false;
     try {
       removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
@@ -17298,7 +17349,7 @@ export class AgentFramework {
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
-          ...this.readsDeferredFor(placement, agentName),
+          ...this.readsRowFor(placement, agentName),
         });
       }
     }
@@ -17602,7 +17653,7 @@ export class AgentFramework {
           // and a wake for a deferred write is dropped once the agent is
           // done with that write: neither may absorb an unrelated wake that
           // would vanish with it.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's
@@ -17675,18 +17726,19 @@ export class AgentFramework {
         continue;
       }
 
-      // A wake whose sole cause was a write deferred for this agent
-      // (readsDeferredWrite) has nothing left to do once a request that
-      // carried that write was answered and, if the wake carries a channel
-      // and isn't marked ambient, the agent has published there since, or
-      // once the write is gone from the queue and the store's current
-      // branch: it starts no turn (deferredWriteDone). A wake is marked
+      // A wake whose sole cause was a row not presented to this agent at its
+      // write, deferred for it or stored during its turn (readsRow), has
+      // nothing left to do once a request that carried that row was
+      // answered and, if the wake carries a channel and isn't marked
+      // ambient, the agent has published there since, or once the row is
+      // gone from the queue and the store's current branch: it starts no
+      // turn (rowDone). A wake is marked
       // ambient when its message's server tagged it chat:ambient, or for a
       // render, every notice the render stands for: such a message asked
       // nothing of the agent, so reading it was all its wake was for. One
       // with neither tag is judged as addressed.
-      const read = requests.filter((r) => r.readsDeferredWrite !== undefined
-        && this.deferredWriteDone(agent, r.readsDeferredWrite,
+      const read = requests.filter((r) => r.readsRow !== undefined
+        && this.rowDone(agent, r.readsRow,
           r.channelId === undefined || r.ambient === true ? undefined : { serverId: r.source, channelId: r.channelId }));
       if (read.length > 0) {
         const left = requests.filter((r) => !read.includes(r));
@@ -17848,8 +17900,8 @@ export class AgentFramework {
           ? trigger?.coalescingSubject : undefined,
         // Likewise a write to read: dropping the merge once it's read must
         // take no other cause with it.
-        readsDeferredWrite: requests.every((r) => r.readsDeferredWrite === trigger?.readsDeferredWrite)
-          ? trigger?.readsDeferredWrite : undefined,
+        readsRow: requests.every((r) => r.readsRow === trigger?.readsRow)
+          ? trigger?.readsRow : undefined,
         // Every merged wake's handed line, each event's once: the turn's start
         // decides each (beginAgentTurn).
         wakeLines: mergeWakeLines(requests),
@@ -18392,7 +18444,11 @@ export class AgentFramework {
   /** Which of these drafts a stored notice or receipt OF THIS RESIDENT names
    *  (draft ids are unique only per resident, and residents can share one
    *  history), each with the newest message that names it, reading only the
-   *  recent history, where this turn's notices are. */
+   *  recent history of the slot's record, where this turn's notices are. A
+   *  notice stored and not presented to the agent yet counts: its next start
+   *  presents it. Once the agent's context presents rows (#291), one taken
+   *  out of its window as an undone turn's (windowStatusOf 'undone') doesn't:
+   *  the record still holds it, and the agent's window doesn't. */
   private draftsNamedInHistory(agent: Agent, ids: string[]): Map<string, string> {
     const wanted = new Set(ids);
     const named = new Map<string, string>();
@@ -18400,9 +18456,11 @@ export class AgentFramework {
     const total = cm.getMessageCount();
     const start = Math.max(0, total - AgentFramework.DRAFT_NOTICE_SCAN);
     const { messages } = cm.getMessageWindow(start, total - start, { resolveBlobs: false });
+    const presented = cm.windowMode() === 'presented';
     for (let i = messages.length - 1; i >= 0 && named.size < wanted.size; i--) {
       const meta = messages[i]!.metadata as { draftIds?: unknown; draftOwner?: unknown } | undefined;
       if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
+      if (presented && cm.windowStatusOf(messages[i]!.id) === 'undone') continue;
       for (const id of meta.draftIds) {
         if (typeof id === 'string' && wanted.has(id) && !named.has(id)) named.set(id, String(messages[i]!.id));
       }
@@ -19084,7 +19142,7 @@ export class AgentFramework {
     if (!config || this.slotHeldFrom(agent)) return undefined;
     let planned: ReturnType<typeof planClock>;
     try {
-      planned = planClock({ now: Date.now(), ...this.lastClockOf(agent.getContextManager()), config, zone: this.timeZone });
+      planned = planClock({ now: Date.now(), ...this.lastClockOf(agent), config, zone: this.timeZone });
     } catch (err) {
       console.error(`[clock] ${agent.name}: no clock row at ${occasion}:`, err);
       return undefined;
@@ -19263,13 +19321,30 @@ export class AgentFramework {
   /** Rows a window's last-clock scan reads at a time. */
   private static readonly CLOCK_SCAN_ROWS = 256;
 
-  /** What the next clock is planned from: the window's newest row's time and
-   *  the time its last clock row reads, found by reading back from the
-   *  newest row, CLOCK_SCAN_ROWS at a time, until a clock row comes, however
-   *  far back it is. In the steady state the newest chunk holds it, unless
-   *  more rows than that have come since the last clock; a window with no
-   *  clock row is read whole once, and then takes one (planClock). */
-  private lastClockOf(cm: ContextManager): { newestRowAt: number | undefined; lastClockAt: number | undefined } {
+  /** What the agent's next clock is planned from: its window's newest row's
+   *  time and the time its last clock row reads, found by reading back from
+   *  the newest row, CLOCK_SCAN_ROWS at a time, until a clock row comes,
+   *  however far back it is. In the steady state the newest chunk holds it,
+   *  unless more rows than that have come since the last clock; a window
+   *  with no clock row is read whole once, and then takes one (planClock).
+   *  While the agent's context is in legacy mode, its window is the slot's
+   *  record, a co-resident's rows and clock rows among them. Once it
+   *  presents rows (#291), the window is the rows presented to it, in their
+   *  order: a co-resident's clock row isn't the agent's, and a row stored
+   *  and not presented yet comes after the clock its start writes, so
+   *  neither is read. */
+  private lastClockOf(agent: Agent): { newestRowAt: number | undefined; lastClockAt: number | undefined } {
+    const cm = agent.getContextManager();
+    if (cm.windowMode() === 'presented') {
+      const window = cm.getPresentedMessages();
+      const newest = window.at(-1);
+      const newestRowAt = newest ? new Date(newest.timestamp).getTime() : undefined;
+      for (let i = window.length - 1; i >= 0; i--) {
+        const stamp = clockStampOf(window[i]!.metadata);
+        if (stamp) return { newestRowAt, lastClockAt: stamp.at };
+      }
+      return { newestRowAt, lastClockAt: undefined };
+    }
     let newestRowAt: number | undefined;
     for (let end = cm.getMessageCount(); end > 0;) {
       const span = Math.min(end, AgentFramework.CLOCK_SCAN_ROWS);
@@ -20105,7 +20180,7 @@ export class AgentFramework {
    *  script. A script is written then, and a later round's wait that watches
    *  it shares the turn's id but not what the agent has read since, so the
    *  script's words can't answer anything injected after it started. */
-  private publishReadThrough(agent: Agent, callId: string | undefined): { branch: string; sequence: number } | null {
+  private publishReadThrough(agent: Agent, callId: string | undefined): ReadMark | null {
     const start = callId === undefined ? undefined : this.scriptCallStarts.get(callId);
     return start ? start.readThrough : agent.getConsumedWatermark();
   }
@@ -21421,18 +21496,18 @@ export class AgentFramework {
 
     // The turn has passed its gate, so from here it goes on with a copy of
     // its trigger without a batch wake's marks or the mark of a wake for a
-    // deferred write. A retry of it then comes back as an ordinary wake by
+    // row it reads (readsRow). A retry of it then comes back as an ordinary wake by
     // whatever door it takes (a provider hold's release, the auxiliary park's
     // requeue, the tool-result guard's restart): this gate doesn't withdraw
     // it for finding its batches consumed, no withdrawal of the subject's
     // wakes reaches it (§4.2 withdraws a wake whose sole cause is the
     // subject, and a merge carries a subject only when it is every merged
     // request's), and the scheduler doesn't drop it as having nothing to read
-    // once this attempt's compile has moved the watermark past the write.
+    // once this attempt's compile has moved the watermark past the row.
     // This frame's activeTurnTriggers entry keeps the trigger as it came; a
     // retry's frame records the copy it carries.
-    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined) {
-      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, ...retry } = trigger;
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, ...retry } = trigger;
       trigger = retry;
     }
     // The wakes merged into this start are the turn's now: it reads them,
@@ -22265,7 +22340,7 @@ export class AgentFramework {
     // made as the round yields, since its deliveries run on the speech
     // chain, which a tool boundary doesn't wait for, so a later round's
     // reading would otherwise be credited to its words.
-    const publishedFrom = (readThrough: { branch: string; sequence: number } | null): SpeechPublished =>
+    const publishedFrom = (readThrough: ReadMark | null): SpeechPublished =>
       (to, text, messageId) => {
         agent.notePublished(destinationKey(to), readThrough);
         streamSpeech(to, text, messageId);
@@ -22302,7 +22377,7 @@ export class AgentFramework {
     // What the turn's first request had read, taken at its round: on the
     // fallback path the prose routed at the turn's end is the whole turn's,
     // so it's credited with this, which every round's words come after.
-    let firstRoundRead: { branch: string; sequence: number } | null | undefined;
+    let firstRoundRead: ReadMark | null | undefined;
     // XML/legacy tool mode has no roundContent, so its final response contains
     // prose from every round. A refused skip_reply's round stays private while
     // later rounds remain deliverable: the turn-end delivery drops that round's
@@ -24996,7 +25071,7 @@ export class AgentFramework {
     const target = this.noticeTargetFor(agentName, `script ${scriptId} wake`);
     if (!target) throw new Error(`agent ${agentName} has no context to wake`);
     try {
-      const placement: { agent?: string; deferredId?: string } = {};
+      const placement: WritePlacement = {};
       const messageId = this.addMessage('user', [{ type: 'text', text: shown }], {
         source: 'code-execution-script',
         scriptId,
@@ -25007,7 +25082,7 @@ export class AgentFramework {
         reason: 'script:wake',
         source: 'code_execution',
         timestamp: Date.now(),
-        ...this.readsDeferredFor(placement, agentName),
+        ...this.readsRowFor(placement, agentName),
       });
       this.emitTrace({
         type: 'message:added',
@@ -25660,7 +25735,7 @@ export class AgentFramework {
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
     turnId?: number,
-    start: { turnId?: number; readThrough: { branch: string; sequence: number } | null } = { readThrough: null },
+    start: { turnId?: number; readThrough: ReadMark | null } = { readThrough: null },
     route: { toServer: boolean } = { toServer: false },
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
@@ -26548,8 +26623,12 @@ export class AgentFramework {
       /** Set by addModuleMessage for a write it marked for a run or a fork
        *  (PRIMARY_IF_UNREAD_KEY): any other write has the mark taken off. */
       markedForRun?: true;
-      /** Out-param: where the message landed (RFC-006 needs to find it again). */
-      placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
+      /** Out-param: where the message landed (RFC-006 needs to find it
+       *  again), and, for the wake that goes with it (readsRowFor), whether
+       *  it was held for its agent's live turn (`deferredId`) or stored and
+       *  not presented to that agent (`presented: false`, which only a
+       *  presenting store path sets). */
+      placement?: WritePlacement;
       /**
        * RFC-006 assembly: the named agent's turn is alive but its compile has
        * not run yet (the same window the turn-start deferred flush writes
@@ -26837,12 +26916,22 @@ export class AgentFramework {
    *  clock rows and stored context injections after it aside: a channel
    *  message by its server, channel and message id, a push event by its
    *  server and event id, and never one a tune-out holds. Past
-   *  NEWEST_SCAN_ROWS such rows, it answers no. */
+   *  NEWEST_SCAN_ROWS such rows, it answers no. While the agent's context
+   *  is in legacy mode, its window is the slot's record, read from its
+   *  newest row. Once it presents rows (#291), the window's own order
+   *  decides, as the agent's next request will hold it (windowTail): the
+   *  rows presented to it, then the rows stored for it and not presented
+   *  yet, which its next start presents; a row stored in a shared slot for
+   *  another agent, such as a co-resident's own round, isn't in it. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
     // A clock row the framework wrote after it (a turn start's, an event's),
     // or a stored context injection (any agent's, a start's), isn't a
     // message a reply could be meant for, so it doesn't count.
-    const newest = agent.getContextManager().queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages
+    const cm = agent.getContextManager();
+    const tail = cm.windowMode() === 'presented'
+      ? this.windowTail(agent, AgentFramework.NEWEST_SCAN_ROWS)
+      : cm.queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages;
+    const newest = tail
       .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata));
     const md = newest?.metadata as Record<string, unknown> | undefined;
     if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
@@ -26853,6 +26942,27 @@ export class AgentFramework {
       return entry.eventId !== undefined && md.eventId === entry.eventId;
     }
     return false;
+  }
+
+  /**
+   * The newest `limit` rows of a presented window as the agent's next
+   * request will hold them, newest first: the rows stored for it and not
+   * presented yet (its arrivals and own rows, whose audience names it, or
+   * unstamped ones), after the rows its window holds. A row presented later
+   * than a newer one comes after it here, as in the window.
+   */
+  private windowTail(agent: Agent, limit: number): StoredMessage[] {
+    const cm = agent.getContextManager();
+    const meantFor = (m: StoredMessage): boolean => {
+      const stamp = audienceOf(m.metadata);
+      return stamp === undefined || stamp.audience.includes(agent.name);
+    };
+    const pending = cm.getUnpresentedMessages().filter(meantFor);
+    const tail: StoredMessage[] = [];
+    for (let i = pending.length - 1; i >= 0 && tail.length < limit; i--) tail.push(pending[i]!);
+    const presented = cm.getPresentedMessages();
+    for (let i = presented.length - 1; i >= 0 && tail.length < limit; i--) tail.push(presented[i]!);
+    return tail;
   }
 
   /** Where addMessage delivers: the named agent, else the primary, else the
@@ -27630,9 +27740,15 @@ export class AgentFramework {
    * autobiographical strategy joins them (asCompiled), other than
    * copies of the entries `held` names; and `held`, for each of
    * those entries with a copy there, its copies and whether any of them is
-   * unread. A notice is read below the lower of its consumed watermark and
-   * the point where the watermark's branch and the current one part
-   * (branchesPartAt), and unread everywhere when it has no watermark. The
+   * unread. A notice is read when the agent's consumed watermark covers it
+   * (covers): once its context presents rows (#291), when it was in the
+   * agent's window as of the mark, so a notice never presented to it, or
+   * presented and never consumed, is unread; in legacy mode, when it is at
+   * or below the mark, or, for a mark on another branch, at or below the
+   * lower of the mark and the point where the two branches part
+   * (branchesPartAt). A mark taken in presented mode can't say on another
+   * branch, and there, as everywhere for an agent with no watermark, every
+   * notice is unread. The
    * watermark is set when the agent is created, and moves at a compile, and
    * at a tool boundary whose stream declares it carries the messages
    * injected there (markContextConsumed). So a notice such a stream carried
@@ -27647,9 +27763,14 @@ export class AgentFramework {
     try {
       const cm = agent.getContextManager();
       const watermark = agent.getConsumedWatermark();
-      const floor = watermark
-        ? Math.min(watermark.sequence, this.branchesPartAt(watermark.branch, cm.currentBranch().name))
-        : Number.NEGATIVE_INFINITY;
+      const current = cm.currentBranch().name;
+      // Read across a branch point for a mark on another branch, which a
+      // mark taken in legacy mode can be (covers: one taken in presented
+      // mode can't say there, so each row is unread and goes on).
+      const cover = coverTest(watermark, cm, watermark && watermark.branch !== current
+        ? { partAt: this.branchesPartAt(watermark.branch, current) }
+        : undefined);
+      const unread = (m: MarkedRow): boolean => cover(m) !== 'covered';
       // A body the store took as more than one message (a sharded body)
       // carries the same metadata on each of its shards, and is one notice,
       // so a shard that continues the body before it isn't taken again: its
@@ -27667,9 +27788,9 @@ export class AgentFramework {
         if (typeof id === 'string' && held.has(id)) {
           const copies = read.held.get(id) ?? { copies: [], unread: false };
           copies.copies.push(storedCopy(m));
-          copies.unread ||= m.sequence > floor;
+          copies.unread ||= unread(m);
           read.held.set(id, copies);
-        } else if (m.sequence > floor && passesToPrimary(m.metadata)) {
+        } else if (passesToPrimary(m.metadata) && unread(m)) {
           if (!continuesBody(messages[i - 1], m)) {
             bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
             lastUnread = i;
@@ -27758,8 +27879,12 @@ export class AgentFramework {
    * after release. (A notice still queued for it, at release or restored at
    * boot, goes on as the queue entry itself: queuedNoticeForPrimary.) Tell
    * the primary instead, naming the speaker, so an agent who can still act
-   * learns of it (noticeForPrimary). Never throws: it runs inside a release,
-   * which must complete whatever this write meets.
+   * learns of it (noticeForPrimary). The notice is the primary's alone
+   * (#291's audience stamp): a co-resident sharing the primary's slot isn't
+   * the agent who takes the speaker's place. On a host with no primary it
+   * goes where a write that names no agent goes, stamped as one. Never
+   * throws: it runs inside a release, which must complete whatever this
+   * write meets.
    */
   private passNoticeToPrimary(
     speaker: string,
@@ -27769,7 +27894,8 @@ export class AgentFramework {
     const notice = this.noticeForPrimary(speaker, metadata, written);
     if (!notice) return;
     try {
-      this.addMessage(notice.participant, notice.content, notice.metadata);
+      this.addMessage(notice.participant, notice.content, notice.metadata,
+        this.primaryAgentName ? { audience: [this.primaryAgentName] } : undefined);
     } catch (err) {
       console.error(`[route-failure] failed to tell the primary ${notice.about}:`, err);
     }
@@ -28152,14 +28278,51 @@ export class AgentFramework {
     );
   }
 
-  /** Whether a wake for a deferred write has nothing left for the agent to
-   *  do, on evidence only. The write's row is at or below the newest
+  /**
+   * Whether a wake for a row it reads (InferenceRequest.readsRow) has
+   * nothing left for the agent to do, on evidence only. A held handle
+   * (heldHandle) names a write still in the deferred queue when its wake was
+   * queued, judged by deferredWriteDone. Any other id names a stored row: it
+   * is done once it is gone from the agent's store on its current branch
+   * (removed, or left on a branch the agent has switched from, where a turn
+   * now would find nothing of it), or once an answered request's consumed
+   * watermark covers it and the agent has spoken where the wake asks
+   * (answeredCovers). A row stored and not yet presented to the agent isn't
+   * covered, so its wake stays: its turn presents the row. Any doubt keeps
+   * the wake, such as a store that can't be read.
+   */
+  private rowDone(agent: Agent, readsRow: string, to: PublishDestination | undefined): boolean {
+    const writeId = heldWriteId(readsRow as MessageId);
+    if (writeId !== undefined) return this.deferredWriteDone(agent, writeId, to);
+    try {
+      const cm = agent.getContextManager();
+      const row = cm.getMessage(readsRow as MessageId);
+      if (!row) return true;
+      return this.answeredCovers(agent, cm, row, to);
+    } catch (error) {
+      console.error(`[wake] ${agent.name}: could not read whether row ${readsRow} was read, so its wake stays:`, error);
+      return false;
+    }
+  }
+
+  /** Whether a request the agent had answered carried `row`: the newest
    *  consumed watermark of an answered request (Agent.getAnsweredWatermark)
-   *  on the agent's current branch, and for a wake that carries a channel
-   *  and wasn't marked ambient (`to`, that channel on the wake's server), the
-   *  agent has since published there having read the row
-   *  (Agent.publishedAfterReading): hearing a message isn't answering it,
-   *  and the wake's turn is the agent's chance to answer there. Or the
+   *  covers it, read in the agent's context (covers), and, for a wake that
+   *  carries a channel and wasn't marked ambient (`to`, that channel on the
+   *  wake's server), the agent has since published there having read the
+   *  row (Agent.publishedAfterReading): hearing a message isn't answering
+   *  it, and the wake's turn is the agent's chance to answer there. A mark
+   *  that can't say (none, or one a branch switch or an undo left on another
+   *  branch) says no. */
+  private answeredCovers(agent: Agent, cm: ContextManager, row: MarkedRow, to: PublishDestination | undefined): boolean {
+    if (covers(agent.getAnsweredWatermark(), cm, row) !== 'covered') return false;
+    return to === undefined || agent.publishedAfterReading(destinationKey(to), row, cm);
+  }
+
+  /** Whether a wake for a deferred write has nothing left for the agent to
+   *  do, on evidence only (the queue arm of rowDone). The write's row is
+   *  covered by an answered request's watermark, and the agent has spoken
+   *  where the wake asks (answeredCovers). Or the
    *  write is in neither the queue (drained entries not yet stored
    *  included) nor the store's current branch: removed, or left on a
    *  branch the agent has switched from, where a turn now would find
@@ -28180,23 +28343,29 @@ export class AgentFramework {
       // No row yet for a write drained from the queue and still to be stored
       // (un-acked); one stored and awaiting a sync is judged by its row.
       if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
-      const watermark = agent.getAnsweredWatermark();
-      const branch = cm.currentBranch().name;
-      if (!watermark || watermark.branch !== branch || row.sequence > watermark.sequence) return false;
-      return to === undefined || agent.publishedAfterReading(destinationKey(to), branch, row.sequence);
+      return this.answeredCovers(agent, cm, row, to);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
       return false;
     }
   }
 
-  /** The mark a wake for `agentName` takes for the write it was queued with
-   *  (`placement`, addMessage's out-param): set only when that write was
-   *  deferred for that agent, since a stored write's wake starts the turn
-   *  that reads it. The scheduler drops the wake once the write needs
-   *  nothing more of the agent (deferredWriteDone). */
-  private readsDeferredFor(placement: { agent?: string; deferredId?: string } | undefined, agentName: string): { readsDeferredWrite?: string } {
-    return placement?.deferredId && placement.agent === agentName ? { readsDeferredWrite: placement.deferredId } : {};
+  /**
+   * The mark a wake for `agentName` takes for the row it was queued with
+   * (`placement`, addMessage's out-param), so the scheduler can drop the
+   * wake once the row needs nothing more of the agent (rowDone). Set only
+   * when the row wasn't presented to that agent at its write: a write
+   * deferred for it (`deferredId`, as its held handle, until the queue
+   * goes), or one stored and not presented to it (`presented: false`, set
+   * where the agent's turn was alive). A row stored for an agent with no
+   * turn alive is read by the turn its wake starts, so that wake stays
+   * plain; so does another agent's wake.
+   */
+  private readsRowFor(placement: WritePlacement | undefined, agentName: string): { readsRow?: string } {
+    if (!placement || placement.agent !== agentName) return {};
+    if (placement.deferredId) return { readsRow: heldHandle(placement.deferredId) };
+    if (placement.messageId && placement.presented === false) return { readsRow: placement.messageId };
+    return {};
   }
 
   // A module context's reads, edits and removals, and a process answer's,

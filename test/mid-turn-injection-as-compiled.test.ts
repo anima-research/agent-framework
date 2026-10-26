@@ -25,6 +25,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { AutobiographicalStrategy, WindowedPassthroughStrategy, type ContextInjection, type MessageId } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { covers } from '../src/read-marks.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
@@ -173,7 +174,7 @@ describe('a message injected at a tool boundary', () => {
     assert.equal(seen.calls, 1, 'the batch is rendered in one call');
     assert.deepEqual(injected.map((m) => m.content), [[text('PLACEDBEFORE')], [text('HEARD')]]);
     const row = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('PLACEDBEFORE'))!;
-    assert.ok(agent.getConsumedWatermark()!.sequence >= row.sequence, 'the consumed mark covers it, as anything injected');
+    assert.equal(covers(agent.getConsumedWatermark(), agent.getContextManager(), row), 'covered', 'the consumed mark covers it, as anything injected');
   });
 
   it("each message goes in as its own render gives it, in its place in the batch", async () => {

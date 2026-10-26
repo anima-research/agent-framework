@@ -71,6 +71,10 @@ export interface CoalescingPlacement {
   messageId?: string;
   /** Entry id in the framework's deferred-write queue (turn-alive deferral). */
   deferredId?: string;
+  /** Set on a stored placement that wasn't presented to `agent` at its
+   *  write, because a turn of the agent's was alive (#291's presentation
+   *  index): like a queued one, the turn being assembled doesn't read it. */
+  presented?: false;
 }
 
 export interface CoalescingScope { kind: 'featureSet' | 'channel'; id: string }
@@ -316,14 +320,16 @@ export interface CoalescerHost<E> {
   deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
   /** Queue a wake for a batch that has no model-visible content yet. */
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
-  /** Queue an ordinary push wake for `agent`, under the batch's own wake
-   *  policy, to read a render of the batch placed in its deferred queue that
-   *  no request consumed, at `deferredId`. It carries no subject, so the
-   *  subject's other wakes, and later withdrawals of them, leave it.
-   *  `allAmbient`: every notice the render stands for was tagged
-   *  `chat:ambient` (DeferredBatch.allAmbient), so the wake is marked
+  /** Queue an ordinary push wake for the placement's agent, under the
+   *  batch's own wake policy, to read a render of the batch that no request
+   *  consumed, placed where the turn being assembled doesn't read it: in
+   *  the agent's deferred queue, or stored and not presented to it
+   *  (`placement`, which the host reads the wake's mark from). It carries
+   *  no subject, so the subject's other wakes, and later withdrawals of
+   *  them, leave it. `allAmbient`: every notice the render stands for was
+   *  tagged `chat:ambient` (DeferredBatch.allAmbient), so the wake is marked
    *  ambient. */
-  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string, deferredId?: string, allAmbient?: boolean): Promise<void>;
+  wakeToRead(occurrence: CoalescedOccurrence<E>, placement: CoalescingPlacement, allAmbient?: boolean): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
   /** The batch's audience still holds the authority it was admitted under. */
@@ -1146,8 +1152,9 @@ export class PushCoalescer<E = unknown> {
         const run = state.occupant?.rendered ? state.occupant : undefined;
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
         const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
-        if (placement?.deferredId) {
-          // Landed in a deferred queue: another agent's, whose turn is alive,
+        if (placement?.deferredId || placement?.presented === false) {
+          // Landed in a deferred queue, or stored and not presented to its
+          // agent: another agent's, whose turn is alive,
           // or the assembling agent's own, behind a write held there (the
           // host's bypassDeferralFor), or after its assembly ended, as any
           // write during its turn. Still unread
@@ -1173,7 +1180,7 @@ export class PushCoalescer<E = unknown> {
             await this.host.wakeForBatch(state.batch.latest);
           }
           state.audienceAgent = placement.agent;
-          await this.host.wakeToRead(occurrence, placement.agent, placement.deferredId, batch.allAmbient === true);
+          await this.host.wakeToRead(occurrence, placement, batch.allAmbient === true);
           return;
         }
         // The materialized occurrence is consumed by the request being

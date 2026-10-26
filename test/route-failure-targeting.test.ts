@@ -13,6 +13,7 @@ import type { ContentBlock, NormalizedResponse } from '@animalabs/membrane';
 import { destinationKey, type ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
+import { covers } from '../src/read-marks.js';
 
 function internals(framework: AgentFramework) {
   return framework as unknown as {
@@ -1646,8 +1647,46 @@ describe('notices about an agent\'s own action', () => {
       store.createBranchAt('rewound', 'maintained', read.sequence - 1);
       await framework.switchBranch('rewound');
       const again = notice('on the rewound branch');
-      assert.ok(again.sequence <= agent.getConsumedWatermark()!.sequence, 'numbered within what the watermark covers on its own branch');
+      // Read across no branch point, the mark (on 'maintained') covers it: its
+      // number is at or below the mark's.
+      assert.equal(covers(agent.getConsumedWatermark(), cm, again, { partAt: Number.POSITIVE_INFINITY }), 'covered',
+        'numbered within what the watermark covers on its own branch');
       assert.deepEqual(tags(), ['on the rewound branch']);
+    });
+
+    // #291: once the agent's window is presented (context-manager's
+    // presentRows), read means in its window as of its consumed mark, not
+    // stored below the store's head then. A mark taken in presented mode
+    // can't say what another branch's rows were to it, so after a switch
+    // every notice goes on.
+    it("in presented mode, counts as read only what the agent's window held at its mark, and on another branch, nothing", async () => {
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
+      const agent = framework.getAgent('secondary')!;
+      const cm = agent.getContextManager();
+      const store = framework.getStore();
+      const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag);
+
+      const before = notice('stored before the write-down');
+      agent.markContextConsumed();
+      cm.presentRows([]);
+      assert.equal(cm.windowMode(), 'presented', 'the window is written down');
+      const shown = notice('presented, then read');
+      cm.presentRows([shown.id]);
+      notice('stored and never presented');
+      agent.markContextConsumed();
+      const late = notice('presented after the mark');
+      cm.presentRows([late.id]);
+      assert.ok(before.sequence < shown.sequence, 'stored in that order');
+      assert.deepEqual(tags(), ['stored and never presented', 'presented after the mark'],
+        "what the window held at the mark is read; a row stored before it and never presented isn't");
+
+      store.createBranch('presented-side', store.currentBranch().name);
+      await framework.switchBranch('presented-side');
+      assert.equal(cm.windowMode(), 'presented', 'the branch carries the window');
+      assert.deepEqual(tags(), ['stored before the write-down', 'presented, then read', 'stored and never presented', 'presented after the mark'],
+        'a presented mark on another branch reads nothing as read');
     });
 
     it('counts as unread a notice stored on a branch after the agent read past the point where it parts from another', async () => {
@@ -1670,7 +1709,9 @@ describe('notices about an agent\'s own action', () => {
       // branch point are its own, and the agent read none of them.
       await framework.switchBranch(home);
       const late = notice('stored at home after the agent read on the side branch');
-      assert.ok(late.sequence <= agent.getConsumedWatermark()!.sequence, 'numbered within what the watermark covers on the side branch');
+      // Read across no branch point, the mark (on the side branch) covers it.
+      assert.equal(covers(agent.getConsumedWatermark(), cm, late, { partAt: Number.POSITIVE_INFINITY }), 'covered',
+        'numbered within what the watermark covers on the side branch');
       assert.deepEqual(tags(), ['stored at home after the agent read on the side branch']);
     });
 
