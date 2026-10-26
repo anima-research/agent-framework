@@ -37,10 +37,10 @@ import type {
 } from './types.js';
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
-import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
+import { hashContent, storedBytes, DEFAULT_MAX_FILE_SIZE, type StoredBytes } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, checkDir, checkRoot, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, includePatternReadable, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, shownLeads, sniffImageMime, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { CHANGED, IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, checkDir, checkRoot, confirmAbsent, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, includePatternReadable, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, shownLeads, sniffImageMime, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -149,8 +149,7 @@ class WorkspaceImageReadError extends Error {
       | 'too_large'
       | 'truncated'
       | 'invalid'
-      | 'unsupported'
-      | 'blob_missing',
+      | 'unsupported',
     message: string,
   ) {
     super(message);
@@ -2492,9 +2491,9 @@ export class WorkspaceModule implements Module {
       const { report, undecided } = await this.ensureSynced(mount, relativePath);
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) return { error: undecided !== null ? this.notCheckedYet(mountPrefixedPath, undecided) : this.notInWorkspace(mountPrefixedPath, report) };
-      const blob = store.getBlob(entry.blobHash);
-      if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
-      return { data: blob };
+      const contents = await this.contentsOf(mount, relativePath, mountPrefixedPath, entry);
+      if ('lost' in contents) return { error: nothingToRead(contents.lost) };
+      return { data: contents.bytes };
     });
   }
 
@@ -3149,22 +3148,17 @@ export class WorkspaceModule implements Module {
     };
   }
 
-  private tryReadImageFromTree(
+  private async readImageFromTree(
     mount: MountState,
     relativePath: string,
     mountPrefixedPath: string,
     maxSize: number,
-  ): { bytes: Buffer; mimeType: SupportedImageMimeType } | null {
-    const store = this.getStore();
-    const entry = store.treeGet(mount.treeStateId, relativePath);
+  ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType } | { lost: LostContents } | null> {
+    const entry = this.getStore().treeGet(mount.treeStateId, relativePath);
     if (!entry) return null;
-
-    const blob = store.getBlob(entry.blobHash);
-    if (!blob) {
-      throw new WorkspaceImageReadError('blob_missing', `Blob not found for: ${mountPrefixedPath}`);
-    }
-
-    return this.validateImageBytes(blob, mountPrefixedPath, maxSize);
+    const contents = await this.contentsOf(mount, relativePath, mountPrefixedPath, entry);
+    if ('lost' in contents) return contents;
+    return this.validateImageBytes(contents.bytes, mountPrefixedPath, maxSize);
   }
 
   /**
@@ -3971,9 +3965,9 @@ export class WorkspaceModule implements Module {
             : [this.notInWorkspace(path, report), ...again].join(' '),
         };
       }
-      const blob = store.getBlob(entry.blobHash);
-      if (!blob) return { error: `Blob not found for: ${path}` };
-      return { bytes: blob, notes: [...whichCopyRead(report, took('modified'), mount.config.mode === 'read-only'), ...again] };
+      const contents = await this.contentsOf(mount, relativePath, path, entry);
+      if ('lost' in contents) return { error: nothingToRead(contents.lost) };
+      return { bytes: contents.bytes, notes: [...whichCopyRead(report, took('modified'), mount.config.mode === 'read-only'), ...again] };
     });
   }
 
@@ -4011,6 +4005,118 @@ export class WorkspaceModule implements Module {
       return { error: `Unable to read file: ${path}${errno ? ` (${errno})` : ''}` };
     } finally {
       await opened.handle.close();
+    }
+  }
+
+  private async contentsOf(
+    mount: MountState,
+    relativePath: string,
+    path: string,
+    version: { blobHash: string; size: number },
+    what: 'saved' | 'conflict-disk' = 'saved',
+    tell: 'now' | 'later' = 'now',
+  ): Promise<{ bytes: Buffer } | { lost: LostContents }> {
+    const store = this.getStore();
+    const stored = storedBytes(store, version.blobHash);
+    if ('bytes' in stored) return stored;
+    const otherSize = new Error('other size');
+    let found: { bytes: Buffer } | { disk: LostContents['disk'] };
+    try {
+      const opened = await this.openContainedFile(mount, relativePath, path, (fileStat) => {
+        if (fileStat.size !== version.size) throw otherSize;
+      });
+      try {
+        const read = await readPrefix(opened.handle, version.size, opened.fileStat.size);
+        found = !read.more && hashContent(read.bytes) === version.blobHash ? { bytes: read.bytes } : { disk: 'other' };
+      } finally {
+        await opened.handle.close();
+      }
+    } catch (err) {
+      found = { disk: err === otherSize ? 'other' : await this.diskLacks(mount, relativePath, path, err) };
+    }
+    const subject = contentsSubject(what, path);
+    const data = { mount: mount.config.name, path, blobHash: version.blobHash, ...('unreadable' in stored ? { storeError: stored.unreadable } : {}) };
+    if ('disk' in found) {
+      const now = storedBytes(store, version.blobHash);
+      if ('bytes' in now) return now;
+      const lost: LostContents = { path, store: now, disk: found.disk, writable: writeRefusal(mount) === null };
+      if (tell === 'now') this.tellLost(mount.config.name, what, version.blobHash, lost);
+      return { lost };
+    }
+    const { bytes } = found;
+    if ('bytes' in storedBytes(store, version.blobHash)) return { bytes };
+    let thrown: string | null = null;
+    try {
+      store.storeBlob(bytes, 'application/octet-stream');
+    } catch (error) {
+      thrown = error instanceof Error ? error.message : String(error);
+    }
+    // Chronicle's storeBlob takes any file already at the hash's path as
+    // stored, so whether the bytes took is what a read of them gives now.
+    const now = storedBytes(store, version.blobHash);
+    if ('bytes' in now) {
+      this.ctx?.notifyOps?.('workspace-contents-restored', 'workspace',
+        `Blob ${version.blobHash}: ${subject} were ${inTheStore(stored)}, and were stored again from disk's copy, whose bytes have their hash.`, data);
+    } else {
+      const unstored = thrown ?? ('missing' in now ? 'the store has no file for them' : `the store can't read its file for them (${now.unreadable})`);
+      this.ctx?.notifyOps?.('workspace-contents-unstored', 'workspace',
+        `Blob ${version.blobHash}: ${subject} are ${inTheStore(now)}. Disk's copy has their hash, so reads are answered from it, but storing it again didn't take: ${unstored}. `
+          + ('unreadable' in now
+            ? "Each read does this again while that lasts. Chronicle keeps a blob file it can't read in place, so where the file is damaged, removing it lets the next read store them."
+            : 'Each read does this again until the store takes them.'),
+        { mount: mount.config.name, path, blobHash: version.blobHash, ...('unreadable' in now ? { storeError: now.unreadable } : {}), unstored });
+    }
+    return { bytes };
+  }
+
+  private tellLost(mountName: string, what: 'saved' | 'conflict-disk', blobHash: string, lost: LostContents): void {
+    this.ctx?.notifyOps?.('workspace-contents-lost', 'workspace',
+      `Blob ${blobHash}: ${contentsSubject(what, lost.path)} are ${inTheStore(lost.store)}, and no copy with their hash could be read from disk to restore them from: ${lostOnDisk(lost)}. `
+        + "Putting back the store's blob file for that hash, from a copy of the store, brings them back.",
+      { mount: mountName, path: lost.path, blobHash, ...('unreadable' in lost.store ? { storeError: lost.store.unreadable } : {}) });
+  }
+
+  private async diskLacks(mount: MountState, relativePath: string, path: string, err: unknown): Promise<LostContents['disk']> {
+    const absent = err instanceof WorkspaceReadError && err.code !== 'mount_unavailable' && (err.errno === 'ENOENT' || err.errno === 'ENOTDIR');
+    if (!absent) return { unreadable: containedRefusal(err, path) };
+    const root = resolve(mount.config.path);
+    const rootReal = await realpath(root).catch(() => root);
+    const view = this.viewOf(mount, this.agreementOrThrow().rootIdentityForRead(mount.config.name));
+    const proof = await confirmAbsent(view, rootReal, relativePath);
+    if (typeof proof !== 'string') return 'none';
+    return { unreadable: proof === CHANGED ? containedRefusal(err, path) : proof };
+  }
+
+  private async restoreEach<T extends { relativePath: string; file: string; hash: string; size: number; what: 'saved' | 'conflict-disk' }>(
+    mount: MountState,
+    versions: readonly T[],
+    each: (version: T, contents: { bytes: Buffer } | { lost: LostContents }) => void,
+  ): Promise<void> {
+    const byHash = new Map<string, T[]>();
+    for (const version of versions) {
+      const sharing = byHash.get(version.hash);
+      if (sharing) sharing.push(version);
+      else byHash.set(version.hash, [version]);
+    }
+    for (const [hash, sharing] of byHash) {
+      let bytes: Buffer | null = null;
+      const lost: Array<[T, LostContents]> = [];
+      for (const version of sharing) {
+        const contents = await this.contentsOf(mount, version.relativePath, version.file, { blobHash: hash, size: version.size }, version.what, 'later');
+        if ('bytes' in contents) {
+          bytes = contents.bytes;
+          break;
+        }
+        lost.push([version, contents.lost]);
+      }
+      if (bytes === null) {
+        for (const [version, found] of lost) {
+          this.tellLost(mount.config.name, version.what, hash, found);
+          each(version, { lost: found });
+        }
+      } else {
+        for (const version of sharing) each(version, { bytes });
+      }
     }
   }
 
@@ -4072,13 +4178,15 @@ export class WorkspaceModule implements Module {
 
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     let treeError: WorkspaceImageReadError | null = null;
+    let lost: LostContents | null = null;
 
     // The workspace's copy first, where it holds one, then disk's. A direct
     // mount holds none, so its image is disk's.
     if (!mount.direct) {
       try {
-        const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
-        if (image) return imageResult(input.path, image);
+        const image = await this.readImageFromTree(mount, relativePath, input.path, maxSize);
+        if (image && 'lost' in image) lost = image.lost;
+        else if (image) return imageResult(input.path, image);
       } catch (err) {
         if (err instanceof WorkspaceImageReadError) {
           treeError = err;
@@ -4089,9 +4197,19 @@ export class WorkspaceModule implements Module {
     }
 
     try {
-      return imageResult(input.path, await this.readImageFromFilesystem(mount, relativePath, input.path, maxSize));
+      const note = lost === null ? undefined
+        : `The workspace's copy of ${input.path} is ${lostInStore(lost)}, so this is disk's copy${lost.disk === 'other' ? ', which holds other contents' : ''}.`;
+      return imageResult(input.path, await this.readImageFromFilesystem(mount, relativePath, input.path, maxSize), note);
     } catch (err) {
       if (err instanceof WorkspaceImageReadError) {
+        if (lost) {
+          return {
+            success: false,
+            isError: true,
+            error: err.code === 'not_found' || lost.disk !== 'other' ? nothingToRead(lost)
+              : `${lostText(lost)}, so it can't be restored, and disk's copy can't be shown (${err.message}). ${lostRemedy(lost)}`,
+          };
+        }
         if (err.code === 'not_found' && treeError) {
           return { success: false, error: treeError.message, isError: true };
         }
@@ -4191,12 +4309,14 @@ export class WorkspaceModule implements Module {
    * stored where its record landed, and that it can't tell where they
    * couldn't be read back.
    * Under the mount's turn, one pass settles every path with disk, by the
-   * rule a listing uses, so the edits apply to what disk now holds. That pass
-   * is the only step that awaits before the commit: every file is then read,
-   * every edit planned, and every entry set (commitToolChanges) with no turn
-   * of the event loop between, so no pass, branch change or other call moves
-   * the tree between a file's read and its set. Disk then takes what it can
-   * of the stored change.
+   * rule a listing uses, so the edits apply to what disk now holds. Each
+   * file's stored contents are then read; where the store has lost some,
+   * they're restored from disk's matching copy (contentsOf) and the pass runs
+   * again, so the plan reads a pass taken after every await. From there
+   * nothing awaits before the commit: every edit is planned and every entry
+   * set (commitToolChanges) with no turn of the event loop between, so no
+   * pass, branch change or other call moves the tree between a file's read
+   * and its set. Disk then takes what it can of the stored change.
    *
    * The answer is held to `maxChars`, the length the call's result may have
    * (ToolCall.resultMaxChars), as edit-text.ts describes.
@@ -4291,7 +4411,26 @@ export class WorkspaceModule implements Module {
       return await this.withMount(mount, async (): Promise<ToolResult> => {
         // As every file tool's pass does, it names the paths it acts on, so a
         // file the mount passes over by design is observed (see PassOptions.named).
-        const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [...targets.values()].map((target) => target.relativePath) }, { named: true });
+        let pass = await this.passUnlocked(mount, { kind: 'paths', paths: [...targets.values()].map((target) => target.relativePath) }, { named: true });
+        let ops = pass.ops;
+        const contents = new Map<string, Buffer>();
+        const lost = new Map<string, { blobHash: string; lost: LostContents }>();
+        const toRecover: Array<{ relativePath: string; file: string; hash: string; size: number; what: 'saved' }> = [];
+        for (const target of targets.values()) {
+          const entry = store.treeGet(mount.treeStateId, target.relativePath);
+          if (!entry || contents.has(entry.blobHash)) continue;
+          const stored = storedBytes(store, entry.blobHash);
+          if ('bytes' in stored) contents.set(entry.blobHash, stored.bytes);
+          else toRecover.push({ relativePath: target.relativePath, file: target.path, hash: entry.blobHash, size: entry.size, what: 'saved' });
+        }
+        if (toRecover.length > 0) {
+          await this.restoreEach(mount, toRecover, (version, found) => {
+            if ('bytes' in found) contents.set(version.hash, found.bytes);
+            else lost.set(version.relativePath, { blobHash: version.hash, lost: found.lost });
+          });
+          pass = await this.passUnlocked(mount, { kind: 'paths', paths: [...targets.values()].map((target) => target.relativePath) }, { named: true });
+          ops = [...ops, ...pass.ops];
+        }
         // A pass that decided nothing checked no file's disk copy.
         const undecided = undecidedOf(pass);
         // Nothing below awaits until the commit's push.
@@ -4310,7 +4449,7 @@ export class WorkspaceModule implements Module {
           // A mode taken in alone isn't a change to the text: it brings nothing
           // new to read, as it makes no event (emitFsEvents), and the edits
           // then write at the mode disk has, so it leaves nothing to say.
-          const took = (op: TreeOp) => pass.ops.some((o) => o.path === target.relativePath && o.op === op && !o.modeOnly);
+          const took = (op: TreeOp) => ops.some((o) => o.path === target.relativePath && o.op === op && !o.modeOnly);
           // Which copy the edits used, when it isn't the one the workspace
           // last agreed on with disk: disk's newer text, or the workspace's
           // copy because disk's couldn't be read or disk has none. A file the
@@ -4380,13 +4519,23 @@ export class WorkspaceModule implements Module {
             problems.push({ kind: 'file', edits: target.edits, path: target.path, text, whole: true });
             continue;
           }
-          notes.push(...lookedIn);
-          const blob = store.getBlob(entry.blobHash);
-          if (!blob) {
-            problems.push({ kind: 'file', edits: target.edits, path: target.path, text: `Blob not found for: ${target.path}`, whole: true });
+          const known = contents.get(entry.blobHash);
+          const stored = known !== undefined ? { bytes: known } : storedBytes(store, entry.blobHash);
+          if (!('bytes' in stored)) {
+            const found = lost.get(target.relativePath);
+            problems.push({
+              kind: 'file',
+              edits: target.edits,
+              path: target.path,
+              text: found?.blobHash === entry.blobHash
+                ? `${lostText(found.lost)}, so it can't be restored, and ${subject} changed nothing. ${lostRemedy(found.lost)}`
+                : `The workspace's copy of ${target.path} changed while ${subject} restored lost contents from disk, and is ${lostInStore({ store: stored })} too, so ${subject} changed nothing. Make the same call again.`,
+              whole: true,
+            });
             continue;
           }
-          const plan = planTargetEdits(tool, target, blob, hints, maxSize, counts, problems);
+          notes.push(...lookedIn);
+          const plan = planTargetEdits(tool, target, stored.bytes, hints, maxSize, counts, problems);
           if (plan === null) continue;
           plans.push({
             target,
@@ -5369,11 +5518,9 @@ export class WorkspaceModule implements Module {
     // read doesn't show it.
     const crlfFiles = new Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>();
     const bomFiles = new Map<string, GrepText['version']>();
-    const search = (text: GrepText): Searched => {
+    const search = (text: GrepText): Searched & { bom: boolean } => {
       const { lines, crlfEnds, lfEnds, bom } = fileText(text.bytes);
       const lineEndings = crlfEnds > 0 ? (lfEnds > 0 ? 'mixed' : 'CRLF') : undefined;
-      if (lineEndings !== undefined && !crlfFiles.has(text.file)) crlfFiles.set(text.file, { ends: lineEndings, version: text.version });
-      if (bom && !bomFiles.has(text.file)) bomFiles.set(text.file, text.version);
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -5386,7 +5533,7 @@ export class WorkspaceModule implements Module {
           found.push(match);
         }
       }
-      return { ...(lineEndings !== undefined ? { lineEndings } : {}), matches: found };
+      return { ...(lineEndings !== undefined ? { lineEndings } : {}), matches: found, bom };
     };
 
     for (const { mount, relativePath, moved, root } of mountsToSearch) {
@@ -5412,16 +5559,21 @@ export class WorkspaceModule implements Module {
         return { success: false, error: await this.disjointRefusal('grep', input.path!, input.glob!, prefixed !== null, mount, relativePath, root), isError: true };
       }
       const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
-      const searched = (text: GrepText): void => {
-        const hits = search(text);
-        if (hits.matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, ...hits });
+      const searched = (text: GrepText): (() => void) => {
+        const { bom, ...hits } = search(text);
+        const { file, state, version } = text;
+        return () => {
+          if (hits.lineEndings !== undefined && !crlfFiles.has(file)) crlfFiles.set(file, { ends: hits.lineEndings, version });
+          if (bom && !bomFiles.has(file)) bomFiles.set(file, version);
+          if (hits.matches.length > 0) results.push({ file, ...(state !== undefined ? { state } : {}), version, ...hits });
+        };
       };
       const kept = prefixed
         ? (path: string): boolean => prefixed.regex.test(path)
         : (path: string): boolean => fileGlob === null || fileGlob.test(path)
           || (byName && fileGlob.test(path.slice(path.lastIndexOf('/') + 1)));
       const found = mount.direct
-        ? await this.textsFromDisk(mount, relativePath, root, start, kept, searched)
+        ? await this.textsFromDisk(mount, relativePath, root, start, kept, (text) => searched(text)())
         : await this.textsFromStore(mount, relativePath, start, kept, searched);
       skipped.push(...found.skipped);
       incomplete.push(...found.incomplete);
@@ -5471,8 +5623,9 @@ export class WorkspaceModule implements Module {
   /**
    * The texts a 'chronicle' mount's grep searches beneath `start`, or in the
    * single file `relativePath` names, those `keep` lets through, each handed
-   * to `each` in path order: a pass over the scope, then each path's
-   * workspace copy, labelled with its state, and a conflict's disk side.
+   * to `search`, whose answers are recorded in path order: a pass over the
+   * scope, then each path's workspace copy, labelled with its state, and a
+   * conflict's disk side.
    * What it doesn't search is in `skipped`, and what it couldn't see in
    * `incomplete`, each mount-prefixed.
    */
@@ -5481,7 +5634,7 @@ export class WorkspaceModule implements Module {
     relativePath: string,
     start: string,
     keep: (path: string) => boolean,
-    each: (text: GrepText) => void,
+    search: (text: GrepText) => () => void,
   ): Promise<{ skipped: GrepSkip[]; incomplete: Array<{ path: string; reason: string }> }> {
     const store = this.getStore();
     const skipped: GrepSkip[] = [];
@@ -5534,16 +5687,18 @@ export class WorkspaceModule implements Module {
       }
 
       const intents = this.intents.get(mount.config.name)!;
+      type Lost = Omit<GrepText, 'bytes'> & { relativePath: string; hash: string; size: number; what: 'saved' | 'conflict-disk' };
+      const found: Array<{ searched: () => void } | { skip: GrepSkip } | { lost: Lost }> = [];
       for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
         if (!keep(report.path)) continue;
         const file = `${mount.config.name}/${report.path}`;
         if (report.state === 'disk-only') {
-          skipped.push({
+          found.push({ skip: {
             file,
             reason: 'disk-only: binary or over the size limit, never stored',
             ...(report.size !== undefined ? { size: report.size } : {}),
             ...(report.mimeType ? { mimeType: report.mimeType } : {}),
-          });
+          } });
           continue;
         }
         // A path in another mount's directory is that mount's: grep gives
@@ -5552,16 +5707,16 @@ export class WorkspaceModule implements Module {
         if (inOtherMount(report.path, this.othersOf(mount.config.name))) continue;
         const refusal = refused.get(report.path);
         if (refusal !== undefined) {
-          skipped.push({ file, reason: refusal });
+          found.push({ skip: { file, reason: refusal } });
           continue;
         }
         // The workspace's version, labelled with the path's state.
         const entry = store.treeGet(mount.treeStateId, report.path);
-        const blob = entry ? store.getBlob(entry.blobHash) : null;
-        if (blob) {
-          each({ file, state: report.state, version: 'workspace', bytes: blob });
-        } else if (entry) {
-          skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
+        if (entry) {
+          const stored = storedBytes(store, entry.blobHash);
+          found.push('bytes' in stored
+            ? { searched: search({ file, state: report.state, version: 'workspace', bytes: stored.bytes }) }
+            : { lost: { file, state: report.state, version: 'workspace', relativePath: report.path, hash: entry.blobHash, size: entry.size, what: 'saved' } });
         }
         if (report.state !== 'conflict') continue;
         // A conflict's disk side. The version recorded with the conflict is
@@ -5571,20 +5726,36 @@ export class WorkspaceModule implements Module {
         // disk version was never stored either.
         const disk = intents.get(report.path)?.conflict?.disk;
         const changed = report.conflict?.diskChangedSinceRecorded === true;
-        const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
-        if (diskBlob) {
-          each({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', bytes: diskBlob });
-        }
-        if (disk?.stored && !diskBlob) {
-          skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
+        if (disk?.stored) {
+          const version = changed ? 'recorded-disk' : 'conflicting-disk';
+          const stored = storedBytes(store, disk.stored);
+          found.push('bytes' in stored
+            ? { searched: search({ file, state: report.state, version, bytes: stored.bytes }) }
+            : { lost: { file, state: report.state, version, relativePath: report.path, hash: disk.stored, size: disk.size, what: 'conflict-disk' } });
         }
         if (changed) {
           if (report.diskNow === 'file') {
-            skipped.push({ file, reason: 'conflict: disk changed since the conflict was recorded; grep searches stored text, so the file disk holds now was not searched' });
+            found.push({ skip: { file, reason: 'conflict: disk changed since the conflict was recorded; grep searches stored text, so the file disk holds now was not searched' } });
           }
         } else if (disk && !disk.stored) {
-          skipped.push({ file, reason: 'conflict: the disk version is binary or over the size limit, never stored', size: disk.size });
+          found.push({ skip: { file, reason: 'conflict: the disk version is binary or over the size limit, never stored', size: disk.size } });
         }
+      }
+      const answers = new Map<Lost, { searched: () => void } | { skip: GrepSkip }>();
+      await this.restoreEach(mount, found.flatMap((item) => ('lost' in item ? [item.lost] : [])), (lost, contents) => {
+        const { file, state, version, what } = lost;
+        answers.set(lost, 'bytes' in contents
+          ? { searched: search({ file, state, version, bytes: contents.bytes }) }
+          : { skip: {
+            file,
+            reason: `${what === 'saved' ? "the workspace's copy" : 'conflict: the disk version recorded with the conflict'} is ${lostInStore(contents.lost)}, `
+              + `and ${lostOnDisk(contents.lost)}, so it was not searched`,
+          } });
+      });
+      for (const item of found) {
+        const answer = 'lost' in item ? answers.get(item.lost)! : item;
+        if ('searched' in answer) answer.searched();
+        else skipped.push(answer.skip);
       }
     });
     return { skipped, incomplete };
@@ -6408,13 +6579,13 @@ export async function inOrder<T, R>(items: readonly T[], width: number, work: (i
 }
 
 /** read_image's answer for an image, wherever it was read from. */
-function imageResult(path: string, image: { bytes: Buffer; mimeType: SupportedImageMimeType }): ToolResult {
+function imageResult(path: string, image: { bytes: Buffer; mimeType: SupportedImageMimeType }, note?: string): ToolResult {
   return {
     success: true,
     data: [
       {
         type: 'text',
-        text: `Path: ${path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
+        text: `Path: ${path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}${note === undefined ? '' : `\n${note}`}`,
       },
       {
         type: 'image',
@@ -6605,6 +6776,48 @@ function linksNote(path: string, staged: Staged, tool: 'write' | EditTool): stri
 function containedRefusal(err: unknown, path: string): string {
   const bare = err instanceof WorkspaceReadError && err.errno !== undefined && err.message === `Unable to read file: ${path}`;
   return bare ? `${err.message} (${err.errno})` : err instanceof Error ? err.message : String(err);
+}
+
+type LostContents = {
+  path: string;
+  store: Exclude<StoredBytes, { bytes: Buffer }>;
+  disk: 'other' | 'none' | { unreadable: string };
+  writable: boolean;
+};
+
+function contentsSubject(what: 'saved' | 'conflict-disk', path: string): string {
+  return what === 'saved' ? `the saved contents of ${path}` : `the version of ${path} that its conflict recorded as disk's`;
+}
+
+function inTheStore(stored: Exclude<StoredBytes, { bytes: Buffer }>): string {
+  return 'missing' in stored ? "missing from the workspace's store" : `unreadable in the workspace's store (${stored.unreadable})`;
+}
+
+function lostInStore(lost: Pick<LostContents, 'store'>): string {
+  return 'missing' in lost.store ? 'missing from the store' : `unreadable in the store (${lost.store.unreadable})`;
+}
+
+function lostOnDisk(lost: LostContents): string {
+  return lost.disk === 'other' ? "disk's copy holds other contents"
+    : lost.disk === 'none' ? 'disk has no copy'
+      : `disk's copy can't be read (${lost.disk.unreadable})`;
+}
+
+function lostText(lost: LostContents): string {
+  return `The workspace's copy of ${lost.path} is ${lostInStore(lost)}, and ${lostOnDisk(lost)}`;
+}
+
+function nothingToRead(lost: LostContents): string {
+  return `${lostText(lost)}, so it can't be restored or read. ${lostRemedy(lost)}`;
+}
+
+function lostRemedy(lost: LostContents): string {
+  const rewrite = lost.writable && 'missing' in lost.store;
+  if (lost.disk === 'other') return `Sync the path to keep disk's copy and give up the workspace's${rewrite ? ', or write the file again' : ''}.`;
+  if (lost.writable) return rewrite ? 'Write the file again, or delete it.' : 'Delete the file to clear it.';
+  return lost.disk === 'none'
+    ? "Sync the path to take disk's deletion, which removes the workspace's copy."
+    : "Once disk's copy can be read, read the file again, which reads it from disk's copy if that copy has the same contents, or sync the path to keep disk's copy and give up the workspace's.";
 }
 
 /**
