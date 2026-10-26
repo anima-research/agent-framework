@@ -1167,10 +1167,11 @@ describe('private wins, one way', () => {
     type Rig = Awaited<ReturnType<typeof surfaceRig>>;
     const idle = (rig: Rig) => rig.framework.getAgent('scout')!.state.status === 'idle';
     const privateTurn = async (rig: Rig) => {
+      const before = rig.routed.length;
       const starts = rig.starts.length;
       rig.framework.pushEvent(tuiMessage('for your eyes only: what is the plan?'));
       await rig.until(() => rig.starts.length > starts && idle(rig), 'the private turn');
-      assert.deepEqual(rig.routed, [], 'control: the private turn spoke in no channel');
+      assert.deepEqual(rig.routed.slice(before), [], 'control: the private turn spoke in no channel');
     };
     const roomTurn = async (rig: Rig) => {
       const before = rig.routed.length;
@@ -1316,6 +1317,33 @@ describe('private wins, one way', () => {
         const newest = rig.framework.getAgent('scout')!.getContextManager().getAllMessages().at(-1);
         assert.equal(readInboundSource(newest?.metadata)?.kind, 'surface', `control: the context ends on the operator's question: ${JSON.stringify(newest)}`);
         assert.deepEqual(await nudge(rig), []);
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a nudge after a channel turn that followed a private exchange speaks in no channel: its context still holds the private input", async () => {
+      const rig = await surfaceRig();
+      try {
+        await privateTurn(rig);
+        await roomTurn(rig);
+        assert.deepEqual(await nudge(rig), []);
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a nudge after the host's own undo, twice, back past a private exchange speaks as on main, in the fallback channel", async () => {
+      const rig = await surfaceRig();
+      try {
+        (rig.framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown })
+          .addMessage('bob', [{ type: 'text', text: 'how is the build?' }], { messageId: 'd1', channelId: ROOM });
+        await roomTurn(rig);
+        await privateTurn(rig);
+        await hostUndo(rig);
+        await hostUndo(rig);
+        assert.ok(!stored(rig).includes('for your eyes only'), `control: the context no longer holds the private exchange: ${stored(rig)}`);
+        assert.deepEqual((await nudge(rig)).map((r) => r.locus), [LOUNGE]);
       } finally {
         await rig.close();
       }
