@@ -8199,6 +8199,37 @@ describe('the mount root', () => {
     assert.equal(env.eventsOf('workspace:deleted').length, 0, 'nothing was taken as deleted');
   });
 
+  test('a materialize on a renumbered root, with nothing run before it, writes the draft and records the root on its new device', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await call(m, 'write', { path: 'work/a.txt', content: 'A2, a draft over a synced file' });
+    const now = rootWithBirthTime(t, env);
+    if (!now) return;
+    m = await recordedAs(env, m, { ...now, dev: bumped(now.dev) });
+    const entriesBefore = rootEntries(m).length;
+
+    const materialized = await call(m, 'materialize', {});
+    assert.equal(materialized.skipped, undefined, 'nothing skipped');
+    assert.equal(env.readDisk('a.txt'), 'A2, a draft over a synced file', 'the draft went out');
+    const entries = rootEntries(m);
+    assert.equal(entries.length, entriesBefore + 1, 'the root was recorded again, once');
+    assert.deepEqual(entries.at(-1).entry.identity, now, 'on the device it is on now');
+    assert.equal(entries.at(-1).entry.reset, undefined, 'not accepted: the evidence stays');
+  });
+
+  test('another directory offered as a recorded root leaves the record as it is', (t) => {
+    const env = new Env(t);
+    const agreement = new DiskAgreement(env.store);
+    agreement.open([{ name: 'work', root: env.dir }]);
+    const recorded = { dev: '1', ino: '2', born: '5' };
+    agreement.recordRootIdentity('work', recorded);
+    agreement.recordRootIdentity('work', { dev: '1', ino: '4', born: '5' }); // another inode
+    agreement.recordRootIdentity('work', { dev: '3', ino: '2', born: '6' }); // another device and birth time
+    agreement.recordRootIdentity('work', { dev: '3', ino: '2' }); // another device, no birth time
+    assert.deepEqual(agreement.rootIdentity('work'), recorded);
+  });
+
   test('a stat with no birth time leaves a recorded birth time as it is', (t) => {
     const env = new Env(t);
     const agreement = new DiskAgreement(env.store);
