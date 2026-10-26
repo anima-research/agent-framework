@@ -12,6 +12,7 @@
 //    "content"? (content blocks, instead of text; [] included)}
 //   {"op":"rename","channelId":…,"label":…}             (channels/changed)
 //   {"op":"publish-mode","mode":"delivered"|"not-delivered"|"no-receipt"|"error"|"hang"}
+//   {"op":"send-mode","mode":"delivered"|"no-channel"|"error"|"hang"}  (SEND_TOOL=1)
 //   {"op":"history","channelId":…,"history":[ChannelIncomingMessage…]}
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL ({event:'publish', channelId, text, messageId}).
@@ -40,6 +41,7 @@ let nextId = 500;
 let processedCommands = 0;
 let publishMode = 'delivered';
 let publishErrorData;
+let sendMode = 'delivered';
 let posted = 0;
 const histories = new Map();
 
@@ -128,6 +130,9 @@ function pollCommands() {
       publishMode = c.mode;
       publishErrorData = c.detail;
       log('publish-mode', { mode: c.mode });
+    } else if (c.op === 'send-mode') {
+      sendMode = c.mode;
+      log('send-mode', { mode: c.mode });
     } else if (c.op === 'history') {
       histories.set(c.channelId, c.history);
     }
@@ -224,7 +229,28 @@ rl.on('line', (line) => {
     return;
   }
   if (msg.method === 'tools/list') {
-    reply(msg.id, { tools: [] });
+    reply(msg.id, {
+      tools: process.env.SEND_TOOL === '1'
+        ? [{
+            name: 'send_message',
+            description: 'Send a message to a channel.',
+            inputSchema: { type: 'object', properties: { channelId: { type: 'string' }, text: { type: 'string' } }, required: ['channelId', 'text'] },
+          }]
+        : [],
+    });
+    return;
+  }
+  if (msg.method === 'tools/call' && msg.params?.name === 'send_message' && process.env.SEND_TOOL === '1') {
+    const args = msg.params?.arguments ?? {};
+    log('send', { channelId: args.channelId, text: args.text, mode: sendMode });
+    if (sendMode === 'hang') return;
+    if (sendMode === 'error') {
+      reply(msg.id, { content: [{ type: 'text', text: `Discord refused part 2. Attempted destination: ${args.channelId}` }], isError: true });
+    } else if (sendMode === 'no-channel') {
+      reply(msg.id, { content: [{ type: 'text', text: 'sent' }] });
+    } else {
+      reply(msg.id, { content: [{ type: 'text', text: JSON.stringify({ messageId: `sent-${++posted}`, channelId: args.channelId }) }] });
+    }
     return;
   }
   if (msg.method === 'tools/call') {

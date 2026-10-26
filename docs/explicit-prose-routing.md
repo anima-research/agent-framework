@@ -117,7 +117,7 @@ depends on the route:
 
 - The turn-frozen locus, announce-on-change notices, and all locus-capture
   policy (addressed-preference, ambient tiers) — no locus exists.
-- Explicit-send prose suppression (`turnSilenced`): redundant, since
+- Explicit-send prose suppression (`silence`): redundant, since
   unprefixed prose bounces and prefixed prose is deliberate.
 - The entire "which event may move the agent's voice" question.
 
