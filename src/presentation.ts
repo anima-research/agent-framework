@@ -36,8 +36,10 @@
  *
  * The module presents only for an agent it has taken on (adopt) whose
  * manager is in presented mode: it never calls presentRows on a manager in
- * legacy mode but for the deliberate write-down at adopt, since any
- * presentRows there writes the whole record down and switches the mode.
+ * legacy mode but for the deliberate write-down at adopt, and again at a
+ * rebase after the store's branch moved to a branch whose window index for
+ * that manager was never written (one made before the write-down), since
+ * any presentRows there writes the whole record down and switches the mode.
  * Nothing in it throws into a writer: a failed presentation is traced and
  * its rows stay out of the window for the next point.
  *
@@ -258,7 +260,11 @@ export type PresentationOccasion =
   /** Rows handed a reader fork as framing. */
   | 'framing'
   /** An agent taken on: its window written down and its own rows repaired. */
-  | 'adopt';
+  | 'adopt'
+  /** The store's branch moved under a live agent (rebase): its window on the
+   *  new branch written down, where that branch had none, and its own rows
+   *  repaired. */
+  | 'rebase';
 
 /** A context manager as the module uses it. */
 export type WindowManager = Pick<ContextManager,
@@ -386,7 +392,8 @@ export class AgentPresentation {
    * window are presented to it, in record order (an undone turn's rows are
    * not: getUnpresentedMessages leaves them out). A window that can't be
    * written down (another version's index format, or a failed write) leaves
-   * the agent in legacy mode for this process, traced once: its window is
+   * the agent in legacy mode, traced once, until a move of the store's
+   * branch writes its window down on the new branch (rebase): its window is
    * the whole record, as before the index. Then, every time, the agent's
    * own-row sink is installed, and every scan memo is dropped, since a
    * registration can change who reads a slot.
@@ -398,18 +405,7 @@ export class AgentPresentation {
     if (!state) {
       state = {};
       this.adopted.set(cm, state);
-      if (cm.windowMode() === 'legacy') {
-        try {
-          cm.presentRows([]);
-        } catch (error) {
-          state.pinnedLegacy = describe(error);
-          this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'adopt', error: state.pinnedLegacy });
-        }
-      }
-      if (!state.pinnedLegacy && cm.windowMode() !== 'presented') {
-        state.pinnedLegacy = 'the window is not in presented mode after its write-down';
-        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'adopt', error: state.pinnedLegacy });
-      }
+      this.writeDown(agent, state, 'adopt');
       if (!state.pinnedLegacy) {
         this.repair(agent);
         // A reader fork is framed before it is taken on (noteFramed at its
@@ -419,6 +415,82 @@ export class AgentPresentation {
       }
     }
     if (!state.pinnedLegacy) agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
+  }
+
+  /**
+   * The store's branch moved under an agent taken on (a host's switchBranch,
+   * a rollback's or a suppression's switch, a failed surgery's restore).
+   * Its manager's window index is the new branch's: on a branch made before
+   * the agent's write-down (every branch an earlier release's store holds,
+   * or a rollback into rows the write-down presented, which branchAt cuts
+   * at their own sequence) there is none, and the window would be the
+   * whole record for the rest of the process. So, as at adopt, such a
+   * window is written down (presentRows([]), traced as presented at
+   * `'rebase'`), and the agent's own rows stored and not in its window are
+   * presented to it (the own-row sweep). A window that is presented on the
+   * new branch is presented again for an agent left in legacy mode by an
+   * earlier branch, its own-row sink installed. A window that can't be
+   * written down, or a manager whose strategy couldn't follow the move
+   * (`failure`, from its reinitializeOnStoreBranch), leaves the agent in
+   * legacy mode until the next move, traced as presentation:failed at
+   * `'rebase'`. Arrivals aren't presented here: the framework's surgery
+   * release presents what each agent is owed. Never throws.
+   */
+  rebase(agent: PresentedAgent, failure?: unknown): void {
+    const cm = agent.getContextManager();
+    const state = this.adopted.get(cm);
+    if (!state) return;
+    this.generation++;
+    this.memos.delete(cm);
+    try {
+      if (failure !== undefined) {
+        state.pinnedLegacy = describe(failure);
+        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy });
+        return;
+      }
+      if (cm.isClosed()) return;
+      delete state.pinnedLegacy;
+      if (!this.writeDown(agent, state, 'rebase')) return;
+      agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
+      this.repair(agent, 'rebase');
+    } catch (error) {
+      state.pinnedLegacy = describe(error);
+      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy });
+    }
+  }
+
+  /**
+   * Write `agent`'s window down where its manager is in legacy mode
+   * (presentRows([]), which also finishes a write-down cut short), and say
+   * whether the window is presented after it. A write-down that fails, or
+   * leaves the manager in legacy mode, pins the agent in legacy mode
+   * (`state.pinnedLegacy`), traced as presentation:failed at `occasion`. A
+   * write-down at a rebase is traced as presented, with the bodies the
+   * window holds.
+   */
+  private writeDown(agent: PresentedAgent, state: Adopted, occasion: 'adopt' | 'rebase'): boolean {
+    const cm = agent.getContextManager();
+    let wrote = false;
+    if (cm.windowMode() === 'legacy') {
+      try {
+        cm.presentRows([]);
+        wrote = true;
+      } catch (error) {
+        state.pinnedLegacy = describe(error);
+        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
+        return false;
+      }
+    }
+    if (cm.windowMode() !== 'presented') {
+      state.pinnedLegacy = 'the window is not in presented mode after its write-down';
+      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
+      return false;
+    }
+    if (wrote && occasion === 'rebase') {
+      const count = bodyHeadCount(cm.getPresentedMessages());
+      if (count > 0) this.host.emitTrace({ type: 'presentation:presented', agentName: agent.name, occasion, count });
+    }
+    return true;
   }
 
   /** Let an agent go: its sink off, and what the module kept for it (its memo, its framing) dropped. */
@@ -817,14 +889,14 @@ export class AgentPresentation {
   }
 
   /** The own-row sweep: the agent's own rows not in its window, presented in record order, traced as a repair. */
-  private repair(agent: PresentedAgent): void {
+  private repair(agent: PresentedAgent, occasion: 'adopt' | 'rebase' = 'adopt'): void {
     try {
       const own = this.pending(agent, false);
       if (own.length === 0) return;
-      const { entered } = this.present(agent, own.map((body) => body.shards[0]!.id), 'adopt', undefined, own, true);
+      const { entered } = this.present(agent, own.map((body) => body.shards[0]!.id), occasion, undefined, own, true);
       if (entered.size > 0) this.host.emitTrace({ type: 'presentation:repaired', agentName: agent.name, count: entered.size });
     } catch (error) {
-      this.failed(agent, 'adopt', error);
+      this.failed(agent, occasion, error);
     }
   }
 
@@ -979,6 +1051,13 @@ function unique(ids: ReadonlyArray<MessageId | undefined>): MessageId[] {
     out.push(id);
   }
   return out;
+}
+
+/** How many bodies a window holds, a sharded one counted once. */
+function bodyHeadCount(window: readonly StoredMessage[]): number {
+  let count = 0;
+  for (let i = 0; i < window.length; i++) if (i === 0 || !continuesBody(window[i - 1], window[i])) count++;
+  return count;
 }
 
 /** The ids of the last `count` bodies of a window, by their first shards, in window order. */

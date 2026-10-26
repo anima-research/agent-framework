@@ -1,8 +1,8 @@
 /**
  * Operator action log — a durable, append-only JSONL record of every
  * operator-initiated mutation of a live resident: branch rollbacks, message
- * suppressions, undo/redo/hide, unstick/nudge, runtime-settings changes,
- * host quiesce/resume. One file per store, next to the chronicle
+ * suppressions, branch checkouts (switchBranch), undo/redo/hide,
+ * unstick/nudge, runtime-settings changes, host quiesce/resume. One file per store, next to the chronicle
  * (`<storePath>/operator-actions.jsonl`), so it travels with backups and
  * survives host restarts the way `repair-receipts.jsonl` and
  * `watchdog-wedge.jsonl` do.
@@ -32,7 +32,7 @@ export interface OperatorRequester {
 export interface OperatorLogEntry {
   /** ISO-8601 wall-clock time of the record. */
   at: string;
-  /** Action kind, e.g. 'rollback', 'suppress', 'undo', 'hide', 'quiesce'. */
+  /** Action kind, e.g. 'rollback', 'suppress', 'checkout', 'undo-turn', 'hide', 'quiesce'. */
   kind: string;
   /** Agent the action targeted (absent for host-wide actions). */
   agent?: string;

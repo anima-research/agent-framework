@@ -597,12 +597,14 @@ export class ApiServer {
     // during a live turn or once stop() has begun, and stop() waits for one
     // already running. It moves the store once any maintenance already
     // running has finished, so the move can come after this call returns.
+    // It writes the switch to the operator log as a checkout over this
+    // surface.
     // The event names this switch's own move, from the branch read here to
     // the one it was asked for: another switch can move the store again
     // before this one continues.
     let switched = false;
     try {
-      await this.framework.switchBranch(params.name);
+      await this.framework.switchBranch(params.name, { requester: { via: 'api' } });
       switched = true;
     } finally {
       // A later step can fail after the store has moved: clients still hear

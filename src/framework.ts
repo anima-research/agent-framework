@@ -12,7 +12,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn, InitializationSupersededError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import {
@@ -4025,6 +4025,13 @@ export class AgentFramework {
     // context-manager that keeps a window index per agent (presentRows).
     if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
       throw new Error('agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent');
+    }
+    // A move of the store's branch is followed by every other live agent's
+    // context (followBranchMove), which needs a context-manager that can
+    // initialize a strategy again on the store's branch without starting a
+    // branch generation of its own.
+    if (typeof (ContextManager.prototype as { reinitializeOnStoreBranch?: unknown }).reinitializeOnStoreBranch !== 'function') {
+      throw new Error('agent-framework needs @animalabs/context-manager with ContextManager.reinitializeOnStoreBranch: a context-manager whose managers can follow a branch move made through another');
     }
     framework.presentation = new AgentPresentation({
       liveAgents: () => framework.agents.values(),
@@ -12564,27 +12571,128 @@ export class AgentFramework {
    * It moves the store once any maintenance already running has finished, so
    * the move can come after the call returns, and a refusal moves nothing.
    * An operator's operation: refused once stop() has begun, and waited for
-   * by stop() while it runs.
+   * by stop() while it runs. It is written to the operator log as a
+   * `checkout` (`requester` and `note` as the caller gives them), a refusal
+   * or failure with its error.
    *
    * The branch moves under every agent sharing the store, so the switch
    * reserves the store as a surgery does: every agent must be idle with no
    * turn alive (no continuation or held retry of one on its way), or it is
    * refused (OperatorActionError 'agent-busy'), and no turn starts until the
-   * switch is done.
+   * switch is done. Before the reservation is released every live agent's
+   * context follows the move (followBranchMove): its strategy is
+   * initialized again on the branch, and its window is written down there
+   * if the branch was made before its write-down.
    */
-  async switchBranch(name: string): Promise<void> {
+  async switchBranch(name: string, opts?: { requester?: OperatorRequester; note?: string }): Promise<void> {
     this.refuseOperatorAfterStop('switch branch');
-    const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+    const logBase: OperatorLogInput = {
+      kind: 'checkout',
+      ...(opts?.requester ? { requester: opts.requester } : {}),
+      ...(opts?.note ? { note: opts.note } : {}),
+      params: { branch: name },
+    };
+    let sourceBranch: string | undefined;
+    let moved = false;
     try {
-      // A maintenance tick already running finishes before the switch.
-      if (this.maintenanceRunning()) await this.settleMaintenancePass();
-      this.store.switchBranch(name);
-      const ws = this.moduleRegistry.getModule('workspace');
-      if (ws && 'materializeMount' in ws) {
-        await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
+      const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+      try {
+        // A maintenance tick already running finishes before the switch.
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
+        sourceBranch = this.store.currentBranch().name;
+        this.store.switchBranch(name);
+        moved = true;
+        // No manager made this move, so every live agent's context follows it.
+        await this.followBranchMove();
+        const ws = this.moduleRegistry.getModule('workspace');
+        if (ws && 'materializeMount' in ws) {
+          await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
+        }
+      } finally {
+        release();
       }
-    } finally {
-      release();
+    } catch (error) {
+      this.recordOperatorAction({
+        ...logBase,
+        ...(moved ? { result: { sourceBranch, targetBranch: name } } : {}),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+    this.recordOperatorAction({ ...logBase, result: { sourceBranch, targetBranch: name } });
+  }
+
+  /**
+   * After the store's branch moved, under a store reservation (a host's
+   * switchBranch, a rollback's switch, a suppression's fork, or a failed
+   * surgery's restore): every live agent's context follows the move. Each
+   * live context but `moved`'s (whose switchBranch or fork initialized its
+   * strategy already) is initialized again on the store's branch
+   * (ContextManager.reinitializeOnStoreBranch), all at once: a manager that
+   * didn't make the move keeps its strategy at the old branch generation
+   * otherwise, and an AutobiographicalStrategy refuses every compile
+   * ("requires reinitialization for the current branch generation") until
+   * a restart. Then the presentation index rebases each agent on the new
+   * branch: a window the branch has none of (a branch made before the
+   * agent's write-down, a rollback into rows the write-down presented) is
+   * written down, and the agent's own rows not in its window are presented,
+   * so an agent that presented before the move presents after it. Arrivals
+   * wait for the reservation's release, which presents what each agent is
+   * owed. Redo entries are dropped, every agent's: each was an undo on a
+   * window of the branch the store left.
+   *
+   * Never throws: the move has happened. A context whose strategy can't
+   * follow (the manager stays fenced until a later initialization
+   * succeeds), or whose window can't be written down, leaves its agent in
+   * legacy mode, logged and traced as presentation:failed at `'rebase'`,
+   * until the next move.
+   */
+  private async followBranchMove(moved?: ContextManager): Promise<void> {
+    try {
+      this.redoStacks.clear();
+      const failures = new Map<ContextManager, unknown>();
+      const managers = new Set<ContextManager>();
+      for (const agent of this.agents.values()) managers.add(agent.getContextManager());
+      await Promise.all([...managers].map(async (cm) => {
+        if (cm === moved || cm.isClosed()) return;
+        try {
+          await this.reinitializeOnStoreBranch(cm);
+        } catch (error) {
+          failures.set(cm, error);
+        }
+      }));
+      for (const agent of this.agents.values()) {
+        const failure = failures.get(agent.getContextManager());
+        if (failure !== undefined) {
+          console.error(
+            `[operator] ${agent.name}'s context couldn't follow the store to branch ${this.store.currentBranch().name}; ` +
+              'its window stays the record until the next branch move:',
+            failure,
+          );
+        }
+        this.presentation?.rebase(agent, failure);
+      }
+    } catch (error) {
+      console.error('[operator] following a branch move failed; an agent whose context did not follow it stays as it was:', error);
+    }
+  }
+
+  /**
+   * One context's reinitializeOnStoreBranch, for followBranchMove. A store
+   * moved again while the strategy initialized rejects the call, which is
+   * made again (twice at most) once the move has settled; an initialization
+   * a newer one superseded (a setStrategy) leaves the strategy to that one.
+   */
+  private async reinitializeOnStoreBranch(cm: ContextManager): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await cm.reinitializeOnStoreBranch();
+        return;
+      } catch (error) {
+        if (error instanceof InitializationSupersededError) return;
+        const moving = error instanceof Error && error.message.startsWith('Branch changed during strategy initialization');
+        if (!moving || attempt >= 3) throw error;
+      }
     }
   }
 
@@ -12600,8 +12708,9 @@ export class AgentFramework {
    * they are: rollbackToMessage is the record-level revert. `redo()` puts
    * the rows back. It is refused while a turn of the agent's is alive, and
    * allowed while another agent's is, and refused for an agent whose window
-   * isn't presented (its write-down failed when it was registered), which
-   * has no window of its own to undo on.
+   * isn't presented (presents: a write-down that failed, at its
+   * registration or after a branch move, or a context that couldn't follow
+   * a branch move), which has no window of its own to undo on.
    *
    * Returns `{ undone: false }` when there is nothing to undo.
    */
@@ -12637,7 +12746,7 @@ export class AgentFramework {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
     if (!this.presents(agent)) {
-      throw new OperatorActionError('failed', `Cannot undo: ${agentName}'s window isn't presented (its write-down failed when it was registered), so it has no window to undo on; rollbackToMessage reverts the record`);
+      throw new OperatorActionError('failed', `Cannot undo: ${agentName}'s window isn't presented on this branch (a write-down of it failed, or its context couldn't follow a branch move; see presentation:failed), so it has no window to undo on; rollbackToMessage reverts the record`);
     }
     return this.undoOnWindow(agent, requester);
   }
@@ -13037,8 +13146,11 @@ export class AgentFramework {
 
   /**
    * After a failed switch or redaction: put the store back on `sourceBranch`
-   * if it moved, and return a sentence saying what actually happened. Never
-   * throws — the caller reports the original failure with this appended.
+   * if it moved, and return a sentence saying what actually happened. Every
+   * other live agent's context follows the store to where it ends
+   * (followBranchMove): its source, or the failed branch when the restore
+   * failed too. Never throws — the caller reports the original failure with
+   * this appended.
    */
   private async restoreSourceBranch(
     cm: ContextManager,
@@ -13050,11 +13162,15 @@ export class AgentFramework {
     if (current !== failedBranch) return `active branch is ${current}`;
     try {
       await cm.switchBranch(sourceBranch);
+      await this.followBranchMove(cm);
       return `active branch restored to ${sourceBranch}`;
     } catch (restoreError) {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
       const status = `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); agent is still on ${failedBranch}`;
       console.error(`[operator] agent=${agentName} ${status}`);
+      // Wherever the store is, the others follow it; `cm`'s own strategy
+      // stays fenced, and is initialized again with them.
+      await this.followBranchMove();
       return status;
     }
   }
@@ -13165,6 +13281,8 @@ export class AgentFramework {
         try {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
           await cm.switchBranch(branchName);
+          // The store moved under every other agent: their contexts follow it.
+          await this.followBranchMove(cm);
         } catch (error) {
           // switchBranch moves the chronicle branch BEFORE awaiting strategy
           // initialization, so a rejection here can leave the store on the
@@ -13329,6 +13447,9 @@ export class AgentFramework {
 
         try {
           createdBranch = await cm.fork(targetBranch);
+          // The fork moved the store under every other agent: their contexts
+          // follow it before any removal reaches their windows.
+          await this.followBranchMove(cm);
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
@@ -14621,8 +14742,8 @@ export class AgentFramework {
           // presents nothing of others' until the quiesce lifts.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
           // What this boundary presented for the agent to hear, in order. An
-          // agent whose window isn't presented (its write-down failed at its
-          // registration) hears nothing here: its window is the record.
+          // agent whose window isn't presented (a write-down of it failed)
+          // hears nothing here: its window is the record.
           const heard: Array<{ id: MessageId; participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           const presentsWindow = this.presents(agent);
           const injects = currentState.supportsInjectedMessages !== false;
@@ -19054,10 +19175,15 @@ export class AgentFramework {
   /**
    * Whether the presentation index presents for `agent` (#291): the agent
    * taken on, and its context in presented mode. Every registered agent is
-   * taken on; one whose window couldn't be written down (another version's
-   * index format, or a failed write) stays in legacy mode for this process,
-   * its window the whole record, and the paths that ask this pass it by:
-   * nothing is presented for it, its tool boundaries hear nothing, and
+   * taken on, its window written down at its registration, and again on the
+   * new branch after every move of the store's branch where that branch has
+   * none (followBranchMove: a branch made before the write-down, a rollback
+   * into rows the write-down presented), so a branch move doesn't end it.
+   * One whose window couldn't be written down (another version's index
+   * format, or a failed write), or whose context couldn't follow a branch
+   * move, stays in legacy mode until the next move, its window the whole
+   * record, traced as presentation:failed; the paths that ask this pass it
+   * by: nothing is presented for it, its tool boundaries hear nothing, and
    * undo refuses it.
    */
   private presents(agent: Agent | undefined): boolean {
@@ -26962,7 +27088,7 @@ export class AgentFramework {
   }
 
   /** The note addMessage takes for a message it stored, for an agent whose
-   *  window isn't presented (its write-down failed at its registration),
+   *  window isn't presented (a write-down of it failed),
    *  whose window is the record: an arrival for its open turn when none of
    *  its turns is alive or its start is assembling (no tool boundary will
    *  weigh it). An agent the presentation index presents for weighs the row

@@ -1,8 +1,11 @@
 - **Hosts: every agent's context follows its own presentation index** (#291). `FrameworkConfig.presentationIndex`
   is removed: what it turned on is how every framework runs (see the presentation index's entries), and a host's
   configuration that still passes it is read as any unknown key is. `create()` refuses a context-manager without
-  `ContextManager.presentRows`. An agent whose window can't be written down at its registration (another version's
-  index format, a failed write) stays in legacy mode for that process, its window the whole record, as before.
+  `ContextManager.presentRows`, or without `ContextManager.reinitializeOnStoreBranch` (context-manager's
+  291-reinitialize-on-store-branch entry), which every other live agent's context calls after a branch move. An
+  agent whose window can't be written down at its registration (another version's index format, a failed write)
+  stays in legacy mode, its window the whole record, as before, until a branch move writes its window down on the
+  new branch.
   - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
     agent's window, its own as undone and others' back to arrived, and `redo` puts them back. Neither writes the
     record or moves a branch, so neither reverts the workspace or `_config` mounts, MCPL checkpoints or the

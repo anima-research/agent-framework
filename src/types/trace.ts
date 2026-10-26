@@ -1011,7 +1011,9 @@ export type TraceEvent =
       /**
        * Rows entered an agent's window (context-manager's presentRows), at
        * one of its presentation points (`occasion`): `count` bodies, a
-       * sharded one counted once.
+       * sharded one counted once. At `rebase`, the store's branch moved to a
+       * branch with no window for the agent, and its window there was
+       * written down: `count` is the bodies it holds.
        */
       type: 'presentation:presented';
       agentName: string;
@@ -1052,7 +1054,11 @@ export type TraceEvent =
        *  agent's window for its next presentation point. At `adopt`, the
        *  agent's window couldn't be written down (another version's index
        *  format, or a failed write), and the agent stays in legacy mode: its
-       *  window is the whole record, as before the index. */
+       *  window is the whole record, as before the index. At `rebase`, after
+       *  the store's branch moved, its window couldn't be written down on
+       *  the new branch, or its context's strategy couldn't follow the move
+       *  (`error` says which), and it stays in legacy mode until the next
+       *  move. */
       type: 'presentation:failed';
       agentName: string;
       occasion: PresentationOccasion;

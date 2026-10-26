@@ -1627,6 +1627,10 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   framework.providerGates = new Map();
   framework.operatorLog = new OperatorLog(undefined);
   framework.opsAlert = () => {};
+  // A branch move drops every redo entry, and rebases each agent the
+  // presentation index presents for: here, none.
+  framework.redoStacks = new Map();
+  framework.presentation = null;
   return { framework, removed, setBranch: (name: string) => { currentBranch = name; } };
 }
 

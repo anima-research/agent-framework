@@ -655,6 +655,9 @@ describe('stop() with an operator operation in flight', () => {
       (api as unknown as { lastKnownBranch: string }).lastKnownBranch = 'stale';
       await api.cmdBranchSwitch({ name: 'side' });
       assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'side' }]]);
+      // The operator log has it as a checkout over the API (#291, FW-AF-1).
+      const checkout = framework.getOperatorLog({ limit: 5 }).find((entry) => entry.kind === 'checkout');
+      assert.deepEqual([checkout?.requester, checkout?.result], [{ via: 'api' }, { sourceBranch: 'main', targetBranch: 'side' }]);
     } finally { await framework.stop(); }
   });
 
@@ -688,8 +691,12 @@ describe('stop() with an operator operation in flight', () => {
   });
 
   it('two API switches handled together each announce their own move', async () => {
-    // With no workspace module, a switch holds the store for no await, so a
-    // second one can move the store before the first's continuation runs.
+    // A second switch can move the store after the first's framework call
+    // has returned and before the API server's continuation for it runs.
+    // (It used to be started alongside the first, when a switch with no
+    // workspace module held the store for no await. A switch now holds the
+    // store while every live agent's context follows the move (#291,
+    // FW-AF-1), so a second one started alongside it is refused as busy.)
     const framework = await create();
     try {
       const api = new ApiServer(framework) as unknown as {
@@ -702,7 +709,16 @@ describe('stop() with an operator operation in flight', () => {
       await api.cmdBranchCreate({ name: 'b' });
       const broadcasts: Array<[string, unknown]> = [];
       api.broadcast = (event, data) => { broadcasts.push([event, data]); };
-      await Promise.all([api.cmdBranchSwitch({ name: 'a' }), api.cmdBranchSwitch({ name: 'b' })]);
+      const switchBranch = framework.switchBranch.bind(framework);
+      let second: Promise<unknown> | undefined;
+      framework.switchBranch = async (name, opts) => {
+        await switchBranch(name, opts);
+        // Started as the first returns: it moves the store at once, before
+        // the API server's continuation for the first runs.
+        if (name === 'a') second = api.cmdBranchSwitch({ name: 'b' });
+      };
+      await api.cmdBranchSwitch({ name: 'a' });
+      await second;
       assert.deepEqual(broadcasts, [
         ['branch:switched', { from: 'main', to: 'a' }],
         ['branch:switched', { from: 'a', to: 'b' }],
