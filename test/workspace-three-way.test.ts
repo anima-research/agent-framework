@@ -1020,8 +1020,8 @@ describe('a mount nested inside another', () => {
     const env = new Env(t);
     for (const f of ['top.txt', 'cat.txt', 'a/b/inner.txt', 'c/near.txt', 'sub/c', 'sub/x/c/f.txt', '..cache/f.txt']) env.writeDisk(f, f);
     const m = await env.open({}, { mounts: [
-      // `a/b` listed by hand matches nothing, so it doesn't stand in for the
-      // nested mount's entry.
+      // `a/b` listed by hand covers the nested mount's directory too, and the
+      // walk still passes it over as that mount's.
       { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', ignore: ['a/b'] },
       { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
       { name: 'near', path: env.disk('c'), mode: 'read-write', watch: 'never' },

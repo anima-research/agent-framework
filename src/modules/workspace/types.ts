@@ -101,10 +101,25 @@ export interface MountConfig {
   /** Poll interval in ms for checking watched root identity changes (default: 2000) */
   watchRootPollMs?: number;
   /**
-   * Simple ignore patterns (NOT full gitignore syntax). Supported forms:
-   * - Exact name match: ".git", "node_modules"
-   * - Directory glob: "node_modules/**" (anything under node_modules)
-   * - Extension glob: "*.pyc" (any file ending in .pyc)
+   * Patterns in these of gitignore's forms, each read as gitignore reads it:
+   * - A name, matched at any depth: ".git", "node_modules". Within a name,
+   *   "*" matches any run of characters and "?" any one: "*.pyc",
+   *   "npm-debug.log*".
+   * - A trailing "/" matches only a directory: "build/" covers every
+   *   directory named build, with what lies beneath it, and no file of that
+   *   name.
+   * - A leading or inner "/" makes a path from the mount's root: "/dist"
+   *   covers only the root's dist, and "a/b" only the root's a/b.
+   * - "**" as the first segment, before one name, matches that name at any
+   *   depth, as the name alone does.
+   * - A trailing "/**" covers a directory from the root and what lies
+   *   beneath it: "node_modules/**" covers only the root's node_modules, and
+   *   no file of that name.
+   * The module refuses, when it's built, a pattern of any other form, such as
+   * a leading "!" or "#", a "[", a "\", a trailing space, "**" anywhere
+   * else, or an empty, "." or ".." segment, naming the pattern and why. A
+   * "?" stands for a "[" or "\" in a name.
+   *
    * A sync without a path and the watcher pass over what the list covers,
    * and over entries with an editor's swap or backup file name whatever it
    * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
@@ -124,13 +139,16 @@ export interface MountConfig {
   ignore?: string[];
   /**
    * The files this mount holds, when it holds only some of what is under its
-   * path: the same pattern forms as `ignore`, read for files. A name or an
-   * extension glob covers a file by its own name, at any depth, and a directory
-   * glob (`dir/**`) covers what lies beneath that directory, and not a file
-   * named like it. Unlike `ignore`, a pattern that matches a directory's name
-   * covers nothing beneath it, since each file is covered by its own name:
-   * `["gate.json"]` holds every file named `gate.json`, and no other file
-   * beneath a directory of that name. A subtree is named with `dir/**`.
+   * path: patterns in `ignore`'s forms, read for files. A pattern that matches
+   * only directories, with a trailing `/` or `/**`, covers what lies beneath a
+   * directory it matches: `fixtures/` every file beneath a directory named
+   * fixtures, at any depth, and `docs/**` or `/docs/` every file beneath the
+   * root's docs. Any other pattern covers a file by its own name, at any
+   * depth, or by its path from the root (`/gate.json`, `src/*.ts`). Unlike
+   * `ignore`, such a pattern covers nothing beneath a directory it matches,
+   * since each file is covered by its own name or path: `["gate.json"]` holds
+   * every file named `gate.json`, and no other file beneath a directory of
+   * that name.
    *
    * It's the mount's boundary for content: no workspace path reads, stores,
    * serves or writes back a file it doesn't cover, and no tool lists,
@@ -237,12 +255,8 @@ export interface MountConfig {
    * include covers it.
    *
    * Left out, the mount holds everything under its path. Given, it's a list
-   * of at least one string, each a name, an `*.ext` glob or a `dir/**` glob,
-   * whose directory may be nested (`a/b/**`). The module refuses a pattern
-   * with a `/` that isn't such a glob, a `*` anywhere but a leading `*.` or
-   * that trailing `/**`, an empty, `.` or `..` segment, and, where `\` is the
-   * platform's separator, a `\`. Any other pattern is a file name, matched
-   * literally, so `[id].tsx` names the file of that name.
+   * of at least one pattern, and the module refuses one `ignore` would
+   * refuse, so `[id].tsx` is refused and `?id].tsx` names that file.
    */
   include?: string[];
   /**
