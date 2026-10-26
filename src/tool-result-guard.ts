@@ -9,6 +9,14 @@ import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './t
 import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
+export type WithheldNoticeKind = 'ran' | 'refused' | 'error';
+const GUARD_NOTICES: Record<WithheldNoticeKind, string> = {
+  ran: TOOL_RESULT_GUARD_NOTICE,
+  refused: "Tool result withheld by the guard. The tool didn't run.",
+  error: "Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.",
+};
+const noticeKind = (result: CompletedToolCall['result'] | undefined): WithheldNoticeKind =>
+  result?.refused === true ? 'refused' : result?.isError === true ? 'error' : 'ran';
 export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
 
 /** Where a withheld result's original went: a workspace path; the path a
@@ -54,9 +62,12 @@ export interface WithheldHost {
 }
 
 /**
- * The stub a withheld result settles to: #159's neutral notice, then where
- * the original is, then, when its tool marked any, the fields kept from its
- * result (`kept`, from keptWhenWithheld). It names no refusal and no
+ * The stub a withheld result settles to: #159's neutral notice for its
+ * `kind` (a result that isn't an error, a refused call's, or another error's),
+ * then where the original is, then, for an error whose original is in a file
+ * known written, a line telling the agent to read it, then, when its tool
+ * marked any, the fields kept from its result (`kept`, from
+ * keptWhenWithheld). It names no refusal and no
  * category (#159 keeps those in operational logs), so reading the rest back
  * is the agent's deliberate choice (agent-framework #277). The place holds
  * the result as stored, which for one over the inline cap is its capped
@@ -67,7 +78,7 @@ export interface WithheldHost {
  * save failed is still queued in memory, and a restart before its retry
  * loses it.
  */
-export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean, kept?: string): string {
+export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean, kept?: string, kind: WithheldNoticeKind = 'ran'): string {
   const audit = `the guard's audit record (${TOOL_RESULT_GUARD_AUDIT_STATE}), for an operator`;
   const keptIn = (only: string) => auditDurable
     ? `is kept ${only}in ${audit}`
@@ -80,8 +91,10 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
       : spill.error === undefined
         ? `Its result is in workspace file ${spill.path}.`
         : `Writing its result to workspace file ${spill.path} failed, so it ${keptIn('only ')}.`;
+  const readable = kind === 'error' && !!spill && 'path' in spill && spill.error === undefined && !spill.unfinished;
+  const readFirst = readable ? ' Read it before calling again.' : '';
   const fields = kept === undefined ? '' : ` Kept from its result: ${kept}`;
-  return `${TOOL_RESULT_GUARD_NOTICE} ${place}${fields}`;
+  return `${GUARD_NOTICES[kind]} ${place}${readFirst}${fields}`;
 }
 
 /**
@@ -140,6 +153,7 @@ interface PendingBatch {
   /** What each result's stub keeps if the batch is withheld, by its index in
    *  content: the fields its tool marked (keptWhenWithheld). */
   kept: Map<number, string>;
+  notices: Map<string, WithheldNoticeKind>;
 }
 
 interface AuditOperation {
@@ -248,7 +262,7 @@ export class ToolResultGuard {
         if (block.type === 'image') images += 1;
         else chars += JSON.stringify(block).length;
       }
-      chars -= TOOL_RESULT_GUARD_NOTICE.length;
+      chars -= GUARD_NOTICES[pending.notices.get(result.toolUseId) ?? 'ran'].length;
     }
     return Math.max(0, Math.ceil(chars / 4) + images * 1600);
   }
@@ -361,12 +375,13 @@ export class ToolResultGuard {
       // with a placeholder if the audit cannot become durable below.
       console.error(`[tool-result-guard] agent=${this.agentName} staged audit write queued:`, error);
     }
+    const results = new Map(originals.map((call) => [call.id, call.result]));
+    const notices = new Map([...results].map(([id, result]) => [id, noticeKind(result)]));
     const withheld: ContentBlock[] = content.map((block) => block.type === 'tool_result'
-      ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError }
+      ? { type: 'tool_result', toolUseId: block.toolUseId, content: GUARD_NOTICES[notices.get(block.toolUseId) ?? 'ran'], isError: block.isError }
       : block);
     // What each stub keeps if the batch is withheld, matched to its tool's
     // result by tool use id, keyed by index as the stubs and files are.
-    const results = new Map(originals.map((call) => [call.id, call.result]));
     const kept = new Map<number, string>();
     for (const [index, block] of content.entries()) {
       const result = block.type === 'tool_result' ? results.get(block.toolUseId) : undefined;
@@ -379,7 +394,7 @@ export class ToolResultGuard {
     // which is correct since a reopened guard has no pending batch.
     const messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
     this.pending = { id, messageId, content, withheld, wireResults,
-      branch: this.cm.currentBranch().name, submitted: false, durable: false, kept };
+      branch: this.cm.currentBranch().name, submitted: false, durable: false, kept, notices };
     // Durability barrier: the audit must reach Chronicle's chain heads before
     // the originals can go to a provider. On a failed sync the batch fails
     // CLOSED: the placeholders go on the wire instead (the turn continues,
@@ -406,7 +421,7 @@ export class ToolResultGuard {
     if (pending.durable) { pending.submitted = true; return results; }
     const ids = new Set(pending.wireResults.map((result) => result.toolUseId));
     return results.map((result) => ids.has(result.toolUseId)
-      ? { ...result, content: TOOL_RESULT_GUARD_NOTICE } : result);
+      ? { ...result, content: GUARD_NOTICES[pending.notices.get(result.toolUseId) ?? 'ran'] } : result);
   }
 
   /** The stream carrying this batch ended without a clean round (abort or
@@ -603,7 +618,7 @@ export class ToolResultGuard {
           spills.set(index, spill);
         }
         const annotated: ContentBlock[] = pending.withheld.map((block, index) => block.type === 'tool_result'
-          ? { ...block, content: withheldResultNotice(spills.get(index) ?? null, pending.durable, pending.kept.get(index)) }
+          ? { ...block, content: withheldResultNotice(spills.get(index) ?? null, pending.durable, pending.kept.get(index), pending.notices.get(block.toolUseId)) }
           : block);
         try {
           this.append({
