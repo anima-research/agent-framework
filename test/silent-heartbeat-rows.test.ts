@@ -899,6 +899,62 @@ describe('replies to a [Continue] turn', () => {
     });
   }
 
+  it('an ambient channel message that arrived while a restart was held starts no turn once the resumed turn read it, though the turn said nothing there', async () => {
+    const event = { ...ordinaryEvent('arrived during the cooldown'), serverId: 'stub', origin: { mcplChannelId: 'world:commons' }, tags: ['chat:ambient'] };
+    const x = await heldRestartMeets({ deliver: false, event, resumed: [createMockResponse(signed('sig-r', 'resumed reply'))] });
+    try {
+      assert.equal(textOf(x.membrane.calls[3]!.messages.at(-1)!), 'arrived during the cooldown', 'the resumed request carried the message');
+      assert.equal(x.membrane.calls.length, 4, "the message's wake started no turn: its server marked it ambient");
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  for (const fork of ['before', 'after'] as const) {
+    it(`a message that arrived while a restart was held, whose turn a quiesce then abandoned, ${fork === 'before' ? 'has a wake that starts no turn once the operator switches to a branch made before it' : 'still has its wake start a turn on a branch made after it'}`, async () => {
+      const membrane = new QueuedStreamsMembrane();
+      const strategy = new OmitToolExchange();
+      strategy.omit = false;
+      const x = await make({ membrane, physicalWindowTokens: 200_000, deliver: false, agent: { strategy } });
+      const internal = x.framework as unknown as {
+        providerAccelerationDefaultCooldownMs: number; providerAccelerationJitterMs: number;
+        providerAccelerationCooldowns: Map<string, { until: number; heldRequests: Array<{ reason: string }> }>;
+        pendingRequests: unknown[]; releaseProviderAccelerationCooldown(agentName: string): void;
+      };
+      internal.providerAccelerationDefaultCooldownMs = 10 * 60_000;
+      internal.providerAccelerationJitterMs = 0;
+      try {
+        membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
+        await wake(x, ordinaryEvent('hello'));
+        membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], accelerationLimit(),
+          [createMockResponse(signed('sig-w', 'wake reply'))]);
+        internal.pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
+        await x.framework.runUntilIdle();
+        assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is held');
+        const store = x.framework.getStore();
+        const trunk = store.currentBranch().name;
+        const beforeMessage = store.currentSequence();
+        await wake(x, ordinaryEvent('arrived during the cooldown'));
+        store.createBranchAt('elsewhere', trunk, fork === 'before' ? beforeMessage : store.currentSequence());
+        const status = await x.framework.quiesce({ abandon: true, timeoutMs: 1_000 });
+        assert.deepEqual(status.activeTurnAgents, [], 'the quiesce ended the held turn');
+        const hold = internal.providerAccelerationCooldowns.get('assistant')!;
+        assert.deepEqual(hold.heldRequests.map((r) => r.reason), ['mcpl:push-event'], "the message's wake still waits in the hold");
+        await x.framework.switchBranch('elsewhere');
+        await x.framework.resume();
+        hold.until = Date.now();
+        internal.releaseProviderAccelerationCooldown('assistant');
+        await x.framework.runUntilIdle();
+        assert.equal(store.currentBranch().name, 'elsewhere', 'the operator switched');
+        if (fork === 'before') {
+          assert.equal(membrane.calls.length, 3, "the message's wake started no turn: its message isn't on the branch");
+        } else {
+          assert.equal(membrane.calls.length, 4, "the message's wake started its turn: no answered request carried it");
+          assert.ok(membrane.calls[3]!.messages.some((m) => textOf(m) === 'arrived during the cooldown'), "the wake's turn reads it");
+        }
+        assert.deepEqual(internal.pendingRequests, []);
+      } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+    });
+  }
+
   it('a later round that follows a message injected at its tool boundary follows the message, not [Continue]', async () => {
     // Hear-while-acting: a message that arrives while the round's tool runs
     // is stored after the tool results and handed to the live stream with

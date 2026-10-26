@@ -14,4 +14,5 @@
   one message, background-script wakes and the gate's self-wake notices.
   Only the agent the message was stored for has its wake judged this way:
   another resident's wake for a message in the shared slot still starts its
-  turn.
+  turn. A wake the event gate starts when a debounce fires carries no mark,
+  so it too still starts its turn (#814).

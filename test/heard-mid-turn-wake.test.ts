@@ -678,17 +678,17 @@ describe('a wake for a write heard mid-turn', () => {
   // -------------------------------------------------------------------------
   // A wake without a channel: read is done
 
-  const unchanneled: Array<[string, (framework: AgentFramework) => unknown]> = [
+  const unchanneled: Array<[string, (framework: AgentFramework) => unknown, string]> = [
     ['a push with no channel', (framework) => framework.pushEvent({
       type: 'mcpl:push-event', serverId: 'chat', featureSet: 'notify', eventId: 'e-1',
       content: [text('the build finished')], triggerInference: true,
-    } as unknown as ProcessEvent)],
+    } as unknown as ProcessEvent), 'the build finished'],
     ["a module's one message", (framework) => framework.pushEvent({
       type: 'clock:reminder', source: 'clock', content: 'the kettle is on',
-    } as unknown as ProcessEvent)],
+    } as unknown as ProcessEvent), 'the kettle is on'],
     ["a background script's wake", (framework) => internals(framework).scriptWake(
       'assistant', 'script-1', '[background-script script-1] finished: 42', 'wake',
-    )],
+    ), 'finished: 42'],
   ];
   for (const [what, write] of unchanneled) {
     it(`${what}, heard at the boundary, starts no turn of its own`, async () => {
@@ -709,9 +709,7 @@ describe('a wake for a write heard mid-turn', () => {
   }
 
   const storedAsItArrives: Array<[string, string, (framework: AgentFramework) => unknown]> = [
-    ['a push with no channel', 'the build finished', unchanneled[0]![1]],
-    ["a module's one message", 'the kettle is on', unchanneled[1]![1]],
-    ["a background script's wake", 'finished: 42', unchanneled[2]![1]],
+    ...unchanneled.map(([what, write, shown]): [string, string, (framework: AgentFramework) => unknown] => [what, shown, write]),
     ['a channel message', 'also this', (framework) => framework.pushEvent(channelMessage(ROOM, 'm-1', 'also this'))],
     ["the gate's self-wake notice", '[self-wake] your test timer', (framework) => internals(framework).eventGate!.armSelfWake('assistant', 1, 'test')],
   ];
