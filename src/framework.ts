@@ -2796,7 +2796,7 @@ const JUDGE_PARAMETER: ToolParameter = {
     'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
     'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
     'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
-    'A batch holding a message addressed to you (a mention, a reply or a DM) wakes you without asking the judge. ' +
+    'A message its server marks as addressed to you (a mention, a reply or a DM) wakes you as an "always" rule would, without asking the judge. ' +
     'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {
@@ -3853,8 +3853,8 @@ export class AgentFramework {
       // reading the agent's context as a dry-run preview, on this host's
       // membrane. Only a host that sets GateOptions.judge has one.
       const judgeOptions = config.gate.judge;
-      const judge = judgeOptions === undefined || judgeOptions.enabled === false ? undefined : new ReplyJudge({
-        membraneFor: (agentName) => framework.ungatedAuxiliaryMembraneFor(agentName),
+      const judge = judgeOptions == null || judgeOptions.enabled === false ? undefined : new ReplyJudge({
+        membraneFor: (agentName) => framework.judgeMembraneFor(agentName),
         options: judgeOptions,
         recordUsage: (agentName, usage) => {
           framework.usageTracker.onInferenceCompleted(agentName, usage, usage.estimatedCost
@@ -4983,15 +4983,7 @@ export class AgentFramework {
     gate.auxiliaryInFlight++;
     try { return await run(); }
     catch (error) {
-      // Compression can be the first call to find a spent quota (idle agent,
-      // scheduled maintenance). Record a stated wait for this call's model,
-      // and arm the host hold so later passes wait at the gate instead of
-      // retrying into it; this pass still fails to its caller.
-      const agent = this.agents.get(agentName);
-      if (agent && error instanceof Error) {
-        if (model !== undefined) this.recordProviderWait(agentName, model, error);
-        this.holdProviderAcceleration(agent, error, undefined, true);
-      }
+      this.recordAuxiliaryFailure(agentName, model, error);
       throw error;
     }
     finally {
@@ -5021,15 +5013,59 @@ export class AgentFramework {
       throw new MaintenanceWithdrawnError(`provider admission closed while stopping (${agentName})`);
     }
   }
+  /**
+   * An auxiliary call can be the first to find a spent quota (idle agent,
+   * scheduled maintenance). Record a stated wait for the call's model, and arm
+   * the host hold so later calls wait at the gate instead of retrying into it;
+   * the call still fails to its caller.
+   */
+  private recordAuxiliaryFailure(agentName: string, model: string | undefined, error: unknown): void {
+    const agent = this.agents.get(agentName);
+    if (agent && error instanceof Error) {
+      if (model !== undefined) this.recordProviderWait(agentName, model, error);
+      this.holdProviderAcceleration(agent, error, undefined, true);
+    }
+  }
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
   }
   /**
-   * Auxiliary calls that take no provider gate: a conversation agent's (its
-   * context manager's compression), and the reply judge's, which a turn of
-   * its agent stops rather than waits for. A conversation agent takes no
-   * provider gate: admission belongs to the persistent resident, and a
-   * generation-unique fork must not leave a gate behind. But its stated waits are recorded for (agent, model)
+   * The reply judge's calls: bound as the agent's other auxiliary calls are,
+   * except that none waits on the agent's turn, which stops the judge instead.
+   * Under a hold that parks the whole agent, a call is refused without being
+   * made, and records nothing.
+   */
+  private judgeMembraneFor(agentName: string): Membrane {
+    return this.membraneAdmitting(async (run, model) => {
+      try {
+        this.withdrawMaintenanceUnderSurgery();
+        this.withdrawMaintenanceWhenStopping(agentName);
+      } catch (withdrawn) {
+        throw Object.assign(withdrawn as Error, { providerAdmission: 'deferred' as const });
+      }
+      this.refuseHeldProviderModel(agentName, model);
+      if (this.cooldownBlocksAuxiliary(agentName)) {
+        const cooldown = this.providerAccelerationCooldowns.get(agentName)!;
+        throw Object.assign(new MembraneError({
+          type: 'rate_limit',
+          retryable: true,
+          retryAfterMs: Math.max(0, cooldown.until - Date.now()),
+          message: `${agentName}'s provider calls are held (${cooldown.reason}), so the reply judge makes none`,
+          rawError: undefined,
+        }), { providerAdmission: 'deferred' as const });
+      }
+      try { return await run(); }
+      catch (error) {
+        if (!(isMembraneError(error) && error.type === 'abort')) this.recordAuxiliaryFailure(agentName, model, error);
+        throw error;
+      }
+    });
+  }
+  /**
+   * A conversation agent's auxiliary calls (its context manager's
+   * compression). A conversation agent takes no provider gate: admission
+   * belongs to the persistent resident, and a generation-unique fork must not
+   * leave a gate behind. But its stated waits are recorded for (agent, model)
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
@@ -5039,7 +5075,7 @@ export class AgentFramework {
    * as a resident's is: a call made while a surgery holds the store, or once
    * stop() has closed provider admission, is withdrawn without being sent.
    */
-  private ungatedAuxiliaryMembraneFor(agentName: string): Membrane {
+  private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
@@ -9840,7 +9876,7 @@ export class AgentFramework {
         return {
           ...tool,
           description: tool.description + ' A judge rule\'s batch, whether waiting out its quiet period, ' +
-            'held or being judged, is still judged, by the rule as it was, and wakes you only on reply.',
+            'held or being judged, still goes to the judge, by the rule as it was.',
         };
       }
       if (tool.name !== 'wake_add_rule') return tool;
@@ -9858,7 +9894,7 @@ export class AgentFramework {
         ...tool,
         description: tool.description + '\n' +
           '• Let a small model decide: `judge` batches like debounceMs, then a cheap reply judge reads your context ' +
-          '(its newest part) with your `instructions` and wakes you only when now looks like a good time to reply, e.g. ' +
+          '(its newest part) with your `instructions` and wakes you when now looks like a good time to reply, e.g. ' +
           '`{ name: "ambient-judged", match: { tagsAny: ["chat:ambient"] }, judge: { debounceMs: 20000, maxWaitMs: 120000, ' +
           'instructions: "Wake me when someone asks me something or the talk turns to the garden; let banter between others go by." } }`.',
         inputSchema: { ...tool.inputSchema, properties: judged },
@@ -13810,7 +13846,7 @@ export class AgentFramework {
         // Provider cooldown ownership belongs to the persistent resident only;
         // generation-unique forks must not leak gates. A fork's own recorded
         // provider waits still bind its compression calls.
-        membrane: this.ungatedAuxiliaryMembraneFor(name),
+        membrane: this.conversationAuxiliaryMembraneFor(name),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 

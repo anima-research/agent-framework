@@ -8,7 +8,8 @@
  * first, then its system prompt, abridged), and asks the model, with the
  * agent's own instructions and the batch, for one line: `REPLY: <reason>` or
  * `WAIT: <reason>`. The conversation shown, the system prompt and the batch's
- * listing each have a fixed size in characters, a few thousand tokens in all.
+ * listing each have a fixed size in characters, a few thousand tokens in all;
+ * the newest message and the newest event are shown even past it.
  *
  * The judge reads; it never writes into the agent's context and never speaks.
  */
@@ -37,10 +38,9 @@ const JUDGE_PARTICIPANT = 'reply-judge';
 
 /** What the framework gives the judge. */
 export interface ReplyJudgeDeps {
-  /** The membrane the judge calls for an agent. The framework's refuses a
-   *  model its provider holds and withdraws a call under a surgery or a
-   *  stop, as for compression, but takes no provider admission, so none of
-   *  the agent's turns waits for the judge. */
+  /** The membrane the judge calls for an agent. The framework's binds the
+   *  judge as it binds compression, refusing a call rather than waiting under
+   *  a hold, and never waits on the agent's turn. */
   membraneFor: (agentName: string) => Membrane;
   options?: ReplyJudgeOptions;
   /** Which of the batch's agents the judge reads the context of. */
@@ -154,7 +154,11 @@ export function judgeSystemPrompt(agentName: string): string {
   ].join('\n');
 }
 
-/** The closing message: the batch, the agent's instructions, the question. */
+/**
+ * The closing message: the batch, the agent's instructions, the question.
+ * A server may not mark its mentions (`chat:addressed`); its mentions then
+ * reach the judge, and the line's second sentence covers them.
+ */
 export function judgeQuestion(
   request: Pick<JudgeRequest, 'events' | 'instructions'>, agentName: string, now: number, maxEventChars = Infinity,
 ): string {

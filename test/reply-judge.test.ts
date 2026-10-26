@@ -52,6 +52,8 @@ describe('reply judge: the question', () => {
     const mention: JudgeEventSummary = { eventType: 'mcpl:channel-incoming', addressed: true, content: 'Scout?', at: Date.now() };
     const addressed = judgeRequest({ events: [mention] });
     assert.strictEqual(judgeQuestion(addressed, 'Scout', Date.now()).includes('None of these events'), false);
+    const mixed = judgeRequest({ events: [...judgeRequest().events, mention] });
+    assert.strictEqual(judgeQuestion(mixed, 'Scout', Date.now()).includes('None of these events'), false);
   });
 });
 
@@ -142,6 +144,45 @@ describe('reply judge: the document', () => {
     assert.ok(all.includes("Scout's system prompt (abridged)"));
     const chars = requests[0]!.system!.length + texts.reduce((n, text) => n + text.length, 0);
     assert.ok(chars < 25_000, String(chars));
+    const [document, about] = texts;
+    assert.ok(document!.startsWith("# Scout's context") && about!.startsWith("## Scout's system prompt"), 'the conversation, then the system prompt');
+    const shown = [...document!.matchAll(/message (\d+) /g)].map((m) => Number(m[1]));
+    assert.deepStrictEqual(shown, Array.from({ length: shown.length }, (_, i) => 2_000 - shown.length + i), 'the newest messages, oldest first, none skipped');
+    assert.strictEqual(requests[0]!.promptCaching, false);
+  });
+
+  it('shows the newest message even when it alone is over the size, cut to the longest a message renders', async () => {
+    const { membrane, requests } = fakeMembrane('REPLY: ok', 3);
+    const newest: NormalizedMessage = { participant: 'user1', content: [
+      { type: 'text', text: 'message 2 ' + 'x'.repeat(5_000) }, { type: 'text', text: 'y'.repeat(5_000) },
+      { type: 'text', text: 'z'.repeat(5_000) + ' end of the newest' },
+    ] };
+    const messages = [...conversation(2), newest];
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane,
+      chooseAgent: (n) => n[0],
+      preview: async () => ({ messages, config: { model: 'x', maxTokens: 1 } }),
+    });
+    await judge.judge(judgeRequest());
+    const document = (requests[0]!.messages[0]!.content[0] as { text: string }).text;
+    assert.ok(document.includes('message 2 ') && document.includes(' end of the newest'), 'the newest message, its head and its tail');
+    assert.ok(document.length > 6_700, String(document.length));
+    assert.ok(document.length < 12_200, String(document.length));
+    assert.ok(document.includes('characters cut'), 'cut to the longest a message renders');
+    assert.ok(!document.includes('message 1 '));
+  });
+
+  it("counts a request's usage as the agent's even when its answer holds no verdict", async () => {
+    const { membrane } = fakeMembrane('I am not sure.');
+    const recorded: string[] = [];
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane,
+      chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      recordUsage: (agentName) => { recorded.push(agentName); },
+    });
+    await assert.rejects(judge.judge(judgeRequest()), /no verdict/);
+    assert.deepStrictEqual(recorded, ['Scout']);
   });
 
   it('calls the agent\'s membrane with the native formatter, and names no message the assistant', async () => {
@@ -169,7 +210,7 @@ describe('reply judge: the document', () => {
     assert.ok(requests[0]!.messages.every((m) => m.participant === 'user'));
   });
 
-  it('lists a long batch newest first within its share, counting the rest', async () => {
+  it('lists the newest of a long batch within its share, oldest of them first, counting the rest', async () => {
     const { membrane, requests } = fakeMembrane();
     const judge = new ReplyJudge({
       membraneFor: () => membrane,
@@ -184,7 +225,11 @@ describe('reply judge: the document', () => {
     assert.ok(last.includes('event 1999 '));
     assert.ok(!last.includes('event 0 '));
     assert.match(last, /\(\d+ earlier events in this batch not listed\)/);
-    assert.ok(last.length < 6_000, String(last.length));
+    const listed = last.split('\n').filter((line) => / event \d+ /.test(line));
+    const shown = listed.map((line) => Number(/ event (\d+) /.exec(line)![1]));
+    assert.deepStrictEqual(shown, Array.from({ length: shown.length }, (_, i) => 2_000 - shown.length + i), 'the newest, oldest of them first');
+    const used = listed.reduce((n, line) => n + line.length + 1, 0);
+    assert.ok(used - 1 <= 2_160 && used > 2_160 - 260, String(used));
   });
 
   it('stops before calling the model when the gate gave up during the preview', async () => {

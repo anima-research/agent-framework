@@ -3148,6 +3148,10 @@ export class EventGate {
     }
 
     if (typeof policy.behavior === 'object') {
+      if ('judge' in policy.behavior && this.judgeFn && Array.isArray(info.tags) && info.tags.includes('chat:addressed')) {
+        this.applyResets(policy);
+        return { trigger: true, policyName: policy.name, behavior: policy.behavior };
+      }
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
         this.handleDebounce(policy, info);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
@@ -3300,6 +3304,7 @@ export class EventGate {
     if (b === 'always') return true;
     if (b === 'defer' || b === 'skip') return false;
     if (typeof b === 'object') {
+      if ('judge' in b && this.judgeFn && Array.isArray(info.tags) && info.tags.includes('chat:addressed')) return true;
       if ('debounce' in b || 'judge' in b) return false; // batches; never triggers inline
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
@@ -3705,10 +3710,8 @@ export class EventGate {
   // =========================================================================
 
   /**
-   * Send one of a judge rule's batches to the reply judge. A batch holding an
-   * event addressed to the agent wakes it instead, with no call. While the
-   * turn that changes the context the judge reads runs, or the host is
-   * quiesced, the batch is held, merged with
+   * Send one of a judge rule's batches to the reply judge. While a resident's
+   * turn runs or the host is quiesced the batch is held instead, merged with
    * any the rule already holds, and judged once both are clear
    * (flushJudgeHeldIfClear): the judge then reads the context the turn left,
    * which may already have answered it. While the judge decides one of the
@@ -3718,17 +3721,6 @@ export class EventGate {
   private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
-    if (events.some((e) => e.addressed)) {
-      const held = this.judgeHeld.get(policyName);
-      this.judgeHeld.delete(policyName);
-      if (deciding) {
-        this.judging.delete(policyName);
-        if (deciding.timer) clearTimeout(deciding.timer);
-        deciding.abort.abort();
-      }
-      this.deliverOrBuffer([...(deciding ? [...deciding.events, ...deciding.queued] : []), ...(held?.events ?? []), ...events]);
-      return;
-    }
     if (deciding) {
       deciding.queued.push(...events);
       this.capJudgeEvents(deciding.queued);
@@ -3861,6 +3853,17 @@ export class EventGate {
     if (state.timer) clearTimeout(state.timer);
     const durationMs = Date.now() - state.started;
     const failed = verdict == null || typeof verdict !== 'object' || typeof verdict.reply !== 'boolean';
+    if (failed && (err as { providerAdmission?: unknown } | undefined)?.providerAdmission === 'deferred') {
+      const wakes = this.judgeOnError === 'wake';
+      console.error(
+        `[gate] Policy "${policyName}": the reply judge made no call (${errorText(err)}), so its batch of ${state.events.length} `
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+      );
+      if (this.disposed) return;
+      if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
+      else if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, this.currentJudge(policyName, state.judge));
+      return;
+    }
     const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
     const reason = failed
       ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
@@ -3875,7 +3878,7 @@ export class EventGate {
       durationMs,
       ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
     };
-    this.judgeRecords.set(policyName, record);
+    if (this.config.policies.some((p) => p.name === policyName)) this.judgeRecords.set(policyName, record);
     if (failed) {
       this.judgeFailStreak++;
       this.judgeLastFailure = safeSlice(reason, 0, 200);
@@ -3956,7 +3959,7 @@ export class EventGate {
     // Deferred, as the inference buffer's flush is, to stay out of the
     // turn-end callback that called this.
     queueMicrotask(() => {
-      for (const [policyName, { events, judge }] of held) this.judgeBatch(policyName, events, judge);
+      for (const [policyName, { events, judge }] of held) this.judgeBatch(policyName, events, this.currentJudge(policyName, judge));
     });
   }
 
