@@ -259,6 +259,11 @@ export interface AgentConfig {
      * to drop. The direct API carries the control too, but reads no report: it
      * traces no usage and feeds no calibration.
      *
+     * On a framework turn, the agent is told, in a `[reasoning] <agent>:`
+     * system notice of kind `reasoning-loss`, when the provider drops blocks
+     * it can place as the agent's stored replies or the stream's rounds, once
+     * per incident and again when a call drops more, whatever `binds` says.
+     *
      * Default false: nothing is sent, and the account's default applies.
      */
     dropBlock?: boolean;
@@ -301,13 +306,10 @@ export interface AgentConfig {
      *     notices are, when a committing compile leaves out a stored reply's
      *     reasoning at a change of the request's head, at a branch's first
      *     compile, or in a fold or other change to an earlier message that
-     *     takes a reply of the current turn, and, with `dropBlock` set too,
-     *     when the provider drops blocks it can place as the agent's stored
-     *     replies or the stream's rounds, once per incident and again when a
-     *     call drops more. The framework hears compiles through
-     *     `Agent.onThinkingStrip` from the agent's first stream on, unless a
-     *     host has set its own, so an agent driven only through the direct
-     *     API is never told.
+     *     takes a reply of the current turn. The framework hears compiles
+     *     through `Agent.onThinkingStrip` from the agent's first stream on,
+     *     unless a host has set its own, so an agent driven only through the
+     *     direct API is never told.
      *
      *   The record and the notes vouch for requests as agent-framework hands
      *   them to membrane, so a membrane `beforeRequest` hook that changes a
