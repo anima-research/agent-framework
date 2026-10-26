@@ -3854,7 +3854,7 @@ export class AgentFramework {
       // membrane. Only a host that sets GateOptions.judge has one.
       const judgeOptions = config.gate.judge;
       const judge = judgeOptions === undefined || judgeOptions.enabled === false ? undefined : new ReplyJudge({
-        membraneFor: (agentName) => framework.auxiliaryMembraneFor(agentName),
+        membraneFor: (agentName) => framework.ungatedAuxiliaryMembraneFor(agentName),
         options: judgeOptions,
         recordUsage: (agentName, usage) => {
           framework.usageTracker.onInferenceCompleted(agentName, usage, usage.estimatedCost
@@ -3874,7 +3874,15 @@ export class AgentFramework {
         configPath,
         initialConfig: config.gate.config,
         privilegedUsersPath: config.gate.privilegedUsersPath,
-        ...(judge ? { judge: judge.judge } : {}),
+        ...(judge ? {
+          judge: judge.judge,
+          // The residents share one message slot, which the judge reads; a
+          // fork's or the subconscious's store is its own.
+          changesJudgedContext: (agentName: string) => {
+            const agent = framework.agents.get(agentName);
+            return agent !== undefined && framework.isOrdinaryResident(agent);
+          },
+        } : {}),
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
@@ -5017,10 +5025,11 @@ export class AgentFramework {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
   }
   /**
-   * A conversation agent's auxiliary calls (its context manager's
-   * compression). A conversation agent takes no provider gate: admission
-   * belongs to the persistent resident, and a generation-unique fork must not
-   * leave a gate behind. But its stated waits are recorded for (agent, model)
+   * Auxiliary calls that take no provider gate: a conversation agent's (its
+   * context manager's compression), and the reply judge's, which a turn of
+   * its agent stops rather than waits for. A conversation agent takes no
+   * provider gate: admission belongs to the persistent resident, and a
+   * generation-unique fork must not leave a gate behind. But its stated waits are recorded for (agent, model)
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
@@ -5030,7 +5039,7 @@ export class AgentFramework {
    * as a resident's is: a call made while a surgery holds the store, or once
    * stop() has closed provider admission, is withdrawn without being sent.
    */
-  private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
+  private ungatedAuxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
@@ -13794,7 +13803,7 @@ export class AgentFramework {
         // Provider cooldown ownership belongs to the persistent resident only;
         // generation-unique forks must not leak gates. A fork's own recorded
         // provider waits still bind its compression calls.
-        membrane: this.conversationAuxiliaryMembraneFor(name),
+        membrane: this.ungatedAuxiliaryMembraneFor(name),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 

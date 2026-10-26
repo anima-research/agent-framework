@@ -68,9 +68,10 @@ const JUDGE_PARTICIPANT = 'reply-judge';
 
 /** What the framework gives the judge. */
 export interface ReplyJudgeDeps {
-  /** The membrane the judge calls for an agent (the framework's auxiliary
-   *  admission for it, so provider holds, surgery and stop bind the judge as
-   *  they bind the agent's other side calls). */
+  /** The membrane the judge calls for an agent. The framework's refuses a
+   *  model its provider holds and withdraws a call under a surgery or a
+   *  stop, as for compression, but takes no provider admission, so none of
+   *  the agent's turns waits for the judge. */
   membraneFor: (agentName: string) => Membrane;
   options?: ReplyJudgeOptions;
   /** Which of the batch's agents the judge reads the context of. */

@@ -477,15 +477,12 @@ export type TraceEvent =
        *  `reply` or `wait` as the judge answered, `error` when it failed,
        *  timed out or answered nothing usable; `woke` is whether the batch
        *  then woke the agent (an error does by the host's onError).
-       *  `rejudged`: a reply reached across one of the batch's agents' turns,
-       *  so the batch is judged once more after it instead of waking then.
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';
       policyName: string;
       verdict: 'reply' | 'wait' | 'error';
       woke: boolean;
-      rejudged?: boolean;
       eventCount: number;
       durationMs: number;
       model?: string;
