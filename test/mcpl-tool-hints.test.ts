@@ -1525,14 +1525,14 @@ test('look naming a tool with no instance shows the definition act checks: the s
   } finally { await t.done(); }
 });
 
-test('RFC-014 §4.2: a rebuild whose listing of a server breaks off tells none of that server\'s moves, and the tool list doesn\'t show them', async () => {
+test('RFC-014 §4.2: a rebuild whose listing of a server breaks off before a moved tool doesn\'t tell its move, and the tool list doesn\'t show it', async () => {
   const moved = withPresence('peek', 'static');
   const { t, moveAndHold, release } = await movingServer([moved[0]!, null as unknown as Json, ...moved.slice(1)]);
   try {
     await moveAndHold();
     release();
     // A rebuild that changes nothing a caller sees has no public sign of its end: this waits on the framework's own flag.
-    await waitFor(() => !(t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight, 'the rebuild ended');
+    await waitFor(() => (t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight === false, 'the rebuild ended');
     await nextMacrotask();
     assert.ok(!t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the tool list doesn\'t show peek');
     assert.equal(notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length, 0, 'so the move isn\'t told');
@@ -1541,6 +1541,22 @@ test('RFC-014 §4.2: a rebuild whose listing of a server breaks off tells none o
     await t.done();
   }
 });
+
+test('RFC-014 §4.2: a rebuild whose listing of a server breaks off after a moved tool tells its move once, and the tool list shows it', async () => {
+  const { t, moveAndHold, release } = await movingServer([...withPresence('peek', 'static'), null as unknown as Json]);
+  try {
+    await moveAndHold();
+    release();
+    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the rebuild publishes peek');
+    await waitFor(() => notices(t.fw).some((x) => x.includes('peek is in your tool list now')), 'the move told');
+    await nextMacrotask();
+    assert.equal(notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length, 1, 'once');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
 
 test('RFC-014 §4.2: a tool a list moves to static is called both ways until the tool list shows it, then by its listed name', async () => {
   const { t, moveAndHold, release } = await movingServer(withPresence('peek', 'static'));
@@ -1680,7 +1696,7 @@ test('RFC-014 §4.2: a rebuild that never publishes leaves its moves to the one 
     await waitFor(() => s.toldMoved() === 1, 'told by the rebuild that published');
     s.release();
     // A rebuild that never publishes changes nothing a caller sees, so its end has no public sign: this waits on the framework's own flag.
-    await waitFor(() => !(s.t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight, 'the older rebuild ended');
+    await waitFor(() => (s.t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight === false, 'the older rebuild ended');
     await roundTrip(s.t);
     await nextMacrotask();
     assert.equal(s.toldMoved(), 1, 'told once');

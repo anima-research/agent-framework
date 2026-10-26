@@ -29795,9 +29795,12 @@ export class AgentFramework {
         // The static↔dynamic moves the lists made since the last rebuild
         // reach the tool list here (§4.2). The agent is told where each tool
         // went once this refresh publishes the list, and not by a refresh that
-        // doesn't, or whose listing of the server breaks off: the moves stay
-        // pending for one that does.
+        // doesn't; a listing that breaks off tells only the moves of the
+        // tools it reached. The rest stay pending for one that does.
         const presence = this.toolsetHub?.get(server.id);
+        const pending = presence?.presence.active ? new Map(presence.presence.moves().map((m) => [m.name, m])) : undefined;
+        const reached: Array<{ name: string; to: Presence }> = [];
+        if (presence && pending) movesListed.set(server.id, { controller: presence, moves: reached });
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -29834,9 +29837,10 @@ export class AgentFramework {
           if (featureSet !== undefined) {
             toolFeatureSets.set(namespacedName, featureSet);
           }
+          const move = pending?.get(tool.name);
+          if (move) reached.push(move);
         }
         if (repeated.length > 0) repeats.push({ serverId: server.id, tools: repeated });
-        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, moves: presence.presence.moves() });
       } catch {
         // Server may not support tools/list — skip silently. A live server
         // whose handshake advertised no MCP `tools` has, in effect, listed
