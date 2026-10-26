@@ -167,7 +167,7 @@ import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } 
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
-import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
+import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
@@ -3623,6 +3623,7 @@ export class AgentFramework {
   private readonly thinkingLossIncidents = new ThinkingLossIncidents();
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
   private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
+  private readonly streamCarried = new WeakMap<YieldingStream, Set<MessageId>>();
   /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
@@ -10451,40 +10452,39 @@ export class AgentFramework {
     }
   }
 
-  /**
-   * Shed the newest turn: remove the newest message that isn't a system
-   * message, whoever wrote it, with the rest of its exchange (the tool_use
-   * turn paired with a tool result, and the whole of a body stored in
-   * shards). It adds no marker; the caller keeps one consolidated marker for
-   * the episode (updateRewindMarker). The returned record's descriptor says
-   * what was removed and its size, never the content, while the raw record
-   * survives in the chronicle log for forensics. Returns null when only
-   * system messages remain.
-   *
-   * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
-   * the shed after inference exhaustion (quarantinePoisonedHistory).
-   */
-  private shedNewestTurn(agent: Agent): RewindRecord | null {
+  private shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): RewindRecord | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
 
-    // Newest message that is not our own episode marker. We shed strictly
-    // newest-first, in sequence — INCLUDING the agent's own turns (poison lives
-    // in tool_use/narration turns too), because newest-first reaches whatever is
-    // poisoning the context if allowed to run deep enough. The one invariant:
+    // We shed strictly newest-first, in sequence — INCLUDING the agent's own
+    // turns (poison lives in tool_use/narration turns too), because
+    // newest-first reaches whatever is poisoning the context if allowed to run
+    // deep enough. The one invariant:
     // shed COMPLETE exchanges. Removing a `tool_result` also removes its paired
     // `tool_use` assistant turn, so we never leave an orphaned tool_use / signed
     // `thinking` block — which the API rejects with a 400 ("thinking blocks in
     // the latest assistant message cannot be modified"). We do NOT add a marker
     // here; the caller keeps one consolidated marker (updateRewindMarker).
+    const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
+    const callCarried = (start: number) => {
+      if (start <= 0) return false;
+      const turn = bodyRangeIn(all, start - 1);
+      return all.slice(turn.from, turn.to + 1).some((m) => hasBlock(m, 'tool_use')) && wasCarried(turn.from, turn.to);
+    };
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
       if (meta.system) continue;
-      idx = i; break;
+      const { from: start } = bodyRangeIn(all, i);
+      const body = all.slice(start, i + 1);
+      if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
+        && (wasCarried(start, i) || (body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start)))) {
+        idx = i; break;
+      }
+      i = start;
     }
     if (idx < 0) return null;
     // The newest message can be the last shard of a body (a document stored
@@ -13742,6 +13742,11 @@ export class AgentFramework {
                 kind: 'injected' as const, id: injection.id, participant: injectedMessages[i]!.participant, sent: injectedMessages[i]!.content,
               })),
             ], replySent === null || replySent === undefined);
+            const carried = this.streamCarried.get(currentState.stream);
+            if (carried) {
+              const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.map((injection) => injection.id) : [];
+              for (const id of [replyId, resultsId, ...injected]) if (id !== undefined) carried.add(id);
+            }
             currentState.stream.provideToolResults(
               submitted,
               midTurnInjections.length > 0 ? { injectedMessages } : undefined,
@@ -20454,6 +20459,7 @@ export class AgentFramework {
         thinkingRecordedAfter,
         thinkingBranch,
         noteRequestSent,
+        carriedBodies,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
@@ -20462,6 +20468,7 @@ export class AgentFramework {
       });
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
+      if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -21800,6 +21807,7 @@ export class AgentFramework {
             const terminalSent = lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content;
             const terminalContent = stampThinkingTokenEstimates(terminalSent, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
+            let refusedReplyId: MessageId | undefined;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
             // call, preserve its later prose exactly as ordinary history.
@@ -21829,6 +21837,7 @@ export class AgentFramework {
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
                 const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                if (response.stopReason === 'refusal') refusedReplyId = terminalId;
                 this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
               } else {
                 // Nothing after the last results: the rows are judged as of now, the last batch settled.
@@ -21836,6 +21845,7 @@ export class AgentFramework {
               }
             } else {
               const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              if (response.stopReason === 'refusal') refusedReplyId = terminalId;
               this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
             }
 
@@ -21965,15 +21975,15 @@ export class AgentFramework {
               // By the time a refusal reaches here, membrane's retries are
               // already spent — so this path is the escalation: rewind (if
               // enabled), then the reaction.
-              // Shed exactly one more (newest, in-sequence) turn and keep the
-              // single episode marker current. `budgetLeft` bounds the loop.
               const doRewind = (
                 budgetLeft: boolean,
                 onStep: (count: number) => void,
                 onGiveUp: () => void,
               ): void => {
+                const cm = agent.getContextManager();
+                if (refusedReplyId !== undefined && cm.getMessage(refusedReplyId)) removeStoredMessage(cm, refusedReplyId);
                 if (!budgetLeft) { onGiveUp(); return; }
-                const rec = this.shedNewestTurn(agent);
+                const rec = this.shedNewestTurn(agent, this.streamCarried.get(stream));
                 if (!rec) { onGiveUp(); return; }
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
@@ -27786,7 +27796,7 @@ export class AgentFramework {
     if (!rec) {
       console.error(
         `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
-        `history is only system markers. Manual repair needed.`,
+        `history holds only system markers and rows a request leaves empty. Manual repair needed.`,
       );
       return;
     }

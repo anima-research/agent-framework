@@ -103,6 +103,9 @@ export interface StartStreamResult {
    *  far in sent order, with this request's head (context-manager's `noteRequestSent`). Present only where the
    *  model binds its thinking and the context manager keeps a record it can be told of. */
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
+  /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
+   *  Absent when the compile reports no provenance. */
+  carriedBodies?: ReadonlySet<MessageId>;
 }
 import type {
   ContextManager,
@@ -2180,6 +2183,9 @@ export class Agent {
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
       ...this.requestNotes(binding, compiled),
+      ...(compiled.provenance
+        ? { carriedBodies: new Set(compiled.provenance.messages.flatMap((m) => m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : [])) }
+        : {}),
       ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
       ...(compiled.provenance ? { thinkingBranch: branchKey(compiled.provenance.branch) } : {}),
       ...(kvEnabled
