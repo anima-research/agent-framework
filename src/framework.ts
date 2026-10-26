@@ -22624,10 +22624,10 @@ export class AgentFramework {
         taken = undefined;
         return joined ?? alone;
       };
-      // A server's error is a failure here too, as the model's dispatch
-      // reads it: its text, without its other blocks, and its structured
-      // content, kept by presence. A success is the server's own blocks and
-      // structured content, for the caller to use in process.
+      // A server's error is a failure here too: its text, without its other
+      // blocks, and its structured content, kept by presence. A success is
+      // the server's own blocks and structured content, for the caller to use
+      // in process.
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
         const { data: blocks, ...failure } = direct;
