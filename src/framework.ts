@@ -22451,7 +22451,7 @@ export class AgentFramework {
         await this.autoFetchReferences(result.content, serverId, 'register')
           .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
         const blocks = Array.isArray(direct.data) ? direct.data : [];
-        const read: ToolResult = taker && blocks.length === 0 && Object.prototype.hasOwnProperty.call(direct, 'structured')
+        const read: ToolResult = taken && blocks.length === 0 && Object.prototype.hasOwnProperty.call(direct, 'structured')
           ? { ...direct, data: JSON.stringify(direct.structured) ?? 'null' }
           : Array.isArray(direct.data) ? { ...direct, dataIsContent: true } : direct;
         return withChange(read);

@@ -170,6 +170,26 @@ test('the operator\'s puppet call stores its result with the tool change its hin
   }
 });
 
+test('a server without toolHints keeps 0.27.0\'s reading of a structured-only result: the puppet stores it as 0.27.0 did', async () => {
+  const server = await startScriptedServer({
+    advert: { featureSets: ADVERT.featureSets },
+    tools: [STATUS],
+    on: (msg, peer) => {
+      if (msg.method === 'tools/call') { peer.reply(msg.id, { content: [], structuredContent: { seen: ['a', 'b'] } }); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url } as McplServerConfig]);
+  try {
+    await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'static tools listed');
+    const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
+    assert.equal(storedResult(fw, toolUseId), '""', 'stored as 0.27.0 stored it');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
 test('the puppet stores a result that is structured content alone as that content\'s JSON, then the tool change', async () => {
   const { server } = await hintingServer({ content: [], structuredContent: { score: 42 } });
   const fw = await connectedTo(server);

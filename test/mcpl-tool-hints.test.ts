@@ -1403,29 +1403,9 @@ test('close with nothing named, after a group the host opened was declared, says
   const { hub, c } = tappedController();
   c.setGroupOpen('cave', true);
   c.manifestChanged({ toolHints: true, toolsets: { cave: { title: 'Cave' } } });
-  const result = await new ToolsetsModule(hub).handleToolCall({ id: 'c1', name: 'close', input: { server: 'arc' } } as never);
+  const result = await new ToolsetsModule(hub, () => null).handleToolCall({ id: 'c1', name: 'close', input: { server: 'arc' } } as never);
   assert.ok(result.isError);
   assert.match(String(result.error), /nothing is open on arc/);
-});
-
-test('a ToolsetsModule built as 0.27.0 built it, ToolsetsModule(hub), takes the change its look shows as told', async () => {
-  const statement = { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [{ name: 'peek', visible: true }] } } };
-  const look = async (module: (hub: ToolsetHub) => ToolsetsModule) => {
-    const { hub, told } = tappedController(() => true, TOOLS, {
-      toolsetsList: (r) => {
-        r({ kind: 'result', method: 'toolsets/list', params: {}, result: statement, awaited: true });
-        return statement;
-      },
-    });
-    const looked = resultText(await module(hub).handleToolCall({ id: 'l1', name: 'look', input: {} } as never));
-    await nextMacrotask();
-    return { looked, told };
-  };
-  const built = await look((hub) => new ToolsetsModule(hub));
-  assert.match(built.looked, /peek\(\)/);
-  assert.equal(built.told.length, 0, 'not told again as a notice');
-  const unshown = await look((hub) => new ToolsetsModule(hub, () => null));
-  assert.equal(unshown.told.length, 1, 'a look whose result reaches no agent leaves it to a notice');
 });
 
 test('a tool a recovery\'s list puts in a toolset leaves the model\'s tool list at the next refresh, and is told so', async () => {
@@ -1640,7 +1620,7 @@ test('a tool a server describes malformed (a description that isn\'t a string, a
   assert.match(text, /peek\(\)/);
   assert.match(text, /delve\(a\?: .*\) — Delve\./);
   assert.match(text, /burrow\(rows\?: .*\) — Burrow\./);
-  const looked = await new ToolsetsModule(hub).handleToolCall({ id: 'l1', name: 'look', input: { server: 'arc', tool: 'delve' } } as never);
+  const looked = await new ToolsetsModule(hub, () => null).handleToolCall({ id: 'l1', name: 'look', input: { server: 'arc', tool: 'delve' } } as never);
   assert.ok(!looked.isError, String(looked.error));
 });
 
@@ -1649,7 +1629,7 @@ test('look at a toolset whose options a server nests very deep still answers', a
   for (let i = 0; i < 20000; i++) deep = { type: 'object', properties: { a: deep } };
   const { hub, c } = tappedController();
   c.manifestChanged({ toolHints: true, toolsets: { maze: { title: 'Maze', options: deep } } });
-  const looked = await new ToolsetsModule(hub).handleToolCall({ id: 'l2', name: 'look', input: { server: 'arc', toolset: 'maze' } } as never);
+  const looked = await new ToolsetsModule(hub, () => null).handleToolCall({ id: 'l2', name: 'look', input: { server: 'arc', toolset: 'maze' } } as never);
   assert.ok(!looked.isError, String(looked.error));
 });
 

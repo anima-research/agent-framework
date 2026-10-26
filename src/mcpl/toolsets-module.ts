@@ -263,11 +263,10 @@ export class ToolsetsModule implements Module {
 
   /** `takerFor`: who shows a call's result to an agent, taking the tool
    *  change rendered into it; null when the result may reach none, and its
-   *  change is left to a notice (RFC-014 §6.1: told once). Left out, every
-   *  call's result is taken to reach the agent, as in 0.27.0. */
+   *  change is left to a notice (RFC-014 §6.1: told once). */
   constructor(
     private readonly hub: ToolsetHub,
-    private readonly takerFor: (call: ToolCall) => ((taken: TakenChange) => void) | null = () => ({ toolsets, cs }) => toolsets.told(cs),
+    private readonly takerFor: (call: ToolCall) => ((taken: TakenChange) => void) | null,
   ) {}
 
   async start(_ctx: ModuleContext): Promise<void> {}
