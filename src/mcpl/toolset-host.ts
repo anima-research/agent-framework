@@ -425,16 +425,6 @@ export class ToolsetController {
     return this.readChanges.get(carrier) ?? emptyChange();
   }
 
-  /** takeChange's change rendered, for a caller that shows it with the carrier
-   *  at once, so it counts as told; '' for nothing. */
-  takeChangeText(carrier: unknown): string {
-    const cs = this.takeChange(carrier);
-    if (isEmptyChange(cs)) return '';
-    const text = this.presence.render(cs);
-    this.told(cs);
-    return text;
-  }
-
   /** A change its taker showed to an agent: its ended records count as told, and the definitions it describes as shown. */
   told(cs: ChangeSet): void {
     this.presence.markTold(cs.ended);

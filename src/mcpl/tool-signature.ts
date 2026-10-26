@@ -24,12 +24,21 @@ export interface HintedTool {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** A schema's literal value (an enum's, a const or a default) as JSON, or … where it's nested too deeply to write. */
+function literal(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? 'null';
+  } catch {
+    return '…';
+  }
+}
+
 function typeSig(schema: JsonSchema | undefined, depth = 0): string {
   if (!schema || typeof schema !== 'object') return 'any';
   if (depth > 8) return '…';
   if (Array.isArray(schema.enum)) {
     // The enum is often the menu (a decision's options): all of it unless it is long.
-    const vals = (schema.enum as unknown[]).map((v) => JSON.stringify(v));
+    const vals = (schema.enum as unknown[]).map(literal);
     if (vals.length <= 8 || vals.join('|').length <= 400) return vals.join('|');
     let shown = 0;
     let len = 0;
@@ -39,7 +48,7 @@ function typeSig(schema: JsonSchema | undefined, depth = 0): string {
     }
     return `${vals.slice(0, Math.max(shown, 4)).join('|')}|…(${vals.length} in all)`;
   }
-  if (schema.const !== undefined) return JSON.stringify(schema.const);
+  if (schema.const !== undefined) return literal(schema.const);
   const alts = (schema.oneOf ?? schema.anyOf) as JsonSchema[] | undefined;
   if (Array.isArray(alts)) return alts.map((s) => typeSig(s, depth + 1)).join(' | ');
   const t = Array.isArray(schema.type) ? (schema.type as string[]).join('|') : (schema.type as string | undefined);
@@ -82,7 +91,7 @@ export function signature(tool: HintedTool): string {
   const props = (isObj(s.properties) ? s.properties : {}) as Record<string, JsonSchema>;
   const req = new Set(Array.isArray(s.required) ? (s.required as string[]) : []);
   const params = Object.entries(props).map(([k, v]) => {
-    const def = isObj(v) && v.default !== undefined ? ` =${JSON.stringify(v.default)}` : '';
+    const def = isObj(v) && v.default !== undefined ? ` =${literal(v.default)}` : '';
     return `${k}${req.has(k) ? '' : '?'}: ${typeSig(v, 1)}${def}`;
   });
   return `${tool.name}(${params.join(', ')})`;
@@ -154,10 +163,11 @@ export function jsonText(value: unknown, space?: number): string {
 /** A tool's signature, description, class and input schema, for `look` naming a tool. */
 export function renderToolDefinition(tool: HintedTool): string {
   const cls = tool._meta?.['mcpl/class'];
+  const classes = Array.isArray(cls) ? cls.filter((c): c is string => typeof c === 'string') : [];
   return [
     signature(tool),
-    tool.description ?? '',
-    ...(Array.isArray(cls) ? [`class: ${cls.join(', ')}`] : []),
+    typeof tool.description === 'string' ? tool.description : '',
+    ...(classes.length ? [`class: ${classes.join(', ')}`] : []),
     'inputSchema:',
     jsonText(tool.inputSchema ?? {}, 2),
   ]

@@ -1758,7 +1758,7 @@ export class McplServerConnection extends EventEmitter {
         throw malformed('no tools array');
       }
       first ??= result;
-      tools.push(...(result.tools as McpToolDefinition[]));
+      for (const t of result.tools as McpToolDefinition[]) tools.push(t);
       if (result.nextCursor === undefined || result.nextCursor === null) {
         // The first page's other fields are kept as they came, so a
         // single-page answer is returned exactly as before.

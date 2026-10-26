@@ -150,7 +150,8 @@ test('vector 3, 11: a push\'s hints apply on arrival whatever is decided about t
     const lists = t.methods().filter((m) => m === 'tools/list').length;
     t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
     await waitFor(() => windowText(t.fw.framework).some((x) => x.includes('tool changes') && x.includes('peek()')), 'the next change applied, and told');
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     assert.equal(t.methods().filter((m) => m === 'tools/list').length, lists, 'no recovery');
   } finally { await t.done(); }
 });
@@ -292,7 +293,8 @@ test('vector 27: open, close and list results take the next rev; tools/list take
     const closed = await callTool(t.fw.framework, 'toolsets--close', { server: 'arc' });
     assert.match(resultText(closed), /packed up\n\[arc\/build\] closed\. Now unavailable: place\./);
     await look(t.fw); // a toolsets/list, rev after the close's
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     assert.equal(lists(), before + 1, 'every rev was the next one: no recovery');
   } finally { await t.done(); }
 });
@@ -974,7 +976,8 @@ test('revs start over on each connection: after a reconnect, the new connection\
     const before = notices(t.fw).length;
     t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: false }]));
     await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('now unavailable: peek')), 'the new connection\'s change told');
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     assert.ok(!t.methods().slice(from).some((m) => m === 'tools/list' || m === 'toolsets/list'), 'no recovery');
   } finally { await t.done(); }
 });
@@ -1041,10 +1044,10 @@ test('taking a result\'s change first tells, as a notice, the change of a result
   readCall(callResult(1, [{ name: 'peek', visible: true }]));
   const later = callResult(2, [{ name: 'peek', visible: false }]);
   readCall(later);
-  const shown = c.takeChangeText(later);
+  const taken = c.takeChange(later);
   assert.equal(told.length, 1, 'the earlier change, told first');
   assert.match(told[0]!, /peek\(\)/);
-  assert.match(shown, /now unavailable: peek/);
+  assert.match(c.presence.render(taken), /now unavailable: peek/);
 });
 
 test('a hint read right after a tools/list\'s last page, in the same chunk, isn\'t undone by that list', async () => {
@@ -1114,7 +1117,8 @@ test('a toolsets/list naming a tool tools/list hasn\'t listed is recovered from,
     await look(t.fw);
     await waitFor(() => t.server.received.slice(from).filter((m) => m.method === 'toolsets/list').length >= 2, 'the recovery read toolsets/list');
     await roundTrip(t);
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     const after = t.server.received.slice(from).map((m) => m.method).filter((m) => m === 'tools/list' || m === 'toolsets/list');
     assert.deepEqual(after, ['toolsets/list', 'tools/list', 'toolsets/list'], 'look\'s read, then one recovery: its own toolsets/list, naming lantern again, starts no other');
   } finally { await t.done(); }
@@ -1134,7 +1138,8 @@ test('a recovery whose tools/list fails reads no toolsets/list', async () => {
     t.server.peer.notify('tools/hints', t.state.hint([]));
     await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'tools/list'), 'the recovery read tools/list');
     await roundTrip(t);
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     assert.ok(!t.server.received.slice(from).some((m) => m.method === 'toolsets/list'));
   } finally { await t.done(); }
 });
@@ -1169,7 +1174,6 @@ test('two paged tools/lists read at once each apply whole, never mixed', async (
     pages.push({ msg, peer });
     return true;
   });
-  const listed = () => t.fw.framework.getAllTools().map((x) => x.name);
   try {
     paging = true;
     const before = notices(t.fw).length;
@@ -1185,7 +1189,7 @@ test('two paged tools/lists read at once each apply whole, never mixed', async (
     await waitFor(() => pages.length >= 3, 'the first list\'s second page asked for');
     answer(2, { tools: [TOOLS[3]!, peekFrom('A', true)], _meta: { 'mcpl/rev': rev } });
     await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('peek() — From list A.')), 'the first list applied whole, its second page included');
-    assert.ok(listed().includes('arc--status'), 'its first page included too');
+    assert.match(await look(t.fw, { server: 'arc', tool: 'status' }), /Status of the arcade\./, 'its first page included too');
     assert.match(await look(t.fw, { server: 'arc', tool: 'peek' }), /From list A\./);
   } finally { await t.done(); }
 });
@@ -1257,7 +1261,8 @@ test('a hint or statement naming a tool the operator\'s tool policy leaves out s
     await roundTrip(t);
     t.state.statement.push({ name: 'lantern', visible: true });
     await look(t.fw);
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     assert.ok(!t.server.received.slice(from).some((m) => m.method === 'tools/list'));
     assert.equal(t.server.received.slice(from).filter((m) => m.method === 'toolsets/list').length, 1, 'only look\'s own read');
   } finally { await t.done(); }
@@ -1342,7 +1347,8 @@ test('a paged tools/list whose rev only some pages carry isn\'t taken for one th
     t.server.peer.notify('notifications/tools/list_changed', {});
     await waitFor(() => t.server.received.slice(from).filter((m) => m.method === 'tools/list').length >= 2, 'both pages asked for');
     await roundTrip(t);
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     assert.ok(!t.server.received.slice(from).some((m) => m.method === 'toolsets/list'), 'no recovery');
   } finally { await t.done(); }
 });
@@ -1355,7 +1361,7 @@ test('a push whose change no notice could carry keeps it for the push\'s own pat
   read({ kind: 'push', params });
   await nextMacrotask();
   writes = true;
-  assert.match(c.takeChangeText(params), /peek\(\)/);
+  assert.match(c.presence.render(c.takeChange(params)), /peek\(\)/);
 });
 
 test('a recovery whose own tools/list straddled a change starts no second recovery', async () => {
@@ -1379,7 +1385,8 @@ test('a recovery whose own tools/list straddled a change starts no second recove
     held.peer.reply(held.msg.id, { tools: TOOLS.slice(3), _meta: { 'mcpl/rev': t.state.rev } });
     await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'toolsets/list'), 'the recovery read toolsets/list');
     await roundTrip(t);
-    await settle(400);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     assert.equal(t.server.received.slice(from).filter((m) => m.method === 'toolsets/list').length, 1);
   } finally { await t.done(); }
 });
@@ -1391,6 +1398,7 @@ test('look at a toolset whose options a server nests very deep still answers (in
   c.manifestChanged({ toolHints: true, toolsets: { maze: { title: 'Maze', options: deep } } });
   const looked = await new ToolsetsModule(hub, () => null).handleToolCall({ id: 'l2', name: 'look', input: { server: 'arc', toolset: 'maze' } } as never);
   assert.ok(!looked.isError, String(looked.error));
+  assert.match(resultText(looked), /options: \(nested too deeply to show\)/);
 });
 
 test('look says when it couldn\'t ask a server, and shows what the host last knew of it', async () => {
@@ -1965,3 +1973,83 @@ test('a tool a server describes malformed (a description that isn\'t a string, a
   } finally { await t.done(); }
 });
 
+
+test('a first sentence that reached the model is left out of the next announcement of the same definition', async () => {
+  const t = await setup();
+  const fresh = async (step: () => void, what: string) => {
+    const before = notices(t.fw).length;
+    step();
+    await waitFor(() => notices(t.fw).length > before, what);
+    await roundTrip(t);
+    return notices(t.fw).slice(before).join('\n');
+  };
+  try {
+    assert.match(await fresh(() => t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }])), 'peek shown'), /peek\(\) — Peek around\./);
+    await fresh(() => t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: false }])), 'peek hidden');
+    const again = await fresh(() => t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }])), 'peek shown again');
+    assert.match(again, /peek\(\)/);
+    assert.doesNotMatch(again, /Peek around\./, 'its first sentence once');
+  } finally { await t.done(); }
+});
+
+test('a look that restates the present counts as shown only what it showed: a tool a hint hid while look waited on another server keeps its first sentence owed', async () => {
+  const t = await setup();
+  let holdFar = false;
+  let heldFar: (() => void) | null = null;
+  const far = await startScriptedServer({
+    advert: ADVERT,
+    tools: [{ name: 'status', description: 'Status of the far arcade.', inputSchema: { type: 'object', properties: {} } }],
+    listRev: () => 1,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') {
+        const answer = () => peer.reply(msg.id, { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [] } } });
+        if (holdFar) { holdFar = false; heldFar = answer; } else answer();
+        return;
+      }
+      if (msg.method === 'tools/call') { peer.reply(msg.id, { content: [{ type: 'text', text: 'done' }] }); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  try {
+    await t.fw.framework.connectMcplServer({ id: 'far', toolPrefix: 'far', url: far.url, toolHints: true } as McplServerConfig);
+    await waitFor(() => far.received.some((m) => m.method === 'toolsets/list'), 'far connected and read');
+    holdFar = true;
+    const lists = t.methods().filter((m) => m === 'toolsets/list').length;
+    t.state.statement = [{ name: 'peek', visible: true }];
+    const looked = t.fw.framework.puppetToolCall('scout', 'toolsets--look', {});
+    await waitFor(() => heldFar !== null && t.methods().filter((m) => m === 'toolsets/list').length > lists, 'look asked both servers; far holds its answer');
+    await roundTrip(t);
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: false }]));
+    await waitFor(() => notices(t.fw).some((x) => x.includes('now unavailable: peek')), 'the hint hid peek while look waited');
+    heldFar!();
+    assert.doesNotMatch(resultText((await looked).result), /peek\(\)/, 'look showed the present, with peek hidden');
+    await roundTrip(t);
+    const before = notices(t.fw).length;
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('peek()')), 'peek shown');
+    assert.match(notices(t.fw).slice(before).join('\n'), /peek\(\) — Peek around\./, 'its first sentence, never yet shown');
+  } finally { await t.done(); await far.close(); }
+});
+
+test('a tool whose schema holds a literal nested very deep, or whose description or class is an object, is announced and looked at', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('tools/list');
+    const before = notices(t.fw).length;
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => held.length === 1, 'the tool list asked for');
+    holding.clear();
+    const listed = TOOLS.filter((x) => x.name !== 'peek').map((x) => JSON.stringify(x)).join(',');
+    const dynamic = '"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true}';
+    const deep = `${'{"a":'.repeat(20000)}1${'}'.repeat(20000)}`;
+    rawLine(t, `{"jsonrpc":"2.0","id":${JSON.stringify(held[0]!.id)},"result":{"tools":[${listed},`
+      + `{"name":"peek","description":{"toString":1},"inputSchema":{"type":"object","properties":{}},"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true,"mcpl/class":[{"toString":1}]}},`
+      + `{"name":"fixed","description":"Fixed.","inputSchema":{"type":"object","properties":{"a":{"const":${deep}},"b":{"enum":[${deep}]},"c":{"type":"string","default":${deep}}}},${dynamic}}],`
+      + `"_meta":{"mcpl/rev":${t.state.rev}}}}`);
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('fixed(')), 'the tools announced');
+    assert.match(notices(t.fw).slice(before).join('\n'), /fixed\(a\?: …, b\?: …, c\?: string =…\) — Fixed\./);
+    const peek = await look(t.fw, { server: 'arc', tool: 'peek' });
+    assert.match(peek, /^peek\(\)\ninputSchema:/, 'no description and no class line where they aren\'t text');
+    assert.match(await look(t.fw, { server: 'arc', tool: 'fixed' }), /^fixed\(a\?: …, b\?: …, c\?: string =…\)\nFixed\./);
+  } finally { await t.done(); }
+});

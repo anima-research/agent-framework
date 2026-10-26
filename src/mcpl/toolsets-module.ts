@@ -415,7 +415,8 @@ export class ToolsetsModule implements Module {
     const lines = restates
       ? read.flatMap(({ c, cs }) => {
         const said = [...cs.suggest.map((s) => c.presence.renderSuggestion(s)), ...c.presence.untoldNotes(cs), ...cs.notes];
-        take?.({ toolsets: c, cs });
+        // The catalog above counted what it showed; the change's own blocks weren't shown.
+        take?.({ toolsets: c, cs: { ...cs, changes: [] } });
         return said;
       })
       : [];
