@@ -86,9 +86,13 @@ for (const shape of ['an update', 'a retraction with a notice', 'a retraction wi
     spied.setStrategy = async (strategy: unknown) => { entered(); await gate; return setStrategy(strategy); };
     const switching = f.framework.switchBranch(f.framework.getStore().currentBranch().name);
     const text = shape === 'an update' ? 'held_update' : shape === 'a retraction with a notice' ? 'held_notice' : '';
+    const bounded = <T>(work: Promise<T>, what: string): Promise<T> => Promise.race([
+      work,
+      new Promise<never>((_, reject) => { setTimeout(() => reject(new Error(`${what} didn't come within 10 s`)), 10_000).unref(); }),
+    ]);
     try {
-      await reached;
-      await f.send('push/event', f.params('2', text, shape === 'an update' ? {} : { retract: true }));
+      await bounded(reached, "the switch's re-initialization");
+      await bounded(f.send('push/event', f.params('2', text, shape === 'an update' ? {} : { retract: true })), 'the push\'s reply');
       assert(f.context().includes('unread_original'), 'the stored message stays while the store is held');
       assert(!f.context().includes('held_update') && !f.context().includes('held_notice'), 'nothing lands while the store is held');
     } finally {

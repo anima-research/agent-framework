@@ -56,12 +56,15 @@
   history. Its channel is unbound, and `context-reinit-failed` says so, and
   how many writes were held for it while the store was held. Its channel's
   next qualifying message spawns a new fork from the template, under a new
-  name. Its messages stay in the store, but no agent reads them again, so
-  an undo and then a redo don't bring it back. It's disposed whether or not
-  its own re-initialization succeeded, with the disposal's alert alone. The
-  move judges every conversation agent once, on the branch the store lands
-  on, after every manager is re-initialized, so a fork an undo empties and
-  a redo made before then restores is kept. One with stored history there
+  name, which needs the template's own context manager to be working. Its
+  messages stay in the store, but no agent reads them again, so an undo and
+  then a redo don't bring it back. It's disposed whether or not its own
+  re-initialization succeeded, with the disposal's alert alone, which gives
+  that failure's cause when there was one. After a rollback, a branch
+  switch, an undo or a redo, every conversation agent is judged once, on
+  the branch the store lands on, after every manager is re-initialized, so
+  a fork an undo empties and a redo made before then restores is kept; a
+  suppression can't empty one. One with stored history there
   stays, even where that history compiles to nothing. If disposing it fails
   partway, the alert says that too, and the others are still judged. What
   reaches a conversation agent while a move holds the store, from its
@@ -71,4 +74,7 @@
   conversation agent once a `stop()` of its lifecycle has begun, under way,
   done, or failed with no `start()` since, as one waiting out a move's hold
   can, fails as a failed spawn does, rather than open its context manager
-  on a store `stop()` is tearing down or has torn down.
+  on a store `stop()` is tearing down or has torn down. A spawn waits out a
+  move's hold before it stores its channel's name counter, so the counter
+  is on the branch the store lands on, and a restart doesn't give a later
+  fork that fork's name.

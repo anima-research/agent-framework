@@ -2349,14 +2349,16 @@ export function restoreAlert(restore: {
 export function disposalAlert(disposal: {
   move: ReinitMove;
   heldWrites?: number;
+  reinitFailed?: string;
   cleanupFailed?: string;
 }): ReinitAlertText {
-  const { move, heldWrites = 0, cleanupFailed } = disposal;
+  const { move, heldWrites = 0, reinitFailed, cleanupFailed } = disposal;
   const opening = `The ${move} left this conversation agent with no messages of its own, so ` +
     (cleanupFailed
       ? 'it was unregistered and its channel unbound, but its cleanup failed (below). '
       : 'it was disposed and its channel unbound. ') +
-    "Its channel's next qualifying message spawns a new fork from the template, under a new name.";
+    "Its channel's next qualifying message spawns a new fork from the template, under a new name, which needs the " +
+    "template's own context manager to be working.";
   const held = heldWrites === 0
     ? ''
     : ` ${heldWrites === 1 ? '1 write was' : `${heldWrites} writes were`} held for it while the store was held.`;
@@ -2364,6 +2366,7 @@ export function disposalAlert(disposal: {
     opening,
     message: `${opening}${held} Its messages stay on the branches that hold them, but no agent reads them again, ` +
       "so a redo to a branch that holds them doesn't bring this one back." +
+      (reinitFailed ? ` Its re-initialization had failed: ${reinitFailed}.` : '') +
       (cleanupFailed ? ` Its cleanup failed: ${cleanupFailed}.` : ''),
   };
 }
@@ -2397,7 +2400,7 @@ const MOVE_NOUNS: Readonly<Record<string, string>> = {
 
 type ManagerReinitFailure =
   | { agentName: string; error: string }
-  | { agentName: string; disposed: { heldWrites: number; cleanupFailed?: string } };
+  | { agentName: string; disposed: { heldWrites: number; reinitFailed?: string; cleanupFailed?: string } };
 
 // context-manager refuses work on a manager whose store has moved to another branch generation with a plain Error,
 // with no class or code, whose message carries one of these texts.
@@ -11696,7 +11699,12 @@ export class AgentFramework {
       } catch (error) {
         cleanupFailed = failureDescription(error);
       }
-      disposals.push({ agentName, disposed: { heldWrites, ...(cleanupFailed !== undefined ? { cleanupFailed } : {}) } });
+      const failed = failures.find((f) => f.agentName === agentName && 'error' in f);
+      disposals.push({ agentName, disposed: {
+        heldWrites,
+        ...(failed && 'error' in failed ? { reinitFailed: failed.error } : {}),
+        ...(cleanupFailed !== undefined ? { cleanupFailed } : {}),
+      } });
     }
     const disposed = new Set(disposals.map((d) => d.agentName));
     return [...failures.filter((f) => !disposed.has(f.agentName)), ...disposals];
@@ -11755,7 +11763,7 @@ export class AgentFramework {
         release();
       }
     })().catch((error: unknown) => {
-      console.error(`[operator] releasing the store the ${state.after} reserved failed: ${boundFailureText(failureDescription(error))}`);
+      console.error(`[operator] the ${state.after}'s re-initialization or its release of the store failed: ${boundFailureText(failureDescription(error))}`);
     });
     return state.done;
   }
@@ -12196,7 +12204,7 @@ export class AgentFramework {
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         try {
-          if (moved) this.reportReinitFailures('suppression', this.disposeEmptiedForks(await this.reinitializeManagers(agentName)));
+          if (moved) this.reportReinitFailures('suppression', await this.reinitializeManagers(agentName));
         } finally {
           release();
         }
@@ -13855,7 +13863,7 @@ export class AgentFramework {
         metadata.triggered = event.triggerInference ?? false;
         // A fork's channel messages are stored past its deferral; a clock goes
         // ahead of one only while the fork has no turn alive (storeDueClock).
-        if (!this.surgeryHold && !this.turnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
+        if (!this.turnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
         const placement = this.writeToFork(target, event.content, AgentFramework.withStoredDigest(metadata, event.content));
@@ -14050,7 +14058,7 @@ export class AgentFramework {
     messageMetadata.triggered = trigger;
 
     // As for a correction above: a clock ahead only while no turn is alive.
-    if (!this.surgeryHold && !this.turnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
+    if (!this.turnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
     const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
@@ -14257,13 +14265,15 @@ export class AgentFramework {
    * Store the router's counters with the spawn's generation, create the fork
    * the decision names and bind its channel to it, registered in
    * conversationSpawns under the channel until it settles. The store runs
-   * inside the spawn's promise, still in routeConversation's synchronous
-   * step, so a store that throws rejects the spawn, which each caller reports
-   * as a failed spawn, rather than throwing out of routeConversation before
-   * the caller's try. routeConversation registers a spawn only when none is
-   * in flight for the channel, and only this spawn's settlement removes it,
-   * so the entry it removes is its own. It's removed before anyone waiting
-   * on it resumes, so a waiter that decides again doesn't find it.
+   * inside the spawn's promise, after it waits out a move's hold, so the
+   * counter lands on the branch the fork is created on; with no hold up, it
+   * runs in routeConversation's synchronous step. Either way a store that
+   * throws rejects the spawn, which each caller reports as a failed spawn,
+   * rather than throwing out of routeConversation before the caller's try.
+   * routeConversation registers a spawn only when none is in flight for the
+   * channel, and only this spawn's settlement removes it, so the entry it
+   * removes is its own. It's removed before anyone waiting on it resumes, so
+   * a waiter that decides again doesn't find it.
    *
    * It binds only while the fork it created is still the agent registered
    * under its name. stop() ends each live fork and unbinds the channels
@@ -14277,6 +14287,7 @@ export class AgentFramework {
   private spawnConversationAgent(channel: ChannelRef, decision: { agentName: string; generation: number }): Promise<Agent> {
     const key = destinationKey(channel);
     const spawn = (async () => {
+      for (let hold = this.surgeryHold; hold?.released; hold = this.surgeryHold) await hold.released;
       // The router's counters are kept by bare id (ConversationRouter.generations).
       this.storeConversationGeneration(channel.channelId, decision.generation);
       const agent = await this.createConversationAgent(decision.agentName, channel);
