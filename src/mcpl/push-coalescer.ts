@@ -67,13 +67,13 @@ export class EmptyContentError extends CoalesceError {
 /** Where an unread occurrence currently lives. */
 export interface CoalescingPlacement {
   agent: string;
-  /** Stored message id in that agent's context manager. */
+  /** Stored message id in that agent's context manager. Absent for a write
+   *  a surgery's hold keeps in memory, which counts as read and can't be
+   *  removed. */
   messageId?: string;
-  /** Entry id in the framework's deferred-write queue (turn-alive deferral). */
-  deferredId?: string;
   /** Set on a stored placement that wasn't presented to `agent` at its
    *  write, because a turn of the agent's was alive (#291's presentation
-   *  index): like a queued one, the turn being assembled doesn't read it. */
+   *  index): the turn being assembled doesn't read it. */
   presented?: false;
 }
 
@@ -170,8 +170,8 @@ export interface AssemblyResult {
    *  read: empty or blank render (§5.2), cancelled, revoked before the render
    *  or at its response, a render-start that could not be made durable (the
    *  batch then waits for its recovery wake), a batch whose audience doesn't
-   *  include the agent, a render placed in a deferred queue (another
-   *  agent's, or this agent's own behind a write held there), a render
+   *  include the agent, a render placed where the turn doesn't read it
+   *  (stored for another agent whose turn is alive, not presented to it), a render
    *  another assembly froze (its compile may show it, as that request's), or
    *  a cause whose batch was withdrawn, displaced or consumed by another
    *  request. */
@@ -304,8 +304,7 @@ export interface CoalescerHost<E> {
    *  injections, as no membrane 0.5.x stream does, counts as unread though
    *  a request may have included it. */
   isUnread(placement: CoalescingPlacement): boolean;
-  /** True iff nothing may have shown the placement to the agent: it is still
-   *  in the deferred queue and known not to be stored already, or it is
+  /** True iff nothing may have shown the placement to the agent: it is
    *  stored where no committing compile has begun to assemble it and no tool
    *  boundary has injected past it. Unlike
    *  isUnread, a compile counts from its start, and a boundary counts
@@ -322,9 +321,9 @@ export interface CoalescerHost<E> {
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
   /** Queue an ordinary push wake for the placement's agent, under the
    *  batch's own wake policy, to read a render of the batch that no request
-   *  consumed, placed where the turn being assembled doesn't read it: in
-   *  the agent's deferred queue, or stored and not presented to it
-   *  (`placement`, which the host reads the wake's mark from). It carries
+   *  consumed, placed where the turn being assembled doesn't read it: stored
+   *  and not presented to the agent (`placement`, which the host reads the
+   *  wake's mark from). It carries
    *  no subject, so the subject's other wakes, and later withdrawals of
    *  them, leave it. `allAmbient`: every notice the render stands for was
    *  tagged `chat:ambient` (DeferredBatch.allAmbient), so the wake is marked
@@ -1152,15 +1151,13 @@ export class PushCoalescer<E = unknown> {
         const run = state.occupant?.rendered ? state.occupant : undefined;
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
         const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
-        if (placement?.deferredId || placement?.presented === false) {
-          // Landed in a deferred queue, or stored and not presented to its
-          // agent: another agent's, whose turn is alive,
-          // or the assembling agent's own, behind a write held there (the
-          // host's bypassDeferralFor), or after its assembly ended, as any
-          // write during its turn. Still unread
-          // there, so it stays replaceable and withdrawable. The turn being
-          // assembled doesn't read it, so it isn't materialized for that turn,
-          // and no request has consumed it. The freeze withdrew the queue's
+        if (placement?.presented === false) {
+          // Stored and not presented to its agent: another agent's, whose
+          // turn is alive, or the assembling agent's own after its assembly
+          // ended, as any write during its turn. Still unread there, so it
+          // stays replaceable and withdrawable. The turn being assembled
+          // doesn't read it, so it isn't materialized for that turn, and no
+          // request has consumed it. The freeze withdrew the placement's
           // agent's wake for this batch; give it an ordinary wake, as any
           // delivery during its turn has, beside any wakes a newer batch has,
           // so that its next turn reads the content (the wake starts no turn

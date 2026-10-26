@@ -2,8 +2,7 @@
  * A module's process response is applied in order: its messages added,
  * edited and removed, then its state update and inference request
  * (applyProcessResponse). One that throws as it applies, such as at an edit
- * of a held write that may already be stored while its store can't be
- * searched (refuseUnsettled), or a removal the store refuses, stops there:
+ * the store refuses, or a removal the store refuses, stops there:
  * what came before stays applied, the operation that threw may have taken
  * effect in part or whole, and the rest of it isn't, as before. A
  * line names the module and where it threw, and the other modules'
@@ -17,7 +16,6 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Module, ModuleContext, ProcessEvent, ProcessState, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { heldHandle } from '../src/held-writes.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t } as ContentBlock];
@@ -74,53 +72,6 @@ async function harness(modules: Responder[]) {
     },
   };
 }
-
-test("a response that throws at an edit of a held write that may already be stored, while its store can't be searched, stops there, and the rest of the event goes on", async (t) => {
-  const refused = new Responder('refused');
-  const after = new Responder('after');
-  const x = await harness([refused, after]); t.after(x.close);
-  const internals = x.framework as unknown as {
-    deferredMessages: Array<Record<string, unknown>>;
-    landedPositions?: unknown;
-  };
-  const cm = x.framework.getAgent('assistant')!.getContextManager() as unknown as {
-    addMessage: (...args: unknown[]) => string; queryMessages: (...args: unknown[]) => unknown;
-  };
-  // A held write whose first write landed, and whose store can't be searched
-  // to tell: context-manager's query throws, and so does the blob-free scan
-  // behind it.
-  cm.addMessage('Antra', text('look left'), { deferredWriteId: 'w-blind' });
-  internals.deferredMessages.push({ id: 'w-blind', seq: 1, participant: 'Antra', content: text('look left'), heldAt: Date.now(), landing: 'unknown' });
-  const query = cm.queryMessages;
-  cm.queryMessages = () => { throw new Error('search failed'); };
-  internals.landedPositions = () => { throw new Error('scan failed'); };
-  refused.onPing = {
-    addMessages: [{ participant: 'Refused', content: text('added before the edit') }],
-    editMessages: [{ messageId: heldHandle('w-blind'), content: text('look up') }],
-    stateUpdate: { seen: true },
-  };
-  after.onPing = { addMessages: [{ participant: 'After', content: text('from after') }] };
-  try {
-    x.framework.pushEvent({ type: 'ping', source: 'test' } as unknown as ProcessEvent);
-    await x.framework.runUntilIdle();
-  } finally { cm.queryMessages = query; delete internals.landedPositions; }
-  const window = x.window();
-  assert.ok(window.includes('After: from after'), `the next module's response was applied:\n${window.join('\n')}`);
-  assert.ok(window.includes('Refused: added before the edit'), 'what came before the throw stays applied');
-  assert.ok(x.errors.some((e) => e.startsWith("[process] refused's response to ping threw at the edit of held:w-blind: what it asked for before that was applied, that operation may have taken effect in part or whole, and the rest of it wasn't")
-    && e.includes("may already be stored, and its store can't be searched")), x.errors.join('\n'));
-  const registry = (x.framework as unknown as { moduleRegistry: { getModuleState(name: string): unknown } }).moduleRegistry;
-  assert.equal(registry.getModuleState('refused'), null, 'its state update, after the throw, was not applied');
-  const completed = x.traces.filter((e) => e.type === 'process:completed' && (e.processEvent as { type: string }).type === 'ping');
-  assert.equal(completed.length, 1, 'the event completed, traced');
-  const listed = (completed[0]!.responses as Array<{ moduleName: string; threw?: { at: string; error: string } }>);
-  assert.deepEqual(listed.map((r) => [r.moduleName, r.threw?.at]), [['refused', 'the edit of held:w-blind'], ['after', undefined]], 'the trace names where the response threw, and the other as applied');
-  assert.ok(listed[0]!.threw?.error.includes("can't be searched"), listed[0]!.threw?.error);
-  const logged = x.framework.queryProcessLogs({ eventType: 'ping' }).entries
-    .map(({ entry }) => (entry.responses as Array<{ moduleName: string; threw?: { at: string } }>).map((r) => [r.moduleName, r.threw?.at]));
-  assert.deepEqual(logged, [[['refused', 'the edit of held:w-blind'], ['after', undefined]]], 'and so does the process log');
-  assert.deepEqual(internals.deferredMessages.map((m) => [m.id, m.content]), [['w-blind', text('look left')]], 'the held write is unedited');
-});
 
 test("a response that throws at a removal the store refuses stops there, and the other modules' responses still apply", async (t) => {
   const refused = new Responder('refused');

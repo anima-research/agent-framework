@@ -4,10 +4,10 @@
  * not every row stored below the store's head then. Each case drives the
  * window directly through context-manager's presentRows, writing rows into
  * the contexts past the framework, on a residents' host, mira the primary
- * and oren, with the presentation index's module on (FrameworkConfig
- * .presentationIndex), which writes each window down as its agent is
- * registered. Beside each, where the answer differs, the legacy-mode answer
- * the same rows give, on a host without the flag.
+ * and oren; the presentation index writes each window down as its agent is
+ * registered. (Before AF-6 made presentation mandatory, cases here set
+ * beside the presented answer the legacy-mode one the same rows gave, on a
+ * host without the flag.)
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,7 +24,7 @@ import { removeStoredMessage } from '../src/stored-removal.js';
 
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t } as ContentBlock];
 
-type Placement = { agent: string; messageId?: string; deferredId?: string; presented?: false };
+type Placement = { agent: string; messageId?: string; presented?: false };
 type Destination = { serverId: string; channelId: string };
 type Internals = {
   addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string; audience?: readonly string[] }): MessageId;
@@ -50,7 +50,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(options: { presentationIndex?: boolean; subconscious?: boolean } = {}) {
+async function boot(options: { subconscious?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-presented-watermarks-'));
   dirs.push(dir);
   const framework = await AgentFramework.create({
@@ -63,7 +63,6 @@ async function boot(options: { presentationIndex?: boolean; subconscious?: boole
     modules: [],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
-    presentationIndex: options.presentationIndex ?? true,
     ...(options.subconscious ? { subconscious: { enabled: true, systemPrompt: 'You notice.' } } : {}),
   } as never);
   frameworks.push(framework);
@@ -100,7 +99,7 @@ async function boot(options: { presentationIndex?: boolean; subconscious?: boole
 
 describe('read marks once windows are presented (#291)', () => {
   it("an agent's marks are read marks, read only through covers", async () => {
-    const h = await boot({ presentationIndex: false });
+    const h = await boot();
     const mark = h.mira.getConsumedWatermark();
     assert.ok(mark, 'taken at her creation');
     // Build-time pins (tsc compiles the tests), never run: no compare by hand.
@@ -153,29 +152,31 @@ describe('read marks once windows are presented (#291)', () => {
     assert.equal(h.internals.isUnreadStoredMessage(h.oren, row), true, 'asked of either resident');
     await h.mira.compileContext();
     assert.equal(h.internals.isUnreadStoredMessage(h.mira, row), false, 'read once her mark covers it');
-
-    // In legacy mode the residents' marks are prefixes of the one record, so
-    // oren's compile reads it for both.
-    const legacy = await boot({ presentationIndex: false });
-    const old = legacy.store('for mira alone', ['mira']);
-    await legacy.oren.compileContext();
-    assert.equal(legacy.internals.isUnreadStoredMessage(legacy.mira, old), false, 'legacy: read once any reader of the slot compiled past it');
   });
 
-  it("the coalescer doesn't remove a row a presented window holds, though no reader consumed it, and still removes one never presented", async () => {
+  // The coalescer removes only what no reader consumed: a row a presented
+  // window holds and no request of its agent's answered is taken back, as
+  // one never presented is (AF-6, once every window presents and rows enter
+  // an idle window at once). A row a reader fork was handed as framing stays.
+  it("the coalescer takes back a row a presented window holds that no reader consumed, as one never presented, and keeps one a reader fork was handed as framing", async () => {
     const h = await boot({ subconscious: true });
     const subconscious = h.framework.getAgent('Subconscious')!;
     h.writeDown(subconscious);
     const held = h.store('in the subconscious\'s window', ['mira', 'oren']);
     const loose = h.store('in no window', ['mira', 'oren']);
+    const framed = h.store('handed to a reader as framing', ['mira', 'oren']);
     subconscious.getContextManager().presentRows([held]);
+    h.internals.presentation!.noteFramed(h.oren, [framed]);
     const placed = (id: MessageId): Placement => ({ agent: 'mira', messageId: id });
     assert.equal(h.internals.isUnreadPlacement(placed(held)), true, 'no reader has consumed it');
-    assert.equal(h.internals.removePlacement(placed(held)), false, 'but a window holds it, so it stays');
-    assert.ok(h.mira.getContextManager().getMessage(held), 'stored still');
+    assert.equal(h.internals.removePlacement(placed(held)), true, 'so it is taken back');
+    assert.equal(h.mira.getContextManager().getMessage(held), null);
+    assert.equal(subconscious.getContextManager().windowStatusOf(held), 'absent', 'and leaves the window that held it with the record');
     assert.equal(h.internals.isUnreadPlacement(placed(loose)), true);
     assert.equal(h.internals.removePlacement(placed(loose)), true, 'a row no window holds is removed, as before');
     assert.equal(h.mira.getContextManager().getMessage(loose), null);
+    assert.equal(h.internals.removePlacement(placed(framed)), false, 'a framed row stays');
+    assert.ok(h.mira.getContextManager().getMessage(framed), 'stored still');
   });
 
   it("an agent the presentation index says holds a row reads it, though it isn't one of the slot's readers", async () => {
@@ -224,55 +225,36 @@ describe('read marks once windows are presented (#291)', () => {
     const event = { serverId: 'discord', eventId: 'ev-1' } as unknown as MessageMetadata;
 
     it('an entry stays newest when an own row presented at its write follows it in the record, until it is presented after that row', async () => {
-      for (const presented of [true, false]) {
-        // The legacy answer from a host without the flag, whose windows stay
-        // the record (until AF-4 the flag's host left them so).
-        const h = await boot({ presentationIndex: presented });
-        if (presented) h.writeDown(h.mira, h.oren);
-        const cm = h.mira.getContextManager();
-        const arrived = h.store('the event', ['mira'], event);
-        const own = cm.addMessage('mira', text('a row of her own'), asOwnRow(undefined, 'mira'));
-        if (presented) cm.presentRows([own]);
-        assert.equal(h.internals.isNewestIn(h.mira, entry), presented,
-          presented
-            ? 'her next request holds her own row, then the entry, which her start presents'
-            : 'legacy: the record ends on her own row');
-        if (!presented) continue;
-        cm.presentRows([arrived]);
-        assert.equal(h.internals.isNewestIn(h.mira, entry), true, 'presented after her row: still newest');
-      }
+      const h = await boot();
+      h.writeDown(h.mira, h.oren);
+      const cm = h.mira.getContextManager();
+      const arrived = h.store('the event', ['mira'], event);
+      const own = cm.addMessage('mira', text('a row of her own'), asOwnRow(undefined, 'mira'));
+      cm.presentRows([own]);
+      assert.equal(h.internals.isNewestIn(h.mira, entry), true, 'her next request holds her own row, then the entry, which her start presents');
+      cm.presentRows([arrived]);
+      assert.equal(h.internals.isNewestIn(h.mira, entry), true, 'presented after her row: still newest');
     });
 
     it("a co-resident's own round stored after the entry doesn't make it not newest", async () => {
-      for (const presented of [true, false]) {
-        // The legacy answer from a host without the flag, whose windows stay
-        // the record (until AF-4 the flag's host left them so).
-        const h = await boot({ presentationIndex: presented });
-        if (presented) h.writeDown(h.mira, h.oren);
-        h.store('the event', ['mira', 'oren'], event);
-        h.oren.getContextManager().addMessage('oren', text("oren's reply"), asOwnRow(undefined, 'oren'));
-        assert.equal(h.internals.isNewestIn(h.mira, entry), presented,
-          presented ? "oren's row isn't in mira's window" : 'legacy: the shared record ends on oren\'s row');
-      }
+      const h = await boot();
+      h.writeDown(h.mira, h.oren);
+      h.store('the event', ['mira', 'oren'], event);
+      h.oren.getContextManager().addMessage('oren', text("oren's reply"), asOwnRow(undefined, 'oren'));
+      assert.equal(h.internals.isNewestIn(h.mira, entry), true, "oren's row isn't in mira's window");
     });
 
     it("a co-resident's clock row isn't this agent's last clock, nor a row not yet presented its newest", async () => {
-      for (const presented of [true, false]) {
-        // The legacy answer from a host without the flag, whose windows stay
-        // the record (until AF-4 the flag's host left them so).
-        const h = await boot({ presentationIndex: presented });
-        if (presented) h.writeDown(h.mira, h.oren);
-        const clock = (owner: string, at: number) => asOwnRow({ system: true, kind: 'clock', clock: { at, onBoundary: false, zone: 'UTC' } } as MessageMetadata, owner);
-        const mine = h.mira.getContextManager().addMessage('user', text('[clock] mira'), clock('mira', 1_000));
-        if (presented) h.mira.getContextManager().presentRows([mine]);
-        h.oren.getContextManager().addMessage('user', text('[clock] oren'), clock('oren', 2_000));
-        const last = h.internals.lastClockOf(h.mira);
-        assert.equal(last.lastClockAt, presented ? 1_000 : 2_000, presented ? "her own clock's" : "legacy: the shared record's last clock, oren's");
-        if (presented) {
-          const myRow = h.mira.getContextManager().getMessage(mine)!;
-          assert.equal(last.newestRowAt, new Date(myRow.timestamp).getTime(), "her window's newest row");
-        }
-      }
+      const h = await boot();
+      h.writeDown(h.mira, h.oren);
+      const clock = (owner: string, at: number) => asOwnRow({ system: true, kind: 'clock', clock: { at, onBoundary: false, zone: 'UTC' } } as MessageMetadata, owner);
+      const mine = h.mira.getContextManager().addMessage('user', text('[clock] mira'), clock('mira', 1_000));
+      h.mira.getContextManager().presentRows([mine]);
+      h.oren.getContextManager().addMessage('user', text('[clock] oren'), clock('oren', 2_000));
+      const last = h.internals.lastClockOf(h.mira);
+      assert.equal(last.lastClockAt, 1_000, "her own clock's");
+      const myRow = h.mira.getContextManager().getMessage(mine)!;
+      assert.equal(last.newestRowAt, new Date(myRow.timestamp).getTime(), "her window's newest row");
     });
 
     it("a drafts notice taken out of the window as an undone turn's doesn't name its draft; one not presented yet does", async () => {
@@ -293,7 +275,7 @@ describe('read marks once windows are presented (#291)', () => {
   });
 
   it("a released agent's unread notice goes to the primary stamped for the primary alone", async () => {
-    const h = await boot({ presentationIndex: false });
+    const h = await boot();
     h.internals.passNoticeToPrimary('fork-gone', { primaryIfUnread: true, kind: 'module-note' } as unknown as MessageMetadata,
       { participant: 'notes', content: text('a write the fork never read') });
     const row = h.mira.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('a write the fork never read'));

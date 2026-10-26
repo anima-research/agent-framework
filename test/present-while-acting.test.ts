@@ -1178,9 +1178,14 @@ describe('present while acting', () => {
     });
   }
 
-  it("during a capacity hold, a store that can't be read at the deferred compile fails the start rather than drop the arrival", async () => {
+  it("during a capacity hold, a store that can't be read at the deferred compile leaves the arrival waiting outside the window rather than drop it", async () => {
     // Adapted from a reviewer's probe: a read that fails says nothing about
-    // whether the message is there, so it can't count as a withdrawal.
+    // whether the message is there, so it can't count as a withdrawal. Since
+    // #291 the arrival is stored at once and enters the window at the start's
+    // presentation point, whose read is the one that fails: the point logs
+    // it and leaves the arrival for the next point, and the start compiles
+    // without it. (With the deferral queue, the start's own read of the
+    // arrival failed the start; this test once expected that.)
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'On it.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
@@ -1191,8 +1196,6 @@ describe('present while acting', () => {
     const routed = stubChannelRegistry(framework);
     module.toolDelayMs = 25;
     failStream(1, accelerationLimit);
-    // Were the failed read taken as a withdrawal, the compile would run and
-    // answer here, at the turn's old channel.
     feedStart(framework, 2, [{ type: 'text', text: 'Here is the rest.' }] as ContentBlock[]);
 
     trigger(framework);
@@ -1206,15 +1209,28 @@ describe('present while acting', () => {
       if (id === arrival.id) throw new Error('store unavailable');
       return getMessage(id);
     };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try {
-      await assert.rejects(release(framework), /store unavailable/);
+      await release(framework);
     } finally {
+      console.error = error;
       cm.getMessage = getMessage;
     }
 
-    assert.equal(membrane.calls.length, 1, 'the deferred compile never ran');
-    assert.deepEqual(routed, [{ text: 'On it.', locus: 'chan-live-1' }], 'and the turn spoke nowhere else');
-    assert.deepEqual(movedTo(framework), [], 'nor told the agent of a move');
+    assert.ok(errors.some((e) => e.includes('[presentation] assistant: presenting at turn-start failed') && e.includes('store unavailable')),
+      errors.join('\n'));
+    assert.equal(membrane.calls.length, 2, 'the deferred compile ran');
+    const compiled = JSON.stringify(membrane.calls[1]!.messages);
+    assert.ok(!compiled.includes('a question for you'), 'without the arrival its point could not read');
+    assert.ok(cm.getMessage(arrival.id), 'the arrival is still stored');
+    assert.ok(!cm.getPresentedMessages().some((m) => m.id === arrival.id), 'and waits outside the window for the next point');
+    assert.deepEqual(routed, [
+      { text: 'On it.', locus: 'chan-live-1' },
+      { text: 'Here is the rest.', locus: 'chan-live-1' },
+    ], 'the turn answered where it was');
+    assert.deepEqual(movedTo(framework), [], 'the agent was told of no move');
 
     await framework.stop();
   });
@@ -1353,27 +1369,27 @@ describe('present while acting', () => {
 
     trigger(framework);
     await framework.runUntilIdle();
-    // During the second start, before its stream exists, a DM arrives and is
-    // deferred: the start holds the turn. (Written directly: the run loop
-    // that would store an event's message is busy with this start.)
+    // During the second start, before its stream exists, a DM arrives. It is
+    // stored at once (#291 took the deferral queue away; this test once
+    // checked it was queued while the start held the turn, and stored by the
+    // failed start's flush) and enters the window at a later point. (Written
+    // directly: the run loop that would store an event's message is busy
+    // with this start.)
     const store = framework as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
-      deferredMessages: unknown[];
     };
-    let deferredInStart = -1;
+    let storedInStart = '';
     // Another agent's tool cycle is pending when the start fails: the flush
     // at its end waits only on this agent's own cycle.
     const cycles = (framework as unknown as { pendingAssistantBlocks: Map<string, ContentBlock[]> }).pendingAssistantBlocks;
     module.startHook = async () => {
-      store.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[], addressed('discord:dm:antra'));
-      deferredInStart = store.deferredMessages.length;
+      storedInStart = store.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[], addressed('discord:dm:antra'));
       cycles.set('builder', [{ type: 'tool_use', id: 'b1', name: 'x', input: {} }] as ContentBlock[]);
     };
     await release(framework);
     cycles.delete('builder');
-    assert.equal(deferredInStart, 1, 'the DM was deferred while the start held the turn');
+    assert.notEqual(storedInStart, '', 'the DM was stored while the start held the turn');
     assert.equal(calls, 2, 'the second start failed before its stream');
-    assert.equal(store.deferredMessages.length, 0, "the failed start's flush stored the DM while another agent's tools were pending");
     // During the second hold, someone else addresses the agent.
     await say(framework, 'over here', addressed('discord:dm:q'));
     await release(framework);
@@ -1381,81 +1397,7 @@ describe('present while acting', () => {
     assert.equal(calls, 3, 'the third start compiled');
     assert.deepEqual(routed, [
       { text: 'Back now.', locus: 'discord:dm:q' },
-    ], 'the newer message wins: the deferred one landed when its start failed');
-
-    await framework.stop();
-  });
-
-  it("a failed start's flush stops at a message it can't store: it and what follows stay queued, in order", async () => {
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
-    ] as ContentBlock[], 'tool_use'));
-    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-
-    const framework = await createFramework();
-    stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
-    let hostHolds = 0;
-    (framework as unknown as { providerHoldHook: (error: Error) => { holdMs: number; reason: string } | undefined })
-      .providerHoldHook = (error) => error.message === 'stream setup failed' && hostHolds++ === 0
-        ? { holdMs: 60_000, reason: 'host hold' } : undefined;
-    // As above: stream one is held at its end, the start after the first
-    // release fails before its stream exists and is held, the third answers.
-    const makeStream = membrane.streamYielding.bind(membrane);
-    let calls = 0;
-    membrane.streamYielding = (request, options) => {
-      const n = ++calls;
-      if (n === 2) throw new Error('stream setup failed');
-      const stream = makeStream(request, options);
-      const iterate = stream[Symbol.asyncIterator].bind(stream);
-      stream[Symbol.asyncIterator] = async function* () {
-        for await (const event of { [Symbol.asyncIterator]: iterate }) {
-          if (event.type === 'complete' && n === 1) {
-            yield { type: 'error' as const, error: accelerationLimit(request) };
-            return;
-          }
-          yield event;
-        }
-      };
-      return stream;
-    };
-    feedStart(framework, 2, [{ type: 'text', text: 'Back now.' }] as ContentBlock[]);
-
-    trigger(framework);
-    await framework.runUntilIdle();
-    // During the second start, before its stream exists, two messages arrive
-    // and are deferred, and the store refuses the first of them.
-    const store = framework as unknown as {
-      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
-      deferredMessages: Array<{ content: ContentBlock[] }>;
-    };
-    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
-      addMessage(participant: string, content: ContentBlock[], metadata?: unknown): string;
-    };
-    const add = cm.addMessage.bind(cm);
-    let refuse = true;
-    cm.addMessage = (participant, content, metadata) => {
-      if (refuse && (content[0] as { text?: string })?.text === 'first') throw new Error('store refused');
-      return add(participant, content, metadata);
-    };
-    module.startHook = async () => {
-      store.addMessage('Antra', [{ type: 'text', text: 'first' }] as ContentBlock[], ambient('discord:dm:antra'));
-      store.addMessage('Antra', [{ type: 'text', text: 'second' }] as ContentBlock[], ambient('discord:dm:antra'));
-    };
-    const texts = () => framework.getAgent('assistant')!.getContextManager().getAllMessages()
-      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text))
-      .filter((t) => t === 'first' || t === 'second');
-    await release(framework);
-    assert.equal(calls, 2, 'the second start failed before its stream');
-    assert.deepEqual(store.deferredMessages.map((m) => (m.content[0] as { text: string }).text), ['first', 'second'],
-      'the message the flush could not store, and the one behind it, stay queued in order');
-    assert.deepEqual(texts(), [], 'nothing behind the refused message was stored');
-
-    // Once the store takes it, the next start stores both, in order.
-    refuse = false;
-    await release(framework);
-    assert.equal(calls, 3, 'the third start compiled');
-    assert.deepEqual(texts(), ['first', 'second']);
+    ], 'the newer message wins: the one stored in the failed start is the older arrival');
 
     await framework.stop();
   });
@@ -1645,7 +1587,12 @@ describe('present while acting', () => {
     });
   }
 
-  it('the start that continues the turn weighs a message its own flush lands, and a delivery assembled for it', async () => {
+  it('the start that continues the turn weighs what entered the window since its last stream: a delivery assembled for it, and a newer message', async () => {
+    // Ported for #291: the deferral queue this test once filled by hand, for
+    // the start's own flush to land, is gone. A delivery assembled while a
+    // start of the turn holds it, and a message stored once that start has
+    // let go, are stored at once and are arrivals as they enter the window;
+    // the turn's next start re-pins to the newest.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
     const framework = await createFramework(LEGACY);
     const routed = stubChannelRegistry(framework);
@@ -1654,8 +1601,7 @@ describe('present while acting', () => {
       turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
       activeTurnTokens: Map<string, number>;
       assembling: Set<string>;
-      deferredMessages: Array<Record<string, unknown>>;
-      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts?: { bypassDeferralFor?: string }): string;
+      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
     };
     const open: Routing = {
       locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set(), wasIn: [],
@@ -1664,20 +1610,12 @@ describe('present while acting', () => {
     internals.turnRouting.set('assistant', open);
     internals.openLogical.set('assistant', open);
     try {
-      // A delivery assembled while a start of the turn holds it (the
-      // coalescing assembly writes past the deferral) is an arrival too.
       internals.activeTurnTokens.set('assistant', -1);
       internals.assembling.add('assistant');
-      internals.addMessage('Antra', [{ type: 'text', text: 'batched' }] as ContentBlock[], addressed('discord:dm:q'), { bypassDeferralFor: 'assistant' });
+      internals.addMessage('Antra', [{ type: 'text', text: 'batched' }] as ContentBlock[], addressed('discord:dm:q'));
       internals.assembling.delete('assistant');
       internals.activeTurnTokens.delete('assistant');
-      assert.deepEqual(open.arrivals.map((a) => a.channel.channelId), ['discord:dm:q']);
-      // A message still deferred when the turn's next start begins lands in
-      // that start's own flush, and is the newest arrival.
-      internals.deferredMessages.push({
-        id: 'deferred-1', seq: 1, participant: 'Antra', forAgent: 'assistant',
-        content: [{ type: 'text', text: 'quick question for you' }], metadata: addressed('discord:dm:antra'),
-      });
+      internals.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[], addressed('discord:dm:antra'));
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
       await framework.runUntilIdle();
 

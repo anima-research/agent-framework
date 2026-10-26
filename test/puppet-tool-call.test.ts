@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { AgentFramework } from '../src/framework.js';
+import { MockMembrane } from './helpers/mock-membrane.js';
 
 /**
  * Framework.puppetToolCall — admin puppet: execute one tool AS an agent and
@@ -47,29 +51,12 @@ function puppetHarness(opts?: {
   const fw = framework as unknown as Record<string, unknown>;
   fw.activeTurnTokens = new Map<string, number>();
   fw.nextTurnToken = 1;
-  fw.deferredMessages = [];
-  // Flushed-but-unsynced deferred writes (durable-queue ack bookkeeping);
-  // a prototype-built harness must seed it like the constructor does.
-  fw.unackedDeferredWrites = [];
-  fw.deferredSeq = 0;
-  fw.deferredScanFrom = new Map();
   fw.pendingAssistantBlocks = new Map();
-  // Window releases a quiesce postponed, which every by-name flush checks
-  // (drainDeferredFor): none here, as the constructor starts it.
+  // Window releases a quiesce postponed: none here, as the constructor starts it.
   fw.releasesAfterResume = new Map();
   // A puppet call is an operation stop() waits for.
   fw.operatorOperations = new Set();
   fw.primaryAgentName = 'princess';
-  // Cross-turn writer path (what a channel message goes through): defers
-  // while a turn is alive, else stores — the real guard, reduced.
-  fw.addMessage = (participant: string, content: Array<Record<string, unknown>>, _m?: unknown, opts?: { forAgent?: string }) => {
-    if ((fw.activeTurnTokens as Map<string, number>).has('princess')) {
-      (fw.deferredMessages as unknown[]).push({ participant, content, forAgent: opts?.forAgent });
-      return '';
-    }
-    stored.push({ participant, content });
-    return `msg-${stored.length}`;
-  };
   (framework as unknown as Record<string, unknown>).getToolsForAgent =
     () => surface.map((name) => ({ name }));
   (framework as unknown as Record<string, unknown>).executeToolCall =
@@ -84,7 +71,6 @@ function puppetHarness(opts?: {
 
   const turn = fw as unknown as {
     activeTurnTokens: Map<string, number>;
-    deferredMessages: Array<{ participant: string; content: Array<Record<string, unknown>>; forAgent?: string }>;
     nextTurnToken: number;
   };
   return { framework, stored, traces, executed, fw: turn };
@@ -231,46 +217,88 @@ test('puppetToolCall refuses an idle agent whose turn is still alive (teardown p
   assert.equal(fw.activeTurnTokens.get('princess'), 41, 'someone else\'s token untouched');
 });
 
-test('a message arriving while the puppet holds the agent lands AFTER the pair, never between', async () => {
-  const { framework, stored, fw, release } = heldHarness();
+/**
+ * A framework of its own, with one agent, scout, whose puppeted tool stays
+ * open until `release()`: where a message is stored and when it enters the
+ * window is the presentation index's (#291), which a prototype-built harness
+ * doesn't have.
+ */
+async function realHeld() {
+  const dir = mkdtempSync(join(tmpdir(), 'puppet-tool-call-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    modules: [],
+  });
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const internals = framework as unknown as {
+    executeToolCall: (call: Record<string, unknown>) => Promise<unknown>;
+    activeTurnTokens: Map<string, number>;
+    addMessage(participant: string, content: Array<{ type: 'text'; text: string }>): string;
+    presentAtEndOf(agent: unknown): void;
+  };
+  internals.executeToolCall = async () => { await gate; return { success: true, data: [{ type: 'text', text: 'done' }], isError: false }; };
+  const cm = framework.getAgent('scout')!.getContextManager();
+  const kinds = (rows: Array<{ content: Array<{ type: string; text?: string }> }>) =>
+    rows.map((m) => (m.content[0]?.type === 'text' ? m.content[0].text! : m.content[0]?.type));
+  return {
+    framework, internals, cm, release,
+    record: () => kinds(cm.getAllMessages() as never),
+    window: () => kinds(cm.getPresentedMessages() as never),
+    close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
+  };
+}
+
+// Ported for #291 to a framework of its own: the message is stored at once,
+// out of the window, and the puppet's end presents it after the pair. This
+// test once ran on the prototype-built harness, whose stand-in addMessage
+// queued the message in the deferral queue for the puppet's end to flush.
+test('a message arriving while the puppet holds the agent enters the window AFTER the pair, never between', async () => {
+  const h = await realHeld();
   const quiet = console.log;
   console.log = () => {};
   try {
-    const p = framework.puppetToolCall('princess', 'mcpl--eido--look', {});
+    const p = h.framework.puppetToolCall('scout', 'agent_settings', { action: 'get' });
     await new Promise((r) => setImmediate(r));
-    // a channel message for the agent, mid-execution: the cross-turn writer defers
-    (framework as unknown as { addMessage: (p: string, c: unknown[]) => unknown })
-      .addMessage('user', [{ type: 'text', text: 'hey, you there?' }]);
-    assert.equal(stored.length, 0, 'deferred, not stored mid-puppet');
-    assert.equal(fw.deferredMessages.length, 1);
-    release();
+    // a channel message for the agent, mid-execution
+    assert.notEqual(h.internals.addMessage('user', [{ type: 'text', text: 'hey, you there?' }]), '', 'stored at once');
+    assert.ok(h.record().includes('hey, you there?'));
+    assert.ok(!h.window().includes('hey, you there?'), 'out of the window mid-puppet');
+    h.release();
     await p;
-    assert.equal(fw.deferredMessages.length, 0, 'flushed at the puppet\'s end, like a turn\'s end');
-    assert.deepEqual(stored.map((m) => m.content[0].type), ['tool_use', 'tool_result', 'text'],
-      'pair first and adjacent; the deferred message follows');
+    assert.deepEqual(h.window().slice(-3), ['tool_use', 'tool_result', 'hey, you there?'],
+      'the pair first and adjacent; the message follows');
   } finally {
     console.log = quiet;
+    await h.close();
   }
 });
 
-test('if a turn replaced the reservation mid-flight, the pair is queued as a unit behind it, not written into it', async () => {
-  const { framework, stored, traces, fw, release } = heldHarness();
+// Ported for #291 as the test above: the pair is stored at once, out of the
+// window of the turn that replaced the reservation, and enters it at that
+// turn's end. This test once had the pair queued as a unit in the deferral
+// queue behind that turn.
+test('if a turn replaced the reservation mid-flight, the pair is stored out of its window, adjacent, and enters it at that turn\'s end', async () => {
+  const h = await realHeld();
   const quiet = console.log;
   console.log = () => {};
   try {
-    const p = framework.puppetToolCall('princess', 'mcpl--eido--look', {});
+    const p = h.framework.puppetToolCall('scout', 'agent_settings', { action: 'get' });
     await new Promise((r) => setImmediate(r));
     // the provider-admission re-entry: a turn takes the marker without re-testing it
-    fw.activeTurnTokens.set('princess', 9999);
-    release();
+    h.internals.activeTurnTokens.set('scout', 9999);
+    h.release();
     await p;
-    assert.equal(stored.length, 0, 'nothing written under the live turn');
-    assert.equal(fw.activeTurnTokens.get('princess'), 9999, 'the turn\'s token is not clobbered');
-    assert.deepEqual(fw.deferredMessages.map((m) => [m.forAgent, m.content[0].type]),
-      [['princess', 'tool_use'], ['princess', 'tool_result']],
-      'both halves queued, adjacent, addressed to the agent');
-    assert.equal(traces[0].deferred, true, 'trace says so');
+    assert.equal(h.internals.activeTurnTokens.get('scout'), 9999, 'the turn\'s token is not clobbered');
+    assert.deepEqual(h.record().slice(-2), ['tool_use', 'tool_result'], 'both halves stored, adjacent');
+    assert.ok(!h.window().includes('tool_use') && !h.window().includes('tool_result'), 'out of the live turn\'s window');
+    h.internals.activeTurnTokens.delete('scout');
+    h.internals.presentAtEndOf(h.framework.getAgent('scout'));
+    assert.deepEqual(h.window().slice(-2), ['tool_use', 'tool_result'], "in the window at that turn's end, adjacent");
   } finally {
     console.log = quiet;
+    await h.close();
   }
 });

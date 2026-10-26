@@ -1,9 +1,9 @@
-- `FrameworkConfig.presentationIndex` (@experimental, default false; #291): each agent's context is to follow its
-  own presentation index, the rows it was shown in the order its requests carried them, kept by context-manager
-  (`presentRows`) beside the store's record. This release builds the index's module and constructs it under the
-  option, which needs a context-manager with `ContextManager.presentRows` (create() refuses the option without one),
-  and wires its presentation points (see the entry for what they do). It checks each write's audience stamp, and a write stamped only for agents none of whom reads the slot it is stored in is traced
-  as `presentation:unreadable-audience` and stored as named. The trace types the index will emit are in
+- The presentation index (#291): each agent's context follows its own window, the rows it was shown in the order
+  its requests carried them, kept by context-manager (`presentRows`) beside the store's record. Every framework
+  constructs the index's module, which needs a context-manager with `ContextManager.presentRows` (create() refuses
+  one without it), and runs its presentation points (see the entry for what they do). It checks each write's
+  audience stamp, and a write stamped only for agents none of whom reads the slot it is stored in is traced as
+  `presentation:unreadable-audience` and stored as named. The trace types the index will emit are in
   `TraceEvent` now: `presentation:presented`, `presentation:repaired`, `presentation:unreadable-audience`,
   `presentation:failed`, `presentation:hand-off-mismatch`, `presentation:retracted` and `window:undone`.
 - `observedRowFor(edge, row, { observer, owners })`: what an observe edge shows of the slot it reads (#291, decision

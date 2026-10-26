@@ -24,7 +24,6 @@ import type {
   ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
-import { heldWriteId } from './held-writes.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
@@ -810,13 +809,14 @@ class ModuleContextImpl implements ModuleContext {
     }
     const id = this.addMessageFn(participant, content, metadata, opts);
 
-    // Track external ID if provided. A write the framework holds keeps '',
-    // as it did before held writes had handles: the map is module state an
-    // earlier release reads back, and a handle is no id to it.
-    // findMessageByExternalId finds the held write by its external id.
+    // Track external ID if provided: the stored id the write was given
+    // (#291 stores every write at once), or '' for one a surgery's hold
+    // keeps in memory, as earlier releases kept '' for a write they held.
+    // findMessageByExternalId finds such a write by its external id once it
+    // is stored.
     if (metadata?.external) {
       const key = `${metadata.external.source}:${metadata.external.id}`;
-      this.externalIdMap.set(key, heldWriteId(id) === undefined ? id : '');
+      this.externalIdMap.set(key, id);
       // Persist the mapping
       this.persistExternalIdMap();
     }
@@ -845,15 +845,15 @@ class ModuleContextImpl implements ModuleContext {
     const entry = this.externalIdMap.get(key);
     if (entry === undefined) return null;
     // A stored id answers while the store holds its row, and once the row is
-    // gone the entry goes, as removeMessage drops it. The '' a held write
-    // keeps here (addMessage) names no row, so the message is looked up in
-    // the store by its external id, held rows included, and the first row
-    // found is taken, as context-manager's findByExternalId takes it: a held
-    // row answers by its handle and leaves the entry as it is, and a stored
-    // row's id becomes the entry. With nothing found, '' stays, as earlier
-    // releases kept it: in a module's start(), the writes the last process
-    // held don't show yet, since create() restores them after the modules
-    // start, and a write that shows later finds its entry.
+    // gone the entry goes, as removeMessage drops it. A '' here names no row:
+    // a write a surgery's hold kept, or one an earlier release held, whose
+    // map it persisted with ''. So the message is looked up in the store by
+    // its external id, and the first row found is taken, as
+    // context-manager's findByExternalId takes it, and its id becomes the
+    // entry. With nothing found, '' stays: in a module's start(), a write an
+    // earlier release left queued isn't stored yet, since create() imports
+    // those after the modules start, and a write that shows later finds its
+    // entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
       this.externalIdMap.delete(key);
@@ -861,7 +861,6 @@ class ModuleContextImpl implements ModuleContext {
       return null;
     }
     const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
-    if (row?.held) return row.id;
     if (!row) return null;
     this.externalIdMap.set(key, row.id);
     this.persistExternalIdMap();

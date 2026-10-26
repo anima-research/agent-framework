@@ -10,10 +10,10 @@
  * the idle second agent is presented it before any wake for it runs, so its
  * one request carries it.
  *
- * A plain test since the presentation points are wired under the flag
- * (AF-4). Before them it failed at helperCarried, the issue's outcome: the
- * message was still held for the first agent's turn when the second one's
- * request was made.
+ * A plain test since the presentation points were wired (AF-4), and with
+ * no option since presentation became mandatory (AF-6). Before them it
+ * failed at helperCarried, the issue's outcome: the message was still held
+ * for the first agent's turn when the second one's request was made.
  */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -110,7 +110,6 @@ async function run(duringFirstTurn: boolean): Promise<Result> {
       { name: 'helper', model: 'test-model', systemPrompt: 'You help.', proseRouting: 'disabled' },
     ],
     modules: [module],
-    presentationIndex: true,
   });
   const helperCm = framework.getAgent('helper')!.getContextManager();
   const question = () => helperCm.getAllMessages().find((m) => carries(textsOf([m])));

@@ -214,13 +214,18 @@ export interface ReaderFramingContext {
   /** Standing dispositions recorded on the epoch, or null. */
   dispositions: string | null;
   /**
-   * The traffic held since the last look, oldest first; empty when nothing
-   * arrived. It includes the messages still queued behind the resident's
-   * turn (admitted, not yet stored), last: their ids are held handles and
-   * their sequences provisional, as a module's held rows are.
+   * The traffic held since the last look, oldest first, as stored; empty
+   * when nothing arrived. A held message is stored as it arrives, the
+   * resident's turn alive or not (#291), so the stored rows are all of it.
    */
   backlog: StoredMessage[];
-  /** How many of `backlog`'s last entries are still queued behind the resident's turn. Absent is none. */
+  /**
+   * Was how many of `backlog`'s last entries were still queued behind the
+   * resident's turn. Since #291 nothing is queued, so the framework never
+   * sets it.
+   *
+   * @deprecated Never set since #291; removed in a later release.
+   */
   queuedCount?: number;
 }
 
@@ -241,15 +246,11 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     return content;
   }
   const n = ctx.backlog.length;
-  const q = Math.min(Math.max(0, Math.floor(ctx.queuedCount ?? 0)), n);
   const lines: string[] = [`\n[Held in ${ctx.channelId} since your last look: ${n} message${n === 1 ? '' : 's'}]`];
   const flush = () => {
     if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
   };
-  const which = q === n ? (q === 1 ? 'It' : 'They') : (q === 1 ? 'The last one' : `The last ${q}`);
-  const queuedNote = `[${which} arrived while ${ctx.resident}'s turn was running, so ${q === 1 ? 'it is' : 'they are'} still queued, not yet stored.]`;
-  for (const [i, message] of ctx.backlog.entries()) {
-    if (q > 0 && i === n - q) lines.push(queuedNote);
+  for (const message of ctx.backlog) {
     const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
     const text = message.content
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')

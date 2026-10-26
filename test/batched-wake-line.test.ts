@@ -257,7 +257,7 @@ describe('a batched wake writes its line only when it says something', () => {
 /**
  * What the framework answers the gate (isNewestContextEntry), against a real
  * window: true only for the event's own stored entry, newest, with no turn
- * alive, nothing deferred, and no tune-out holding it.
+ * alive and no tune-out holding it.
  */
 describe('isNewestContextEntry', () => {
   let tempDir: string;
@@ -297,7 +297,6 @@ describe('isNewestContextEntry', () => {
     isNewestContextEntry(entry: { eventType: string; serverId?: string; channelId?: string; messageId?: string; eventId?: string }): boolean;
     activeTurnTokens: Map<string, number>;
     activeStreams: Map<string, unknown>;
-    deferredMessages: Array<{ forAgent?: string }>;
     addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>): string;
     agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ metadata?: Record<string, unknown>; content: Array<{ type: string; text?: string }> }> } }>;
   };
@@ -471,7 +470,9 @@ describe('isNewestContextEntry', () => {
     assert.equal(ask(), false);
   });
 
-  it('false while a turn is alive (started, or streaming) or a write is deferred for the agent', async () => {
+  // #291 took the deferral queue away, and with it this test's third case,
+  // a write deferred for the agent: a write is stored at once.
+  it('false while a turn is alive (started, or streaming)', async () => {
     command(`dm ev-${++n} 134 1548000000000000001 a DM`);
     const md = await stored('a DM');
     const ask = () => internals().isNewestContextEntry({ eventType: 'mcpl:push-event', serverId: 'discord', eventId: md.eventId as string });
@@ -482,9 +483,6 @@ describe('isNewestContextEntry', () => {
     internals().activeStreams.set('scout', {});
     assert.equal(ask(), false, 'a turn streaming');
     internals().activeStreams.delete('scout');
-    internals().deferredMessages.push({ forAgent: 'scout' });
-    assert.equal(ask(), false, 'a write deferred');
-    internals().deferredMessages.pop();
     assert.equal(ask(), true);
   });
 
@@ -520,7 +518,7 @@ class HoldThenAnswerMembrane extends MockMembrane {
 }
 
 describe('a handed line is written once per wake', () => {
-  it('a start that resumes a logical turn takes in no handed line, as it takes in no deferred write', async () => {
+  it('a start that resumes a logical turn takes in no handed line', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wake-line-resume-'));
     const membrane = new MockMembrane();
     const framework = await AgentFramework.create({
@@ -636,7 +634,7 @@ describe('a handed line is written once per wake', () => {
   });
 });
 
-describe('a handed line across readers, a flush, a quiesce and a hold', () => {
+describe('a handed line across readers, a quiesce and a hold', () => {
   type Bare = {
     framework: AgentFramework;
     membrane: MockMembrane;
@@ -680,9 +678,13 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
   const wake = (lines: unknown[], timestamp = Date.now()) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp, wakeLines: lines });
 
-  // Every resident gets every batched wake. Only the delivery agent's start
-  // places the line, so it lands once, before that agent's own answer.
-  it('one wake for two residents, the co-resident first: she writes no line, and the delivery agent\'s start writes it once, after her reply and before its own answer', async () => {
+  // Every resident gets every batched wake. Since #291 each resident's start
+  // decides the line by its own window and writes it as its own row, which
+  // enters no other window; a co-resident's reply is her own row too. This
+  // test once had only the delivery agent's start write the slot's one line,
+  // after mira's reply; now the DM is newest in each window, so neither
+  // writes it.
+  it('one wake for two residents, the co-resident first: each start weighs the line by its own window, where the DM is newest, so neither writes it', async () => {
     const b = await bare(['scout', 'mira']);
     try {
       storeDm(b, 'ev-1', 'are you there?');
@@ -691,17 +693,16 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       b.internals.pendingRequests.push({ ...wake([line]), agentName: 'mira' });
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: mira\'s turn ran');
-      assert.equal(texts(b).filter((t) => t.includes('LINE-MIRA-FIRST')).length, 0, 'mira places nothing');
+      assert.equal(texts(b).filter((t) => t.includes('LINE-MIRA-FIRST')).length, 0, 'mira places nothing: the DM is newest in her window');
+      const scoutWindow = () => b.framework.getAgent('scout')!.getContextManager().getPresentedMessages()
+        .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
+      assert.ok(!scoutWindow().some((t) => t.includes('mira answers')), "premise: mira's reply is her own row, in no window but hers");
       b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout answers' }]));
       b.internals.pendingRequests.push(wake([line]));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 2, 'premise: scout\'s turn ran');
-      const all = texts(b);
-      const mira = all.findIndex((t) => t.includes('mira answers'));
-      const at = all.findIndex((t) => t.includes('LINE-MIRA-FIRST'));
-      const scout = all.findIndex((t) => t.includes('scout answers'));
-      assert.equal(all.filter((t) => t.includes('LINE-MIRA-FIRST')).length, 1, 'written once');
-      assert.ok(mira >= 0 && at > mira && scout > at, `after mira's reply, before scout's answer (mira ${mira}, line ${at}, scout ${scout})`);
+      assert.equal(texts(b).filter((t) => t.includes('LINE-MIRA-FIRST')).length, 0, 'scout places nothing either: the DM is newest in its window');
+      assert.ok(scoutWindow().some((t) => t.includes('scout answers')), "scout's answer follows the DM in its window");
     } finally { await done(b); }
   });
 
@@ -749,7 +750,11 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     }
   });
 
-  it('the delivery agent\'s start while a co-resident\'s turn is alive, or while the host is quiesced: no line written, traced, left for a later start', async () => {
+  // Since #291 a co-resident's live turn holds no line: the line is the
+  // starting resident's own row, in no window but its own. This test once
+  // traced a line placed while mira's turn was alive as held; now only a
+  // quiesce holds one.
+  it('the delivery agent\'s start while the host is quiesced: no line written, traced, left for a later start; a co-resident\'s live turn holds none', async () => {
     const b = await bare(['scout', 'mira']);
     try {
       storeDm(b, 'ev-1', 'are you there?');
@@ -758,48 +763,52 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       b.framework.onTrace((event) => { traces.push(event as unknown as { type: string }); });
       const scout = b.framework.getAgent('scout')!;
       storeDm(b, 'ev-2', 'and another');
-      // One line whose message is newest, with mira's turn alive: held, not newest.
+      // One line whose message is newest, with mira's turn alive: newest.
       b.internals.activeTurnTokens.set('mira', 1);
       try {
         b.internals.placeWakeLines(scout, [dmLine('ev-2', 'LINE-ONE')]);
       } finally {
         b.internals.activeTurnTokens.delete('mira');
       }
-      assert.deepEqual(traces.splice(0).filter((t) => t.type === 'gate:wake-line-omitted').map((t) => t.reason), ['held'], 'held takes precedence over newest');
+      assert.deepEqual(traces.splice(0).filter((t) => t.type === 'gate:wake-line-omitted').map((t) => t.reason), ['newest'],
+        "mira's live turn holds nothing");
       const lines = [dmLine('ev-1', 'LINE-HELD'), dmLine('ev-2', 'LINE-HELD2')];
+      await b.framework.quiesce({ reason: 'test window' });
+      b.internals.placeWakeLines(scout, lines);
+      assert.equal(texts(b).filter((t) => t.includes('LINE-HELD')).length, 0, 'none written while quiesced');
+      const omitted = traces.filter((t) => t.type === 'gate:wake-line-omitted');
+      assert.deepEqual(omitted.map((t) => t.reason), ['held', 'held'], 'each line traced as held');
+      await b.framework.resume();
       b.internals.activeTurnTokens.set('mira', 1);
       try {
         b.internals.placeWakeLines(scout, lines);
       } finally {
         b.internals.activeTurnTokens.delete('mira');
       }
-      assert.equal(texts(b).filter((t) => t.includes('LINE-HELD')).length, 0, 'not written into mira\'s live turn');
-      await b.framework.quiesce({ reason: 'test window' });
-      b.internals.placeWakeLines(scout, lines);
-      assert.equal(texts(b).filter((t) => t.includes('LINE-HELD')).length, 0, 'nor while quiesced');
-      const omitted = traces.filter((t) => t.type === 'gate:wake-line-omitted');
-      assert.deepEqual(omitted.map((t) => t.reason), ['held', 'held', 'held', 'held'], 'each line traced as held, each time');
-      await b.framework.resume();
-      b.internals.placeWakeLines(scout, lines);
-      assert.equal(texts(b).filter((t) => t.includes('LINE-HELD')).length, 2, 'a later start writes both');
+      assert.equal(texts(b).filter((t) => t.includes('LINE-HELD')).length, 2, "a later start writes both, mira's turn alive or not");
     } finally { await done(b); }
   });
 
-  it('a write deferred while a turn ran lands at the next start before the line is decided, so the line comes after it', async () => {
+  // Ported for #291: the chatter is stored at once, and waits outside the
+  // window rather than in the deferral queue this test once checked.
+  it('a write stored while a turn ran enters the window at the next start before the line is decided, so the line comes after it', async () => {
     const b = await bare(['scout']);
     try {
       storeDm(b, 'ev-1', 'are you there?');
+      const window = (): string[] => b.framework.getAgent('scout')!.getContextManager().getPresentedMessages()
+        .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
       b.internals.activeTurnTokens.set('scout', 1);
       storeChatter(b);
       b.internals.activeTurnTokens.delete('scout');
-      assert.ok(!texts(b).some((t) => t.includes('unrelated chatter')), 'premise: the chatter waits, deferred');
+      assert.ok(texts(b).some((t) => t.includes('unrelated chatter')), 'premise: the chatter is stored');
+      assert.ok(!window().some((t) => t.includes('unrelated chatter')), 'premise: and waits outside the window');
       b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
       b.internals.pendingRequests.push(wake([dmLine('ev-1', 'LINE-FLUSH')]));
       await b.framework.runUntilIdle();
-      const all = texts(b);
+      const all = window();
       const chatter = all.findIndex((t) => t.includes('unrelated chatter'));
       const line = all.findIndex((t) => t.includes('LINE-FLUSH'));
-      assert.ok(chatter >= 0 && line > chatter, `the flushed chatter, then the line (chatter ${chatter}, line ${line})`);
+      assert.ok(chatter >= 0 && line > chatter, `the chatter, then the line (chatter ${chatter}, line ${line})`);
     } finally { await done(b); }
   });
 

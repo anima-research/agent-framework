@@ -834,11 +834,14 @@ describe('Residents read one message slot', () => {
     addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
     turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string } }>;
     activeTurnTokens: Map<string, number>;
-    deferredMessages: unknown[];
     channelRegistry: unknown;
     providerAccelerationCooldowns: Map<string, { until: number }>;
     releaseProviderAccelerationCooldown(agentName: string): void;
   };
+
+  /** Whether the residents' slot stores a row holding `text`. */
+  const storedText = (framework: AgentFramework, text: string): boolean => framework.getAgent('scout')!.getContextManager()
+    .getAllMessages().some((m) => JSON.stringify(m.content).includes(text));
 
   /** Two residents, scout the primary and shade. A registry stand-in
    *  resolves a fresh locus to the turn's trigger channel and records where
@@ -1004,23 +1007,23 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
-  it("a second resident's held turn weighs a message the primary's own start stores (latest-inbound)", async () => {
+  // Ported for #291: the message is stored at once, where it once waited in
+  // the primary's deferral queue for the primary's next start to store it.
+  it("a second resident's held turn weighs a message stored while the primary's turn is alive (latest-inbound)", async () => {
     const { framework, i, routed, release } = await residents('shade', {
       2: [[{ type: 'text', text: 'scout here' }] as ContentBlock[]],
       3: hereIAm,
     }, undefined, LEGACY);
     framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
     await framework.runUntilIdle();
-    // While scout's turn is alive, a message for the primary waits in its
-    // queue, and scout's next start stores it.
+    // While scout's turn is alive, a message comes in; it is stored at once.
     i.activeTurnTokens.set('scout', 999);
     framework.pushEvent(residentIncoming('discord:dm:antra', 'shade, over here please', 'shade', true));
     await framework.runUntilIdle();
-    assert.equal(i.deferredMessages.length, 1, 'the message waits for scout');
+    assert.ok(storedText(framework, 'shade, over here please'), 'stored while scout\'s turn is alive');
     i.activeTurnTokens.delete('scout');
     framework.pushEvent(residentIncoming('discord:guild:chanC', 'scout, a word', 'scout', false));
     await framework.runUntilIdle();
-    assert.equal(i.deferredMessages.length, 0, "scout's start stored it");
     await release('shade');
 
     assert.deepEqual(routed.filter((r) => r.agent === 'shade'),
@@ -1052,7 +1055,9 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
-  it("a second resident's held turn weighs a message the primary's tool boundary drains (latest-inbound)", async () => {
+  // Ported for #291, as the test above: the message is stored at once, where
+  // it once waited in the primary's queue for the primary's tool boundary.
+  it("a second resident's held turn weighs a message stored while the primary's tool runs (latest-inbound)", async () => {
     const { framework, i, routed, release } = await residents('shade', {
       2: [
         [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
@@ -1062,18 +1067,15 @@ describe('Residents read one message slot', () => {
     }, undefined, LEGACY);
     framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
     await framework.runUntilIdle();
-    // The message comes while scout's tool runs, so it waits in scout's queue
-    // until scout's boundary stores it.
-    let queued = -1;
+    // The message comes while scout's tool runs; it is stored at once.
+    let stored = '';
     pause.during = async () => {
-      i.addMessage('Antra', [{ type: 'text', text: 'shade, over here please' }],
+      stored = i.addMessage('Antra', [{ type: 'text', text: 'shade, over here please' }],
         { channelId: 'discord:dm:antra', serverId: 'discord', tags: ['chat:addressed'] });
-      queued = i.deferredMessages.length;
     };
     framework.pushEvent(residentIncoming('discord:guild:chanC', 'scout, a word', 'scout', false));
     await framework.runUntilIdle();
-    assert.equal(queued, 1, "the message waited in scout's queue while its tool ran");
-    assert.equal(i.deferredMessages.length, 0, "scout's boundary stored it");
+    assert.notEqual(stored, '', "stored while scout's tool ran");
     await release('shade');
 
     assert.deepEqual(routed.filter((r) => r.agent === 'shade'),

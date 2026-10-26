@@ -1,9 +1,10 @@
 /**
  * A wake for a write the agent heard mid-turn (issue #264).
  *
- * A message that arrives while a turn is alive is deferred, and its wake
- * waits behind the busy agent. At the turn's next tool boundary the message
- * is stored and injected, so the live turn reads it (hear-while-acting). The
+ * A message that arrives while a turn is alive is stored at once and kept
+ * out of the agent's window (#291's presentation index), and its wake waits
+ * behind the busy agent. At the turn's next tool boundary the message enters
+ * the window and is injected, so the live turn reads it (hear-while-acting). The
  * wake then starts no turn of its own once nothing is left for the agent to
  * do: a request that carried the write was answered and, for a wake that
  * carries a channel, unless its message's server marked it ambient, the agent
@@ -31,8 +32,7 @@ import { AgentFramework } from '../src/index.js';
 import type { GateConfig } from '../src/gate/types.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { headOf, legacyMarkFrom, rowAt } from './helpers/read-mark-rows.js';
-import { heldHandle } from '../src/held-writes.js';
+import { headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import type { MarkCm, MarkedRow, ReadMark } from '../src/read-marks.js';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
@@ -40,7 +40,6 @@ const ROOM = 'chat:room';
 const GENERAL = 'chat:general';
 
 type Internals = {
-  deferredMessages: Array<{ id: string }>;
   pendingRequests: Array<Record<string, unknown>>;
   turnRouting: Map<string, unknown>;
   agents: Map<string, unknown>;
@@ -48,7 +47,7 @@ type Internals = {
   dispatchSleepToolCall(agentName: string, call: ToolCall): void;
   scriptWake(agentName: string, scriptId: string, text: string, label: string): Promise<void>;
   bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: unknown): void;
-  readsRowFor(placement: { agent?: string; messageId?: string; deferredId?: string; presented?: false } | undefined, agentName: string): { readsRow?: string };
+  readsRowFor(placement: { agent?: string; messageId?: string; presented?: false } | undefined, agentName: string): { readsRow?: string };
   dispatchChannelToolCall(agentName: string, call: ToolCall): void;
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
@@ -61,7 +60,8 @@ async function until(done: () => boolean, label: string, timeoutMs = 5000): Prom
 }
 
 /** Each tool holds its round open while `during` writes something, until
- *  that write is deferred, its wake waiting behind the busy agent. `wait`
+ *  that write is stored (out of the agent's window while its turn is alive),
+ *  its wake waiting behind the busy agent. `wait`
  *  then lets the turn go on; `stop` ends it at its boundary, with nothing
  *  more said. Events with text make module messages and ask for inference. */
 class HoldModule implements Module {
@@ -83,10 +83,10 @@ class HoldModule implements Module {
     const during = this.during;
     this.during = null;
     if (during) {
-      const fw = internals(this.framework!);
-      const queued = fw.deferredMessages.length;
+      const cm = this.framework!.getAgent('assistant')!.getContextManager();
+      const stored = cm.getMessageCount();
       await during();
-      await until(() => fw.deferredMessages.length > queued, 'the mid-turn write to be deferred');
+      await until(() => cm.getMessageCount() > stored, 'the mid-turn write to be stored');
     }
     if (call.name.endsWith('stop')) return { success: true, data: { stopped: true }, endTurn: true };
     return { success: true, data: { ok: true } };
@@ -396,8 +396,9 @@ describe('a wake for a write heard mid-turn', () => {
       const read = agent.getConsumedWatermark();
       const cm = agent.getContextManager();
       const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-      assert.equal(agent.publishedAfterReading(room, rowAt(headOf(read)), cm), true, 'noted with what its request read');
-      assert.equal(agent.publishedAfterReading(room, rowAt(headOf(read) + 1), cm), false, 'and nothing stored after');
+      assert.equal(agent.publishedAfterReading(room, newestCovered(read, cm), cm), true, 'noted with what its request read');
+      const after = cm.getMessage(cm.addMessage('Antra', [text('stored after')]))!;
+      assert.equal(agent.publishedAfterReading(room, after, cm), false, 'and nothing stored after');
       await framework.stop();
     });
   }
@@ -638,15 +639,20 @@ describe('a wake for a write heard mid-turn', () => {
       fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set(), ...routing });
       const agent = framework.getAgent('assistant')!;
       const cm = agent.getContextManager();
-      cm.addMessage('Antra', [text('earlier words')]);
+      // Each row the agent reads enters its window first (#291): a write past
+      // the framework does at the agent's next point.
+      const present = () => (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(agent);
+      const earlier = cm.getMessage(cm.addMessage('Antra', [text('earlier words')]))!;
+      present();
       agent.markContextConsumed();
       const atCall = agent.getConsumedWatermark();
 
       fw.dispatchSleepToolCall('assistant', { id: 's1', name: 'sleep', input: { seconds: 60 }, ...(turnId ? { callerTurnId: turnId } : {}) });
       const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-      assert.equal(agent.publishedAfterReading(room, rowAt(headOf(atCall)), cm), false, 'nothing is noted before it lands');
+      assert.equal(agent.publishedAfterReading(room, earlier, cm), false, 'nothing is noted before it lands');
       // The agent reads more before the announcement lands.
-      cm.addMessage('Antra', [text('later words')]);
+      const laterRow = cm.getMessage(cm.addMessage('Antra', [text('later words')]))!;
+      present();
       agent.markContextConsumed();
       const later = agent.getConsumedWatermark();
       assert.ok(headOf(later) > headOf(atCall), 'the agent read more');
@@ -655,23 +661,20 @@ describe('a wake for a write heard mid-turn', () => {
       fw.eventGate!.clearSleep();
 
       assert.deepEqual(posted.map(([, channelId]) => channelId), speech === 'delivered' ? [ROOM] : []);
-      assert.equal(agent.publishedAfterReading(room, rowAt(headOf(atCall)), cm), noted);
-      assert.equal(agent.publishedAfterReading(room, rowAt(headOf(later)), cm), false, 'and not with what it read after the call');
+      assert.equal(agent.publishedAfterReading(room, earlier, cm), noted);
+      assert.equal(agent.publishedAfterReading(room, laterRow, cm), false, 'and not with what it read after the call');
       await framework.stop();
     });
   }
 
-  it("a write deferred for one agent, or stored and not presented to it, marks that agent's wake only, and a write stored for it at once marks none", async () => {
+  it("a write stored and not presented to one agent marks that agent's wake only, and a write presented to it at once marks none", async () => {
     const framework = await createFramework();
     const fw = internals(framework);
-    // A queued write is named by its held handle (InferenceRequest.readsRow).
-    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', deferredId: 'd-1' }, 'assistant'), { readsRow: heldHandle('d-1') });
-    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', deferredId: 'd-1' }, 'helper'), {}, "another agent's wake stays plain");
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant' }, 'assistant'), {}, 'its wake starts the turn that reads it');
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'assistant'), {},
       'nor does a write stored and presented to it: its wake starts the turn that reads it');
     // #291: a row stored during the agent's turn and not presented to it
-    // waits for its turn as a queued one does, by its stored id.
+    // waits for its turn, by its stored id.
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'assistant'), { readsRow: 'm-1' });
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'helper'), {}, "another agent's wake stays plain");
     assert.deepEqual(fw.readsRowFor(undefined, 'assistant'), {}, 'nor does a wake with no write');
@@ -795,7 +798,7 @@ describe('a wake for a write heard mid-turn', () => {
 
     assert.ok(JSON.stringify(stream.injected).includes('also this'), 'the boundary handed the stream the message');
     assert.ok(posted.some(([t, channelId]) => t === 'heard you' && channelId === ROOM), `the turn spoke in room at its end: ${JSON.stringify(posted)}`);
-    assert.equal(agent.publishedAfterReading(destinationKey({ serverId: 'chat', channelId: ROOM }), rowAt(headOf(firstRead)), agent.getContextManager()), true,
+    assert.equal(agent.publishedAfterReading(destinationKey({ serverId: 'chat', channelId: ROOM }), newestCovered(firstRead, agent.getContextManager()), agent.getContextManager()), true,
       "the end's prose is noted as a publish made having read what the first request had");
     assert.equal(membrane.calls.length, 2, 'its wake started the turn');
     assert.deepEqual(drops, []);

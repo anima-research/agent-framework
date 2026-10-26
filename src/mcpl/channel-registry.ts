@@ -273,8 +273,8 @@ function desiredStateRecord(item: unknown): {
 
 /**
  * The desired state `store`'s lifecycle log records for `channelId` on
- * `serverId`, for a reader with no registry yet, as a serving boot's
- * deferred-write flush is, before initializeMcpl: the last decision wins, as
+ * `serverId`, for a reader with no registry yet, as the boot's import of an
+ * earlier release's queued writes is, before initializeMcpl: the last decision wins, as
  * the registry's replay reads it (getDesiredState answers once there is a
  * registry). undefined when no decision names it.
  */

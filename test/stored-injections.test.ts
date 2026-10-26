@@ -4,8 +4,11 @@
  * stored in the agent's window, appended as the message compile() would have
  * placed, so it stays where the agent saw it: one the agent's last request
  * held with the same content (or a newer copy a start whose compile threw
- * stored) isn't stored again, and a changed one is appended then. While the window is held (quiesced, or another reader of
- * the shared slot mid-turn), compile() places it instead. A module's
+ * stored) isn't stored again, and a changed one is appended then. While the
+ * host is quiesced, compile() places it instead. (Another reader of the
+ * shared slot mid-turn no longer holds it back, #291: the row is the agent's
+ * own, in no window but its own.) Rows these tests write into a context past
+ * the framework enter the windows at a point the test runs (presentAll). A module's
  * injection can opt out (placedEachCompile) and is placed as before; an MCPL
  * server's can't. A stored row is marked with its agent and namespace, and
  * every other agent's view leaves it out.
@@ -108,6 +111,14 @@ const textOf = (m: { content: unknown }): string =>
 const storedInjections = (agent: Agent) => agent.getContextManager().getAllMessages()
   .filter((m) => (m.metadata as { contextInjection?: unknown } | undefined)?.contextInjection !== undefined);
 
+/** Present each agent what it is owed, as at its turn's end (#291): rows a
+ *  test writes into a context past the framework enter the windows of their
+ *  readers at their next point, here. */
+const presentAll = (x: { framework: AgentFramework }): void => {
+  const internal = x.framework as unknown as { agents: Map<string, Agent>; presentAtEndOf(agent: Agent): void };
+  for (const agent of internal.agents.values()) internal.presentAtEndOf(agent);
+};
+
 /** A turn: push the message, answer it, and wait until the framework is idle. */
 async function turn(x: { framework: AgentFramework; membrane: MockMembrane }, content: string): Promise<void> {
   x.membrane.pushResponse(createMockResponse([text(`reply to ${content}`)]));
@@ -129,6 +140,7 @@ for (const [shape, build] of [
     const x = await make();
     const agent = x.framework.getAgent('prime')!;
     build(agent);
+    presentAll(x);
     const inj = injection();
     const placed = await agent.buildActivationRequest([], [inj], undefined, [], { dryRun: true });
     assert.equal(internals(x.framework).storeInjections(agent, [inj]), undefined, 'nothing is left for compile()');
@@ -183,6 +195,7 @@ test("an MCPL server can't opt its injection out of being stored: its conversion
   const agent = x.framework.getAgent('prime')!;
   agent.getContextManager().addMessage('user', [text('hello')]);
   agent.getContextManager().addMessage('prime', [text('reply')]);
+  presentAll(x);
   const server = {
     id: 'srv',
     grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.afterUser']), []),
@@ -268,6 +281,7 @@ test("a speaker merely named like an injection's participant is an arrival: the 
   agent.getContextManager().addMessage('user', [text('hello')]);
   agent.getContextManager().addMessage('prime', [text('reply')]);
   agent.getContextManager().addMessage('system_context:visitor', [text('VISITOR')]);
+  presentAll(x);
   const request = await agent.buildActivationRequest([], undefined, undefined, [], { dryRun: true });
   assert.deepEqual(request.messages.map(textOf), ['hello', 'reply', 'VISITOR']);
 });
@@ -276,6 +290,7 @@ test("another agent's stored injection stays out of a second resident's view and
   const x = await make({ agents: ['prime', 'helper'], subconscious: true });
   const prime = x.framework.getAgent('prime')!;
   prime.getContextManager().addMessage('user', [text('hello')]);
+  presentAll(x);
   const inj = injection('PRIME-ONLY');
   internals(x.framework).storeInjections(prime, [inj]);
   const compiled = async (name: string) =>
@@ -349,20 +364,24 @@ test("while the host is quiesced, nothing is stored: compile() places a changed 
   }
 });
 
-test("while another reader of the shared slot has a turn alive, nothing is stored there: compile() places it, as for a clock row", async () => {
+test("another reader of the shared slot's live turn doesn't hold an agent's injection back: it is stored, the agent's own row, in no window but the agent's", async () => {
+  // #291: before, nothing was stored in the shared slot while another of its
+  // readers had a turn alive, as for a clock row, and compile() placed it.
   const x = await make({ agents: ['prime', 'helper'] });
   const prime = x.framework.getAgent('prime')!;
   prime.getContextManager().addMessage('user', [text('hello')]);
+  presentAll(x);
   const inj = injection();
   internals(x.framework).activeTurnTokens.set('helper', Symbol('turn'));
   try {
-    assert.deepEqual(internals(x.framework).storeInjections(prime, [inj]), [inj]);
+    assert.equal(internals(x.framework).storeInjections(prime, [inj]), undefined, 'stored');
   } finally {
     internals(x.framework).activeTurnTokens.delete('helper');
   }
-  assert.equal(storedInjections(prime).length, 0);
-  assert.equal(internals(x.framework).storeInjections(prime, [inj]), undefined, 'once the slot is free, it is stored');
-  assert.equal(storedInjections(prime).length, 1);
+  const [row] = storedInjections(prime);
+  assert.ok(row, 'one row');
+  assert.notEqual(prime.getContextManager().ordinalOf(row.id), undefined, "in prime's window");
+  assert.equal(x.framework.getAgent('helper')!.getContextManager().ordinalOf(row.id), undefined, "and never in the helper's");
 });
 
 test("a module reads a stored injection's row, with its mark, among the window's messages", async () => {
@@ -445,6 +464,7 @@ test('an injection with a lone surrogate in its text and namespace is stored wel
   const x = await make();
   const agent = x.framework.getAgent('prime')!;
   agent.getContextManager().addMessage('user', [text('hello')]);
+  presentAll(x);
   const lone = (): ContextInjection => ({ namespace: 'ns\ud83d', position: 'afterUser', content: [text('cut \ud83d here')] });
   const placed = await agent.buildActivationRequest([], [lone()], undefined, [], { dryRun: true });
   const first = lone();
@@ -479,6 +499,7 @@ test('a gather that interleaves sources is stored in the order gathered, as comp
   const x = await make();
   const agent = x.framework.getAgent('prime')!;
   agent.getContextManager().addMessage('user', [text('hello')]);
+  presentAll(x);
   const gathered = (b = 'B') => [injection('A', 'x'), injection(b, 'y'), injection('C', 'x')];
   const placed = await agent.buildActivationRequest([], gathered(), undefined, [], { dryRun: true });
   assert.equal(internals(x.framework).storeInjections(agent, gathered()), undefined);
@@ -608,6 +629,7 @@ test("a row whose mark isn't whole is no stored injection: every view keeps it",
   const prime = x.framework.getAgent('prime')!;
   prime.getContextManager().addMessage('user', [text('hello')]);
   prime.getContextManager().addMessage('system_context:lessons', [text('PARTIAL')], { contextInjection: { agent: 'prime', namespace: 'lessons' } } as never);
+  presentAll(x);
   const compiled = await x.framework.getAgent('helper')!.getContextManager().compile(undefined, undefined, { dryRun: true });
   assert.ok(compiled.messages.map(textOf).includes('PARTIAL'));
 });
@@ -647,6 +669,7 @@ test('a preview puts a stand-in where the start would store it: before what comp
   };
   const x = await make({ modules: [gathers] });
   x.framework.getAgent('prime')!.getContextManager().addMessage('prime', [text('a reply, with no user message before it')]);
+  presentAll(x);
   const preview = await x.framework.previewActivation('prime', { injections: true });
   x.membrane.pushResponse(createMockResponse([text('woke')]));
   internals(x.framework).pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'framework', timestamp: Date.now() });
@@ -660,6 +683,7 @@ test('in a window with no user message, a stored injection after the agent\'s re
   const x = await make();
   const agent = x.framework.getAgent('prime')!;
   agent.getContextManager().addMessage('prime', [text('a reply, with no user message before it')]);
+  presentAll(x);
   const placed = await agent.buildActivationRequest([], [injection('LESSON')], undefined, [], { dryRun: true });
   assert.deepEqual(placed.messages.map(textOf), ['a reply, with no user message before it', 'LESSON'], 'placed, it ends the request, as on main');
   internals(x.framework).storeInjections(agent, [injection('LESSON')]);
@@ -766,6 +790,7 @@ test("an injection that would leave nothing in a request isn't stored: compile()
   const agent = x.framework.getAgent('prime')!;
   agent.getContextManager().addMessage('user', [text('hello')]);
   agent.getContextManager().addMessage('prime', [text('reply')]);
+  presentAll(x);
   const blank: ContextInjection = { namespace: 'lessons', position: 'afterUser', content: [text('  \n ')] };
   const none: ContextInjection = { namespace: 'other', position: 'afterUser', content: [] };
   assert.deepEqual(internals(x.framework).storeInjections(agent, [blank, none]), [blank, none]);
@@ -800,21 +825,26 @@ test("a stored row is marked as the framework's own: system, and kind 'context-i
   assert.equal((row!.metadata as { kind?: unknown }).kind, 'context-injection');
 });
 
-test("while another reader of the shared slot has a turn alive, a preview places a changed injection, as the start would", async () => {
+test("while another reader of the shared slot has a turn alive, a preview shows a changed injection appended, as the start would store it", async () => {
+  // #291: another reader's live turn no longer holds an agent's own rows
+  // back, so the start stores it, and the preview shows it there. (Before,
+  // compile() placed it, after the newest user message.)
   const lessons = new Lessons();
   const x = await make({ modules: [lessons], agents: ['prime', 'helper'] });
   // The window a turn would leave, written directly: with two residents, a
   // turn would ask both to answer.
   const prime = x.framework.getAgent('prime')!;
   prime.getContextManager().addMessage('user', [text('one')]);
+  presentAll(x);
   internals(x.framework).storeInjections(prime, [injection('LESSON one')]);
   prime.getContextManager().addMessage('prime', [text('reply to one')]);
+  presentAll(x);
   await sent(prime);
   lessons.lesson = 'LESSON two';
   internals(x.framework).activeTurnTokens.set('helper', Symbol('turn'));
   try {
     const preview = (await x.framework.previewActivation('prime', { injections: true })).messages.map(textOf);
-    assert.deepEqual(preview, ['one', 'LESSON two', 'LESSON one', 'reply to one', '[Continue]']);
+    assert.deepEqual(preview, ['one', 'LESSON one', 'reply to one', 'LESSON two', '[Continue]']);
   } finally {
     internals(x.framework).activeTurnTokens.delete('helper');
   }
@@ -833,6 +863,7 @@ test('where another resident spoke last, a stored injection after that message e
   const prime = x.framework.getAgent('prime')!;
   prime.getContextManager().addMessage('user', [text('hello')]);
   prime.getContextManager().addMessage('helper', [text("helper's answer")]);
+  presentAll(x);
   internals(x.framework).storeInjections(prime, [injection('LESSON')]);
   const request = await prime.buildActivationRequest([], undefined, undefined, [], { dryRun: true });
   assert.deepEqual(request.messages.map(textOf), ['hello', "helper's answer", 'LESSON']);
@@ -866,6 +897,7 @@ test('a gather of a stored injection and a blank one in a window ending on the r
   const x = await make();
   const agent = x.framework.getAgent('prime')!;
   agent.getContextManager().addMessage('prime', [text('a reply, with no user message before it')]);
+  presentAll(x);
   const blank: ContextInjection = { namespace: 'blank', position: 'afterUser', content: [text('   ')] };
   const left = internals(x.framework).storeInjections(agent, [injection('REAL'), blank]);
   assert.deepEqual(left, [blank], 'the blank one is left to compile()');
@@ -914,6 +946,7 @@ test("a start doesn't fail when the store can't read a row: the record and the t
   const cm = agent.getContextManager();
   const hello = cm.addMessage('user', [text('hello')]);
   const reply = cm.addMessage('prime', [text('reply')]);
+  presentAll(x);
   internals(x.framework).storeInjections(agent, [injection()]);
   const getMessage = cm.getMessage.bind(cm);
   const errors: string[] = [];
@@ -970,6 +1003,7 @@ test('a preview with a stand-in and a placed blank injection keeps [Continue] la
   };
   const x = await make({ modules: [gathers] });
   x.framework.getAgent('prime')!.getContextManager().addMessage('prime', [text('a reply, with no user message before it')]);
+  presentAll(x);
   const preview = await x.framework.previewActivation('prime', { injections: true });
   assert.deepEqual(preview.messages.map(textOf), ['a reply, with no user message before it', 'REAL', '[Continue]']);
   x.membrane.pushResponse(createMockResponse([text('woke')]));
@@ -982,6 +1016,7 @@ test("in a held window with no user message, a changed injection compile() place
   const x = await make();
   const agent = x.framework.getAgent('prime')!;
   agent.getContextManager().addMessage('prime', [text('a reply, with no user message before it')]);
+  presentAll(x);
   internals(x.framework).quiesced = true;
   try {
     const left = internals(x.framework).storeInjections(agent, [injection('CHANGED')]);

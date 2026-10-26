@@ -241,8 +241,11 @@ describe('the audience stamp (#291)', () => {
   /** mira's compile against the same rows unstamped, in a store of their own: the stamp is metadata only. */
   async function assertCompilesAsUnstamped(framework: AgentFramework): Promise<void> {
     const stamped = framework.getAgent('mira')!.getContextManager();
-    const rows = stamped.getAllMessages();
-    assert.ok(rows.length >= 6 && rows.every((r) => audienceOf(r.metadata) !== undefined), 'every row is stamped');
+    assert.ok(stamped.getAllMessages().every((r) => audienceOf(r.metadata) !== undefined), 'every row is stamped');
+    // Her window (#291): the rows she was shown, which another resident's own
+    // rows aren't among, unstamped, compile as they do stamped.
+    const rows = stamped.getPresentedMessages();
+    assert.ok(rows.length >= 6, 'her window holds the rows');
     const store = JsStore.openOrCreate({ path: join(tempDir, 'unstamped.chronicle') });
     try {
       const bare = await ContextManager.open({ store, namespace: 'agents/mira', strategy: new PassthroughStrategy() });
@@ -358,15 +361,16 @@ describe('the audience stamp (#291)', () => {
   });
 
   /** Held mail for oren, and a copy of it queued for mira (it was hers before a re-addressing, say). */
-  function mailForOrenQueuedForMira(framework: AgentFramework, text: string): HeldMail {
-    const internals = framework as unknown as { registry: AgentRegistry; deferredMessages: unknown[] };
+  /** Held mail for oren, and a copy of it for mira stored in the residents' slot. */
+  function mailForOrenWithACopyForMira(framework: AgentFramework, text: string): HeldMail {
+    const internals = framework as unknown as {
+      registry: AgentRegistry;
+      addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+    };
     const mail = internals.registry.holdMail({
       kind: 'message', from: internals.registry.ref('mira'), to: 'oren', content: [{ type: 'text', text }],
     });
-    internals.deferredMessages.push({
-      id: `copy-${mail.id}`, seq: 1_000 + internals.deferredMessages.length, participant: 'mira', content: [{ type: 'text', text }],
-      metadata: { kind: 'agent-message', dendrite: { mailId: mail.id, to: 'mira' } }, forAgent: 'mira', heldAt: Date.now(),
-    });
+    internals.addMessage('mira', [{ type: 'text', text }], { kind: 'agent-message', dendrite: { mailId: mail.id, to: 'mira' } }, { forAgent: 'mira' });
     return mail;
   }
   /** The recipient (`dendrite.to`) of each copy of a mail in the residents' slot, in store order. */
@@ -374,29 +378,11 @@ describe('the audience stamp (#291)', () => {
     .filter((r) => (r.metadata?.dendrite as { mailId?: string } | undefined)?.mailId === mail.id)
     .map((r) => (r.metadata?.dendrite as { to?: string }).to);
 
-  it('a copy of held mail queued for another resident doesn\'t hold back the mail\'s delivery at boot', async () => {
-    const framework = await boot();
-    const internals = framework as unknown as { reconcileAgentRegistry(interrupted: unknown[]): void };
-    const mail = mailForOrenQueuedForMira(framework, 'for oren, a copy queued for mira');
-
-    internals.reconcileAgentRegistry([]);
-    await framework.runUntilIdle();
-    // The queued check counted any queued copy by its mail id, so oren's
-    // mail waited for mira's copy to land, and was released by it.
-    assert.deepEqual(copiesOf(framework, mail), ['oren'], 'delivered to oren, mira\'s copy still queued');
-    assert.deepEqual(framework.listHeldMail(), [], 'and released by that delivery');
-  });
-
   it('a copy of held mail for another resident that lands doesn\'t release the mail: its own delivery does', async () => {
     const framework = await boot();
-    const internals = framework as unknown as {
-      reconcileAgentRegistry(interrupted: unknown[]): void;
-      flushForStart(agent: unknown, occasion: 'turn-start' | 'assembly'): boolean;
-    };
-    const mail = mailForOrenQueuedForMira(framework, 'for oren, a copy queued for mira that lands');
+    const internals = framework as unknown as { reconcileAgentRegistry(interrupted: unknown[]): void };
+    const mail = mailForOrenWithACopyForMira(framework, 'for oren, a copy for mira that lands');
 
-    // A turn start's flush lands mira's copy in her store.
-    internals.flushForStart(framework.getAgent('mira')!, 'turn-start');
     assert.deepEqual(copiesOf(framework, mail), ['mira'], 'mira\'s copy landed');
     assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mail.id], 'still held for oren: the copy wasn\'t his');
 
@@ -413,6 +399,8 @@ describe('the audience stamp (#291)', () => {
     assert.deepEqual(record.relationships.observes, [{ includeHeld: true }], 'it reads the residents\' slot as an observer');
     first.getAgent('Subconscious')!.getContextManager().addMessage('Subconscious', [{ type: 'text', text: 'my own note' }]);
     first.getAgent('mira')!.getContextManager().addMessage('user', [{ type: 'text', text: 'in the shared slot' }]);
+    // Written past the framework, both enter the subconscious's window at its next point (#291).
+    (first as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(first.getAgent('Subconscious'));
     assert.equal(first.getAgent('mira')!.getContextManager().getAllMessages().some((m) => textOf(m).includes('my own note')), false,
       'the note is in the subconscious\'s slot alone');
     await first.stop();
@@ -502,28 +490,12 @@ describe('the audience stamp (#291)', () => {
   const rowNamed = (framework: AgentFramework, text: string): Row | undefined =>
     rowsOf(framework, 'mira').find((r) => textOf(r) === text);
 
-  it('an entry an earlier version left queued is stamped when the queue is restored, so a flush that stores it straight into the store stores it stamped', async () => {
+  it("an entry an earlier version left queued is stamped as the boot's import stores it", async () => {
+    // #291's one-release importer stores each entry through addMessage, with
+    // the stamp addMessage gives any write: for the agent it is queued for;
+    // for every resident when it names none, as a write that names no agent
+    // is; and for nobody when a tune-out holds it. Nobody's own row.
     const framework = await bootOnOlderQueue([olderPlain, olderHeld, olderForOren], { quiesced: true });
-    const internals = framework as unknown as {
-      deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
-      flushForStart(agent: unknown, occasion: 'turn-start' | 'assembly'): boolean;
-    };
-    // Restored with the stamp this version queues a write with: for the
-    // agent it is queued for; for every resident when it names none, as a
-    // write that names no agent is (this pinned ['mira'], the primary, until
-    // such a write was told from one for the primary); and for nobody when
-    // a tune-out holds it. Nobody's own row.
-    assert.deepEqual(
-      Object.fromEntries(internals.deferredMessages.map((m) => [m.id, audienceOf(m.metadata)])),
-      { 'old-plain': { audience: ['mira', 'oren'] }, 'old-held': { audience: [] }, 'old-for-oren': { audience: ['oren'] } },
-    );
-
-    // A turn start's flush stores what is queued for its agent straight into
-    // its store, with the metadata the entry was queued with (the reviewers'
-    // probe.mjs stored it there unstamped). A quiesced host starts no turn,
-    // so the flush is called here as a turn start calls it; on a live host it
-    // meets a restored entry that resume()'s flush couldn't store.
-    internals.flushForStart(framework.getAgent('mira')!, 'turn-start');
     const plain = rowNamed(framework, 'OLD-PLAIN');
     assert.deepEqual(plain?.metadata?.audience, ['mira', 'oren'], 'for every resident: it names no agent');
     assert.equal(plain?.metadata?.ownRowOf, undefined);
@@ -531,10 +503,6 @@ describe('the audience stamp (#291)', () => {
     const held = rowNamed(framework, 'OLD-HELD');
     assert.deepEqual(held?.metadata?.audience, [], 'for nobody: a tune-out holds it');
     assert.deepEqual(held?.metadata?.tuneOut, { epochId: 'e1' }, 'its hold kept');
-    assert.equal(rowNamed(framework, 'OLD-FOR-OREN'), undefined, 'oren\'s entry waits for oren');
-
-    // resume()'s flush stores the rest through addMessage, carrying the stamp.
-    await framework.resume();
     const forOren = rowNamed(framework, 'OLD-FOR-OREN');
     assert.deepEqual(forOren?.metadata?.audience, ['oren'], 'for the agent it was queued for');
     assert.equal(forOren?.metadata?.deferredWriteId, 'old-for-oren');
@@ -542,56 +510,15 @@ describe('the audience stamp (#291)', () => {
     assert.deepEqual(unstamped.map((r) => `${r.participant}: ${textOf(r)}`), [], 'no row goes unstamped');
   });
 
-  it('stop()\'s drain stores a held entry an earlier version left queued for nobody, its hold kept', async () => {
-    // A serving boot lands the restored queue at once (boot recovery). Its
-    // write of the held entry fails here, once, before anything is stored,
-    // so the entry stays queued for mira until stop()'s drain stores it.
-    const proto = ContextManager.prototype as unknown as { addMessage(...args: unknown[]): unknown };
-    const real = proto.addMessage;
-    let failed = false;
-    proto.addMessage = function (this: unknown, ...args: unknown[]) {
-      if (!failed && textOf({ content: args[1] as ContentBlock[] }) === 'OLD-HELD') {
-        failed = true;
-        throw new Error('store unavailable');
-      }
-      return real.apply(this, args);
-    };
-    let framework: AgentFramework;
-    try {
-      framework = await bootOnOlderQueue([olderPlain, olderHeld], { quiesced: false });
-    } finally {
-      proto.addMessage = real;
-    }
-    assert.ok(failed, 'the boot recovery tried the held entry');
-    // For every resident, as a write that names no agent (this pinned ['mira'] before such a write was told from one for the primary).
-    assert.deepEqual(rowNamed(framework, 'OLD-PLAIN')?.metadata?.audience, ['mira', 'oren'], 'the boot recovery stored the plain one, for every resident');
-    assert.equal(rowNamed(framework, 'OLD-HELD'), undefined);
-    assert.equal(framework.getHostModeStatus().deferredWrites, 1, 'the held one still queued');
-
-    await framework.stop();
-    const after = await boot();
-    const held = rowNamed(after, 'OLD-HELD');
-    assert.ok(held, 'stop()\'s drain stored it');
-    assert.deepEqual(held.metadata?.audience, [], 'for nobody, not for the agent whose store it landed in (it was [\'mira\'])');
-    assert.equal(held.metadata?.ownRowOf, undefined);
-    assert.deepEqual(held.metadata?.tuneOut, { epochId: 'e1' }, 'its hold kept');
-    assert.equal(held.metadata?.deferredWriteId, 'old-held');
-  });
-
-  it('a write that carries a tune-out\'s hold and no stamp, handed back from the queue as stop()\'s drain hands it, is for nobody', async () => {
-    // The reviewers' probe2.mjs: addMessage stamped a write from the queue
-    // that carried no stamp for its delivery agent, held or not. Restore now
-    // stamps what an earlier version queued; this is addMessage's own rule,
-    // for any write with the hold that doesn't say who it is for.
+  it("a write that carries a tune-out's hold and no stamp is for nobody", async () => {
+    // The reviewers' probe2.mjs: addMessage stamped a write that carried no
+    // stamp for its delivery agent, held or not. This is addMessage's own
+    // rule, for any write with the hold that doesn't say who it is for.
     const framework = await boot({ residents: ['mira'] });
-    const entry: QueuedEntry = {
-      id: 'unstamped-held', seq: 1, participant: 'user', content: [{ type: 'text', text: 'UNSTAMPED-HELD' }],
-      metadata: { tuneOut: { epochId: 'e1' }, channelId: 'c' }, heldAt: Date.now(),
-    };
     const internals = framework as unknown as {
-      readdDrained(drained: QueuedEntry[], where: string, opts?: { bypassDeferral?: boolean }): QueuedEntry[];
+      addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>): string;
     };
-    assert.equal(internals.readdDrained([entry], 'stop', { bypassDeferral: true }).length, 1);
+    assert.ok(internals.addMessage('user', [{ type: 'text', text: 'UNSTAMPED-HELD' }], { tuneOut: { epochId: 'e1' }, channelId: 'c' }));
     const row = rowNamed(framework, 'UNSTAMPED-HELD');
     assert.deepEqual(row?.metadata?.audience, [], 'for nobody, not [\'mira\']');
     assert.deepEqual(row?.metadata?.tuneOut, { epochId: 'e1' }, 'its hold kept');

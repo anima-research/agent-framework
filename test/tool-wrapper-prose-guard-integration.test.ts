@@ -467,7 +467,9 @@ describe('tool wrapper prose guard integration', () => {
       disposeConversationAgent(agentName: string): void;
       agents: Map<string, object>;
     };
-    const fork = { name: 'fork', toolResultGuard: { hasPending: false } };
+    // A stand-in context manager: since #291 every framework presents, and a
+    // disposal lets the agent go from the presentation index, which reads it.
+    const fork = { name: 'fork', toolResultGuard: { hasPending: false }, getContextManager: () => ({}) };
     internals.agents.set('fork', fork);
     internals.logicalTurnToolCalls.set(fork, { turnToken: 1, count: 1 });
     internals.disposeConversationAgent('fork');

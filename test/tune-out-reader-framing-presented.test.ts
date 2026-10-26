@@ -73,7 +73,6 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", {
       modules: [gates],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
-      presentationIndex: true,
     } as never);
     frameworks.push(framework);
     const traces: TraceEvent[] = [];

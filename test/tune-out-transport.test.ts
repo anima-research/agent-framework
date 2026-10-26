@@ -1426,23 +1426,22 @@ test('a tune-out on record at a start with no subconscious ends there, its chann
     'as its backlog.'), store.logged.join('\n'));
 });
 
-test('the ending counts a diverted message still queued to be written, and says so in the singular', async (t) => {
+// Ported for #291: the diverted write is stored at once, where this test
+// once put it, and one for another agent, in the deferral queue by hand.
+test('the ending counts a diverted message stored for the primary, and says so in the singular', async (t) => {
   const store = await tunedOutStore(t, 0);
   const second = await store.start(false, true);
   const i = second as unknown as RestartInternals & {
-    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; metadata?: unknown; forAgent?: string; heldAt: number }>;
+    addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
     endTuneOutsWithoutCoordinator(): void;
   };
-  // A tune-out recorded on this start, with one diverted write still held
-  // for the primary and one for another agent, which isn't the primary's
-  // backlog.
+  // A tune-out recorded on this start, with one diverted write stored for
+  // the primary.
   i.channelRegistry.enterTuneOut('disc', CHANNEL, { ...PARAMS, epochId: 'held' }, 'agent-tool');
-  const diverted = { participant: 'chatter', content: [{ type: 'text', text: 'held' }], metadata: { tuneOut: { epochId: 'held' } }, heldAt: Date.now() };
-  i.deferredMessages.push({ id: 'w1', seq: 1, ...diverted }, { id: 'w2', seq: 2, ...diverted, forAgent: 'someone-else' });
+  assert.notEqual(i.addMessage('chatter', [{ type: 'text', text: 'held' }], { tuneOut: { epochId: 'held' } }), '', 'stored at once');
   await store.capture(async () => { i.endTuneOutsWithoutCoordinator(); });
   assert.ok(store.logged.includes(`[tune-out] ${endedLine} The 1 message it diverted stays here, and nothing will deliver it as ` +
     'its backlog.'), store.logged.join('\n'));
-  i.deferredMessages.length = 0;
 });
 
 test('a tune-out on record when a start without servers connects one later ends then, keeping the agent\'s provenance', async (t) => {

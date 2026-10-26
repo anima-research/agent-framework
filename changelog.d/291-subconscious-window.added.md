@@ -1,7 +1,7 @@
-- With `FrameworkConfig.presentationIndex` on (#291, @experimental), the persistent subconscious reads on its own
-  window: the residents' slot is still merged into its context, as the record its window is presented from, and the
-  residents' rows enter its window by its observe edge at its own points, so a row the slot takes during its turn
-  enters at its tool boundary or its next start, never inside the turn.
+- The persistent subconscious reads on its own window (#291): the residents' slot is still merged into its
+  context, as the record its window is presented from, and the residents' rows enter its window by its observe edge
+  at its own points, so a row the slot takes during its turn enters at its tool boundary or its next start, never
+  inside the turn.
   - Its window starts at the oldest active tune-out's start as an index ordinal, fixed once per tune-out, once no
     row it is owed from before the start is out of its window, and kept in `subconscious/<primary>/window-starts`;
     a later tune-out's enter or a restart sets that ordinal again rather than converting the tune-out's sequence

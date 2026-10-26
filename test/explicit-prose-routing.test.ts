@@ -2282,8 +2282,11 @@ describe('explicit prose routing', () => {
       ] as ContentBlock[], 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]));
     });
-    const deferred = () => (framework as unknown as { deferredMessages: Array<{ content: Array<{ text?: string }> }> })
-      .deferredMessages.filter((m) => m.content.some((b) => b.text === CAFE_NOTE));
+    // Since #291 the note is stored at once and waits outside the window,
+    // where this test once found it in the deferral queue.
+    const stored = () => windowTexts(framework).filter((t) => t === CAFE_NOTE);
+    const presented = () => framework.getAgent('assistant')!.getContextManager().getPresentedMessages()
+      .flatMap((m) => m.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])));
 
     // A failure lets the held post and move go and stops the framework, so the file still ends.
     try {
@@ -2297,11 +2300,11 @@ describe('explicit prose routing', () => {
       }
       assert.equal(module.calls.length, 2, "the next turn's move is running");
       releaseCafe();
-      for (const end = Date.now() + 5000; deferred().length === 0 && Date.now() < end;) {
+      for (const end = Date.now() + 5000; stored().length === 0 && Date.now() < end;) {
         await new Promise<void>((resolve) => setTimeout(resolve, 5));
       }
-      assert.equal(deferred().length, 1, 'the note is due, and held');
-      assert.ok(!windowTexts(framework).includes(CAFE_NOTE), "it isn't written while that turn's move runs");
+      assert.equal(stored().length, 1, 'the note is due, and stored');
+      assert.ok(!presented().includes(CAFE_NOTE), "it isn't in the window while that turn's move runs");
       releaseMove();
       await idle;
 

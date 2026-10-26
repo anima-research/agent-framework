@@ -59,7 +59,6 @@ async function waitFor(what: string, cond: () => boolean, timeoutMs = 30_000): P
 
 type Internals = {
   tuneOutCoordinator: TuneOutCoordinator;
-  deferredMessages: Array<{ content: ContentBlock[] }>;
   channelRegistry: { listChannelsRaw(): unknown[] };
   pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
   addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId;
@@ -73,7 +72,7 @@ afterEach(async () => {
 });
 
 /** A resident (scout) and the persistent subconscious on the tune-out fixture's channel, the requests recorded by agent. */
-async function boot(options: { presentationIndex: boolean; thinkingBinding?: boolean }) {
+async function boot(options: { thinkingBinding?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'tune-out-sub-p1-'));
   dirs.push(dir);
   const commandPath = join(dir, 'commands.txt');
@@ -93,7 +92,6 @@ async function boot(options: { presentationIndex: boolean; thinkingBinding?: boo
     modules: [gates],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
-    presentationIndex: options.presentationIndex,
   } as never);
   frameworks.push(framework);
   const traces: TraceEvent[] = [];
@@ -103,17 +101,18 @@ async function boot(options: { presentationIndex: boolean; thinkingBinding?: boo
   await waitFor('channel registration', () => internals.channelRegistry.listChannelsRaw().length > 0);
   const cm = (name: string) => framework.getAgent(name)!.getContextManager();
   const storedHas = (t: string) => cm('scout').getAllMessages().some((m) => textOf(m).includes(t));
-  const queuedHas = (t: string) => internals.deferredMessages.some((m) => textOf(m).includes(t));
   const say = (kind: 'ambient' | 'addressed', id: string, t: string) => appendFileSync(commandPath, `${kind} ${id} ${t}\n`);
-  return { framework, membrane, gates, traces, internals, cm, storedHas, queuedHas, say };
+  return { framework, membrane, gates, traces, internals, cm, storedHas, say };
 }
 
 describe("the persistent subconscious reads what a tune-out held while the resident's turn ran (P1, #793, #291)", () => {
-  for (const presentationIndex of [false, true]) {
+  // Each case once ran twice, without the presentation index and with it;
+  // since #291 (AF-6) every framework presents, so it runs once.
+  {
     for (const mode of ['idle', 'mid-turn'] as const) {
-      const tag = `P1${mode === 'idle' ? 'a' : 'b'}${presentationIndex ? 'w' : ''}`;
-      it(`${tag}: its wake request holds the three held messages, stored by then, the resident ${mode}${presentationIndex ? ', with the presentation index' : ''}`, { timeout: 120_000 }, async () => {
-        const h = await boot({ presentationIndex });
+      const tag = `P1${mode === 'idle' ? 'a' : 'b'}`;
+      it(`${tag}: its wake request holds the three held messages, stored by then, the resident ${mode}`, { timeout: 120_000 }, async () => {
+        const h = await boot();
         assert.ok(h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 1, maxWakes: 5 }, 'agent-tool').ok);
         const tags = [`${tag}-AMB-1`, `${tag}-AMB-2`, `${tag}-ADDR-3`];
         // Where each held message stood when the subconscious's first request was made.
@@ -121,7 +120,7 @@ describe("the persistent subconscious reads what a tune-out held while the resid
         let residentBusy: boolean | undefined;
         h.membrane.onRequest = (agent, request) => {
           if (agent !== SUB || atRequest || !JSON.stringify(request.messages).includes('[Tune-out wake')) return;
-          atRequest = tags.map((t) => (h.storedHas(t) ? 'stored' : h.queuedHas(t) ? 'queued' : 'neither'));
+          atRequest = tags.map((t) => (h.storedHas(t) ? 'stored' : 'not stored'));
           residentBusy = h.gates.entered.has('p1') && !h.storedHas('Scout done.');
         };
         if (mode === 'mid-turn') {
@@ -154,13 +153,13 @@ describe("the persistent subconscious reads what a tune-out held while the resid
     }
   }
 
-  for (const presentationIndex of [false, true]) {
-    it(`a held message stored during the resident's turn leaves its rounds' thinking as it was${presentationIndex ? ', with the presentation index' : ''}`, { timeout: 120_000 }, async () => {
+  {
+    it("a held message stored during the resident's turn leaves its rounds' thinking as it was", { timeout: 120_000 }, async () => {
       // Stored at once, the held row stands in the record between the
       // resident's turn's start and its round, which its view leaves out:
       // its next request still begins with the one before and carries the
       // turn's signed thinking.
-      const h = await boot({ presentationIndex, thinkingBinding: true });
+      const h = await boot({ thinkingBinding: true });
       const scoutCm = h.cm('scout');
       const strips: unknown[] = [];
       const compile = scoutCm.compile.bind(scoutCm);
@@ -197,7 +196,7 @@ describe("the persistent subconscious reads what a tune-out held while the resid
   }
 
   it("P1': with the presentation index, a row the residents' slot takes during the subconscious's turn enters at its tool boundary, and its turn's thinking is sent again", { timeout: 120_000 }, async () => {
-    const h = await boot({ presentationIndex: true, thinkingBinding: true });
+    const h = await boot({ thinkingBinding: true });
     const sub = h.framework.getAgent(SUB)!;
     const subCm = sub.getContextManager();
     assert.equal(subCm.windowMode(), 'presented', 'premise: its window is presented');

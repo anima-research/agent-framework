@@ -1,14 +1,13 @@
 /**
- * The presentation points (#291, AF-4), with FrameworkConfig.presentationIndex
- * on: a write is stored at once and enters each reader's window at that
+ * The presentation points (#291, AF-4; mandatory since AF-6): a write is
+ * stored at once and enters each reader's window at that
  * reader's points (its turn's start, its tool boundary as a prefix its
  * stream can carry, its turn's end, and at once while no turn of it is
  * alive); an agent's own rows enter as they are written, but for one written
  * where a turn it isn't part of may be alive, which waits; a surgery's hold
  * keeps writes in memory and replays them at its release; a quiesce freezes
  * every window but for each agent's own rows; an undo takes a turn out of
- * the agent's window and a redo puts it back, moving no branch. Beside
- * several, the answer a host without the flag gets.
+ * the agent's window and a redo puts it back, moving no branch.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -42,7 +41,7 @@ class SurfaceModule implements Module {
 const input = (t: string, ask: string[]): ProcessEvent =>
   ({ type: 'external-message', source: 'test', content: [text(t)], metadata: { ask } }) as unknown as ProcessEvent;
 
-type Placement = { agent?: string; messageId?: string; deferredId?: string; presented?: false };
+type Placement = { agent?: string; messageId?: string; presented?: false };
 type Internals = {
   addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string; placement?: Placement }): MessageId;
   readsRowFor(placement: Placement | undefined, agentName: string): { readsRow?: string };
@@ -70,7 +69,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSeconds: number }; presentationIndex?: boolean } = {}) {
+async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSeconds: number } } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-presentation-points-'));
   dirs.push(dir);
   const membrane = new WireMembrane();
@@ -89,7 +88,6 @@ async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSe
     modules: [gates, surface],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
-    presentationIndex: opts.presentationIndex ?? true,
   } as never);
   frameworks.push(framework);
   const traces: TraceEvent[] = [];
@@ -103,7 +101,7 @@ async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSe
   return { framework, membrane, gates, surface, internals, traces, agent, cm, rowWith, inWindow, windowTexts };
 }
 
-describe('presentation points, with the presentation index (#291)', () => {
+describe('presentation points (#291)', () => {
   it("a write during a live turn is stored at once, out of the window and with no clock; its boundary hears it, and a row it cuts enters at the turn's end", async () => {
     const h = await boot({ clock: true });
     h.membrane.script('mira', round('c1', [text('looking')], 'wait', { gate: 'm' }), final([text('done')]));
@@ -177,16 +175,13 @@ describe('presentation points, with the presentation index (#291)', () => {
       && (e as { unstamped?: number }).unstamped === 1), 'presented at the start, traced as unstamped');
   });
 
-  it('a write while no turn is alive enters every idle reader\'s window at once; flag off, the window is the record', async () => {
+  it('a write while no turn is alive enters every idle reader\'s window at once', async () => {
     const on = await boot({ residents: ['mira', 'oren'] });
     const placement: Placement = {};
     const id = on.internals.addMessage('someone', [text('for both')], undefined, { placement });
     assert.deepEqual(audienceOf(on.cm('mira').getMessage(id)!.metadata)?.audience, ['mira', 'oren']);
     assert.deepEqual([on.inWindow('mira', 'for both'), on.inWindow('oren', 'for both')], [true, true], 'present at rest, for each reader');
     assert.equal(placement.presented, undefined, 'presented: no wake needs to read it');
-    const off = await boot({ residents: ['mira', 'oren'], presentationIndex: false });
-    off.internals.addMessage('someone', [text('for both')]);
-    assert.deepEqual(['mira', 'oren'].map((name) => off.cm(name).windowMode()), ['legacy', 'legacy']);
   });
 
   it("each row of another writer's that enters a window outside a tool boundary is weighed once, as its open turn's arrival", async () => {
@@ -348,7 +343,6 @@ describe('presentation points, with the presentation index (#291)', () => {
     assert.ok(!compiled.includes('two') && !compiled.includes('looking'), 'and the next compile');
     assert.ok(cm.getAllMessages().some((m) => textOf(m) === 'two'), 'the record keeps them');
     assert.deepEqual(h.traces.filter((t) => t.type === 'window:undone').map((t) => [(t as { retracted: number }).retracted]), [[4]]);
-    assert.equal(h.traces.filter((t) => t.type === 'undo:completed').length, 0, 'a window undo is no branch switch');
 
     // A write since: at rest, it and the arrival the undo gave back enter the window.
     h.internals.addMessage('user', [text('after the undo')], undefined, { forAgent: 'mira' });
@@ -384,48 +378,26 @@ describe('presentation points, with the presentation index (#291)', () => {
     assert.deepEqual(h.windowTexts('mira'), ['first', 'one', 'second'], 'from the first row in the window stored after its sequence');
   });
 
-  it('with the flag off, a checkpoint is what it was', async () => {
-    const h = await boot({ presentationIndex: false });
-    h.membrane.script('mira', final([text('one')]));
-    h.framework.start();
-    h.framework.pushEvent(input('first', ['mira']));
-    await until(() => !!h.rowWith('mira', 'one'), 'the turn');
-    await h.framework.runUntilIdle();
-    assert.deepEqual(Object.keys(h.internals.getTurnCheckpoints('mira').at(-1)!).sort(), ['agentName', 'branchName', 'sequenceBefore', 'timestamp', 'turnIndex']);
-    assert.match(h.framework.undoLastTurn('mira').toBranch!, /^undo\/mira\//, 'and an undo moves to a branch of its own');
-  });
-
   it("a co-resident's live turn no longer holds an agent's own rows back", async () => {
-    for (const presentationIndex of [true, false]) {
-      const h = await boot({ residents: ['mira', 'oren'], clock: true, presentationIndex });
-      h.internals.activeTurnTokens.set('oren', 7);
-      const clock = h.internals.storeDueClock(h.agent('mira'), 'event');
-      // Flag off, the clock would land inside oren's turn in the shared
-      // record, so none is written; on, it is mira's own row, in no window
-      // but hers.
-      assert.equal(!!clock, presentationIndex, presentationIndex ? 'written for mira' : 'flag off: held while oren\'s turn is alive');
-      if (clock) {
-        assert.notEqual(h.cm('mira').ordinalOf(clock.id), undefined, 'in her window');
-        assert.equal(h.cm('oren').ordinalOf(clock.id), undefined, "never in oren's");
-      }
-      h.internals.activeTurnTokens.delete('oren');
-    }
+    // Before #291 a clock would have landed inside oren's turn in the shared
+    // record, so none was written while it was alive.
+    const h = await boot({ residents: ['mira', 'oren'], clock: true });
+    h.internals.activeTurnTokens.set('oren', 7);
+    const clock = h.internals.storeDueClock(h.agent('mira'), 'event');
+    assert.ok(clock, 'written for mira: her own row, in no window but hers');
+    assert.notEqual(h.cm('mira').ordinalOf(clock.id), undefined, 'in her window');
+    assert.equal(h.cm('oren').ordinalOf(clock.id), undefined, "never in oren's");
+    h.internals.activeTurnTokens.delete('oren');
   });
 
   it("each resident a batched wake was for writes its own line into its own window, once", async () => {
     const line = { entry: { eventType: 'mcpl:push-event', serverId: 'notes', eventId: 'not-stored' }, policyNames: ['batch'], shown: '#room', at: Date.now() };
-    for (const presentationIndex of [true, false]) {
-      const h = await boot({ residents: ['mira', 'oren'], presentationIndex });
-      for (const name of ['mira', 'oren', 'mira', 'oren']) h.internals.placeWakeLines(h.agent(name), [line]);
-      const lines = h.cm('mira').getAllMessages().filter((m) => (m.metadata as { source?: string } | undefined)?.source === 'gate:debounce');
-      if (presentationIndex) {
-        assert.deepEqual(lines.map((m) => audienceOf(m.metadata)?.ownRowOf), ['mira', 'oren'], "one line each, each the resident's own row");
-        assert.deepEqual(lines.map((m) => [h.cm('mira').ordinalOf(m.id) !== undefined, h.cm('oren').ordinalOf(m.id) !== undefined]),
-          [[true, false], [false, true]], 'each in its own window');
-      } else {
-        assert.deepEqual(lines.map((m) => audienceOf(m.metadata)?.ownRowOf), ['mira'], "flag off: the delivery agent's one line");
-      }
-    }
+    const h = await boot({ residents: ['mira', 'oren'] });
+    for (const name of ['mira', 'oren', 'mira', 'oren']) h.internals.placeWakeLines(h.agent(name), [line]);
+    const lines = h.cm('mira').getAllMessages().filter((m) => (m.metadata as { source?: string } | undefined)?.source === 'gate:debounce');
+    assert.deepEqual(lines.map((m) => audienceOf(m.metadata)?.ownRowOf), ['mira', 'oren'], "one line each, each the resident's own row");
+    assert.deepEqual(lines.map((m) => [h.cm('mira').ordinalOf(m.id) !== undefined, h.cm('oren').ordinalOf(m.id) !== undefined]),
+      [[true, false], [false, true]], 'each in its own window');
   });
 
   it('a closure prompt written while the fork\'s turn is alive waits for that turn\'s end', async () => {

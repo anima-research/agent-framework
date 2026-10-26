@@ -282,6 +282,8 @@ interface Boundary {
   /** The round's rows in the agent's window: its tool_use or tool_result. */
   roundRows: () => string[];
   blocks: () => string[];
+  /** Each block in the agent's window, in its order (#291: a row stored during a turn enters it at a point). */
+  windowBlocks: () => string[];
   /** What the workspace holds at the round's first spill path. */
   spilled: () => Promise<string>;
   /** stop(), bounded: a stream left running fails the test. */
@@ -392,6 +394,7 @@ async function holdAtToolBoundary(options: HoldOptions = {}): Promise<Boundary> 
     turnEnded: () => framework.getHostModeStatus().activeTurns === 0 && agent.state.status === 'idle',
     roundRows: () => blocks().filter((b) => b.endsWith(':call_fetch')).map((b) => b.split(':')[0]),
     blocks,
+    windowBlocks: () => blocksOf(agent.getContextManager().getPresentedMessages()),
     spilled: async () => {
       const read = await workspace.readBinary(spills.paths[0]);
       return 'data' in read ? read.data.toString('utf8') : `(${read.error})`;
@@ -676,14 +679,17 @@ describe('a tool boundary nobody stops', () => {
   it("stores the round's tool_use with its results once the write is done, and a message sent meanwhile after them", async () => {
     const b = await holdAtToolBoundary();
     try {
-      // While the write runs, the turn is alive, so the message is deferred.
+      // While the write runs, the turn is alive, so the message is stored
+      // out of the window (#291; it was once deferred), and enters the window
+      // after the round, whose rows are stored once the write is done: the
+      // window's order, not the record's, is the one checked here.
       b.module.say('meanwhile');
-      assert.deepEqual(b.roundRows(), [], "neither of the round's rows is in the window while its write runs");
+      assert.deepEqual(b.roundRows(), [], "neither of the round's rows is stored while its write runs");
       await b.release();
 
       assert.ok(b.traces.some((t) => t.type === 'inference:stream_resumed'), 'the round was resumed');
       await waitFor('the turn to end', b.turnEnded);
-      const blocks = b.blocks();
+      const blocks = b.windowBlocks();
       const toolUse = blocks.indexOf('tool_use:call_fetch');
       assert.ok(toolUse >= 0, "the round's tool_use is stored");
       assert.equal(blocks[toolUse + 1], 'tool_result:call_fetch', 'its result is stored right after it');

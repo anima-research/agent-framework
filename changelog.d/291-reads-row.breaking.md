@@ -14,15 +14,13 @@
     `publishedAfterReading(destination, row, cm)` takes the row and the
     agent's context in place of a branch and a sequence.
   - `InferenceRequest.readsDeferredWrite` is renamed `readsRow`. Its value
-    is the stored row the wake is for, or, while the write still waits in
-    the framework's deferred queue, its held handle (`held:` and the queue
-    entry's id), where it was the bare entry id. The wake is dropped, as
-    before, once an answered request covered the row (and, with a channel,
-    the agent spoke there after), or once the row is gone.
+    is the stored row the wake is for, where it was the deferred queue
+    entry's id (the queue is gone: a write is stored at once). The wake is
+    dropped, as before, once an answered request covered the row (and, with
+    a channel, the agent spoke there after), or once the row is gone.
   - `WritePlacement` gains `messageId` and `presented?: false` (a row stored
-    and not presented to its agent, whose turn was alive), which the
-    framework sets with `FrameworkConfig.presentationIndex` on.
+    and not presented to its agent, whose turn was alive).
 
   **Migration:** compare marks through `covers` and `markAtOrAfter` instead
   of reading `.sequence`; rename `readsDeferredWrite` to `readsRow`, and
-  give a queued write's wake its held handle.
+  give it the stored id the write was answered.

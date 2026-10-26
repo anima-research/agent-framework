@@ -102,7 +102,6 @@ describe("reader forks: the framework hands on what a tune-out held while the re
       deriveAgent: (options: DeriveCall) => Promise<unknown>;
       runEphemeralToCompletion: () => Promise<{ speech: string }>;
       tuneOutCoordinator: TuneOutCoordinator;
-      deferredMessages: Array<{ id: string; content: ContentBlock[] }>;
       channelRegistry: { listChannelsRaw(): unknown[] };
     };
     stubbed.deriveAgent = async (options) => {
@@ -121,7 +120,7 @@ describe("reader forks: the framework hands on what a tune-out held while the re
       await framework.start();
       await waitFor('channel registration', () => stubbed.channelRegistry.listChannelsRaw().length > 0);
       assert.ok(stubbed.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 200, maxWakes: 5 }, 'agent-tool').ok);
-      const forks = () => traces.filter((t) => t.type === 'tune-out:reader-fork') as Array<TraceEvent & { held: number; queued: number }>;
+      const forks = () => traces.filter((t) => t.type === 'tune-out:reader-fork') as Array<TraceEvent & { held: number; queued?: number }>;
       const failures = () => traces.filter((t) => t.type === 'tune-out:reader-fork-failed') as Array<TraceEvent & { returned: number; reported: boolean }>;
       const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages() as unknown as Array<{ id: string; content: ContentBlock[]; metadata?: { deferredWriteId?: string } }>;
       const storedIdOf = (needle: string) => stored().find((m) => textOf(m.content as never).includes(needle))?.id;
@@ -146,9 +145,10 @@ describe("reader forks: the framework hands on what a tune-out held while the re
       await waitFor('the first fork', () => forks().length === 1);
       const ids = ['AMB-1', 'AMB-2', 'ADDR-3'].map((s) => storedIdOf(s));
       assert.ok(ids.every((id) => typeof id === 'string'), "all three are stored, though the resident's turn still waits");
-      assert.equal(stubbed.deferredMessages.filter((m) => /AMB-|ADDR-/.test(textOf(m.content as never))).length, 0, 'and none is queued');
       assert.equal(forks()[0]!.held, 3);
-      assert.equal(forks()[0]!.queued, 0, 'the trace counts none as queued');
+      // #291 took the deferral queue away, and the trace's count of what was
+      // still queued with it.
+      assert.equal(forks()[0]!.queued, undefined, 'the trace counts nothing as queued');
       const framing = derives[0]!.framing[0]!;
       assert.deepEqual(framing.metadata.heldMessageIds, ids, 'each is named by its stored id');
       const shown = textOf(framing.content as never);
@@ -183,7 +183,7 @@ describe("reader forks: the framework hands on what a tune-out held while the re
       say('addressed', 'x6', 'ADDR-6 one more');
       await waitFor('the last fork', () => forks().length === 3);
       assert.equal(forks()[2]!.held, 1);
-      assert.equal(forks()[2]!.queued, 0, 'ADDR-6 was stored directly');
+      assert.equal(forks()[2]!.queued, undefined, 'ADDR-6 was stored directly');
       const last = textOf(derives[3]!.framing[0]!.content as never);
       assert.ok(last.includes('ADDR-6 one more'), last);
       for (const s of ['AMB-1', 'AMB-2', 'ADDR-3', 'ADDR-4', 'ADDR-5']) assert.ok(!last.includes(s), `and not ${s}, handed before`);

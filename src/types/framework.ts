@@ -205,28 +205,6 @@ export interface FrameworkConfig {
   };
 
   /**
-   * Each agent's context follows its own presentation index (#291): the
-   * rows it was shown, in the order its requests carried them, kept by
-   * context-manager (`presentRows`) beside the store's record. Other
-   * writers' rows enter an agent's window at its turn start, its tool
-   * boundary and its turn's end, and at once while it has no turn alive;
-   * its own rows enter as they are written. Default false: each agent's
-   * window is the record, as before.
-   *
-   * Needs a context-manager with `ContextManager.presentRows`; create()
-   * refuses the option without one.
-   *
-   * @experimental Under construction: this release constructs the index's
-   * module and checks each write's audience stamp (a write stamped only for
-   * agents that can't read its slot is traced as
-   * `presentation:unreadable-audience`), and presents nothing yet, so every
-   * compile and request is what it is with the option off. A later release
-   * wires the presentation points behind it, and the one after makes it the
-   * only mode and removes the option.
-   */
-  presentationIndex?: boolean;
-
-  /**
    * IANA zone of the agent's wall clock: it renders wall-clock times for the
    * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
    * counted from local midnight here). Stored/protocol timestamps remain
@@ -257,9 +235,15 @@ export interface FrameworkConfig {
   hostModePath?: string;
 
   /**
-   * Branch-independent durable queue of context writes deferred while
-   * quiesced. Defaults to `<storePath>/recovery/deferred-writes.json`; same
-   * rationale and fallback as `hostModePath`.
+   * Where a release before #291 kept its durable queue of deferred context
+   * writes. Defaults to `<storePath>/recovery/deferred-writes.json`; without
+   * either, the store's `framework/deferred-writes` slot. This release keeps
+   * no queue (a write is stored at once, and enters each agent's window at
+   * that agent's presentation points): create() reads the record once,
+   * stores each write it holds, and clears it.
+   *
+   * @deprecated Read once at boot by the deferred-write importer; removed in
+   * the next release.
    */
   deferredWritesPath?: string;
 

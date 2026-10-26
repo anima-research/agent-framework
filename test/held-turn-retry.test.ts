@@ -1281,6 +1281,12 @@ test("a budget restart's start merged with a fresh wake and parked: abortInferen
     const { fw, internal } = await framework(path, membrane);
     try {
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-message' }]);
+      // Written straight to the context manager, the message enters the
+      // window at a point (#291), here as at rest. Left out of it, it would be
+      // an arrival the restart doesn't present, and the scheduler would keep
+      // the wake out of the restart's batch for a turn of its own after the
+      // restart's (the merge this test is about wouldn't happen).
+      (fw as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(fw.getAgent('resident'));
       const gate = internal.providerGate('resident');
       gate.auxiliaryInFlight = 1;
       internal.pendingRequests.push(

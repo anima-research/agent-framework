@@ -9,11 +9,13 @@
  *    made it; a result whose hold isn't durable is not delivered.
  * 3. The registry and its ended log live in recovery files beside the store,
  *    which win over the branch-local state.
- * 4. At a quiesced boot, held mail waits with the deferred queue and lands
- *    once, at resume.
+ * 4. Mail sent while the host is quiesced is stored at once, through a
+ *    quiesced reboot too, and enters the recipient's window once, at
+ *    resume. (#291 took the deferral queue away; this case once had the
+ *    mail wait with the queue and land at resume.)
  * 5. stopAgent releases the stopped agent's window as the idle reap does: a
- *    failure notice it never read reaches the primary, and a write queued
- *    for it lands in its window.
+ *    failure notice it never read reaches the primary, and a write stored
+ *    for it while its turn was alive stays in its namespace.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -179,22 +181,26 @@ describe('the registry\'s durable state (findings 1 to 4)', () => {
     assert.equal(file.mail.length, 1, 'the hold is in the recovery file');
   });
 
-  it('4: at a quiesced boot, held mail waits with the deferred queue and lands once, at resume', async () => {
+  it('4: mail sent while quiesced is stored at once, through a quiesced boot, and enters the window once, at resume', async () => {
+    const inWindow = (framework: AgentFramework, needle: string) => framework.getAgent('mira')!.getContextManager()
+      .getPresentedMessages().filter((m) => textOf(m.content).includes(needle)).length;
     const first = await boot();
     await first.quiesce({ reason: 'maintenance' });
     first.sendAgentMessage('oren', 'mira', [{ type: 'text', text: 'MAIL-1' }]);
     (first as unknown as { addMessage(p: string, c: ContentBlock[], m?: Record<string, unknown>, o?: { forAgent?: string }): string })
       .addMessage('user', [{ type: 'text', text: 'PLAIN-1' }], { kind: 'test-note' }, { forAgent: 'mira' });
-    assert.equal(rowsWith(first, 'mira', 'MAIL-1').length, 0, 'held by the quiesce');
-    assert.equal(first.listHeldMail().length, 1);
+    assert.equal(rowsWith(first, 'mira', 'MAIL-1').length, 1, 'stored at once');
+    assert.equal(inWindow(first, 'MAIL-1'), 0, 'out of the window while quiesced');
     await first.stop();
     const second = await boot();
     assert.equal(second.getHostModeStatus().quiesced, true, 'boots quiesced');
-    assert.equal(rowsWith(second, 'mira', 'MAIL-1').length, 0, 'the mail waits with the queue');
-    assert.equal(rowsWith(second, 'mira', 'PLAIN-1').length, 0);
-    await second.resume();
+    assert.equal(rowsWith(second, 'mira', 'MAIL-1').length, 1, 'the mail is in the store once');
     assert.equal(rowsWith(second, 'mira', 'PLAIN-1').length, 1);
-    assert.equal(rowsWith(second, 'mira', 'MAIL-1').length, 1, 'the mail lands once, at resume');
+    assert.equal(inWindow(second, 'MAIL-1'), 0, 'and still out of the window');
+    await second.resume();
+    assert.equal(inWindow(second, 'PLAIN-1'), 1);
+    assert.equal(inWindow(second, 'MAIL-1'), 1, 'the mail enters the window once, at resume');
+    assert.equal(rowsWith(second, 'mira', 'MAIL-1').length, 1, 'stored once');
     assert.equal(second.listHeldMail().length, 0, 'and is released');
   });
 });
@@ -338,14 +344,10 @@ describe('5: stopAgent releases the window as the idle reap does', () => {
   const internals = () => framework as unknown as {
     initializeMcpl(servers: []): Promise<void>;
     activeTurnTokens: Map<string, number>;
-    deferredMessages: Array<{ forAgent?: string }>;
     pendingAssistantBlocks: Map<string, unknown[]>;
     lastConversationSweep: number;
     sweepExpiredConversations(): void;
     quiesced: boolean;
-    deferredWritesPersisted: boolean;
-    unackedDeferredWrites: unknown[];
-    flushDeferredWrites(label: string): Promise<void>;
     closingConversationAgents: Set<string>;
     addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
   };
@@ -409,19 +411,18 @@ describe('5: stopAgent releases the window as the idle reap does', () => {
       if (how === 'stopAgent') assert.equal(framework.getAgentRecord(fork.name)?.ended?.reason, 'stopped');
     });
 
-    it(`5b, ${how}: an ordinary write queued for the fork lands in its window and is acknowledged`, async () => {
+    // Ported for #291: the write is stored at once, where this test once
+    // queued it and checked the release stored and acknowledged it.
+    it(`5b, ${how}: an ordinary write for the fork while its turn is alive is stored at once and kept in its namespace`, async () => {
       const fork = await spawnFork();
       const state = internals();
-      state.deferredWritesPersisted = true;
       state.activeTurnTokens.set(fork.name, 3);
-      state.addMessage('user', [{ type: 'text', text: 'queued for the fork' }], { kind: 'test-note' }, { forAgent: fork.name });
-      assert.equal(state.deferredMessages.length, 1);
+      const id = state.addMessage('user', [{ type: 'text', text: 'stored for the fork' }], { kind: 'test-note' }, { forAgent: fork.name });
+      assert.notEqual(id, '', 'stored at once');
       state.activeTurnTokens.delete(fork.name);
       if (how === 'reap') reap(fork.name); else framework.stopAgent(fork.name, { by: 'test', reason: 'test' });
       assert.equal(framework.getAgent(fork.name), null);
-      assert.equal(state.deferredMessages.length, 0, 'released, not left queued');
-      assert.equal(state.unackedDeferredWrites.length, 0, 'acknowledged');
-      assert.equal(await forkWindowHas(fork.name, 'queued for the fork'), true, 'in its window');
+      assert.equal(await forkWindowHas(fork.name, 'stored for the fork'), true, 'in its namespace');
     });
   }
 });

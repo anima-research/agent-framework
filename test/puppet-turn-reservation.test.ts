@@ -20,7 +20,6 @@ type Internals = {
   executeToolCall: (call: Record<string, unknown>) => Promise<unknown>;
   withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
   providerGates: Map<string, { primaryDepth: number; auxiliaryInFlight: number }>;
-  deferredMessages: unknown[];
 };
 const settle = () => new Promise((r) => setTimeout(r, 30));
 
@@ -138,7 +137,12 @@ describe('puppetToolCall vs a concurrent wake (#145)', () => {
       const stored = () => (framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string }> }>)
         .map((m) => m.content[0]?.type);
       assert.deepEqual(stored().filter((t) => t === 'tool_use' || t === 'tool_result'), ['tool_use', 'tool_result'], 'pair persisted when puppetToolCall resolves');
-      assert.equal(i.deferredMessages.length, 0, 'nothing stranded in the deferred queue');
+      // Since #291 the pair is stored at once, so nothing waits in a
+      // deferral queue (this line once checked that queue was empty): it is
+      // in the window once the puppet has let go.
+      const cm = framework.getAgent('scout')!.getContextManager();
+      const pair = cm.getAllMessages().filter((m) => m.content[0]?.type === 'tool_use' || m.content[0]?.type === 'tool_result');
+      assert.ok(pair.every((m) => cm.ordinalOf(m.id) !== undefined), 'the pair is in the window');
       assert.equal(i.activeTurnTokens.has('scout'), false, 'reservation released');
 
       // 5. the retained wake runs afterwards and sees the pair

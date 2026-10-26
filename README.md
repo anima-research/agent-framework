@@ -474,10 +474,12 @@ Pause the inference thread and MCPL data planes while keeping the framework,
 context managers, and membrane hot — so compression/refold/quarantine work runs
 through the live machinery instead of offline scripts (issue #122). Quiesce
 persists across restarts; `resume` gates on a fresh per-agent feasibility
-preview of the current runtime settings (`force` overrides).
+preview of the current runtime settings (`force` overrides). While quiesced, a
+context write (a module event, an API `message.send`) is stored at once, and
+enters the agents' windows at `resume` (#291).
 
 ```typescript
-await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });  // throws QuiesceBlockedError if the deferred writes can't reach disk
+await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
 await framework.maintenanceTick();   // drain quarantine / advance merges
 await framework.resume();            // throws ResumeBlockedError if the layout won't compile
 ```

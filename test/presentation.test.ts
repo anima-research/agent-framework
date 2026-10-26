@@ -3,9 +3,8 @@
  * real ContextManagers on a temp chronicle store, with a fake host: two
  * residents over the shared slot (mira, the primary, and oren), the
  * subconscious serving mira, which reads the residents' slot through its
- * observe edge, and a shared fork of mira on its own branch. Nothing of the
- * framework calls the module yet (FrameworkConfig.presentationIndex is
- * inert); these are its decisions on their own.
+ * observe edge, and a shared fork of mira on its own branch: its decisions
+ * on their own, apart from the framework that calls it.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';

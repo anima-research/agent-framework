@@ -18,7 +18,6 @@ import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.
 import { fixture, eventually, settles, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
-import { heldHandle } from '../src/held-writes.js';
 import { coverTest, readMarkForTest, type ReadMark } from '../src/read-marks.js';
 
 // ---------------------------------------------------------------------------
@@ -468,25 +467,11 @@ test('#196 finding 4: a context-budget restart does not assemble a pending batch
   assert.equal((f.renders[0].notices as unknown[]).length, 2);
 });
 
-test('#196 finding 5: undo of a turn keeps the coalesced input that preceded it', async (t) => {
-  const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
-  await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
-  await f.framework.runUntilIdle();
-  await f.send('push/event', f.params('b', 'unread_before_undo', { key: 'b', initial: true }));
-  await f.turn();
-  assert(f.lastRequest().includes('unread_before_undo'));
-  f.framework.undoLastTurn('agent');
-  assert(f.context().includes('unread_before_undo'), 'the input survives the undo of the turn that read it');
-  const r = await f.send('push/event', f.params('c', 'after_undo', { key: 'b' }));
-  assert.equal(r.result.coalesce.outcome, 'appended', 'after a branch switch nothing is replaceable');
-});
-
-// With the presentation index (#291) the undo is the window's: no branch
-// moves, and the input the undone turn's start presented stays in the
-// window, read by the request that carried it, so nothing makes it
-// replaceable again.
+// The undo is the window's (#291): no branch moves, and the input the undone
+// turn's start presented stays in the window, read by the request that
+// carried it, so nothing makes it replaceable again.
 test('#196 finding 5, on the window: undo of a turn keeps the coalesced input that preceded it', async (t) => {
-  const f = await fixture({ server: { shouldTriggerInference: () => true }, framework: { presentationIndex: true } }); t.after(f.close);
+  const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
   await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
   await f.framework.runUntilIdle();
   await f.send('push/event', f.params('b', 'unread_before_undo', { key: 'b', initial: true }));
@@ -500,16 +485,20 @@ test('#196 finding 5, on the window: undo of a turn keeps the coalesced input th
   assert.equal(r.result.coalesce.outcome, 'appended', 'the request that carried it read it');
 });
 
-test('a replacement while a turn is alive edits the deferred queue, not the live turn', async (t) => {
+test('a replacement while a turn is alive replaces the stored row the turn was never shown, not the live turn', async (t) => {
+  // #291: the original is stored at once, out of the live turn's window, and
+  // the replacement takes its place there. (Before #291 the original waited
+  // in the deferred queue, and the replacement edited the queue.)
   const f = await fixture(); t.after(f.close);
-  const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; deferredMessages: unknown[] };
+  const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; presentAtEndOf(agent: unknown): void };
   internals.activeTurnTokens.set('agent', 100);
   await f.send('push/event', f.params('1', 'queued_original', { initial: true }));
   const r = await f.send('push/event', f.params('2', 'queued_replacement'));
   assert.equal(r.result.coalesce.outcome, 'replaced');
-  assert.equal(internals.deferredMessages.length, 1);
-  assert(!f.context().includes('queued_original') && !f.context().includes('queued_replacement'));
+  assert(!f.context().includes('queued_original') && f.context().includes('queued_replacement'), 'the store holds the replacement alone');
+  assert(!f.window().includes('queued_original') && !f.window().includes('queued_replacement'), 'and the live turn is shown neither');
   internals.activeTurnTokens.delete('agent');
+  internals.presentAtEndOf(f.framework.getAgent('agent'));
   await f.turn();
   assert(f.lastRequest().includes('queued_replacement') && !f.lastRequest().includes('queued_original'));
 });
@@ -525,6 +514,9 @@ test('compression consumes: a message folded into a summary is no longer replace
   await f.send('push/event', f.params('1', 'folded_original', { initial: true }));
   const cm = f.framework.getAgent('agent')!.getContextManager();
   for (let i = 0; i < 30; i++) cm.addMessage('user', [{ type: 'text', text: `filler_${i} ` + 'lorem ipsum '.repeat(40) }]);
+  // Rows written past the framework enter the window, and the strategy's
+  // folds, at the agent's next point (#291).
+  f.present();
   for (let i = 0; i < 12; i++) await cm.tick();
   assert(cm.getMaxSummaryLevel() > 0, 'folding happened');
   const r = await f.send('push/event', f.params('2', 'after_fold'));
@@ -628,14 +620,14 @@ test('G4: a deferred channel-scoped push spawns the conversation fork it needs',
   assert(!f.context().includes('document_diff'));
 });
 
-test('G6: a replacement finds its prior after the deferred flush stored it', async (t) => {
+test("G6: a replacement finds its prior once the turn's end has presented it", async (t) => {
   const f = await fixture(); t.after(f.close);
-  const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; flushDeferredWrites(label: string): Promise<void> };
+  const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; presentAtEndOf(agent: unknown): void };
   internals.activeTurnTokens.set('agent', 100);
   await f.send('push/event', f.params('1', 'queued_then_stored', { initial: true }));
   internals.activeTurnTokens.delete('agent');
-  await internals.flushDeferredWrites('test');
-  assert(f.context().includes('queued_then_stored'), 'flushed into context, unread');
+  internals.presentAtEndOf(f.framework.getAgent('agent'));
+  assert(f.window().includes('queued_then_stored'), 'in the window, unread');
   const r = await f.send('push/event', f.params('2', 'replacement_after_flush'));
   assert.equal(r.result.coalesce.outcome, 'replaced');
   assert(!f.context().includes('queued_then_stored') && f.context().includes('replacement_after_flush'));
@@ -1226,9 +1218,7 @@ type TurnInternals = {
   providerAccelerationCooldowns: Map<string, { startedAt: number; until: number; timer: ReturnType<typeof setTimeout>; heldRequests: Wake[]; reason: string; failures: number }>;
   releaseProviderAccelerationCooldown(agent: string): void;
   providerGate(agent: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> };
-  drainDeferredFor(agent: string): unknown[];
-  readdDrained(entries: unknown[], where: string, opts?: { bypassDeferral?: boolean }): unknown[];
-  ackDeferredWrites(): void;
+  presentAtEndOf(agent: unknown): void;
   pushCoalescer: {
     pendingBatches(): number;
     assemble(agent: string, causes?: readonly string[]): Promise<{ settled: Set<string>; materialized: Set<string> }>;
@@ -1243,12 +1233,11 @@ const TWO_RESIDENTS = [
 /** A trigger filter under which a push whose text says 'quiet' triggers no inference. */
 const QUIET_PUSHES_DONT_TRIGGER = { shouldTriggerInference: (text: string) => !text.includes('quiet') };
 
-/** Ends the turn a stand-in token kept alive, storing what waited in its
- *  deferred queue, as a torn-down turn's flush does. */
+/** Ends the turn a stand-in token kept alive: what was stored for the agent
+ *  meanwhile enters its window, as at a torn-down turn's end (#291). */
 function endStandInTurn(internals: TurnInternals, agent = 'agent'): void {
   if (!internals.activeTurnTokens.delete(agent)) return;
-  internals.readdDrained(internals.drainDeferredFor(agent), 'the stand-in turn ends');
-  internals.ackDeferredWrites();
+  internals.presentAtEndOf((internals as unknown as { agents: Map<string, unknown> }).agents.get(agent));
 }
 
 function withdrawals(f: Awaited<ReturnType<typeof fixture>>): string[] {
@@ -1414,7 +1403,7 @@ test("a batch-only turn that reaches its assembly while another resident's assem
   assert.equal(joined.materialized.size, 0, 'and took nothing of it as its own');
 });
 
-test("a render placed in a live turn's deferred queue isn't read by the resident that rendered it; the queue's agent is woken for it", async (t) => {
+test("a render stored for a live turn, out of its window, isn't read by the resident that rendered it; its agent is woken for it", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
@@ -1422,23 +1411,23 @@ test("a render placed in a live turn's deferred queue isn't read by the resident
   const internals = f.framework as unknown as TurnInternals;
   // The primary's turn is alive, as while it waits on a tool call; this
   // token stands in for one. 'other''s assembly renders the batch, and the
-  // delivery, bound for the primary's context, waits in its queue.
+  // delivery, bound for the primary's context, is stored out of its window.
   internals.activeTurnTokens.set('agent', -1);
   try {
     await settles(internals.processInferenceRequests(), 'one scheduler pass');
     assert.equal(f.membrane.calls.length, 0, "'other' read nothing, so its turn started no inference");
     assert.deepEqual(withdrawn, ['other']);
     assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], 'the primary is woken for the render');
-    assert(!f.context().includes('document_diff'), 'which is still in its queue');
+    assert(!f.window().includes('document_diff'), "which its window doesn't hold yet");
   } finally {
     endStandInTurn(internals);
   }
   await settles(f.framework.runUntilIdle(), "the primary's turn");
   assert.equal(f.membrane.calls.length, 1);
-  assert(f.lastRequest().includes('document_diff'), "the primary's turn read the render once its queue was flushed");
+  assert(f.lastRequest().includes('document_diff'), "the primary's turn read the render once its window held it");
 });
 
-test("a render placed in a live turn's deferred queue takes a newer batch of its subject, and its wakes, to its agent", async (t) => {
+test("a render stored for a live turn, out of its window, takes a newer batch of its subject, and its wakes, to its agent", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   let release!: (value: unknown) => void;
@@ -1475,7 +1464,7 @@ test("a render placed in a live turn's deferred queue takes a newer batch of its
   assert(f.lastRequest().includes('first_render') && f.lastRequest().includes('second_render'), 'one call read both renders');
 });
 
-test("a render placed in a live turn's deferred queue wakes its agent though a newer batch of its subject wakes no one", async (t) => {
+test("a render stored for a live turn, out of its window, wakes its agent though a newer batch of its subject wakes no one", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS, server: QUIET_PUSHES_DONT_TRIGGER }); t.after(f.close);
   f.alwaysRespond();
   let release!: (value: unknown) => void;
@@ -1576,53 +1565,14 @@ test("a render placed in a live turn's deferred queue takes a newer batch of its
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
 
-test("a render whose write failed at its agent's turn start is read before the next render of its subject, in that turn's request", async (t) => {
-  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
-  f.alwaysRespond();
-  let renders = 0;
-  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
-  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
-  const internals = f.framework as unknown as TurnInternals;
-  // As in the test above: 'other''s assembly places the render in the
-  // primary's deferred queue while the primary's turn is alive, and a notice
-  // opens a newer batch, which follows the primary. That turn ends without
-  // a flush, so the render is still queued when the primary's next turn
-  // starts, and that start's flush fails to store it, once.
-  internals.activeTurnTokens.set('agent', -1);
-  try {
-    await settles(internals.processInferenceRequests(), 'the scheduler pass');
-    assert.equal(renders, 1, "'other''s assembly rendered the first batch");
-    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
-  } finally {
-    internals.activeTurnTokens.delete('agent');
-  }
-  const cm = f.framework.getAgent('agent')!.getContextManager();
-  const add = cm.addMessage.bind(cm);
-  let failed = false;
-  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
-    if (!failed && JSON.stringify(args[1]).includes('first_render')) {
-      failed = true;
-      throw new Error('transient');
-    }
-    return add(...args);
-  };
-  const errors: string[] = [];
-  const error = console.error;
-  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-  try {
-    await settles(f.framework.runUntilIdle(), "the primary's turn");
-  } finally {
-    console.error = error;
-  }
-  assert.ok(errors.some((e) => e.includes('turn-start flush for agent') && e.includes('transient')), "the start's flush couldn't store the first render");
-  assert.equal(renders, 2);
-  assert.equal(f.membrane.calls.length, 1);
-  const request = f.lastRequest();
-  assert(request.includes('first_render') && request.indexOf('first_render') < request.indexOf('second_render'), 'one call read the first render, then the second');
-});
-
-test("a render an assembly joins reaches the joining agent's request when it lands in that agent's queue (vector 25)", async (t) => {
-  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+test("a render an assembly joins reaches the joining agent's request when it lands in that agent's context (vector 25)", async (t) => {
+  // The residents' prompts tell their requests apart: both read the shared
+  // slot, so 'other''s turn, whose assembly presents what arrived for it,
+  // reads the renders too (#291).
+  const f = await fixture({ agents: [
+    { name: 'agent', model: 'test', systemPrompt: 'test agent' },
+    { name: 'other', model: 'test', systemPrompt: 'test other' },
+  ] }); t.after(f.close);
   f.alwaysRespond();
   let release!: (value: unknown) => void;
   let began!: () => void;
@@ -1652,64 +1602,25 @@ test("a render an assembly joins reaches the joining agent's request when it lan
   internals.activeTurnTokens.delete('agent');
   const second = internals.processInferenceRequests();
   await settles(notesStarted, "the notes' render for the primary");
-  // The document's render lands in the primary's window, written for
-  // 'other''s assembly, so the primary's live turn defers it into its queue.
-  const flushed: string[] = [];
-  f.framework.onTrace((e) => {
-    const event = e as { type: string; source?: string; messageId?: string };
-    if (event.type === 'message:added' && event.source === 'deferred-flush:assembly' && event.messageId) flushed.push(event.messageId);
-  });
+  // The document's render lands in the primary's store, written for
+  // 'other''s assembly while the primary's own assembly runs, which presents
+  // it before the primary's compile (#291; before, the primary's live turn
+  // deferred it, and its assembly's flush stored it).
   release({ content: [{ type: 'text', text: 'first_render' }] });
   await settles(Promise.all([first, second]), 'both passes');
   await settles(f.framework.runUntilIdle(), 'the drain');
-  const primaryCalls = f.membrane.calls.filter((c) => JSON.stringify((c as { messages?: unknown }).messages).includes('notes_render'));
+  const primaryCalls = f.membrane.calls.filter((c) => (c as { system?: unknown }).system === 'test agent'
+    && JSON.stringify((c as { messages?: unknown }).messages).includes('notes_render'));
   assert.equal(primaryCalls.length, 1, "one primary turn: the render's wake to read it was retired once its request read it");
   assert(JSON.stringify((primaryCalls[0] as { messages?: unknown }).messages).includes('first_render'), "the primary's request read the render its assembly joined");
-  const store = f.framework.getAgent('agent')!.getContextManager().getAllMessages();
-  assert.ok(store.some((m) => flushed.includes(m.id) && JSON.stringify(m.content).includes('first_render')), "the render was deferred into the primary's queue and written by its assembly's flush");
-  // Stored before the turn's checkpoint, it is the turn's input: undoing the
-  // turn keeps it.
-  f.framework.undoLastTurn('agent');
-  assert(f.context().includes('first_render'), 'the undo of the turn that read it keeps it');
-});
-
-test("a render deferred behind a write the store keeps refusing stays tracked, and a retraction removes both", async (t) => {
-  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
-  f.alwaysRespond();
-  let renders = 0;
-  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
-  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
-  const internals = f.framework as unknown as TurnInternals & { deferredMessages: Array<{ content: unknown }> };
-  // As above, the first render waits in the primary's queue when its next
-  // turn starts, and the newer batch follows the primary. Here the store
-  // refuses the first render every time.
-  internals.activeTurnTokens.set('agent', -1);
-  try {
-    await settles(internals.processInferenceRequests(), 'the scheduler pass');
-    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
-  } finally {
-    internals.activeTurnTokens.delete('agent');
-  }
   const cm = f.framework.getAgent('agent')!.getContextManager();
-  const add = cm.addMessage.bind(cm);
-  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
-    if (JSON.stringify(args[1]).includes('first_render')) throw new Error('disk full');
-    return add(...args);
-  };
-  const error = console.error;
-  console.error = () => {};
-  try {
-    await settles(f.framework.runUntilIdle(), "the primary's turns");
-  } finally {
-    console.error = error;
-  }
-  assert.equal(renders, 2, "the primary's assembly rendered the newer batch");
-  const queued = () => internals.deferredMessages.map((m) => JSON.stringify(m.content));
-  assert.ok(queued().some((c) => c.includes('second_render')), 'the newer render waits behind the refused one');
-  assert.ok(f.membrane.calls.every((c) => !JSON.stringify((c as { messages?: unknown }).messages).includes('second_render')), 'no request read it without the render it builds on');
-  const r = await f.send('push/event', f.params('3', '', { retract: true }));
-  assert.equal(r.result.coalesce.outcome, 'retracted', 'both renders were unread, and both are withdrawn');
-  assert.ok(!queued().some((c) => c.includes('first_render') || c.includes('second_render')), 'neither is queued any more');
+  const render = cm.getAllMessages().find((m) => JSON.stringify(m.content).includes('first_render'))!;
+  const checkpoint = (f.framework as unknown as { getTurnCheckpoints(name: string): Array<{ indexLengthBefore?: number }> })
+    .getTurnCheckpoints('agent').find((c) => c.indexLengthBefore !== undefined && c.indexLengthBefore > (cm.ordinalOf(render.id) ?? Infinity));
+  assert.ok(checkpoint, "the render entered the primary's window before a turn's checkpoint: that turn's input");
+  // As the turn's input, undoing the turn keeps it.
+  f.framework.undoLastTurn('agent');
+  assert(f.window().includes('first_render'), 'the undo of the turn that read it keeps it');
 });
 
 test("a wake to read a render that was retracted unread starts no turn", async (t) => {
@@ -1736,19 +1647,15 @@ test("a wake to read a render that was retracted unread starts no turn", async (
 
 test("a wake to read a render neither carries its mark into a merge with other causes nor absorbs another wake while parked", async (t) => {
   const f = await fixture(); t.after(f.close);
-  const internals = f.framework as unknown as TurnInternals & {
-    quiesced: boolean;
-    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
-  };
-  // The renders they read wait, unread, in the agent's queue.
-  internals.deferredMessages.push(
-    { id: 'render-1', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'queued_render' }], heldAt: Date.now() },
-    { id: 'render-2', seq: 2, participant: 'editor', content: [{ type: 'text', text: 'other_render' }], heldAt: Date.now() });
+  const internals = f.framework as unknown as TurnInternals & { quiesced: boolean };
+  // The renders they read are stored, unread: no request of the agent's
+  // carried them.
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const render1 = cm.addMessage('editor', [{ type: 'text', text: 'queued_render' }]);
+  const render2 = cm.addMessage('editor', [{ type: 'text', text: 'other_render' }]);
   const wake = (extra: Partial<Wake> = {}): Wake => ({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), ...extra });
   // Parked while quiesced, wakes are kept newest by key; a wake to read the
   // render keys apart from a plain push wake, so neither absorbs the other.
-  // A render still queued is named by its held handle (InferenceRequest.readsRow).
-  const [render1, render2] = [heldHandle('render-1'), heldHandle('render-2')];
   internals.quiesced = true;
   try {
     internals.pendingRequests.push(wake({ readsRow: render1 }), wake(), wake({ readsRow: render2 }));
@@ -1770,37 +1677,33 @@ test("a wake to read a render neither carries its mark into a merge with other c
     await settles(internals.processInferenceRequests(), 'the lone pass');
   } finally {
     internals.startAgentStream = start;
-    internals.deferredMessages.splice(0);
   }
   assert.deepEqual(triggers.map((r) => r.readsRow), [undefined, undefined, render1], 'merged with a plain wake, or one reading another render, it drops the mark; alone it keeps it');
 });
 
 test("a wake to read a render starts its turn until the render's row is at or below the watermark of the agent's answered requests on the current branch", async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
-  const internals = f.framework as unknown as TurnInternals & {
-    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
-  };
+  const internals = f.framework as unknown as TurnInternals;
   const agent = f.framework.getAgent('agent')! as unknown as {
-    getContextManager(): { getAllMessages(): Array<{ id: string; sequence: number; metadata?: { deferredWriteId?: string } }>; currentBranch(): { name: string } };
+    getContextManager(): { getMessage(id: string): { id: string; sequence: number } | null; addMessage(p: string, c: unknown[]): string; currentBranch(): { name: string } };
     getAnsweredWatermark(): ReadMark | null;
     answeredWatermark: ReadMark | null;
   };
   // A legacy-mode mark (no index length) at a row's sequence on the current
   // branch: the store's head when that row was the newest.
   const markAt = (sequence: number): ReadMark => readMarkForTest(agent.getContextManager().currentBranch().name, sequence, null);
-  // A render placed in the agent's queue lands in its store, as a flush
-  // stores it, while its wake to read it waits.
+  // A render stored for the agent while its wake to read it waits, by name.
+  const rows = new Map<string, string>();
   const land = (id: string): { id: string; sequence: number } => {
-    internals.deferredMessages.push({ id, seq: 1, participant: 'editor', content: [{ type: 'text', text: `${id}_text` }], heldAt: Date.now() });
-    internals.readdDrained(internals.drainDeferredFor('agent'), `${id} lands`);
-    internals.ackDeferredWrites();
-    const row = agent.getContextManager().getAllMessages().find((m) => m.metadata?.deferredWriteId === id);
+    const stored = agent.getContextManager().addMessage('editor', [{ type: 'text', text: `${id}_text` }]);
+    rows.set(id, stored);
+    const row = agent.getContextManager().getMessage(stored);
     assert(row, `${id} landed on the current branch`);
     return row;
   };
   // The pass starts whatever turns are left.
   const pass = async (id: string): Promise<number> => {
-    internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle(id) });
+    internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: rows.get(id) ?? id });
     let started = 0;
     const start = internals.startAgentStream;
     internals.startAgentStream = async () => { started++; return undefined; };
@@ -1827,18 +1730,6 @@ test("a wake to read a render starts its turn until the render's row is at or be
   const after = land('render_after');
   agent.answeredWatermark = markAt(after.sequence);
   assert.equal(await pass('render_below'), 0, 'below the watermark on its branch, the wake starts no turn');
-  // Drained from the queue but not yet stored: still queued.
-  const pendingWrite = { id: 'render_drained', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'render_drained_text' }], heldAt: Date.now() };
-  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.push(pendingWrite);
-  assert.equal(await pass('render_drained'), 1, 'drained and not yet stored, the wake starts the turn');
-  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.splice(0);
-  // Stored and read, but still un-acked while the chronicle's sync fails:
-  // judged by its row.
-  const unsynced = land('render_unsynced');
-  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.push({ ...pendingWrite, id: 'render_unsynced' });
-  agent.answeredWatermark = markAt(unsynced.sequence);
-  assert.equal(await pass('render_unsynced'), 0, 'stored and read, though not yet synced, the wake starts no turn');
-  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.splice(0);
   // With no watermark (a store that couldn't be read when it was taken): in doubt.
   const noMark = land('render_null');
   agent.answeredWatermark = null;
@@ -1846,18 +1737,21 @@ test("a wake to read a render starts its turn until the render's row is at or be
   agent.answeredWatermark = markAt(noMark.sequence);
   await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
   await f.framework.runUntilIdle();
-  // An operator's undo switches the store to a new branch; the watermark of
-  // the agent's answered requests stays on the old one until a request on
-  // the new one is answered. The render lands at or below that watermark's
-  // sequence, so only the branch tells it unread.
-  f.framework.undoLastTurn('agent');
+  // An operator's rollback switches the store to a new branch (an undo, on
+  // the window since #291, switches none); the watermark of the agent's
+  // answered requests stays on the old one until a request on the new one is
+  // answered. The render lands at or below that watermark's sequence, so
+  // only the branch tells it unread.
+  const turnOne = (f.framework.getAgent('agent')!.getContextManager().getAllMessages() as Array<{ id: string; content: unknown }>)
+    .find((m) => JSON.stringify(m.content).includes('turn_one'))!;
+  await f.framework.rollbackToMessage('agent', { messageId: turnOne.id });
   const afterUndo = land('render_1');
   const mark = agent.getAnsweredWatermark();
-  // Read across no branch point, the mark covers the row: its head is at or
-  // past the row's sequence.
-  const atOrPast = coverTest(mark, f.framework.getAgent('agent')!.getContextManager(), { partAt: Number.POSITIVE_INFINITY });
-  assert(mark && mark.branch !== agent.getContextManager().currentBranch().name && atOrPast(afterUndo) === 'covered',
-    `the watermark is on another branch, at or past the render's row (${afterUndo.sequence})`);
+  assert(mark && mark.branch !== agent.getContextManager().currentBranch().name, 'the watermark is on another branch');
+  // A mark taken in presented mode (the turn's request was answered on the
+  // old branch) can't say on another branch, whatever the row's sequence.
+  const across = coverTest(mark, f.framework.getAgent('agent')!.getContextManager(), { partAt: Number.POSITIVE_INFINITY });
+  assert.equal(across(afterUndo), 'doubt', `the mark can't say of the render's row (${afterUndo.sequence})`);
   assert.equal(await pass('render_1'), 1, 'with the watermark on another branch, the wake starts the turn');
 });
 
@@ -1878,9 +1772,9 @@ test("a render's wake to read it is marked ambient only when the coalescer says 
       retract: false, deferred: true, initial: false, content: [],
       ...(tags ? { tags: [...tags] } : {}),
       event: { lane: 'push', event: { triggerInference: true, origin: {} } },
-    } as unknown as CoalescedOccurrence<unknown>, { agent: 'agent', deferredId: 'render-x' }, allAmbient);
+    } as unknown as CoalescedOccurrence<unknown>, { agent: 'agent', messageId: 'render-x', presented: false }, allAmbient);
     assert.equal(internals.pendingRequests.length, 1, 'one wake to read the render');
-    assert.equal(internals.pendingRequests[0]!.readsRow, heldHandle('render-x'), "the render's held handle, while it is queued");
+    assert.equal(internals.pendingRequests[0]!.readsRow, 'render-x', "the render's stored id, which the agent wasn't shown at its write");
     assert.equal(internals.pendingRequests[0]!.ambient, ambient, `latest tags ${JSON.stringify(tags)}, all ambient ${allAmbient}`);
   }
 });
@@ -1893,8 +1787,8 @@ test("a deferred batch is all ambient only while every notice folded into it was
   let holdRender: Promise<void> | null = null;
   const host = (): CoalescerHost<null> => ({
     isUnread: () => true, isUnshown: () => true, remove: () => true,
-    // Every delivery lands in the deferred queue of an agent whose turn is alive.
-    deliver: async (occ) => ({ agent: 'other', deferredId: `deferred-${occ.eventId}` }),
+    // Every delivery is stored for an agent whose turn is alive, and not presented to it.
+    deliver: async (occ) => ({ agent: 'other', messageId: `row-${occ.eventId}`, presented: false }),
     wakeForBatch: async () => {}, wakeToRead: async (occ, _placement, allAmbient) => { seen.set(occ.key, allAmbient); },
     cancelWake: () => {}, authorized: () => true,
     audience: async () => ['other'],
@@ -1990,18 +1884,13 @@ test("a deferred batch is all ambient only while every notice folded into it was
 
 test("a wake to read a render that carries a channel starts its turn until the agent has published there having read it, unless the render was ambient", async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
-  const internals = f.framework as unknown as TurnInternals & {
-    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
-  };
+  const internals = f.framework as unknown as TurnInternals;
   const agent = f.framework.getAgent('agent')! as unknown as {
-    getContextManager(): { getAllMessages(): Array<{ sequence: number; metadata?: { deferredWriteId?: string } }>; currentBranch(): { name: string } };
+    getContextManager(): { getMessage(id: string): { id: string; sequence: number } | null; addMessage(p: string, c: unknown[]): string; currentBranch(): { name: string } };
     answeredWatermark: ReadMark | null;
     notePublished(destination: string, readThrough: ReadMark | null): void;
   };
-  internals.deferredMessages.push({ id: 'render_room', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'render_room_text' }], heldAt: Date.now() });
-  internals.readdDrained(internals.drainDeferredFor('agent'), 'render_room lands');
-  internals.ackDeferredWrites();
-  const row = agent.getContextManager().getAllMessages().find((m) => m.metadata?.deferredWriteId === 'render_room');
+  const row = agent.getContextManager().getMessage(agent.getContextManager().addMessage('editor', [{ type: 'text', text: 'render_room_text' }]));
   assert(row, 'the render landed on the current branch');
   const branch = agent.getContextManager().currentBranch().name;
   // Legacy-mode marks (no index length), by branch and the store's head.
@@ -2009,7 +1898,7 @@ test("a wake to read a render that carries a channel starts its turn until the a
   agent.answeredWatermark = at(branch, row.sequence);
   const pass = async (tagged?: 'addressed' | 'ambient' | 'untagged'): Promise<number> => {
     internals.pendingRequests.push({
-      agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), channelId: 'editor:room', readsRow: heldHandle('render_room'),
+      agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), channelId: 'editor:room', readsRow: row.id,
       ...(tagged === 'addressed' ? { addressed: true } : tagged === 'ambient' ? { addressed: false, ambient: true } : tagged === 'untagged' ? { addressed: false } : {}),
     });
     let started = 0;
@@ -2064,13 +1953,11 @@ test("a turn a wake to read a render started, held by a provider hold, is retrie
       rawError: { status: 429 }, rawRequest: request,
     } as ConstructorParameters<typeof MembraneError>[0]));
   };
-  const internals = f.framework as unknown as TurnInternals & {
-    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
-  };
-  // A render waits in the agent's queue with its wake to read it; the turn
-  // the wake starts stores it at its start and compiles it.
-  internals.deferredMessages.push({ id: 'render-1', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'queued_render' }], heldAt: Date.now() });
-  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-1') });
+  const internals = f.framework as unknown as TurnInternals;
+  // A render is stored, not yet in the agent's window, with its wake to read
+  // it; the turn the wake starts presents it at its start and compiles it.
+  const render = f.framework.getAgent('agent')!.getContextManager().addMessage('editor', [{ type: 'text', text: 'queued_render' }]);
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: render });
   await settles(f.framework.runUntilIdle(), 'the turn that meets the limit');
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('queued_render'), 'its request read the render');
@@ -2086,15 +1973,10 @@ test("a turn a wake to read a render started, held by a provider hold, is retrie
 test("a wake to read a render starts its turn when the store can't say whether the agent read it", async (t) => {
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as TurnInternals;
-  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { queryMessages: (...a: unknown[]) => unknown };
-  const query = cm.queryMessages;
-  cm.queryMessages = () => { throw new Error('a blob the store names is missing'); };
-  // The blob-free scan that stands in when the query throws can't read the
-  // store either.
-  const scanning = f.framework as unknown as { landedPositions?: unknown };
-  scanning.landedPositions = () => { throw new Error('a blob the store names is missing, and the scan failed too'); };
-  t.after(() => { delete scanning.landedPositions; });
-  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-1') });
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { getMessage: (...a: unknown[]) => unknown };
+  const getMessage = cm.getMessage;
+  cm.getMessage = () => { throw new Error('a blob the store names is missing'); };
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: 'render-1' });
   const triggers: unknown[] = [];
   const start = internals.startAgentStream;
   internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger); return undefined; };
@@ -2106,7 +1988,7 @@ test("a wake to read a render starts its turn when the store can't say whether t
   } finally {
     console.error = error;
     internals.startAgentStream = start;
-    cm.queryMessages = query;
+    cm.getMessage = getMessage;
   }
   assert.equal(triggers.length, 1, 'in doubt, the wake starts the turn');
   assert(errors.some((e) => e.includes('render-1') && e.includes('a blob the store names is missing')), `the failed read is logged: ${JSON.stringify(errors)}`);
@@ -2116,7 +1998,7 @@ test("a wake to read a render that's gone is dropped from a pass whose other wak
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as TurnInternals;
   internals.pendingRequests.push(
-    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-gone') },
+    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: 'render-gone' },
     { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
   const triggers: Wake[] = [];
   const start = internals.startAgentStream;
@@ -2163,7 +2045,7 @@ test("a provider recovery whose released wakes start no turn ends and reopens au
     return admitted;
   };
   // Under a policy that would start a turn for anything, even no cause.
-  assert.equal(await releaseThenPass(true, { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-gone') }),
+  assert.equal(await releaseThenPass(true, { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: 'render-gone' }),
     true, "a gone render's wake: the parked auxiliary call is admitted");
   assert.equal(await releaseThenPass(false, { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() }),
     true, 'a wake the policy drops: the parked auxiliary call is admitted');
@@ -2174,7 +2056,7 @@ test("a provider recovery whose released wakes start no turn ends and reopens au
   gate.primaryPending = true;
   internals.providerAccelerationRecoveries.set('agent', { startedAt: Date.now(), failures: 1, heldRequests: 2, reason: 'held', releasedAt: Date.now() });
   internals.pendingRequests.push(
-    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: heldHandle('render-gone') },
+    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: 'render-gone' },
     { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
   let started = 0;
   const start = internals.startAgentStream;
@@ -2203,12 +2085,12 @@ test("a provider hold keeps a wake to read a render, a batch wake, a batch-only 
   // subject: only its subjects tell it from an ordinary wake, or from a
   // merge of other batches.
   const merged = wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'notes'] });
-  internals.pendingRequests.push(merged, wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsRow: heldHandle('render-1') }), wake({ readsRow: heldHandle('render-2') }),
+  internals.pendingRequests.push(merged, wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsRow: 'render-1' }), wake({ readsRow: 'render-2' }),
     wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'other'] }));
   await settles(internals.processInferenceRequests(), 'the held pass');
   const held = internals.providerAccelerationCooldowns.get('agent')?.heldRequests ?? [];
   assert.deepEqual(held.map((r) => [r.coalescingSubject, r.coalescingBatchSubjects?.join(','), r.readsRow]),
-    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, heldHandle('render-1')], [undefined, undefined, heldHandle('render-2')], [undefined, 'doc,other', undefined]],
+    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, 'render-1'], [undefined, undefined, 'render-2'], [undefined, 'doc,other', undefined]],
     'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 
@@ -2238,7 +2120,7 @@ test("an assembly that throws closes the window in which its writes bypass the t
   assert.equal(internals.assembling.size, 0, 'and closed when it threw');
 });
 
-test("a write deferred for an agent while its assembly awaits a render lands in that turn's request, unless the host is quiesced by then", async (t) => {
+test("a write for an agent while its assembly awaits a render is stored at once, and lands in that turn's request, unless the host is quiesced by then", async (t) => {
   for (const quiesce of [false, true]) {
     const f = await fixture();
     try {
@@ -2253,7 +2135,6 @@ test("a write deferred for an agent while its assembly awaits a render lands in 
       const internals = f.framework as unknown as TurnInternals & {
         quiesced: boolean;
         assembling: Set<string>;
-        deferredMessages: unknown[];
         addMessage(participant: string, content: Array<{ type: 'text'; text: string }>): string;
       };
       // A plain push wakes the agent and a notice opens a batch while another
@@ -2269,10 +2150,12 @@ test("a write deferred for an agent while its assembly awaits a render lands in 
       }
       const turn = f.framework.runUntilIdle();
       await settles(started, 'the render');
-      // A module's write while the assembly awaits the render is deferred:
-      // the agent's turn is alive. The render then gives nothing, so no write
-      // of the assembly's comes after it.
-      assert.equal(internals.addMessage('Antra', [{ type: 'text', text: 'module_write' }]), '', 'deferred');
+      // A module's write while the assembly awaits the render is stored at
+      // once (#291) and presented by the assembly, before the turn's compile.
+      // The render then gives nothing, so no write of the assembly's comes
+      // after it.
+      const written = internals.addMessage('Antra', [{ type: 'text', text: 'module_write' }]);
+      assert.notEqual(written, '', 'stored at once');
       if (quiesce) internals.quiesced = true;
       release({ content: [] });
       await settles(turn, "the agent's turn");
@@ -2280,10 +2163,10 @@ test("a write deferred for an agent while its assembly awaits a render lands in 
       assert(first.includes('plain_before'), `quiesced ${quiesce}: the turn ran`);
       assert.equal(internals.assembling.size, 0, `quiesced ${quiesce}: the window closed with the assembly`);
       assert.equal(first.includes('module_write'), !quiesce, quiesce
-        ? 'a quiesced host keeps it queued for resume()'
+        ? 'a quiesced host keeps it out of the window until resume()'
         : "the turn's request read the write that arrived while its assembly awaited the render");
       if (quiesce) {
-        assert.ok(internals.deferredMessages.length > 0, 'still queued');
+        assert.equal(f.framework.getAgent('agent')!.getContextManager().windowStatusOf(written as never), 'out', 'stored, not presented');
         internals.quiesced = false;
       }
     } finally {
@@ -3091,18 +2974,20 @@ test("#157: another resident's compile that assembles a message stored at once i
   assert(!isMarked(stored), "the edit isn't marked as the agent's first view");
 });
 
-test("#157: an edit that addresses the agent, of a follow-up that arrived during the turn and was flushed when the turn was held, moves the turn to the follow-up's channel", async (t) => {
+test("#157: an edit that addresses the agent, of a follow-up that arrived during the turn and was kept out of its window while the turn was held, moves the turn to the follow-up's channel", async (t) => {
   const f = await fixture({ framework: { speech: { locus: 'latest-inbound' } } }); /* the re-pin is the legacy rule */ t.after(f.close); await f.register(); await f.register('other');
   let outcome: string | undefined;
   const channel = await heldTurnSpeaksInto(f, async () => {
-    assert(storedWith(f, 'follow_up_wiht_typo'), 'the hold flushed the follow-up into the store');
+    assert(storedWith(f, 'follow_up_wiht_typo') && !f.window().includes('follow_up_wiht_typo'), 'the follow-up is stored, out of the held turn\'s window');
     outcome = (await f.send('push/event', {
       ...f.params('e1', 'follow_up_fixed @agent', { channelId: 'other', key: 'message:mq' }), tags: ['chat:edited', 'chat:mention'],
     })).result.coalesce.outcome;
   }, async () => {
-    // The follow-up arrives while the first stream runs, so it waits in the deferred queue.
+    // The follow-up arrives while the first stream runs: stored at once, and
+    // kept out of the live turn's window (#291; before, it waited in the
+    // deferred queue).
     await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
-    assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+    assert(storedWith(f, 'follow_up_wiht_typo') && !f.window().includes('follow_up_wiht_typo'), 'stored at once, out of the live turn\'s window');
   });
   assert.equal(outcome, 'replaced', 'the edit replaced the follow-up the agent had not seen');
   assert.equal(channel, 'other');
@@ -3251,20 +3136,20 @@ test("#157: the render of a deferred notice that births its subject is the agent
  *  a first-view decision has to be taken before the removal. */
 function removals() {
   const removed = new Set<string>();
-  const key = (p: { deferredId?: string; messageId?: string }) => p.deferredId ?? p.messageId ?? '';
+  const key = (p: { messageId?: string }) => p.messageId ?? '';
   return {
-    gone: (p: { deferredId?: string; messageId?: string }) => removed.has(key(p)),
-    remove: (p: { deferredId?: string; messageId?: string }) => { removed.add(key(p)); return true; },
+    gone: (p: { messageId?: string }) => removed.has(key(p)),
+    remove: (p: { messageId?: string }) => { removed.add(key(p)); return true; },
   };
 }
 
-test("#157: a render that lands unread in another agent's deferred queue keeps its first view, so an edit that replaces it is marked", async () => {
+test("#157: a render stored unread for another agent whose turn is alive keeps its first view, so an edit that replaces it is marked", async () => {
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
   const r = removals();
   const host: CoalescerHost<null> = {
     isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
-    // Every delivery lands in the deferred queue of an agent whose turn is alive.
-    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    // Every delivery is stored for an agent whose turn is alive, and not presented to it.
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', messageId: `row-${delivered.length}`, presented: false as const }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent', 'other'],
     render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
@@ -3282,15 +3167,15 @@ test("#157: a render that lands unread in another agent's deferred queue keeps i
   assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'e1', firstView: true }], 'the render and the edit that replaced it are each marked');
 });
 
-test("#157: a notice's render that lands while an earlier render of its subject waits unread in a deferred queue is no first view", async () => {
+test("#157: a notice's render that lands while an earlier render of its subject waits unread, not shown to its agent, is no first view", async () => {
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
   let releaseFirst!: () => void;
   const firstRender = new Promise<void>((resolve) => { releaseFirst = resolve; });
   const r = removals();
   const host: CoalescerHost<null> = {
     isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
-    // Every delivery lands in the deferred queue of an agent whose turn is alive.
-    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    // Every delivery is stored for an agent whose turn is alive, and not presented to it.
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', messageId: `row-${delivered.length}`, presented: false as const }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent', 'other'],
     render: async (occ) => { if (occ.eventId === 'n1') await firstRender; return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] }; },
@@ -3311,7 +3196,7 @@ test("#157: a notice's render that lands while an earlier render of its subject 
   assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], 'only the first render is the first view');
 });
 
-/** A coalescer whose every delivery lands in the deferred queue of 'other',
+/** A coalescer whose every delivery is stored, not presented, for 'other',
  *  an agent whose turn is alive, unless `stored` names the event, whose
  *  delivery is then stored and so materialized for the assembling turn, or
  *  `unplaced` does, whose delivery is placed nowhere. The renders of `held`
@@ -3325,7 +3210,7 @@ function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Se
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
   // Each placement's event, for the per-event read and shown answers.
   const eventOf = new Map<string, string>();
-  const named = (p: { deferredId?: string; messageId?: string }, events?: Set<string>) => events?.has(eventOf.get(p.deferredId ?? p.messageId ?? '') ?? '') === true;
+  const named = (p: { messageId?: string }, events?: Set<string>) => events?.has(eventOf.get(p.messageId ?? '') ?? '') === true;
   const releases = new Map<string, () => void>();
   const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
   const started = new Map<string, () => void>();
@@ -3340,8 +3225,8 @@ function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Se
       if (unplaced.includes(occ.eventId)) return undefined;
       const placement = stored.includes(occ.eventId)
         ? { agent: 'agent', messageId: `stored-${delivered.length}` }
-        : { agent: 'other', deferredId: `deferred-${delivered.length}` };
-      eventOf.set(placement.messageId ?? placement.deferredId!, occ.eventId);
+        : { agent: 'other', messageId: `row-${delivered.length}`, presented: false as const };
+      eventOf.set(placement.messageId!, occ.eventId);
       return placement;
     },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,

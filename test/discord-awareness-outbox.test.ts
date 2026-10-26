@@ -1617,7 +1617,6 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   framework.lastVisiblePreview = async () => null;
   framework.activeTurnTokens = new Map();
   framework.nextTurnToken = 1;
-  framework.deferredMessages = [];
   framework.pendingAssistantBlocks = new Map();
   // A host/command and a store surgery are operations stop() waits for.
   framework.operatorOperations = new Set();

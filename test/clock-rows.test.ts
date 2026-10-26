@@ -275,7 +275,7 @@ function silentTick() {
   };
 }
 
-type Row = { participant: string; content: ContentBlock[]; metadata?: Record<string, any>; timestamp: Date };
+type Row = { id: string; participant: string; content: ContentBlock[]; metadata?: Record<string, any>; timestamp: Date };
 
 /** A membrane that answers a turn it has no response queued for with a
  *  plain reply, for a test where a second resident takes turns of its own. */
@@ -663,7 +663,11 @@ describe('clock rows in the framework', () => {
     } finally { await x.framework.stop(); }
   });
 
-  it('writes no clock into the residents\' shared slot while another resident\'s turn is alive', async () => {
+  // Ported for #291: a clock row is its resident's own row, in no other
+  // resident's window, so another resident's live turn holds none back. This
+  // test once had the clock wait for the assistant's turn to end, since in
+  // the shared record it would have sat inside that turn.
+  it('writes a clock for one resident while another resident\'s turn is alive, in no window but its own', async () => {
     const x = await make(undefined, { agents: [{ name: 'other', clock: { intervalMinutes: 10 } }], membrane: new AnsweringMembrane() });
     const writeFor = (name: string, text: string) =>
       (x.framework as any).addMessage('user', [{ type: 'text', text }], {}, { forAgent: name });
@@ -680,9 +684,11 @@ describe('clock rows in the framework', () => {
       writeFor('other', 'for other, after');
       await x.framework.runUntilIdle();
       const all = rows(x.framework);
-      assert.ok(!isClock(all[indexOfText(all, 'for other, mid-turn') - 1]!),
-        'none while the assistant\'s turn is alive, though 11:10 had passed: it would sit inside that turn');
-      assert.equal(textOf(all[indexOfText(all, 'for other, after') - 1]!), 'Clock: 11:30 UTC', 'one once it has ended');
+      const clock = all[indexOfText(all, 'for other, mid-turn') - 1]!;
+      assert.equal(textOf(clock), 'Clock: 11:10 UTC', "one while the assistant's turn is alive, as 11:10 had passed");
+      assert.equal(x.framework.getAgent('assistant')!.getContextManager().ordinalOf(clock.id as never), undefined, "in no window of the assistant's");
+      assert.notEqual(x.framework.getAgent('other')!.getContextManager().ordinalOf(clock.id as never), undefined, "in other's");
+      assert.equal(textOf(all[indexOfText(all, 'for other, after') - 1]!), 'Clock: 11:30 UTC', 'and the next once it is due');
     } finally { await x.framework.stop(); }
   });
 

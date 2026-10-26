@@ -3,9 +3,11 @@
  * opaque, so a test that needs where one was taken reads the store head
  * from its description (describeReadMark), and one that asks of a row a
  * legacy-mode mark covers builds the row from its sequence, as a cover
- * reads it.
+ * reads it. A mark taken in presented mode covers a row by its place in the
+ * agent's window, so a test asks it of a real row (newestCovered).
  */
-import { describeReadMark, readMarkForTest, type MarkedRow, type ReadMark } from '../../src/read-marks.js';
+import type { StoredMessage } from '@animalabs/context-manager';
+import { covers, describeReadMark, readMarkForTest, type MarkCm, type MarkedRow, type ReadMark } from '../../src/read-marks.js';
 
 /** The store head `mark` was taken at (`main@412` or `main@412#57` gives 412). */
 export function headOf(mark: ReadMark | null): number {
@@ -22,4 +24,12 @@ export function rowAt(sequence: number, id = `row@${sequence}`): MarkedRow {
 /** A mark taken in legacy mode on `mark`'s branch, `by` past its head (`-1`: just before it). */
 export function legacyMarkFrom(mark: ReadMark, by: number): ReadMark {
   return readMarkForTest(mark.branch, headOf(mark) + by, null);
+}
+
+/** The newest row of `cm`'s window that `mark` covers: what a request whose
+ *  mark it is had read last. Throws when it covers none. */
+export function newestCovered(mark: ReadMark | null, cm: MarkCm & { getPresentedMessages(): StoredMessage[] }): StoredMessage {
+  const row = cm.getPresentedMessages().filter((m) => covers(mark, cm, m) === 'covered').at(-1);
+  if (!row) throw new Error(`${describeReadMark(mark)} covers no row of the window`);
+  return row;
 }

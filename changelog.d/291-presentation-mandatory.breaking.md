@@ -1,0 +1,21 @@
+- **Hosts: every agent's context follows its own presentation index** (#291). `FrameworkConfig.presentationIndex`
+  is removed: what it turned on is how every framework runs (see the presentation index's entries), and a host's
+  configuration that still passes it is read as any unknown key is. `create()` refuses a context-manager without
+  `ContextManager.presentRows`. An agent whose window can't be written down at its registration (another version's
+  index format, a failed write) stays in legacy mode for that process, its window the whole record, as before.
+  - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
+    agent's window, its own as undone and others' back to arrived, and `redo` puts them back. Neither writes the
+    record or moves a branch, so neither reverts the workspace or `_config` mounts, MCPL checkpoints or the
+    inference log any more: `rollbackToMessage` is the record-level revert. The result's `fromBranch` and `toBranch`
+    are both the store's branch and its `window` says how many rows left or entered; the `undo:completed` and
+    `redo:completed` traces are removed in favour of `window:undone`, and the API server broadcasts `window:undone`
+    in place of `branch:switched` for them. Both are refused while a turn of the agent's is alive, and for an agent
+    whose window isn't presented.
+  - **Context-manager's MANIFEST:** with a chronicle that has the batched identity append, the first window
+    write-down that holds rows, or any presentation of more than one row, moves the store's MANIFEST to version 2,
+    which earlier chronicle builds refuse (context-manager's 291-window-batches entry). Going back to an earlier
+    release after that needs a copy of the store taken before the upgrade.
+
+  **Migration:** drop `presentationIndex` from the configuration. A host that listened for `undo:completed`,
+  `redo:completed`, or `branch:switched` with reason `undo`/`redo`, to refresh a view listens for `window:undone`.
+  A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`.

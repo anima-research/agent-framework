@@ -27,6 +27,11 @@ class Injecting implements Module {
   }
 }
 
+/** For each agent's context manager, what presents a row `say` wrote straight
+ *  to it (#291: a row enters a window at a point, and a compile reads the
+ *  window), as a row the framework stores at rest is presented at once. */
+const presenters = new Map<ContextManager, () => void>();
+
 async function make() {
   const dir = mkdtempSync(join(tmpdir(), 'request-compile-stats-'));
   const framework = await AgentFramework.create({
@@ -39,6 +44,9 @@ async function make() {
     ],
     modules: [new Injecting()],
   });
+  const internal = framework as unknown as { agents: Map<string, unknown>; presentAtEndOf(agent: unknown): void };
+  const presentAll = () => { for (const agent of internal.agents.values()) internal.presentAtEndOf(agent); };
+  for (const name of ['agent', 'plain', 'knowing']) presenters.set(framework.getAgent(name)!.getContextManager(), presentAll);
   return {
     framework,
     async close() { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
@@ -57,7 +65,11 @@ function recordResults(cm: ContextManager): CompileResult[] {
   return results;
 }
 
-const say = (cm: ContextManager, participant: string, text: string) => cm.addMessage(participant, [{ type: 'text', text }]);
+const say = (cm: ContextManager, participant: string, text: string) => {
+  const id = cm.addMessage(participant, [{ type: 'text', text }]);
+  presenters.get(cm)?.();
+  return id;
+};
 
 /** What a select chose, by bucket: the stats without the parts that can
  *  differ between two compiles of the same selection, such as a plan's

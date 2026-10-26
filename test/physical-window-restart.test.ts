@@ -88,7 +88,7 @@ const image = (): ContentBlock => ({ type: 'image', source: { type: 'base64', da
 /**
  * A tool whose first call brings in a message with the given blocks beside
  * a line of text while it runs, as someone sending photos mid-turn does.
- * The framework holds the message, and the next round carries it as a
+ * The framework stores the message, and the next round carries it as a
  * mid-turn injection. Later calls bring in nothing.
  */
 class PhotosDuringToolModule implements Module {
@@ -115,12 +115,15 @@ class PhotosDuringToolModule implements Module {
         content: [{ type: 'text', text: PHOTOS_TEXT }, ...this.blocks],
         metadata: {},
       } as unknown as ProcessEvent);
-      // The call returns once the framework holds this message for the
-      // round's boundary.
-      const held = () => (framework as unknown as { deferredMessages: Array<{ content: ContentBlock[] }> }).deferredMessages
-        .some((m) => m.content.some((b) => b.type === 'text' && b.text === PHOTOS_TEXT));
+      // The call returns once the framework has stored this message, out of
+      // the live turn's window until the round's boundary presents it (#291;
+      // it once waited in the deferred queue).
+      const cm = (framework as unknown as { deliveryAgent(): { getContextManager(): { getAllMessages(): Array<{ content: ContentBlock[] }> } } })
+        .deliveryAgent().getContextManager();
+      const held = () => cm.getAllMessages()
+        .some((m) => m.content.some((b) => b.type === 'text' && (b as { text?: string }).text === PHOTOS_TEXT));
       for (const end = Date.now() + 5_000; !held();) {
-        if (Date.now() > end) throw new Error('the message was never held for the boundary');
+        if (Date.now() > end) throw new Error('the message was never stored for the boundary');
         await new Promise((r) => setTimeout(r, 5));
       }
     }
@@ -687,11 +690,19 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
   });
 
-  it("prices a mid-turn image at its tokenEstimate stamp", async () => {
+  // Since #291 a message is stored at once and a boundary injects the stored
+  // copy, and the store keeps an inline image as its source alone (no
+  // tokenEstimate stamp: context-manager's blob round trip). So the stamp
+  // reaches no injection, and the image is priced at 1,600, as the store's
+  // later compiles price it; an overestimate, which costs one early restart.
+  // This test once had the stamp price the injection, from the deferral
+  // queue's copy as it was written.
+  it("prices a mid-turn image as the store keeps it: a stamp the stored copy doesn't carry prices nothing", async () => {
     const stamped = { ...image(), tokenEstimate: 100 } as ContentBlock;
-    const { restarted, carried } = await photosRound([stamped, stamped, stamped]);
-    assert.ok(!restarted, 'three images stamped at 100 tokens fit, where three unstamped cross');
-    assert.ok(carried, 'the message rode into the next round');
+    const { restarted, appended, carried } = await photosRound([stamped, stamped, stamped]);
+    assert.ok(restarted, 'three images cross the window, as three unstamped do');
+    assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
+    assert.ok(carried, 'the restarted request carries the message');
   });
 
   for (const stamp of [Number.NaN, -1_600]) {
