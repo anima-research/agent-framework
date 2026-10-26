@@ -60,7 +60,8 @@
   messages stay in the store, but no agent reads them again, so an undo and
   then a redo don't bring it back. It's disposed whether or not its own
   re-initialization succeeded, with the disposal's alert alone, which gives
-  that failure's cause when there was one. After a rollback, a branch
+  that failure's cause when there was one; that alert's webhook cooldown is
+  its own, so a refusal posted for the same agent doesn't silence it. After a rollback, a branch
   switch, an undo or a redo, every conversation agent is judged once, on
   the branch the store lands on, after every manager is re-initialized, so
   a fork an undo empties and a redo made before then restores is kept; a

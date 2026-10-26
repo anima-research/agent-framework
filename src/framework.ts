@@ -11712,15 +11712,17 @@ export class AgentFramework {
 
   private reportReinitFailures(after: ReinitMove, failures: ManagerReinitFailure[]): void {
     for (const failure of failures) {
-      this.reportReinitFailure(failure.agentName, after, 'disposed' in failure
-        ? disposalAlert({ move: after, ...failure.disposed }).message
-        : refusedWorkAlert(after, failure.error).message);
+      if ('disposed' in failure) {
+        this.reportReinitFailure(failure.agentName, after, disposalAlert({ move: after, ...failure.disposed }).message, 'disposed');
+      } else {
+        this.reportReinitFailure(failure.agentName, after, refusedWorkAlert(after, failure.error).message);
+      }
     }
   }
 
-  private reportReinitFailure(agentName: string, after: string, message: string): void {
+  private reportReinitFailure(agentName: string, after: string, message: string, key?: string): void {
     console.error(`[operator] agent=${agentName} ${boundFailureText(message)}`);
-    this.opsAlert('context-reinit-failed', agentName, message, { data: { after } });
+    this.opsAlert('context-reinit-failed', agentName, message, { data: { after }, ...(key === undefined ? {} : { key }) });
   }
 
   private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): Promise<void>; abandon(): void } {

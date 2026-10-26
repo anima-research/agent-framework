@@ -1363,7 +1363,7 @@ describe('conversation forks and an undo', () => {
       const message = alerts[0]!.message;
       assert.ok(message.startsWith('The undo left this conversation agent with no messages of its own'), message);
       says(message, 'it was disposed and its channel unbound', "Its channel's next qualifying message spawns a new fork",
-        "a redo to a branch that holds them doesn't bring this one back");
+        "which needs the template's own context manager to be working", "a redo to a branch that holds them doesn't bring this one back");
       assert.doesNotMatch(message, /refuses its work|held for it/);
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed rather than left to answer with no history');
       const router = framework.getConversationRouter()!;
@@ -1420,15 +1420,19 @@ describe('conversation forks and an undo', () => {
       const alerts = reinitAlertsOf(framework);
       const pass = gateReinit(framework, 'a-tail-g1');
       const undo = framework.undoLastTurn('a');
-      await pass.reached;
-      for (const event of [
-        channelMessage('world:late', 'A MESSAGE WHILE HELD'),
-        channelMessage('world:late', 'A CORRECTION WHILE HELD', { deliverTo: 'a-late-g1' }),
-      ]) {
-        const placement = await internals.handleMcplChannelIncoming(event);
-        assert.ok(placement?.deferredId, `deferred: ${JSON.stringify(placement)}`);
+      try {
+        await pass.reached;
+        for (const event of [
+          channelMessage('world:late', 'A MESSAGE WHILE HELD'),
+          channelMessage('world:late', 'A CORRECTION WHILE HELD', { deliverTo: 'a-late-g1' }),
+        ]) {
+          const placement = await internals.handleMcplChannelIncoming(event);
+          assert.equal(placement?.agent, 'a-late-g1', `placed for the fork: ${JSON.stringify(placement)}`);
+          assert.ok(placement?.deferredId, `deferred: ${JSON.stringify(placement)}`);
+        }
+      } finally {
+        pass.open();
       }
-      pass.open();
       await undo.settled;
       assert.ok(!framework.getAgent('a-late-g1'), 'disposed: nothing was written into its emptied namespace while the store was held');
       assert.deepEqual(alerts.map((alert) => alert.agentName).sort(), ['a-late-g1', 'a-tail-g1'], JSON.stringify(alerts));
@@ -1883,6 +1887,44 @@ describe('conversation forks and an undo', () => {
     }, { tick: true });
   });
 
+  it("a rollback asked for in the same step as a mention that spawns a fork is refused as busy", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-spawn-busy-', async (framework, forkInternals) => {
+      const internals = forkInternals as unknown as HoldInternals;
+      const cmA = framework.getAgent('a')!.getContextManager();
+      cmA.addMessage('user', [{ type: 'text', text: 'hello a' }]);
+      cmA.addMessage('user', [{ type: 'text', text: 'again' }]);
+      const first = cmA.getAllMessages()[0]!;
+      const arriving = internals.handleMcplChannelIncoming(channelMessage('world:new', 'A FIRST MENTION'));
+      await assert.rejects(framework.rollbackToMessage('a', { messageId: first.id }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /is being created/.test(e.message));
+      const placement = await arriving;
+      assert.ok(placement?.agent && framework.getAgent(placement.agent), `the spawn made its fork: ${JSON.stringify(placement)}`);
+      assert.equal(cmA.getAllMessages().length, 2, 'the rollback changed nothing');
+    });
+  });
+
+  it("a fork that refused its work and is then disposed has both alerts posted to the webhook", { timeout: 30_000 }, async () => {
+    const webhook = captureWebhook();
+    try {
+      await withForks('reinit-fork-dispose-webhook-', async (framework, internals) => {
+        await forksAroundACheckpoint(framework, internals);
+        const strategy = framework.getAgent('a-late-g1')!.getContextManager().getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+        const initialize = strategy.initialize.bind(strategy);
+        strategy.initialize = async () => { throw new Error('injected fork init failure'); };
+        await framework.switchBranch(framework.getStore().currentBranch().name);
+        strategy.initialize = initialize;
+        await framework.undoLastTurn('a').settled;
+        assert.ok(!framework.getAgent('a-late-g1'), 'disposed');
+        const posts = webhook.posted.filter((post) => post.startsWith('\u{1F6A8} **a-late-g1** context-reinit-failed: '));
+        assert.equal(posts.length, 2, JSON.stringify(posts.map((post) => post.slice(0, 120))));
+        says(posts[0]!, 'refuses its work');
+        says(posts[1]!, 'it was disposed and its channel unbound');
+      });
+    } finally {
+      webhook.restore();
+    }
+  });
+
   it("while a rollback waits for running maintenance, a fork's channel message is deferred, and lands on the branch the rollback moves to", { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-hold-rollback-', async (framework, forkInternals) => {
       await forksAroundACheckpoint(framework, forkInternals);
@@ -2248,8 +2290,9 @@ describe("a re-initialization alert's opening", () => {
           const reinitFailed = `injected re-initialization failure ${'z'.repeat(causeLength)}`;
           shapes.push([`disposal after the ${move} whose cleanup failed, ${heldWrites} held`, disposalAlert({ move, cleanupFailed, heldWrites }), false]);
           shapes.push([`disposal after the ${move} whose re-initialization failed, ${heldWrites} held`, disposalAlert({ move, reinitFailed, heldWrites }), false]);
-          shapes.push([`disposal after the ${move} whose re-initialization and cleanup failed, ${heldWrites} held`,
-            disposalAlert({ move, reinitFailed, cleanupFailed, heldWrites }), false]);
+          const bothFailed = disposalAlert({ move, reinitFailed, cleanupFailed, heldWrites });
+          says(bothFailed.message, `Its re-initialization had failed: ${reinitFailed}.`, `Its cleanup failed: ${cleanupFailed}.`);
+          shapes.push([`disposal after the ${move} whose re-initialization and cleanup failed, ${heldWrites} held`, bothFailed, false]);
           const whole = disposalAlert({ move, heldWrites }).message;
           assert.equal(opsWebhookText(whole), whole, `a disposal after the ${move} with ${heldWrites} held and no failure carries no cause, and is kept whole`);
         }
