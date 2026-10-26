@@ -45,7 +45,7 @@ type Internals = {
   dispatchSleepToolCall(agentName: string, call: ToolCall): void;
   scriptWake(agentName: string, scriptId: string, text: string, label: string): Promise<void>;
   bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: unknown): void;
-  readsDeferredFor(placement: { agent?: string; deferredId?: string } | undefined, agentName: string): { readsDeferredWrite?: string };
+  readsWriteFor(placement: { agent?: string; deferredId?: string; messageId?: string } | undefined, agentName: string): { readsDeferredWrite?: string; readsStoredMessage?: string };
   dispatchChannelToolCall(agentName: string, call: ToolCall): void;
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
@@ -664,12 +664,14 @@ describe('a wake for a write heard mid-turn', () => {
     });
   }
 
-  it("a write deferred for one agent marks that agent's wake only, and a write stored at once marks none", async () => {
+  it("a write marks the wake of the agent it went to with the id it was deferred or stored under, and another agent's wake stays plain", async () => {
     const framework = await createFramework();
     const fw = internals(framework);
-    assert.deepEqual(fw.readsDeferredFor({ agent: 'assistant', deferredId: 'd-1' }, 'assistant'), { readsDeferredWrite: 'd-1' });
-    assert.deepEqual(fw.readsDeferredFor({ agent: 'assistant', deferredId: 'd-1' }, 'helper'), {}, "another agent's wake stays plain");
-    assert.deepEqual(fw.readsDeferredFor({ agent: 'assistant' }, 'assistant'), {}, 'its wake starts the turn that reads it');
+    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', deferredId: 'd-1' }, 'assistant'), { readsDeferredWrite: 'd-1' });
+    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', deferredId: 'd-1' }, 'helper'), {}, "another agent's wake stays plain");
+    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', messageId: 'm-1' }, 'assistant'), { readsStoredMessage: 'm-1' },
+      'a wake can wait while a request reads a stored write, as behind a held continuation');
+    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', messageId: 'm-1' }, 'helper'), {}, "another agent's wake stays plain");
     await framework.stop();
   });
 
