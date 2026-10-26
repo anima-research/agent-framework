@@ -423,6 +423,27 @@ test("/unstick after a refusal whose reply had text sheds that reply first, sinc
   } finally { await rig.close(); }
 });
 
+test("when /unstick gives up at its cap, no later request carries the refused reply's text", async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[], [refused()], [refused()], [refused(partial)]], {});
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 2);
+    const started = await (rig.framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; started?: boolean }>;
+    }).handleHostCommand('test-server', { command: 'unstick', agentName: 'scout', maxRewinds: 1 });
+    assert.equal(started.started, true);
+    for (let i = 0; i < 200 && rig.requests.length < 4; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    await rig.framework.runUntilIdle();
+    assert.equal(rig.requests.length, 4, "the premise: the unstick's run, refused, and its one retry, refused with text");
+    assert.ok(markerOf(rig.requests[3]!), 'the premise: the retry followed a rewind');
+    await rig.say('a new question', 5);
+    assert.equal(rig.requests.length, 5, 'the unstick gave up, and the next turn ran');
+    assert.ok(!rig.texts(rig.requests[4]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+    assert.ok(rig.texts(rig.requests[4]!).some((t) => t.includes('reply 1')), 'and still carries the history before the shed turn');
+  } finally { await rig.close(); }
+});
+
 test('/unstick after a refusal sheds the refused message, not the refused reply, and the marker says 1', async () => {
   const rig = await rewindRig([[], [refused()], [refused()]], {});
   try {
