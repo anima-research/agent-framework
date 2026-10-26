@@ -605,7 +605,7 @@ test('act\'s results arrive as a direct call\'s do: structured content to a scri
         const failing = (msg.params as Json).arguments && ((msg.params as Json).arguments as Json).fail === true;
         peer.reply(msg.id, failing
           ? { content: [{ type: 'text', text: 'the board is locked' }], isError: true }
-          : { content: [{ type: 'text', text: 'peeked' }], structuredContent: { seen: ['a', 'b'] } });
+          : { content: [{ type: 'text', text: 'peeked' }, { type: 'text', text: 'twice' }], structuredContent: { seen: ['a', 'b'] } });
         return;
       }
       if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
@@ -613,12 +613,16 @@ test('act\'s results arrive as a direct call\'s do: structured content to a scri
   });
   const fw = await connectedTo(server, { codeExecution: { enabled: true } });
   try {
-    const code = 'const r = await tools["toolsets--act"]({ server: "arc", tool: "peek", args: {} }); text(JSON.stringify(r.structuredContent));';
+    const code = 'const a = await tools["toolsets--act"]({ server: "arc", tool: "peek", args: {} }); const d = await tools["arc--status"]({}); text(JSON.stringify([a.content, a.structuredContent, d.content, d.structuredContent]));';
     await modelCalls(fw, [
       { type: 'tool_use', id: 'toolu_script', name: 'code_execution', input: { code } },
       { type: 'tool_use', id: 'toolu_error', name: 'toolsets--act', input: { server: 'arc', tool: 'peek', args: { fail: true } } },
     ]);
-    assert.match(resultFor(fw, 'toolu_script'), /\{"seen":\["a","b"\]\}/);
+    const printed = resultFor(fw, 'toolu_script');
+    const [actContent, actStructured, directContent, directStructured] = JSON.parse(printed.slice(printed.indexOf('[['), printed.lastIndexOf(']') + 1)) as unknown[];
+    assert.deepEqual(actStructured, { seen: ['a', 'b'] });
+    assert.deepEqual([actContent, actStructured], [directContent, directStructured], 'as the static tool\'s direct call reads the same answer');
+    assert.equal((actContent as unknown[]).length, 2, 'each of the server\'s blocks');
     assert.match(resultFor(fw, 'toolu_error'), /the board is locked/);
     const results = (fw.membrane.lastStream?.receivedToolResults ?? []).flat() as Array<{ toolUseId: string; isError?: boolean }>;
     assert.equal(results.find((r) => r.toolUseId === 'toolu_error')?.isError, true, 'an error result');
