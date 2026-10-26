@@ -29774,7 +29774,7 @@ export class AgentFramework {
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
     const repeats: Array<{ serverId: string; tools: string[] }> = [];
-    const movesListed = new Map<string, { controller: ToolsetController; moves: Array<{ name: string; to: Presence }> }>();
+    const movesListed = new Map<string, { controller: ToolsetController; prefix: string; moves: Array<{ name: string; to: Presence }> }>();
 
     for (const server of [...this.mcplServerRegistry.getAllServers()]) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -29794,13 +29794,12 @@ export class AgentFramework {
         // server's tap, so its presence is current.
         // The static↔dynamic moves the lists made since the last rebuild
         // reach the tool list here (§4.2). The agent is told where each tool
-        // went once this refresh publishes the list, and not by a refresh that
-        // doesn't; a listing that breaks off tells only the moves of the
-        // tools it reached. The rest stay pending for one that does.
+        // went once this refresh publishes a list that shows it there: a move
+        // to static once the list offers the tool, a move to dynamic once it
+        // doesn't (a listing that breaks off publishes what it read). The
+        // rest stay pending for a refresh that does.
         const presence = this.toolsetHub?.get(server.id);
-        const pending = presence?.presence.active ? new Map(presence.presence.moves().map((m) => [m.name, m])) : undefined;
-        const reached: Array<{ name: string; to: Presence }> = [];
-        if (presence && pending) movesListed.set(server.id, { controller: presence, moves: reached });
+        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, prefix, moves: presence.presence.moves() });
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -29837,8 +29836,6 @@ export class AgentFramework {
           if (featureSet !== undefined) {
             toolFeatureSets.set(namespacedName, featureSet);
           }
-          const move = pending?.get(tool.name);
-          if (move) reached.push(move);
         }
         if (repeated.length > 0) repeats.push({ serverId: server.id, tools: repeated });
       } catch {
@@ -29933,7 +29930,10 @@ export class AgentFramework {
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
     this.mcplListedServers = listedServers;
-    for (const [serverId, { controller, moves }] of movesListed) if (listedServers.has(serverId)) controller.applyMoves(moves);
+    const offered = new Set(this.mcplTools.map((tool) => tool.name));
+    for (const [serverId, { controller, prefix, moves }] of movesListed) {
+      if (listedServers.has(serverId)) controller.applyMoves(moves.filter((m) => (m.to === 'static') === offered.has(`${prefix}--${m.name}`)));
+    }
     for (const { serverId, tools: repeatedTools } of repeats) {
       const one = repeatedTools.length === 1;
       const listed = repeatedTools.map((name) => logValue(name)).join(', ');

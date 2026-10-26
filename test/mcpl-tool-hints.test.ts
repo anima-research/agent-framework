@@ -1542,6 +1542,48 @@ test('RFC-014 §4.2: a rebuild whose listing of a server breaks off before a mov
   }
 });
 
+test('RFC-014 §4.2: a move a broken-off listing didn\'t publish is told by the next rebuild that does', async () => {
+  const moved = withPresence('peek', 'static');
+  const list = [moved[0]!, null as unknown as Json, ...moved.slice(1)];
+  const { t, moveAndHold, release } = await movingServer(list);
+  const toldMoved = () => notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length;
+  try {
+    await moveAndHold();
+    release();
+    await waitFor(() => (t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight === false, 'the broken rebuild ended');
+    assert.equal(toldMoved(), 0, 'not told while the list doesn\'t show peek');
+    list.splice(1, 1);
+    const lists = t.server.received.filter((m) => m.method === 'tools/list').length;
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => t.server.received.filter((m) => m.method === 'tools/list').length > lists, 'the next rebuild\'s tools/list asked for');
+    release();
+    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the next rebuild publishes peek');
+    await waitFor(() => toldMoved() > 0, 'the move told');
+    await nextMacrotask();
+    assert.equal(toldMoved(), 1, 'once');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
+test('RFC-014 §4.2: a move to dynamic is told by a broken-off listing that no longer offers the tool, though it never read it', async () => {
+  const { t, moveAndHold, release } = await movingServer([null as unknown as Json, ...withPresence('status', 'dynamic')]);
+  const toldLeft = () => notices(t.fw).filter((x) => x.includes('status left your tool list')).length;
+  try {
+    await moveAndHold();
+    release();
+    await waitFor(() => !t.fw.framework.getAllTools().some((x) => x.name === 'arc--status'), 'the rebuild publishes a list without status');
+    await waitFor(() => toldLeft() > 0, 'the move told');
+    await nextMacrotask();
+    assert.equal(toldLeft(), 1, 'once');
+    assert.equal(resultText(await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'status', args: {} })), 'status done', 'and act calls it');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
 test('RFC-014 §4.2: a rebuild whose listing of a server breaks off after a moved tool tells its move once, and the tool list shows it', async () => {
   const { t, moveAndHold, release } = await movingServer([...withPresence('peek', 'static'), null as unknown as Json]);
   try {
