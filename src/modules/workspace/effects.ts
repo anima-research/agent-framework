@@ -60,7 +60,6 @@ import {
   leadsInto,
   nameOf,
   coversLanding,
-  namesNestedPlace,
   nestedAtReal,
   parentOf,
 } from './observe.js';
@@ -398,8 +397,8 @@ export async function writeContained(
 export async function refusedLanding(view: MountView, rootReal: string, rel: string, real: string): Promise<string | null> {
   const leaves = view.followSymlinks ? LEAVES_MOUNT : OUTSIDE_PARENT;
   if (!contained(rootReal, real)) return leaves;
-  const holder = nestedAtReal(real, view.nested);
-  if (holder) return namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, rel, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED;
+  const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });
+  if (holder) return holder.names(false) ? leadsInto(view.name, rel, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED;
   if (!(await coversLanding(view, rootReal, real, rel))) return view.followSymlinks ? leaves : NOT_FOLLOWED;
   return null;
 }
@@ -581,10 +580,10 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     // and the file it leads to are left as they are. Where that mount's
     // include leaves the place out, it's no mount's, and the link leaves this
     // one (namesNestedPlace).
-    const holder = nestedAtReal(real, view.nested);
+    const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });
     if (holder) {
-      const directory = holder.include !== undefined && await stat(real).then((s) => s.isDirectory(), () => false);
-      throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, directory) ? leadsInto(view.name, rel, holder) : LEAVES_MOUNT, false);
+      const directory = holder.judgedByInclude && await stat(real).then((s) => s.isDirectory(), () => false);
+      throw new EffectFailed(holder.names(directory) ? leadsInto(view.name, rel, holder) : LEAVES_MOUNT, false);
     }
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);

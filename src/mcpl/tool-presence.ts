@@ -25,7 +25,7 @@
  *
  * Ported from mcpl-cc-bridge's presence.ts, the reference host.
  */
-import { objectSignature, renderToolLines, toolDigest, type HintedTool } from './tool-signature.js';
+import { objectSignature, renderToolLines, toolDigest, type HintedTool, type Shown } from './tool-signature.js';
 
 export interface ToolsetDecl {
   title?: string;
@@ -69,15 +69,20 @@ export interface Change {
   /** The visible tools after the change. */
   now: HintedTool[];
 }
-export interface ChangeSet { changes: Change[]; suggest: Suggestion[]; notes: string[] }
+export interface ChangeSet {
+  changes: Change[];
+  suggest: Suggestion[];
+  notes: string[];
+  /** Ended records' notes, by id: rendered while the id is untold, told once the set reaches an agent (markTold). */
+  ended?: Array<{ id: string; note: string }>;
+  /** false when its taker showed the change without its blocks (a look that restates the present shows the live catalog instead): told() then counts none of its definitions shown, while a notice that tells it still shows them. */
+  blocksShown?: false;
+}
 
 export const emptyChange = (): ChangeSet => ({ changes: [], suggest: [], notes: [] });
-export const isEmptyChange = (c: ChangeSet): boolean => !c.changes.length && !c.suggest.length && !c.notes.length;
-export const joinChanges = (...sets: ChangeSet[]): ChangeSet => ({
-  changes: sets.flatMap((s) => s.changes),
-  suggest: sets.flatMap((s) => s.suggest),
-  notes: sets.flatMap((s) => s.notes),
-});
+export const isEmptyChange = (c: ChangeSet): boolean => !c.changes.length && !c.suggest.length && !c.notes.length && !c.ended?.length;
+/** Whether a change to one key shows that key's tools in a block: what render prints and markShown counts as shown. */
+const showsBlock = (c: Change): boolean => !c.closed && (c.opened || c.appeared.length > 0 || c.redefined.length > 0 || c.gone.length > 0);
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
@@ -90,7 +95,7 @@ const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v 
  *           the last + 1 (a message was lost unread): recover.
  *  behind:  at or below the last, not applied: recover.
  */
-export interface ApplyOutcome { applied: boolean; skipped: boolean; behind: boolean; suggest: Suggestion[] }
+export interface ApplyOutcome { applied: boolean; skipped: boolean; behind: boolean; suggest: Suggestion[]; unlisted: boolean }
 
 /** What a hint `definition` may change (RFC §6.1): everything else stays the listed tool's. */
 interface DefOverride { description?: string; inputSchema?: Record<string, unknown>; annotations?: Record<string, unknown> }
@@ -117,10 +122,10 @@ export class ToolPresence {
   private visible = new Map<string, Set<string>>();
   /** Definition overrides from hints: per key (an instance's own, or a toolset's), per tool. */
   private defs = new Map<string, Map<string, DefOverride>>();
-  /** `ended` ids told to the agent: once per id, across reconnects (RFC §5.3). */
+  /** `ended` ids told to the agent, kept while the server still reports them (RFC §5.3). */
   private toldEnded = new Set<string>();
+  /** Moves a tools/list made that the model's tool list doesn't show yet: told once a rebuild has published them. */
   private pendingMoves = new Map<string, Presence>();
-  private moved = new Map<string, Presence>();
   /** Digests of definitions the model has been shown with their first sentence. */
   readonly shown = new Set<string>();
 
@@ -132,6 +137,8 @@ export class ToolPresence {
     private readonly allowed: (tool: string) => boolean = () => true,
     /** How a static tool is named in the API tool list, for `look`. */
     private readonly listedName: (tool: string) => string = (tool) => tool,
+    /** Where the model's published tool list last put a tool, if it's there (shownAs). */
+    private readonly published: (tool: string) => Presence | undefined = () => undefined,
   ) {}
 
   // ── connection lifecycle ──
@@ -166,6 +173,7 @@ export class ToolPresence {
       }
     }
     this.declared = decl;
+    for (const name of Object.keys(decl)) this.groups.delete(name);
     this.surface = mcpl && isObj(mcpl.surface) ? { title: str(mcpl.surface.title), summary: str(mcpl.surface.summary) } : null;
     // RFC §5.1: removing a toolset, or turning its instances on or off, ends
     // its open instances; one that becomes undeclared starts closed under the
@@ -190,21 +198,35 @@ export class ToolPresence {
     this.visible.clear();
     this.defs.clear();
     this.pendingMoves.clear();
-    this.moved.clear();
   }
 
   /** tools/list: every definition, visible or not (RFC §4.1). A tool the host's policy refuses is left out. */
   setTools(list: HintedTool[]): void {
-    this.tools = new Map(list
-      .filter((t) => isObj(t) && typeof t.name === 'string' && this.allowed(t.name))
-      .map((t) => [t.name, t]));
+    const seen = new Map([...this.tools.keys()].map((name) => [name, this.presenceOf(name)]));
+    const named = list.filter((t) => isObj(t) && typeof t.name === 'string');
+    this.tools = new Map();
+    for (const t of named) if (this.allowed(t.name) && !this.tools.has(t.name)) this.tools.set(t.name, t);
     for (const set of this.visible.values()) for (const n of [...set]) if (!this.tools.has(n)) set.delete(n);
+    // RFC §4.1: the list states each tool's presence, and presence follows
+    // it. A changed presence is a move the model's tool list shows at its
+    // next rebuild (§4.2; applyMoves); one the list reverses before then
+    // never reached that list.
+    for (const name of [...this.pendingMoves.keys()]) if (!this.tools.has(name)) this.pendingMoves.delete(name);
+    for (const name of this.active ? this.tools.keys() : []) {
+      const was = seen.get(name);
+      const listed = this.listedPresence(name);
+      if (this.pendingMoves.has(name)) {
+        if (this.pendingMoves.get(name) !== listed) this.pendingMoves.delete(name);
+      } else if (was !== undefined && was !== listed) {
+        this.pendingMoves.set(name, listed);
+      }
+    }
     // The list's `mcpl/visible` is the server's word only where nothing else
     // speaks: toolset-less dynamic tools and undeclared groups. For a declared
     // toolset it's an aggregate ("visible in some open instance"); per-instance
     // state comes from toolsets/list and hint changes (RFC §4.1, §5.3).
     for (const t of this.tools.values()) {
-      if (this.presenceOf(t.name) !== 'dynamic') continue;
+      if (this.listedPresence(t.name) !== 'dynamic') continue;
       const ts = this.toolsetOf(t.name);
       if (ts && this.isDeclared(ts)) continue;
       this.setVisible(keyOf(ts ?? NO_TOOLSET), t.name, t._meta?.['mcpl/visible'] !== false);
@@ -234,12 +256,23 @@ export class ToolPresence {
     return m && typeof m['mcpl/toolset'] === 'string' && m['mcpl/toolset'] ? (m['mcpl/toolset'] as string) : undefined;
   }
 
-  /** static unless hinted dynamic; a toolset wins over any "static" (RFC §4.1); a move applies only at a boundary (applyMoves). */
+  /** As the list states it: a toolset's tool is dynamic whatever a hint says (RFC §4.1). */
   presenceOf(name: string): Presence {
     if (!this.active) return 'static';
+    return this.listedPresence(name);
+  }
+
+  /** RFC §4.2: "Until it applies the move, the tool keeps working where it
+   *  is." Whether a tool is at `place` in the tool list last published, or
+   *  in the server's latest tools/list (its presence). Until a rebuild
+   *  applies a move the two differ, and a call is taken at either. */
+  shownAs(name: string, place: Presence): boolean {
+    if (!this.active) return place === 'static';
+    return this.published(name) === place || this.listedPresence(name) === place;
+  }
+
+  private listedPresence(name: string): Presence {
     if (this.toolsetOf(name)) return 'dynamic';
-    const moved = this.moved.get(name);
-    if (moved) return moved;
     return this.tools.get(name)?._meta?.['mcpl/presence'] === 'dynamic' ? 'dynamic' : 'static';
   }
 
@@ -332,12 +365,12 @@ export class ToolPresence {
 
   /** Apply a HintChanges (RFC §6.1) from any of its carriers, as it is read (see ApplyOutcome). */
   apply(h: unknown): ApplyOutcome {
-    const none: ApplyOutcome = { applied: false, skipped: false, behind: false, suggest: [] };
+    const none: ApplyOutcome = { applied: false, skipped: false, behind: false, suggest: [], unlisted: false };
     if (!isObj(h) || typeof h.rev !== 'number' || !Number.isFinite(h.rev)) return none;
     if (h.rev <= this.rev) return { ...none, behind: true };
     const skipped = h.rev !== this.rev + 1;
     this.rev = h.rev;
-    return { ...none, applied: true, skipped, suggest: this.applyBody(h) };
+    return { ...none, applied: true, skipped, ...this.applyBody(h) };
   }
 
   /**
@@ -352,7 +385,8 @@ export class ToolPresence {
     return lost;
   }
 
-  private applyBody(h: Record<string, unknown>): Suggestion[] {
+  private applyBody(h: Record<string, unknown>): { suggest: Suggestion[]; unlisted: boolean } {
+    let unlisted = false;
     for (const e of arr(h.toolsets)) {
       if (!isObj(e) || !str(e.toolset) || !this.isDeclared(e.toolset as string)) continue; // undeclared toolsets are host-local
       const ts = e.toolset as string;
@@ -366,20 +400,20 @@ export class ToolPresence {
       else if (e.state === 'closed') this.dropKey(key);
     }
     for (const e of arr(h.tools)) {
-      if (!isObj(e) || !str(e.name) || !this.tools.has(e.name as string)) continue;
+      if (!isObj(e) || !str(e.name)) continue;
       const name = e.name as string;
-      // A toolset's tool is dynamic whatever a hint says (RFC §4.1).
-      if ((e.presence === 'static' || e.presence === 'dynamic') && !this.toolsetOf(name)) {
-        // RFC §4.2: a move applies at a boundary the host chooses; until then the tool stays where it is.
-        if (e.presence !== this.presenceOf(name)) this.pendingMoves.set(name, e.presence);
-        else this.pendingMoves.delete(name);
+      if (!this.tools.has(name)) {
+        if (this.allowed(name)) unlisted = true;
+        continue;
       }
-      if (isObj(e.definition) && this.presenceOf(name) === 'dynamic') {
+      // A hint's presence stages nothing: a hinted move takes effect when
+      // the server's tools/list states it (RFC §4.1), as the rebuild's own
+      // list does. A definition it gives is the tool's current one, kept
+      // whatever its presence now, for when it's shown dynamic (§6.1).
+      if (isObj(e.definition)) {
         const key = this.defKeyFor(name, str(e.instance));
-        if (key !== null) {
-          if (!this.defs.has(key)) this.defs.set(key, new Map());
-          this.defs.get(key)!.set(name, overrideOf(e.definition));
-        }
+        if (!this.defs.has(key)) this.defs.set(key, new Map());
+        this.defs.get(key)!.set(name, overrideOf(e.definition));
       }
       if (typeof e.visible === 'boolean') for (const key of this.keysFor(name, str(e.instance))) this.setVisible(key, name, e.visible);
     }
@@ -388,14 +422,14 @@ export class ToolPresence {
       if (!isObj(s) || !str(s.toolset) || (s.action !== 'open' && s.action !== 'close')) continue;
       suggest.push({ toolset: s.toolset as string, ...(str(s.instance) ? { instance: str(s.instance) } : {}), action: s.action, reason: str(s.reason) ?? '' });
     }
-    return suggest;
+    return { suggest, unlisted };
   }
 
   /**
    * Where a definition lands (RFC §6.1): with `instance`, that instance's own;
    * without, the toolset's (for a toolset without instances, its only one's).
    */
-  private defKeyFor(name: string, instance: string | undefined): string | null {
+  private defKeyFor(name: string, instance: string | undefined): string {
     const ts = this.toolsetOf(name);
     if (!ts) return keyOf(NO_TOOLSET);
     return keyOf(ts, this.declared[ts]?.instances ? instance : undefined);
@@ -445,7 +479,7 @@ export class ToolPresence {
    * Returns what was lost, what the server says ended while no connection was
    * told, its suggestions, and whether its rev skipped one.
    */
-  adopt(result: unknown): { lost: OpenRecord[]; ended: Ended[]; suggest: Suggestion[]; skipped: boolean } {
+  adopt(result: unknown): { lost: OpenRecord[]; ended: Ended[]; suggest: Suggestion[]; skipped: boolean; unlisted: boolean } {
     const had = [...this.open.values()];
     // A full statement: a dynamic tool not stated visible is invisible.
     // Undeclared groups stay as the host has them open or closed.
@@ -463,9 +497,10 @@ export class ToolPresence {
     }
     let suggest: Suggestion[] = [];
     let skipped = false;
+    let unlisted = false;
     const h = isObj(r._meta) ? r._meta['mcpl/hints'] : undefined;
     if (isObj(h)) {
-      suggest = this.applyBody(h);
+      ({ suggest, unlisted } = this.applyBody(h));
       // Its own rev, at its place in order (RFC §6.1).
       if (typeof h.rev === 'number' && Number.isFinite(h.rev)) {
         skipped = h.rev !== this.rev + 1;
@@ -477,29 +512,51 @@ export class ToolPresence {
       if (!isObj(e) || !str(e.toolset)) continue;
       ended.push({ ...(str(e.id) ? { id: str(e.id) } : {}), toolset: e.toolset as string, ...(str(e.instance) ? { instance: str(e.instance) } : {}), reason: str(e.reason) ?? '' });
     }
-    return { lost: had.filter((o) => !this.open.has(keyOf(o.toolset, o.instance))), ended, suggest, skipped };
+    // RFC §5.3: a record is reported on every toolsets/list until it expires, and its id is never
+    // reused, so an id the server no longer reports needn't be remembered.
+    const reported = new Set(ended.flatMap((e) => (e.id ? [e.id] : [])));
+    for (const id of [...this.toldEnded]) if (!reported.has(id)) this.toldEnded.delete(id);
+    return { lost: had.filter((o) => !this.open.has(keyOf(o.toolset, o.instance))), ended, suggest, skipped, unlisted };
   }
 
   /**
    * What the agent should hear about an adoption: what ended while it was
-   * away, each `ended` id once however often the server repeats it (RFC
-   * §5.3), and what is closed now.
+   * away, each `ended` id until it has been told (RFC §5.3; markTold), and
+   * what is closed now. An ended record with an id is in `ended`, rendered
+   * while its id is untold.
    */
-  adoptionNotes(lost: OpenRecord[], ended: Ended[]): string[] {
+  adoptionNotes(lost: OpenRecord[], ended: Ended[]): { notes: string[]; ended: Array<{ id: string; note: string }> } {
     const notes: string[] = [];
-    const endedKeys = new Set(ended.map((e) => keyOf(e.toolset, e.instance)));
+    const told: Array<{ id: string; note: string }> = [];
+    const endedKeys = new Set<string>();
     for (const e of ended) {
+      if (!e.id || !this.toldEnded.has(e.id)) endedKeys.add(keyOf(e.toolset, e.instance));
+      const note = `${this.label(keyOf(e.toolset, e.instance))} ended${e.reason ? `: ${e.reason}` : ''}.`;
       if (e.id) {
-        if (this.toldEnded.has(e.id)) continue;
-        this.toldEnded.add(e.id);
-      }
-      notes.push(`${this.label(keyOf(e.toolset, e.instance))} ended${e.reason ? `: ${e.reason}` : ''}.`);
+        if (!this.toldEnded.has(e.id)) told.push({ id: e.id, note });
+      } else notes.push(note);
     }
     for (const o of lost) {
       if (endedKeys.has(keyOf(o.toolset, o.instance))) continue;
       notes.push(`${this.label(keyOf(o.toolset, o.instance))} is closed: ${this.server} no longer has it open. ${this.openHint(o.toolset)} starts a new one.`);
     }
-    return notes;
+    return { notes, ended: told };
+  }
+
+  /** The agent has been told these ended records (a notice written, a result it reads); the next statement forgets any it no longer reports. */
+  markTold(ended: ChangeSet['ended']): void {
+    for (const { id } of ended ?? []) this.toldEnded.add(id);
+  }
+
+  /** The definitions a change set's tool blocks describe have reached the model. */
+  markShown(cs: ChangeSet): void {
+    for (const c of cs.changes) if (showsBlock(c)) for (const t of c.now) this.shown.add(toolDigest(t));
+  }
+
+  /** A set's ended notes whose ids are still untold, each once. */
+  untoldNotes(cs: ChangeSet): string[] {
+    const seen = new Set<string>();
+    return (cs.ended ?? []).filter(({ id }) => !this.toldEnded.has(id) && !seen.has(id) && !!seen.add(id)).map(({ note }) => note);
   }
 
   // ── host-made opens of undeclared groups (RFC §5.4) ──
@@ -514,15 +571,15 @@ export class ToolPresence {
 
   // ── boundaries ──
 
-  /** Apply pending static↔dynamic moves (RFC §4.2) at a boundary the host chooses. Returns what moved. */
-  applyMoves(): Array<{ name: string; to: Presence }> {
-    const out: Array<{ name: string; to: Presence }> = [];
-    for (const [name, to] of this.pendingMoves) {
-      if (!this.tools.has(name)) continue;
-      this.moved.set(name, to);
-      out.push({ name, to });
-    }
-    this.pendingMoves.clear();
+  /** The static↔dynamic moves the lists made since the last rebuild, still to be shown. */
+  moves(): Array<{ name: string; to: Presence }> {
+    return [...this.pendingMoves].map(([name, to]) => ({ name, to }));
+  }
+
+  /** At a rebuild of the model's tool list (RFC §4.2): those of `moves` still pending, now shown. */
+  applyMoves(moves = this.moves()): Array<{ name: string; to: Presence }> {
+    const out = moves.filter(({ name, to }) => this.pendingMoves.get(name) === to);
+    for (const { name } of out) this.pendingMoves.delete(name);
     return out;
   }
 
@@ -550,14 +607,22 @@ export class ToolPresence {
   }
 
   /** The tool block for one key: its label, how to call, and the visible tools (new or changed ones described). */
-  toolBlock(key: string, tools: HintedTool[], opts: { describeAll?: boolean; headed?: boolean; title?: string } = {}): string[] {
+  toolBlock(key: string, tools: HintedTool[], opts: { describeAll?: boolean; headed?: boolean; title?: string; seen?: Shown } = {}): string[] {
     const head = opts.headed === false ? '' : `${this.label(key)}${opts.title ? ` ${opts.title}` : ''} `;
     if (!tools.length) return [`${head}no tools available right now.`];
-    return [`${head}tools now — ${this.callHint(key)}:`, ...renderToolLines(tools, this.shown, { describeAll: opts.describeAll })];
+    return [`${head}tools now — ${this.callHint(key)}:`, ...renderToolLines(tools, opts.seen ?? this.shown, { describeAll: opts.describeAll })];
   }
 
-  /** What the model reads for a change set. `bare`: a key whose header the caller already printed. */
-  render(cs: ChangeSet, opts: { bare?: string } = {}): string {
+  /**
+   * What the model reads for a change set. `bare`: a key whose header the
+   * caller already printed. `mark: false` renders without counting the
+   * definitions it describes as shown, for text that may not reach the model
+   * (markShown counts them once it has). `describeAll`: every tool with its
+   * first sentence, as for a result that may reach no agent.
+   */
+  render(cs: ChangeSet, opts: { bare?: string; mark?: boolean; describeAll?: boolean } = {}): string {
+    const local = new Set<string>();
+    const seen: Shown = opts.mark === false ? { has: (d) => this.shown.has(d) || local.has(d), add: (d) => { local.add(d); } } : this.shown;
     const lines: string[] = [];
     for (const c of cs.changes) {
       const bare = opts.bare === c.key;
@@ -566,8 +631,7 @@ export class ToolPresence {
         continue;
       }
       const title = (c.opened || c.retitled) && !bare ? c.title : undefined;
-      const setChanged = c.opened || c.appeared.length > 0 || c.redefined.length > 0 || c.gone.length > 0;
-      if (setChanged) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title }));
+      if (showsBlock(c)) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title, seen, describeAll: opts.describeAll }));
       else if (title) lines.push(`${this.label(c.key)} ${title}`);
       if (c.gone.length) lines.push(`now unavailable: ${c.gone.join(', ')}`);
       if (c.opened && !bare) {
@@ -576,7 +640,7 @@ export class ToolPresence {
       }
     }
     for (const s of cs.suggest) lines.push(this.renderSuggestion(s));
-    lines.push(...cs.notes);
+    lines.push(...this.untoldNotes(cs), ...cs.notes);
     return lines.join('\n');
   }
 
@@ -605,14 +669,16 @@ export class ToolPresence {
     return lines.join('\n');
   }
 
-  /** look naming this server: what is open (with tools) and what can be opened. */
-  catalog(): string {
+  /** look naming this server: what is open (with tools) and what can be
+   *  opened. `mark: false`, as for render, for a look whose result may
+   *  reach no agent. */
+  catalog(opts: { mark?: boolean } = {}): string {
     const lines: string[] = [];
     lines.push(this.surface ? `${this.server} — ${[this.surface.title, this.surface.summary].filter(Boolean).join(': ')}` : this.server);
     const v = this.view();
     if (v.size) {
       for (const [key, e] of v) {
-        lines.push(...this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title }).map((l) => `  ${l}`));
+        lines.push(...this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title, seen: opts.mark === false ? new Set<string>() : undefined }).map((l) => `  ${l}`));
         const close = this.closeHint(key);
         if (close) lines.push(`    ${close} closes it.`);
       }
@@ -639,7 +705,7 @@ export class ToolPresence {
 
   /** Where a tool can be called from now, for `look` naming it. */
   toolStatus(tool: string): string {
-    if (this.presenceOf(tool) === 'static') return `static — in your tool list as ${this.listedName(tool)}`;
+    if (this.presenceOf(tool) === 'static') return `static — called by name, as ${this.listedName(tool)}`;
     const where = [...this.view().entries()].filter(([, e]) => e.tools.has(tool)).map(([k]) => k);
     const ts = this.toolsetOf(tool);
     return where.length

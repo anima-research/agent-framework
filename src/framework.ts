@@ -594,6 +594,14 @@ function serverAddressOf(cfg: McplServerConfig): ServerAddress {
   return { url: cfg.url };
 }
 
+function withChangeText(result: ToolResult, change: string): ToolResult {
+  if (!change) return result;
+  if (result.isError) return { ...result, error: result.error ? `${result.error}\n${change}` : change };
+  if (Array.isArray(result.data)) return { ...result, data: [...result.data, { type: 'text', text: change }] };
+  if (typeof result.data === 'string' && result.data) return { ...result, data: `${result.data}\n${change}` };
+  return { ...result, data: change };
+}
+
 /**
  * The text of an MCPL tools/call result: its text blocks' text, joined by
  * line breaks, with empty ones left out. A text block whose text isn't a
@@ -615,10 +623,9 @@ function mcplResultText(content: McpToolResultContent[] | undefined): string {
  * An MCPL tools/call result the server marked `isError`, as a failure: its
  * text is the error, and with none, or only whitespace, as a server's error
  * answer reads it, the error says the server gave no words and that whether
- * the call did anything is unknown. Its other blocks aren't kept. The model's
- * dispatch and an in-process caller (`executeToolCall`,
- * `ModuleContext.callTool`) both take a server's error from here, so it reads
- * the same on each path. `callName` is the tool's name as it was called.
+ * the call did anything is unknown. Its other blocks aren't kept. An
+ * in-process caller (`executeToolCall`, `ModuleContext.callTool`) takes a
+ * server's error from here. `callName` is the tool's name as it was called.
  */
 function mcplToolFailure(content: McpToolResultContent[] | undefined, serverId: string, callName: string): ToolResult {
   const said = mcplResultText(content);
@@ -743,6 +750,34 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
   },
 };
 
+type SettingsReading = {
+  core: Record<string, string>;
+  exts: Map<AgentSettingsExtension, { touched: readonly string[]; fields: Record<string, string> }>;
+};
+
+const readExtensionSettings = (ext: AgentSettingsExtension, agentName: string): Record<string, string> => {
+  const values = ext.get(agentName);
+  return Object.fromEntries(Object.entries(values).map(([key, value]) =>
+    [key, value === undefined ? 'undefined' : JSON.stringify(value)]));
+};
+
+const changedSettings = (before: Record<string, string>, now: Record<string, string>): string[] =>
+  [...new Set([...Object.keys(before), ...Object.keys(now)])].filter((key) => before[key] !== now[key]);
+
+const settingNumber = (name: string, value: unknown): number => {
+  if (typeof value === 'number') return value;
+  // Number() reads null, false and blank text as 0, true as 1, and a list of one number or numeric text as that number.
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN;
+  if (!Number.isNaN(n)) return n;
+  throw new Error(`${name} must be a number, not ${shownValue(value)}`);
+};
+
+const settingBoolean = (name: string, value: unknown): boolean => {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true' || value === 'false') return value === 'true';
+  throw new Error(`${name} must be true or false, not ${shownValue(value)}`);
+};
+
 /** First sentence (or line) of a description — what `utils list` shows. */
 const utilityOneLiner = (description: string): string => {
   const line = description.split('\n')[0]!;
@@ -758,8 +793,9 @@ import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
-import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
-import { ToolsetsModule, resolveAct } from './mcpl/toolsets-module.js';
+import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
+import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
+import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -2317,6 +2353,116 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
+interface SyncMoveReinit {
+  again: boolean;
+  after: 'undo' | 'redo';
+  done: Promise<void>;
+}
+
+export interface ReinitAlertText {
+  opening: string;
+  message: string;
+}
+
+export const REINIT_MOVES = ['undo', 'redo', 'rollback', 'suppression', 'branch switch'] as const;
+export type ReinitMove = (typeof REINIT_MOVES)[number];
+
+const RECOVERY = 're-initializes it and stores its queued writes, at resume on a quiesced host; a restart can lose them.';
+
+export function refusedWorkAlert(move: ReinitMove, cause: string): ReinitAlertText {
+  const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
+    `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+  return { opening, message: `${opening} Its re-initialization failed: ${cause}.` };
+}
+
+export function restoreAlert(restore: {
+  source: string;
+  now: string;
+  selected: boolean;
+  cause: string;
+} & ({ move: 'rollback'; managerCurrent?: false } | { move: 'suppression'; managerCurrent: boolean })): ReinitAlertText {
+  const { move, source, now, selected, managerCurrent, cause } = restore;
+  if (selected) {
+    const opening = `The ${move} failed and the store was put back, but this agent's context manager failed to re-initialize. ` +
+      `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+    return { opening, message: `${opening} The store is on ${source}. Its re-initialization failed: ${cause}.` };
+  }
+  const where = ` The store is on ${now}, and the restore to ${source} failed: ${cause}.`;
+  if (managerCurrent) {
+    const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager is current on the ` +
+      `branch the ${move} made: it serves from there, which may be partly suppressed, until switchBranch() to the ` +
+      'branch it should run on moves it.';
+    return { opening, message: `${opening}${where}` };
+  }
+  const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager refuses its work ` +
+    `until switchBranch() to the branch it should run on ${RECOVERY}`;
+  return { opening, message: `${opening}${where}` };
+}
+
+export function disposalAlert(disposal: {
+  move: ReinitMove;
+  heldWrites?: number;
+  reinitFailed?: string;
+  cleanupFailed?: string;
+}): ReinitAlertText {
+  const { move, heldWrites = 0, reinitFailed, cleanupFailed } = disposal;
+  const opening = `The ${move} left this conversation agent with no messages of its own, so ` +
+    (cleanupFailed
+      ? 'it was unregistered and its channel unbound, but its cleanup failed (below). '
+      : 'it was disposed and its channel unbound. ') +
+    "Its channel's next qualifying message spawns a new fork from the template, under a new name, which needs the " +
+    "template's own context manager to be working.";
+  const held = heldWrites === 0
+    ? ''
+    : ` ${heldWrites === 1 ? '1 write was' : `${heldWrites} writes were`} held for it while the store was held.`;
+  return {
+    opening,
+    message: `${opening}${held} Its messages stay on the branches that hold them, but no agent reads them again, ` +
+      "so a redo to a branch that holds them doesn't bring this one back." +
+      (reinitFailed ? ` Its re-initialization had failed: ${reinitFailed}.` : '') +
+      (cleanupFailed ? ` Its cleanup failed: ${cleanupFailed}.` : ''),
+  };
+}
+
+export function longHoldAlert(hold: {
+  move: string;
+  agentName: string;
+  heldSeconds: number;
+  queued: number;
+  reinitializing?: string;
+  waitingForMaintenance: boolean;
+}): ReinitAlertText {
+  const { move, agentName, heldSeconds, queued, reinitializing, waitingForMaintenance } = hold;
+  const opening = `The ${move} has held the store for ${heldSeconds} s, so no turn starts and the writes it defers wait in ` +
+    `the deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). A restart ends the ${move}, the ` +
+    'conversation agents and the runs, and re-initializes the configured agents; writes still queued at exit ' +
+    'survive only in a persisted deferral queue.';
+  const on = reinitializing !== undefined
+    ? `, and is re-initializing ${reinitializing}'s context manager now`
+    : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
+  return { opening, message: `${opening} The ${move} is for ${agentName}${on}.` };
+}
+
+const HOLD_ALERT_MS = 60_000;
+
+const MOVE_NOUNS: Readonly<Record<string, string>> = {
+  'roll back': 'rollback',
+  suppress: 'suppression',
+  'switch branch': 'branch switch',
+};
+
+type ManagerReinitFailure =
+  | { agentName: string; error: string }
+  | { agentName: string; disposed: { heldWrites: number; reinitFailed?: string; cleanupFailed?: string } };
+
+// context-manager refuses work on a manager whose store has moved to another branch generation with a plain Error,
+// with no class or code, whose message carries one of these texts.
+const MOVED_BRANCH_REFUSALS = ['requires reinitialization for the current branch generation', 'refused stale branch-scoped mutation'];
+
+function refusedForMovedBranch(message: string): boolean {
+  return MOVED_BRANCH_REFUSALS.some((text) => message.includes(text));
+}
+
 /** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
 function scriptResultBrief(content: unknown[]): string {
   for (const block of content) {
@@ -2439,6 +2585,10 @@ function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): s
   let tailStart = text.length - tailLength;
   if (splitsPair(text, tailStart)) tailStart++;
   return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+export function opsWebhookText(message: string): string {
+  return boundFailureText(message, OPS_WEBHOOK_MESSAGE_MAX_CHARS);
 }
 
 /** A provider error code, verbatim when token-sized; otherwise bounded. */
@@ -3490,7 +3640,16 @@ export class AgentFramework {
    * agent admitted mid-switch, a wake for an agent created later — at the
    * scheduler, ephemeral admission and puppet entry points.
    */
-  private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
+  private surgeryHold: {
+    verb: string;
+    agentName: string;
+    since: number;
+    released?: Promise<void>;
+    reinitializing?: string;
+  } | null = null;
+  private readonly conversationSpawnsInFlight = new Set<string>();
+  private syncMoveReinit: SyncMoveReinit | null = null;
+  private holdAlertMs = HOLD_ALERT_MS;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** The servers whose running pass a later trigger joined
@@ -4852,14 +5011,27 @@ export class AgentFramework {
         .flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
       this.ackDeferredWrites();
+      const keptWhere = (persisted: boolean, memoryOnly: string): string => !persisted
+        ? memoryOnly
+        : this.deferredWritesBehind
+          ? "the persisted queue's record is behind, since its last write failed or met the cap, so a restart can lose them"
+          : 'the persisted queue keeps them for boot';
+      for (const name of this.quiesced ? [] : registered.filter((agent) => !stillStreaming.has(agent))) {
+        const kept = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
+        if (kept > 0) {
+          console.error(
+            `[deferral] stop: ${kept} deferred write(s) for ${name} stay queued, not stored by the flush above; ` +
+            keptWhere(this.deferredWritesPersisted, 'this memory-only queue loses them at exit'),
+          );
+        }
+      }
       for (const name of registered.filter((agent) => stillStreaming.has(agent))) {
         const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
         if (held > 0) {
           console.error(
             `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream is still running and may still write; ` +
-            (this.deferredWritesPersisted || this.quiesced
-              ? 'the persisted queue keeps them for boot'
-              : 'this memory-only queue loses them if the process exits before that stream settles'),
+            keptWhere(this.deferredWritesPersisted || this.quiesced,
+              'this memory-only queue loses them if the process exits before that stream settles'),
           );
         }
       }
@@ -5766,6 +5938,9 @@ export class AgentFramework {
           if (error instanceof MaintenanceWithdrawnError) {
             withdrawn = true;
             console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
+          } else if (this.syncMoveReinit && error instanceof Error && refusedForMovedBranch(error.message)) {
+            withdrawn = true;
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${error.message}`);
           } else {
             this.reportMaintenanceFailure(
               agent.name,
@@ -5779,7 +5954,9 @@ export class AgentFramework {
           if ('error' in state) {
             // A run records an agent's first failure: a readiness refusal
             // after a tick that failed is read again by the next pass.
-            if (record.error === undefined && !withdrawn) this.reportMaintenanceFailure(agent.name, record, state.error);
+            if (record.error === undefined && !withdrawn && !(this.syncMoveReinit && refusedForMovedBranch(state.error))) {
+              this.reportMaintenanceFailure(agent.name, record, state.error);
+            }
           } else {
             record.readyAfter = state.ready;
             if (state.pending) record.pendingAfter = state.pending;
@@ -6582,7 +6759,7 @@ export class AgentFramework {
         };
       },
       update: (agentName: string, patch: Record<string, unknown>) => {
-        const n = Number(patch.tool_result_inline_max_chars);
+        const n = settingNumber('tool_result_inline_max_chars', patch.tool_result_inline_max_chars);
         if (!Number.isFinite(n) || n < 1000) {
           throw new Error('tool_result_inline_max_chars must be a number >= 1000');
         }
@@ -6638,10 +6815,7 @@ export class AgentFramework {
       },
       keys: ['tool_result_guard'],
       get,
-      update: (name, patch) => {
-        if (typeof patch.tool_result_guard !== 'boolean') throw new Error('tool_result_guard must be a boolean');
-        return set(name, patch.tool_result_guard);
-      },
+      update: (name, patch) => set(name, settingBoolean('tool_result_guard', patch.tool_result_guard)),
       reset: (name) => set(name, undefined),
     };
   }
@@ -6679,10 +6853,7 @@ export class AgentFramework {
       },
       keys: ['closed_channel_note'],
       get,
-      update: (name, patch) => {
-        if (typeof patch.closed_channel_note !== 'boolean') throw new Error('closed_channel_note must be a boolean');
-        return set(name, patch.closed_channel_note);
-      },
+      update: (name, patch) => set(name, settingBoolean('closed_channel_note', patch.closed_channel_note)),
       reset: (name) => set(name, undefined),
     };
   }
@@ -7137,6 +7308,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     // Feasibility preflight — only a budget-bearing patch can wedge, and only
     // on the immediate path (a paced descent leaves the compile budget alone
     // and converges only as far as the folded floor allows). Boot restore
@@ -7205,6 +7377,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     const result = agent.resetRuntimeSettings(keys);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
@@ -7225,6 +7398,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     const result = agent.cancelRuntimeSettingsTransition();
     this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     this.recordOperatorAction({
@@ -7233,6 +7407,14 @@ export class AgentFramework {
       ...(opts?.requester ? { requester: opts.requester } : {}),
     });
     return result;
+  }
+
+  private refuseRuntimeSettingsChangeUnderHold(agentName: string): void {
+    if (!this.surgeryHold) return;
+    throw new OperatorActionError(
+      'agent-busy',
+      `Cannot change ${agentName}'s runtime settings: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}; nothing was changed. Try again once it finishes.`,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -8968,7 +9150,7 @@ export class AgentFramework {
   }
 
   /** Load resident-set inline caps from framework state, dropping (loudly)
-   *  anything that fails the same validation the live update enforces. A
+   *  anything Number() doesn't read as a finite number of at least 1000. A
    *  failed read is logged and boot goes on without them: nothing is lost,
    *  since persistToolResultInlineCap reads the stored caps again before it
    *  writes one. */
@@ -10891,11 +11073,13 @@ export class AgentFramework {
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
     let undone = 0;
+    let settled: Promise<void> | undefined;
     try {
       for (let i = 0; i < requested; i++) {
         const r = this.runUndoLastTurn(agentName, hostCommandRequester(serverId, params));
         if (!r.undone) break;
         undone++;
+        settled = r.settled;
       }
     } catch (error) {
       // e.g. "Cannot undo while agent is streaming" — report what happened,
@@ -10913,6 +11097,8 @@ export class AgentFramework {
     if (undone === 0) {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
+
+    await settled;
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -11234,20 +11420,34 @@ export class AgentFramework {
    * turn alive (no continuation or held retry of one on its way), or it is
    * refused (OperatorActionError 'agent-busy'), and no turn starts until the
    * switch is done.
+   *
+   * Every agent's context manager is re-initialized for the branch before
+   * the store is released (reinitializeManagers). One whose
+   * re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`), and the switch still resolves. A switch to the
+   * branch the store is already on re-initializes them too, which is how a
+   * manager left refusing by a failed re-initialization is recovered without
+   * a restart.
    */
   async switchBranch(name: string): Promise<void> {
     this.refuseOperatorAfterStop('switch branch');
     const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+    let reinitializing: Promise<ManagerReinitFailure[]> | undefined;
     try {
       // A maintenance tick already running finishes before the switch.
       if (this.maintenanceRunning()) await this.settleMaintenancePass();
       this.store.switchBranch(name);
+      reinitializing = this.reinitializeManagers();
       const ws = this.moduleRegistry.getModule('workspace');
       if (ws && 'materializeMount' in ws) {
         await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
       }
     } finally {
-      release();
+      try {
+        if (reinitializing) this.reportReinitFailures('branch switch', this.disposeEmptiedForks(await reinitializing));
+      } finally {
+        release();
+      }
     }
   }
 
@@ -11260,12 +11460,30 @@ export class AgentFramework {
    *
    * The undone branch is saved so `redo()` can restore it.
    * Returns the checkpoint that was undone, or null if nothing to undo.
+   *
+   * The branch moves under every agent sharing the store, so an undo
+   * reserves the store as a surgery does: every agent must be idle, or it is
+   * refused (OperatorActionError 'agent-busy'). It returns once the store has
+   * moved, and the store stays reserved until every agent's context manager
+   * is re-initialized for the new branch, so no turn starts before then. One
+   * whose re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`). An undo or redo made before the managers are
+   * done moves the store again under the same reservation, and they are
+   * re-initialized for the branch the last one leaves.
+   *
+   * `settled`, present when the store moved, settles once that reservation
+   * is released, every manager re-initialized or its failure alerted, and
+   * never rejects. Await it before work that needs the store free: a
+   * compile on an agent's own context manager, or a write meant to land at
+   * once, which the reservation would defer. An undo or redo that moves the
+   * store again under the same reservation settles with it.
    */
   undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     this.refuseOperatorAfterStop('undo');
     return this.runUndoLastTurn(agentName, requester);
@@ -11278,16 +11496,17 @@ export class AgentFramework {
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     const agent = this.agents.get(agentName);
     if (!agent) {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot undo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot undo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -11297,13 +11516,23 @@ export class AgentFramework {
     }
 
     const checkpoint = checkpoints.pop()!;
-    this.saveTurnCheckpoints(agentName, checkpoints);
-
     const currentBranch = this.store.currentBranch();
     const undoBranchName = this.newOperatorBranchName(`undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`);
 
-    this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
-    this.store.switchBranch(undoBranchName);
+    const move = this.beginSyncMove('undo', agentName);
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+      this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
+      this.store.switchBranch(undoBranchName);
+    } catch (error) {
+      try {
+        this.saveTurnCheckpoints(agentName, [...checkpoints, checkpoint]);
+      } finally {
+        move.abandon();
+      }
+      throw error;
+    }
+    const settled = move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -11335,6 +11564,7 @@ export class AgentFramework {
       turnIndex: checkpoint.turnIndex,
       fromBranch: currentBranch.name,
       toBranch: undoBranchName,
+      settled,
     };
   }
 
@@ -11343,11 +11573,15 @@ export class AgentFramework {
    *
    * Switches back to the branch that was active before the last undo.
    * Returns false if there's nothing to redo.
+   *
+   * It reserves the store and re-initializes every agent's context manager
+   * as undoLastTurn() does, and its result's `settled` is undoLastTurn()'s.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     this.refuseOperatorAfterStop('redo');
     const agent = this.agents.get(agentName);
@@ -11355,10 +11589,10 @@ export class AgentFramework {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot redo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot redo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -11367,10 +11601,30 @@ export class AgentFramework {
       return { redone: false };
     }
 
-    const { branchName, checkpoint } = redoStack.pop()!;
     const currentBranch = this.store.currentBranch();
-
-    this.store.switchBranch(branchName);
+    const move = this.beginSyncMove('redo', agentName);
+    const entry = redoStack.pop()!;
+    const { branchName, checkpoint } = entry;
+    try {
+      this.store.switchBranch(branchName);
+    } catch (error) {
+      let gone = false;
+      try {
+        gone = !this.store.listBranches().some((b) => b.name === branchName);
+      } catch {
+      }
+      if (!gone) redoStack.push(entry);
+      move.abandon();
+      if (!gone) throw error;
+      const left = redoStack.length;
+      throw new OperatorActionError(
+        'failed',
+        `Cannot redo: the branch this redo returns to, ${branchName}, no longer exists, so that step is dropped. ` +
+          (left === 0 ? 'No redo steps remain.' : left === 1 ? '1 redo step remains.' : `${left} redo steps remain.`),
+        { cause: error },
+      );
+    }
+    const settled = move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -11396,6 +11650,7 @@ export class AgentFramework {
       redone: true,
       fromBranch: currentBranch.name,
       toBranch: branchName,
+      settled,
     };
   }
 
@@ -11502,6 +11757,7 @@ export class AgentFramework {
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
     }
+    for (const name of this.conversationSpawnsInFlight) busy.push(`${name} is being created`);
     if (busy.length > 0) {
       throw new OperatorActionError(
         'agent-busy',
@@ -11517,8 +11773,11 @@ export class AgentFramework {
     }
     // The token snapshot only covers agents that exist now; the hold covers
     // arrivals during the awaited switch (see surgeryHold).
-    const hold = { verb, agentName, since: Date.now() };
+    let resolveHold!: () => void;
+    const hold = { verb, agentName, since: Date.now(), released: new Promise<void>((resolve) => { resolveHold = resolve; }) };
     this.surgeryHold = hold;
+    const watchdog = setTimeout(() => this.reportLongHold(hold), this.holdAlertMs);
+    watchdog.unref?.();
     // Maintenance calls parked at a provider gate wake, find the hold and are
     // withdrawn, so the wait for running maintenance can't wait on them.
     for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -11530,9 +11789,11 @@ export class AgentFramework {
     return () => {
       if (released) return;
       released = true;
+      clearTimeout(watchdog);
       // The release runs to its end before stop() can go on.
       settle();
       if (this.surgeryHold === hold) this.surgeryHold = null;
+      resolveHold();
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
@@ -11543,10 +11804,139 @@ export class AgentFramework {
       if (this.deferredMessages.length > 0) {
         const free = [...reserved.keys()]
           .filter((name) => !this.activeTurnTokens.has(name) && !this.pendingAssistantBlocks.has(name));
-        this.readdDrained(free.flatMap((name) => this.drainDeferredFor(name)), 'post-surgery flush');
+        this.readdDrained(free.flatMap((name) => this.drainDeferredFor(name)), 'post-surgery flush',
+          { traceAs: 'deferred-flush:surgery-release' });
         this.ackDeferredWrites();
       }
     };
+  }
+
+  private async reinitializeManagers(except?: string): Promise<ManagerReinitFailure[]> {
+    const failures: ManagerReinitFailure[] = [];
+    const hold = this.surgeryHold;
+    for (const [agentName, agent] of [...this.agents]) {
+      if (agentName === except) continue;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (hold) hold.reinitializing = agentName;
+      try {
+        const cm = agent.getContextManager();
+        await cm.setStrategy(cm.getStrategy());
+      } catch (error) {
+        if (this.agents.get(agentName) === agent) {
+          failures.push({ agentName, error: failureDescription(error) });
+        }
+      } finally {
+        if (hold) delete hold.reinitializing;
+      }
+    }
+    return failures;
+  }
+
+  private reportLongHold(hold: { verb: string; agentName: string; since: number; reinitializing?: string }): void {
+    const heldMs = Date.now() - hold.since;
+    const queued = this.deferredMessages.length;
+    const reinitializing = hold.reinitializing;
+    const waitingForMaintenance = reinitializing === undefined && this.maintenanceRunning();
+    this.opsAlert('store-held-long', hold.agentName,
+      longHoldAlert({
+        move: MOVE_NOUNS[hold.verb] ?? hold.verb, agentName: hold.agentName, heldSeconds: Math.round(heldMs / 1000),
+        queued, reinitializing, waitingForMaintenance,
+      }).message,
+      {
+        data: {
+          verb: hold.verb,
+          heldMs,
+          queued,
+          ...(reinitializing !== undefined ? { reinitializing } : {}),
+          ...(waitingForMaintenance ? { waitingForMaintenance } : {}),
+        },
+      });
+  }
+
+  private disposeEmptiedForks(failures: ManagerReinitFailure[]): ManagerReinitFailure[] {
+    const disposals: ManagerReinitFailure[] = [];
+    for (const [agentName, channelId] of [...this.conversationAgentHomes]) {
+      const agent = this.agents.get(agentName);
+      if (!agent || agent.getContextManager().getMessageCount() > 0) continue;
+      const heldWrites = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agentName).length;
+      let cleanupFailed: string | undefined;
+      try {
+        if (this.conversationRouter?.getBinding(channelId)?.agentName === agentName) {
+          this.conversationRouter.unbind(channelId);
+        }
+        this.disposeConversationAgent(agentName);
+      } catch (error) {
+        cleanupFailed = failureDescription(error);
+      }
+      const failed = failures.find((f) => f.agentName === agentName && 'error' in f);
+      disposals.push({ agentName, disposed: {
+        heldWrites,
+        ...(failed && 'error' in failed ? { reinitFailed: failed.error } : {}),
+        ...(cleanupFailed !== undefined ? { cleanupFailed } : {}),
+      } });
+    }
+    const disposed = new Set(disposals.map((d) => d.agentName));
+    return [...failures.filter((f) => !disposed.has(f.agentName)), ...disposals];
+  }
+
+  private reportReinitFailures(after: ReinitMove, failures: ManagerReinitFailure[]): void {
+    for (const failure of failures) {
+      if ('disposed' in failure) {
+        this.reportReinitFailure(failure.agentName, after, disposalAlert({ move: after, ...failure.disposed }).message, 'disposed');
+      } else {
+        this.reportReinitFailure(failure.agentName, after, refusedWorkAlert(after, failure.error).message);
+      }
+    }
+  }
+
+  private reportReinitFailure(agentName: string, after: string, message: string, key?: string): void {
+    console.error(`[operator] agent=${agentName} ${boundFailureText(message)}`);
+    this.opsAlert('context-reinit-failed', agentName, message, { data: { after }, ...(key === undefined ? {} : { key }) });
+  }
+
+  private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): Promise<void>; abandon(): void } {
+    const running = this.syncMoveReinit;
+    if (running) {
+      const busy = [...this.agents].filter(([, a]) => a.state.status !== 'idle').map(([name, a]) => `${name} is ${a.state.status}`);
+      if (busy.length > 0) {
+        throw new OperatorActionError(
+          'agent-busy',
+          `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+        );
+      }
+      return {
+        landed: () => { running.again = true; running.after = verb; return running.done; },
+        abandon: () => {},
+      };
+    }
+    const release = this.reserveStoreForSurgery(verb, agentName);
+    return {
+      landed: () => this.reinitializeAfterSyncMove(verb, release),
+      abandon: release,
+    };
+  }
+
+  private reinitializeAfterSyncMove(after: 'undo' | 'redo', release: () => void): Promise<void> {
+    const state: SyncMoveReinit = { again: false, after, done: Promise.resolve() };
+    this.syncMoveReinit = state;
+    state.done = (async () => {
+      try {
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
+        let failures: ManagerReinitFailure[];
+        do {
+          state.again = false;
+          failures = await this.reinitializeManagers();
+        } while (state.again);
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
+        this.reportReinitFailures(state.after, this.disposeEmptiedForks(failures));
+      } finally {
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
+        release();
+      }
+    })().catch((error: unknown) => {
+      console.error(`[operator] the ${state.after}'s re-initialization or its release of the store failed: ${boundFailureText(failureDescription(error))}`);
+    });
+    return state.done;
   }
 
   /**
@@ -11633,10 +12023,12 @@ export class AgentFramework {
    * throws — the caller reports the original failure with this appended.
    */
   private async restoreSourceBranch(
+    move: 'rollback' | 'suppression',
     cm: ContextManager,
     sourceBranch: string,
     failedBranch: string,
     agentName: string,
+    managerCurrent = false,
   ): Promise<string> {
     const current = this.store.currentBranch().name;
     if (current !== failedBranch) return `active branch is ${current}`;
@@ -11645,8 +12037,25 @@ export class AgentFramework {
       return `active branch restored to ${sourceBranch}`;
     } catch (restoreError) {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
-      const status = `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); agent is still on ${failedBranch}`;
+      const now = this.store.currentBranch().name;
+      const selected = now === sourceBranch;
+      const status = selected
+        ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
+          'the agent refuses its work until switchBranch() to the current branch re-initializes it'
+        : managerCurrent
+          ? `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, where the agent's ` +
+            'context manager is current, so the agent serves from that branch until switchBranch() moves it'
+          : `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, ` +
+            `and the agent refuses its work until switchBranch() to ${sourceBranch} re-initializes it`;
       console.error(`[operator] agent=${agentName} ${status}`);
+      try {
+        const named = move === 'suppression' ? { move, managerCurrent } : { move };
+        this.reportReinitFailure(agentName, `restore to ${sourceBranch}`, restoreAlert({
+          ...named, source: sourceBranch, now, selected, cause: detail,
+        }).message);
+      } catch (reportError) {
+        console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
+      }
       return status;
     }
   }
@@ -11726,6 +12135,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         // A maintenance tick already running finishes before the switch.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -11748,12 +12158,14 @@ export class AgentFramework {
         try {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
           await cm.switchBranch(branchName);
+          moved = true;
         } catch (error) {
           // switchBranch moves the chronicle branch BEFORE awaiting strategy
           // initialization, so a rejection here can leave the store on the
           // new branch with an uninitialized strategy. Retire the batch and
           // go back to the source; keep the branch for diagnosis.
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          moved = this.store.currentBranch().name !== sourceBranch;
+          const restored = await this.restoreSourceBranch('rollback', cm, sourceBranch, targetBranch, agentName);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11774,7 +12186,11 @@ export class AgentFramework {
         this.deliverDiscordAwarenessInBackground('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
-        release();
+        try {
+          if (moved) this.reportReinitFailures('rollback', this.disposeEmptiedForks(await this.reinitializeManagers(agentName)));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -11881,6 +12297,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         // A maintenance tick already running finishes before the fork.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -11907,11 +12324,13 @@ export class AgentFramework {
 
         try {
           createdBranch = await cm.fork(targetBranch);
+          moved = true;
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
           // branch. Go back to the source, then retire the batch.
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          moved = this.store.currentBranch().name !== sourceBranch;
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, targetBranch, agentName);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11928,7 +12347,7 @@ export class AgentFramework {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
           // say honestly whether that restore happened.
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, createdBranch, agentName);
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, createdBranch, agentName, true);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11955,7 +12374,11 @@ export class AgentFramework {
         this.deliverDiscordAwarenessInBackground('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
-        release();
+        try {
+          if (moved) this.reportReinitFailures('suppression', await this.reinitializeManagers(agentName));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -13625,14 +14048,14 @@ export class AgentFramework {
         if (!this.turnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
-        const id = target.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(metadata, event.content));
+        const placement = this.writeToFork(target, event.content, AgentFramework.withStoredDigest(metadata, event.content));
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         const channel: ChannelRef = { serverId: event.serverId, channelId: event.channelId };
         if (this.conversationRouter.getBinding(channel)?.agentName === target.name) {
           this.conversationRouter.touch(channel);
         }
-        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
@@ -13642,7 +14065,7 @@ export class AgentFramework {
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
-        return { agent: target.name, messageId: id };
+        return placement;
       }
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       event = { ...event, targetAgents: [target.name] };
@@ -13820,9 +14243,9 @@ export class AgentFramework {
     if (!this.turnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
-    const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
+    const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(channel);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
 
     if (trigger) {
       this.pendingRequests.push({
@@ -13838,7 +14261,16 @@ export class AgentFramework {
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
-    return { agent: agent.name, messageId: id };
+    return placement;
+  }
+
+  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>): CoalescingPlacement {
+    if (this.surgeryHold) {
+      const placement: CoalescingPlacement = { agent: '' };
+      this.addMessage('user', content, metadata as MessageMetadata, { forAgent: agent.name, placement });
+      return placement;
+    }
+    return { agent: agent.name, messageId: agent.getContextManager().addMessage('user', content, metadata) };
   }
 
   /**
@@ -13850,6 +14282,10 @@ export class AgentFramework {
    * event loop like any agent — but never primary.
    */
   private async createConversationAgent(name: string, home: ChannelRef): Promise<Agent> {
+    for (let hold = this.surgeryHold; hold?.released; hold = this.surgeryHold) await hold.released;
+    if (this.stopPromise || (!this.running && this.queue?.isClosed)) {
+      throw new Error(`conversation agent "${name}" not created: the framework is stopping`);
+    }
     const router = this.conversationRouter!;
     const templateConfig = this.agentConfigs.get(router.templateAgent);
     const template = this.agents.get(router.templateAgent);
@@ -13860,6 +14296,7 @@ export class AgentFramework {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
     this.usedEphemeralAgentNames.set(name, 'conversation');
+    this.conversationSpawnsInFlight.add(name);
     const release: ManagerRelease = { released: false, calls: new Set() };
     try {
 
@@ -13972,6 +14409,8 @@ export class AgentFramework {
       if (release.manager) this.closeManager(release.manager);
       this.usedEphemeralAgentNames.delete(name);
       throw error;
+    } finally {
+      this.conversationSpawnsInFlight.delete(name);
     }
   }
 
@@ -14013,13 +14452,15 @@ export class AgentFramework {
    * Store the router's counters with the spawn's generation, create the fork
    * the decision names and bind its channel to it, registered in
    * conversationSpawns under the channel until it settles. The store runs
-   * inside the spawn's promise, still in routeConversation's synchronous
-   * step, so a store that throws rejects the spawn, which each caller reports
-   * as a failed spawn, rather than throwing out of routeConversation before
-   * the caller's try. routeConversation registers a spawn only when none is
-   * in flight for the channel, and only this spawn's settlement removes it,
-   * so the entry it removes is its own. It's removed before anyone waiting
-   * on it resumes, so a waiter that decides again doesn't find it.
+   * inside the spawn's promise, after it waits out a move's hold, so the
+   * counter lands on the branch the fork is created on; with no hold up, it
+   * runs in routeConversation's synchronous step. Either way a store that
+   * throws rejects the spawn, which each caller reports as a failed spawn,
+   * rather than throwing out of routeConversation before the caller's try.
+   * routeConversation registers a spawn only when none is in flight for the
+   * channel, and only this spawn's settlement removes it, so the entry it
+   * removes is its own. It's removed before anyone waiting on it resumes, so
+   * a waiter that decides again doesn't find it.
    *
    * It binds only while the fork it created is still the agent registered
    * under its name. stop() ends each live fork and unbinds the channels
@@ -14033,6 +14474,7 @@ export class AgentFramework {
   private spawnConversationAgent(channel: ChannelRef, decision: { agentName: string; generation: number }): Promise<Agent> {
     const key = destinationKey(channel);
     const spawn = (async () => {
+      for (let hold = this.surgeryHold; hold?.released; hold = this.surgeryHold) await hold.released;
       // The router's counters are kept by bare id (ConversationRouter.generations).
       this.storeConversationGeneration(channel.channelId, decision.generation);
       const agent = await this.createConversationAgent(decision.agentName, channel);
@@ -14229,8 +14671,8 @@ export class AgentFramework {
         this.conversationAgentHomes.delete(binding.agentName);
         continue;
       }
-      agent.getContextManager().addMessage(
-        'user',
+      this.writeToFork(
+        agent,
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
         { channelId: binding.channelId, conversationClosure: true },
       );
@@ -15226,6 +15668,7 @@ export class AgentFramework {
       return true;
     }
     if (!p.messageId) return false;
+    if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {
@@ -22436,6 +22879,9 @@ export class AgentFramework {
     const turnToken = this.nextTurnToken++;
     this.activeTurnTokens.set(agentName, turnToken);
     let ownedToEnd = false;
+    const changes: TakenChange[] = [];
+    (this.puppetChanges ??= new Map()).set(toolUseId, changes);
+    let stored = false;
     try {
       const started = Date.now();
       // The pair is stored under the cap its call carried, the agent's inline cap at the call: a call
@@ -22491,6 +22937,7 @@ export class AgentFramework {
         // must not lose the pair from a persisted queue.
         if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       }
+      stored = checked.usable;
 
       this.emitTrace({
         type: 'puppet:tool-call',
@@ -22507,6 +22954,11 @@ export class AgentFramework {
       );
       return { toolUseId, result: checked.usable ? returned : result };
     } finally {
+      this.puppetChanges?.delete(toolUseId);
+      for (const { toolsets, cs } of changes) {
+        if (stored) toolsets.told(cs);
+        else toolsets.tell(cs);
+      }
       if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
       // Messages deferred while we held the token land now, after the pair
       // — the same end-of-turn flush driveStream performs, under the same
@@ -22525,14 +22977,15 @@ export class AgentFramework {
 
   private async executeToolCallFrom(given: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
     const call = asCalled(given);
+    // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
+    // denial here is a failure. It's this call's end, so it's traced here.
+    const failed = (failure: ToolResult, traced = failure.error ?? ''): ToolResult => {
+      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: traced });
+      return failure;
+    };
     if (origin.kind === 'agent') {
-      // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
-      // denial here is a failure. It's this call's end, so it's traced here.
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
-      if (failure) {
-        this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: failure.error ?? '' });
-        return failure;
-      }
+      if (failure) return failed(failure);
     }
     const marked = markedInputRefusal(call);
     if (marked !== undefined) {
@@ -22553,17 +23006,17 @@ export class AgentFramework {
     // where a programmatic call of that tool goes, with its instance.
     if (call.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
       const target = this.resolveToolsetAct(call);
-      if (!target.ok) return { success: false, error: target.error, isError: true };
+      if (!target.ok) return failed({ success: false, error: target.error, isError: true }, this.everyServerRedactor()(target.error));
       if (origin.kind === 'agent') {
         const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
-        if (failure) return failure;
+        if (failure) return failed(failure, this.everyServerRedactor()(failure.error ?? ''));
       }
       return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
     }
 
     // MCPL tools go where the model's own call of the name goes, by the same
     // resolver and with the prefix it matched: to the server whose listing
-    // offers the name, else the longest matching prefix.
+    // has the name, else the longest matching prefix.
     if (this.mcplServerRegistry) {
       const mcpl = this.resolveMcplTool(call.name);
       if (mcpl) return this.executeMcplToolCall(call, mcpl[0], mcpl[1]);
@@ -22618,6 +23071,21 @@ export class AgentFramework {
    */
   private toolsetActCalls?: WeakMap<ToolCall, { instance?: string }>;
 
+  private puppetChanges?: Map<string, TakenChange[]>;
+
+  /** RFC-014 §6.1: a change reaches the agent once, so it goes with a result
+   *  only where the result is stored in an agent's window (the puppet's) or
+   *  handed to an agent awaiting it; null where it may not reach one. */
+  private changeTaker(call: ToolCall): ((taken: TakenChange) => void) | null {
+    if (call.callerAgentName === undefined) return null;
+    const puppet = this.puppetChanges?.get(call.id);
+    if (puppet) return (taken) => puppet.push(taken);
+    if (this.scriptToolWaiters.has(call.id)) return null;
+    const agent = this.agents.get(call.callerAgentName);
+    if (agent?.state.status !== 'waiting_for_tools' || !agent.state.pending.has(call.id)) return null;
+    return ({ toolsets, cs }) => toolsets.told(cs);
+  }
+
   /** A toolsets--act call resolved (resolveAct) to the call of the server's
    *  tool it makes, under that tool's model-facing name and with its
    *  arguments, its id kept; or the reason it can't be sent. */
@@ -22643,7 +23111,7 @@ export class AgentFramework {
   private dispatchToolsetAct(agentName: string, call: ToolCall): void {
     const target = this.resolveToolsetAct(call);
     if (!target.ok) {
-      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: target.error });
+      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: this.everyServerRedactor()(target.error) });
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: TOOLSETS_MODULE,
         result: this.refusedResult(agentName, call.id, target.error),
@@ -22659,23 +23127,13 @@ export class AgentFramework {
     this.dispatchMcplToolCall(agentName, target.call, target.serverId, target.prefix);
   }
 
-  /**
-   * RFC-014 §6.2: a tool result that goes to the agent, with the tool change
-   * its hints made (applied as the result was read) told after the server's
-   * content; taking it means it isn't told again as a notice. The result
-   * itself when there's none, as for every server without toolHints.
-   */
-  private withToolsetChange<R extends { content?: unknown }>(serverId: string, result: R): R {
-    const change = this.toolsetHub?.get(serverId)?.changeText(result) ?? '';
-    if (!change) return result;
-    return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: change }] };
-  }
-
   /** A programmatic call of an MCPL tool: `serverId` and `prefix` as
    *  resolveMcplTool matched them, or as toolsets--act resolved them
-   *  (toolsetActCalls). Its RFC-014 tool change isn't shown with its result,
-   *  which goes to its caller, not necessarily to the agent: it's told as a
-   *  notice (ToolsetController.tellUnlessClaimed). */
+   *  (toolsetActCalls). Its RFC-014 tool change goes with its result only
+   *  where the result is stored in an agent's window or handed to an agent
+   *  awaiting it (changeTaker); any other caller's
+   *  result may never reach one, so its change is told as a notice
+   *  (ToolsetController.tellUnlessClaimed). */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized, so the call didn\'t run', isError: true };
@@ -22696,18 +23154,37 @@ export class AgentFramework {
     const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
     if (dynamicRefusal) return { success: false, error: dynamicRefusal, isError: true };
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
+    let taken: TakenChange | undefined;
     try {
       const result = modern
         ? await modern.callTool(toolName, args)
         : await server!.sendToolsCall(toolName, args, undefined, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined);
-      // A server's error is a failure here too, as the model's dispatch
-      // reads it: its text (mcplToolFailure), without its other blocks, and
-      // its structured content, kept by presence. A success is the server's
-      // own blocks and structured content, for the caller to use in process.
+      const agentName = call.callerAgentName;
+      const taker = modern || agentName === undefined || !(result.isError || result.content === undefined || Array.isArray(result.content))
+        ? null : this.changeTaker(call);
+      const toolsets = taker ? this.toolsetHub?.get(serverId) : undefined;
+      const cs = toolsets?.takeChange(result);
+      if (toolsets && cs && !isEmptyChange(cs)) taken = { toolsets, cs };
+      const withChange = (answer: ToolResult, alone: ToolResult = answer): ToolResult => {
+        if (!taken) return answer;
+        const joined = this.withWholeChange(agentName!, call, answer, taken.toolsets.presence.render(taken.cs, { mark: false }), call.resultMaxChars);
+        if (joined) taker!(taken);
+        else taken.toolsets.tell(taken.cs);
+        taken = undefined;
+        return joined ?? alone;
+      };
+      // A server's error is a failure here too: its text, without its other
+      // blocks, and its structured content, kept by presence. A success is
+      // the server's own blocks and structured content, for the caller to use
+      // in process.
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
-        const { data: _blocks, ...failure } = direct;
-        return failure;
+        const { data: blocks, ...failure } = direct;
+        let shown: ToolResult = failure;
+        if (taken && !(Array.isArray(blocks) && blocks.length) && direct.structured != null) {
+          try { shown = { ...failure, error: JSON.stringify(direct.structured) }; } catch { /* past what the runtime's JSON.stringify can write */ }
+        }
+        return withChange(shown);
       }
       // RFC-005 §6.2: register an MCPL peer's references with this server, so
       // a stub later made of them is bound and fetch_reference can fetch
@@ -22722,16 +23199,34 @@ export class AgentFramework {
       if (server && server.capabilities !== null) {
         await this.autoFetchReferences(result.content, serverId, 'register')
           .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
-        return Array.isArray(direct.data) ? { ...direct, dataIsContent: true } : direct;
+        const blocks = Array.isArray(direct.data) ? direct.data : [];
+        const read: ToolResult = Array.isArray(direct.data) ? { ...direct, dataIsContent: true } : direct;
+        const shown: ToolResult = taken && blocks.length === 0 && Object.prototype.hasOwnProperty.call(direct, 'structured')
+          ? { ...direct, data: JSON.stringify(direct.structured) ?? 'null' }
+          : read;
+        return withChange(shown, read);
       }
-      return direct;
+      return withChange(direct);
     } catch (err) {
+      if (taken) taken.toolsets.tell(taken.cs);
       return {
         success: false,
-        error: redactServerText(err instanceof Error ? err.message : err, config ?? {}),
+        error: this.withActStateHint(call, serverId, err, redactServerText(err instanceof Error ? err.message : err, config ?? {})),
         isError: true,
       };
     }
+  }
+
+  private withWholeChange(agentName: string, call: ToolCall, result: ToolResult, change: string, maxChars: number | undefined): ToolResult | null {
+    const joined = withChangeText(result, change);
+    const cap = maxChars ?? this.resultMaxCharsFor(agentName, call.id);
+    const { text } = this.storedToolResultText(agentName, { id: call.id, name: call.name, input: call.input, result: joined, durationMs: 0 }, cap);
+    return text.endsWith(change.toWellFormed()) && text.length <= cap ? joined : null;
+  }
+
+  private withActStateHint(call: ToolCall, serverId: string, error: unknown, text: string): string {
+    if (!this.toolsetActCalls?.has(call) || (error instanceof McplRequestError && error.outcome === 'not-sent')) return text;
+    return withLookHint(serverId, text);
   }
 
   // ---------------------------------------------------------------------------
@@ -24192,8 +24687,9 @@ export class AgentFramework {
 
   /**
    * Find the MCPL server for a tool: [serverId, prefix], or null.
-   * The tool listing decides: the server whose tools/list offered the
-   * name, after its tool policy, as of the last tool refresh (a server that
+   * The tool listing decides: the server whose tools/list listed the name
+   * (offered to the model, or an RFC-014 dynamic tool, which dispatch then
+   * refuses by that name unless the published list or the server's latest tools/list puts it as static), after its tool policy, as of the last tool refresh (a server that
    * closed since keeps its names until the next one). A name the listing
    * doesn't hold (invented by the model, or no longer listed) goes to the
    * longest matching prefix. Prefixes that meet, such as `foo` and
@@ -25383,7 +25879,7 @@ export class AgentFramework {
    *  other write is dropped, logged, by addMessage. Nothing here reads the gone agent's
    *  window, so such a notice an earlier write of which landed there, and
    *  which the agent read, goes on too. */
-  private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
+  private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean; traceAs?: string }): DeferredWrite[] {
     let passed = 0;
     let writes = 0;
     const entries = drained.flatMap((msg) => {
@@ -25412,6 +25908,9 @@ export class AgentFramework {
       const agent = this.deliveryAgent(msg.forAgent);
       if (agent) this.noteStored(agent, msg.metadata, id, bypassFor(msg));
     });
+    if (opts?.traceAs) {
+      for (const { id } of written.values()) if (id) this.emitTrace({ type: 'message:added', messageId: id, source: opts.traceAs });
+    }
     return [...written.keys()];
   }
 
@@ -26600,7 +27099,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${opsWebhookText(wholeMessage)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
@@ -26864,6 +27363,8 @@ export class AgentFramework {
         } catch (err) {
           if (err instanceof MaintenanceWithdrawnError) {
             console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);
+          } else if (this.syncMoveReinit && err instanceof Error && refusedForMovedBranch(err.message)) {
+            console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${err.message})`);
           } else {
             console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
           }
@@ -27910,10 +28411,18 @@ export class AgentFramework {
 
   /** RFC-014: every toolHints server's presence, made on first use. */
   private toolsets(): ToolsetHub {
-    return (this.toolsetHub ??= new ToolsetHub({
+    if (this.toolsetHub) return this.toolsetHub;
+    const listedName = (serverId: string, tool: string) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`;
+    return (this.toolsetHub = new ToolsetHub({
       notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
+      canNotify: (serverId) => CapabilityGrant.of(this.mcplServerRegistry?.getServer(serverId)).has('pushEvents'),
       log: (line) => console.error(`[mcpl] ${line}`),
-      listedName: (serverId, tool) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`,
+      listedName,
+      published: (serverId, tool) => {
+        const name = listedName(serverId, tool);
+        if (this.mcplToolServers?.get(name) !== serverId) return undefined;
+        return this.mcplTools.some((t) => t.name === name) ? 'static' : 'dynamic';
+      },
     }));
   }
 
@@ -27927,7 +28436,7 @@ export class AgentFramework {
     if (existing) {
       throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints needs that name for its meta-tools`);
     }
-    await this.addModule(new ToolsetsModule(hub));
+    await this.addModule(new ToolsetsModule(hub, (call) => this.changeTaker(call)));
   }
 
   /** RFC-014 §5.3: after a (re)connect whose policy has settled, read what
@@ -27950,21 +28459,26 @@ export class AgentFramework {
    * it. The text is the server's (its tool definitions, titles, reasons), so
    * the notice names the server.
    */
-  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): void {
+  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): boolean {
     const connection = this.mcplServerRegistry?.getServer(serverId);
     if (!CapabilityGrant.of(connection).has('pushEvents')) {
-      console.error(`[mcpl] ${serverId}: a tool change was not told (pushEvents is not granted); ${META_TOOL_NAMES.look} shows it`);
-      return;
+      console.error(`[mcpl] ${serverId}: a tool change was not told (pushEvents is not granted); ${META_TOOL_NAMES.look} shows the state it left`);
+      return false;
     }
-    if (this.agents.size === 0) return;
+    if (this.agents.size === 0) {
+      console.error(`[mcpl] ${serverId}: a tool change was not told (no agent is registered to tell); ${META_TOOL_NAMES.look} shows the state it left`);
+      return false;
+    }
     try {
       this.addMessage(
         'user',
         [{ type: 'text', text: `MCPL server "${serverId}", tool changes:\n${text}` }],
         { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
       );
+      return true;
     } catch (error) {
       console.error(`[mcpl] ${serverId}: a tool change notice could not be written:`, error);
+      return false;
     }
   }
 
@@ -28124,11 +28638,11 @@ export class AgentFramework {
     let connection: McplServerConnection;
     // The transport the connect registered, which its own exchange is for.
     let registeredEpoch = 0;
-    // RFC-014: a toolHints server's meta-tools exist before it connects.
-    if (config.toolHints === true) await this.ensureToolsetsModule();
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
+      // RFC-014: a toolHints server's meta-tools exist before it connects.
+      if (config.toolHints === true) await this.ensureToolsetsModule();
       // Its policy exchange is in flight from its registration until the
       // exchange settles: an opener that runs meanwhile (a resume, startup's
       // staged open) passes the connection by, so nothing opens its planes
@@ -28859,7 +29373,7 @@ export class AgentFramework {
     return this.trackOperatorOperation('mcpl:disconnect', () => this.runDisconnectMcplServer(id));
   }
 
-  private async runDisconnectMcplServer(id: string): Promise<void> {
+  private async runDisconnectMcplServer(id: string, opts: { keepToolsets?: boolean } = {}): Promise<void> {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
@@ -28912,6 +29426,7 @@ export class AgentFramework {
       // from close(), and the transient path deliberately preserves checkpoints.
       this.featureSetManager?.removeServer(id);
       this.checkpointManager?.removeServer(id);
+      if (!opts.keepToolsets) this.toolsetHub?.forget(id);
 
       // Only this server's own claims, as the prefix map holds them rather
       // than as its configuration reads now: a server connected since under
@@ -29021,7 +29536,7 @@ export class AgentFramework {
     this.restartClaims().ids.set(config.id, claim);
     this.restartClaims().prefixes.set(prefix, claim);
     try {
-      await this.runDisconnectMcplServer(id);
+      await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && config.toolHints === true });
       try {
         await this.runConnectMcplServer(config, claim);
       } catch (error) {
@@ -29508,30 +30023,38 @@ export class AgentFramework {
       // RFC-014 §6.1 carrier 2: the tool change this push explains was
       // applied as it was read; it's told after the event's own content. A
       // push the host then refuses still tells its change, on its own.
-      const change = this.toolsetHub?.get(connection.id)?.changeText(params) ?? '';
+      const toolsets = this.toolsetHub?.get(connection.id);
+      const cs = toolsets?.takeChange(params);
+      const change = toolsets && cs ? toolsets.presence.render(cs, { mark: false }) : '';
+      const tellAlone = () => {
+        if (this.recordToolsetNotice(connection.id, change, { invite: false })) toolsets!.told(cs!);
+      };
       const content = (params as { payload?: { content?: unknown } } | null)?.payload?.content;
       if (!change || !Array.isArray(content)) {
-        if (change) this.recordToolsetNotice(connection.id, change, { invite: false });
+        if (change) tellAlone();
         await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
         return;
       }
-      let refused = false;
+      let accepted = false;
       const told = {
         respond: (result: unknown) => {
-          if ((result as { accepted?: unknown } | null)?.accepted === false) refused = true;
+          accepted = (result as { accepted?: unknown } | null)?.accepted !== false;
           responder?.respond(result);
         },
         respondError: (code: number, message: string, data?: unknown) => {
-          refused = true;
           (responder?.respondError as ((code: number, message: string, data?: unknown) => void) | undefined)?.(code, message, data);
         },
       };
-      await this.pushHandler?.handlePushEvent(
-        connection.id,
-        { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
-        told as never,
-      );
-      if (refused) this.recordToolsetNotice(connection.id, change, { invite: false });
+      try {
+        await this.pushHandler?.handlePushEvent(
+          connection.id,
+          { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
+          told as never,
+        );
+      } finally {
+        if (accepted) toolsets!.told(cs!);
+        else tellAlone();
+      }
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -30014,6 +30537,7 @@ export class AgentFramework {
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
     const repeats: Array<{ serverId: string; tools: string[] }> = [];
+    const movesListed = new Map<string, { controller: ToolsetController; prefix: string; moves: Array<{ name: string; to: Presence }> }>();
 
     for (const server of [...this.mcplServerRegistry.getAllServers()]) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -30031,11 +30555,14 @@ export class AgentFramework {
         // so a call act makes is attributed, classed and state-exchanged as
         // a direct call of the tool would be. The list was read through the
         // server's tap, so its presence is current.
-        // A static↔dynamic move the server hinted applies here, at a list
-        // boundary (§4.2), and the agent is told where the tool went.
+        // The static↔dynamic moves the lists made since the last rebuild
+        // reach the tool list here (§4.2). The agent is told where each tool
+        // went once this refresh publishes a list that shows it there: a move
+        // to static once the list offers the tool, a move to dynamic once it
+        // doesn't (a listing that breaks off publishes what it read). The
+        // rest stay pending for a refresh that does.
         const presence = this.toolsetHub?.get(server.id);
-        const moves = presence?.presence.active ? presence.applyMoves() : [];
-        if (moves.length > 0) this.recordToolsetNotice(server.id, moves.join('\n'), { invite: false });
+        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, prefix, moves: presence.presence.moves() });
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -30166,6 +30693,10 @@ export class AgentFramework {
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
     this.mcplListedServers = listedServers;
+    const offered = new Set(this.mcplTools.map((tool) => tool.name));
+    for (const [serverId, { controller, prefix, moves }] of movesListed) {
+      if (listedServers.has(serverId)) controller.applyMoves(moves.filter((m) => (m.to === 'static') === offered.has(`${prefix}--${m.name}`)));
+    }
     for (const { serverId, tools: repeatedTools } of repeats) {
       const one = repeatedTools.length === 1;
       const listed = repeatedTools.map((name) => logValue(name)).join(', ');
@@ -30173,7 +30704,7 @@ export class AgentFramework {
         'mcpl-tool-duplicate',
         serverId,
         `MCPL server "${serverId}" lists ${one ? 'the tool' : 'the tools'} ${listed} more than once. ` +
-          `The model is offered the first listing of ${one ? 'it' : 'each'}, and the rest are left out. ` +
+          `The first listing of ${one ? 'it' : 'each'} is the one used (offered to the model, or called through toolsets--act for a dynamic tool), and the rest are left out. ` +
           'A server should list each tool once, so this is for its maintainer to change.',
         { data: { tools: repeatedTools } },
       );
@@ -30182,7 +30713,9 @@ export class AgentFramework {
   }
 
   /**
-   * Report operator tool-name patterns that match no model-facing tool:
+   * Report operator tool-name patterns that match no tool name: one the
+   * model is offered, or an RFC-014 dynamic tool's listed name, which its
+   * class rules and lifecycle selectors match as a direct call's would:
    * `toolClassOverrides` keys and each server's `toolLifecycle.observe.tools`
    * / `toolLifecycle.inputs.tools`. These match `<toolPrefix>--<tool>`, and
    * the default prefix is `mcpl--<serverId>`, so a pattern written against
@@ -30231,7 +30764,7 @@ export class AgentFramework {
             && (this.mcplListedServers?.has(id) ?? false),
         };
       });
-      const names = this.modelFacingToolNames();
+      const names = this.patternableToolNames();
 
       for (const entry of pending) {
         const verdict = checkToolPattern(entry.pattern, names, servers);
@@ -30255,9 +30788,10 @@ export class AgentFramework {
 
   /** Every tool name the framework offers to anyone: the shared board plus
    *  each agent's own surface, before presentation visibility (a hidden tool
-   *  is still callable, so classes and lifecycle still apply to it). */
-  private modelFacingToolNames(): Set<string> {
-    const names = new Set(this.getAllTools().map((t) => t.name));
+   *  is still callable, so classes and lifecycle still apply to it), and
+   *  every name an MCPL server lists, a dynamic tool's included. */
+  private patternableToolNames(): Set<string> {
+    const names = new Set([...this.getAllTools().map((t) => t.name), ...(this.mcplToolServers?.keys() ?? [])]);
     for (const agent of this.agents.values()) {
       for (const tool of this.availableToolsForPresentation(agent.name)) names.add(tool.name);
     }
@@ -30414,7 +30948,12 @@ export class AgentFramework {
     const readThrough = sender ? this.publishReadThrough(sender, call.id) : null;
 
     const dispatchRedactor = serverTextRedactor(config ?? {});
+    let taken: TakenChange | undefined;
     const failDispatch = (error: unknown) => {
+      if (taken) {
+        taken.toolsets.tell(taken.cs);
+        taken = undefined;
+      }
       const raw = error instanceof Error ? error : new Error(String(error));
       // Server and transport text, as every record of it is, with the
       // configuration the call was dispatched under.
@@ -30431,7 +30970,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: err.message, isError: true },
+        result: { success: false, error: this.withActStateHint(call, serverId, raw, err.message), isError: true },
       });
     };
 
@@ -30591,10 +31130,13 @@ export class AgentFramework {
     }
 
     legacy.sendToolsCall(toolName, args, stateParams, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined)
-      // RFC-014 §6.2: a call reports its own consequences; the tool change
-      // its result carried is told after the server's content.
-      .then((result) => this.withToolsetChange(serverId, result))
       .then(async (result) => {
+        // RFC-014 §6.2: a call reports its own consequences, so the tool
+        // change its result carried is told after the server's content, to
+        // the agent that reads it; a script's result leaves it to a notice.
+        const toolsets = forScript || !mcplPeer ? undefined : this.toolsetHub?.get(serverId);
+        const cs = toolsets?.takeChange(result);
+        if (toolsets && cs && !isEmptyChange(cs)) taken = { toolsets, cs };
         // RFC-005: register references and fetch the small ones, and every
         // one a script will read, before serialization, so their stubs carry
         // a saved path. Only an MCPL peer's blocks are references; an
@@ -30626,7 +31168,14 @@ export class AgentFramework {
           await this.autoFetchReferences(result.content, serverId, mode, claims)
             .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
         }
-        return { result, toolResult: await reading(result, mcplPeer) };
+        const read = await reading(result, mcplPeer);
+        if (!taken) return { result, toolResult: read };
+        const joined = this.withWholeChange(agentName, call, read, taken.toolsets.presence.render(taken.cs, { mark: false }), this.resultMaxCharsFor(agentName, call.id));
+        if (!joined) {
+          taken.toolsets.tell(taken.cs);
+          taken = undefined;
+        }
+        return { result, toolResult: joined ?? read };
       })
       .then(({ result, toolResult: answer }) => {
         let toolResult = answer;
@@ -30732,6 +31281,8 @@ export class AgentFramework {
           moduleName: `mcpl:${serverId}`,
           result: toolResult,
         });
+        if (taken) taken.toolsets.told(taken.cs);
+        taken = undefined;
       })
       .catch(failDispatch);
   }
@@ -30752,8 +31303,8 @@ export class AgentFramework {
       ? { structured: result.structuredContent }
       : {};
     if (result.isError) {
-      // Its text as the model's dispatch reads it (mcplToolFailure). The raw
-      // content rides along for a script's structured result, the server's
+      // Its text (mcplToolFailure). The raw content rides along for a
+      // script's structured result, the server's
       // own account of the error; an in-process caller gets the text alone
       // (executeMcplToolCall).
       const content = Array.isArray(result.content) ? result.content as McpToolResultContent[] : undefined;
@@ -32253,6 +32804,43 @@ export class AgentFramework {
       });
   }
 
+  private readAgentSettings(agentName: string, touched: ReadonlyMap<AgentSettingsExtension, readonly string[]>): SettingsReading {
+    const s = this.getAgentRuntimeSettings(agentName);
+    const saved = this.agents.get(agentName)?.getRuntimeSettingsOverrides() ?? {};
+    return {
+      core: {
+        context_budget_tokens: JSON.stringify([
+          s.contextBudgetTokens, s.effectiveContextBudgetTokens, s.transition, saved.contextBudgetTokens ?? null,
+        ]),
+        tail_tokens: JSON.stringify([s.tailTokens ?? null, saved.tailTokens ?? null]),
+        transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
+        same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
+      },
+      exts: new Map([...touched].map(([ext, keys]) => [ext, { touched: keys, fields: readExtensionSettings(ext, agentName) }])),
+    };
+  }
+
+  private settingsChangedSince(agentName: string, before: SettingsReading | undefined): string {
+    if (!before) return 'Nothing in this call was changed.';
+    let changed: string[];
+    try {
+      const now = this.readAgentSettings(agentName, new Map([...before.exts].map(([ext, { touched }]) => [ext, touched])));
+      changed = [
+        ...changedSettings(before.core, now.core),
+        ...[...before.exts].flatMap(([ext, { touched, fields }]) => {
+          const differ = changedSettings(fields, now.exts.get(ext)!.fields);
+          const own = ext.keys.filter((key) => differ.includes(key));
+          return own.length > 0 ? own : differ.length > 0 ? touched : [];
+        }),
+      ];
+    } catch {
+      return 'Whether anything in this call was changed couldn\'t be read back.';
+    }
+    return changed.length === 0
+      ? 'No setting reads differently after this call.'
+      : `Changed before the refusal: ${changed.join(', ')}; no other setting reads differently.`;
+  }
+
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({
       type: 'tool:started',
@@ -32262,6 +32850,8 @@ export class AgentFramework {
       input: call.input,
     });
     let result: ToolResult;
+    const action = (call.input as { action?: unknown } | undefined)?.action;
+    let before: SettingsReading | undefined;
     try {
       const input = (call.input ?? {}) as {
         action?: unknown;
@@ -32286,41 +32876,57 @@ export class AgentFramework {
             data: { ...this.getAgentRuntimeSettings(agentName), ...extGet() },
           };
           break;
-        case 'cancel':
+        case 'cancel': {
+          const extra = Object.keys(input).filter((key) => key !== 'action');
+          if (extra.length > 0) {
+            throw new Error(`A cancel doesn't take ${extra.join(', ')}: it takes no settings`);
+          }
+          before = this.readAgentSettings(agentName, new Map());
           result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
           break;
+        }
         case 'update': {
+          if (input.settings !== undefined) {
+            throw new Error('`settings` lists names for a reset; to change a setting, give its name and new value');
+          }
+          const known = new Set<string>(['action', 'immediate', ...AgentFramework.AGENT_SETTINGS_CORE_KEYS]);
+          for (const ext of extensions.values()) ext.keys.forEach((key) => known.add(key));
+          const unknown = Object.keys(input).filter((key) => !known.has(key));
+          if (unknown.length > 0) {
+            throw new Error(`Unknown setting${unknown.length > 1 ? 's' : ''}: ${unknown.join(', ')}`);
+          }
           const patch: AgentRuntimeSettingsPatch = {};
           if (input.context_budget_tokens !== undefined) {
-            patch.contextBudgetTokens = Number(input.context_budget_tokens);
+            patch.contextBudgetTokens = settingNumber('context_budget_tokens', input.context_budget_tokens);
           }
-          if (input.tail_tokens !== undefined) patch.tailTokens = Number(input.tail_tokens);
+          if (input.tail_tokens !== undefined) patch.tailTokens = settingNumber('tail_tokens', input.tail_tokens);
           if (input.transition_pace_tokens !== undefined) {
-            patch.transitionPaceTokens = Number(input.transition_pace_tokens);
+            patch.transitionPaceTokens = settingNumber('transition_pace_tokens', input.transition_pace_tokens);
           }
           if (input.same_round_think_text_policy !== undefined) {
             patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
-          if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
+          if (input.immediate !== undefined) patch.immediate = settingBoolean('immediate', input.immediate);
           // Route extension-owned keys to their modules; apply the core patch
           // only when it touches core keys (an extension-only update must not
           // disturb a converging budget transition).
-          const extResults: Record<string, unknown> = {};
+          const slices: Array<{ ext: AgentSettingsExtension; slice: Record<string, unknown> }> = [];
           for (const ext of extensions.values()) {
             const slice: Record<string, unknown> = {};
             for (const key of ext.keys) {
               if (input[key] !== undefined) slice[key] = input[key];
             }
-            if (Object.keys(slice).length > 0) {
-              Object.assign(extResults, ext.update(agentName, slice));
-            }
+            if (Object.keys(slice).length > 0) slices.push({ ext, slice });
           }
           const coreTouched = Object.keys(patch).length > 0;
+          before = this.readAgentSettings(agentName, new Map(slices.map((s) => [s.ext, Object.keys(s.slice)])));
           const core = coreTouched
             ? this.updateAgentRuntimeSettings(agentName, patch)
             : this.getAgentRuntimeSettings(agentName);
+          const extResults: Record<string, unknown> = {};
+          for (const { ext, slice } of slices) Object.assign(extResults, ext.update(agentName, slice));
           result = {
             success: true,
             data: {
@@ -32338,27 +32944,33 @@ export class AgentFramework {
           break;
         }
         case 'reset': {
+          const extra = Object.keys(input).filter((key) => key !== 'action' && key !== 'settings');
+          if (extra.length > 0) {
+            throw new Error(`A reset doesn't take ${extra.join(', ')}: give the names to reset in \`settings\``);
+          }
           let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
           const extResetKeys = new Map<AgentSettingsExtension, string[]>();
           const resetsAllSettings = input.settings === undefined;
           if (input.settings !== undefined) {
             if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
-            const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
-              context_budget_tokens: 'contextBudgetTokens',
-              tail_tokens: 'tailTokens',
-              transition_pace_tokens: 'transitionPaceTokens',
-              same_round_think_text_policy: 'sameRoundThinkTextPolicy',
-            };
+            const names = new Map<string, keyof AgentRuntimeSettingsPatch>([
+              ['context_budget_tokens', 'contextBudgetTokens'],
+              ['tail_tokens', 'tailTokens'],
+              ['transition_pace_tokens', 'transitionPaceTokens'],
+              ['same_round_think_text_policy', 'sameRoundThinkTextPolicy'],
+            ]);
             keys = [];
             for (const name of input.settings) {
-              if (typeof name === 'string' && names[name]) {
-                keys.push(names[name]);
+              const coreKey = typeof name === 'string' ? names.get(name) : undefined;
+              if (coreKey) {
+                keys.push(coreKey);
                 continue;
               }
               const owner = [...extensions.values()].find(
                 (ext) => typeof name === 'string' && ext.keys.includes(name),
               );
               if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
+              if (!owner.reset) throw new Error(`${String(name)} can't be reset: give it the value you want with an update`);
               const list = extResetKeys.get(owner) ?? [];
               list.push(name as string);
               extResetKeys.set(owner, list);
@@ -32367,21 +32979,19 @@ export class AgentFramework {
           }
           const touchedSameRoundThinkTextPolicy =
             resetsAllSettings || keys?.includes('sameRoundThinkTextPolicy') === true;
-          const extResults: Record<string, unknown> = {};
-          if (input.settings === undefined) {
-            // Reset-all covers extensions too.
-            for (const ext of extensions.values()) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName));
-            }
-          } else {
-            for (const [ext, list] of extResetKeys) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
-            }
-          }
           const coreTouched = input.settings === undefined || keys !== undefined;
+          // Reset-all covers extensions too.
+          const extResets: Array<[AgentSettingsExtension, string[] | undefined]> = resetsAllSettings
+            ? [...extensions.values()].map((ext) => [ext, undefined])
+            : [...extResetKeys];
+          before = this.readAgentSettings(agentName, new Map(extResets.map(([ext, list]) => [ext, list ?? ext.keys])));
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);
+          const extResults: Record<string, unknown> = {};
+          for (const [ext, list] of extResets) {
+            if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
+          }
           result = {
             success: true,
             data: {
@@ -32402,9 +33012,12 @@ export class AgentFramework {
           throw new Error('agent_settings: action must be get, update, reset, or cancel');
       }
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
       result = {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: action === 'update' || action === 'reset' || action === 'cancel'
+          ? `${/[.!?]$/.test(reason.trim()) ? reason.trim() : `${reason.trim()}.`} ${this.settingsChangedSince(agentName, before)}`
+          : reason,
         isError: true,
       };
     }

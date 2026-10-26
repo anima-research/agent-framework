@@ -1480,7 +1480,7 @@ test("a direct mount whose root moves between a read's parse and its open names 
   assert.match(err.message, /lies in mount "work", nested in mount "ref"/);
 });
 
-test("a direct mount whose root has moved resolves no other mount's root but those configured beneath its path", async (t) => {
+test("a direct mount whose root has moved resolves no other mount's root but those configured on or beneath its path", async (t) => {
   const env = new Env(t);
   // `ref` reaches `a` through `link`, and `x` is configured through a link
   // of its own, elsewhere.
@@ -1538,6 +1538,49 @@ const FOLDS_CASE = (() => {
     rmSync(dir, { recursive: true, force: true });
   }
 })();
+
+const KEEPS_FORMS_APART = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'workspace-direct-forms-'));
+  try {
+    writeFileSync(join(dir, 'caf\u00e9'), '');
+    return !existsSync(join(dir, 'cafe\u0301'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
+test("a direct root moved beside directories spelled in another case or form places each mount there as a start there does, and says where it only may lie", {
+  skip: FOLDS_CASE || !KEEPS_FORMS_APART ? 'the temp directory folds case or joins the normalization forms, so these spellings name one directory' : false,
+}, async (t) => {
+  const env = new Env(t);
+  const a = join(env.root, 'a');
+  mkdirSync(a);
+  for (const top of ['cafe', 'CAFE', 'caf\u00e9', 'cafe\u0301']) {
+    mkdirSync(join(env.root, top, 'inner'), { recursive: true });
+    writeFileSync(join(env.root, top, 'inner', 'file.txt'), `${top}\n`);
+  }
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link }, [
+    { name: 'upper', path: join(env.root, 'CAFE', 'inner'), mode: 'read-write', watch: 'never' },
+    { name: 'nfd', path: join(env.root, 'cafe\u0301', 'inner'), mode: 'read-write', watch: 'never' },
+  ]];
+  const moved = await env.open(...mounts);
+  const answer = (m: WorkspaceModule) => call(m, 'read', { path: 'ref/inner/file.txt' });
+
+  rmSync(link);
+  symlinkSync(join(env.root, 'cafe'), link);
+  const own = await answer(moved);
+  assert.equal(own.success, false, String(own.error));
+  assert.match(String(own.error), /may lie in mount "upper", nested in mount "ref".*can't tell whether "ref\/inner" is mount "upper"'s directory/);
+  assert.deepEqual(own, await answer(await new Env(t).open(...mounts)));
+
+  rmSync(link);
+  symlinkSync(join(env.root, 'caf\u00e9'), link);
+  const guessed = await answer(moved);
+  assert.match(String(guessed.error), /may lie in mount "nfd", nested in mount "ref".*can't tell whether "ref\/inner" is mount "nfd"'s directory/);
+  assert.deepEqual(guessed, await answer(await new Env(t).open(...mounts)));
+});
 
 test("on a disk that folds case, a mount configured beneath a moved direct root, spelled otherwise than disk spells it, is nested as a start there nests it", {
   skip: FOLDS_CASE ? false : "the temp directory tells case apart, so a path spelled in another case reaches nothing: this runs on a disk that folds case, such as macOS's default",
