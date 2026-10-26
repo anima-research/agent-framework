@@ -102,7 +102,7 @@ function asTurnWithNoLiveRound(membrane: MockMembrane, call: ContentBlock): void
 const long = `{"steps": "${'x'.repeat(200)}`;
 
 const refusals: Array<{ marker: string; says: string; why: string }> = [
-  { marker: '{"steps": 1', says: 'Nothing was done: probe--move its arguments must be one JSON object, and this call gave text that isn\'t JSON, which may have been cut off: "{\\"steps\\": 1".', why: 'text that isn\'t JSON, shown' },
+  { marker: '{"steps": 1', says: 'Nothing was done: probe--move its arguments must be one JSON object, and this call gave text that isn\'t JSON, which may have been cut off: "{\\"steps\\": 1"; call it again with one JSON object.', why: 'text that isn\'t JSON, shown' },
   { marker: '', says: 'Nothing was done: probe--move its arguments never arrived; call it again with them whole.', why: 'nothing of its arguments' },
   { marker: ' \n', says: 'Nothing was done: probe--move its arguments never arrived; call it again with them whole.', why: 'only whitespace' },
   { marker: '[1,2]', says: 'Nothing was done: probe--move its input must be an object, and this call gave an array.', why: 'an array' },
@@ -132,7 +132,7 @@ test("a refusal shows only the start of the model's text", async () => {
   try {
     const [result] = await h.turn([marked(long)]);
     assert.ok(result!.content.includes('"{\\"steps\\": \\"xxxxxxxxxx'), result!.content);
-    assert.ok(result!.content.endsWith('….'), result!.content);
+    assert.ok(result!.content.endsWith('…; call it again with one JSON object.'), result!.content);
     assert.ok(!result!.content.includes('x'.repeat(100)), 'the rest of the text is left out');
     assert.deepEqual(h.effects, []);
   } finally { await h.close(); }

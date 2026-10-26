@@ -84,7 +84,7 @@ export function markedInputRefusal(call: { name: string; unparseableInput?: stri
   try {
     parsed = JSON.parse(text);
   } catch {
-    return `Nothing was done: ${call.name} its arguments must be one JSON object, and this call gave text that isn't JSON, which may have been cut off: ${shown(text)}.`;
+    return `Nothing was done: ${call.name} its arguments must be one JSON object, and this call gave text that isn't JSON, which may have been cut off: ${shown(text)}; call it again with one JSON object.`;
   }
   if (parsed === null) return undefined;
   if (typeof parsed !== 'object' || Array.isArray(parsed)) return `Nothing was done: ${call.name} ${notAnObject(parsed)}.`;
