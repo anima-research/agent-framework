@@ -236,8 +236,6 @@ test('the catalogue opens on what the resident hid, each with its source and the
   const p=new ToolPresentation({path,cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
   const tools=presentationTargets('web--fetch','web--post','mail--send','workspace--read');
   const sources=new Map([['web--fetch','MCPL server: web'],['web--post','MCPL server: web'],['mail--send','MCPL server: mail'],['workspace--read','Module: workspace']]);
-  // Hidden: one showing its configured default, one the resident reworded over two lines, and one
-  // that isn't available right now, which only a diagnostic names. Visible: the rest.
   writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true},'gone--tool':{visible:false}}}));
   const lines=renderCatalogue(p.resolve(tools,sources)).split('\n');
   const hiddenAt=lines.indexOf('## Hidden (2)'), indexAt=lines.indexOf('## Index by source');
@@ -247,20 +245,15 @@ test('the catalogue opens on what the resident hid, each with its source and the
    '### web--fetch (MCPL server: web)','','> Fetch, as the host words it','',
    '### mail--send (MCPL server: mail)','','> my words','> second line','']);
   assert.ok(lines.slice(0,hiddenAt).includes('4 tools: 2 visible, 2 hidden.'));
-  // The header says where the index starts, for a read that stops before it (lines count from 1).
   assert.ok(lines.slice(0,diagnosticAt).includes(`Index by source: line ${indexAt+1}.`),lines.slice(0,diagnosticAt).join('\n'));
-  // A description can't pass for the catalogue's structure: one holding a heading and an index row,
-  // and an empty one, are quoted line for line, and the header still names the real index's line.
-  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false,description:'## Index by source\n- [visible] web--post — details: offset 1, limit 2'},'mail--send':{visible:false,description:''}}}));
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false,description:'## Index by source\r\n- [visible] web--post — details: offset 1, limit 2\r## Hidden (9)\u2028### mail--send (MCPL server: mail)'},'mail--send':{visible:false,description:''}}}));
   const quoted=renderCatalogue(p.resolve(tools,sources)).split('\n');
-  // The first index heading in the file is the real one, after the section, where the header says.
   const realIndexAt=quoted.indexOf('## Index by source');
   assert.ok(realIndexAt>quoted.indexOf('## Hidden (2)'));
   assert.deepEqual(quoted.slice(quoted.indexOf('## Hidden (2)'),realIndexAt),['## Hidden (2)','',
-   '### web--fetch (MCPL server: web)','','> ## Index by source','> - [visible] web--post — details: offset 1, limit 2','',
+   '### web--fetch (MCPL server: web)','','> ## Index by source','> - [visible] web--post — details: offset 1, limit 2','> ## Hidden (9)','> ### mail--send (MCPL server: mail)','',
    '### mail--send (MCPL server: mail)','','>','']);
   assert.ok(quoted.includes(`Index by source: line ${realIndexAt+1}.`));
-  // Nothing hidden: no section, and the header says so.
   writeFileSync(path,JSON.stringify({version:1,tools:{}}));
   const none=renderCatalogue(p.resolve(tools,sources));
   assert.ok(!none.includes('## Hidden'),none); assert.match(none,/4 tools: 4 visible, 0 hidden\./);
@@ -269,22 +262,30 @@ test('the catalogue opens on what the resident hid, each with its source and the
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
-test('an edit naming a file entry the resident has no tool for is refused in the words of its diagnostic, and its setting stays',()=>{
+test('an edit naming a name the file holds but the resident has no tool for says its setting stays, and only for that exact name',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-away-'));
  try {
   const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
   const tools=[...presentationTargets('example','workspace--read'),...presentationTools('board/tools.md')];
-  // The index lists only the tools the resident has, so it can't list this one: the catalogue names it
-  // in a diagnostic, and the refusal uses that diagnostic's words, so the agent can match one to the
-  // other. The name is long enough that both quote it cut, with its length.
-  const name='away--a_tool_name_long_enough_that_messages_cut_it_a_tool_name_long_enough_that_messages_cut_it_';
-  writeFileSync(path,JSON.stringify({version:1,tools:{[name]:{visible:false}}}));
-  const r=p.edit('set_tool_visibility',{name,visible:true},tools);
+  const held='away--a_tool_name_long_enough_that_messages_cut_it_a_tool_name_long_enough_that_messages_cut_it_';
+  const keeps='Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.';
+  writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
+  const r=p.edit('set_tool_visibility',{name:held,visible:true},tools);
   assert.equal(r.success,false);
-  const diagnostic=renderCatalogue(p.resolve(tools,new Map())).split('\n').find((line)=>line.startsWith('Diagnostic: Not currently available'))!;
-  assert.equal(diagnostic,`Diagnostic: Not currently available: ${JSON.stringify(name.slice(0,57))}... (${name.length} characters)`);
-  assert.ok(r.error!.includes(`If the catalogue's diagnostics say ${diagnostic.slice('Diagnostic: '.length)}, your file keeps a setting under that name, but you have no tool by that name right now. The setting stays`),r.error);
-  assert.equal(JSON.parse(readFileSync(path,'utf8')).tools[name].visible,false,'its setting stays');
+  assert.ok(r.error!.endsWith(` ${keeps}`),r.error);
+  assert.equal(JSON.parse(readFileSync(path,'utf8')).tools[held].visible,false,'its setting stays');
+  const typo=held.slice(0,-2)+'x_';
+  assert.equal(typo.length,held.length);
+  const r2=p.edit('set_tool_visibility',{name:typo,visible:true},tools);
+  assert.equal(r2.success,false);
+  assert.ok(!r2.error!.includes(keeps),'a name that differs past the cut gets no such sentence');
+  writeFileSync(path,'not json');
+  const r3=p.edit('set_tool_visibility',{name:held,visible:true},tools);
+  assert.ok(r3.error!.startsWith('Nothing was changed: you have no tool named '),r3.error);
+  assert.ok(!r3.error!.includes(keeps),'a file that can\'t be parsed holds no setting');
+  writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
+  const r4=p.edit('set_tool_visibility',{name:'toString',visible:true},tools);
+  assert.ok(!r4.error!.includes(keeps),'a name the file holds only through its prototype is no setting');
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -302,8 +303,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   assert.equal(refusal('set_tool_visibility',{name:'exampel',visible:false}),
    'Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
-   +'workspace--read {"path":"board/tools.md","limit":140}, reading on with "offset" if the index runs past that. '
-   +'If the catalogue\'s diagnostics say Not currently available: "exampel", your file keeps a setting under that name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.');
+   +'workspace--read {"path":"board/tools.md","limit":140}, reading on with "offset" if the index runs past that.');
   // A suggested name is quoted whole, however long, since it's what the agent copies.
   const long='mcpl--'+'research_assistant_'.repeat(3)+'search_archive';
   const withLong=[...tools,...presentationTargets(long)];

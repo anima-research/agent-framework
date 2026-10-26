@@ -326,12 +326,11 @@ export class ToolPresentation {
     const name = args.name as string;
     if (!available.some((t) => t.name === name)) {
       const near = closestNames(name, available.map((t) => t.name));
+      let held = false;
+      try { held = Object.hasOwn(parsePresentation(this.read()).tools, name); } catch { held = false; }
       throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
         + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`
-        // The index lists only the tools the resident has: a name the file holds that it has no tool by
-        // now (a tool away, removed or not allowed to this agent, or a key that was never a tool) is
-        // named by a diagnostic instead, in these words.
-        + ` If the catalogue's diagnostics say Not currently available: ${quoted(name)}, your file keeps a setting under that name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.`);
+        + (held ? ' Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.' : ''));
     }
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
       throw new PresentationRefusal(`Nothing was changed: the description is ${count(characters(args.description))} characters, over the ${count(MAX_DESCRIPTION_CHARS)} allowed. Shorten it and call set_tool_description again.`);
@@ -362,20 +361,11 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
   const indexLineAt = lines.indexOf('Index by source: line N.');
   // One line each: a quoted parse error can hold the file's own line breaks.
   for (const diagnostic of snapshot.diagnostics) lines.push('Diagnostic: '+diagnostic.replace(/\r\n|\r|\n/g, '\\n'));
-  // The available tools hidden from the resident come right after the header
-  // and any diagnostics, each with the description it would show, so a read
-  // from the top reaches them before the index, with no read per hidden tool
-  // and no pass through every visible tool's description. A long section
-  // pushes the index further down; the read's own truncation note says to
-  // read on.
   const hidden = snapshot.entries.filter(e => !e.visible);
   if (hidden.length) {
     lines.push(`## Hidden (${hidden.length})`, '');
-    // Each description line quoted, so none is the same as one of the catalogue's own lines, such as
-    // a heading or an index row ahead of the real index; one line each, so no offset moves.
-    for (const entry of hidden) lines.push(`### ${entry.name} (${entry.source})`, '', ...entry.description.split('\n').map(line => line ? `> ${line}` : '>'), '');
+    for (const entry of hidden) lines.push(`### ${entry.name} (${entry.source})`, '', ...entry.description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).map(line => line ? `> ${line}` : '>'), '');
   }
-  // The index's line, for a read that stops before it: filled in now that it's known.
   lines[indexLineAt] = `Index by source: line ${lines.length + 1}.`;
   lines.push('## Index by source', '');
   const index = new Map<string, number>();
