@@ -1716,7 +1716,7 @@ test('an entry\'s spelling takes no path out of a nested mount\'s directory that
   // As configured, a path is later's.
   await refusedAs('write', { path: 'outer/later/y.txt', content: 'y\n' }, 'later');
   assert.match(String((await call('write', { path: 'outer/LATER/y.txt', content: 'y\n' })).error),
-    /^"outer\/LATER\/y\.txt" may lie in mount "later", nested in mount "outer".*can't tell "outer\/LATER" from "outer\/later"/);
+    /^The write did nothing: "outer\/LATER\/y\.txt" may lie in mount "later", nested in mount "outer".*can't tell "outer\/LATER" from "outer\/later"/);
   // Outside deep's directory, the entry's spelling stands: beside it, and
   // for the directory that holds it.
   const sibling = await call('write', { path: 'outer/PROJ/z.txt', content: 'z\n' });
