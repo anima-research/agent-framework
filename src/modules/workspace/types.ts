@@ -102,7 +102,10 @@ export interface MountConfig {
   watchRootPollMs?: number;
   /**
    * Patterns in these of gitignore's forms, each covering the files
-   * gitignore's reading of it covers:
+   * gitignore's reading of it covers, with two differences: names compare
+   * exactly, as git's do with `core.ignorecase` off (its default folds case
+   * on macOS and Windows), and "?" matches one character where git's matches
+   * one byte, so the two differ on names outside ASCII:
    * - A name, matched at any depth: ".git", "node_modules". Within a name,
    *   "*" matches any run of characters and "?" any one: "*.pyc",
    *   "npm-debug.log*".
@@ -120,8 +123,7 @@ export interface MountConfig {
    * The module refuses, when it's built, a pattern of any other form, such as
    * a leading "!" or "#", a "[", a "\", a trailing space, "**" anywhere
    * else, or an empty, "." or ".." segment, naming the pattern and why. A
-   * "?", which matches any one character, can stand for a "[" or "\" in a
-   * name.
+   * "?" can stand for a "[" or "\" in a name.
    *
    * A sync without a path and the watcher pass over what the list covers,
    * and over entries with an editor's swap or backup file name whatever it
@@ -142,7 +144,8 @@ export interface MountConfig {
   ignore?: string[];
   /**
    * The files this mount holds, when it holds only some of what is under its
-   * path: patterns in `ignore`'s forms, read for files. A pattern that matches
+   * path: patterns in `ignore`'s forms, read for files, and a `[` read as
+   * itself, so `[id].tsx` names that file. A pattern that matches
    * only directories, with a trailing `/` or `/**`, covers what lies beneath a
    * directory it matches: `fixtures/` every file beneath a directory named
    * fixtures, at any depth, and `docs/**` or `/docs/` every file beneath the
@@ -259,8 +262,7 @@ export interface MountConfig {
    *
    * Left out, the mount holds everything under its path. Given, it's a list
    * of at least one pattern, and the module refuses one `ignore` would
-   * refuse, so `[id].tsx` is refused, and `?id].tsx` covers that file and any
-   * other name that differs from it only in that character.
+   * refuse but for a `[`.
    */
   include?: string[];
   /**

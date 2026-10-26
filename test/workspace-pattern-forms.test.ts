@@ -6,7 +6,7 @@
 
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -126,6 +126,23 @@ describe('ignore reads gitignore\'s forms', () => {
     assert.deepEqual(await synced(t, ['gen', 'tmp/t.txt', 'x/tmp/u.txt', 'keep.txt'], { ignore: ['gen/**', 'tmp/**'] }), ['gen', 'keep.txt', 'x/tmp/u.txt']);
   });
 
+  test('a "?" stands for a "[" in a name, which an ignore pattern can\'t hold', async (t) => {
+    assert.deepEqual(await synced(t, ['[id].tsx', 'x/[id].tsx', 'other.tsx'], { ignore: ['?id].tsx'] }), ['other.tsx']);
+  });
+
+  test('on a mount that follows links, a link counts as what it leads to: a directory for a directory-only pattern, a file not', async (t) => {
+    const env = new Env(t, ['real/a.txt', 'file.txt']);
+    symlinkSync('real', join(env.dir, 'build'));
+    symlinkSync('file.txt', join(env.dir, 'bin'));
+    const m = await env.open({ ignore: ['build/', 'bin/'], followSymlinks: true });
+    const IGNORED_NOTE = "this mount's ignore list covers it, so a sync without a path won't maintain it";
+    const listingSays = async (path: string) => JSON.stringify(await m.handleToolCall({ id: 't', name: 'ls', input: { path } }));
+    assert.match(await listingSays('work/build'), /ignored by the mount/);
+    assert.deepEqual((await call(m, 'sync', { path: 'work/build' })).ignored, [{ mount: 'work', path: 'build', note: IGNORED_NOTE }]);
+    assert.doesNotMatch(await listingSays('work/bin'), /ignored by the mount/);
+    assert.equal((await call(m, 'sync', { path: 'work/bin' })).ignored, undefined);
+  });
+
   test('"*" and "?" match within a name, and "*.ext" matches as before', async (t) => {
     const files = ['npm-debug.log', 'npm-debug.log.1', '.env', 'x/.env.local', 'test.txt', 'tent.txt', 'teest.txt', 'a.md', 'x/b.md', 'keep.txt'];
     assert.deepEqual(await synced(t, files, { ignore: ['npm-debug.log*', '.env*', 'te?t.txt', '*.md'] }), ['keep.txt', 'teest.txt']);
@@ -153,8 +170,10 @@ describe('include reads gitignore\'s forms, for files', () => {
     assert.deepEqual(await synced(t, files, { include: ['/docs/', '**/cache/'] }), ['cache/c', 'docs/a.md', 'y/cache/d']);
   });
 
-  test('a "?" stands for a "[" in a name, which a pattern can\'t hold', async (t) => {
-    assert.deepEqual(await synced(t, ['[id].tsx', 'x/[id].tsx', 'other.tsx'], { include: ['?id].tsx'] }), ['[id].tsx', 'x/[id].tsx']);
+  test('a "[" is read as itself, as 0.27.0 promised, with "*" and "?" beside it too', async (t) => {
+    const files = ['[id].tsx', 'x/[id].tsx', '[id]-x.tsx', 'i.tsx', 'd.tsx'];
+    assert.deepEqual(await synced(t, files, { include: ['[id].tsx'] }), ['[id].tsx', 'x/[id].tsx']);
+    assert.deepEqual(await synced(t, files, { include: ['[id]*.tsx'] }), ['[id]-x.tsx', '[id].tsx', 'x/[id].tsx']);
   });
 });
 

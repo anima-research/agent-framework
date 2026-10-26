@@ -1,25 +1,29 @@
 - **Hosts and operators whose workspace mounts set `ignore` or `include`:**
   both lists now read one grammar, the gitignore forms a config copied from
-  a `.gitignore` uses, each as gitignore reads it, and a pattern of any other
-  form stops the module from being built, with an error naming the mount,
-  the pattern and why. Before, `ignore` read only a name, `dir/**` and
-  `*.ext`, and any other pattern matched only an entry of exactly that name,
-  or nothing, without a word.
+  a `.gitignore` uses, and a pattern of any other form stops the module from
+  being built, with an error naming the mount, the pattern and why. Each form
+  covers the files git's reading of it covers, with two differences: names
+  compare exactly, as git's do with `core.ignorecase` off (its default folds
+  case on macOS and Windows), and a `?` matches one character where git's
+  matches one byte, so the two differ on names outside ASCII. Before,
+  `ignore` read only a name, `dir/**` and `*.ext`, and any other pattern
+  matched only an entry of exactly that name, or nothing, without a word.
 
   **Who needs to act:** a config holding a pattern the lists now refuse,
   which loaded before:
-  - in either list, a leading `!` or `#`, a `[`, a trailing space, or a `\`.
+  - in either list, a leading `!` or `#`, a trailing space, or a `\`.
     `include` read each of these as part of a name (a `\` only where `/` is
-    the platform's separator), so `[id].tsx` named that file;
-  - in `ignore`, also `**` anywhere but as the first segment before one name
-    or in a trailing `/**`, or an empty, `.` or `..` segment, which
-    `include` already refused.
+    the platform's separator);
+  - in `ignore`, also a `[`, `**` anywhere but as the first segment before
+    one name or in a trailing `/**`, or an empty, `.` or `..` segment, which
+    `include` already refused, apart from the `[`. `include` still reads a
+    `[` as itself, so `[id].tsx` names that file.
 
   Remove such a pattern, or write it in a form the lists read. A `?` matches
-  any one character, so it can stand for a `[` or `\` in a name: `?id].tsx`
-  covers `[id].tsx`, and any other name that differs from it only in that
-  character. An `ignore` that isn't a list, such as `null`, is refused too;
-  `[]` still ignores nothing.
+  any one character, so it can stand for a `[` or `\` in a name: in `ignore`,
+  `?id].tsx` covers `[id].tsx`, and any other name that differs from it only
+  in that character. An `ignore` that isn't a list, such as `null`, is
+  refused too; `[]` still ignores nothing.
 
   **What `ignore` now covers that it didn't:**
   - `dir/`: a directory named `dir` at any depth, with what lies beneath it,

@@ -1643,8 +1643,8 @@ describe('mount include', () => {
   });
 
   test('a pattern holding "\\" is refused on every platform, where "/" is the separator too', () => {
-    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.notEqual(patternRefusal(pattern), undefined, pattern);
-    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(patternRefusal(pattern), undefined, pattern);
+    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.notEqual(patternRefusal(pattern, 'include'), undefined, pattern);
+    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(patternRefusal(pattern, 'include'), undefined, pattern);
   });
 
   test('include is checked when the module is built, and the refusal names the mount and what it refused', () => {
@@ -1660,8 +1660,8 @@ describe('mount include', () => {
     }
     refusal([1n], 'include pattern 1n isn\'t read: ');
     refusal({ pattern: 1n }, 'include must be a non-empty list of patterns, not [object Object]');
-    refusal(['gate.json', '[ab].json'], 'include pattern "[ab].json" isn\'t read: ');
-    for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**'], ['sub/file.txt'], ['foo*'], ['*'], ['*.'], ['*.js*'], ['a/*/**'], ['fixtures/'], ['/gate.json']]) {
+    refusal(['gate.json', '!gate.json'], 'include pattern "!gate.json" isn\'t read: ');
+    for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**'], ['sub/file.txt'], ['foo*'], ['*'], ['*.'], ['*.js*'], ['a/*/**'], ['fixtures/'], ['/gate.json'], ['[id].tsx']]) {
       assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(good)] }), JSON.stringify(good));
     }
   });

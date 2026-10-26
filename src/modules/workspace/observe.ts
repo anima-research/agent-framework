@@ -1711,7 +1711,6 @@ function parsePattern(pattern: string): Pattern | string {
   if (pattern.startsWith('!')) return 'a leading "!" makes an exception in a .gitignore, and this list has none, so leave it out';
   if (pattern.startsWith('#')) return 'a leading "#" marks a comment in a .gitignore, so leave comments out of the list';
   if (pattern.includes('\\')) return '"\\" is an escape in a .gitignore and a separator on Windows, so no pattern here holds one, and "?" stands for one in a name';
-  if (pattern.includes('[')) return '"[" starts a character class in a .gitignore, which this list doesn\'t read, so write each name out, with "?" for a "[" in it';
   if (pattern.endsWith(' ')) return 'a .gitignore drops trailing spaces, so remove them';
   const anyDepth = pattern.startsWith('**/');
   let body = anyDepth ? pattern.slice(3) : pattern;
@@ -1724,7 +1723,7 @@ function parsePattern(pattern: string): Pattern | string {
   const segments = body.split('/');
   if (segments.some((s) => s === '' || s === '.' || s === '..')) return 'it has an empty, "." or ".." segment, which names no entry';
   const glob = (s: string): string | RegExp => /[*?]/.test(s)
-    ? new RegExp(`^${s.replace(/[.+^${}()|\]*?]/g, (c) => (c === '*' ? '.*' : c === '?' ? '.' : `\\${c}`))}$`, 'su')
+    ? new RegExp(`^${s.replace(/[.+^${}()|[\]*?]/g, (c) => (c === '*' ? '.*' : c === '?' ? '.' : `\\${c}`))}$`, 'su')
     : s;
   return { segments: segments.map(glob), anchored, directory };
 }
@@ -1739,10 +1738,18 @@ function matchesEntry(pattern: Pattern, segments: readonly string[], directory: 
   return segments.length === pattern.segments.length && pattern.segments.every((s, i) => nameMatches(s, segments[i]!));
 }
 
-export function patternRefusal(pattern: unknown): string | undefined {
+export function patternRefusal(pattern: unknown, list: 'ignore' | 'include'): string | undefined {
   if (typeof pattern !== 'string') return "it isn't a string";
   const reading = readPattern(pattern);
-  return typeof reading === 'string' ? reading : undefined;
+  if (typeof reading === 'string') return reading;
+  if (list === 'ignore' && pattern.includes('[')) {
+    return '"[" starts a character class in a .gitignore, which this list doesn\'t read, so write each name out, with "?" for a "[" in it';
+  }
+  return undefined;
+}
+
+export function directoryAt(path: string, followSymlinks: boolean): Promise<boolean | undefined> {
+  return (followSymlinks ? stat : lstat)(path).then((s) => s.isDirectory(), () => undefined);
 }
 
 /**
@@ -1942,8 +1949,7 @@ export async function walkScope(
   if (!opts.named && scope !== '') {
     let why = passedOverAt(scope, view.ignore, view.others, true);
     if (why !== undefined && passedOverAt(scope, view.ignore, view.others, false) === undefined) {
-      const directory = await lstat(join(rootReal, scope)).then((s) => s.isDirectory() || (view.followSymlinks && s.isSymbolicLink()), () => true);
-      if (!directory) why = undefined;
+      if ((await directoryAt(join(rootReal, scope), view.followSymlinks)) === false) why = undefined;
     }
     if (why !== undefined) {
       walk.others.set(scope, why);
