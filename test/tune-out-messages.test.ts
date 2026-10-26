@@ -264,4 +264,3 @@ test("speak_in_channel's refusal names the setting in the host's log, not to the
     ['[tune-out] speak_in_channel refused: FrameworkConfig.subconscious.allowChannelSpeech is off'],
   );
 });
-

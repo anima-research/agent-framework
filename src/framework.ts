@@ -5096,6 +5096,13 @@ export class AgentFramework {
     }
     return { delayMs: ownMs, ownMs, stated: false };
   }
+  /** Whether two requests are one wake, for a provider hold's dedup: the
+   *  same agent, reason, source, time and channel, on the same server (two
+   *  servers' channels can share an id), and the same coalescing
+   *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
+   *  single subject), and the write a wake reads. A wake with any of them
+   *  can be withdrawn or dropped on its own, and must not stand for one
+   *  without. (coalescingBatch is set only beside one of the first two.) */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
@@ -15587,6 +15594,11 @@ export class AgentFramework {
         // a turn alive at the quiesce can finish; everything else parks.
         const passThrough = requests.filter((r) => passesQuiesce(r));
         const parked = requests.filter((r) => !passesQuiesce(r));
+        // Coalesce per (reason, addressed): every channel wake shares one
+        // reason, so keying on reason alone would let an ambient message
+        // parked later evict a DM/mention parked earlier — and the
+        // addressed-outranks-ambient trigger selection below would then
+        // route the resumed turn into the wrong channel.
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
@@ -30875,6 +30887,7 @@ export class AgentFramework {
    * Dispatch a synthesized channel tool call.
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+    // Conversation forks act only on their home channel.
     const home = this.conversationAgentHomes.get(agentName);
     const madeIn = call.callerTurnId;
     const privateTurn = call.name === 'channel_publish' && !this.scriptCallStarts.has(call.id) && (madeIn !== undefined
