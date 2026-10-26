@@ -3,6 +3,8 @@ import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
 import type { DraftReason } from '../prose-drafts.js';
+import type { MessageSlotRef } from '../dendrite/types.js';
+import type { PresentationOccasion } from '../presentation.js';
 
 /**
  * Base for all trace events.
@@ -1002,6 +1004,88 @@ export type TraceEvent =
       /** Envelope kind of the acceptance the observer failed on. */
       kind: 'channel' | 'unscoped' | 'surface';
       error: string;
+    })
+
+  // The presentation index (#291, src/presentation.ts): which stored rows
+  // each agent's window holds, in the order its requests carried them.
+  // Emitted only by a host with FrameworkConfig.presentationIndex on.
+  | (TraceEventBase & {
+      /**
+       * Rows entered an agent's window (context-manager's presentRows), at
+       * one of its presentation points (`occasion`): `count` bodies, a
+       * sharded one counted once.
+       */
+      type: 'presentation:presented';
+      agentName: string;
+      occasion: PresentationOccasion;
+      count: number;
+      /** At a tool boundary: the first row that couldn't join the live
+       *  stream (a tool block, or a row named as the agent), where the rows
+       *  presented there stop. It and the rows after it wait for the turn's
+       *  end. */
+      cutAt?: string;
+      /** How many of them carry no audience stamp (stored by a host's
+       *  writer that doesn't stamp), presented to the slot's owners and
+       *  its observers. */
+      unstamped?: number;
+    })
+  | (TraceEventBase & {
+      /** An agent's own rows that were stored and not in its window, found
+       *  when the agent was taken on or at boot, were presented to it. */
+      type: 'presentation:repaired';
+      agentName: string;
+      count: number;
+    })
+  | (TraceEventBase & {
+      /**
+       * A row was stamped for agents of which none reads the slot it is
+       * stored in (`deliveredTo`'s), so no window presents it by its
+       * audience. It is stored as named, never widened: observers of the
+       * slot see it only as their edge shows it.
+       */
+      type: 'presentation:unreadable-audience';
+      messageId?: string;
+      audience: string[];
+      slot: MessageSlotRef;
+      deliveredTo: string;
+    })
+  | (TraceEventBase & {
+      /** A presentation failed; the rows it didn't present stay out of the
+       *  agent's window for its next presentation point. At `adopt`, the
+       *  agent's window couldn't be written down (another version's index
+       *  format, or a failed write), and the agent stays in legacy mode: its
+       *  window is the whole record, as before the index. */
+      type: 'presentation:failed';
+      agentName: string;
+      occasion: PresentationOccasion;
+      error: string;
+    })
+  | (TraceEventBase & {
+      /** At a tool boundary's hand-off, the newest rows of the agent's
+       *  window weren't the rows the stream was about to be given, in that
+       *  order. The stream's later rounds are noted as unvouched, so their
+       *  thinking is left out at the next compile rather than refused. */
+      type: 'presentation:hand-off-mismatch';
+      agentName: string;
+      expected: string[];
+      tail: string[];
+    })
+  | (TraceEventBase & {
+      /** Rows were taken out of an agent's window (retractRows): a removal
+       *  through another agent's context, or a row shed from the window. */
+      type: 'presentation:retracted';
+      agentName: string;
+      messageIds: string[];
+      reason: string;
+    })
+  | (TraceEventBase & {
+      /** An undo on the presentation index: the undone turn's rows left the
+       *  agent's window (`retracted`), and a redo presented them again
+       *  (`represented`). No branch moved. */
+      type: 'window:undone';
+      agentName: string;
+      retracted: number;
+      represented?: number;
     })
 
   // Held prose drafts (src/prose-drafts.ts): plain speech kept privately

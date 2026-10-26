@@ -38,6 +38,7 @@ export {
   asOwnRow,
   audienceOf,
   isOwnRowOf,
+  observedRowFor,
   storeOwnRow,
 } from './audience.js';
 export type { AudienceStamp, OwnRowWriter } from './audience.js';

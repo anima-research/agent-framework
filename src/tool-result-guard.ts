@@ -182,6 +182,16 @@ export class ToolResultGuard {
 
   get enabled(): boolean { return this.override ?? this.configured; }
   setHost(host: WithheldHost | undefined): void { this.host = host; }
+
+  /** Where the results message is told of once stored (the agent's own-row sink, Agent.setOwnRowSink). */
+  private ownRowSink?: (ids: readonly MessageId[]) => void;
+  /**
+   * Install where storeResults tells of the results message it stores, once
+   * the add has returned (the presentation index presents it in the agent's
+   * window then, #291), or take it off with undefined. An idempotent retry
+   * of a batch already staged stores nothing and tells nothing.
+   */
+  setOwnRowSink(sink: ((ids: readonly MessageId[]) => void) | undefined): void { this.ownRowSink = sink; }
   /** Settles once every annotation started so far has finished: each of
    *  those stubs has been edited to say where its original is, or its edit
    *  failed and waits in the storage queue, retried in order until it lands
@@ -342,7 +352,11 @@ export class ToolResultGuard {
     keptCap: number | undefined,
   ): MessageId {
     metadata = asOwnRow(metadata, this.agentName);
-    if (!this.enabled) return this.cm.addMessage('user', content, metadata);
+    if (!this.enabled) {
+      const id = this.cm.addMessage('user', content, metadata);
+      this.ownRowSink?.([id]);
+      return id;
+    }
     if (this.pending) {
       // Idempotent for the same not-yet-submitted batch: a caller that
       // retries after a failure between staging and submission (e.g. a
@@ -384,6 +398,9 @@ export class ToolResultGuard {
     const messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
     this.pending = { id, messageId, content, withheld, wireResults,
       branch: this.cm.currentBranch().name, submitted: false, durable: false, kept };
+    // Told before the durability barrier below, so the sync that makes the
+    // audit durable carries the row's presentation too.
+    this.ownRowSink?.([messageId]);
     // Durability barrier: the audit must reach Chronicle's chain heads before
     // the originals can go to a provider. On a failed sync the batch fails
     // CLOSED: the placeholders go on the wire instead (the turn continues,

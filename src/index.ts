@@ -7,6 +7,7 @@ export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from 
 export { Agent } from './agent.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
+export type { PresentationOccasion } from './presentation.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';

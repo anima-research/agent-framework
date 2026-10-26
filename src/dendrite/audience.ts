@@ -52,7 +52,8 @@
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
-import type { AgentName } from './types.js';
+import { isAnotherAgentsInjection } from '../stored-injections.js';
+import type { AgentName, ObserveEdge } from './types.js';
 
 /** The metadata key listing who a row is for. */
 export const AUDIENCE_KEY = 'audience';
@@ -102,10 +103,62 @@ export function isOwnRowOf(metadata: unknown, agent: AgentName): boolean {
   return audienceOf(metadata)?.ownRowOf === agent;
 }
 
+/**
+ * The admission record on a stored message: it was held from the residents
+ * by a policy epoch (`metadata.tuneOut = { epochId }`). ONE predicate for
+ * "held from the resident", read by the compiled-view filter, the mid-turn
+ * injection and the presentation index (#291) alike (#232 H1), so the window
+ * and the wire agree. Such a row is stamped for nobody (an empty audience),
+ * whatever store it lands in.
+ */
+export const heldFromResidents = (metadata: Record<string, unknown> | undefined): boolean =>
+  !!(metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+
+/**
+ * Whether a row of a slot an agent observes is for that agent (#291,
+ * decision 1): what an observe edge shows of the slot it reads. `observer`
+ * is the agent the edge is on, and `owners` are the agents whose own slot it
+ * reads (the registry's `slotOwners`).
+ *
+ * - Another agent's stored context injection: no. It is that agent's
+ *   context, not conversation, as every view of the framework's leaves out.
+ * - A row stored under the observer's own name: no. It is the observer's
+ *   delivery into the slot (the subconscious's summary or note into the
+ *   residents' slot), which its own round already holds.
+ * - A row a tune-out holds: only through an edge that shows held traffic
+ *   (`includeHeld`, the subconscious's).
+ * - A row with no audience stamp (stored before the stamp, or by a host's
+ *   writer that doesn't stamp): yes, as the merged view showed it.
+ * - An owner's own row (its rounds, results, clock rows, notices about its
+ *   own turn), and a row whose audience names an owner (channel traffic,
+ *   mail, module rows): yes.
+ * - Anything else, such as a row stamped only for an agent that doesn't read
+ *   the slot, or for a derived agent on another branch: no.
+ */
+export function observedRowFor(
+  edge: Pick<ObserveEdge, 'includeHeld'>,
+  row: { participant: string; metadata?: unknown },
+  context: { observer: AgentName; owners: readonly AgentName[] },
+): boolean {
+  if (isAnotherAgentsInjection(row.metadata, context.observer)) return false;
+  if (row.participant === context.observer) return false;
+  if (heldFromResidents(row.metadata as Record<string, unknown> | undefined)) return edge.includeHeld === true;
+  const stamp = audienceOf(row.metadata);
+  if (!stamp) return true;
+  if (stamp.ownRowOf !== undefined && context.owners.includes(stamp.ownRowOf)) return true;
+  return stamp.audience.some((name) => context.owners.includes(name));
+}
+
 /** What `storeOwnRow` writes through: an agent, or anything that names one and holds its context. */
 export interface OwnRowWriter {
   readonly name: AgentName;
   getContextManager(): Pick<ContextManager, 'addMessage'>;
+  /**
+   * Told the ids of the agent's own rows once they are stored (the
+   * presentation index's own-row sink, #291), each once its write has
+   * returned. A writer without it is told nothing.
+   */
+  ownRowsStored?(ids: readonly MessageId[]): void;
 }
 
 /**
@@ -113,6 +166,18 @@ export interface OwnRowWriter {
  * Every writer that stores into an agent's context directly, past the
  * framework's `addMessage`, stores the agent's own rows through this, so
  * none of them goes unstamped.
+ *
+ * With `present` (the default), the writer is told of the row once the add
+ * has returned (`ownRowsStored`), never from inside it, where a sharded body
+ * may still be storing its shards: under the presentation index (#291) that
+ * presents the row in the agent's window at once. That is right for a row
+ * the agent's stream carries (its round, its results, a notice injected at
+ * its boundary), one written before its next compile or after its stream's
+ * last request, and one written while the agent has no turn alive. A row
+ * written at another moment, where a turn the row isn't part of may be
+ * alive, passes `present: false`: it stays stored and out of the window,
+ * and the index's own-row sweep at the agent's next presentation point
+ * presents it there.
  */
 export function storeOwnRow(
   agent: OwnRowWriter,
@@ -120,6 +185,9 @@ export function storeOwnRow(
   content: ContentBlock[],
   metadata?: MessageMetadata,
   options?: AddMessageOptions,
+  present = true,
 ): MessageId {
-  return agent.getContextManager().addMessage(participant, content, asOwnRow(metadata, agent.name), undefined, options);
+  const id = agent.getContextManager().addMessage(participant, content, asOwnRow(metadata, agent.name), undefined, options);
+  if (present) agent.ownRowsStored?.([id]);
+  return id;
 }

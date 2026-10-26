@@ -2351,6 +2351,27 @@ export class Agent {
     return this.contextManager;
   }
 
+  /** Where this agent tells of its own rows once they are stored (setOwnRowSink). */
+  private ownRowSink?: (ids: readonly MessageId[]) => void;
+
+  /**
+   * Install where this agent tells of its own rows once they are stored
+   * (its rounds and the rows the framework writes for it through
+   * storeOwnRow, and its tool results through its guard), or take it off
+   * with undefined. The presentation index (#291) installs one when it takes
+   * the agent on, and presents each row in the agent's window as it is
+   * told. With none, as for an agent nothing took on, nothing is told.
+   */
+  setOwnRowSink(sink: ((ids: readonly MessageId[]) => void) | undefined): void {
+    this.ownRowSink = sink;
+    this.toolResultGuard.setOwnRowSink(sink);
+  }
+
+  /** Tell the sink of own rows just stored (storeOwnRow calls it, once each add has returned). */
+  ownRowsStored(ids: readonly MessageId[]): void {
+    this.ownRowSink?.(ids);
+  }
+
   /**
    * Build the effective system prompt, appending any system-position
    * injections, their blocks joined by line breaks. The system prompt is

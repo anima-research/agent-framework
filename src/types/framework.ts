@@ -205,6 +205,28 @@ export interface FrameworkConfig {
   };
 
   /**
+   * Each agent's context follows its own presentation index (#291): the
+   * rows it was shown, in the order its requests carried them, kept by
+   * context-manager (`presentRows`) beside the store's record. Other
+   * writers' rows enter an agent's window at its turn start, its tool
+   * boundary and its turn's end, and at once while it has no turn alive;
+   * its own rows enter as they are written. Default false: each agent's
+   * window is the record, as before.
+   *
+   * Needs a context-manager with `ContextManager.presentRows`; create()
+   * refuses the option without one.
+   *
+   * @experimental Under construction: this release constructs the index's
+   * module and checks each write's audience stamp (a write stamped only for
+   * agents that can't read its slot is traced as
+   * `presentation:unreadable-audience`), and presents nothing yet, so every
+   * compile and request is what it is with the option off. A later release
+   * wires the presentation points behind it, and the one after makes it the
+   * only mode and removes the option.
+   */
+  presentationIndex?: boolean;
+
+  /**
    * IANA zone of the agent's wall clock: it renders wall-clock times for the
    * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
    * counted from local midnight here). Stored/protocol timestamps remain

@@ -203,6 +203,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
+import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn } from './presentation.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
@@ -972,20 +973,6 @@ interface DrainedWrite {
   content: ContentBlock[];
 }
 
-/** What later compiles render from the store for the copies of one write
- *  that landed: one copy as it is, and two or more, the shards of a sharded
- *  body, as context-manager's autobiographical strategy (the one that
- *  shards on ingest) joins a body's consecutive shards: their non-text
- *  blocks, then one text block of their joined text. The join is that
- *  strategy's `mergeAdjacentBodyGroupRaw`, which context-manager doesn't
- *  export, so the rule is copied here, and a test compares the two. */
-function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): ContentBlock[] {
-  if (landed.length === 1) return landed[0]!.content;
-  const blocks = landed.flatMap((m) => m.content);
-  const text = blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
-  return [...blocks.filter((b) => b.type !== 'text'), { type: 'text', text } as ContentBlock];
-}
-
 /** One stored copy of a deferred write, as the drain reads it back: a
  *  sharded body's copies carry its `bodyGroupId`. */
 type StoredCopy = { id: MessageId; content: ContentBlock[]; bodyGroupId?: string };
@@ -1050,18 +1037,6 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
     return typeof type === 'string' ? type : 'untyped';
   };
   return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map(kind))].join('+') || 'empty'})`;
-}
-
-/** Whether a deferred message can join a live stream at a tool boundary:
- *  no tool blocks (the membrane's tool cycle) and not named as the agent
- *  itself (it would render as an assistant turn, a prefill). */
-function isInjectableMidTurn(msg: { participant: string; content: ContentBlock[] }, agent: Pick<Agent, 'isOwnParticipant'>): boolean {
-  // Exact, as membrane's role test is: a participant the request assigns
-  // the assistant role (the agent's name, and for a derived agent the
-  // voice it inherited) renders as the assistant. It's the name as sent,
-  // which the boundary takes as the store keeps it.
-  return !agent.isOwnParticipant(nameAsStored(msg.participant))
-    && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result');
 }
 
 /**
@@ -2370,14 +2345,10 @@ interface EphemeralRun {
   endedBy?: string;
 }
 
-/**
- * The admission record on a stored message: it was held from the residents
- * by a policy epoch (`metadata.tuneOut = { epochId }`). ONE predicate for
- * "held from the resident", read by the compiled-view filter and by the
- * mid-turn injection alike (#232 H1), so the window and the wire agree.
- */
-export const heldFromResidents = (metadata: Record<string, unknown> | undefined): boolean =>
-  !!(metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+// heldFromResidents, the one predicate for "held from the resident", lives
+// beside the audience stamp (dendrite/audience.ts), where the presentation
+// index's observe rule reads it too, and is exported here as before.
+export { heldFromResidents } from './presentation.js';
 
 /**
  * What a reader of the residents' shared message slot does not see: held
@@ -3530,6 +3501,13 @@ export class AgentFramework {
     // registry's memory, so it comes off the recovery file too.
     onRollback: () => this.rewriteEndedRecovery(this.registry.endedHistory()),
   });
+  /**
+   * The presentation index (#291, presentation.ts), under
+   * FrameworkConfig.presentationIndex; null without it. Set once, in
+   * create(), before any agent is created. Inert until the presentation
+   * points are wired: only addMessage's stamp check (checkAudience) calls it.
+   */
+  private presentation: AgentPresentation | null = null;
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
   /**
@@ -4007,6 +3985,23 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
+    // The presentation index (#291), before any agent exists. It needs a
+    // context-manager that keeps a window index per agent (presentRows).
+    if (config.presentationIndex === true) {
+      if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
+        throw new Error('presentationIndex needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent');
+      }
+      framework.presentation = new AgentPresentation({
+        liveAgents: () => framework.agents.values(),
+        registry: framework.registry,
+        turnAlive: (name) => {
+          const agent = framework.agents.get(name);
+          return !!agent && (framework.hasTurn(name) || framework.turnAlive(agent));
+        },
+        frozen: () => framework.quiesced || framework.surgeryHold !== null,
+        emitTrace: (event) => framework.emitTrace(event),
+      });
+    }
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
@@ -26629,6 +26624,10 @@ export class AgentFramework {
     if (!(opts?.fromQueue && audienceOf(metadata))) {
       metadata = withAudience(metadata, opts?.audience ?? this.defaultAudience(opts?.forAgent, metadata) ?? [agent.name]);
     }
+    // A stamp no reader of the slot can read is a routing fault, traced once
+    // for the write (not again when it comes back from the queue). The row
+    // is stored as named.
+    if (!opts?.fromQueue) this.presentation?.checkAudience(metadata, agent.name);
 
     // Defer non-tool_result messages while a tool cycle is mid-flight
     // (pendingAssistantBlocks: preserves tool_use → tool_result adjacency)

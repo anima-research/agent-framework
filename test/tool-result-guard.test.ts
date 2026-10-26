@@ -4085,3 +4085,36 @@ test('an already-aborted direct call never reaches membrane', async () => {
     assert.equal(calls, 0);
   } finally { await h.framework.stop(); }
 });
+
+test("storeResults tells the own-row sink of the results it stores, guarded or not, and nothing on an idempotent retry", async () => {
+  const { ContextManager } = await import('@animalabs/context-manager');
+  const { ToolResultGuard } = await import('../src/tool-result-guard.js');
+  const dir = mkdtempSync(join(tmpdir(), 'af-guard-sink-')); dirs.push(dir);
+  const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy() });
+  try {
+    const told: string[][] = [];
+    const call = (id: string) => cm.addMessage('Claude', [{ type: 'tool_use', id, name: 'search', input: {} }]);
+    const results = (id: string): ContentBlock[] => [{ type: 'tool_result', toolUseId: id, content: 'found' }];
+    const wire = (id: string) => [{ toolUseId: id, content: 'found' }];
+
+    call('tu-1');
+    const plain = new ToolResultGuard('Claude', cm, false);
+    plain.setOwnRowSink((ids) => { told.push([...ids]); assert.ok(ids.every((id) => cm.getMessage(id) !== null), 'stored when told'); });
+    const unguarded = plain.storeResults(results('tu-1'), wire('tu-1'), [], undefined, undefined);
+    assert.deepEqual(told, [[unguarded]], 'the unguarded arm');
+
+    call('tu-2');
+    const guarded = new ToolResultGuard('Claude', cm, true);
+    guarded.setOwnRowSink((ids) => { told.push([...ids]); });
+    const staged = guarded.storeResults(results('tu-2'), wire('tu-2'), [], undefined, undefined);
+    assert.deepEqual(told, [[unguarded], [staged]], 'the guarded arm, its placeholders');
+    assert.equal(guarded.storeResults(results('tu-2'), wire('tu-2'), [], undefined, undefined), staged, 'the retry returns the staged id');
+    assert.deepEqual(told, [[unguarded], [staged]], 'and tells nothing');
+
+    guarded.settleTurnEnded();
+    guarded.setOwnRowSink(undefined);
+    call('tu-3');
+    guarded.storeResults(results('tu-3'), wire('tu-3'), [], undefined, undefined);
+    assert.equal(told.length, 2, 'with the sink off, nothing is told');
+  } finally { cm.close(); }
+});
