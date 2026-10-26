@@ -16068,8 +16068,15 @@ export class AgentFramework {
     bounced: 'routing prefix bounced',
   };
 
+  /** Why the held-draft notice's drafts were held, as the clause after "because". */
+  private static readonly DRAFT_REASON_BECAUSE: Record<DraftReason, (many: boolean) => string> = {
+    'explicit-send': () => 'there was an explicit send in the same round as the plain speech',
+    'no-destination': (many) => `${many ? 'they' : 'it'} had no destination — after a routing envelope failed, ` +
+      'plain speech waits for a new valid target',
+    bounced: (many) => `${many ? 'their' : 'its'} routing prefix bounced`,
+  };
+
   private draftsHeldNotice(agentName: string, held: Draft[], reason: DraftReason): string {
-    const ids = held.map((d) => d.id);
     const many = held.length > 1;
     const quoted = (ds: Draft[]): string => ds.map((d) => `"${d.id}"`).join(', ');
     // Words copied from a draft that may already have been posted resend
@@ -16084,12 +16091,23 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
     ];
-    // Named: residents that share one message slot (#197) share this window.
+    // Each draft is named with its opening words, so the resident can tell
+    // which of its messages this is.
+    const opening = (d: Draft): string => AgentFramework.draftPreview(d.text, 50);
+    const named = held.map((d) => `${d.id} (starting ${opening(d)})`);
+    const which = many
+      ? `your ${held.length} plain-speech messages`
+      : `your plain-speech message starting ${opening(held[0]!)}`;
     // "Not sent" only when no copied words may already have been posted.
+    const status = risky.length > 0
+      ? `${many ? 'are' : 'is'} held as`
+      : `${many ? 'were not sent and are' : 'was not sent and is'} instead held as`;
+    const heldAs = many
+      ? `drafts ${named.slice(0, -1).join(', ')} and ${named.at(-1)}`
+      : `draft ${held[0]!.id}`;
+    // Named: residents that share one message slot (#197) share this window.
     return (
-      `[drafts] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
-      `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
-      `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
+      `[drafts] ${agentName}: ${which} ${status} ${heldAs} because ${AgentFramework.DRAFT_REASON_BECAUSE[reason](many)}. ` +
       `${resend.join('; ')}; drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
     );
   }
@@ -16099,7 +16117,7 @@ export class AgentFramework {
     return formatZonedDateTime(t, this.timeZone).replace(/:\d\d\.\d{3}/, '');
   }
 
-  /** A draft's opening words, for the drafts tool's listing only. */
+  /** A draft's opening words, for the drafts tool's listing and the held-draft notice. */
   private static draftPreview(text: string, max = 80): string {
     const flat = text.replace(/\s+/g, ' ').trim();
     return JSON.stringify(flat.length > max ? `${flat.slice(0, max)}…` : flat);
