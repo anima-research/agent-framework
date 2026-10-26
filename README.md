@@ -463,8 +463,8 @@ framework registers a `toolsets` module with four constant tools:
   notice;
 - `toolsets--close {server?, toolset?, instance?}` closes it.
 
-`server` can be left out when only one server has the name. A server with no
-toolsets stops presenting them once its latest `tools/list` has no dynamic
+`server` can be left out when only one server has the name. By our reading of
+the code, a server with no toolsets stops presenting them once its latest `tools/list` has no dynamic
 tool, so until the rebuild, act takes its last one only with `server` named.
 Hint changes apply
 as their message is read, in `rev` order, whatever becomes of the message (a
@@ -494,13 +494,13 @@ result, when a later change goes to the agent before the call's caller has
 taken it, so changes are told in the order they were read (the agent's window
 can still show a call's result, a push's event, or a change its taker couldn't
 show after a change read later). The model's own call's change counts as told
-once its result is handed back: if the turn is stopped, or the agent is gone,
-while the call is out, the result is dropped and the change with it, and
+once its result is handed back: if the turn is stopped while the call is out
+(or, by our reading of the code, the agent is gone), the result is dropped and the change with it, and
 `toolsets--look` shows the state it left. Notices and reminders
 need the server's `pushEvents` grant, like any delivery; without it, a change
 that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told with its
-definition until text describing it has reached the model, except that a puppet's open, close or look whose result
-the store refuses has already counted it. Suggestions are shown, never acted on. Each
+definition until text describing it has reached the model, except that, by our reading of the code, a puppet's
+open, close or look whose result the store refuses has already counted it. Suggestions are shown, never acted on. Each
 `ended` id is told once while the
 host runs (told ids are kept in memory), short of rare interleavings, such as a
 `toolsets--look` overlapping other reads of the same server, that can tell one
