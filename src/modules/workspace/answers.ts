@@ -100,9 +100,9 @@ export function changesFiles(tool: string): boolean {
   return CHANGING.has(tool);
 }
 
-export const ROOT_UNREADABLE = "Calling again may work; if it fails the same way, whoever runs this host can make the mount's directory readable.";
+export const ROOT_RECHECK = "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.";
 
-export const ROOT_UNCHECKED = "Calling again won't change that until the mount's directory is back at its path; whoever runs this host can check the directory and its path.";
+export const ROOT_UNCHECKED = "Calling again won't change that while the mount's directory is gone from its path, and checks it afresh otherwise; whoever runs this host can check the directory and its path.";
 
 export const AWAITS_REOPEN = "The workspace can't check its files against disk until its store is reopened, so calling again won't change that; whoever runs this host can reopen it with a restart.";
 

@@ -1029,6 +1029,20 @@ export class CheckedDir {
   }
 }
 
+/**
+ * What is at a mount root's path now, followed as the root is: for a
+ * directory, undefined; for anything else, ENOTDIR; and where the path
+ * can't be followed to anything, the errno its stat failed with, ENOENT
+ * when nothing is there.
+ */
+export async function rootAbsence(root: string): Promise<string | undefined> {
+  try {
+    return (await stat(root)).isDirectory() ? undefined : 'ENOTDIR';
+  } catch (err) {
+    return errno(err);
+  }
+}
+
 /** Check the directory at a canonical location, if one is there. */
 async function checkedAt(view: MountView, rel: string, real: string): Promise<CheckedDir | null> {
   const info = await lstat(real, { bigint: true }).catch(() => null);

@@ -1,13 +1,14 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { systemWords } from '../src/modules/workspace/answers.js';
 import { linkWords } from '../src/modules/workspace/observe.js';
-import { callGate } from '../src/modules/workspace/disk-agreement.js';
+import { DISK_AGREEMENT_RECORD_TYPE, callGate } from '../src/modules/workspace/disk-agreement.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
@@ -442,19 +443,137 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
       'The read did nothing: "work/locked.txt" isn\'t in the workspace, and disk couldn\'t be checked: cannot open (permission denied). Calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk.');
   });
 
-  test("a mount whose directory is gone says who can put it back, and a reason that doesn't tell gone from moved says who can check it", async (t) => {
+  test("a mount whose directory is gone, or is now a file, says who can put it back, and a reason that doesn't tell gone from moved says who can check it", async (t) => {
     const env = new Env(t);
-    const m = await env.open([{ name: 'gone' }, { name: 'dgone', backend: 'direct' }]);
+    const m = await env.open([{ name: 'gone' }, { name: 'dgone', backend: 'direct' }, { name: 'dfile', backend: 'direct' }]);
     rmSync(join(env.root, 'gone'), { recursive: true });
     rmSync(join(env.root, 'dgone'), { recursive: true });
+    rmSync(join(env.root, 'dfile'), { recursive: true });
+    writeFileSync(join(env.root, 'dfile'), 'a file where the directory was\n');
     const back = "Calling again won't change that; whoever runs this host can put the mount's directory back at its path.";
     assert.equal(await refused(m, 'read_image', { path: 'gone/a.png' }), `The read_image did nothing: the directory of mount "gone" isn't on disk, so nothing in it can be read. ${back}`);
     assert.equal(await refused(m, 'read', { path: 'dgone/a.txt' }), `The read did nothing: the directory of mount "dgone" isn't on disk, so nothing in it can be read. ${back}`);
     assert.equal(await refused(m, 'read', { path: 'gone/a.txt' }),
       'The read did nothing: "gone/a.txt" isn\'t in the workspace, and disk couldn\'t be checked: the mount root is unavailable. '
-      + "Calling again won't change that until the mount's directory is back at its path; whoever runs this host can check the directory and its path.");
+      + "Calling again won't change that while the mount's directory is gone from its path, and checks it afresh otherwise; whoever runs this host can check the directory and its path.");
     assert.equal(await refused(m, 'delete', { path: 'dgone/a.txt' }), `The delete did nothing to "dgone/a.txt": the mount root isn't on disk. ${back}`);
     assert.equal(await refused(m, 'write', { path: 'dgone/a.txt', content: 'x' }), `The write did nothing to "dgone/a.txt": the mount root is unavailable. ${back}`);
+    assert.equal(await refused(m, 'write', { path: 'dfile/a.txt', content: 'x' }), `The write did nothing to "dfile/a.txt": the mount root is unavailable. ${back}`);
+    assert.equal(await refused(m, 'read', { path: 'dfile/a.txt' }), `The read did nothing: the directory of mount "dfile" isn't on disk, so nothing in it can be read. ${back}`);
+  });
+
+  test("a mount directory a read, a write or a delete can't check gives its errno's fix where it has one, else says calling again may work and who can check it, and where its path came to name another directory, calling again does", async (t) => {
+    const recheck = "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.";
+    const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    const realpath = fsp.realpath;
+    const repointedDuring = async (env: Env, during: string, act: () => Promise<string>): Promise<string> => {
+      let repointed = false;
+      fsp.realpath = async (...args: unknown[]) => {
+        const got = await realpath(...args);
+        if (!repointed && args[0] === join(env.root, 'link') && (new Error().stack ?? '').includes(during)) {
+          repointed = true;
+          renameSync(join(env.root, 'first'), join(env.root, 'first-old'));
+          symlinkSync(join(env.root, 'second'), join(env.root, 'first'));
+        }
+        return got;
+      };
+      syncBuiltinESMExports();
+      try {
+        const answer = await act();
+        assert.ok(repointed, `the mount's path came to name another directory during ${during}`);
+        return answer;
+      } finally {
+        fsp.realpath = realpath;
+        syncBuiltinESMExports();
+      }
+    };
+    const mount = async (): Promise<{ env: Env; m: WorkspaceModule }> => {
+      const env = new Env(t);
+      writeFileSync(join(env.dir('first'), 'a.txt'), 'first\n');
+      writeFileSync(join(env.dir('second'), 'a.txt'), 'second\n');
+      symlinkSync(join(env.root, 'first'), join(env.root, 'link'));
+      return { env, m: await env.open([{ name: 'd', path: join(env.root, 'link'), backend: 'direct' }]) };
+    };
+
+    const read = await mount();
+    assert.equal(await repointedDuring(read.env, 'readRoot', () => refused(read.m, 'read', { path: 'd/a.txt' })),
+      `The read did nothing: the directory of mount "d" can't be checked at its path, so nothing in it can be read. ${recheck}`);
+    assert.match(JSON.stringify(await ok(read.m, 'read', { path: 'd/a.txt' })), /second/);
+
+    const write = await mount();
+    assert.equal(await repointedDuring(write.env, 'diskView', () => refused(write.m, 'write', { path: 'd/a.txt', content: 'new\n' })),
+      `The write did nothing to "d/a.txt": the mount root is unavailable. ${recheck}`);
+    assert.equal(readFileSync(join(write.env.root, 'second', 'a.txt'), 'utf8'), 'second\n', 'the refused write wrote nothing');
+    assert.equal(readFileSync(join(write.env.root, 'first-old', 'a.txt'), 'utf8'), 'first\n', 'the refused write wrote nothing');
+    await ok(write.m, 'write', { path: 'd/a.txt', content: 'new\n' });
+    assert.equal(readFileSync(join(write.env.root, 'second', 'a.txt'), 'utf8'), 'new\n');
+
+    const stale = await mount();
+    fsp.realpath = async (...args: unknown[]) => {
+      if (args[0] === join(stale.env.root, 'link')) throw Object.assign(new Error('injected'), { code: 'ESTALE' });
+      return realpath(...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(await refused(stale.m, 'read', { path: 'd/a.txt' }),
+        `The read did nothing: the directory of mount "d" can't be read: a stale network file handle. ${recheck}`);
+      assert.equal(await refused(stale.m, 'write', { path: 'd/a.txt', content: 'new\n' }),
+        `The write did nothing to "d/a.txt": cannot resolve the directory (a stale network file handle). ${recheck}`);
+    } finally {
+      fsp.realpath = realpath;
+      syncBuiltinESMExports();
+    }
+
+    const denied = await mount();
+    fsp.realpath = async (...args: unknown[]) => {
+      if (args[0] === join(denied.env.root, 'link')) throw Object.assign(new Error('injected'), { code: 'EACCES' });
+      return realpath(...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(await refused(denied.m, 'write', { path: 'd/a.txt', content: 'new\n' }),
+        'The write did nothing to "d/a.txt": cannot resolve the directory (permission denied). Calling again won\'t change that; whoever runs this host can change the permissions.');
+    } finally {
+      fsp.realpath = realpath;
+      syncBuiltinESMExports();
+    }
+
+    const staleStat = await mount();
+    const stat = fsp.stat;
+    const rootReal = realpathSync(join(staleStat.env.root, 'first'));
+    fsp.stat = async (...args: unknown[]) => {
+      if (args[0] === rootReal && (args[1] as { bigint?: boolean } | undefined)?.bigint === true) throw Object.assign(new Error('injected'), { code: 'ESTALE' });
+      return stat(...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(await refused(staleStat.m, 'delete', { path: 'd/a.txt' }),
+        `The delete did nothing to "d/a.txt": the mount root can't be read: a stale network file handle. ${recheck}`);
+    } finally {
+      fsp.stat = stat;
+      syncBuiltinESMExports();
+    }
+    assert.equal(readFileSync(join(staleStat.env.root, 'first', 'a.txt'), 'utf8'), 'first\n');
+  });
+
+  test('a disk read while the store holds no whole record of what disk agreed says nothing helps until the store is reopened, even with its mount directory gone', async (t) => {
+    const env = new Env(t);
+    const store = env.store as unknown as { appendJson: (type: string, payload: unknown) => unknown };
+    const append = store.appendJson;
+    store.appendJson = function (this: unknown, type: string, payload: unknown) {
+      if (type === DISK_AGREEMENT_RECORD_TYPE) throw new Error('injected: the store refused the append');
+      return append.call(this, type, payload);
+    };
+    const m = new WorkspaceModule({ mounts: [{ name: 'work', path: env.dir('work'), mode: 'read-write', watch: 'never' }] });
+    try {
+      assert.throws(() => m.initStore(env.store), /injected/);
+    } finally {
+      store.appendJson = append;
+    }
+    rmSync(join(env.root, 'work'), { recursive: true });
+    assert.equal(await refused(m, 'read_image', { path: 'work/a.png' }),
+      "The read_image did nothing: the workspace can't check its files against disk until its store is reopened: an append to its record of what disk last agreed with failed inside the store, "
+      + "so that record may lack what the append held. Calling again won't change that; whoever runs this host can reopen it with a restart.");
   });
 
   test("a file on disk the workspace doesn't store says why, and what reads it", async (t) => {

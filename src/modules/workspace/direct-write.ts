@@ -56,7 +56,7 @@ import type { BigIntStats } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { relative, sep } from 'node:path';
 import { refusedLanding } from './effects.js';
-import { ROOT_UNCHECKED, ROOT_UNREADABLE, errnoWayOn, errnoWords, onlyTheHost, systemWords } from './answers.js';
+import { ROOT_RECHECK, errnoWayOn, errnoWords, onlyTheHost, systemWords } from './answers.js';
 import {
   type CheckedDir,
   type MountView,
@@ -69,6 +69,7 @@ import {
   checkDir,
   checkRoot,
   errno,
+  rootAbsence,
   nameOf,
   parentOf,
 } from './observe.js';
@@ -136,10 +137,12 @@ const AFRESH = 'Calling again checks it afresh.';
 
 const NAME_ITS_OWN = "Calling again won't change that; if you know the file it leads to, name that file by its own path.";
 
+function rootWayOn(code: string | undefined): string {
+  return code === 'ENOENT' || code === 'ENOTDIR' ? onlyTheHost("put the mount's directory back at its path") : errnoWayOn(code, ROOT_RECHECK, true);
+}
+
 function refusedWayOn(reason: string, code?: string, hostsName = false): string | null {
-  if (reason === ROOT_UNAVAILABLE) {
-    return code === 'ENOENT' || code === 'ENOTDIR' ? onlyTheHost("put the mount's directory back at its path") : code !== undefined ? errnoWayOn(code, ROOT_UNREADABLE, true) : ROOT_UNCHECKED;
-  }
+  if (reason === ROOT_UNAVAILABLE) return rootWayOn(code);
   if (code !== undefined) return errnoWayOn(code, undefined, hostsName);
   if (reason === NOT_FOLLOWED) return NAME_ITS_OWN;
   if (reason === OUTSIDE_PARENT || reason === LEAVES_MOUNT) return "Calling again won't change that; the workspace writes only inside its mounts.";
@@ -220,7 +223,10 @@ export async function stageContained(
   { makeDirectory = false }: { makeDirectory?: boolean } = {},
 ): Promise<Staged> {
   const root = await checkRoot(view, rootReal);
-  if ('reason' in root) throw new WriteRefused(root.reason, refusedWayOn(root.reason, root.errno, true), root.errno);
+  if ('reason' in root) {
+    const code = root.errno ?? await rootAbsence(rootReal);
+    throw new WriteRefused(root.reason, rootWayOn(code), code);
+  }
   let parent = await directoryOf(view, rootReal, rel, makeDirectory);
   let path = parent.at(nameOf(rel));
   let info = await lstat(path, { bigint: true }).catch((err: unknown) => {

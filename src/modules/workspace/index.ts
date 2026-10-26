@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, storedBytes, DEFAULT_MAX_FILE_SIZE, type StoredBytes } from './sync.js';
 import { DiskAgreement, EvidenceUnavailable, callGate, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { CHANGED, DIRECTORY, IGNORED, LEAVES_MOUNT, NONBLOCK, NOT_FOLLOWED, NOT_REGULAR, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, includePatternReadable, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, realSegments, restBeneath, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { CHANGED, DIRECTORY, IGNORED, LEAVES_MOUNT, NONBLOCK, NOT_FOLLOWED, NOT_REGULAR, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, includePatternReadable, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, realSegments, restBeneath, rootAbsence, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -65,7 +65,7 @@ import {
   settleAdoptionBeforeMutation,
 } from './reconcile.js';
 import { EffectFailed, unlinkContained } from './effects.js';
-import { AWAITS_REOPEN, ROOT_UNCHECKED, ROOT_UNREADABLE, Refusal, changesFiles, didNothing, errnoCode, errnoWayOn, errnoWords, hostFix, onlyTheHost, systemWords, unexpectedAnswer } from './answers.js';
+import { AWAITS_REOPEN, ROOT_RECHECK, ROOT_UNCHECKED, Refusal, changesFiles, didNothing, errnoCode, errnoWayOn, errnoWords, hostFix, onlyTheHost, systemWords, unexpectedAnswer } from './answers.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { closestNames } from '../../closest-names.js';
 import { RecordJournal } from '../../record-journal.js';
@@ -325,19 +325,6 @@ function errnoOf(err: unknown): string | undefined {
     : undefined;
 }
 
-/**
- * What is at a mount root's path now, followed as the root is: for a
- * directory, undefined; for anything else, ENOTDIR; and where the path
- * can't be followed to anything, the errno its stat failed with, ENOENT
- * when nothing is there.
- */
-async function rootAbsence(root: string): Promise<string | undefined> {
-  try {
-    return (await stat(root)).isDirectory() ? undefined : 'ENOTDIR';
-  } catch (err) {
-    return errnoOf(err);
-  }
-}
 
 /** read_image's refusal of a file over the mount's size limit, wherever it's found to be. */
 function imageTooLarge(maxSize: number, mountPrefixedPath: string, size: string): WorkspaceImageReadError {
@@ -3224,19 +3211,14 @@ export class WorkspaceModule implements Module {
    * another directory carries none. The identity is rootIdentityForRead's,
    * which answers while the evidence awaits reopening; where even it can't
    * be read, as when the evidence was never read back whole, the read is
-   * refused too, with an errno only where no directory is at the root's path.
+   * refused before its root is resolved, with an errno only where no
+   * directory is at the root's path.
    * A direct mount's root is checked against no identity, and its read reads
    * no evidence: it promises what's at its root now (diskView).
    */
   private async readRoot(mount: MountState): Promise<{ real: string; dir: CheckedDir }> {
     const name = mount.config.name;
     const root = resolve(mount.config.path);
-    let real: string;
-    try {
-      real = await realpath(root);
-    } catch (err) {
-      throw new RootUnavailable(name, null, 'realpath_root', errnoOf(err));
-    }
     let rootIdentity: MountView['rootIdentity'];
     if (!mount.direct) {
       try {
@@ -3246,6 +3228,12 @@ export class WorkspaceModule implements Module {
         // Where no directory is at the root's path, its errno still says so.
         throw new RootUnavailable(name, err instanceof Error ? err.message : String(err), 'root', await rootAbsence(root), err instanceof Refusal ? err : undefined);
       }
+    }
+    let real: string;
+    try {
+      real = await realpath(root);
+    } catch (err) {
+      throw new RootUnavailable(name, null, 'realpath_root', errnoOf(err));
     }
     const checked = await checkRoot(this.viewOf(mount, rootIdentity), real);
     if ('dir' in checked) return { real, dir: checked.dir };
@@ -5010,7 +4998,7 @@ export class WorkspaceModule implements Module {
         const code = errnoOf(err);
         const why = code === 'ENOENT' || code === 'ENOTDIR'
           ? `the mount root isn't on disk. ${onlyTheHost("put the mount's directory back at its path")}`
-          : `the mount root can't be read: ${systemWords(code, err)}. ${errnoWayOn(code, ROOT_UNREADABLE, true)}`;
+          : `the mount root can't be read: ${systemWords(code, err)}. ${errnoWayOn(code, ROOT_RECHECK, true)}`;
         return { success: false, isError: true, error: didNothing('delete', why, path) };
       }
       const view = { ...disk.view, rootIdentity: { dev: String(rootStat.dev), ino: String(rootStat.ino) } };
@@ -6872,10 +6860,9 @@ function readRefusal(err: WorkspaceReadError, path: string): string {
       }
       if (err.errno !== undefined) {
         return `the directory of mount ${mount} can't be read: ${errnoWords(err.errno)}. `
-          + errnoWayOn(err.errno, ROOT_UNREADABLE, true);
+          + errnoWayOn(err.errno, ROOT_RECHECK, true);
       }
-      return `the directory of mount ${mount} can't be checked at its path, so nothing in it can be read. `
-        + "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.";
+      return `the directory of mount ${mount} can't be checked at its path, so nothing in it can be read. ${ROOT_RECHECK}`;
     }
     return `${shown} can't be read: ${sentence(err.reason)}`;
   }
@@ -7116,6 +7103,8 @@ class StoredThenFailed extends Error {
   }
 }
 
+const ONCE_REOPENED = ', once the store is reopened';
+
 /**
  * The answer to a write, edit or delete that the workspace stored but
  * couldn't finish: its push to disk didn't complete, or what follows the tree
@@ -7127,8 +7116,6 @@ class StoredThenFailed extends Error {
  * script. A note comes last: an edit's on which copy it applied to, or a
  * deletion's that it unlinked nothing.
  */
-const ONCE_REOPENED = ', once the store is reopened';
-
 function storedButUnfinished(
   tool: 'write' | 'edit' | 'delete',
   path: string,
