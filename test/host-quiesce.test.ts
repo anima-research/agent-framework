@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,6 +26,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { schedulerPasses } from './helpers/scheduler-passes.js';
 
 async function waitFor(
   description: string,
@@ -91,11 +92,12 @@ test('quiesce parks wakes; resume releases them', async () => {
     const before = await framework.quiesce({ reason: 'test window' });
     assert.equal(before.quiesced, true);
     assert.equal(before.drained, true);
+    const nextPass = schedulerPasses(framework, waitFor);
 
     const nudge = framework.nudgeAgent('agent', 'operator');
     assert.equal(nudge.ok, true);
-    // Give the running loop time to (not) start a turn.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // A pass over the nudge's wake, which would have started its turn.
+    await nextPass();
     assert.equal(membrane.calls.length, 0, 'no inference while quiesced');
     assert.equal(framework.getAgent('agent')!.state.status, 'idle');
     assert.equal(framework.getHostModeStatus().gatedRequests, 1);
@@ -111,13 +113,15 @@ test('parked wakes coalesce per (agent, reason), keeping the set bounded', async
   await withFramework(membrane, async (framework) => {
     framework.start();
     await framework.quiesce();
+    const nextPass = schedulerPasses(framework, waitFor);
     for (let i = 0; i < 5; i++) framework.nudgeAgent('agent', 'operator');
     // The loop's next pass compresses same-reason parked requests to one.
     await waitFor(
       'coalescing to a single parked request',
       () => framework.getHostModeStatus().gatedRequests === 1,
     );
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // A later pass over the coalesced request, which would have started it.
+    await nextPass();
     assert.equal(framework.getHostModeStatus().gatedRequests, 1, 'stays bounded');
     assert.equal(membrane.calls.length, 0);
   });
@@ -131,6 +135,7 @@ test('coalescing keeps an ADDRESSED wake alive when an ambient one of the same r
   await withFramework(membrane, async (framework) => {
     framework.start();
     await framework.quiesce();
+    const nextPass = schedulerPasses(framework, waitFor);
     // Re-read on every access: the scheduler REASSIGNS pendingRequests
     // when it takes a batch, so a captured reference goes stale.
     const pending = () => (framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
@@ -141,11 +146,12 @@ test('coalescing keeps an ADDRESSED wake alive when an ambient one of the same r
       { agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'framework', timestamp: t + 2, addressed: false, channelId: 'lounge' },
     );
     await waitFor('scheduler pass to coalesce', () => framework.getHostModeStatus().gatedRequests === 2);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // A later pass over the survivors, which would have started them.
+    await nextPass();
     const survivors = pending().filter((r) => r.reason === 'mcpl:channel-incoming');
     assert.equal(survivors.length, 2, 'one addressed + one ambient survive');
     assert.ok(survivors.some((r) => r.addressed === true && r.channelId === 'dm'), 'the addressed wake survived');
-    assert.ok(survivors.some((r) => r.addressed === false), 'the newest ambient wake survived');
+    assert.ok(survivors.some((r) => r.addressed === false && r.timestamp === t + 2), 'the newest ambient wake survived');
     assert.equal(membrane.calls.length, 0);
   });
 });
@@ -850,23 +856,35 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
 // Review-fix regressions (code review 08-21)
 // ---------------------------------------------------------------------------
 
-/** A membrane whose stream sleeps before producing its response — a turn
- *  that settles on its own after `delayMs`, so a drain window's real length
- *  becomes observable: a collapsed window returns undrained immediately, a
- *  sane one waits for the turn. */
-class DelayedMembrane extends MockMembrane {
-  constructor(private readonly delayMs: number) { super(); }
+/** A membrane whose stream produces its response only once the test opens
+ *  its gate, so a turn stays in flight for as long as a test needs: a
+ *  collapsed drain window returns undrained, a sane one waits for the turn. */
+class GatedMembrane extends MockMembrane {
+  private opened = false;
+  private waiters: Array<() => void> = [];
+  open(): void {
+    this.opened = true;
+    for (const wake of this.waiters.splice(0)) wake();
+  }
+  private gate(): Promise<void> {
+    return this.opened ? Promise.resolve() : new Promise((resolve) => { this.waiters.push(resolve); });
+  }
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
     const inner = super.streamYielding(request, options);
-    const delayMs = this.delayMs;
+    // A cancel lets this stream past the gate, to the aborted event its
+    // inner stream then yields, so a test that fails before open() doesn't
+    // leave stop() waiting on it.
+    let cancelled!: () => void;
+    const cancelling = new Promise<void>((resolve) => { cancelled = resolve; });
+    const gate = () => Promise.race([this.gate(), cancelling]);
     return {
-      cancel: () => inner.cancel(),
+      cancel: () => { inner.cancel(); cancelled(); },
       provideToolResults: (...args: unknown[]) => (inner.provideToolResults as (...a: unknown[]) => void)(...args),
       get isWaitingForTools() { return inner.isWaitingForTools; },
       get pendingToolCallIds() { return inner.pendingToolCallIds; },
       get toolDepth() { return inner.toolDepth; },
       async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await gate();
         yield* inner as unknown as AsyncIterable<StreamEvent>;
       },
     } as unknown as YieldingStream;
@@ -876,24 +894,28 @@ class DelayedMembrane extends MockMembrane {
 test('a non-finite timeoutMs falls back to the default drain window, never NaN-collapses', async () => {
   // NaN reached quiesce() via Number('12O000') on the HTTP ingress. With the
   // old Math.max(1_000, NaN) the deadline was NaN and the drain window
-  // collapsed to zero. Discriminating observable: a turn that settles after
-  // 600ms is drained by a sane window and NOT by a collapsed one.
-  const membrane = new DelayedMembrane(600);
+  // collapsed to zero. Discriminating observable: a turn held in flight
+  // until quiesce has begun is drained by a sane window, and a collapsed one
+  // has already returned undrained by then.
+  const membrane = new GatedMembrane();
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'late' }]));
   await withFramework(membrane, async (framework) => {
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
-    const started = Date.now();
-    const status = await framework.quiesce({ timeoutMs: Number('12O000') });
+    const quiescing = framework.quiesce({ timeoutMs: Number('12O000') });
+    // quiesce() marks the host quiesced, then checks the drain before its
+    // first await, so the turn is still held at that check.
+    await waitFor('quiesce to begin', () => framework.getHostModeStatus().quiesced);
+    membrane.open();
+    const status = await quiescing;
     assert.equal(status.quiesced, true);
     assert.equal(status.drained, true, 'the window waited for the turn');
-    assert.ok(Date.now() - started >= 400, 'quiesce actually waited');
   });
 });
 
 test('timeoutMs is clamped inside quiesce() — a sub-second value still drains a short turn', async () => {
-  const membrane = new DelayedMembrane(600);
+  const membrane = new GatedMembrane();
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'late' }]));
   await withFramework(membrane, async (framework) => {
     framework.start();
@@ -901,7 +923,16 @@ test('timeoutMs is clamped inside quiesce() — a sub-second value still drains 
     await waitFor('turn to start', () => membrane.calls.length === 1);
     // 1ms honoured literally would return undrained; the [1s, 10m] floor
     // (now inside quiesce(), shared by WS/HTTP/host-command) waits it out.
-    const status = await framework.quiesce({ timeoutMs: 1 });
+    // The subject is time, so the turn settles on a timer: its gate opens
+    // 300 ms into the window. The drain looks again every 250 ms, and a
+    // timer due sooner always fires first, so a 1 ms window ends at its
+    // first look with the turn still held. A floor of 1 s looks again at
+    // 500, 750 and 1000 ms, so a correct run fails only if none of those
+    // looks finds the turn settled, which takes this process being held up
+    // for most of that second.
+    const quiescing = framework.quiesce({ timeoutMs: 1 });
+    setTimeout(() => membrane.open(), 300);
+    const status = await quiescing;
     assert.equal(status.drained, true);
     assert.equal(AgentFramework.QUIESCE_TIMEOUT_MAX_MS, 600_000);
   });
@@ -916,21 +947,54 @@ test('a concurrent resume() supersedes a draining quiesce: no abandon, no stale 
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
 
-    const pending = framework.quiesce({ timeoutMs: 5_000, abandon: true });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    assert.equal(framework.getHostModeStatus().quiesced, true, 'draining');
+    // A window sized for a hang, so the resume reaches it while it drains,
+    // however slow the machine is. A resume that didn't supersede it would
+    // show only when the window ends, 60 s on, abandoning the turn.
+    const pending = framework.quiesce({ timeoutMs: 60_000, abandon: true });
+    await waitFor('quiesce to begin', () => framework.getHostModeStatus().quiesced);
     await framework.resume();
     const status = await pending;
     assert.equal(status.quiesced, false, 'the superseded quiesce reports the live mode');
     assert.ok(
       !traces.some((t) => t.type === 'inference:aborted'),
-      'the turn that outlived the window was NOT abandoned after the resume',
+      'the turn the quiesce was draining was NOT abandoned after the resume',
     );
     assert.ok(!traces.some((t) => t.type === 'host:quiesce'), 'no stale host:quiesce trace');
     // Release the hung turn so teardown is clean.
     framework.getAgent('agent')!.cancelStream();
     await waitFor('agent idle', () => framework.getAgent('agent')!.state.status === 'idle');
   });
+});
+
+test('the status lists the agents holding a turn, sorted, the set activeTurns counts', async () => {
+  const membrane = new HangingMembrane();
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [
+      { name: 'zed', model: 'test-model', systemPrompt: 'test' },
+      { name: 'amy', model: 'test-model', systemPrompt: 'test' },
+    ],
+    modules: [],
+  });
+  try {
+    assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, [], 'no turn is held while idle');
+    framework.start();
+    framework.nudgeAgent('zed', 'operator');
+    framework.nudgeAgent('amy', 'operator');
+    await waitFor('both turns to start', () => membrane.calls.length === 2);
+    const serving = framework.getHostModeStatus();
+    assert.deepEqual(serving.activeTurnAgents, ['amy', 'zed'], 'both streams are running, listed in order');
+    assert.equal(serving.activeTurns, 2, 'the list is the set activeTurns counts');
+
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    assert.deepEqual(status.activeTurnAgents, [], 'the abandon ended both');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('abandon reports turns it cannot cancel (token held, no stream)', async () => {
@@ -945,6 +1009,7 @@ test('abandon reports turns it cannot cancel (token held, no stream)', async () 
       const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
       assert.equal(status.drained, false);
       assert.deepEqual(status.unabandonable, ['agent']);
+      assert.deepEqual(status.activeTurnAgents, ['agent'], 'the turn it cannot cancel still holds its turn');
       const trace = traces.find((t) => t.type === 'host:quiesce') as { unabandonable?: string[] } | undefined;
       assert.deepEqual(trace?.unabandonable, ['agent']);
       assert.equal(membrane.calls.length, 0, 'nothing was cancelled or started');
@@ -974,6 +1039,13 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
   await withFramework(membrane, async (framework) => {
     const traces: TraceEvent[] = [];
     framework.onTrace((event) => traces.push(event));
+    // The turn's lifecycle goes to MCPL servers granted it, through the hook
+    // orchestrator, not to onTrace: stand one in that records it.
+    const lifecycle: string[] = [];
+    (framework as unknown as { hookOrchestrator: unknown }).hookOrchestrator = {
+      beforeInference: async () => [],
+      emitLifecycle: (params: { phase: string }) => { lifecycle.push(params.phase); },
+    };
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
@@ -987,10 +1059,7 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
     // stream must not be reported failed and then aborted.
     assert.ok(!traces.some((t) => t.type === 'inference:failed'),
       'an abandoned turn is not first recorded as a provider failure');
-    const lifecycle = traces
-      .filter((t) => String(t.type).includes('lifecycle'))
-      .map((t) => (t as { phase?: string }).phase);
-    if (lifecycle.length > 0) assert.ok(!lifecycle.includes('completed'), 'an abandoned turn is not "completed"');
+    assert.deepEqual(lifecycle, ['started', 'aborted'], 'an abandoned turn ends its lifecycle "aborted", not "completed"');
   });
 });
 
@@ -1117,8 +1186,10 @@ test('abandon can escalate an already-quiesced, undrained host', async () => {
 
     // Old behavior: `if (this.quiesced) return status` made this a no-op and
     // the only way out was resume()+re-quiesce, reopening planes mid-surgery.
+    assert.deepEqual(first.activeTurnAgents, ['agent'], 'the first window lists the turn still held');
     const second = await framework.quiesce({ abandon: true });
     assert.equal(second.drained, true, 'second quiesce escalates to abandon');
+    assert.deepEqual(second.activeTurnAgents, [], 'and the turn it ended holds none');
   });
 });
 
@@ -1296,10 +1367,9 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
     add('one', 'agent');
     add('two', 'scout');
     add('three', 'agent');
-    // Nothing checks a fresh write's blocks beyond reading each one's type,
-    // so a block that isn't an object can be queued; the log line names it
-    // by its JavaScript type.
-    internals.addMessage('user', [{ type: 'text', text: 'stuck' }, 'a bare string'], undefined, { forAgent: 'agent' });
+    // A write whose content the store would accept, which the store below
+    // refuses all the same; the log line names it by its blocks' types.
+    internals.addMessage('user', [{ type: 'text', text: 'stuck' }, { type: 'text', text: 'and more' }], undefined, { forAgent: 'agent' });
     add('for scout', 'scout');
     add('behind the stuck one', 'agent');
     add('also for scout', 'scout');
@@ -1314,7 +1384,7 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
       return realAdd(participant, content, metadata, causedBy);
     }) as typeof agentCm.addMessage;
     const named = () => lines.filter((line) =>
-      line.includes(`deferred write ${stuckId} (user: text+string) for agent could not be stored`)
+      line.includes(`deferred write ${stuckId} (user: text) for agent could not be stored`)
       && line.includes('a thrown value that has no text')).length;
 
     let status = await framework.resume();
@@ -1364,9 +1434,10 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
     // them in the recovery file: a null block, a string block and a number
     // block beside a text block, content that isn't blocks, a participant
     // that isn't text, which the line names by its type, and a target that
-    // is empty or isn't text. Once stored, a string or number block would
-    // make every compile for the agent throw, since the context manager's
-    // token estimate keys a WeakMap on each block.
+    // is empty or isn't text. A store before context-manager 0.16.0 kept a
+    // string or number block, and every compile for the agent then threw,
+    // since the context manager's token estimate keys a WeakMap on each
+    // block; from 0.16.0 the store refuses one.
     const file = join(storePath, 'recovery', 'deferred-writes.json');
     const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
     assert.equal(doc.pending.length, 2);
@@ -1396,6 +1467,58 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
       .map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(texts, ['first', 'second']);
     await assert.doesNotReject(framework.getAgent('agent')!.compileContext(), 'and the agent compiles');
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a recovered deferred write context-manager refuses as malformed is dropped at the first flush, and the ack takes it out of the recovery file', { timeout: 60_000 }, async () => {
+  // A write addMessage refuses now could sit in a queue an earlier process
+  // persisted: a text block whose text isn't a string is an object block, so
+  // boot restores it, and the store refuses it at the flush that meets it.
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-refused-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
+    add('user', [{ type: 'text', text: 'first' }]);
+    add('user', [{ type: 'text', text: 'second' }]);
+    await framework.stop();
+
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 2);
+    // Between the two writes, so the second is queued behind it: the second
+    // moves up one seq, and the malformed entry takes its place.
+    const second = doc.pending[1]!;
+    const seq = second.seq as number;
+    second.seq = seq + 1;
+    doc.pending.splice(1, 0, { id: 'number-text', seq, participant: 'user', content: [{ type: 'text', text: 5 }] });
+    writeFileSync(file, JSON.stringify(doc));
+
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getHostModeStatus().deferredWrites, 3, 'boot restores it with the others');
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    await framework.resume();
+    console.error = error;
+    assert.ok(lines.some((line) => line.includes("was refused as malformed, so it's dropped rather than queued again") && line.includes('content[0]')), lines.join('\n'));
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['first', 'second'], 'what was queued behind it landed, in order');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'nothing is queued again');
+    assert.ok(!readFileSync(file, 'utf8').includes('number-text'), 'and the recovery file no longer holds it');
   } finally {
     console.error = error;
     await framework.stop();
@@ -1643,10 +1766,12 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
     assert.equal(status.drained, false, 'a parked admission is not "drained"');
 
     // Release the auxiliary: before the fix this started a turn while quiesced.
+    const nextPass = schedulerPasses(framework, waitFor);
     releaseAux();
     await auxDone;
     await waitFor('admission released', () => (internals.providerGates.get('agent')?.primaryDepth ?? 0) === 0);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // A pass over the requeued wake, which would have started it.
+    await nextPass();
     assert.equal(membrane.calls.length, 0, 'NO inference while quiesced');
     assert.equal(framework.getHostModeStatus().quiesced, true);
     assert.ok(framework.getHostModeStatus().gatedRequests >= 1, 'the wake was requeued, not dropped');
@@ -1762,6 +1887,28 @@ test('a failed chronicle sync keeps flushed deferred writes in the durable queue
 
 const CRASH_CHILD = fileURLToPath(new URL('./helpers/quiesce-crash-child.js', import.meta.url));
 
+function runCrashChild(
+  storePath: string,
+  mode: string,
+  abort: AbortSignal,
+): Promise<{ status: number | null; signal: NodeJS.Signals | null; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CRASH_CHILD, storePath, mode], { signal: abort, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    let failure: Error | undefined;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', (error) => {
+      failure = error;
+      if (child.pid === undefined) reject(error);
+    });
+    child.on('close', (status, signal) => {
+      if (failure) reject(new Error(`${failure.message} (stderr: ${stderr.slice(-800)})`, { cause: failure }));
+      else resolve({ status, signal, stderr });
+    });
+  });
+}
+
 const CRASH_SCENARIOS = [
   { mode: 'after-ack', label: 'right after the first ack of the resume flush',
     expect: ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], bootQuiesced: true },
@@ -1776,7 +1923,7 @@ const CRASH_SCENARIOS = [
 ] as const;
 
 for (const scenario of CRASH_SCENARIOS) {
-  test(`a REAL process exit ${scenario.label} loses no deferred write and duplicates none`, async () => {
+  test(`a REAL process exit ${scenario.label} loses no deferred write and duplicates none`, async (context) => {
     const dir = mkdtempSync(join(tmpdir(), `host-quiesce-crash-${scenario.mode}-`));
     const storePath = join(dir, 'store');
     const config = () => ({
@@ -1787,11 +1934,8 @@ for (const scenario of CRASH_SCENARIOS) {
     });
     let framework: AgentFramework | null = null;
     try {
-      const child = spawnSync(process.execPath, [CRASH_CHILD, storePath, scenario.mode], {
-        encoding: 'utf8',
-        timeout: 60_000,
-      });
-      assert.equal(child.status, 0, `child staged the crash (stderr: ${child.stderr.slice(-800)})`);
+      const child = await runCrashChild(storePath, scenario.mode, context.signal);
+      assert.equal(child.status, 0, `child staged the crash (signal: ${child.signal}; stderr: ${child.stderr.slice(-800)})`);
 
       const wanted = new Set<string>(scenario.expect);
       const texts = () => framework!.getAgent('agent')!.getContextManager().getAllMessages()

@@ -48,6 +48,8 @@ export async function changesFlow(root: string, batches: FsChange[][], dirs: rea
       if (where.every(reportedIn)) return;
     }
   }
+  // Asked once more at the bound, so a process held past it fails only a probe still unreported.
+  if (where.every(reportedIn)) return;
   const seen = [...new Set(batches.flat().map((c) => c.path))];
   assert.fail(`expected the watcher to report a probe in each of ${where.map((d) => d || '.').join(', ')}; it reported ${seen.join(', ') || 'nothing'}`);
 }

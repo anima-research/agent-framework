@@ -198,9 +198,10 @@ export function canonicalJson(value: unknown): string {
  * 'base64', data, mediaType } }` and nothing else, its data re-encoded from
  * the decoded bytes, and an image's media type taken from its bytes'
  * signature where they have one. Any other block comes back as it was given,
- * except a `blob_ref`, which the store resolves to its inline media on read:
- * it is digested as given here, so a copy holding one doesn't match its
- * digest (the MCPL lanes never store one).
+ * except a store-internal `blob_ref` from an unresolved read, which resolves
+ * to inline media by default. It is digested as given here, so an unresolved
+ * read and its resolved form differ. Context-manager refuses caller-supplied
+ * blob_ref writes; the MCPL lanes never store one.
  */
 function storedBlock(block: unknown): unknown {
   const media = block as { type?: unknown; source?: { type?: unknown; data?: unknown; mediaType?: unknown } } | null;

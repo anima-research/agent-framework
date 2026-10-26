@@ -71,7 +71,9 @@ function convertContent(content: string | McplContentBlock[], serverId: string):
 
 /**
  * Convert an MCPL wire-format context injection, from the server `serverId`,
- * to a context-manager ContextInjection.
+ * to a context-manager ContextInjection. It builds only these four fields,
+ * so a server can't opt an injection out of being stored
+ * (ModuleContextInjection.placedEachCompile, which only a module may set).
  */
 function convertMcplInjection(mcplInj: McplContextInjection, serverId: string): ContextInjection {
   return {
@@ -114,8 +116,17 @@ export class HookOrchestrator {
    *
    * Returns aggregated ContextInjection[] ready for context-manager's compile().
    * Fail-open: servers that time out or error are silently skipped.
+   *
+   * `channelsFor` gives each server its own channel context (§14.4), in
+   * place of `params.channels`: channel ids are unique only within one
+   * server's connection (§14.2), so each server is told only of its own
+   * channels (ChannelRegistry.buildChannelContext). Undefined from it leaves
+   * the field out for that server.
    */
-  async beforeInference(params: BeforeInferenceParams): Promise<ContextInjection[]> {
+  async beforeInference(
+    params: BeforeInferenceParams,
+    channelsFor?: (serverId: string) => BeforeInferenceParams['channels'],
+  ): Promise<ContextInjection[]> {
     // §5.4: the GRANT decides fan-out, not the raw advertisement — which
     // also fixes selection for the recursive §5.1 shape, where
     // `beforeInference: {observe: true, …}` is an object, not `true`. A
@@ -132,7 +143,7 @@ export class HookOrchestrator {
 
     this._isInHook = true;
     try {
-      return await this.fanOutBeforeInference(servers, params);
+      return await this.fanOutBeforeInference(servers, params, channelsFor);
     } finally {
       this._isInHook = false;
     }
@@ -163,17 +174,33 @@ export class HookOrchestrator {
   private async fanOutBeforeInference(
     servers: McplServerConnection[],
     params: BeforeInferenceParams,
+    channelsFor?: (serverId: string) => BeforeInferenceParams['channels'],
   ): Promise<ContextInjection[]> {
     const results = await Promise.allSettled(
-      servers.map((server) => {
+      // Async, so a throw building one server's channel context fails that
+      // server alone, as its timeout or transport error would.
+      servers.map(async (server) => {
+        let base = params;
+        if (channelsFor) {
+          const { channels: _shared, ...rest } = params;
+          let channels: BeforeInferenceParams['channels'];
+          try {
+            channels = channelsFor(server.id);
+          } catch (err) {
+            // A bug, not a server's failure: said, then this server is skipped.
+            console.error(`[beforeInference] the channel context for "${server.id}" couldn't be built, so it isn't called:`, err);
+            throw err;
+          }
+          base = channels ? { ...rest, channels } : rest;
+        }
         // §10.1: a server not granted observe MUST receive
         // `userMessage: null` — the field is ABSENT authority, not merely
         // discouraged — while the hook is still invoked so granted
         // injection positions keep working (write-without-read).
         const perServer: BeforeInferenceParams =
           CapabilityGrant.of(server).has('contextHooks.beforeInference.observe')
-            ? params
-            : { ...params, userMessage: null };
+            ? base
+            : { ...base, userMessage: null };
         return withTimeout(
           server.sendBeforeInference(perServer),
           BEFORE_INFERENCE_TIMEOUT_MS,

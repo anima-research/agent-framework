@@ -32,9 +32,14 @@ export type CoalesceOutcome = typeof COALESCE_OUTCOMES[number];
 class CancelledRender extends Error {}
 
 export class CoalesceError extends Error {
-  constructor(readonly field: string, message: string, readonly code = -32602) {
+  /** Set on a failure that came after the occurrence's effects: it was
+   *  admitted, and only its acknowledgement failed (acknowledge). A lane
+   *  must not answer it as not admitted. */
+  readonly admitted: boolean;
+  constructor(readonly field: string, message: string, readonly code = -32602, options: { admitted?: true } = {}) {
     super(message);
     this.name = 'CoalesceError';
+    this.admitted = options.admitted === true;
   }
 }
 
@@ -122,6 +127,14 @@ interface DeferredBatch<E> {
   latest: CoalescedOccurrence<E>;
   notices: DeferredNotice[];
   dropped: number;
+  /** Every notice folded into the batch, a dropped one included, and a
+   *  plain occurrence a notice displaced unread (Occupant.ambient), was
+   *  tagged `chat:ambient` (RFC-001), so its render asks nothing of the agent
+   *  (CoalescerHost.wakeToRead). Snapshots carry it. A batch restored
+   *  without it, from a snapshot written before it existed or from an
+   *  acceptance receipt, which doesn't carry it, reads as not all ambient:
+   *  the side that keeps a wake. */
+  allAmbient?: true;
   /** Set on a batch restored from a snapshot whose render may have started. */
   noRender?: boolean;
   /** The batch opened on the agent's first view of its subject: a fresh
@@ -179,8 +192,20 @@ interface Occupant {
    *  render that joins a run finds a version placed. In memory only: a
    *  snapshot's occupant comes back as read. */
   firstView?: true;
+  /** A plain occurrence its server tagged `chat:ambient`. A notice that
+   *  displaces it unread stands its batch's render in its place, so that
+   *  render is all ambient only if this was (DeferredBatch.allAmbient). In
+   *  memory only, as `firstView`: a snapshot's occupant comes back as read,
+   *  and only an unread one is displaced. */
+  ambient?: true;
   /** The run's earlier renders, oldest first, each placed ahead of this one. */
   before?: Array<Omit<Occupant, 'before'>>;
+}
+
+/** An occupant's `ambient` mark, for a plain occurrence its server tagged
+ *  `chat:ambient`. */
+function ambientOccupant(occurrence: { tags?: string[] }): { ambient?: true } {
+  return occurrence.tags?.includes('chat:ambient') === true ? { ambient: true } : {};
 }
 
 /** The occupant holding a run's renders, given oldest first: the newest,
@@ -210,7 +235,16 @@ interface SubjectState<E> {
   touchedAt: number;
 }
 
-interface ReceiptEntry { result: PushEventResult; at: number; committed: boolean; firstView?: true }
+interface ReceiptEntry {
+  result: PushEventResult;
+  at: number;
+  committed: boolean;
+  firstView?: true;
+  /** Set while the receipt's record isn't written (recordReceipt failed):
+   *  what a rewrite keeps from the admission. The rest of the record is the
+   *  subject's state when it's written. */
+  unwritten?: { subject: string; born?: SubjectState<unknown>['history'] };
+}
 
 export interface CoalescingSnapshot {
   version: 1;
@@ -232,7 +266,7 @@ export interface CoalescingSnapshot {
     firstViewEnded?: true;
     /** `firstView` only on a batch that wasn't rendering: one that was may
      *  have been shown. */
-    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean; firstView?: true };
+    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean; firstView?: true; allAmbient?: true };
   }>;
 }
 /** One receipt, written synchronously at acceptance (bridges the snapshot throttle). */
@@ -244,15 +278,18 @@ export interface CoalescingReceiptRecord {
   /** History the subject was created with, for a subject first seen by this receipt. */
   born?: SubjectState<unknown>['history'];
   /** The subject's first view had ended by this acceptance
-   *  (SubjectState.firstViewEnded), so a crash before the snapshot flush
-   *  can't forget the end. A record written before this field existed has
-   *  none and reads as not ended, as a snapshot does. */
+   *  (SubjectState.firstViewEnded), or by the time a retry wrote the record,
+   *  so a crash before the snapshot flush can't forget the end. A record
+   *  written before this field existed has none and reads as not ended, as a
+   *  snapshot does. */
   firstViewEnded?: true;
   /** The subject's pending batch AFTER this acceptance: the accepted work
    *  itself (so a crash before the snapshot flush cannot lose it while keeping
    *  the receipt that suppresses its retry), or `null` when the acceptance
    *  left no batch — a retraction or plain replacement must be recoverable
-   *  too. Records replay in order, so the last one per subject wins. */
+   *  too. Records replay in order, so the last one per subject wins. A
+   *  record a retry writes (its first write failed) takes the batch the
+   *  subject has then, a rendering one included. */
   batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
 }
 
@@ -282,8 +319,11 @@ export interface CoalescerHost<E> {
   /** Queue an ordinary push wake for `agent`, under the batch's own wake
    *  policy, to read a render of the batch placed in its deferred queue that
    *  no request consumed, at `deferredId`. It carries no subject, so the
-   *  subject's other wakes, and later withdrawals of them, leave it. */
-  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string, deferredId?: string): Promise<void>;
+   *  subject's other wakes, and later withdrawals of them, leave it.
+   *  `allAmbient`: every notice the render stands for was tagged
+   *  `chat:ambient` (DeferredBatch.allAmbient), so the wake is marked
+   *  ambient. */
+  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string, deferredId?: string, allAmbient?: boolean): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
   /** The batch's audience still holds the authority it was admitted under. */
@@ -298,11 +338,13 @@ export interface CoalescerHost<E> {
    *  be recoverable before the RPC is issued, §3.2). Throws on failure. */
   saveNow?(snapshot: CoalescingSnapshot): void;
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
-   *  on failure, which fails the acceptance (the producer retries). */
+   *  on failure, which fails that answer: the receipt is kept unwritten, and
+   *  the producer's retry writes it again rather than admitting it again. */
   recordReceipt?(record: CoalescingReceiptRecord): void;
   /** One call per ADMITTED occurrence (never for a producer retry the receipt
-   *  deduplicates), after its receipt is recorded. Observation only: a throw
-   *  is contained here and never fails the acceptance. */
+   *  deduplicates), after its effects, whether or not its receipt could be
+   *  written. Observation only: a throw is contained here and never fails the
+   *  acceptance. */
   accepted?(occurrence: CoalescedOccurrence<E>): void;
   /** Make every write so far DURABLE (an fsync; the coalescer requests each
    *  commit under its lock, so no two acceptances share one).
@@ -397,14 +439,20 @@ export function validateCoalescedContent(
 /**
  * Whether the converter (`convertBlock` in convert-block.ts, which every lane
  * uses) shows a block as itself, its text or its image or
- * audio source, or as a reference stub, and not as a placeholder: an
+ * audio source (for MCP's embedded resource, its contents'), or as a
+ * reference stub, and not as a placeholder: an
  * unrecognized block, a no-data or no-media-type one, withheld inline data,
  * or a text block whose text isn't a string. This follows its branches in
  * their order.
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';
-  if (b.type === 'resource') return classifyBlock(b).kind === 'reference';
+  if (b.type === 'resource' || b.type === 'resource_link') {
+    const c = classifyBlock(b);
+    // MCP's embedded resource shows as the block its contents make.
+    if (c.kind === 'embedded') return c.contents.kind === 'block' && showsAsItself(c.contents.block);
+    return c.kind === 'reference';
+  }
   if (b.type !== 'image' && b.type !== 'audio') return false;
   if (isInlineContradiction(b)) return false;
   if (isFilledString(b.uri) && b.disposition !== undefined) return classifyBlock(b).kind === 'reference';
@@ -540,17 +588,27 @@ export class PushCoalescer<E = unknown> {
     return entry;
   }
 
-  /** Acknowledge a receipt: durable first. A receipt whose commit failed is
-   *  committed now (no effects are repeated); if that fails again, so does
-   *  the acknowledgement, and the producer retries once more. */
+  /** Acknowledge a receipt: durable first. A receipt whose record couldn't be
+   *  written is written now, and one whose commit failed is committed now (no
+   *  effects are repeated); if either fails again, so does the
+   *  acknowledgement, and the producer retries once more. */
   private async acknowledge(key: string, entry: ReceiptEntry, subject: string, eventId: string): Promise<PushEventResult> {
+    if (entry.unwritten) {
+      try {
+        this.recordReceipt(key, entry, entry.unwritten);
+      } catch (error) {
+        this.host.audit({ kind: 'persist-failed', subject, eventId, error: String(error) });
+        throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000, { admitted: true });
+      }
+      delete entry.unwritten;
+    }
     if (!entry.committed) {
       try {
         await this.host.commit?.();
         entry.committed = true;
       } catch (error) {
         this.host.audit({ kind: 'persist-failed', subject, eventId, error: String(error) });
-        throw new CoalesceError('eventId', 'host could not make the acceptance durable; retry', -32000);
+        throw new CoalesceError('eventId', 'host could not make the acceptance durable; retry', -32000, { admitted: true });
       }
     }
     return structuredClone(entry.result);
@@ -571,9 +629,11 @@ export class PushCoalescer<E = unknown> {
   }
 
   private async admit(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
-    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
-    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     const duplicate = this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId));
+    // A retry of an occurrence admitted before the stop is refused too, but
+    // as one admitted: its effects are in, so no lane may say it wasn't.
+    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000, duplicate ? { admitted: true } : {});
+    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     if (duplicate) {
       // A producer retrying acknowledged work is also a chance to notice a
       // batch left asleep by a failed freeze: wake it now, without effects.
@@ -605,19 +665,18 @@ export class PushCoalescer<E = unknown> {
     state.touchedAt = this.now();
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
     const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
-    const entry: ReceiptEntry = { result: structuredClone(result), at: this.now(), committed: false, ...(this.deliveredFirstView ? { firstView: true as const } : {}) };
-    try {
-      this.host.recordReceipt?.({
-        key: receiptKey, result: entry.result, at: entry.at, subject, ...(born ? { born } : {}),
-        ...(state.firstViewEnded ? { firstViewEnded: true as const } : {}),
-        batch: state.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
-      });
-    } catch (error) {
-      // Not acknowledged: the work would be lost while its receipt suppressed
-      // a retry. The producer retries within the window.
-      this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(error) });
-      throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000);
-    }
+    // The effects are done, so the receipt is kept whatever its record's
+    // write does: a retry is answered from it, never admitted again (RFC-006
+    // §3.1). Its record is written and made durable before an acknowledgement
+    // (acknowledge), by this answer or a retry's. While this process lives,
+    // the in-memory receipt deduplicates a retry, which writes or commits
+    // what failed. The snapshot carries it too, so a later save and commit
+    // keep it across a restart; a kill before either leaves nothing of it,
+    // and the retry is a fresh acceptance.
+    const entry: ReceiptEntry = {
+      result: structuredClone(result), at: this.now(), committed: false, unwritten: { subject, ...(born ? { born } : {}) },
+      ...(this.deliveredFirstView ? { firstView: true as const } : {}),
+    };
     this.receipts.set(receiptKey, entry);
     try {
       this.host.accepted?.(occurrence);
@@ -626,10 +685,29 @@ export class PushCoalescer<E = unknown> {
     }
     this.prune();
     this.persist();
-    // Written but not yet durable: the in-memory receipt deduplicates a retry
-    // while this process lives, and the retry commits it (acknowledge); after
-    // a kill nothing of it exists and the retry is a fresh acceptance.
     return this.acknowledge(receiptKey, entry, subject, occurrence.eventId);
+  }
+
+  /** Write a receipt's record: what the admission fixed (`fixed`), with the
+   *  subject's first-view end and pending batch as they are now. A record
+   *  written by a retry follows any written since its admission, and records
+   *  replay in order, so it carries the batch the subject has now, not the
+   *  one it had then. That includes a batch whose render has started, which
+   *  the render-start snapshot holds too: a `null` would clear it at a
+   *  restore, and a crash before the render's content is stored would lose
+   *  the accepted work. (At an admission no batch is rendering without a
+   *  pending one: a plain occurrence or a retraction cancels the render, and
+   *  a deferred notice opens a batch.) Throws when the host's write does. */
+  private recordReceipt(key: string, entry: ReceiptEntry, fixed: { subject: string; born?: SubjectState<unknown>['history'] }): void {
+    const state = this.subjects.get(fixed.subject);
+    const batch = state?.batch ?? state?.rendering?.batch;
+    this.host.recordReceipt?.({
+      // A birth is the subject's only while the coalescer still holds it: one
+      // evicted since its admission is untracked, `unknown` (prune).
+      key, result: entry.result, at: entry.at, subject: fixed.subject, ...(fixed.born && state ? { born: fixed.born } : {}),
+      ...(state?.firstViewEnded ? { firstViewEnded: true as const } : {}),
+      batch: batch ? structuredClone({ latest: batch.latest as CoalescedOccurrence<unknown>, notices: batch.notices, dropped: batch.dropped }) : null,
+    });
   }
 
   private subjectFor(subject: string, occurrence: CoalescedOccurrence<E>): SubjectState<E> {
@@ -784,7 +862,7 @@ export class PushCoalescer<E = unknown> {
     // context that read a version, never a new one (§3.2).
     const placement = await this.deliver({ ...occurrence, deliverTo: state.audienceAgent });
     if (placement) {
-      state.occupant = { eventId: occurrence.eventId, placement };
+      state.occupant = { eventId: occurrence.eventId, placement, ...ambientOccupant(occurrence) };
       state.audienceAgent = placement.agent;
     }
     return 'noted';
@@ -809,7 +887,7 @@ export class PushCoalescer<E = unknown> {
           ...occurrence, deliverTo: prior.placement.agent,
           ...(firstView ? { firstView: true } : {}),
         });
-        state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
+        state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}), ...ambientOccupant(occurrence) } : undefined;
         if (placement) state.audienceAgent = placement.agent;
         return 'replaced';
       }
@@ -823,7 +901,7 @@ export class PushCoalescer<E = unknown> {
     // batch's place (a batch's own first view ends with the subject's).
     const firstView = hadBatch ? batchFirstView && state.history === 'none' : outcome === 'first' && !state.firstViewEnded;
     const placement = await this.deliver(hadBatch && firstView ? { ...occurrence, firstView: true } : occurrence);
-    state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
+    state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}), ...ambientOccupant(occurrence) } : undefined;
     if (placement) state.audienceAgent = placement.agent;
     return outcome;
   }
@@ -838,6 +916,10 @@ export class PushCoalescer<E = unknown> {
     // batches already open too). A render still under way is weighed when a
     // batch's first delivery is.
     let firstView = state.history === 'none' && !state.firstViewEnded;
+    // Whether every notice the batch's render stands for was tagged
+    // `chat:ambient` (DeferredBatch.allAmbient): this one, and a plain
+    // occurrence it displaces unread, whose place the render takes.
+    let ambient = occurrence.tags?.includes('chat:ambient') === true;
     if (occupantUnread && state.occupant?.rendered) {
       // An unread render is a delta the next render builds on (§5.2), not a
       // plain occurrence: it stays, and the batch follows its agent (§3.2), so
@@ -848,6 +930,7 @@ export class PushCoalescer<E = unknown> {
       // §5.1: a notice displaces an unread plain occurrence and opens a batch
       // — in the audience that held the plain occurrence (§3.2).
       if (!this.occupantLeaves(state, state.occupant)) firstView = false;
+      if (state.occupant.ambient !== true) ambient = false;
       this.host.audit({ kind: 'displaced', subject, eventId: state.occupant.eventId });
       if (this.host.remove(state.occupant.placement)) {
         outcome = 'replaced';
@@ -864,10 +947,11 @@ export class PushCoalescer<E = unknown> {
       state.batch.notices.push(notice);
       if (state.batch.notices.length > this.maxNotices) { state.batch.notices.shift(); state.batch.dropped++; }
       state.batch.latest = occurrence;
+      if (!ambient) delete state.batch.allAmbient;
       outcome = 'replaced';
     } else {
       // Rule 1: a notice during a render opens a NEW batch ("first").
-      state.batch = { latest: occurrence, notices: [notice], dropped: 0, ...(firstView ? { firstView: true as const } : {}) };
+      state.batch = { latest: occurrence, notices: [notice], dropped: 0, ...(firstView ? { firstView: true as const } : {}), ...(ambient ? { allAmbient: true as const } : {}) };
     }
     await this.host.wakeForBatch(occurrence);
     return outcome;
@@ -1073,7 +1157,9 @@ export class PushCoalescer<E = unknown> {
           // agent's wake for this batch; give it an ordinary wake, as any
           // delivery during its turn has, beside any wakes a newer batch has,
           // so that its next turn reads the content (the wake starts no turn
-          // once the agent has read it, or it's removed).
+          // once a request that carried it is answered and, if the wake
+          // carries a channel and the batch wasn't all ambient, the agent has
+          // published there since, or once it's removed).
           // The run's renders keep their own records, whatever else an
           // occupant carries, a first view's mark included.
           let before: Occupant['before'];
@@ -1087,7 +1173,7 @@ export class PushCoalescer<E = unknown> {
             await this.host.wakeForBatch(state.batch.latest);
           }
           state.audienceAgent = placement.agent;
-          await this.host.wakeToRead(occurrence, placement.agent, placement.deferredId);
+          await this.host.wakeToRead(occurrence, placement.agent, placement.deferredId, batch.allAmbient === true);
           return;
         }
         // The materialized occurrence is consumed by the request being
@@ -1131,6 +1217,7 @@ export class PushCoalescer<E = unknown> {
         state.batch = {
           latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped,
           ...(s.batch.rendering ? { noRender: true } : s.batch.firstView ? { firstView: true as const } : {}),
+          ...(s.batch.allAmbient ? { allAmbient: true as const } : {}),
         };
       }
       this.subjects.set(s.subject, state);
@@ -1193,9 +1280,9 @@ export class PushCoalescer<E = unknown> {
       if (r.batch === undefined) continue; // pre-round-3 record: no batch information
       // The subject's batch AFTER that acceptance, newer than the snapshot:
       // the accepted deferred work itself, or null for a withdrawal /
-      // replacement that cleared it. It never began rendering before the
-      // record was written, but the snapshot cannot say whether it did
-      // afterwards: take the fallback.
+      // replacement that cleared it. Its render may have started before the
+      // record was written (a retry's record) or after, and the snapshot
+      // cannot say whether it ran: take the fallback.
       const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
       state.batch = r.batch
         ? { latest: r.batch.latest as CoalescedOccurrence<E>, notices: r.batch.notices, dropped: r.batch.dropped, noRender: true }
@@ -1216,8 +1303,8 @@ export class PushCoalescer<E = unknown> {
         // restore() reads only these. After a restart nothing of the subject
         // is tracked as unread, a run included: its history counts as read.
         ...(s.occupant ? { occupant: { eventId: s.occupant.eventId, placement: s.occupant.placement } } : {}),
-        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : s.batch.firstView ? { firstView: true as const } : {}) } }
-          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
+        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : s.batch.firstView ? { firstView: true as const } : {}), ...(s.batch.allAmbient ? { allAmbient: true as const } : {}) } }
+          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true, ...(s.rendering.batch.allAmbient ? { allAmbient: true as const } : {}) } }
           : {}),
       })),
     };

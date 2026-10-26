@@ -1506,7 +1506,7 @@ describe('after a branch move, every agent on the store compiles without a resta
 
 describe('conversation forks and an undo', () => {
   type ForkInternals = Internals & {
-    createConversationAgent(name: string, channelId: string): Promise<{ getContextManager(): ContextManager }>;
+    createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ getContextManager(): ContextManager }>;
   };
 
   it("a fork created while an undo's managers re-initialize waits for them, and compiles", { timeout: 30_000 }, async () => {
@@ -1550,7 +1550,7 @@ describe('conversation forks and an undo', () => {
       };
       assert.equal(framework.undoLastTurn('a').undone, true);
       assert.ok(internals.syncMoveReinit, 'the re-initialization is running');
-      const spawning = internals.createConversationAgent('a-chan-g1', 'world:chan');
+      const spawning = internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
       await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
       await settled();
       assert.equal(order.length, 0, `the spawn waits, and nothing has compiled the template: ${JSON.stringify(order)}`);
@@ -1607,14 +1607,14 @@ describe('conversation forks and an undo', () => {
     const router = framework.getConversationRouter()!;
     const cmA = framework.getAgent('a')!.getContextManager();
     cmA.addMessage('user', [{ type: 'text', text: 'hello a' }]);
-    await internals.createConversationAgent('a-early-g1', 'world:early');
-    router.bind('world:early', 'a-early-g1', 1);
+    await internals.createConversationAgent('a-early-g1', { serverId: 'world', channelId: 'world:early' });
+    router.bind({ serverId: 'world', channelId: 'world:early' }, 'a-early-g1', 1);
     framework.getAgent('a-early-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'early own' }]);
     const sequenceBefore = framework.getStore().currentSequence();
     cmA.addMessage('user', [{ type: 'text', text: 'a turn to undo' }]);
     internals.saveTurnCheckpoints('a', [{ agentName: 'a', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
-    await internals.createConversationAgent('a-late-g1', 'world:late');
-    router.bind('world:late', 'a-late-g1', 1);
+    await internals.createConversationAgent('a-late-g1', { serverId: 'world', channelId: 'world:late' });
+    router.bind({ serverId: 'world', channelId: 'world:late' }, 'a-late-g1', 1);
     framework.getAgent('a-late-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'late own' }]);
     return sequenceBefore;
   };
@@ -1628,7 +1628,7 @@ describe('conversation forks and an undo', () => {
       const undo = framework.undoLastTurn('a');
       assert.equal(undo.undone, true);
       await undo.settled;
-      assert.equal(router.getBinding('world:late')?.agentName, 'a-late-g1', 'the fork stays, bound to its channel');
+      assert.equal(router.getBinding({ serverId: 'world', channelId: 'world:late' })?.agentName, 'a-late-g1', 'the fork stays, bound to its channel');
       const late = await textsOf(framework, 'a-late-g1');
       assert.equal(count(late, 'hello a'), 1, `seeded again from the template's compile on this branch: ${JSON.stringify(late)}`);
       assert.equal(count(late, 'a turn to undo'), 0, JSON.stringify(late));
@@ -1655,8 +1655,8 @@ describe('conversation forks and an undo', () => {
   it("a switch to a branch from before a fork was spawned seeds it again; a fork whose re-initialization fails there is reported, and not seeded", { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-switch-', async (framework, internals, logged) => {
       const sequenceBefore = await forksAroundACheckpoint(framework, internals);
-      await internals.createConversationAgent('a-bad-g1', 'world:bad');
-      framework.getConversationRouter()!.bind('world:bad', 'a-bad-g1', 1);
+      await internals.createConversationAgent('a-bad-g1', { serverId: 'world', channelId: 'world:bad' });
+      framework.getConversationRouter()!.bind({ serverId: 'world', channelId: 'world:bad' }, 'a-bad-g1', 1);
       const alerts: Array<{ kind: string; agentName: string; message: string }> = [];
       framework.onTrace((event) => {
         if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string });
@@ -1769,7 +1769,7 @@ describe('conversation forks and an undo', () => {
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed rather than left to answer with no history');
       const router = framework.getConversationRouter()!;
-      assert.equal(router.getBinding('world:late'), undefined, 'its channel is unbound');
+      assert.equal(router.getBinding({ serverId: 'world', channelId: 'world:late' }), undefined, 'its channel is unbound');
       const next = router.route({ channelId: 'world:late', mentioned: true, kind: 'channel' });
       assert.equal(next.kind, 'spawn', `the channel's next mention spawns a fresh fork: ${JSON.stringify(next)}`);
       assert.ok(framework.getAgent('a-early-g1'), 'the fork spawned before the point stays');
@@ -1781,8 +1781,8 @@ describe('conversation forks and an undo', () => {
       await forksAroundACheckpoint(framework, internals);
       const router = framework.getConversationRouter()!;
       // A second fork spawned after the checkpoint, after a-late-g1 in the pass.
-      await internals.createConversationAgent('a-later-g1', 'world:later');
-      router.bind('world:later', 'a-later-g1', 1);
+      await internals.createConversationAgent('a-later-g1', { serverId: 'world', channelId: 'world:later' });
+      router.bind({ serverId: 'world', channelId: 'world:later' }, 'a-later-g1', 1);
       framework.getAgent('a-later-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'later own' }]);
       const alerts: Array<{ kind: string; agentName: string; message: string }> = [];
       framework.onTrace((event) => {
@@ -1815,7 +1815,7 @@ describe('conversation forks and an undo', () => {
       assert.match(reinit[0]!.message, /couldn't be seeded again, so it was unregistered and its channel unbound, but its cleanup failed \(below\)\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The write held for it while the store was held may be in its window, where no agent reads it, still queued under its name, or in neither, as far as that cleanup got\. A flush that meets one still queued passes a failed reply on to the primary agent and drops anything else, logged\. .*It couldn't be seeded because its seeding from the template failed: .*injected seed failure\. Its cleanup failed: .*injected release failure\.$/);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is unregistered');
-      assert.equal(router.getBinding('world:late'), undefined, 'its channel is unbound');
+      assert.equal(router.getBinding({ serverId: 'world', channelId: 'world:late' }), undefined, 'its channel is unbound');
       const later = await textsOf(framework, 'a-later-g1');
       assert.equal(count(later, 'hello a'), 1, `the next fork is seeded again from the template: ${JSON.stringify(later)}`);
       assert.equal(count(later, 'later own'), 0, JSON.stringify(later));
@@ -1841,7 +1841,7 @@ describe('conversation forks and an undo', () => {
         await gate;
         return compile(...args);
       };
-      const spawning = internals.createConversationAgent('a-chan-g1', 'world:chan');
+      const spawning = internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
       await reached;
       try {
         assert.throws(
@@ -1874,7 +1874,7 @@ describe('conversation forks and an undo', () => {
       const compile = cmA.compile.bind(cmA);
       (cmA as unknown as { compile: () => Promise<never> }).compile = async () => { throw new Error('injected template compile failure'); };
       try {
-        await assert.rejects(internals.createConversationAgent('a-chan-g1', 'world:chan'), /injected template compile failure/);
+        await assert.rejects(internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' }), /injected template compile failure/);
       } finally {
         (cmA as unknown as { compile: typeof compile }).compile = compile;
       }
@@ -1950,7 +1950,7 @@ describe('conversation forks and an undo', () => {
         }
         assert.equal(framework.getStore().currentBranch().name, 'main');
         assert.ok(framework.getAgent('a-late-g1'), 'not disposed');
-        assert.equal(framework.getConversationRouter()!.getBinding('world:late')?.agentName, 'a-late-g1');
+        assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId: 'world:late' })?.agentName, 'a-late-g1');
         const late = await textsOf(framework, 'a-late-g1');
         assert.equal(count(late, 'hello a'), 1, `no template copy stacked on its own history: ${JSON.stringify(late)}`);
         assert.equal(count(late, 'late own'), 1, JSON.stringify(late));
@@ -1962,8 +1962,8 @@ describe('conversation forks and an undo', () => {
   it('a fork disposed in a pass that a later move joins is still reported', { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-disposed-joined-', async (framework, internals) => {
       await forksAroundACheckpoint(framework, internals);
-      await internals.createConversationAgent('a-late2-g1', 'world:late2');
-      framework.getConversationRouter()!.bind('world:late2', 'a-late2-g1', 1);
+      await internals.createConversationAgent('a-late2-g1', { serverId: 'world', channelId: 'world:late2' });
+      framework.getConversationRouter()!.bind({ serverId: 'world', channelId: 'world:late2' }, 'a-late2-g1', 1);
       framework.getAgent('a-late2-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'late2 own' }]);
       const alerts: Array<{ kind: string; agentName: string; message: string; data?: { after?: string } }> = [];
       framework.onTrace((event) => {
@@ -2018,9 +2018,9 @@ describe('conversation forks and an undo', () => {
       // A spawn seeds from the template too, so the channel spawns again only once it's re-initialized.
       assert.match(byAgent.get('a-late-g1')!, /no agent reads them again/);
       assert.ok(!framework.getAgent('a-late-g1'), 'the empty fork is disposed');
-      assert.equal(framework.getConversationRouter()!.getBinding('world:late'), undefined);
+      assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId: 'world:late' }), undefined);
       assert.ok(framework.getAgent('a-early-g1'), 'the fork with history stays');
-      assert.equal(framework.getConversationRouter()!.getBinding('world:early')?.agentName, 'a-early-g1');
+      assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId: 'world:early' })?.agentName, 'a-early-g1');
     });
   });
 
@@ -2054,8 +2054,8 @@ describe('conversation forks and an undo', () => {
       const turn1 = { agentName: 'a', turnIndex: 1, sequenceBefore: store.currentSequence(), branchName: 'main', timestamp: Date.now() };
       cmA.addMessage('user', [{ type: 'text', text: 'a turn one' }]);
       internals.saveTurnCheckpoints('a', [turn1]);
-      await internals.createConversationAgent('a-late-g1', 'world:late');
-      framework.getConversationRouter()!.bind('world:late', 'a-late-g1', 1);
+      await internals.createConversationAgent('a-late-g1', { serverId: 'world', channelId: 'world:late' });
+      framework.getConversationRouter()!.bind({ serverId: 'world', channelId: 'world:late' }, 'a-late-g1', 1);
       framework.getAgent('a-late-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'late own' }]);
       const turn2 = { agentName: 'a', turnIndex: 2, sequenceBefore: store.currentSequence(), branchName: 'main', timestamp: Date.now() };
       cmA.addMessage('user', [{ type: 'text', text: 'a turn two' }]);
@@ -2096,7 +2096,7 @@ describe('conversation forks and an undo', () => {
       }
       assert.deepEqual(alerts.filter((alert) => alert.kind === 'context-reinit-failed'), [], 'nothing reported: the refusal came in a pass a move joined');
       assert.ok(framework.getAgent('a-late-g1'), 'not disposed');
-      assert.equal(framework.getConversationRouter()!.getBinding('world:late')?.agentName, 'a-late-g1');
+      assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId: 'world:late' })?.agentName, 'a-late-g1');
       const late = await textsOf(framework, 'a-late-g1');
       assert.equal(count(late, 'hello a'), 1, `seeded again by the next pass, from the template: ${JSON.stringify(late)}`);
       assert.equal(count(late, 'late own'), 0, JSON.stringify(late));
@@ -2125,7 +2125,7 @@ describe('conversation forks and an undo', () => {
     await withForks('reinit-fork-recreate-', async (framework, internals) => {
       const cmA = framework.getAgent('a')!.getContextManager();
       cmA.addMessage('user', [{ type: 'text', text: 'hello a' }]);
-      await internals.createConversationAgent('a-chan-g1', 'world:chan');
+      await internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
       const stored = framework.getAgent('a-chan-g1')!.getContextManager().getMessageCount();
       assert.ok(stored > 0, 'seeded once');
       // The name comes round again over the same namespace, as when the
@@ -2142,7 +2142,7 @@ describe('conversation forks and an undo', () => {
         return this === cmA ? result : { ...result, messages: [] };
       };
       try {
-        await internals.createConversationAgent('a-chan-g1', 'world:chan');
+        await internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
       } finally {
         proto.compile = compile;
       }
@@ -2315,7 +2315,7 @@ describe('conversation forks and an undo', () => {
         return initialize(...args);
       };
       assert.equal(framework.undoLastTurn('a').undone, true);
-      const spawning = internals.createConversationAgent('a-new-g1', 'world:new');
+      const spawning = internals.createConversationAgent('a-new-g1', { serverId: 'world', channelId: 'world:new' });
       void spawning.catch(() => {});
       await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
       const stopping = framework.stop();
@@ -2531,7 +2531,7 @@ describe('conversation forks and an undo', () => {
       modules: [stopper('stopper')],
       conversations: { templateAgent: 'a', bind: { channel: 'mention' }, strategyFactory: () => autobiographical() },
     });
-    const spawn = (name: string) => (framework as unknown as ForkInternals).createConversationAgent(name, `world:${name}`);
+    const spawn = (name: string) => (framework as unknown as ForkInternals).createConversationAgent(name, { serverId: 'world', channelId: `world:${name}` });
     try {
       framework.getAgent('a')!.getContextManager().addMessage('user', [{ type: 'text', text: 'hello a' }]);
       framework.start();
@@ -2575,7 +2575,7 @@ describe('conversation forks and an undo', () => {
       let running: boolean | undefined;
       internals.endConnectsInFlight = () => {
         running = internals.running;
-        spawning = internals.createConversationAgent('a-early-g1', 'world:early');
+        spawning = internals.createConversationAgent('a-early-g1', { serverId: 'world', channelId: 'world:early' });
         void spawning.catch(() => {});
         endConnects();
       };
@@ -2606,7 +2606,7 @@ describe('conversation forks and an undo', () => {
       framework.start();
       await framework.stop();
       framework.start();
-      await (framework as unknown as ForkInternals).createConversationAgent('a-after-g1', 'world:after');
+      await (framework as unknown as ForkInternals).createConversationAgent('a-after-g1', { serverId: 'world', channelId: 'world:after' });
       assert.ok(framework.getAgent('a-after-g1'), 'registered');
       assert.deepEqual(await textsOf(framework, 'a-after-g1'), ['hello a'], 'seeded from the template');
     } finally {
@@ -2649,7 +2649,7 @@ describe('conversation forks and an undo', () => {
         assert.equal(undo.undone, true);
         await undo.settled;
       }, async () => {
-        framework.getConversationRouter()!.getBinding('world:late')!.lastActivity = 0;
+        framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId: 'world:late' })!.lastActivity = 0;
         internals.lastConversationSweep = 0;
         internals.sweepExpiredConversations();
         assert.deepEqual(storedTexts(late), [], 'the closure prompt is not written into the emptied fork during the wait');

@@ -14,6 +14,7 @@ import { WebSocketServer } from 'ws';
 import type { AddressInfo } from 'node:net';
 
 import { AgentFramework } from '../src/index.js';
+import { referenceRegistry } from '../src/mcpl/references.js';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -102,6 +103,9 @@ test('connectMcplServer lazily initializes MCPL on a zero-server framework and e
     assert.deepEqual(framework.listMcplServers(), [], 'no servers configured at start');
 
     await framework.connectMcplServer(serverConfig('dyn'));
+    // Its address is recorded where a reference's stub reads it: none, for a
+    // server the host spawns.
+    assert.equal(referenceRegistry.serverAddress('dyn'), 'no-address');
 
     const servers = framework.listMcplServers();
     assert.equal(servers.length, 1);

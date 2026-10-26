@@ -641,6 +641,8 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 export function mcplPolicyGrants(config: McplServerConfig): string[] {
   const grants: string[] = [];
   if (isEffective(config.allowHostCommands)) grants.push('allowHostCommands');
+  // RFC-014 tool hints are an MCPL advertisement.
+  if (config.toolHints === true) grants.push('toolHints');
   // An allow-list, except that a pattern matching a path denied by default
   // grants it (computeGrant's explicitlyEnabled), named by the path.
   const enabled = config.enabledCapabilities as unknown;
@@ -733,7 +735,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   if (binding.family === 'modern') {
     if (timeout !== undefined && !(Number.isInteger(timeout) && timeout >= 1 && timeout <= MAX_TIMER_MS)) {
       problems.push(
-        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${String(timeout)}); every modern call has a deadline`,
+        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${asText(timeout)}); every modern call has a deadline`,
       );
     }
     for (const path of mcplPolicyGrants(config)) {

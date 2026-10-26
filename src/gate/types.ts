@@ -17,9 +17,10 @@
  * bucket are denied (decision: trigger=false). Tokens regenerate at one per
  * `refillIntervalMs`, capped at `tokens`. Buckets are partitioned by the
  * value of `keyBy` resolved against event metadata — so a per-user limit
- * uses `keyBy: "senderId"`, a per-channel limit uses `keyBy: "channelId"`,
- * etc. With no `keyBy` (or when the resolved value is missing), one shared
- * bucket is used for the policy.
+ * uses `keyBy: "senderId"`, a per-channel limit uses `keyBy: "channelId"`
+ * (resolved to the channel's registered id, as `keyBy` says), etc. With no
+ * `keyBy` (or when the resolved value is missing), one shared bucket is used
+ * for the policy.
  */
 export interface RateLimitConfig {
   /** Max bucket capacity, also the initial fill. Must be > 0. */
@@ -27,8 +28,12 @@ export interface RateLimitConfig {
   /** Milliseconds between token regenerations. Must be > 0. */
   refillIntervalMs: number;
   /**
-   * Metadata field name to partition buckets by. If absent or the metadata
-   * field is missing on a given event, all events share one bucket.
+   * Metadata field name to partition buckets by. `"channelId"` takes the
+   * channel's registered id where the gate resolves one, as `match.channel`
+   * does, so a channel's push events share its messages' bucket, a voice
+   * report's included, though it carries no `channelId`. Otherwise, if
+   * absent or the metadata field is missing on a given event, all such
+   * events share one bucket.
    */
   keyBy?: string;
 }
@@ -45,7 +50,8 @@ export interface RateLimitConfig {
 export interface PassiveSampleConfig {
   /** Trigger every N-th match. Must be > 0. */
   every: number;
-  /** Optional metadata field name for separate per-key counters. */
+  /** Optional metadata field name for separate per-key counters, resolved
+   *  as `RateLimitConfig.keyBy` is. */
   keyBy?: string;
 }
 
@@ -68,7 +74,12 @@ export interface GatePolicyMatch {
   scope?: string[];
   /** ServerId to match (exact or glob with *). */
   source?: string;
-  /** ChannelId to match (exact or glob with *). */
+  /** Channel to match (exact or glob with *): against the event's channel
+   *  id, then the registered id the gate resolves for it
+   *  (`resolveRouteChannel`). A channels/incoming message carries the
+   *  registered id (`discord:<guild>:<channel>`), and a push the adapter's
+   *  raw one or none, so a registered-form pattern meets every event in its
+   *  channel whose push names the channel, and a raw id only push events. */
   channel?: string;
   /** Content text filter. */
   filter?: { type: 'text' | 'regex'; pattern: string };
@@ -155,7 +166,17 @@ export interface GateConfig {
 export interface GateOptions {
   /** Path to gate.json. Default: derived from storePath. */
   configPath?: string;
-  /** Initial config, seeded to gate.json if the file doesn't exist. */
+  /**
+   * The recipe's gate config. The first start seeds gate.json with it. Each
+   * later start merges it into gate.json against the recipe last applied,
+   * which the gate keeps beside gate.json (`gate.recipe.json`): a rule the
+   * recipe dropped, renamed, moved or redefined follows it, a rule edited at
+   * run time or by hand stays, and so does one no recipe declared. Rules are
+   * merged by name, compared by what they mean and kept as written: a
+   * recipe's rule with no name is never merged, as one with no name was never
+   * added, and where gate.json or the recipe names a rule twice, a start only
+   * adds the rules gate.json lacks. See `recipe-reconcile.ts`.
+   */
   config?: GateConfig;
   /**
    * Path to a JSON file listing user ids that may wake the agent even while
@@ -229,6 +250,47 @@ export interface GateEventInfo {
   paths?: string[];
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
+}
+
+/** An MCPL event whose content the framework stored at arrival, as a
+ *  batched wake names it to the framework (EventGate's `isNewestEntry`):
+ *  a channel message by its server, channel and message id, a push event by
+ *  its server and event id. */
+export interface GateEntryRef {
+  eventType: string;
+  serverId?: string;
+  channelId?: string;
+  messageId?: string;
+  eventId?: string;
+}
+
+/** A batched wake's `[Gate: …]` line that the gate handed to the wake rather
+ *  than wrote: its batch was one event whose entry was still the newest in
+ *  the window when the batch fired (EventGate's `isNewestEntry`). A fresh
+ *  start of the wake's turn decides it (the framework's placeWakeLines): the
+ *  delivery agent's own start leaves it out while that entry is still the
+ *  newest, and writes it once something follows; a co-resident's start
+ *  places none; two or more such lines are each written;
+ *  and none is written while the host is quiesced or another reader of the
+ *  residents' shared slot has a turn alive. A line left out stays for a
+ *  later fresh start of the same wake. Its text is rendered when it's
+ *  written (wakeLineText), so its age is true then.
+ *
+ *  Every request for one wake carries the same object: the framework writes
+ *  each line once by its identity, across the wake's retries and holds. A
+ *  host that hands the gate's requests on itself passes the line on as it
+ *  is, not a copy per agent. */
+export interface WakeLine {
+  /** The event's own entry. */
+  entry: GateEntryRef;
+  policyNames: string[];
+  /** The channel as the line names it to the agent. */
+  shown: string;
+  /** When the event arrived (ms): the line's age is counted from it to when
+   *  the line is written (wakeLineText). */
+  at: number;
+  /** The channel the line names, as the omission's trace reports it. */
+  channelId?: string;
 }
 
 /** Per-policy runtime statistics (for gate:status). */

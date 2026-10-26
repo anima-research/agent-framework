@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { ChildCapacity, type CallAnswer } from '../src/code-execution/isolate/runner.js';
 import { AgentScripts, ScriptRefusal, type ScriptCallContext, type ScriptsConfig, type ScriptsHost } from '../src/code-execution/isolate/scripts.js';
 import { renderOutput } from '../src/code-execution/isolate/output.js';
+import { fireNextYieldAsSet } from './helpers/capture-timers.js';
 
 // With this file's own extension, as the runner names its entry, so the runtime runs a file that exists.
 const FAKE_CHILD = fileURLToPath(new URL(`./helpers/fake-child-entry${extname(fileURLToPath(import.meta.url))}`, import.meta.url));
@@ -284,8 +285,8 @@ test("each call carries the script's origin, and the watching call's turn only w
   assert.deepEqual(
     contexts.map((c) => { const { watching: _, ...rest } = c as { watching?: unknown }; return rest; }),
     [
-      { name: 'echo', origin: 'origin-1', watch },
-      { name: 'slow', origin: 'origin-1', watch },
+      { name: 'echo', origin: 'origin-1', watch, startTurnId: 7 },
+      { name: 'slow', origin: 'origin-1', watch, startTurnId: 7 },
     ],
   );
   assert.equal((contexts[1] as { watching(): unknown }).watching(), watch);
@@ -294,6 +295,34 @@ test("each call carries the script's origin, and the watching call's turn only w
   const r = await running;
   assert.deepEqual(r.ending, { how: 'finished' });
   assert.equal((contexts[1] as { watching(): unknown }).watching(), undefined);
+  await scripts.dispose();
+});
+
+test("a script's calls carry the turn its run was made in, and what its agent had read then, under a later turn's wait too", async () => {
+  const contexts: Array<{ name: string; watch?: { turnId?: number }; startTurnId?: number; startReadThrough?: unknown }> = [];
+  const gates: Array<() => void> = [];
+  const { scripts } = setup({
+    config: { yieldMs: 30_000 },
+    host: {
+      dispatch: async (_agent, name, args, context) => {
+        contexts.push({ name, ...context });
+        if (name === 'slow') await new Promise<void>((resolve) => gates.push(resolve));
+        return result(`${name} ${args}`);
+      },
+    },
+  });
+  // The run returns at once, and the script goes on; a later turn waits on it.
+  const atStart = { branch: 'main', sequence: 3 };
+  const run = await scripts.run('alice', `await tools.slow({}); await tools.echo({});`, 0, { watch: { turnId: 7, endTurn: false }, startReadThrough: atStart });
+  for (let i = 0; i < 2_000 && gates.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  const waiting = scripts.wait('alice', run.scriptId, 30_000, { turnId: 9, endTurn: false });
+  gates[0]!();
+  const r = await waiting;
+  assert.deepEqual(r.ending, { how: 'finished' });
+  const echo = contexts.find((c) => c.name === 'echo');
+  assert.equal(echo?.watch?.turnId, 9, 'the call carries the turn watching it');
+  assert.equal(echo?.startTurnId, 7, 'and the turn its script was started in');
+  assert.deepEqual(echo?.startReadThrough, atStart, 'and what its agent had read when it started');
   await scripts.dispose();
 });
 
@@ -344,7 +373,6 @@ test('a second call on a script another call is waiting on is refused, with noth
 
 test('a left script that crashes or reaches its limit wakes its agent', async () => {
   const { scripts, wakes } = setup({ config: { yieldMs: 100, lifetimeMs: 1_500 } });
-  // Each yields at once, before its child has started, so it's left running when it ends.
   const crash = await scripts.run('alice', `await tools.echo({}); __crash();`, 0);
   const limit = await scripts.run('alice', `await tools.slow({ key: 'l' });`, 0);
   for (let i = 0; i < 400 && scripts.running('alice') > 0; i++) await new Promise((r) => setTimeout(r, 10));
@@ -377,7 +405,7 @@ test("a script's calls carry the turn of the call watching when each reaches the
   let answer!: () => void;
   const held = new Promise<void>((resolve) => (answer = resolve));
   const { scripts } = setup({
-    config: { yieldMs: 100 },
+    config: { yieldMs: 100, maxYieldMs: 60_000, lifetimeMs: 120_000 },
     host: {
       dispatch: async (_agent, name, args, context) => {
         contexts.push({ name, ...context });
@@ -391,8 +419,9 @@ test("a script's calls carry the turn of the call watching when each reaches the
       },
     },
   });
-  // The run yields at once, before its child has started, so every call comes under a wait.
-  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, 0);
+  const yields = fireNextYieldAsSet(scripts, 60_000);
+  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, 60_000);
+  assert.deepEqual(yields, { fired: true }, 'the run yielded as its timer was set');
   assert.equal(r.running, true);
   const first = { turnId: 1, endTurn: false };
   const firstWait = scripts.wait('alice', r.scriptId, 30_000, first);

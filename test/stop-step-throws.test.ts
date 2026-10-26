@@ -115,7 +115,7 @@ const sentCompletes: string[] = [];
  * stop() for its first pass, or while it waits (from the liveness watchdog's
  * stop(), which runs between its two passes) for its pass after the waits.
  * Other agents, such as the run whose end releases its window, read their
- * unread replies as usual.
+ * unread notices as usual.
  */
 function postponedReleases(framework: AgentFramework, error: Error, when: 'before stop()' | 'while stop() waits'): () => void {
   unreadPassed.length = 0;
@@ -129,14 +129,14 @@ function postponedReleases(framework: AgentFramework, error: Error, when: 'befor
   if (when === 'before stop()') postpone();
   else watchdog.stop = function (this: unknown) { postpone(); return stop.call(this); };
   const owner = framework as unknown as Record<string, unknown>;
-  const usual = (owner.unreadFailedReplies as (agent: unknown) => unknown[]).bind(framework);
-  owner.unreadFailedReplies = (agent: { name: string }) => {
+  const usual = (owner.releasedWindow as (agent: unknown, held: Set<string>) => unknown).bind(framework);
+  owner.releasedWindow = (agent: { name: string }, held: Set<string>) => {
     if (agent.name === 'first') throw error;
-    if (agent.name !== 'second') return usual(agent);
+    if (agent.name !== 'second') return usual(agent, held);
     unreadPassed.push(agent.name);
-    return [];
+    return { unread: [], held: new Map() };
   };
-  return () => { delete owner.unreadFailedReplies; watchdog.stop = stop; };
+  return () => { delete owner.releasedWindow; watchdog.stop = stop; };
 }
 
 function checkPostponedReleases(framework: AgentFramework): void {
