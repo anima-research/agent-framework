@@ -54,10 +54,13 @@
 
   A private turn's plain speech is kept private in every mode. In locus and
   hybrid modes its `[delivered]` receipt counts it and says the plain speech
-  went to no channel, rather than reporting a failed send. In explicit mode,
-  a private turn's unprefixed speech is no longer bounced and held as a
-  draft to resend: a notice says it was kept private and how to publish. In
-  every mode, words a send silenced are held as drafts, as in any turn. Speech
+  went to no channel, rather than reporting a failed send. In explicit mode, a
+  private turn's unprefixed speech is no longer bounced and held as a draft to
+  resend: a notice says it was kept private and how to publish. An envelope
+  that bounces in a private turn, because it names no destination, names one
+  that doesn't resolve, or can't be delivered, isn't held as a draft either:
+  its notice says the words were kept private and how to publish. In every
+  mode, words a send silenced are held as drafts, as in any turn. Speech
   handlers are told a private turn's speech is private
   (`SpeechContext.nonChannelOrigin`), and the built-in Discord module posts
   none of it and edits its thoughts into no message.

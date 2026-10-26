@@ -2841,6 +2841,27 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  for (const [mode, label, text] of [
+    ['hybrid', 'names no destination', '>>>\nThe plan is X.'],
+    ['hybrid', 'names a channel that does not resolve', '>>>#missing The plan is X.'],
+    ['explicit', 'names a channel that does not resolve', '>>#missing The plan is X.'],
+  ] as const) {
+    it(`a private ${mode} turn's envelope that ${label} keeps its words private, with no draft`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: 'Ordinary words.' }] as ContentBlock[]);
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, []);
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), [], 'nothing holds the words to resend');
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('was not delivered'));
+      assert.ok(notice?.includes('It was kept private') && !notice.includes('{{unsent}}'), `the resident is told the words were kept private: ${notice}`);
+      await framework.stop();
+    });
+  }
+
   it("hybrid keeps a private turn's unprefixed prose on its surface", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');

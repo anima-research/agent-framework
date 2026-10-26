@@ -2004,7 +2004,7 @@ describe('private wins, one way', () => {
       await rig.until(() => rig.starts.length >= 1, 'the private turn');
       await rig.framework.runUntilIdle();
       const receipt = rig.texts().find((t) => t.startsWith('[delivered]')) ?? '';
-      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(skip_reply or a private think\)/, receipt);
+      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(skip_reply, a drafts call or a private think\)/, receipt);
       assert.match(receipt, /1 plain-speech segment\(s\) kept private \(private turn/, receipt);
     } finally {
       await rig.close();
@@ -2025,7 +2025,7 @@ describe('private wins, one way', () => {
       await rig.framework.runUntilIdle();
       assert.deepEqual(rig.routed, []);
       const receipt = rig.texts().find((t) => t.startsWith('[delivered]')) ?? '';
-      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(skip_reply or a private think\)/, receipt);
+      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(skip_reply, a drafts call or a private think\)/, receipt);
       assert.doesNotMatch(receipt, /private turn/, receipt);
     } finally {
       await rig.close();

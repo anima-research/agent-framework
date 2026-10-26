@@ -18915,12 +18915,13 @@ export class AgentFramework {
       console.error(`[prose] ${name}: ${text.length} chars may not have been delivered — ${reason}`);
       return;
     }
-    const words = this.unsentWords(agent, text, after.substituted);
+    const privateTurn = round.routing.nonChannelOrigin === true && !after.substituted;
+    const words = privateTurn ? undefined : this.unsentWords(agent, text, after.substituted);
     let draft: Draft | undefined;
     let inherited: InheritedRisk | undefined;
-    if ('draft' in words) {
+    if (words && 'draft' in words) {
       draft = words.draft;
-    } else {
+    } else if (words) {
       inherited = words.inheritedRisk;
       // The bounce notice below names the draft, so no separate held notice.
       draft = this.holdProseDrafts(
@@ -18943,7 +18944,7 @@ export class AgentFramework {
     // reaches this one.
     const ownRisk = !!draft && !inherited && draftState(draft) === 'unconfirmed';
     const byToken = !!draft && !inherited && !ownRisk && this.proseDrafts.latestBounce(name)?.id === draft.id;
-    const kept = !draft
+    const held = !draft
       ? 'It could not be held as a draft; the words remain in your history.'
       : byToken
         ? `It is held as draft ${draft.id}; nothing is lost. To deliver it unchanged, reply with a destination plus the ` +
@@ -18954,6 +18955,9 @@ export class AgentFramework {
           `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "${example}"` +
           `${inherited || ownRisk ? ', confirmDuplicate: true' : ''}); ` +
           `drafts(action: "dismiss", draftIds: ["${draft.id}"]) sets it aside.`;
+    const kept = privateTurn
+      ? `It was kept private: this turn holds private input, so it isn't held as a draft. To publish, use ${privateTurnReach(agent)}.`
+      : held;
     const risky = inherited && draft
       ? ` It includes the words of draft ${inherited.draftId}, which may already have been posted, so ${draft.id} ` +
         'can be resent only with the drafts tool and confirmDuplicate: true.'
