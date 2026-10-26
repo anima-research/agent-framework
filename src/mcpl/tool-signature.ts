@@ -51,7 +51,7 @@ function typeSig(schema: JsonSchema | undefined, depth = 0): string {
   if (schema.const !== undefined) return literal(schema.const);
   const alts = (schema.oneOf ?? schema.anyOf) as JsonSchema[] | undefined;
   if (Array.isArray(alts)) return alts.map((s) => typeSig(s, depth + 1)).join(' | ');
-  // Only text names a type; anything else a server sends there reads as no type.
+  // Only text names a type: entries that aren't text are left out, and a type with none reads as no type.
   const types = (Array.isArray(schema.type) ? schema.type : [schema.type]).filter((x): x is string => typeof x === 'string');
   const t = types.length ? types.join('|') : undefined;
   switch (t) {

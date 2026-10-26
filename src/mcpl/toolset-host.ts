@@ -426,7 +426,7 @@ export class ToolsetController {
     return this.readChanges.get(carrier) ?? emptyChange();
   }
 
-  /** A change its taker showed to an agent: its ended records count as told, and the definitions it describes as shown. */
+  /** A change its taker showed to an agent: its ended records count as told, and the definitions it describes as shown, unless the taker showed it without its blocks (`blocksShown: false`). */
   told(cs: ChangeSet): void {
     this.presence.markTold(cs.ended);
     if (cs.blocksShown !== false) this.presence.markShown(cs);
