@@ -375,8 +375,9 @@ export class ToolsetController {
    * A dynamic tool called by its namespaced name, as if it were listed (a
    * model imitating an earlier call, a module): refused, so every call into
    * a toolset goes through act, which knows its instance and gates closed
-   * groups (RFC §5.4, §5.5). Null for any other tool, including one the
-   * model was last shown as static (shownAs: RFC §4.2, until its move applies).
+   * groups (RFC §5.4, §5.5). Null for any other tool, including one the tool
+   * list last published or the server's latest tools/list puts as static
+   * (shownAs: RFC §4.2, until its move applies).
    */
   dynamicCallRefusal(tool: string, calledAs: string): string | null {
     if (!this.presence.active || !this.presence.tool(tool) || this.presence.shownAs(tool, 'static')) return null;

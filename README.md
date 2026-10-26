@@ -502,9 +502,11 @@ start.
 
 A dynamic tool called by its prefixed name is refused, pointing at
 `toolsets--act`, unless the tool list or the server's latest list shows it as
-static (a move waiting for its rebuild). Calls to an undeclared toolset's tools are refused while the
-host has that group closed (RFC-014 §5.4). Projection and surface mode are not
-implemented: a `surface` server's static tools are listed like any server's.
+static (a move waiting for its rebuild). Calls to an undeclared toolset's
+tools are refused while the host has that group closed (RFC-014 §5.4), except
+by a tool's listed name until the rebuild that publishes its move into the
+group. Projection and surface mode are not implemented: a `surface` server's
+static tools are listed like any server's.
 
 #### Per-channel conversation routing (deprecated)
 

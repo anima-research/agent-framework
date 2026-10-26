@@ -263,9 +263,9 @@ export class ToolPresence {
   }
 
   /** RFC §4.2: "Until it applies the move, the tool keeps working where it
-   *  is." Whether the model has been shown a tool at `place`: in the tool list
-   *  last published, or in the latest announcement (its presence). Until a
-   *  rebuild applies a move the two differ, and a call is taken at either. */
+   *  is." Whether a tool is at `place` in the tool list last published, or
+   *  in the server's latest tools/list (its presence). Until a rebuild
+   *  applies a move the two differ, and a call is taken at either. */
   shownAs(name: string, place: Presence): boolean {
     if (!this.active) return place === 'static';
     return this.published(name) === place || this.listedPresence(name) === place;
