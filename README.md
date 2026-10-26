@@ -455,7 +455,8 @@ framework registers a `toolsets` module with four constant tools:
   anything nested or branching too far to the server, which checks every
   call itself;
 - `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
-  and what can be opened, or one tool's description and input schema. It
+  and what can be opened, or one tool's signature, description, class and
+  input schema. It
   re-reads the server first, and says so when it couldn't; what that changed
   is in the answer when look restates everything, and otherwise told as a
   notice;
@@ -468,7 +469,8 @@ dynamic takes effect when the server's `tools/list` states it, and the tool
 list follows at its next rebuild that lists the server, whichever refresh
 brings it (a move is no reason to rebuild the tool list early). Until then the
 tool is called at either place, where the tool list shows it or where the
-server's latest list put it (RFC-014 §4.2: it keeps working where it was), and
+server's latest list put it (RFC-014 §4.2 keeps it working where it is until
+the move applies), and
 once that rebuild has published the list, a notice says where it went. A list
 read while a rebuild is under way can undo a move that rebuild then publishes;
 neither is told, and the next rebuild puts the tool back.
@@ -489,8 +491,8 @@ taken it, so changes are told in the order they were read (the agent's window
 can still show a call's result, a push's event, or a change its taker couldn't
 show after a change read later). Notices and reminders
 need the server's `pushEvents` grant, like any delivery; without it, a change
-that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told the first
-time its definition appears. Suggestions are shown, never acted on. Each
+that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told with its
+definition until text describing it has reached the model. Suggestions are shown, never acted on. Each
 `ended` id is told once while the
 host runs (told ids are kept in memory), short of rare interleavings, such as a
 `toolsets--look` overlapping other reads of the same server, that can tell one
