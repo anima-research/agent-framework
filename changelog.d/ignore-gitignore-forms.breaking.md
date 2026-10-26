@@ -2,10 +2,12 @@
   both lists now read one grammar, the gitignore forms a config copied from
   a `.gitignore` uses, and a pattern of any other form stops the module from
   being built, with an error naming the mount, the pattern and why. Each form
-  covers the files git's reading of it covers, with two differences: names
+  covers the files git's reading of it covers, with three differences: names
   compare exactly, as git's do with `core.ignorecase` off (its default folds
-  case on macOS and Windows), and a `?` matches one character where git's
-  matches one byte, so the two differ on names outside ASCII. Before,
+  case on macOS and Windows); a `?` matches one character where git's
+  matches one byte, so the two differ on names outside ASCII; and on a mount
+  that follows links, a link to a directory counts as a directory, where git
+  reads every link as a file. Before,
   `ignore` read only a name, `dir/**` and `*.ext`, and any other pattern
   matched only an entry of exactly that name, or nothing, without a word.
 

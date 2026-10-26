@@ -1749,7 +1749,8 @@ export function patternRefusal(pattern: unknown, list: 'ignore' | 'include'): st
 }
 
 export function directoryAt(path: string, followSymlinks: boolean): Promise<boolean | undefined> {
-  return (followSymlinks ? stat : lstat)(path).then((s) => s.isDirectory(), () => undefined);
+  if (!followSymlinks) return lstat(path).then((s) => s.isDirectory(), () => undefined);
+  return stat(path).then((s) => s.isDirectory(), () => lstat(path).then(() => false, () => undefined));
 }
 
 /**

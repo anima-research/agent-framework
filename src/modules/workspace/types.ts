@@ -102,10 +102,12 @@ export interface MountConfig {
   watchRootPollMs?: number;
   /**
    * Patterns in these of gitignore's forms, each covering the files
-   * gitignore's reading of it covers, with two differences: names compare
+   * gitignore's reading of it covers, with three differences: names compare
    * exactly, as git's do with `core.ignorecase` off (its default folds case
-   * on macOS and Windows), and "?" matches one character where git's matches
-   * one byte, so the two differ on names outside ASCII:
+   * on macOS and Windows); "?" matches one character where git's matches
+   * one byte, so the two differ on names outside ASCII; and on a mount that
+   * follows links, a link to a directory counts as a directory, where git
+   * reads every link as a file:
    * - A name, matched at any depth: ".git", "node_modules". Within a name,
    *   "*" matches any run of characters and "?" any one: "*.pyc",
    *   "npm-debug.log*".

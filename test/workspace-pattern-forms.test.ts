@@ -134,13 +134,15 @@ describe('ignore reads gitignore\'s forms', () => {
     const env = new Env(t, ['real/a.txt', 'file.txt']);
     symlinkSync('real', join(env.dir, 'build'));
     symlinkSync('file.txt', join(env.dir, 'bin'));
-    const m = await env.open({ ignore: ['build/', 'bin/'], followSymlinks: true });
+    symlinkSync('nowhere', join(env.dir, 'gone'));
+    const m = await env.open({ ignore: ['build/', 'bin/', 'gone/'], followSymlinks: true });
     const IGNORED_NOTE = "this mount's ignore list covers it, so a sync without a path won't maintain it";
     const listingSays = async (path: string) => JSON.stringify(await m.handleToolCall({ id: 't', name: 'ls', input: { path } }));
     assert.match(await listingSays('work/build'), /ignored by the mount/);
     assert.deepEqual((await call(m, 'sync', { path: 'work/build' })).ignored, [{ mount: 'work', path: 'build', note: IGNORED_NOTE }]);
     assert.doesNotMatch(await listingSays('work/bin'), /ignored by the mount/);
     assert.equal((await call(m, 'sync', { path: 'work/bin' })).ignored, undefined);
+    assert.doesNotMatch(await listingSays('work/gone'), /ignored by the mount/);
     const all = await call(m, 'sync', { mount: 'work' });
     assert.deepEqual(all.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }], JSON.stringify(all));
   });
