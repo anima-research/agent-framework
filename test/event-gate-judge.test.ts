@@ -483,18 +483,21 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
-  it('maxWaitMs judges a batch that keeps getting pushed back', async () => {
+  it('maxWaitMs judges a batch that keeps getting pushed back, counted on the gate\'s clock from its first event', async () => {
+    let clock = 1_000_000;
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('maxwait.json', {
       policies: [{ name: 'busy', match: {}, behavior: { judge: { debounceMs: 150, maxWaitMs: 250 } } }],
-    }), { judge: judge.fn });
-    for (let i = 0; i < 8; i++) {
+    }), { judge: judge.fn, now: () => clock });
+    // Steady chatter, 60 ms apart on the gate's clock, never 150 ms of quiet:
+    // the sixth event, 300 ms after the first, is past the 250 ms cap.
+    for (let i = 0; i < 6; i++) {
       gate.evaluate(chat(`m${i}`));
-      await sleep(60);
+      clock += 60;
     }
-    // 8 × 60 ms of steady chatter, never 150 ms of quiet: judged by maxWait.
-    assert.ok(judge.requests.length >= 1);
-    assert.ok(judge.requests[0]!.events.length >= 3 && judge.requests[0]!.events.length <= 6, String(judge.requests[0]!.events.length));
+    await sleep(20);
+    assert.strictEqual(judge.requests.length, 1);
+    assert.strictEqual(judge.requests[0]!.events.length, 6);
     gate.dispose();
   });
 
@@ -537,22 +540,6 @@ describe('judge rules: a message addressed to the agent', () => {
     judge.answer({ reply: true, reason: 'late' });
     await sleep(10);
     assert.strictEqual(wakes.length, 1);
-    gate.dispose();
-  });
-});
-
-describe("judge rules: the gate's clock", () => {
-  it('maxWaitMs is counted on the clock the gate is given', async () => {
-    let clock = 1_000_000;
-    const judge = scriptedJudge();
-    const { gate } = makeGate(writeConfig('clock.json', {
-      policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 2000, maxWaitMs: 2000 } } }],
-    }), { judge: judge.fn, now: () => clock });
-    gate.evaluate(chat('first'));
-    clock += 2000;
-    gate.evaluate(chat('second'));
-    await sleep(200);
-    assert.strictEqual(judge.requests.length, 1, 'judged at once: the batch reached its maxWaitMs on the gate\'s clock');
     gate.dispose();
   });
 });
@@ -600,17 +587,18 @@ async function judgeFramework(t: { after: (fn: () => Promise<void>) => void }, j
     const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
     return round![0]!;
   };
-  const wakeAddRule = () => {
+  const toolNamed = (name: string) => {
     const tools = membrane.calls.at(-1)!.tools ?? [];
-    return tools.find((tool) => tool.name === 'wake_add_rule')!;
+    return tools.find((tool) => tool.name === name)!;
   };
-  return { framework, membrane, configPath, call, wakeAddRule };
+  const wakeAddRule = () => toolNamed('wake_add_rule');
+  return { framework, membrane, configPath, call, wakeAddRule, toolNamed };
 }
 
 describe('wake_add_rule with judge', () => {
   it('saves a judge rule with the agent\'s instructions, and refuses one whose instructions sit outside judge', async (t) => {
     const { readFileSync } = await import('node:fs');
-    const { configPath, call, wakeAddRule } = await judgeFramework(t, {});
+    const { configPath, call, wakeAddRule, toolNamed } = await judgeFramework(t, {});
 
     const saved = await call({
       name: 'ambient',
@@ -634,11 +622,12 @@ describe('wake_add_rule with judge', () => {
     const shown = await call(example);
     assert.strictEqual(shown.isError, false, shown.content);
     assert.strictEqual(JSON.parse(shown.content).ignoredFields, undefined, 'every field the example gives is read');
+    assert.match(toolNamed('wake_remove_rule').description, /A judge rule's batch.*is still judged, by the rule as it was, and wakes you only on reply/);
   });
 
   it('a host that sets no GateOptions.judge wires no judge: the tool offers none, and a judge it is given is not read', async (t) => {
     const { readFileSync } = await import('node:fs');
-    const { framework, configPath, call, wakeAddRule } = await judgeFramework(t);
+    const { framework, configPath, call, wakeAddRule, toolNamed } = await judgeFramework(t);
     const given = await call({ name: 'ambient', match: { tagsAny: ['chat:ambient'] }, judge: { debounceMs: 20000 } });
     assert.strictEqual(given.isError, true);
     assert.match(given.content, /specify exactly one behavior/);
@@ -646,6 +635,7 @@ describe('wake_add_rule with judge', () => {
     assert.match(given.content, /"judge"/, 'the refusal names the parameter it does not read');
     assert.strictEqual((JSON.parse(readFileSync(configPath, 'utf-8')) as GateConfig).policies.some((p) => p.name === 'ambient'), false);
     assert.strictEqual(JSON.stringify(wakeAddRule()).includes('judge'), false, 'nothing in the tool names the judge');
+    assert.strictEqual(JSON.stringify(toolNamed('wake_remove_rule')).includes('judge'), false, 'nor in wake_remove_rule');
     const gate = (framework as unknown as { eventGate: { judgeFn?: unknown } }).eventGate;
     assert.strictEqual(gate.judgeFn, undefined);
   });

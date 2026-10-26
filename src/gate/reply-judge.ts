@@ -4,11 +4,12 @@
  *
  * Per batch it takes the request the agent WOULD send if woken now (the
  * framework's previewActivation, a dry run that commits nothing), renders it
- * as one plain-text document (the agent's system prompt, abridged, then its
- * conversation, oldest first), keeps the newest part of that document that
- * fits the judge's input budget, and asks the model, with the agent's own
- * instructions and the batch, for one line: `REPLY: <reason>` or
- * `WAIT: <reason>`.
+ * as one plain-text document (the agent's conversation, oldest first, then
+ * its system prompt, abridged, so a system prompt that changes doesn't break
+ * the cached conversation before it), keeps the newest part of the
+ * conversation that fits the judge's input budget, and asks the model, with
+ * the agent's own instructions and the batch, for one line: `REPLY: <reason>`
+ * or `WAIT: <reason>`.
  *
  * Cost and latency. The budget (`maxInputTokens`, default 90,000) keeps every
  * request under the 100,000-token line past which Claude Haiku 5.5 costs five

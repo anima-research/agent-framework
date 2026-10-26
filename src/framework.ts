@@ -9836,6 +9836,13 @@ export class AgentFramework {
 
   private static readonly JUDGED_WAKE_RULE_TOOLS: import('./types/index.js').ToolDefinition[] =
     AgentFramework.WAKE_RULE_TOOLS.map((tool) => {
+      if (tool.name === 'wake_remove_rule') {
+        return {
+          ...tool,
+          description: tool.description + ' A judge rule\'s batch, whether waiting out its quiet period, ' +
+            'held or being judged, is still judged, by the rule as it was, and wakes you only on reply.',
+        };
+      }
       if (tool.name !== 'wake_add_rule') return tool;
       const judged: Record<string, ToolParameter> = {};
       for (const [key, value] of Object.entries(tool.inputSchema.properties ?? {})) {
