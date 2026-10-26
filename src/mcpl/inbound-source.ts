@@ -22,7 +22,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { blockAsStored } from '@animalabs/context-manager';
+import { blockAsStored, MalformedContentError } from '@animalabs/context-manager';
 import { logDetail, logValue } from './log-value.js';
 
 /** The MCPL admission lane that accepted an item. Its contract decides what
@@ -202,8 +202,8 @@ function storedBlock(block: unknown): unknown {
   try {
     return blockAsStored(block as Parameters<typeof blockAsStored>[0]);
   } catch (err) {
-    const { name, message } = (err ?? {}) as { name?: unknown; message?: unknown };
-    if (name !== 'MalformedContentError') {
+    if (!(err instanceof MalformedContentError)) {
+      const { name, message } = (err ?? {}) as { name?: unknown; message?: unknown };
       console.error(
         `[stored-digest-as-given] error=${logValue(typeof name === 'string' ? name : typeof err)}: ` +
         logDetail(typeof message === 'string' ? message : ''),
