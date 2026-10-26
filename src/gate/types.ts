@@ -60,8 +60,8 @@ export interface PassiveSampleConfig {
  * does, then, instead of waking the agent when the batch fires, ask a small,
  * cheap model (the host's reply judge, `GateOptions.judge`) whether now is a
  * good time for the agent to reply. The judge reads the agent's context as one
- * document (its newest part, kept under the judge's input budget), the agent's
- * own `instructions` and the batch, and answers reply or wait. On reply the
+ * document (its newest part), the agent's own `instructions` and the batch,
+ * and answers reply or wait. On reply the
  * batch is delivered as a debounce's is; on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
  * judged afresh. A batch holding an event addressed to the agent
@@ -226,8 +226,9 @@ export interface GateOptions {
 
 /**
  * Host options for the reply judge, the small model `judge` rules ask whether
- * now is a good time for the agent to reply. The host sets the model and the
- * budget, not the agent: an agent's rule says when to ask and what to say.
+ * now is a good time for the agent to reply. The host sets the model and how
+ * the judge runs, not the agent: an agent's rule says when to ask and what to
+ * say.
  */
 export interface ReplyJudgeOptions {
   /** False leaves the judge unwired, as leaving `GateOptions.judge` out does:
@@ -238,13 +239,6 @@ export interface ReplyJudgeOptions {
   /** The model the judge runs on, as the host's membrane names it. Default
    *  `claude-haiku-5-5`. */
   model?: string;
-  /**
-   * The most input tokens one judge request may carry, its instructions and
-   * the batch included; the context document is cut from its oldest end to
-   * fit. Default 90,000: Claude Haiku 5.5 costs five times as much past
-   * 100,000 input tokens, and the margin covers the estimate's error.
-   */
-  maxInputTokens?: number;
   /** The longest (ms) a judge request may take before the batch is decided by
    *  `onError`. Default 20,000. */
   timeoutMs?: number;
@@ -256,10 +250,6 @@ export interface ReplyJudgeOptions {
    *  verdict, quickly. `"none"` sends no effort, for a provider that doesn't
    *  take Anthropic's `output_config`. */
   effort?: 'low' | 'medium' | 'high' | 'none';
-  /** The prompt cache's lifetime for the judge's context document. `"5m"`
-   *  (the default) suits judge rules that fire minutes apart; `"1h"` costs
-   *  more to write and suits ones that fire less often. */
-  cacheTtl?: '5m' | '1h';
 }
 
 /** One event of a batch, as the reply judge is shown it. */

@@ -70,7 +70,7 @@ export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent 
 // EventGate
 export { EventGate, wakeLineText, type WakeProvenance, type WritePlacement } from './gate/index.js';
 export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine } from './gate/index.js';
-export { ReplyJudge, DEFAULT_JUDGE_MODEL, DEFAULT_JUDGE_MAX_INPUT_TOKENS } from './gate/index.js';
+export { ReplyJudge, DEFAULT_JUDGE_MODEL } from './gate/index.js';
 export type { JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, ReplyJudgeDeps } from './gate/index.js';
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
