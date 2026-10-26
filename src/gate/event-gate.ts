@@ -3533,14 +3533,14 @@ export class EventGate {
     // judged by then, from its first event, quiet or not.
     const delay = (firstAt: number, batchJudge: JudgeConfig | undefined): number => {
       const cap = batchJudge?.maxWaitMs;
-      return cap === undefined ? debounceMs : Math.max(0, Math.min(debounceMs, firstAt + cap - Date.now()));
+      return cap === undefined ? debounceMs : Math.max(0, Math.min(debounceMs, firstAt + cap - this.now()));
     };
     if (existing) {
       clearTimeout(existing.timer);
       existing.events.push(event);
       existing.timer = setTimeout(() => this.fireDebounce(policy.name), delay(existing.firstAt, existing.judge));
     } else {
-      const firstAt = Date.now();
+      const firstAt = this.now();
       const timer = setTimeout(() => this.fireDebounce(policy.name), delay(firstAt, judge));
       this.debounceTimers.set(policy.name, { timer, events: [event], firstAt, ...(judge ? { judge } : {}) });
     }
@@ -3719,6 +3719,17 @@ export class EventGate {
   private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig, rejudge = false): void {
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
+    if (events.some((e) => e.addressed)) {
+      const held = this.judgeHeld.get(policyName);
+      this.judgeHeld.delete(policyName);
+      if (deciding) {
+        this.judging.delete(policyName);
+        if (deciding.timer) clearTimeout(deciding.timer);
+        deciding.abort.abort();
+      }
+      this.deliverOrBuffer([...(deciding ? [...deciding.events, ...deciding.queued] : []), ...(held?.events ?? []), ...events]);
+      return;
+    }
     if (deciding) {
       deciding.queued.push(...events);
       this.capJudgeEvents(deciding.queued);
@@ -3902,7 +3913,6 @@ export class EventGate {
       verdict: outcome,
       woke: wake,
       ...(rejudging ? { rejudged: true } : {}),
-      reason: safeSlice(reason, 0, 300),
       eventCount: state.events.length,
       durationMs,
       ...(!failed && verdict.model ? { model: verdict.model } : {}),

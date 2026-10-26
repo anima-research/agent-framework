@@ -64,8 +64,10 @@ export interface PassiveSampleConfig {
  * own `instructions` and the batch, and answers reply or wait. On reply the
  * batch is delivered as a debounce's is; on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
- * judged afresh. A judge that fails or times out wakes the agent (fail open),
- * unless the host set its `onError` to `"skip"`.
+ * judged afresh. A batch holding an event addressed to the agent
+ * (`chat:addressed`) wakes it without asking the judge. A judge that fails or
+ * times out wakes the agent (fail open), unless the host set its `onError` to
+ * `"skip"`.
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
@@ -217,7 +219,8 @@ export interface GateOptions {
    * missing, no one bypasses sleep.
    */
   privilegedUsersPath?: string;
-  /** The reply judge that `judge` rules ask (see JudgeConfig). */
+  /** The reply judge that `judge` rules ask (see JudgeConfig). Left out, the
+   *  host wires none. */
   judge?: ReplyJudgeOptions;
 }
 
@@ -227,8 +230,10 @@ export interface GateOptions {
  * budget, not the agent: an agent's rule says when to ask and what to say.
  */
 export interface ReplyJudgeOptions {
-  /** False leaves the judge unwired: a `judge` rule then wakes the agent as a
-   *  debounce of its `debounceMs` would, and gate_status says so. Default true. */
+  /** False leaves the judge unwired, as leaving `GateOptions.judge` out does:
+   *  `wake_add_rule` then offers no `judge`, and a `judge` rule in gate.json
+   *  wakes the agent as a debounce of its `debounceMs` would, which
+   *  gate_status says. Default true. */
   enabled?: boolean;
   /** The model the judge runs on, as the host's membrane names it. Default
    *  `claude-haiku-5-5`. */

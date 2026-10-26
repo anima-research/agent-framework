@@ -1968,7 +1968,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
     return round![0]!;
   };
 
-  const timing = 'so nothing was saved. For a debounce, a rate limit, sampling or the reply judge, give debounceMs, rateLimit, passiveSample or judge instead of behavior.';
+  const timing = 'so nothing was saved. For a debounce, a rate limit or sampling, give debounceMs, rateLimit or passiveSample instead of behavior.';
   // XML tool mode parses `behavior` by its declared type, a string, so the
   // object form arrives as text.
   for (const [behavior, shown] of [['{"debounce": 60000}', '"{\\"debounce\\": 60000}"'], ['deffer', '"deffer"'], [5, '5'], [['always'], '["always"]']] as const) {
@@ -1990,7 +1990,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   assert.match(absent.content, /addPolicy: no policy named "nope" to anchor on — have: \[mentions\]/);
   // Its own parameters are checked as a rule's fields are: a slip is refused.
   const before = readFileSync(configPath, 'utf-8');
-  const parameters = '"name", "match", "behavior", "debounceMs", "rateLimit", "passiveSample", "judge", "position", "insertBefore", '
+  const parameters = '"name", "match", "behavior", "debounceMs", "rateLimit", "passiveSample", "position", "insertBefore", '
     + '"insertAfter", "passthrough" and "resets"';
   const slip = await call({ name: 'watch', passiveSample: { every: 10 }, pasthrough: true });
   assert.equal(slip.isError, true);
@@ -2143,26 +2143,15 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   // Each of the description's examples, made as the call it shows, is saved as it reads.
   const examples = [...description.matchAll(/`(\{ name: "[^`]+\})`/g)]
     .map((m) => new Function(`return (${m[1]});`)() as Record<string, unknown>);
-  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'ambient-judged']);
+  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn']);
   for (const example of examples) {
     const result = await call(example);
     assert.equal(result.isError, false, result.content);
     assert.equal(JSON.parse(result.content).ignoredFields, undefined, 'every field it gives is read');
   }
-  assert.deepEqual(onDisk(configPath).policies.slice(-3), [
+  assert.deepEqual(onDisk(configPath).policies.slice(-2), [
     { name: 'watch-notes', match: { scope: ['workspace:modified'], mount: 'project', pathGlob: 'notes/*.md' }, behavior: 'always' },
     { name: 'watch-cairn', match: { source: 'discord', channel: 'discord:*:12345', tagsAny: ['chat:ambient'] }, behavior: { debounce: 60000 } },
-    {
-      name: 'ambient-judged',
-      match: { tagsAny: ['chat:ambient'] },
-      behavior: {
-        judge: {
-          debounceMs: 20000,
-          maxWaitMs: 120000,
-          instructions: 'Wake me when someone asks me something or the talk turns to the garden; let banter between others go by.',
-        },
-      },
-    },
   ]);
 
   // A change over a gate.json with problems keeps them as written.

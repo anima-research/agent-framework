@@ -41,7 +41,7 @@ function scriptedJudge() {
   };
 }
 
-function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip' } = {}) {
+function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number } = {}) {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
   const wakes: Array<{ agentName: string; reason: string }> = [];
@@ -54,6 +54,7 @@ function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: 
     ...(opts.judge ? { judge: opts.judge } : {}),
     ...(opts.judgeTimeoutMs !== undefined ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
     ...(opts.judgeOnError ? { judgeOnError: opts.judgeOnError } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
   });
   return { gate, traces, messages, wakes };
 }
@@ -149,6 +150,7 @@ describe('judge rules: verdicts', () => {
     assert.ok(verdict);
     assert.strictEqual(verdict.verdict, 'reply');
     assert.strictEqual(verdict.woke, true);
+    assert.strictEqual('reason' in verdict, false, "the judge's reason isn't traced");
     const state = gate.getStatus().policies[0]!.judgeState!;
     assert.deepStrictEqual(state.verdicts, { reply: 1, wait: 0, error: 0, rejudged: 0 });
     assert.strictEqual(state.last!.reason, 'a direct question');
@@ -508,6 +510,52 @@ describe('judge rules: timing', () => {
   });
 });
 
+describe('judge rules: a message addressed to the agent', () => {
+  it('a batch holding one wakes the agent without asking the judge', async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes, messages } = makeGate(writeConfig('addressed.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('nice weather'));
+    gate.evaluate(chat('agent, are you there?', { tags: ['chat:addressed'] }));
+    await sleep(160);
+    assert.strictEqual(judge.requests.length, 0);
+    assert.deepStrictEqual(wakes, [{ agentName: 'agent', reason: 'gate:debounce' }]);
+    assert.strictEqual(messages.length, 1);
+    gate.dispose();
+  });
+
+  it("one that fires while the judge decides the rule's earlier batch wakes the agent now, and that verdict wakes nothing more", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('addressed-deciding.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('lol'));
+    await sleep(160);
+    assert.strictEqual(judge.waiting(), 1, 'premise: the judge is deciding the first batch');
+    gate.evaluate(chat('agent?', { tags: ['chat:addressed'] }));
+    await sleep(160);
+    assert.deepStrictEqual(wakes, [{ agentName: 'agent', reason: 'gate:debounce' }]);
+    assert.strictEqual(judge.requests[0]!.signal.aborted, true);
+    judge.answer({ reply: true, reason: 'late' });
+    await sleep(10);
+    assert.strictEqual(wakes.length, 1);
+    gate.dispose();
+  });
+});
+
+describe("judge rules: the gate's clock", () => {
+  it('maxWaitMs is counted on the clock the gate is given', async () => {
+    let clock = 1_000_000;
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('clock.json', {
+      policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 2000, maxWaitMs: 2000 } } }],
+    }), { judge: judge.fn, now: () => clock });
+    gate.evaluate(chat('first'));
+    clock += 2000;
+    gate.evaluate(chat('second'));
+    await sleep(200);
+    assert.strictEqual(judge.requests.length, 1, 'judged at once: the batch reached its maxWaitMs on the gate\'s clock');
+    gate.dispose();
+  });
+});
+
 describe('judge rules without a judge', () => {
   it('wake as a debounce of the same quiet period, and gate_status says so', async () => {
     const { gate, wakes } = makeGate(writeConfig('unwired.json', JUDGED));
@@ -519,34 +567,48 @@ describe('judge rules without a judge', () => {
   });
 });
 
+async function judgeFramework(t: { after: (fn: () => Promise<void>) => void }, judge?: Record<string, unknown>) {
+  const { AgentFramework } = await import('../src/index.js');
+  const { MockMembrane, createMockResponse } = await import('./helpers/mock-membrane.js');
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'gate-judge-'));
+  const configPath = join(dir, 'gate.json');
+  const membrane = new MockMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+    modules: [],
+    gate: {
+      configPath,
+      config: { default: 'defer', policies: [{ name: 'mentions', match: { tagsAny: ['chat:mention'] }, behavior: 'always' }] },
+      ...(judge ? { judge } : {}),
+    },
+  });
+  t.after(async () => {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const call = async (input: Record<string, unknown>) => {
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'add', name: 'wake_add_rule', input }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([]));
+    assert.strictEqual(framework.nudgeAgent('scout').ok, true);
+    await framework.runUntilIdle();
+    const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
+    return round![0]!;
+  };
+  const wakeAddRule = () => {
+    const tools = membrane.calls.at(-1)!.tools ?? [];
+    return tools.find((tool) => tool.name === 'wake_add_rule')!;
+  };
+  return { framework, membrane, configPath, call, wakeAddRule };
+}
+
 describe('wake_add_rule with judge', () => {
   it('saves a judge rule with the agent\'s instructions, and refuses one whose instructions sit outside judge', async (t) => {
-    const { AgentFramework } = await import('../src/index.js');
-    const { MockMembrane, createMockResponse } = await import('./helpers/mock-membrane.js');
-    const { mkdtempSync, readFileSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-'));
-    const configPath = join(dir, 'gate.json');
-    const membrane = new MockMembrane();
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store'),
-      membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
-      modules: [],
-      gate: { configPath, config: { default: 'defer', policies: [{ name: 'mentions', match: { tagsAny: ['chat:mention'] }, behavior: 'always' }] } },
-    });
-    t.after(async () => {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    });
-    const call = async (input: Record<string, unknown>) => {
-      membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'add', name: 'wake_add_rule', input }], 'tool_use'));
-      membrane.pushResponse(createMockResponse([]));
-      assert.strictEqual(framework.nudgeAgent('scout').ok, true);
-      await framework.runUntilIdle();
-      const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
-      return round![0]!;
-    };
+    const { readFileSync } = await import('node:fs');
+    const { configPath, call, wakeAddRule } = await judgeFramework(t, {});
 
     const saved = await call({
       name: 'ambient',
@@ -561,6 +623,54 @@ describe('wake_add_rule with judge', () => {
     const misplaced = await call({ name: 'loose', debounceMs: 20000, instructions: 'Wake me for questions.' });
     assert.strictEqual(misplaced.isError, true);
     assert.match(misplaced.content, /"instructions", a field of "judge"/);
+
+    const tool = wakeAddRule();
+    assert.ok((tool.inputSchema.properties as Record<string, unknown>).judge, 'the tool takes judge');
+    const examples = [...tool.description.matchAll(/`(\{ name: "[^`]+\})`/g)]
+      .map((m) => new Function(`return (${m[1]});`)() as Record<string, unknown>);
+    const example = examples.find((e) => e.name === 'ambient-judged')!;
+    const shown = await call(example);
+    assert.strictEqual(shown.isError, false, shown.content);
+    assert.strictEqual(JSON.parse(shown.content).ignoredFields, undefined, 'every field the example gives is read');
+  });
+
+  it('a host that sets no GateOptions.judge wires no judge: the tool offers none, and a judge it is given is not read', async (t) => {
+    const { readFileSync } = await import('node:fs');
+    const { framework, configPath, call, wakeAddRule } = await judgeFramework(t);
+    const given = await call({ name: 'ambient', match: { tagsAny: ['chat:ambient'] }, judge: { debounceMs: 20000 } });
+    assert.strictEqual(given.isError, true);
+    assert.match(given.content, /specify exactly one behavior/);
+    assert.doesNotMatch(given.content, /`judge`/);
+    assert.match(given.content, /"judge"/, 'the refusal names the parameter it does not read');
+    assert.strictEqual((JSON.parse(readFileSync(configPath, 'utf-8')) as GateConfig).policies.some((p) => p.name === 'ambient'), false);
+    assert.strictEqual(JSON.stringify(wakeAddRule()).includes('judge'), false, 'nothing in the tool names the judge');
+    const gate = (framework as unknown as { eventGate: { judgeFn?: unknown } }).eventGate;
+    assert.strictEqual(gate.judgeFn, undefined);
+  });
+
+  it("a judge request's usage counts as the judged agent's", async (t) => {
+    const { framework, membrane } = await judgeFramework(t, {});
+    membrane.pushResponse({
+      content: [{ type: 'text', text: 'WAIT: banter between others' }],
+      stopReason: 'end_turn',
+      usage: { inputTokens: 300, outputTokens: 9 },
+      details: { usage: { inputTokens: 300, outputTokens: 9, cacheReadTokens: 2000, cacheCreationTokens: 100 }, model: { actual: 'claude-haiku-5-5' } },
+    } as never);
+    const before = framework.getSessionUsage().byAgent.find((a) => a.agentName === 'scout');
+    const judge = (framework as unknown as { eventGate: { judgeFn: JudgeFn } }).eventGate.judgeFn;
+    const verdict = await judge({
+      policyName: 'ambient',
+      events: [{ eventType: 'mcpl:push-event', addressed: false, content: 'lol', at: Date.now() }],
+      agentNames: ['scout'],
+      signal: new AbortController().signal,
+    });
+    assert.strictEqual(verdict.reply, false, 'premise: the judge answered');
+    const after = framework.getSessionUsage().byAgent.find((a) => a.agentName === 'scout');
+    assert.ok(after, "the agent's usage has a tally");
+    assert.strictEqual(after.inferenceCount - (before?.inferenceCount ?? 0), 1);
+    assert.strictEqual(after.usage.inputTokens - (before?.usage.inputTokens ?? 0), 300);
+    assert.strictEqual(after.usage.cacheReadTokens - (before?.usage.cacheReadTokens ?? 0), 2000);
+    assert.strictEqual(after.usage.outputTokens - (before?.usage.outputTokens ?? 0), 9);
   });
 });
 

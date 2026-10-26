@@ -26,7 +26,7 @@
  */
 
 import { NativeFormatter } from '@animalabs/membrane';
-import type { ContentBlock, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
+import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions } from './types.js';
 
 /** The judge's model when the host names none. */
@@ -77,6 +77,8 @@ export interface ReplyJudgeDeps {
   chooseAgent: (agentNames: string[]) => string | undefined;
   /** The request the agent would send if woken now, as a dry run (previewActivation). */
   preview: (agentName: string) => Promise<NormalizedRequest>;
+  /** Count a judge request's usage as the agent's, where its turns' usage is counted. */
+  recordUsage?: (agentName: string, usage: DetailedUsage) => void;
 }
 
 /** One message of the agent's context, rendered. */
@@ -245,6 +247,7 @@ export class ReplyJudge {
   private readonly effort: 'low' | 'medium' | 'high' | 'none';
   private readonly chooseAgent: ReplyJudgeDeps['chooseAgent'];
   private readonly preview: ReplyJudgeDeps['preview'];
+  private readonly recordUsage: ReplyJudgeDeps['recordUsage'];
   /** Characters per token, corrected from each response's reported input. */
   private charsPerToken = INITIAL_CHARS_PER_TOKEN;
   private readonly anchors = new Map<string, Anchor>();
@@ -270,6 +273,7 @@ export class ReplyJudge {
     this.effort = deps.options?.effort ?? 'low';
     this.chooseAgent = deps.chooseAgent;
     this.preview = deps.preview;
+    this.recordUsage = deps.recordUsage;
   }
 
   /** The gate's judge function. */
@@ -426,6 +430,7 @@ export class ReplyJudge {
       formatter: new NativeFormatter(),
     });
     const usage = (response as NormalizedResponse).details?.usage;
+    if (usage) this.recordUsage?.(built.agentName, usage);
     const inputTokens = (response.usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheCreationTokens ?? 0);
     this.calibrate(built.chars, inputTokens);
     if (inputTokens > this.maxInputTokens) {

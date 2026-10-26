@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
@@ -2790,6 +2790,29 @@ interface StreamRequestNotes {
   stopped: boolean;
 }
 
+const JUDGE_PARAMETER: ToolParameter = {
+  type: 'object',
+  description:
+    'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
+    'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
+    'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
+    'A batch holding a message addressed to you (a mention, a reply or a DM) wakes you without asking the judge. ' +
+    'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
+    'Its verdicts and reasons are in gate_status.',
+  properties: {
+    debounceMs: { type: 'number', description: 'Quiet period (ms) before the batch is judged (100–300000).' },
+    maxWaitMs: {
+      type: 'number',
+      description: 'Judge the batch by this long (ms) after its first event even while messages keep coming (up to 3600000). Omit to wait for quiet.',
+    },
+    instructions: {
+      type: 'string',
+      description: 'Your word to the judge (up to 4000 characters): when you want to be woken, when to let things go by.',
+    },
+  },
+  required: ['debounceMs'],
+};
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -3469,6 +3492,7 @@ export class AgentFramework {
 
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
+  private judgeWired = false;
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
@@ -3827,12 +3851,17 @@ export class AgentFramework {
           : './data/gate.json');
       // The reply judge `judge` rules ask (gate/reply-judge.ts): a small model
       // reading the agent's context as a dry-run preview, on this host's
-      // membrane. Unless the host turns it off, every gate has one, so a
-      // judge rule an agent adds works where its host never configured one.
+      // membrane. Only a host that sets GateOptions.judge has one.
       const judgeOptions = config.gate.judge;
-      const judge = judgeOptions?.enabled === false ? undefined : new ReplyJudge({
+      const judge = judgeOptions === undefined || judgeOptions.enabled === false ? undefined : new ReplyJudge({
         membraneFor: (agentName) => framework.auxiliaryMembraneFor(agentName),
         options: judgeOptions,
+        recordUsage: (agentName, usage) => {
+          framework.usageTracker.onInferenceCompleted(agentName, usage, usage.estimatedCost
+            ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
+            : undefined);
+          framework.persistUsageState();
+        },
         // The batch wakes every agent but the subconscious; the judge reads the
         // primary's context, the resident the gate's wakes are for.
         chooseAgent: (names) => (framework.primaryAgentName && names.includes(framework.primaryAgentName)
@@ -3840,13 +3869,14 @@ export class AgentFramework {
           : names[0]),
         preview: (agentName) => framework.previewActivation(agentName),
       });
+      framework.judgeWired = judge !== undefined;
       framework.eventGate = new EventGate({
         configPath,
         initialConfig: config.gate.config,
         privilegedUsersPath: config.gate.privilegedUsersPath,
         ...(judge ? { judge: judge.judge } : {}),
-        ...(judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
-        ...(judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
+        ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
+        ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
@@ -6261,7 +6291,7 @@ export class AgentFramework {
       ? [
           this.eventGate.getToolDefinition(),
           ...AgentFramework.SLEEP_TOOLS,
-          ...AgentFramework.WAKE_RULE_TOOLS,
+          ...(this.judgeWired ? AgentFramework.JUDGED_WAKE_RULE_TOOLS : AgentFramework.WAKE_RULE_TOOLS),
           AgentFramework.EVENT_TAGS_TOOL,
         ]
       : [];
@@ -9681,12 +9711,7 @@ export class AgentFramework {
         '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
         '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
         'e.g. `{ name: "watch-cairn", match: { source: "discord", channel: "discord:*:12345", tagsAny: ["chat:ambient"] }, debounceMs: 60000 }` ' +
-        '(the channel must be subscribed for ambient events to arrive — see channel mode).\n' +
-        '• Let a small model decide: `judge` batches like debounceMs, then a cheap reply judge reads your context ' +
-        '(its newest part) with your `instructions` and wakes you only when now looks like a good time to reply, e.g. ' +
-        '`{ name: "ambient-judged", match: { tagsAny: ["chat:ambient"] }, judge: { debounceMs: 20000, maxWaitMs: 120000, ' +
-        'instructions: "Wake me when someone asks me something or the talk turns to the garden; let banter between others go by." } }`. ' +
-        'Keep your DM/mention rules ahead of it with `always` if those should never wait on the judge.',
+        '(the channel must be subscribed for ambient events to arrive — see channel mode).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -9720,8 +9745,8 @@ export class AgentFramework {
             enum: ['always', 'defer', 'skip'],
             description:
               'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
-              'context). For debounce / rate-limit / sampling / the reply judge, use debounceMs / rateLimit / ' +
-              'passiveSample / judge below instead of this field. Exactly one behavior must be given.',
+              'context). For debounce / rate-limit / sampling, use debounceMs / rateLimit / ' +
+              'passiveSample below instead of this field. Exactly one behavior must be given.',
           },
           debounceMs: {
             type: 'number',
@@ -9745,27 +9770,6 @@ export class AgentFramework {
               keyBy: { type: 'string', description: 'Metadata field for separate per-key counters.' },
             },
             required: ['every'],
-          },
-          judge: {
-            type: 'object',
-            description:
-              'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
-              'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
-              'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
-              'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
-              'Its verdicts and reasons are in gate_status.',
-            properties: {
-              debounceMs: { type: 'number', description: 'Quiet period (ms) before the batch is judged (100–300000).' },
-              maxWaitMs: {
-                type: 'number',
-                description: 'Judge the batch by this long (ms) after its first event even while messages keep coming (up to 3600000). Omit to wait for quiet.',
-              },
-              instructions: {
-                type: 'string',
-                description: 'Your word to the judge (up to 4000 characters): when you want to be woken, when to let things go by.',
-              },
-            },
-            required: ['debounceMs'],
           },
           position: {
             type: 'string',
@@ -9820,6 +9824,30 @@ export class AgentFramework {
       },
     },
   ];
+
+  private static readonly JUDGED_WAKE_RULE_TOOLS: import('./types/index.js').ToolDefinition[] =
+    AgentFramework.WAKE_RULE_TOOLS.map((tool) => {
+      if (tool.name !== 'wake_add_rule') return tool;
+      const judged: Record<string, ToolParameter> = {};
+      for (const [key, value] of Object.entries(tool.inputSchema.properties ?? {})) {
+        judged[key] = key === 'behavior'
+          ? { ...value, description:
+              'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
+              'context). For debounce / rate-limit / sampling / the reply judge, use debounceMs / rateLimit / ' +
+              'passiveSample / judge below instead of this field. Exactly one behavior must be given.' }
+          : value;
+        if (key === 'passiveSample') judged.judge = JUDGE_PARAMETER;
+      }
+      return {
+        ...tool,
+        description: tool.description + '\n' +
+          '• Let a small model decide: `judge` batches like debounceMs, then a cheap reply judge reads your context ' +
+          '(its newest part) with your `instructions` and wakes you only when now looks like a good time to reply, e.g. ' +
+          '`{ name: "ambient-judged", match: { tagsAny: ["chat:ambient"] }, judge: { debounceMs: 20000, maxWaitMs: 120000, ' +
+          'instructions: "Wake me when someone asks me something or the talk turns to the garden; let banter between others go by." } }`.',
+        inputSchema: { ...tool.inputSchema, properties: judged },
+      };
+    });
 
   /** Discoverability for event tags (MCPL RFC-001): the reserved chat:* core,
    *  each connected server's declared tag ontology, and gate.js status. */
@@ -30857,7 +30885,8 @@ export class AgentFramework {
       // of `match`, `rateLimit` or `passiveSample` given on its own, which the
       // rule would otherwise be saved without; any other name is named in the
       // result's ignoredFields, and in a refusal's text.
-      const parameters = AgentFramework.WAKE_RULE_TOOLS[0]!.inputSchema.properties as Record<string, unknown>;
+      const parameters = (this.judgeWired ? AgentFramework.JUDGED_WAKE_RULE_TOOLS : AgentFramework.WAKE_RULE_TOOLS)[0]!
+        .inputSchema.properties as Record<string, unknown>;
       const input = checkToolInput(
         'wake_add_rule', (call.input ?? {}) as Record<string, unknown>, parameters, ignored, { match: 'the rule matches every event' },
       ) as {
@@ -30870,12 +30899,14 @@ export class AgentFramework {
         input.debounceMs !== undefined ? 'debounceMs' : null,
         input.rateLimit !== undefined ? 'rateLimit' : null,
         input.passiveSample !== undefined ? 'passiveSample' : null,
-        input.judge !== undefined ? 'judge' : null,
+        this.judgeWired && input.judge !== undefined ? 'judge' : null,
       ].filter((s): s is string => s !== null);
       if (behaviorSources.length === 0) {
         finish({
           success: false,
-          error: 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, `passiveSample`, or `judge`.',
+          error: this.judgeWired
+            ? 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, `passiveSample`, or `judge`.'
+            : 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, or `passiveSample`.',
           isError: true,
         });
         return;
@@ -30899,8 +30930,11 @@ export class AgentFramework {
         finish({
           success: false,
           error: `wake_add_rule: behavior must be "always", "defer" or "skip", and it's ${shownValue(named)}, `
-            + 'so nothing was saved. For a debounce, a rate limit, sampling or the reply judge, give debounceMs, rateLimit, '
-            + 'passiveSample or judge instead of behavior.',
+            + (this.judgeWired
+              ? 'so nothing was saved. For a debounce, a rate limit, sampling or the reply judge, give debounceMs, rateLimit, '
+                + 'passiveSample or judge instead of behavior.'
+              : 'so nothing was saved. For a debounce, a rate limit or sampling, give debounceMs, rateLimit or '
+                + 'passiveSample instead of behavior.'),
           isError: true,
         });
         return;
@@ -30909,7 +30943,7 @@ export class AgentFramework {
         input.debounceMs !== undefined ? { debounce: input.debounceMs }
         : input.rateLimit !== undefined ? { rate_limit: input.rateLimit }
         : input.passiveSample !== undefined ? { passive_sample: input.passiveSample }
-        : input.judge !== undefined ? { judge: input.judge }
+        : this.judgeWired && input.judge !== undefined ? { judge: input.judge }
         : input.behavior;
 
       // Placement: at most one of position / insertBefore / insertAfter.
