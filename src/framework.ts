@@ -14544,14 +14544,15 @@ export class AgentFramework {
           // ephemeral run's disposal discards the ledger; nothing stored names
           // either. One tool:result_dropped goes out, for the result being
           // handled, as at the batch hook's drop above.
+          // (roundStoppedDuringBuild is the test, which the completed
+          // stream's build below shares.)
           const after = agent.state as AgentState;
-          const cancelledAs = this.frameworkCancelledStreams.get(`${agent.name}:${agent.streamId}`);
-          const cancelled = cancelledAs !== undefined && currentState.stream?.isWaitingForTools === false;
-          if (after !== currentState || cancelled) {
+          const stopped = this.roundStoppedDuringBuild(agent, currentState, currentState.stream);
+          if (stopped !== null) {
             console.warn(
               `[framework] Dropping the tool round of agent '${agent.name}' (callId=${event.callId}): ` +
               `its turn was stopped while the round's results were prepared (status '${after.status}'` +
-              `${cancelled ? `, stream cancelled: ${cancelledAs}` : ''}), ` +
+              `${stopped !== 'state-changed' ? `, stream cancelled: ${stopped}` : ''}), ` +
               `so the round isn't stored and its stream isn't resumed.`,
             );
             this.emitTrace({
@@ -19039,6 +19040,28 @@ export class AgentFramework {
   }
 
   /**
+   * Whether a round's turn was stopped while its results were built (a
+   * spill's workspace write), which a tool boundary and a stream that
+   * completed while its tools ran both await before they store anything:
+   * the stop's name, or null when the round goes on. `before` is the state
+   * the build began from and `stream` the round's stream.
+   *
+   * A host's cancelStream, stop() and abortInference, and an ephemeral run's
+   * disposal, replace that state (the agent is left idle): `'state-changed'`.
+   * A quiesce's abandon and stop() record their cancel of the stream and
+   * leave the state to driveStream: the record's name, once the stream is no
+   * longer waiting for these results. The stream's state is what makes the
+   * record this stream's: one left under the same key by an earlier stream,
+   * such as an earlier agent's of the same name, sits beside a stream still
+   * waiting.
+   */
+  private roundStoppedDuringBuild(agent: Agent, before: AgentState, stream: YieldingStream | undefined): string | null {
+    const cancelledAs = this.frameworkCancelledStreams.get(`${agent.name}:${agent.streamId}`);
+    if (cancelledAs !== undefined && stream?.isWaitingForTools === false) return cancelledAs;
+    return agent.state !== before ? 'state-changed' : null;
+  }
+
+  /**
    * Store the clock row due in `agent`'s window (clock-rows.ts), if the agent
    * has clock rows and a boundary has passed since the window's last clock,
    * or the window holds no clock row yet (planClock), and return it. The
@@ -22970,12 +22993,14 @@ export class AgentFramework {
                 `Injecting error results for ${agent.getPendingToolIds().length} pending tool(s).`
               );
               // Inject error results for all remaining pending tools
-              for (const pendingId of agent.getPendingToolIds()) {
-                agent.provideToolResult(pendingId, {
-                  success: false,
-                  error: 'Stream completed before tool result was received (likely max_tokens truncation).',
-                  isError: true,
-                });
+              const stillRunning = agent.getPendingToolIds();
+              const notReceived = {
+                success: false,
+                error: 'Stream completed before tool result was received (likely max_tokens truncation).',
+                isError: true,
+              };
+              for (const pendingId of stillRunning) {
+                agent.provideToolResult(pendingId, { ...notReceived });
               }
               // Store the round and its results, with the same bounded spill
               // policy as the ordinary path (issue #89: this guard path must
@@ -22998,6 +23023,53 @@ export class AgentFramework {
               const built = ready && inline
                 ? await this.buildStoredToolResultContent(agent.name, ready.toolResults, inline.cap, inline.bound)
                 : undefined;
+              // A stop or an operator's abandon during the build drops the
+              // round, as at an ordinary tool boundary (the same test,
+              // roundStoppedDuringBuild): neither the round, its results nor
+              // the reply after its last tool block is stored, and one
+              // tool:result_dropped goes out, for the first call that was
+              // still running. The stream has completed, so no event of it
+              // reports the stop: it ends the turn here, as a stop made during
+              // the guard's wait above does, the framework's own stop before a
+              // caller's, with the stop's one inference:aborted and no
+              // inference:completed.
+              const stopped = ready && inline ? this.roundStoppedDuringBuild(agent, readyState, stream) : null;
+              if (stopped !== null) {
+                console.warn(
+                  `[framework] Dropping the tool round of agent '${agent.name}': its turn was stopped while the results ` +
+                  `of a stream that completed with its tools still running were built (status '${agent.state.status}'` +
+                  `${stopped !== 'state-changed' ? `, stream cancelled: ${stopped}` : ''}), ` +
+                  `so neither the round, its results nor the reply after them is stored.`,
+                );
+                this.emitTrace({
+                  type: 'tool:result_dropped',
+                  agentName: agent.name,
+                  callId: stillRunning[0] ?? ready!.toolResults[0]?.id ?? '',
+                  agentStatus: agent.state.status,
+                  result: { ...notReceived },
+                });
+                if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
+                  generationLost = true;
+                  lifecyclePhase = 'aborted';
+                  return;
+                }
+                const recorded = this.frameworkCancelledStreams.get(`${agent.name}:${myStreamId}`);
+                const frameworkStop = recorded === 'shutdown' || this.providerAdmissionClosed ? 'shutdown'
+                  : recorded === 'quiesce_abandoned' ? 'quiesce_abandoned' : undefined;
+                const callerStop = agent.takeCancel();
+                lifecyclePhase = 'aborted';
+                if (frameworkStop) {
+                  this.settleFrameworkCancel({
+                    agent, myStreamId, startTime, compiledRequest, kind: frameworkStop, closes: streamRouting, log: logStream,
+                  });
+                  return;
+                }
+                this.settleDeliberateCancel({
+                  agent, myStreamId, startTime, compiledRequest,
+                  reason: callerStop?.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing',
+                });
+                return;
+              }
               const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
               const pendingId = pending ? agent.addAssistantResponse(pending, turnRowMetadata) : undefined;
               if (ready && inline && built) {

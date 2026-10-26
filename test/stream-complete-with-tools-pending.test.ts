@@ -20,6 +20,12 @@
  * A message for prime that comes in meanwhile waits, as any write for an
  * agent whose turn is alive does, and is stored after the round and its
  * results, never between them.
+ *
+ * A stop or an operator's abandon that lands while the results are built
+ * drops the round, as at an ordinary tool boundary: neither the round nor
+ * its results is stored, one tool:result_dropped goes out for it, and the
+ * stop's one inference:aborted ends the turn, with no inference:completed.
+ * (Before, both were stored and the turn reported itself completed.)
  */
 
 import { describe, it } from 'node:test';
@@ -31,6 +37,7 @@ import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/
 import type {
   Agent,
   ContentBlock,
+  TraceEvent,
   EventResponse,
   Module,
   ModuleContext,
@@ -396,4 +403,44 @@ describe('a stream that completes while its tools run', () => {
       await run.cleanup();
     }
   });
+  for (const [label, stop, reason] of [
+    ["a caller's stop", (framework: AgentFramework) => { assert.equal(framework.abortInference('prime', 'test'), true); }, 'test'],
+    ["an operator's abandon", async (framework: AgentFramework) => {
+      const quiesced = framework.quiesce({ abandon: true, timeoutMs: 1_000 });
+      const marks = (framework as unknown as { frameworkCancelledStreams: Map<string, string> }).frameworkCancelledStreams;
+      await waitFor('the abandon to cancel the stream', () => [...marks.values()].includes('quiesce_abandoned'));
+      return quiesced;
+    }, 'quiesce_abandoned'],
+  ] as const) {
+    it(`drops the round and its results when ${label} lands while its results are built`, async () => {
+      const run = await primeCompletedWhileSpillHeld();
+      const { framework, blocks } = run;
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
+      const warn = console.warn;
+      console.warn = () => {};
+      try {
+        const settled = await stop(framework);
+        await run.finish();
+        await within('the quiesce to return', Promise.resolve(settled));
+        const all = blocks();
+        for (const block of ['text:Fetching both.', 'tool_use:call_fetch', 'tool_use:call_slow', 'tool_result:call_fetch', 'tool_result:call_slow']) {
+          assert.ok(!all.includes(block), `${block} is not stored`);
+        }
+        const forPrime = traces.filter((t) => (t as { agentName?: string }).agentName === 'prime');
+        assert.deepEqual(forPrime.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason), [reason],
+          "the stop's one inference:aborted");
+        assert.deepEqual(forPrime.filter((t) => t.type === 'inference:completed'), [], 'and the turn did not complete');
+        const dropped = forPrime.filter((t): t is Extract<TraceEvent, { type: 'tool:result_dropped' }> =>
+          t.type === 'tool:result_dropped' && /Stream completed before tool result/.test(String((t.result as { error?: unknown }).error)));
+        assert.deepEqual(dropped.map((t) => t.callId), ['call_slow'], 'one tool:result_dropped for the round, its first call still running');
+        const interrupted = all.filter((b) => b.startsWith('text:[turn-interrupted]'));
+        assert.deepEqual(interrupted.length, reason === 'test' ? 1 : 0, "a caller's stop leaves its marker; an abandon leaves none");
+        if (reason === 'test') assert.match(interrupted[0]!, /stopped before it finished/);
+      } finally {
+        console.warn = warn;
+        await run.cleanup();
+      }
+    });
+  }
 });
