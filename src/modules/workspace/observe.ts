@@ -47,7 +47,7 @@ import { lstat, mkdir, open, readdir, readlink, realpath, stat, statfs } from 'n
 import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
-import { errnoCode, errnoWords } from './answers.js';
+import { errnoCode, systemWords } from './answers.js';
 
 export interface MountView {
   /**
@@ -419,7 +419,7 @@ export async function coversLanding(view: Pick<MountView, 'include'>, rootReal: 
  */
 export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly NestedMount[] = [], include?: readonly string[]): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
-  if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${errnoWords(errnoCode({ code: found.code }))})`;
+  if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${systemWords(errnoCode({ code: found.code }), found.code)})`;
   const link = `${spell(found.link)} is a symlink`;
   if (leads === null || leads.kind === 'nowhere') return `${link}, which this mount does not follow`;
   if (leads.kind === 'outside') return `${link} leading outside the mount, which this mount does not follow`;
@@ -920,7 +920,7 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     // link this mount doesn't follow.
     const found = rel === '' ? null : await linkOnTheWay(view, rel);
     if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
-    return { kind: 'unobserved', reason: `cannot resolve the directory (${errnoWords(code)})`, ...(code !== undefined ? { errno: code } : {}) };
+    return { kind: 'unobserved', reason: `cannot resolve the directory (${systemWords(code, err)})`, ...(code !== undefined ? { errno: code } : {}) };
   }
   // A mount that doesn't follow symlinks goes through none on the way to a
   // directory, inside the mount or out of it.
@@ -1010,7 +1010,7 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
       await mkdir(base.at(parts[i]!));
     } catch (err) {
       const code = errno(err);
-      if (code !== 'EEXIST') return { kind: 'unobserved', reason: `cannot create the directory ${childRel} (${errnoWords(code)})`, ...(code !== undefined ? { errno: code } : {}) };
+      if (code !== 'EEXIST') return { kind: 'unobserved', reason: `cannot create the directory ${childRel} (${systemWords(code, err)})`, ...(code !== undefined ? { errno: code } : {}) };
     }
     // Made, or there already (made meanwhile, or not a directory): it must
     // be a real directory now, never a symlink or file in its place.
@@ -1063,7 +1063,7 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     } catch (err) {
       const code = errno(err);
       if (code === 'ENOTDIR') return CHANGED;
-      if (code !== 'ENOENT') return `cannot stat (${errnoWords(code)})`;
+      if (code !== 'ENOENT') return `cannot stat (${systemWords(code, err)})`;
       // Absent from a directory that, like each above it, is still the one its path names.
       return proven();
     }
@@ -1191,7 +1191,7 @@ async function parentPlacement(view: MountView, rootReal: string, relativePath: 
     // link this mount doesn't follow.
     const found = await linkOnTheWay(view, relativePath, 'parents');
     if (found !== null) return { reason: await linkReason(view, rootReal, found) };
-    return { reason: `cannot resolve the parent directory (${errnoWords(code)})` };
+    return { reason: `cannot resolve the parent directory (${systemWords(code, err)})` };
   }
 }
 
@@ -1212,7 +1212,7 @@ export async function observePath(view: MountView, rootReal: string, relativePat
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT' || code === 'ENOTDIR') return absence(view, rootReal, relativePath);
-    return { kind: 'unobserved', reason: `cannot stat (${errnoWords(code)})` };
+    return { kind: 'unobserved', reason: `cannot stat (${systemWords(code, err)})` };
   }
   if (info.isSymbolicLink()) {
     if (!view.followSymlinks) return { kind: 'unobserved', reason: NOT_FOLLOWED };
@@ -1220,13 +1220,13 @@ export async function observePath(view: MountView, rootReal: string, relativePat
     try {
       target = await stat(lexical, { bigint: true });
     } catch (err) {
-      return { kind: 'unobserved', reason: `a symlink whose target cannot be read (${errnoWords(errno(err))})` };
+      return { kind: 'unobserved', reason: `a symlink whose target cannot be read (${systemWords(errno(err), err)})` };
     }
     let real: string;
     try {
       real = await realpath(lexical);
     } catch (err) {
-      return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${errnoWords(errno(err))})` };
+      return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${systemWords(errno(err), err)})` };
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: LEAVES_MOUNT };
     const holder = nestedAtReal(real, view.nested);
@@ -1288,7 +1288,7 @@ async function openContained(
       return { kind: 'unobserved', reason: found === null ? NOT_FOLLOWED : await linkReason(view, rootReal, found) };
     }
     if (code === 'EISDIR') return { kind: 'unobserved', reason: DIRECTORY };
-    return { kind: 'unobserved', reason: `cannot open (${errnoWords(code)})` };
+    return { kind: 'unobserved', reason: `cannot open (${systemWords(code, err)})` };
   }
   let keep = false;
   try {
@@ -1330,7 +1330,7 @@ async function openContained(
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT') return absence(view, rootReal, relativePath);
-    return { kind: 'unobserved', reason: `cannot read (${errnoWords(code)})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(code, err)})` };
   } finally {
     if (!keep) await handle.close();
   }
@@ -1428,7 +1428,7 @@ export async function readPath(
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT') return absence(view, rootReal, relativePath);
-    return { kind: 'unobserved', reason: `cannot read (${errnoWords(code)})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(code, err)})` };
   } finally {
     await handle.close();
   }
@@ -1488,7 +1488,7 @@ export async function readBytes(
     if (more) return { kind: 'bytes', size: Math.max(Number((await handle.stat({ bigint: true })).size), bytes.length + 1), bytes: null, head: bytes.subarray(0, HEAD_BYTES) };
     return { kind: 'bytes', size: bytes.byteLength, bytes, head: bytes.subarray(0, HEAD_BYTES) };
   } catch (err) {
-    return { kind: 'unobserved', reason: `cannot read (${errnoWords(errno(err))})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(errno(err), err)})` };
   } finally {
     await handle.close();
   }
@@ -1512,7 +1512,7 @@ export async function readHead(
     const { bytesRead } = await handle.read(head, 0, HEAD_BYTES, 0);
     return { kind: 'head', size: Number(info.size), mtimeMs: Number(info.mtimeMs), head: head.subarray(0, bytesRead) };
   } catch (err) {
-    return { kind: 'unobserved', reason: `cannot read (${errnoWords(errno(err))})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(errno(err), err)})` };
   } finally {
     await handle.close();
   }
@@ -1860,7 +1860,7 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
   try {
     info = await lstat(real, { bigint: true });
   } catch (err) {
-    if (errno(err) !== 'ENOENT') return { kind: 'unobserved', reason: `cannot stat (${errnoWords(errno(err))})` };
+    if (errno(err) !== 'ENOENT') return { kind: 'unobserved', reason: `cannot stat (${systemWords(errno(err), err)})` };
     const proof = await confirmAbsent(view, rootReal, rel, 'beneath');
     return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent', by: proof.by };
   }

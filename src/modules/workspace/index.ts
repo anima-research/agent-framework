@@ -38,7 +38,7 @@ import type {
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, storedBytes, DEFAULT_MAX_FILE_SIZE, type StoredBytes } from './sync.js';
-import { DiskAgreement, EvidenceUnavailable, sameRootIdentity } from './disk-agreement.js';
+import { DiskAgreement, EvidenceUnavailable, callGate, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
 import { CHANGED, DIRECTORY, IGNORED, LEAVES_MOUNT, NONBLOCK, NOT_FOLLOWED, NOT_REGULAR, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, checkDir, checkRoot, confirmAbsent, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, includePatternReadable, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, shownLeads, sniffImageMime, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
@@ -65,7 +65,7 @@ import {
   settleAdoptionBeforeMutation,
 } from './reconcile.js';
 import { EffectFailed, unlinkContained } from './effects.js';
-import { AWAITS_REOPEN, ROOT_UNCHECKED, Refusal, changesFiles, didNothing, errnoCode, errnoWayOn, errnoWords, hostFix, onlyTheHost, unexpectedAnswer } from './answers.js';
+import { AWAITS_REOPEN, ROOT_UNCHECKED, ROOT_UNREADABLE, Refusal, changesFiles, didNothing, errnoCode, errnoWayOn, errnoWords, hostFix, onlyTheHost, systemWords, unexpectedAnswer } from './answers.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { closestNames } from '../../closest-names.js';
 import { RecordJournal } from '../../record-journal.js';
@@ -255,6 +255,12 @@ export class WorkspaceReadError extends Error {
   ) {
     super(message);
     this.name = 'WorkspaceReadError';
+  }
+}
+
+class NotRegularFile extends WorkspaceReadError {
+  constructor(path: string, stage: WorkspaceReadStage) {
+    super('not_found', `Not a regular file: ${path}`, stage);
   }
 }
 
@@ -2189,7 +2195,12 @@ export class WorkspaceModule implements Module {
     return work;
   }
 
-  private async runToolCall(call: ToolCall): Promise<ToolResult> {
+  private runToolCall(call: ToolCall): Promise<ToolResult> {
+    const gate = { passed: false };
+    return callGate.run(gate, () => this.answerToolCall(call, gate));
+  }
+
+  private async answerToolCall(call: ToolCall, gate: { passed: boolean }): Promise<ToolResult> {
     const reopenAtStart = this.agreement?.awaitsReopen === true;
     try {
       // Every handler reads its input as its schema describes it; a call
@@ -2230,17 +2241,17 @@ export class WorkspaceModule implements Module {
           return { success: false, error: unknownToolMessage(this.name, call.name, this.getTools()), isError: true };
       }
     } catch (err) {
-      return { success: false, error: this.failureAnswer(call, err, reopenAtStart), isError: true };
+      return { success: false, error: this.failureAnswer(call, err, reopenAtStart, gate.passed), isError: true };
     }
   }
 
-  private failureAnswer(call: ToolCall, err: unknown, reopenAtStart: boolean): string {
+  private failureAnswer(call: ToolCall, err: unknown, reopenAtStart: boolean, passedGate: boolean): string {
     const input = (typeof call.input === 'object' && call.input !== null ? call.input : {}) as { path?: unknown; mount?: unknown };
     const path = typeof input.path === 'string' ? input.path : undefined;
     const mountName = path !== undefined ? path.split('/')[0]! : typeof input.mount === 'string' ? input.mount : undefined;
     const subject = path !== undefined ? JSON.stringify(path) : typeof input.mount === 'string' ? `mount ${JSON.stringify(input.mount)}` : undefined;
     const reopened = !reopenAtStart && this.agreement?.awaitsReopen === true;
-    if (err instanceof EvidenceUnavailable && reopened && changesFiles(call.name)) {
+    if (err instanceof EvidenceUnavailable && passedGate && changesFiles(call.name)) {
       return `The ${call.name}${subject !== undefined ? ` of ${subject}` : ''} stopped partway: ${err.message} Whether it changed anything before it stopped isn't known until then.`;
     }
     if (err instanceof Refusal) return didNothing(call.name, err.message);
@@ -2474,11 +2485,12 @@ export class WorkspaceModule implements Module {
         if (!committed) throw error;
         // As write words it: a store that failed after recording the file
         // skipped its push, so on a mount that pushes, disk lacks it.
+        const reopen = this.agreement?.awaitsReopen === true;
         failure = error instanceof StoredThenFailed
           ? `Stored "${mountPrefixedPath}" in Chronicle, but the store failed after recording it: ${error.message}.`
-            + (error.pushes ? " Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it." : '')
+            + (error.pushes ? ` Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it${reopen ? ONCE_REOPENED : ''}.` : '')
           : `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
-        if (this.agreement?.awaitsReopen === true) failure += ` ${AWAITS_REOPEN}`;
+        if (reopen) failure += ` ${AWAITS_REOPEN}`;
       }
       if (failure !== null) {
         // The file is in the Chronicle tree, where the workspace's tools read
@@ -3389,7 +3401,7 @@ export class WorkspaceModule implements Module {
     }
     if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) {
       // A FIFO, socket or device is never opened.
-      throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'lstat');
+      throw new NotRegularFile(mountPrefixedPath, 'lstat');
     }
 
     let handle: Awaited<ReturnType<typeof open>>;
@@ -3425,7 +3437,7 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
       }
       if (!fileStat.isFile()) {
-        throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'fstat');
+        throw new NotRegularFile(mountPrefixedPath, 'fstat');
       }
 
       if (!follow && !useNoFollow) {
@@ -3538,7 +3550,9 @@ export class WorkspaceModule implements Module {
    * (`outside_include`), a path in another mount's directory nested in the one named
    * (`other_mount`), unavailable mount, missing or non-regular file,
    * directory, policy-denied symlink, outside-mount target, and
-   * file-changed-during-read.
+   * file-changed-during-read. An error met while parsing the path that is
+   * none of these refusals, such as the store's, is thrown as it is, and a
+   * `maxBytes` that isn't a non-negative integer throws a `RangeError`.
    */
   async readFileFromDisk(
     mountPrefixedPath: string,
@@ -4673,7 +4687,7 @@ export class WorkspaceModule implements Module {
       }
     } else if ('storeFailed' in outcome) {
       head = `${stored}\n\nThe store failed after recording them: ${cutLine(outcome.storeFailed)}.`
-        + (outcome.pushes ? " Their push to disk didn't run, so disk lacks them until a materialize of their files writes them." : '')
+        + (outcome.pushes ? ` Their push to disk didn't run, so disk lacks them until a materialize of their files writes them${reopen ? ONCE_REOPENED : ''}.` : '')
         + (reopen ? ` ${AWAITS_REOPEN}` : '');
     } else {
       head = `${stored}\n\nThe rest of the call failed: ${cutLine(outcome.threw)}.${reopen ? ` ${AWAITS_REOPEN}` : " ls shows each path's state."}`;
@@ -5027,7 +5041,7 @@ export class WorkspaceModule implements Module {
         const code = errnoOf(err);
         const why = code === 'ENOENT' || code === 'ENOTDIR'
           ? `the mount root isn't on disk. ${onlyTheHost("put the mount's directory back at its path")}`
-          : `the mount root can't be read: ${errnoWords(code)}. ${errnoWayOn(code, 'Calling again may work.', true)}`;
+          : `the mount root can't be read: ${systemWords(code, err)}. ${errnoWayOn(code, ROOT_UNREADABLE, true)}`;
         return { success: false, isError: true, error: didNothing('delete', why, path) };
       }
       const view = { ...disk.view, rootIdentity: { dev: String(rootStat.dev), ino: String(rootStat.ino) } };
@@ -6143,15 +6157,16 @@ export class WorkspaceModule implements Module {
       };
     }
 
-    const heldNothing = explicit !== null && explicit.relativePath !== '' && !explicit.mount.direct
+    const held = explicit;
+    const heldNothing = held !== null && held.relativePath !== '' && !held.mount.direct
       && allWritten.length === 0 && allDeleted.length === 0 && pendingDeletions.length === 0 && blocked.length === 0 && passedOver.length === 0
-      && !this.holdsAnythingAt(explicit.mount, explicit.relativePath);
+      && !this.holdsAnythingAt(held.mount, held.relativePath);
     return {
       success: true,
       data: {
         materialized: allWritten,
         count: allWritten.length,
-        ...(heldNothing ? { note: `The workspace holds nothing at ${JSON.stringify(input.path)}, so there was nothing to write there.` } : {}),
+        ...(heldNothing ? { note: `The workspace holds nothing at ${JSON.stringify(`${held.mount.config.name}/${held.relativePath}`)}, so there was nothing to write there.` } : {}),
         ...(allDeleted.length > 0 ? { deleted: allDeleted } : {}),
         ...(pendingDeletions.length > 0
           ? {
@@ -6355,7 +6370,7 @@ export class WorkspaceModule implements Module {
       success: true,
       data: {
         results: allResults,
-        ...(nothingThere ? { note: `Neither the workspace nor disk has anything at ${JSON.stringify(input.path)}, so there was nothing to sync.` } : {}),
+        ...(nothingThere ? { note: `Neither the workspace nor disk has anything at ${JSON.stringify(`${named.name}/${named.relativePath}`)}, so there was nothing to sync.` } : {}),
         totalSynced: allResults.reduce((sum, r) => sum + r.synced.length, 0),
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
         ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
@@ -6888,9 +6903,10 @@ function readRefusal(err: WorkspaceReadError, path: string): string {
       }
       if (err.errno !== undefined) {
         return `the directory of mount ${mount} can't be read: ${errnoWords(err.errno)}. `
-          + errnoWayOn(err.errno, "Calling again may work; if it fails the same way, whoever runs this host can make the mount's directory readable.", true);
+          + errnoWayOn(err.errno, ROOT_UNREADABLE, true);
       }
-      return `the directory of mount ${mount} can't be checked at its path, so nothing in it can be read. ${ROOT_UNCHECKED}`;
+      return `the directory of mount ${mount} can't be checked at its path, so nothing in it can be read. `
+        + "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.";
     }
     return `${shown} can't be read: ${sentence(err.reason)}`;
   }
@@ -6908,7 +6924,7 @@ function readRefusal(err: WorkspaceReadError, path: string): string {
       return `${shown} changed on disk while it was being read. Calling again reads it afresh.`;
     case 'not_found':
       if (err.errno === 'ENOENT' || err.errno === 'ENOTDIR') return `there's no file at ${shown}. ls or glob lists the files that exist.`;
-      if (err.errno === undefined && (err.stage === 'lstat' || err.stage === 'fstat')) {
+      if (err instanceof NotRegularFile) {
         return `${shown} isn't a regular file (it's a pipe, a socket or a device), so the workspace doesn't read it. ${onlyTheHost('put a regular file there')}`;
       }
       if (err.stage === 'realpath') return `where ${shown} leads on disk can't be resolved: ${errnoWords(err.errno)}. ${errnoWayOn(err.errno)}`;
@@ -7142,6 +7158,8 @@ class StoredThenFailed extends Error {
  * script. A note comes last: an edit's on which copy it applied to, or a
  * deletion's that it unlinked nothing.
  */
+const ONCE_REOPENED = ', once the store is reopened';
+
 function storedButUnfinished(
   tool: 'write' | 'edit' | 'delete',
   path: string,
@@ -7157,8 +7175,8 @@ function storedButUnfinished(
     : 'storeFailed' in outcome
       ? ` The store failed after recording it: ${outcome.storeFailed}.` + (!outcome.pushes ? ''
         : tool === 'delete'
-          ? ' Its push to disk didn\'t run, so disk keeps the file until a materialize of the path with applyDeletions deletes it.'
-          : ' Its push to disk didn\'t run, so disk lacks the change until a materialize of the path writes it.')
+          ? ` Its push to disk didn't run, so disk keeps the file until a materialize of the path with applyDeletions deletes it${reopen ? ONCE_REOPENED : ''}.`
+          : ` Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it${reopen ? ONCE_REOPENED : ''}.`)
       : ` The rest of the call failed: ${outcome.threw}.${reopen ? '' : " ls shows the path's state."}`;
   return { success: false, isError: true, error: stored + rest + (reopen ? ` ${AWAITS_REOPEN}` : '') + (note !== null ? ` ${note}` : '') };
 }

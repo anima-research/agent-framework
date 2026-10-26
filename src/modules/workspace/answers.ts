@@ -51,7 +51,7 @@ export function errnoWords(code: string | undefined): string {
 export function hostFix(code: string | undefined): string | undefined {
   switch (code) {
     case 'ENOSPC': return 'free space on its disk';
-    case 'EFBIG': return 'raise the limit on a file\'s size, or move the mount to a filesystem that holds larger files';
+    case 'EFBIG': return 'raise the limit on a file\'s size, or keep the files on a filesystem that holds larger ones';
     case 'EDQUOT': return 'raise or free the disk quota';
     case 'EROFS': return 'make the filesystem writable';
     case 'EIO': return 'check the disk';
@@ -65,6 +65,10 @@ export function hostFix(code: string | undefined): string | undefined {
 
 const PASSING = new Set(['EIO', 'EMFILE', 'ENFILE', 'ENOMEM']);
 const AS_DISK_IS = new Set(['EISDIR', 'ENOTDIR', 'EEXIST', 'ENOTEMPTY', 'EXDEV']);
+
+export function systemWords(code: string | undefined, error: unknown): string {
+  return code !== undefined ? errnoWords(code) : boundedErrorMessage(error);
+}
 
 export function errnoWayOn(code: string | undefined, otherwise = 'Calling again may work.', hostsName = false): string {
   if (code === 'ENAMETOOLONG' && hostsName) return onlyTheHost("give the mount's directory a shorter path");
@@ -96,7 +100,9 @@ export function changesFiles(tool: string): boolean {
   return CHANGING.has(tool);
 }
 
-export const ROOT_UNCHECKED = "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.";
+export const ROOT_UNREADABLE = "Calling again may work; if it fails the same way, whoever runs this host can make the mount's directory readable.";
+
+export const ROOT_UNCHECKED = "Calling again won't change that until the mount's directory is back at its path; whoever runs this host can check the directory and its path.";
 
 export const AWAITS_REOPEN = "The workspace can't check its files against disk until its store is reopened, so calling again won't change that; whoever runs this host can reopen it with a restart.";
 
@@ -110,7 +116,7 @@ export interface Unexpected {
 export function unexpectedAnswer(tool: string, subject: string | undefined, error: unknown, how: Unexpected = {}): string {
   const stored = how.stored ?? 'unknown';
   const code = errnoCode(error);
-  const words = how.said ?? (code !== undefined ? errnoWords(code) : boundedErrorMessage(error));
+  const words = how.said ?? systemWords(code, error);
   const before = stored !== 'not' ? '' : tool === 'edit_many' ? ', before any of its edits was stored' : `, before the ${tool === 'delete' ? 'deletion' : tool} was stored`;
   const head = `The ${tool}${subject !== undefined ? ` of ${subject}` : ''} stopped on an error the workspace didn't expect${before}: ${words.replace(/\.$/, '')}.`;
   if (stored === 'held') {

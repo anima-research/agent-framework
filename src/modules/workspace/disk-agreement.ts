@@ -33,6 +33,7 @@
  * succeed, since its completion releases a draft's protection.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { resolve } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import { RecordJournal } from '../../record-journal.js';
@@ -42,6 +43,8 @@ const UNTIL_REOPENED = "the workspace can't check its files against disk until i
 const REOPEN = onlyTheHost('reopen it with a restart');
 
 export class EvidenceUnavailable extends Refusal {}
+
+export const callGate = new AsyncLocalStorage<{ passed: boolean }>();
 
 /** Everything `stat` says about a file that can vouch for unchanged bytes. */
 export interface Fingerprint {
@@ -231,6 +234,8 @@ export class DiskAgreement {
       throw new EvidenceUnavailable(`${UNTIL_REOPENED}: reading back its record of what disk last agreed with failed. ${REOPEN}`);
     }
     if (this.journal.needsReconcile) this.rebuild();
+    const gate = callGate.getStore();
+    if (gate) gate.passed = true;
   }
 
   get awaitsReopen(): boolean {

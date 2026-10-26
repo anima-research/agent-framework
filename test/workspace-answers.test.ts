@@ -1,10 +1,13 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
+import { systemWords } from '../src/modules/workspace/answers.js';
+import { linkWords } from '../src/modules/workspace/observe.js';
+import { callGate } from '../src/modules/workspace/disk-agreement.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
@@ -198,35 +201,111 @@ describe('an error no handler threw on purpose', () => {
     assert.match(await refused(m, 'ls', { path: 'work' }), /^The ls did nothing: the workspace can't check its files against disk until its store is reopened/);
   });
 
-  test('the store coming to await its reopening partway through a materialize says it stopped partway', async (t) => {
+  test('the store coming to await its reopening after a materialize wrote to disk says it stopped partway', async (t) => {
     const env = new Env(t);
     const m = await env.open([{ name: 'work' }, { name: 'other' }]);
     await ok(m, 'write', { path: 'work/a.txt', content: 'one' });
     await ok(m, 'write', { path: 'other/b.txt', content: 'two' });
-    const agreement = (m as unknown as { agreement: { set: (mount: string, path: string, value: unknown) => void } }).agreement;
-    const getBlob = env.store.getBlob.bind(env.store);
+    const agreement = (m as unknown as { agreement: { set: (mount: string, path: string, ...rest: unknown[]) => unknown } }).agreement;
+    const set = agreement.set.bind(agreement);
     let latched = false;
-    env.store.getBlob = (...args: Parameters<typeof getBlob>) => {
-      if (!latched) {
+    agreement.set = (mount: string, path: string, ...rest: unknown[]) => {
+      if (!latched && mount === 'work' && existsSync(join(env.root, 'work', 'a.txt'))) {
         latched = true;
         const append = env.store.appendJson;
         env.store.appendJson = () => { throw storeError('IO error: No space left on device (os error 28)'); };
-        assert.throws(() => agreement.set('other', 'b.txt', { kind: 'absent' }));
+        // Outside the materialize's own context, as another call's append would be.
+        callGate.exit(() => assert.throws(() => set('other', 'b.txt', { kind: 'absent' })));
         env.store.appendJson = append;
       }
-      return getBlob(...args);
+      return set(mount, path, ...rest);
     };
     const error = await refused(m, 'materialize', { path: 'work/a.txt' });
+    assert.equal(latched, true, 'the latch came after the push wrote the file');
     assert.equal(error, 'The materialize of "work/a.txt" stopped partway: the workspace can\'t check its files against disk until its store is reopened: an append to its record of what disk last agreed with failed inside the store, '
       + "so that record may lack what the append held. Calling again won't change that; whoever runs this host can reopen it with a restart. Whether it changed anything before it stopped isn't known until then.");
+    assert.equal(existsSync(join(env.root, 'work', 'a.txt')), true, 'the push wrote the file before the refusal');
+  });
+
+  test("a change the store recorded before failing, while another call's append left the store awaiting its reopening, says the materialize that writes it works once the store is reopened", async (t) => {
+    const latchOnRecord = async () => {
+      const env = new Env(t);
+      const m = await env.open([{ name: 'auto', autoMaterialize: true }, { name: 'other' }]);
+      await ok(m, 'write', { path: 'other/b.txt', content: 'two' });
+      const inner = m as unknown as { agreement: { set: (mount: string, path: string, value: unknown) => void }; mounts: Map<string, { treeStateId: string }> };
+      const tree = inner.mounts.get('auto')!.treeStateId;
+      const treeSet = env.store.treeSet.bind(env.store);
+      env.store.treeSet = (...args: Parameters<typeof treeSet>) => {
+        const recorded = treeSet(...args);
+        if (args[0] !== tree) return recorded;
+        const append = env.store.appendJson;
+        env.store.appendJson = () => { throw storeError('IO error: No space left on device (os error 28)'); };
+        callGate.exit(() => assert.throws(() => inner.agreement.set('other', 'b.txt', { kind: 'absent' })));
+        env.store.appendJson = append;
+        throw storeError('IO error: No space left on device (os error 28)');
+      };
+      return m;
+    };
+    const failed = 'failed after recording it: IO error: No space left on device (os error 28).';
+    const later = `Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it, once the store is reopened. ${REOPEN}`;
+    assert.equal(await refused(await latchOnRecord(), 'write', { path: 'auto/a.txt', content: 'one' }),
+      `The write of "auto/a.txt" is stored in the workspace, so don't send it again. The store ${failed} ${later}`);
+    assert.equal((await (await latchOnRecord()).writeBinary('auto/b.bin', Buffer.from([0, 1, 2]), 'application/octet-stream')).error,
+      `Stored "auto/b.bin" in Chronicle, but the store ${failed} ${later}`);
+  });
+
+  test("the store coming to await its reopening while a call reads its path, before the call reaches its change, says the call did nothing", async (t) => {
+    const env = new Env(t);
+    const m = await env.open([{ name: 'work' }, { name: 'other', autoMaterialize: true }]);
+    const inner = m as unknown as { parseFilePath: (path: string) => Promise<unknown> };
+    const parse = inner.parseFilePath.bind(m);
+    let other = '';
+    inner.parseFilePath = async (path: string) => {
+      const parsed = await parse(path);
+      if (path === 'work/a.txt') {
+        const append = env.store.appendJson;
+        env.store.appendJson = () => { throw storeError('IO error: No space left on device (os error 28)'); };
+        other = await refused(m, 'write', { path: 'other/c.txt', content: 'three' });
+        env.store.appendJson = append;
+      }
+      return parsed;
+    };
+    assert.equal(await refused(m, 'write', { path: 'work/a.txt', content: 'one' }),
+      'The write did nothing: the workspace can\'t check its files against disk until its store is reopened: an append to its record of what disk last agreed with failed inside the store, '
+      + "so that record may lack what the append held. Calling again won't change that; whoever runs this host can reopen it with a restart.");
+    assert.match(other, /^The write of "other\/c\.txt" is stored in the workspace, so don't send it again\./, 'the other call is the one whose append failed');
+    const work = (m as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!;
+    assert.equal(env.store.treeGet(work.treeStateId, 'a.txt'), null, 'nothing was stored');
+    assert.equal(existsSync(join(env.root, 'work', 'a.txt')), false, 'nothing reached disk');
+  });
+});
+
+describe('a system error with no code', () => {
+  test('is quoted, cut at its bound, where an errno would be given in plain words', () => {
+    assert.equal(systemWords('EACCES', new Error('EACCES: permission denied, open \'/host/path\'')), 'permission denied');
+    assert.equal(systemWords(undefined, new Error('the stat was cut short')), 'the stat was cut short');
+    assert.equal(systemWords(undefined, new Error('x'.repeat(600))), `${'x'.repeat(500)}… (600 characters)`);
+    assert.equal(linkWords('work', { unsure: 'a', code: 'the readlink was cut short' }, null), 'cannot tell whether "work/a" is a symlink (the readlink was cut short)');
+  });
+
+  test("a read that fails without a code isn't called a pipe, a socket or a device", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    writeFileSync(join(env.root, 'work', 'a.png'), PNG);
+    (m as unknown as { openContainedFile: () => Promise<never> }).openContainedFile = async () => {
+      throw new WorkspaceReadError('not_found', 'Unable to read file: work/a.png', 'lstat');
+    };
+    assert.equal(await refused(m, 'read_image', { path: 'work/a.png' }),
+      'The read_image did nothing: "work/a.png" can\'t be read from disk: an error the system gave no code for. Calling again may work.');
   });
 });
 
 describe('a call the workspace refuses says what it did not do, quotes what it was given, and gives the way on', () => {
-  test("a mount's root names no file, for write, read, read_image and delete", async (t) => {
+  test("a mount's root names no file, for write, read, read_image, delete and writeBinary", async (t) => {
     const env = new Env(t);
     const m = await env.open();
     const root = '"work" names the root of mount "work", which isn\'t a file; ls "work" lists the files in it.';
+    assert.equal((await m.writeBinary('work', Buffer.from('x'), 'text/plain')).error, root);
     assert.equal(await refused(m, 'write', { path: 'work', content: 'x' }), `The write did nothing: ${root}`);
     assert.equal(await refused(m, 'read', { path: 'work' }), `The read did nothing: ${root}`);
     assert.equal(await refused(m, 'read_image', { path: 'work' }), `The read_image did nothing: ${root}`);
@@ -373,7 +452,7 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
     assert.equal(await refused(m, 'read', { path: 'dgone/a.txt' }), `The read did nothing: the directory of mount "dgone" isn't on disk, so nothing in it can be read. ${back}`);
     assert.equal(await refused(m, 'read', { path: 'gone/a.txt' }),
       'The read did nothing: "gone/a.txt" isn\'t in the workspace, and disk couldn\'t be checked: the mount root is unavailable. '
-      + "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.");
+      + "Calling again won't change that until the mount's directory is back at its path; whoever runs this host can check the directory and its path.");
     assert.equal(await refused(m, 'delete', { path: 'dgone/a.txt' }), `The delete did nothing to "dgone/a.txt": the mount root isn't on disk. ${back}`);
     assert.equal(await refused(m, 'write', { path: 'dgone/a.txt', content: 'x' }), `The write did nothing to "dgone/a.txt": the mount root is unavailable. ${back}`);
   });
