@@ -14397,10 +14397,6 @@ export class AgentFramework {
 
   /** Why the held-draft notice's drafts were held, as the clause after "because". */
   private static readonly DRAFT_REASON_BECAUSE: Record<DraftReason, (many: boolean) => string> = {
-    // A send silences plain speech in its own round and the turn's later
-    // rounds (turnSilenced), so a later round's drafts are held by a send
-    // made in an earlier one. Only the cause is named: new input clears the
-    // silence (adoptInjectedRound), and a budget restart starts without it.
     'explicit-send': () => 'you made an explicit send in this round or an earlier one this turn',
     'no-destination': (many) => `${many ? 'they' : 'it'} had no destination — after a routing envelope failed, ` +
       'plain speech waits for a new valid target',
@@ -14422,12 +14418,6 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
     ];
-    // Each draft is told apart by its length and, among several, by its
-    // place: one hold keeps its segments in the order written. The notice
-    // itself quotes none of a draft's words: the drafts tool shows them when
-    // the resident asks. riskText does carry a connector's error message,
-    // bounded, so a connector whose error echoes what it was sent could put
-    // a draft's words here.
     const named = held.map((d) => `${d.id} (${d.text.length} chars)`);
     const which = many
       ? `your ${held.length} plain-speech messages`
