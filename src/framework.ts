@@ -750,6 +750,34 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
   },
 };
 
+type SettingsReading = {
+  core: Record<string, string>;
+  exts: Map<AgentSettingsExtension, { touched: readonly string[]; fields: Record<string, string> }>;
+};
+
+const readExtensionSettings = (ext: AgentSettingsExtension, agentName: string): Record<string, string> => {
+  const values = ext.get(agentName);
+  return Object.fromEntries(Object.entries(values).map(([key, value]) =>
+    [key, value === undefined ? 'undefined' : JSON.stringify(value)]));
+};
+
+const changedSettings = (before: Record<string, string>, now: Record<string, string>): string[] =>
+  [...new Set([...Object.keys(before), ...Object.keys(now)])].filter((key) => before[key] !== now[key]);
+
+const settingNumber = (name: string, value: unknown): number => {
+  if (typeof value === 'number') return value;
+  // Number() reads null, false and blank text as 0, true as 1, and a list of one number or numeric text as that number.
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN;
+  if (!Number.isNaN(n)) return n;
+  throw new Error(`${name} must be a number, not ${shownValue(value)}`);
+};
+
+const settingBoolean = (name: string, value: unknown): boolean => {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true' || value === 'false') return value === 'true';
+  throw new Error(`${name} must be true or false, not ${shownValue(value)}`);
+};
+
 /** First sentence (or line) of a description — what `utils list` shows. */
 const utilityOneLiner = (description: string): string => {
   const line = description.split('\n')[0]!;
@@ -6590,7 +6618,7 @@ export class AgentFramework {
         };
       },
       update: (agentName: string, patch: Record<string, unknown>) => {
-        const n = Number(patch.tool_result_inline_max_chars);
+        const n = settingNumber('tool_result_inline_max_chars', patch.tool_result_inline_max_chars);
         if (!Number.isFinite(n) || n < 1000) {
           throw new Error('tool_result_inline_max_chars must be a number >= 1000');
         }
@@ -6646,10 +6674,7 @@ export class AgentFramework {
       },
       keys: ['tool_result_guard'],
       get,
-      update: (name, patch) => {
-        if (typeof patch.tool_result_guard !== 'boolean') throw new Error('tool_result_guard must be a boolean');
-        return set(name, patch.tool_result_guard);
-      },
+      update: (name, patch) => set(name, settingBoolean('tool_result_guard', patch.tool_result_guard)),
       reset: (name) => set(name, undefined),
     };
   }
@@ -6687,10 +6712,7 @@ export class AgentFramework {
       },
       keys: ['closed_channel_note'],
       get,
-      update: (name, patch) => {
-        if (typeof patch.closed_channel_note !== 'boolean') throw new Error('closed_channel_note must be a boolean');
-        return set(name, patch.closed_channel_note);
-      },
+      update: (name, patch) => set(name, settingBoolean('closed_channel_note', patch.closed_channel_note)),
       reset: (name) => set(name, undefined),
     };
   }
@@ -8976,7 +8998,7 @@ export class AgentFramework {
   }
 
   /** Load resident-set inline caps from framework state, dropping (loudly)
-   *  anything that fails the same validation the live update enforces. A
+   *  anything Number() doesn't read as a finite number of at least 1000. A
    *  failed read is logged and boot goes on without them: nothing is lost,
    *  since persistToolResultInlineCap reads the stored caps again before it
    *  writes one. */
@@ -32364,6 +32386,43 @@ export class AgentFramework {
       });
   }
 
+  private readAgentSettings(agentName: string, touched: ReadonlyMap<AgentSettingsExtension, readonly string[]>): SettingsReading {
+    const s = this.getAgentRuntimeSettings(agentName);
+    const saved = this.agents.get(agentName)?.getRuntimeSettingsOverrides() ?? {};
+    return {
+      core: {
+        context_budget_tokens: JSON.stringify([
+          s.contextBudgetTokens, s.effectiveContextBudgetTokens, s.transition, saved.contextBudgetTokens ?? null,
+        ]),
+        tail_tokens: JSON.stringify([s.tailTokens ?? null, saved.tailTokens ?? null]),
+        transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
+        same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
+      },
+      exts: new Map([...touched].map(([ext, keys]) => [ext, { touched: keys, fields: readExtensionSettings(ext, agentName) }])),
+    };
+  }
+
+  private settingsChangedSince(agentName: string, before: SettingsReading | undefined): string {
+    if (!before) return 'Nothing in this call was changed.';
+    let changed: string[];
+    try {
+      const now = this.readAgentSettings(agentName, new Map([...before.exts].map(([ext, { touched }]) => [ext, touched])));
+      changed = [
+        ...changedSettings(before.core, now.core),
+        ...[...before.exts].flatMap(([ext, { touched, fields }]) => {
+          const differ = changedSettings(fields, now.exts.get(ext)!.fields);
+          const own = ext.keys.filter((key) => differ.includes(key));
+          return own.length > 0 ? own : differ.length > 0 ? touched : [];
+        }),
+      ];
+    } catch {
+      return 'Whether anything in this call was changed couldn\'t be read back.';
+    }
+    return changed.length === 0
+      ? 'No setting reads differently after this call.'
+      : `Changed before the refusal: ${changed.join(', ')}; no other setting reads differently.`;
+  }
+
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({
       type: 'tool:started',
@@ -32373,6 +32432,8 @@ export class AgentFramework {
       input: call.input,
     });
     let result: ToolResult;
+    const action = (call.input as { action?: unknown } | undefined)?.action;
+    let before: SettingsReading | undefined;
     try {
       const input = (call.input ?? {}) as {
         action?: unknown;
@@ -32397,41 +32458,57 @@ export class AgentFramework {
             data: { ...this.getAgentRuntimeSettings(agentName), ...extGet() },
           };
           break;
-        case 'cancel':
+        case 'cancel': {
+          const extra = Object.keys(input).filter((key) => key !== 'action');
+          if (extra.length > 0) {
+            throw new Error(`A cancel doesn't take ${extra.join(', ')}: it takes no settings`);
+          }
+          before = this.readAgentSettings(agentName, new Map());
           result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
           break;
+        }
         case 'update': {
+          if (input.settings !== undefined) {
+            throw new Error('`settings` lists names for a reset; to change a setting, give its name and new value');
+          }
+          const known = new Set<string>(['action', 'immediate', ...AgentFramework.AGENT_SETTINGS_CORE_KEYS]);
+          for (const ext of extensions.values()) ext.keys.forEach((key) => known.add(key));
+          const unknown = Object.keys(input).filter((key) => !known.has(key));
+          if (unknown.length > 0) {
+            throw new Error(`Unknown setting${unknown.length > 1 ? 's' : ''}: ${unknown.join(', ')}`);
+          }
           const patch: AgentRuntimeSettingsPatch = {};
           if (input.context_budget_tokens !== undefined) {
-            patch.contextBudgetTokens = Number(input.context_budget_tokens);
+            patch.contextBudgetTokens = settingNumber('context_budget_tokens', input.context_budget_tokens);
           }
-          if (input.tail_tokens !== undefined) patch.tailTokens = Number(input.tail_tokens);
+          if (input.tail_tokens !== undefined) patch.tailTokens = settingNumber('tail_tokens', input.tail_tokens);
           if (input.transition_pace_tokens !== undefined) {
-            patch.transitionPaceTokens = Number(input.transition_pace_tokens);
+            patch.transitionPaceTokens = settingNumber('transition_pace_tokens', input.transition_pace_tokens);
           }
           if (input.same_round_think_text_policy !== undefined) {
             patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
-          if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
+          if (input.immediate !== undefined) patch.immediate = settingBoolean('immediate', input.immediate);
           // Route extension-owned keys to their modules; apply the core patch
           // only when it touches core keys (an extension-only update must not
           // disturb a converging budget transition).
-          const extResults: Record<string, unknown> = {};
+          const slices: Array<{ ext: AgentSettingsExtension; slice: Record<string, unknown> }> = [];
           for (const ext of extensions.values()) {
             const slice: Record<string, unknown> = {};
             for (const key of ext.keys) {
               if (input[key] !== undefined) slice[key] = input[key];
             }
-            if (Object.keys(slice).length > 0) {
-              Object.assign(extResults, ext.update(agentName, slice));
-            }
+            if (Object.keys(slice).length > 0) slices.push({ ext, slice });
           }
           const coreTouched = Object.keys(patch).length > 0;
+          before = this.readAgentSettings(agentName, new Map(slices.map((s) => [s.ext, Object.keys(s.slice)])));
           const core = coreTouched
             ? this.updateAgentRuntimeSettings(agentName, patch)
             : this.getAgentRuntimeSettings(agentName);
+          const extResults: Record<string, unknown> = {};
+          for (const { ext, slice } of slices) Object.assign(extResults, ext.update(agentName, slice));
           result = {
             success: true,
             data: {
@@ -32449,27 +32526,33 @@ export class AgentFramework {
           break;
         }
         case 'reset': {
+          const extra = Object.keys(input).filter((key) => key !== 'action' && key !== 'settings');
+          if (extra.length > 0) {
+            throw new Error(`A reset doesn't take ${extra.join(', ')}: give the names to reset in \`settings\``);
+          }
           let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
           const extResetKeys = new Map<AgentSettingsExtension, string[]>();
           const resetsAllSettings = input.settings === undefined;
           if (input.settings !== undefined) {
             if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
-            const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
-              context_budget_tokens: 'contextBudgetTokens',
-              tail_tokens: 'tailTokens',
-              transition_pace_tokens: 'transitionPaceTokens',
-              same_round_think_text_policy: 'sameRoundThinkTextPolicy',
-            };
+            const names = new Map<string, keyof AgentRuntimeSettingsPatch>([
+              ['context_budget_tokens', 'contextBudgetTokens'],
+              ['tail_tokens', 'tailTokens'],
+              ['transition_pace_tokens', 'transitionPaceTokens'],
+              ['same_round_think_text_policy', 'sameRoundThinkTextPolicy'],
+            ]);
             keys = [];
             for (const name of input.settings) {
-              if (typeof name === 'string' && names[name]) {
-                keys.push(names[name]);
+              const coreKey = typeof name === 'string' ? names.get(name) : undefined;
+              if (coreKey) {
+                keys.push(coreKey);
                 continue;
               }
               const owner = [...extensions.values()].find(
                 (ext) => typeof name === 'string' && ext.keys.includes(name),
               );
               if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
+              if (!owner.reset) throw new Error(`${String(name)} can't be reset: give it the value you want with an update`);
               const list = extResetKeys.get(owner) ?? [];
               list.push(name as string);
               extResetKeys.set(owner, list);
@@ -32478,21 +32561,19 @@ export class AgentFramework {
           }
           const touchedSameRoundThinkTextPolicy =
             resetsAllSettings || keys?.includes('sameRoundThinkTextPolicy') === true;
-          const extResults: Record<string, unknown> = {};
-          if (input.settings === undefined) {
-            // Reset-all covers extensions too.
-            for (const ext of extensions.values()) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName));
-            }
-          } else {
-            for (const [ext, list] of extResetKeys) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
-            }
-          }
           const coreTouched = input.settings === undefined || keys !== undefined;
+          // Reset-all covers extensions too.
+          const extResets: Array<[AgentSettingsExtension, string[] | undefined]> = resetsAllSettings
+            ? [...extensions.values()].map((ext) => [ext, undefined])
+            : [...extResetKeys];
+          before = this.readAgentSettings(agentName, new Map(extResets.map(([ext, list]) => [ext, list ?? ext.keys])));
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);
+          const extResults: Record<string, unknown> = {};
+          for (const [ext, list] of extResets) {
+            if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
+          }
           result = {
             success: true,
             data: {
@@ -32513,9 +32594,12 @@ export class AgentFramework {
           throw new Error('agent_settings: action must be get, update, reset, or cancel');
       }
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
       result = {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: action === 'update' || action === 'reset' || action === 'cancel'
+          ? `${/[.!?]$/.test(reason.trim()) ? reason.trim() : `${reason.trim()}.`} ${this.settingsChangedSince(agentName, before)}`
+          : reason,
         isError: true,
       };
     }
