@@ -157,9 +157,14 @@ export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { descr
   });
 }
 
-/** A server's value as JSON, or a note where it's nested too deeply to show. */
+/** A server's value as JSON, or a note where it's nested too deeply, or too long, to show. */
 export function jsonText(value: unknown, space?: number): string {
-  return nestsWithin(value) ? JSON.stringify(value, null, space) ?? '' : '(nested too deeply to show)';
+  if (!nestsWithin(value)) return '(nested too deeply to show)';
+  try {
+    return JSON.stringify(value, null, space) ?? '';
+  } catch {
+    return '(too long to show)';
+  }
 }
 
 /** A tool's signature, description, class and input schema, for `look` naming a tool. */

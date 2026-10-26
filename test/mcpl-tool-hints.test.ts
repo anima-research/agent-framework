@@ -1124,7 +1124,7 @@ test('a toolsets/list naming a tool tools/list hasn\'t listed is recovered from,
   } finally { await t.done(); }
 });
 
-test('a recovery whose tools/list fails still reads toolsets/list, as connecting does', async () => {
+test('a recovery whose tools/list fails still reads toolsets/list, as connecting does, and tells what it says', async () => {
   let failing = false;
   const t = await setup((msg, peer) => {
     if (msg.method !== 'tools/list' || !failing) return false;
@@ -1134,10 +1134,13 @@ test('a recovery whose tools/list fails still reads toolsets/list, as connecting
   try {
     failing = true;
     const from = t.server.received.length;
+    const before = notices(t.fw).length;
+    t.state.open = [{ toolset: 'build', title: 'Workshop' }];
     t.state.next();
     t.server.peer.notify('tools/hints', t.state.hint([]));
     await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'tools/list'), 'the recovery read tools/list');
     await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'toolsets/list'), 'and then toolsets/list');
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('Workshop')), 'what toolsets/list said, told');
     await roundTrip(t);
     await settle(400); // past the 200 ms recovery debounce
     await roundTrip(t); // and the server has read whatever the host sent before it
@@ -2176,12 +2179,16 @@ test('a literal is written out up to 65 levels deep and cut to … past that, wh
     const dynamic = '"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true}';
     const nested = (levels: number) => `${'{"a":'.repeat(levels)}1${'}'.repeat(levels)}`;
     rawLine(t, `{"jsonrpc":"2.0","id":${JSON.stringify(held[0]!.id)},"result":{"tools":[${listed},`
-      + `{"name":"bounded","description":"Bounded.","inputSchema":{"type":"object","properties":{"a":{"const":${nested(65)}},"b":{"const":${nested(66)}}}},${dynamic}}],`
+      + `{"name":"bounded","description":"Bounded.","inputSchema":{"type":"object","properties":{"a":{"const":${nested(65)}},"b":{"const":${nested(66)}}}},${dynamic}},`
+      + `{"name":"edge","description":"Edge.","inputSchema":{"type":"object","properties":{"a":{"const":${nested(62)}}}},${dynamic}},`
+      + `{"name":"past","description":"Past.","inputSchema":{"type":"object","properties":{"a":{"const":${nested(63)}}}},${dynamic}}],`
       + `"_meta":{"mcpl/rev":${t.state.rev}}}}`);
     await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('bounded(')), 'the tool announced');
     const line = notices(t.fw).slice(before).join('\n').split('\n').find((l) => l.includes('bounded('))!;
     assert.ok(line.includes(`a?: ${nested(65)}, b?: …)`), line.slice(0, 200));
     assert.match(await look(t.fw, { server: 'arc', tool: 'bounded' }), /inputSchema:\n\(nested too deeply to show\)/);
+    assert.match(await look(t.fw, { server: 'arc', tool: 'edge' }), /inputSchema:\n\{\n  "type": "object"/);
+    assert.match(await look(t.fw, { server: 'arc', tool: 'past' }), /inputSchema:\n\(nested too deeply to show\)/);
   } finally { await t.done(); }
 });
 
