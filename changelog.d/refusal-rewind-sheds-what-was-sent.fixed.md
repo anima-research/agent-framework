@@ -19,8 +19,8 @@
     the rewind off, the refused reply stays.
   - **A stored row the refused request didn't carry**, such as a tuned-out
     channel's traffic or a message stored while the request streamed, is
-    left in place and isn't counted, unless it belongs to a tool exchange
-    the shed takes whole: a call's stored result, or a row stored between a
-    call and its result.
+    left in place and isn't counted, unless it's the stored result of a
+    call the refused request carried, stored right after that call, which
+    goes with it as one exchange.
   - **The shed after inference exhaustion** passes over rows the sanitizer
     leaves empty in the same way.
