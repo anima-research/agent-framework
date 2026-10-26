@@ -978,7 +978,7 @@ export class CheckedDir {
     private readonly lexical: string,
     private readonly dev: bigint,
     private readonly ino: bigint,
-    private readonly born: bigint = 0n,
+    private readonly born: bigint,
   ) {}
 
   /** Which directory it is. */

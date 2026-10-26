@@ -10,14 +10,14 @@
  * intent — tombstones, store origin, conflicts — lives in BranchIntents and
  * rewinds with the tree.
  *
- * P is evidence about one directory, so each mount also records the identity
- * (device, inode and birth time: sameRootIdentity) of the root that evidence
- * was gathered under. A root that isn't that directory any more (an unmounted
- * drive whose mountpoint is now empty, a replaced directory) is an unavailable
- * mount, never a disk on which every file was deleted; only an explicit
- * acceptance takes it, and that starts its evidence afresh. A place, where a
- * walk stopped (`walks`), binds no root: it only says where the next walk
- * starts, in whatever directory the root is by then.
+ * P is evidence about one directory, so each mount also records the identity of
+ * the root that evidence was gathered under (sameRootIdentity says when two
+ * name the same directory). A root that isn't that directory any more (an
+ * unmounted drive whose mountpoint is now empty, a replaced directory) is an
+ * unavailable mount, never a disk on which every file was deleted; only an
+ * explicit acceptance takes it, and that starts its evidence afresh. A place,
+ * where a walk stopped (`walks`), binds no root: it only says where the next
+ * walk starts, in whatever directory the root is by then.
  *
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
@@ -96,7 +96,8 @@ export type Physical = Agreed | Pending | Interrupted;
 
 /**
  * Which directory a mount root is: its device and inode, and its birth time
- * in nanoseconds where the filesystem reports one, as decimal strings.
+ * in nanoseconds as Node reports it, where that is above zero, as decimal
+ * strings.
  */
 export interface RootIdentity {
   dev: string;
