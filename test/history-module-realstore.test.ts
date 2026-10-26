@@ -405,46 +405,94 @@ describe('HistoryModule on a real store: a search that stops at maxScan with no 
     const tieMs = now - 20 * MIN;
     const out: Row[] = [];
     for (let i = 0; i < 6; i++) out.push({ text: `tie${i}`, channel: 'c', ms: tieMs });
+    for (let i = 0; i < 5; i++) out.push({ text: `other${i}`, channel: 'd', ms: now - (15 - i) * MIN });
     for (let i = 0; i < 4; i++) out.push({ text: `later${i}`, channel: 'c', ms: now - (10 - i) * MIN });
     return out;
   };
+  const rest = (d: any) => d.hint.split('. Continue')[0];
+  const kinds = [false, true] as const;
 
   it('says no message matched among those scanned and that this is not a negative result, with no count when no channel is given', async () => {
     const { mod } = build(rows());
-    for (const [order, regex] of [['oldest', false], ['newest', false], ['oldest', true], ['newest', true]] as const) {
-      const d = await call(mod, 'search', { query: 'needle', order, regex, maxScan: 3 });
-      assert.equal(d.truncated, true);
-      assert.deepEqual(d.matches, []);
-      assert.equal(
-        d.hint.split('. Continue')[0],
-        `No match among the ${order} 3 messages scanned (maxScan); the rest of this range was not searched, so this is not a negative result for the range`,
-      );
+    for (const regex of kinds) {
+      for (const order of ['oldest', 'newest'] as const) {
+        const d = await call(mod, 'search', { query: 'needle', order, regex, maxScan: 3 });
+        assert.equal(d.truncated, true);
+        assert.deepEqual(d.matches, []);
+        assert.equal(
+          rest(d),
+          `No match among the ${order} 3 messages scanned (maxScan); the rest of this range was not searched, so this is not a negative result for the range`,
+        );
+      }
     }
   });
 
-  it('gives the exact number of the range\'s messages not searched when a channel is given', async () => {
+  it("gives the exact number of the channel's messages in the range not searched when a channel is given", async () => {
     const { mod } = build(rows());
-    for (const [maxScan, rest] of [[3, '7 more in this range were not searched'], [9, '1 more in this range was not searched']] as const) {
-      const d = await call(mod, 'search', { query: 'needle', channelId: 'c', maxScan });
-      assert.equal(d.truncated, true);
-      assert.ok(d.hint.includes(`; ${rest}, so this is not a negative result`), d.hint);
+    const cases = [
+      [3, 'the oldest 3 messages scanned (maxScan); 7 more in this range were not searched'],
+      [9, 'the oldest 9 messages scanned (maxScan); 1 more in this range was not searched'],
+      [1, 'the oldest 1 message scanned (maxScan); 9 more in this range were not searched'],
+    ] as const;
+    for (const regex of kinds) {
+      for (const [maxScan, words] of cases) {
+        const d = await call(mod, 'search', { query: 'needle', channelId: 'c', regex, maxScan });
+        assert.equal(d.truncated, true);
+        assert.equal(rest(d), `No match among ${words}, so this is not a negative result for the range`);
+      }
     }
   });
 
-  it('counts the messages earlier calls scanned at the resume instant as searched', async () => {
+  it('counts the messages earlier calls scanned at the resume instant as searched, from either end', async () => {
     const { mod } = build(rows());
+    for (const order of ['oldest', 'newest'] as const) {
+      const first = await call(mod, 'search', { query: 'needle', channelId: 'c', order, maxScan: 3 });
+      const d = await call(mod, 'search', { query: 'needle', channelId: 'c', order, maxScan: 3, ...first.resume });
+      assert.equal(d.truncated, true);
+      assert.ok(rest(d).includes('; 4 more in this range were not searched'), `${order}: ${d.hint}`);
+    }
+  });
+
+  it('gives the exact number for a dense range, a millisecond larger than a page, and a resume that reaches the end of the range', async () => {
+    const now = Date.now();
+    const dense: Row[] = [{ text: 'elsewhere', channel: 'x', ms: now - 30 * 24 * 60 * MIN }];
+    for (let i = 0; i < 2000; i++) dense.push({ text: `dense${i}`, channel: 'd', ms: now - 3 * 24 * 60 * MIN + i * 1000 });
+    for (let i = 0; i < 5; i++) dense.push({ text: `q${i}`, channel: 'd', ms: now - (55 - 10 * i) * MIN });
+    const a = await call(build(dense).mod, 'search', { query: 'needle', channelId: 'd', order: 'newest', maxScan: 10 });
+    assert.ok(rest(a).includes('; 1995 more in this range were not searched'), a.hint);
+
+    const T = now - 60 * MIN;
+    const tie: Row[] = [{ text: 'm-old', channel: 'x', ms: now - 30 * 24 * 60 * MIN }];
+    for (let i = 0; i < 1100; i++) tie.push({ text: `m-tie${i}`, channel: 'd', ms: T });
+    for (let i = 0; i < 3; i++) tie.push({ text: `m-late${i}`, channel: 'd', ms: now - (30 - 10 * i) * MIN });
+    const b = await call(build(tie).mod, 'search', { query: 'needle', channelId: 'd', order: 'newest', maxScan: 10 });
+    assert.ok(rest(b).includes('; 1093 more in this range were not searched'), b.hint);
+
+    const short: Row[] = [];
+    for (let i = 0; i < 6; i++) short.push({ text: `tie${i}`, channel: 'c', ms: T });
+    for (let i = 0; i < 2; i++) short.push({ text: `later${i}`, channel: 'c', ms: now - (10 - i) * MIN });
+    const { mod } = build(short);
     const first = await call(mod, 'search', { query: 'needle', channelId: 'c', maxScan: 3 });
-    const d = await call(mod, 'search', { query: 'needle', channelId: 'c', maxScan: 3, ...first.resume });
-    assert.equal(d.truncated, true);
-    assert.ok(d.hint.includes('; 4 more in this range were not searched'), d.hint);
+    const c = await call(mod, 'search', { query: 'needle', channelId: 'c', maxScan: 3, ...first.resume });
+    assert.ok(rest(c).includes('; 2 more in this range were not searched'), c.hint);
   });
 
   it('does not say "no match" when the truncated scan found one', async () => {
     const { mod } = build(rows());
-    const d = await call(mod, 'search', { query: 'tie1', channelId: 'c', maxScan: 3 });
-    assert.equal(d.truncated, true);
-    assert.equal(d.matches.length, 1);
-    assert.doesNotMatch(d.hint, /No match/);
+    for (const regex of kinds) {
+      const d = await call(mod, 'search', { query: 'tie1', channelId: 'c', regex, maxScan: 3 });
+      assert.equal(d.truncated, true);
+      assert.equal(d.matches.length, 1);
+      assert.doesNotMatch(d.hint, /No match/);
+    }
+  });
+
+  it('names only channelId and dates as narrowing when the scan stopped at maxScan, and author too when it stopped at limit', async () => {
+    const { mod } = build(rows());
+    const scan = await call(mod, 'search', { query: 'tie', channelId: 'c', maxScan: 3 });
+    assert.match(scan.hint, /or narrow with channelId\/dates\.$/);
+    const limit = await call(mod, 'search', { query: 'tie', channelId: 'c', limit: 1 });
+    assert.match(limit.hint, /or narrow with channelId\/author\/dates\.$/);
   });
 });
 
@@ -457,15 +505,17 @@ describe('HistoryModule on a real store: an author-filtered extract that stops a
     return out;
   };
 
-  it('says returning none is not a negative result for the window, with or without a channel', async () => {
+  it('says returning none is not a negative result for the window, whatever left the page empty', async () => {
     const { mod } = build(rows());
-    for (const channel of [{}, { channelId: 'c' }]) {
-      const d = await call(mod, 'extract', { author: 'antra', maxScan: 3, ...channel });
-      assert.equal(d.truncated, true);
-      assert.deepEqual(d.messages, []);
+    const cases = [{ author: 'antra' }, { author: 'antra', channelId: 'c' }, { excludeAuthor: 'bob' }, { author: 'bob', offset: 5 }];
+    for (const filter of cases) {
+      const d = await call(mod, 'extract', { maxScan: 3, ...filter });
+      assert.equal(d.truncated, true, JSON.stringify(filter));
+      assert.deepEqual(d.messages, [], JSON.stringify(filter));
       assert.equal(
         d.hint.split(' Continue')[0],
         'Stopped after scanning 3 messages of the window without reaching its end, so returning none is not a negative result for the window.',
+        JSON.stringify(filter),
       );
     }
   });
