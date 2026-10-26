@@ -75,6 +75,8 @@ export interface ChangeSet {
   notes: string[];
   /** Ended records' notes, by id: rendered while the id is untold, told once the set reaches an agent (markTold). */
   ended?: Array<{ id: string; note: string }>;
+  /** false when its taker showed the change without its blocks (a look that restates the present shows the live catalog instead): told() then counts none of its definitions shown, while a notice that tells it still shows them. */
+  blocksShown?: false;
 }
 
 export const emptyChange = (): ChangeSet => ({ changes: [], suggest: [], notes: [] });

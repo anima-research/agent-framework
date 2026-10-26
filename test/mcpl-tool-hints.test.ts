@@ -1184,12 +1184,13 @@ test('two paged tools/lists read at once each apply whole, never mixed', async (
     const answer = (i: number, result: Json) => pages[i]!.peer.reply(pages[i]!.msg.id, result);
     const rev = t.state.rev;
     const peekFrom = (list: string, visible: boolean) => ({ name: 'peek', description: `From list ${list}.`, inputSchema: { type: 'object', properties: {} }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': visible } });
-    answer(0, { tools: TOOLS.slice(0, 3), nextCursor: 'a2', _meta: { 'mcpl/rev': rev } });
+    answer(0, { tools: [{ ...TOOLS[0]!, description: 'Status, from list A.' }, ...TOOLS.slice(1, 3)], nextCursor: 'a2', _meta: { 'mcpl/rev': rev } });
     answer(1, { tools: [...TOOLS.slice(0, 4), peekFrom('B', false)], _meta: { 'mcpl/rev': rev } });
     await waitFor(() => pages.length >= 3, 'the first list\'s second page asked for');
     answer(2, { tools: [TOOLS[3]!, peekFrom('A', true)], _meta: { 'mcpl/rev': rev } });
     await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('peek() — From list A.')), 'the first list applied whole, its second page included');
-    assert.match(await look(t.fw, { server: 'arc', tool: 'status' }), /Status of the arcade\./, 'its first page included too');
+    assert.match(await look(t.fw, { server: 'arc', tool: 'status' }), /Status, from list A\./, 'its first page included too');
+    assert.ok(t.fw.framework.getAllTools().some((x) => x.name === 'arc--status'), 'and the model\'s tool list holds it');
     assert.match(await look(t.fw, { server: 'arc', tool: 'peek' }), /From list A\./);
   } finally { await t.done(); }
 });
@@ -1282,15 +1283,28 @@ test('look with a tool or toolset, or one that fails, tells its re-read\'s chang
   } finally { await t.done(); }
 });
 
-test('a definition first described in a notice that wasn\'t written is described again (in process: a server\'s grant doesn\'t change while it\'s connected, so a refused notice can\'t be followed by a written one)', () => {
-  let writing = false;
-  const { told, read } = tappedController(() => writing);
-  read({ kind: 'hints', params: { rev: 1, tools: [{ name: 'peek', visible: true }] } });
-  read({ kind: 'hints', params: { rev: 2, tools: [{ name: 'peek', visible: false }] } });
-  writing = true;
-  read({ kind: 'hints', params: { rev: 3, tools: [{ name: 'peek', visible: true }] } });
-  assert.equal(told.length, 1);
-  assert.match(told[0]!, /peek\(\) — Peek around\./);
+test('a definition first described in a notice that wasn\'t written is described again once the server is granted pushEvents', async () => {
+  let advert: Json = { ...ADVERT, pushEvents: false };
+  const t = await setup((msg, peer) => {
+    if (msg.method === 'mcpl/manifest') { peer.reply(msg.id, { version: '0.5', ...advert }); return true; }
+    return false;
+  }, {}, advert);
+  const count = (method: string) => t.methods().filter((m) => m === method).length;
+  try {
+    const before = notices(t.fw).length;
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: false }]));
+    await roundTrip(t);
+    assert.equal(notices(t.fw).length, before, 'no notice without the grant');
+    const [manifests, lists] = [count('mcpl/manifest'), count('tools/list')];
+    advert = { ...ADVERT, pushEvents: true };
+    t.server.peer.notify('mcpl/manifestChanged', { revision: 'r2', domains: ['featureSets'] });
+    await waitFor(() => count('mcpl/manifest') > manifests && count('tools/list') > lists, 'the manifest fetched again and applied');
+    await roundTrip(t);
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('peek()')), 'peek told');
+    assert.match(notices(t.fw).slice(before).join('\n'), /peek\(\) — Peek around\./);
+  } finally { await t.done(); }
 });
 
 test('a push\'s change that nothing takes is told as a notice (in process: a push refused before the push path reads it needs a stopping host)', async () => {
@@ -1391,7 +1405,7 @@ test('a recovery whose own tools/list straddled a change starts no second recove
   } finally { await t.done(); }
 });
 
-test('look at a toolset whose options a server nests very deep still answers (in process: a manifest nested that deep isn\'t taken by the framework\'s manifest read, so no server reaches it)', async () => {
+test('look at a toolset whose options a server nests very deep still answers (in process: the suite\'s scripted server writes its initialize answer with JSON.stringify, which can\'t write options that deep)', async () => {
   let deep: Json = { type: 'string' };
   for (let i = 0; i < 20000; i++) deep = { type: 'object', properties: { a: deep } };
   const { hub, c } = tappedController();
@@ -2067,7 +2081,7 @@ test('a look that restates the present counts as shown only what it showed: a to
   } finally { await t.done(); await far.close(); }
 });
 
-test('a tool whose schema holds a literal nested very deep, or whose description or class is an object, is announced and looked at', async () => {
+test('a tool whose schema holds a literal nested very deep or a type that isn\'t text, or whose description or class entries are objects, is announced and looked at', async () => {
   const { t, holding, held } = await holdingServer();
   try {
     holding.add('tools/list');
@@ -2079,13 +2093,33 @@ test('a tool whose schema holds a literal nested very deep, or whose description
     const dynamic = '"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true}';
     const deep = `${'{"a":'.repeat(20000)}1${'}'.repeat(20000)}`;
     rawLine(t, `{"jsonrpc":"2.0","id":${JSON.stringify(held[0]!.id)},"result":{"tools":[${listed},`
-      + `{"name":"peek","description":{"toString":1},"inputSchema":{"type":"object","properties":{}},"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true,"mcpl/class":[{"toString":1}]}},`
-      + `{"name":"fixed","description":"Fixed.","inputSchema":{"type":"object","properties":{"a":{"const":${deep}},"b":{"enum":[${deep}]},"c":{"type":"string","default":${deep}}}},${dynamic}}],`
+      + `{"name":"peek","description":{"toString":1},"inputSchema":{"type":"object","properties":{}},"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true,"mcpl/class":["game",{"toString":1}]}},`
+      + `{"name":"fixed","description":"Fixed.","inputSchema":{"type":"object","properties":{"a":{"const":${deep}},"b":{"enum":[${deep}]},"c":{"type":"string","default":${deep}},"d":{"type":{"toString":1}},"e":{"type":["string",{"toString":1}]}}},${dynamic}}],`
       + `"_meta":{"mcpl/rev":${t.state.rev}}}}`);
     await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('fixed(')), 'the tools announced');
-    assert.match(notices(t.fw).slice(before).join('\n'), /fixed\(a\?: …, b\?: …, c\?: string =…\) — Fixed\./);
+    assert.match(notices(t.fw).slice(before).join('\n'), /fixed\(a\?: …, b\?: …, c\?: string =…, d\?: any, e\?: string\) — Fixed\./);
     const peek = await look(t.fw, { server: 'arc', tool: 'peek' });
-    assert.match(peek, /^peek\(\)\ninputSchema:/, 'no description and no class line where they aren\'t text');
-    assert.match(await look(t.fw, { server: 'arc', tool: 'fixed' }), /^fixed\(a\?: …, b\?: …, c\?: string =…\)\nFixed\./);
+    assert.match(peek, /^peek\(\)\nclass: game\ninputSchema:/, 'no description where it isn\'t text, and only the class entries that are');
+    assert.match(await look(t.fw, { server: 'arc', tool: 'fixed' }), /^fixed\(a\?: …, b\?: …, c\?: string =…, d\?: any, e\?: string\)\nFixed\./);
+  } finally { await t.done(); }
+});
+
+test('a puppet look that restates the present, whose pair can\'t be stored, tells the change it found as a notice', async () => {
+  const t = await setup();
+  try {
+    const cm = t.fw.framework.getAgent('scout')!.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    let refused = false;
+    cm.addMessage = ((...args: Parameters<typeof add>) => {
+      if (!refused) {
+        refused = true;
+        throw new Error('the store refused the write');
+      }
+      return add(...args);
+    }) as typeof cm.addMessage;
+    const before = notices(t.fw).length;
+    t.state.statement = [{ name: 'peek', visible: true }];
+    await assert.rejects(t.fw.framework.puppetToolCall('scout', 'toolsets--look', { server: 'arc' }), /the store refused the write/);
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('peek()')), 'the change look found, told as a notice');
   } finally { await t.done(); }
 });

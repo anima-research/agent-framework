@@ -366,7 +366,8 @@ export class ToolsetController {
     const text = this.presence.render(cs, { mark: false });
     if (!text) return 'empty';
     if (!this.deps.notify(this.serverId, text, { invite: cs.suggest.some((s) => s.action === 'open') })) return 'refused';
-    this.told(cs);
+    this.presence.markTold(cs.ended);
+    this.presence.markShown(cs);
     return 'told';
   }
 
@@ -428,7 +429,7 @@ export class ToolsetController {
   /** A change its taker showed to an agent: its ended records count as told, and the definitions it describes as shown. */
   told(cs: ChangeSet): void {
     this.presence.markTold(cs.ended);
-    this.presence.markShown(cs);
+    if (cs.blocksShown !== false) this.presence.markShown(cs);
   }
 
   /** A change its taker couldn't show, told as a notice instead, or dropped when none can be written. */
