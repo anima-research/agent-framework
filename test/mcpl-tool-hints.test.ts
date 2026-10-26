@@ -328,7 +328,7 @@ test('a close answered after its timeout still closes the instance it named, and
     const connection = (t.fw.framework as unknown as { mcplServerRegistry: { getServer(id: string): { sendToolsetsClose(p: Json, ms: number): Promise<unknown> } } })
       .mcplServerRegistry.getServer('arc');
     await assert.rejects(connection.sendToolsetsClose({ toolset: 'game', instance: 'g1' }, 300));
-    assert.ok(held, 'the close reached the server');
+    await waitFor(() => held !== null, 'the close reached the server');
     const h = held as unknown as { id: unknown; peer: ScriptedPeer };
     h.peer.reply(h.id, { content: [] });
     await waitFor(() => notices(t.fw).some((x) => x.includes('[arc/game:g1] closed.')), 'the late close told');
