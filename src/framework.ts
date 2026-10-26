@@ -2400,15 +2400,16 @@ export function disposalAlert(disposal: {
     ? ''
     : releasePostponed
       ? `${goes}its window's release was postponed to the host's resume, which stores what its store takes of ${them} ` +
-        'there and passes any failed reply on to the primary agent. A stop() before the resume drops all but a ' +
-        "failed reply, logged, and after a crash the restarted host's resume drops them the same way; that reply " +
-        "goes to the primary at the restarted host's resume."
+        'there and passes on to the primary agent each failed reply, channel notice the fork could have acted on, ' +
+        'or module write for it. A stop() before the resume drops the rest, logged, and those go to the primary ' +
+        "at the restarted host's resume; after a crash, that resume does the same."
       : cleanupFailed
         ? ` ${writes} held for it while the store was held may be in its window, where no agent reads ${them}, ` +
           'still queued under its name, or in neither, as far as that cleanup got. A flush that meets one still ' +
-          'queued passes a failed reply on to the primary agent and drops anything else, logged.'
-        : `${goes}its window's release stored what its store took of ${them} there and passed any failed reply on ` +
-          'to the primary agent.';
+          "queued passes it on to the primary agent if it's a failed reply, a channel notice the fork could have " +
+          'acted on, or a module write for it, and drops anything else, logged.'
+        : `${goes}its window's release stored what its store took of ${them} there and passed on to the primary ` +
+          'agent each failed reply, channel notice the fork could have acted on, or module write for it.';
   return {
     opening,
     message: `${opening} That fork is seeded from the template, under a new name.${held} ` +

@@ -16,6 +16,7 @@ import type {
   TokenBudget,
 } from '@animalabs/context-manager';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
+import type { Module, ModuleContext } from '../src/index.js';
 import {
   REINIT_MOVES, TEMPLATE_REMEDIES, disposalAlert, longHoldAlert, opsWebhookText, refusedWorkAlert, restoreAlert, type AgentKind,
   type ReinitAlertText,
@@ -1698,7 +1699,7 @@ describe('conversation forks and an undo', () => {
       }
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /couldn't be seeded again, so it was unregistered and its channel unbound, but its cleanup failed \(below\)\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The write held for it while the store was held may be in its window, where no agent reads it, still queued under its name, or in neither, as far as that cleanup got\. A flush that meets one still queued passes a failed reply on to the primary agent and drops anything else, logged\. .*It couldn't be seeded because its seeding from the template failed: .*injected seed failure\. Its cleanup failed: .*injected release failure\.$/);
+      assert.match(reinit[0]!.message, /couldn't be seeded again, so it was unregistered and its channel unbound, but its cleanup failed \(below\)\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The write held for it while the store was held may be in its window, where no agent reads it, still queued under its name, or in neither, as far as that cleanup got\. A flush that meets one still queued passes it on to the primary agent if it's a failed reply, a channel notice the fork could have acted on, or a module write for it, and drops anything else, logged\. .*It couldn't be seeded because its seeding from the template failed: .*injected seed failure\. Its cleanup failed: .*injected release failure\.$/);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is unregistered');
       assert.equal(router.getBinding({ serverId: 'world', channelId: 'world:late' }), undefined, 'its channel is unbound');
@@ -2147,7 +2148,7 @@ describe('conversation forks and an undo', () => {
       assert.deepEqual(storedTexts(late), ['FIRST DURING THE UNDO', 'SECOND DURING THE UNDO'], 'the held writes are in its window');
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /so it was disposed and its channel unbound\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The 2 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release stored what its store took of them there and passed any failed reply on to the primary agent\. Its messages stay on the branches/);
+      assert.match(reinit[0]!.message, /so it was disposed and its channel unbound\. Its channel's next qualifying message spawns a new fork, unless its seeding fails again\. That fork is seeded from the template, under a new name\. The 2 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release stored what its store took of them there and passed on to the primary agent each failed reply, channel notice the fork could have acted on, or module write for it\. Its messages stay on the branches/);
     });
   });
 
@@ -2184,21 +2185,30 @@ describe('conversation forks and an undo', () => {
 
   for (const after of ['resume', 'stop', 'crash', 'cleanup', 'released before the report'] as const) {
     it(after === 'resume'
-      ? "a fork disposed on a quiesced host: its window takes the writes held for it at the host's resume, and the primary is told of a failed reply"
+      ? "a fork disposed on a quiesced host: its window takes the writes held for it at the host's resume, and a failed reply, a channel notice it could act on and a module's write for it each reach the primary"
       : after === 'stop'
-        ? "a fork disposed on a quiesced host: a stop before the resume drops its held writes, logged, stored nowhere, and passes a failed reply on to the primary, told at the restarted host's resume"
+        ? "a fork disposed on a quiesced host: a stop before the resume drops its other held writes, logged, stored nowhere, and a failed reply, a channel notice it could act on and a module's write for it each reach the primary at the restarted host's resume"
         : after === 'crash'
-          ? "a fork disposed on a quiesced host: after a crash, the restarted host's resume drops its held writes, logged, stored nowhere, and passes a failed reply on to the primary"
+          ? "a fork disposed on a quiesced host: after a crash, the restarted host's resume drops its other held writes, logged, stored nowhere, and a failed reply, a channel notice it could act on and a module's write for it each reach the primary"
           : after === 'cleanup'
             ? "a fork disposed on a quiesced host whose cleanup then fails: its alert says the release was postponed to the resume, which takes the writes held for it"
             : "a fork disposed on a quiesced host whose postponed release runs before the alert is made: the alert says the release was postponed, as the disposal met it",
     { timeout: 90_000 }, async () => {
       const tempDir = mkdtempSync(join(tmpdir(), `reinit-fork-quiesced-${after}-`));
+      let courier: ModuleContext | undefined;
+      const courierModule = (): Module => ({
+        name: 'courier',
+        async start(ctx: ModuleContext) { courier ??= ctx; },
+        async stop() {},
+        getTools: () => [],
+        async handleToolCall() { return { success: true }; },
+        async onProcess() { return {}; },
+      });
       const config = () => ({
         storePath: join(tempDir, 'store'),
         membrane: new MockMembrane().asMembrane(),
         agents: [{ name: 'a', model: 'test-model', systemPrompt: 'You are a.', strategy: autobiographical() }],
-        modules: [],
+        modules: [courierModule()],
         conversations: { templateAgent: 'a', bind: { channel: 'mention' as const }, strategyFactory: () => autobiographical() },
       });
       type Queue = {
@@ -2208,8 +2218,15 @@ describe('conversation forks and an undo', () => {
       };
       const queuedForFork = (framework: AgentFramework) =>
         (framework as unknown as Queue).deferredMessages.filter((msg) => msg.forAgent === 'a-late-g1').length;
-      const notices = (framework: AgentFramework) => storedTexts(framework.getAgent('a')!.getContextManager())
-        .filter((text) => text.startsWith('[discord-send-failed] A reply by a-late-g1'));
+      const passedOn = (framework: AgentFramework) => {
+        const texts = storedTexts(framework.getAgent('a')!.getContextManager());
+        return {
+          failedReply: texts.filter((text) => text.startsWith('[discord-send-failed] A reply by a-late-g1')).length,
+          channelNotice: texts.filter((text) => text.startsWith('[channels] Now open: #late (c-late): a message from a-late-g1')).length,
+          moduleWrite: texts.filter((text) => text === 'A MODULE WRITE FOR THE FORK').length,
+        };
+      };
+      const eachOnce = { failedReply: 1, channelNotice: 1, moduleWrite: 1 };
       const logged: string[] = [];
       const error = console.error;
       console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -2253,6 +2270,9 @@ describe('conversation forks and an undo', () => {
             }
             const failed = { kind: 'discord-send-failed', channelId: 'world:late', reason: 'injected send failure', textLen: 19, outcome: 'failed' };
             assert.equal((framework as unknown as Queue).addMessage('a-late-g1', [{ type: 'text', text: 'A REPLY THAT FAILED' }], failed, { forAgent: 'a-late-g1' }), '', 'deferred');
+            const opened = { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId: 'world', cause: 'opened-by-reply', channels: [{ channelId: 'c-late', label: '#late' }] } };
+            assert.equal((framework as unknown as Queue).addMessage('user', [{ type: 'text', text: '[channels] Now open: #late (c-late): your own message into the closed channel opened it.' }], opened, { forAgent: 'a-late-g1' }), '', 'deferred');
+            assert.match(courier!.addMessage('courier', [{ type: 'text', text: 'A MODULE WRITE FOR THE FORK' }], undefined, { forAgent: 'a-late-g1' }), /^held:/, 'deferred');
             (cmA as unknown as { compile: () => Promise<never> }).compile = async () => { throw new Error('injected template compile failure'); };
           });
         } finally {
@@ -2260,18 +2280,26 @@ describe('conversation forks and an undo', () => {
           owner.evictTurnCheckpoints = evict;
         }
         assert.ok(!framework.getAgent('a-late-g1'), 'disposed');
+        const store = framework.getStore();
+        try {
+          store.registerState({ id: 'mcpl/channel-lifecycle', strategy: 'append_log' } as never);
+        } catch (err) {
+          if (!/exist/i.test(String(err))) throw err;
+        }
+        store.appendToStateJson('mcpl/channel-lifecycle', { kind: 'desired-state', serverId: 'world', channelId: 'c-late', desired: 'open', source: 'opened-by-reply' });
+        store.sync();
         if (after === 'released before the report') {
           assert.equal(queuedForFork(framework), 0, 'its release took them');
           assert.ok(!(framework as unknown as Queue).releasesAfterResume.has('a-late-g1'), 'and has run');
           const window = storedTexts(late);
-          assert.equal(window.filter((text) => /DURING THE UNDO|A REPLY THAT FAILED/.test(text)).length, 3, JSON.stringify(window));
+          assert.equal(window.filter((text) => /DURING THE UNDO|A REPLY THAT FAILED|c-late|A MODULE WRITE FOR THE FORK/.test(text)).length, 5, JSON.stringify(window));
         } else {
-          assert.equal(queuedForFork(framework), 3, 'its held writes stay queued while the host is quiesced');
+          assert.equal(queuedForFork(framework), 5, 'its held writes stay queued while the host is quiesced');
           assert.ok((framework as unknown as Queue).releasesAfterResume.has('a-late-g1'), 'its release waits for the resume');
         }
         const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
         assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-        assert.match(reinit[0]!.message, / The 3 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release was postponed to the host's resume, which stores what its store takes of them there and passes any failed reply on to the primary agent\. A stop\(\) before the resume drops all but a failed reply, logged, and after a crash the restarted host's resume drops them the same way; that reply goes to the primary at the restarted host's resume\. Its messages stay on the branches/);
+        assert.match(reinit[0]!.message, / The 5 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release was postponed to the host's resume, which stores what its store takes of them there and passes on to the primary agent each failed reply, channel notice the fork could have acted on, or module write for it\. A stop\(\) before the resume drops the rest, logged, and those go to the primary at the restarted host's resume; after a crash, that resume does the same\. Its messages stay on the branches/);
         if (after === 'cleanup') {
           assert.match(reinit[0]!.message, /, but its cleanup failed \(below\)\. /);
           assert.match(reinit[0]!.message, / Its cleanup failed: .*injected checkpoint eviction failure\.$/);
@@ -2284,13 +2312,13 @@ describe('conversation forks and an undo', () => {
           const booted = await AgentFramework.create({ ...config(), storePath: join(crashed, 'store') });
           try {
             const kept = (booted as unknown as { deferredMessages: Array<{ forAgent?: string; content: unknown }> }).deferredMessages
-              .filter((msg) => /DURING THE UNDO|A REPLY THAT FAILED|A reply by a-late-g1/.test(JSON.stringify(msg.content)));
-            assert.equal(kept.length, 3, `the persisted queue kept the three: ${JSON.stringify(kept)}`);
+              .filter((msg) => /DURING THE UNDO|A REPLY THAT FAILED|A reply by a-late-g1|c-late|A MODULE WRITE FOR THE FORK/.test(JSON.stringify(msg.content)));
+            assert.equal(kept.length, 5, `the persisted queue kept the five: ${JSON.stringify(kept)}`);
             await booted.resume();
             assert.equal(queuedForFork(booted), 0, 'nothing stays queued for the fork');
             const dropped = logged.slice(mark).filter((line) => /delivery target "a-late-g1" is not a registered agent/.test(line));
             assert.equal(dropped.length, 2, logged.slice(mark).join('\n'));
-            assert.equal(notices(booted).length, 1, 'the primary is told of the failed reply');
+            assert.deepEqual(passedOn(booted), eachOnce, 'the primary gets each of the three');
             const window = await StoreWindow.open({
               store: booted.getStore(), namespace: 'conversations/a-late-g1', isolate: true, strategy: new PassthroughStrategy(),
             });
@@ -2307,8 +2335,8 @@ describe('conversation forks and an undo', () => {
           await framework.resume();
           assert.equal(queuedForFork(framework), 0);
           const window = storedTexts(late);
-          assert.equal(window.filter((text) => /DURING THE UNDO|A REPLY THAT FAILED/.test(text)).length, 3, JSON.stringify(window));
-          assert.equal(notices(framework).length, 1, 'the primary is told of the failed reply');
+          assert.equal(window.filter((text) => /DURING THE UNDO|A REPLY THAT FAILED|c-late|A MODULE WRITE FOR THE FORK/.test(text)).length, 5, JSON.stringify(window));
+          assert.deepEqual(passedOn(framework), eachOnce, 'the primary gets each of the three');
           await framework.stop();
         } else {
           const mark = logged.length;
@@ -2319,11 +2347,11 @@ describe('conversation forks and an undo', () => {
           const booted = await AgentFramework.create(config());
           try {
             const kept = (booted as unknown as { deferredMessages: Array<{ forAgent?: string; content: unknown }> }).deferredMessages
-              .filter((msg) => /DURING THE UNDO|A REPLY THAT FAILED|A reply by a-late-g1/.test(JSON.stringify(msg.content)));
-            assert.equal(kept.length, 1, `the persisted queue kept the failed reply, for the primary: ${JSON.stringify(kept)}`);
-            assert.equal(kept[0]!.forAgent, undefined, "the primary's");
+              .filter((msg) => /DURING THE UNDO|A REPLY THAT FAILED|A reply by a-late-g1|c-late|A MODULE WRITE FOR THE FORK/.test(JSON.stringify(msg.content)));
+            assert.equal(kept.length, 3, `the persisted queue kept the three for the primary: ${JSON.stringify(kept)}`);
+            assert.deepEqual(kept.map((msg) => msg.forAgent), [undefined, undefined, undefined], "the primary's");
             await booted.resume();
-            assert.equal(notices(booted).length, 1, 'the primary is told of the failed reply');
+            assert.deepEqual(passedOn(booted), eachOnce, 'the primary gets each of the three');
             const window = await StoreWindow.open({
               store: booted.getStore(), namespace: 'conversations/a-late-g1', isolate: true, strategy: new PassthroughStrategy(),
             });

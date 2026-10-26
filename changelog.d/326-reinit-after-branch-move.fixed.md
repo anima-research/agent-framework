@@ -74,13 +74,13 @@
   the template is missing or failed to re-initialize, is disposed rather than left to
   answer with no history: `context-reinit-failed` says so and why. The
   writes held for it while the store was held go with it: its window's
-  release stores what its store takes of them there and passes any failed
-  reply on to the primary agent. On a quiesced host that release is
-  postponed to the resume. A `stop()` before the resume drops all but a
-  failed reply, logged, and after a crash the restarted host's resume drops
-  them the same way; that reply goes to the primary at the restarted host's
-  resume. The alert says how many, and which of these the disposal
-  met, since the fork its channel spawns next, under a new name,
+  release stores what its store takes of them there and passes on to the
+  primary agent each failed reply, channel notice the fork could have acted
+  on, or module write for it. On a quiesced host that release is postponed
+  to the resume. A `stop()` before the resume drops the rest, logged, and
+  those go to the primary at the restarted host's resume; after a crash,
+  that resume does the same. The alert says how many, and which of these
+  the disposal met, since the fork its channel spawns next, under a new name,
   doesn't get them. If
   disposing it fails partway, the alert says that too, and the move's other
   conversation agents are still seeded. Its channel's next qualifying message spawns a
