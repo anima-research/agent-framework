@@ -99,6 +99,31 @@ export function readMarkOf(cm: MarkCm): ReadMark | null {
 }
 
 /**
+ * A mark of where `cm` stands now, as readMarkOf takes one, that covers its
+ * window only below `length` (an index length of that window, at most its
+ * own): for a redo on the window (AgentFramework.redo), which puts back,
+ * at new ordinals and in their order, rows a mark covered before they were
+ * undone and rows it didn't, so the mark it gives again covers the first
+ * and not the rest. Null where readMarkOf gives null, and in legacy mode,
+ * where a mark has no length.
+ */
+export function readMarkThrough(cm: MarkCm, length: number): ReadMark | null {
+  const now = readMarkOf(cm);
+  if (!now || now[LENGTH] === null) return null;
+  return mark(now.branch, now[HEAD], Math.min(length, now[LENGTH]));
+}
+
+/**
+ * Whether a mark covers rows by their ordinals in a window (one taken in
+ * presented mode): a row taken out of the window and presented again, at a
+ * new ordinal past its length, leaves it. A mark taken in legacy mode
+ * covers by sequence, which no presentation moves.
+ */
+export function coversByOrdinal(mark: ReadMark | null): boolean {
+  return !!mark && mark[LENGTH] !== null;
+}
+
+/**
  * A test of many rows against one mark, read against `reader` (the manager
  * whose window the mark is of), which reads the reader's branch and mode
  * once. The rules:

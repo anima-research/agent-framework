@@ -15,6 +15,13 @@
   result's `window` field (`{ retracted, represented }`) says how many rows left or entered it, and a
   `window:undone` trace is emitted. The API server broadcasts a `window:undone` event (with the agent's name, the
   counts and the reason) for them. `TurnCheckpoint` records the window's index length and branch while the context
-  is presented.
+  is presented. A redo first takes out the rows presented since its undo, which the agent's next point presents
+  after the redone turn, so undos redone in turn give back the window they took, in its order. The agent's read
+  marks that covered the undone rows (consumed, shown, answered, and each destination's) cover them again once a
+  redo puts them back, so a row the redone reply answered isn't taken back as unread. An undo cut short after rows
+  left the window (its second retraction refused) is refused with `OperatorActionError` `'failed'` and can be
+  redone, or finished by another undo. A redo is refused on another branch than its undo's, where
+  `getUndoRedoState().canRedo` is false, and every branch move the framework makes drops the redo entries. A stored
+  injection whose copy an undo took out of the window is stored again at the next start.
 - `WorkspaceModule.useWindow(lookup)`: how the framework tells the workspace whether an agent's window still holds
   the turn that wrote a mount direct, so the head-move notice follows an undo that moves no branch.

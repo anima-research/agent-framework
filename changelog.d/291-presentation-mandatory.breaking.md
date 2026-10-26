@@ -13,7 +13,8 @@
     are both the store's branch and its `window` says how many rows left or entered; the `undo:completed` and
     `redo:completed` traces are removed in favour of `window:undone`, and the API server broadcasts `window:undone`
     in place of `branch:switched` for them. Both are refused while a turn of the agent's is alive, and for an agent
-    whose window isn't presented.
+    whose window isn't presented; a redo also on another branch than its undo's, which the base redo switched back
+    to.
   - **Context-manager's MANIFEST:** with a chronicle that has the batched identity append, the first window
     write-down that holds rows, or any presentation of more than one row, moves the store's MANIFEST to version 2,
     which earlier chronicle builds refuse (context-manager's 291-window-batches entry). Going back to an earlier

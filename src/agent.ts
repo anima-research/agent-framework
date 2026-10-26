@@ -260,6 +260,17 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
   return { maxConsecutive: max };
 }
 
+/** A stored injection's copy a compile built to send rendered (Agent.renderedInjection). */
+interface RenderedInjectionCopy {
+  /** The row's id: the body the compile's provenance names. */
+  id: MessageId;
+  part: number;
+  parts: number;
+  /** Whether the compile held the part: every shard of it, however the strategy shaped it. */
+  held: boolean;
+  sequence: number;
+}
+
 /** A branch's key in Agent.unsentSince: its id and when it was created. */
 function branchKey(branch: { readonly id: string; readonly created: number }): string {
   return `${branch.id}\u0000${branch.created}`;
@@ -1256,6 +1267,44 @@ export class Agent {
     return !!noted && covers(noted, cm, row) === 'covered';
   }
 
+  /**
+   * Every read mark this agent holds: its consumed, shown and answered
+   * watermarks and the mark noted for each destination it published into,
+   * each mark once (two of them are often the one mark). A redo on the
+   * window (AgentFramework.redo) reads which of them covered the rows it
+   * puts back, and gives those marks again (replaceReadMarks).
+   */
+  heldReadMarks(): ReadMark[] {
+    const held = new Set<ReadMark>();
+    for (const mark of [this.consumedWatermark, this.shownWatermark, this.answeredWatermark, ...this.publishedThrough.values()]) {
+      if (mark) held.add(mark);
+    }
+    return [...held];
+  }
+
+  /**
+   * Put each mark `replacements` maps in its place wherever this agent holds
+   * it (heldReadMarks), so a mark held as two of them stays one: a redo on
+   * the window (#291) puts rows back at new ordinals, past every mark that
+   * covered them before their undo, and gives each such mark again where it
+   * covers them now. It counts as a mark (watermarkMarks), so a compile that
+   * began before it doesn't put its own older mark back over it.
+   */
+  replaceReadMarks(replacements: ReadonlyMap<ReadMark, ReadMark>): void {
+    const swap = (mark: ReadMark | null): ReadMark | null => (mark && replacements.get(mark)) ?? mark;
+    const consumed = swap(this.consumedWatermark);
+    if (consumed !== this.consumedWatermark) {
+      this.consumedWatermark = consumed;
+      this.watermarkMarks++;
+    }
+    this.shownWatermark = swap(this.shownWatermark);
+    this.answeredWatermark = swap(this.answeredWatermark);
+    for (const [destination, mark] of this.publishedThrough) {
+      const next = replacements.get(mark);
+      if (next) this.publishedThrough.set(destination, next);
+    }
+  }
+
   /** Mark everything in the agent's window (in legacy mode, everything
    *  stored) as consumed: the agent's creation, at boot or later, and a tool
    *  boundary that injected messages into a live stream declaring it carries
@@ -1360,9 +1409,10 @@ export class Agent {
    */
   private renderedInjections?: {
     branch: { readonly id: string; readonly created: number };
-    /** Per namespace, per content hash: the parts any copy of that content
-     *  holds, how many it has, and its newest copy's sequence. */
-    byNamespace: Map<string, Map<string, { parts: number; held: Set<number>; sequence: number }>>;
+    /** Per namespace, per content hash: each copy of that content the
+     *  compile rendered, by its row's id, with the part it is, how many
+     *  parts the content has, whether the compile held it, and its sequence. */
+    byNamespace: Map<string, Map<string, RenderedInjectionCopy[]>>;
   };
 
   /**
@@ -1465,7 +1515,7 @@ export class Agent {
       this.renderedInjections = undefined;
       return;
     }
-    const byNamespace = new Map<string, Map<string, { parts: number; held: Set<number>; sequence: number }>>();
+    const byNamespace = new Map<string, Map<string, RenderedInjectionCopy[]>>();
     for (const [i, source] of provenance.messages.entries()) {
       // Only a message rendered as an injection's participant can be one, so
       // the store is read for those alone.
@@ -1479,14 +1529,11 @@ export class Agent {
         // would only add copies, every start. A part missing shards still
         // says which content is newest.
         const held = body.complete || (body.missing !== undefined && !body.missing.includes('shards'));
-        const contents = byNamespace.get(mark.namespace) ?? new Map();
+        const contents = byNamespace.get(mark.namespace) ?? new Map<string, RenderedInjectionCopy[]>();
         byNamespace.set(mark.namespace, contents);
-        // Copies of the same content in view pool what they hold: the agent
-        // has each part that one of them holds.
-        const known = contents.get(mark.contentHash) ?? { parts: mark.parts, held: new Set<number>(), sequence: body.sequence };
-        if (held) known.held.add(mark.part);
-        known.sequence = Math.max(known.sequence, body.sequence);
-        contents.set(mark.contentHash, known);
+        const copies = contents.get(mark.contentHash) ?? [];
+        copies.push({ id: body.messageId, part: mark.part, parts: mark.parts, held, sequence: body.sequence });
+        contents.set(mark.contentHash, copies);
       }
     }
     this.renderedInjections = { branch: provenance.branch, byNamespace };
@@ -1496,19 +1543,48 @@ export class Agent {
    * The newest content of `namespace` among this agent's stored injections
    * that the last compile built to send rendered, by its newest copy: its
    * content hash, and whether every part of that content was there in some
-   * copy, every shard, however the strategy shaped it. Undefined when none
-   * was, when this agent hasn't built a request since it started, or when
-   * the window's branch has changed since.
+   * copy, every shard, however the strategy shaped it. Copies of the same
+   * content pool what they hold: the agent has each part one of them holds.
+   * A copy the agent's next request won't hold is passed over: one an undo
+   * took out of its window since (#291: `'undone'`, which no presentation
+   * point presents again until a redo), and one no longer stored. Undefined
+   * when no copy is left, when this agent hasn't built a request since it
+   * started, or when the window's branch has changed since.
    */
   renderedInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
     const rendered = this.renderedInjections;
     const branch = this.contextManager.currentBranchRef();
     if (!rendered || rendered.branch.id !== branch.id || rendered.branch.created !== branch.created) return undefined;
-    let newest: [string, { parts: number; held: Set<number>; sequence: number }] | undefined;
-    for (const entry of rendered.byNamespace.get(namespace) ?? []) {
-      if (!newest || entry[1].sequence > newest[1].sequence) newest = entry;
+    let newest: { contentHash: string; parts: number; held: Set<number>; sequence: number } | undefined;
+    for (const [contentHash, copies] of rendered.byNamespace.get(namespace) ?? []) {
+      let pooled: { parts: number; held: Set<number>; sequence: number } | undefined;
+      for (const copy of copies) {
+        if (!this.renderedCopyStands(copy.id)) continue;
+        pooled ??= { parts: copy.parts, held: new Set(), sequence: copy.sequence };
+        if (copy.held) pooled.held.add(copy.part);
+        pooled.sequence = Math.max(pooled.sequence, copy.sequence);
+      }
+      if (pooled && (!newest || pooled.sequence > newest.sequence)) newest = { contentHash, ...pooled };
     }
-    return newest ? { contentHash: newest[0], whole: newest[1].held.size === newest[1].parts } : undefined;
+    return newest ? { contentHash: newest.contentHash, whole: newest.held.size === newest.parts } : undefined;
+  }
+
+  /**
+   * Whether a stored injection's copy the last compile rendered is still
+   * where the agent's next request reads it: stored, and not taken out of
+   * its window by an undo (#291). A copy out of the window otherwise
+   * (`'out'`, as a redo leaves one presented since its undo) is presented
+   * again at the agent's next point, its own rows' sweep, so it counts. A
+   * context that can't say (a double without windowStatusOf, a read that
+   * throws) counts it, as before the window was presented.
+   */
+  private renderedCopyStands(id: MessageId): boolean {
+    try {
+      const status = this.contextManager.windowStatusOf?.(id);
+      return status !== 'undone' && status !== 'absent';
+    } catch {
+      return true;
+    }
   }
 
   /**

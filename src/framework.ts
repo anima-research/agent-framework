@@ -211,7 +211,7 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn, readerFacts, type PresentationOccasion } from './presentation.js';
-import { coverTest, covers, type MarkedRow, type ReadMark } from './read-marks.js';
+import { coverTest, covers, coversByOrdinal, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
@@ -1525,6 +1525,12 @@ interface TurnCheckpoint {
   windowBranch?: string;
 }
 
+/** Whether two checkpoints are one turn's: a redo puts its undo's back only where an undo cut short didn't leave it in place. */
+function sameCheckpoint(a: TurnCheckpoint, b: TurnCheckpoint): boolean {
+  return a.agentName === b.agentName && a.turnIndex === b.turnIndex && a.sequenceBefore === b.sequenceBefore
+    && a.branchName === b.branchName && a.timestamp === b.timestamp;
+}
+
 /**
  * A write a surgery's hold kept out of every store
  * (AgentFramework.surgeryHeldWrites): what addMessage was given, or, for a
@@ -2014,18 +2020,47 @@ interface FrameworkWriteOptions {
   audience?: readonly string[];
 }
 
+/** A body of an agent's window, by the row that names it (AgentFramework.windowBodiesFrom). */
+interface WindowBody {
+  /** The id of the body's first shard, which names the body. */
+  id: MessageId;
+  /** The ordinal it holds in the window. */
+  ordinal: number;
+  sequence: number;
+  /** Whether it is the agent's own row (isOwnRowOf). */
+  own: boolean;
+}
+
 /** What an undo on the window (#291, decision 4) keeps for its redo. */
 interface RedoEntry {
-  /** The store's branch at the undo. */
+  /** The store's branch at the undo: a redo on another is refused, its ordinals being another window's. */
   branchName: string;
   checkpoint: TurnCheckpoint;
+  window: {
+    /**
+     * The rows the undo took out of the agent's window, in window order:
+     * each body by the id that names it, whether it was the agent's own, and
+     * the ordinal it held until the undo.
+     */
+    tail: WindowBody[];
+    /** The index length right after the undo: what a redo finds at this ordinal and after entered the window since. */
+    lengthAfterUndo: number;
+    /**
+     * Bodies that were in the window right after the undo and are back in
+     * it past `lengthAfterUndo`: a later undo took them out and its redo
+     * put them back, at new ordinals. They weren't presented since this
+     * undo, so this one's redo leaves them where they are.
+     */
+    kept: Set<MessageId>;
+  };
   /**
-   * The rows the undo took out of the agent's window, in window order, by
-   * the id that names each body and whether it was the agent's own; and the
-   * index length right after the undo, from which a redo first takes out
-   * what was presented since.
+   * The agent's marks (Agent.heldReadMarks) that covered rows of the tail
+   * by their ordinals at the undo, each with the tail's bodies it covered.
+   * A redo puts the tail back at new ordinals, past every such mark, and
+   * gives each mark the agent still holds again where it covers those
+   * bodies and no other row the redo puts back (redoOnWindow).
    */
-  window: { tail: Array<{ id: MessageId; own: boolean }>; lengthAfterUndo: number };
+  marks: Array<{ mark: ReadMark; covered: ReadonlySet<MessageId> }>;
 }
 
 interface InferenceToolSnapshot {
@@ -12759,7 +12794,17 @@ export class AgentFramework {
    * until a redo; others' rows leave as arrived and not presented, and its
    * next presentation point presents them again, after what it holds then.
    * The rows are named body by body, by the shard that names each, in
-   * window order, and kept for redo with the index length the undo left.
+   * window order, and kept for redo with the ordinal each held, the index
+   * length the undo left, and which of them each of the agent's marks
+   * covered (marksOverTail).
+   *
+   * Own rows and others' leave in two calls, each whole or not at all on a
+   * store that batches. The redo entry is kept before either, so an undo
+   * cut short after rows left (between the calls, or partway through one
+   * on a store without the batched form) is refused with
+   * OperatorActionError 'failed' and can be redone: a redo puts back what
+   * left, in its order, and its checkpoint stays for another undo to finish
+   * it. An undo that took nothing out throws its error and keeps nothing.
    */
   private undoOnWindow(agent: Agent, requester?: OperatorRequester): {
     undone: boolean;
@@ -12779,22 +12824,54 @@ export class AgentFramework {
     if (checkpoints.length === 0) return { undone: false };
     const checkpoint = checkpoints.pop()!;
     const cm = agent.getContextManager();
-    const tail = this.windowTailFrom(cm, this.checkpointLength(cm, checkpoint), agentName);
+    const tail = this.windowBodiesFrom(cm, this.checkpointLength(cm, checkpoint), agentName);
     const own = tail.filter((row) => row.own).map((row) => row.id);
     const others = tail.filter((row) => !row.own).map((row) => row.id);
-    // Own rows first, then others'. Each call takes its rows out whole or
-    // not at all; a throw leaves the checkpoint where it was, for another
-    // try, which finds what is still in the window past it.
-    if (own.length > 0) cm.retractRows(own, { undone: true });
-    if (others.length > 0) cm.retractRows(others);
-    this.saveTurnCheckpoints(agentName, checkpoints);
     const branch = this.store.currentBranch().name;
+    const entry: RedoEntry = {
+      branchName: branch,
+      checkpoint,
+      window: { tail, lengthAfterUndo: cm.indexLength(), kept: new Set() },
+      marks: this.marksOverTail(agent, cm, tail),
+    };
     let redoStack = this.redoStacks.get(agentName);
     if (!redoStack) {
       redoStack = [];
       this.redoStacks.set(agentName, redoStack);
     }
-    redoStack.push({ branchName: branch, checkpoint, window: { tail, lengthAfterUndo: cm.indexLength() } });
+    redoStack.push(entry);
+    try {
+      if (own.length > 0) cm.retractRows(own, { undone: true });
+      if (others.length > 0) cm.retractRows(others);
+    } catch (error) {
+      const left = tail.filter((row) => cm.ordinalOf(row.id) === undefined).length;
+      if (left === 0) {
+        redoStack.pop();
+        throw error;
+      }
+      // Cut short with rows out: the entry stays for a redo, the checkpoint
+      // for another undo, which takes out what is still in the window past it.
+      entry.window.lengthAfterUndo = cm.indexLength();
+      const reason = error instanceof Error ? error.message : String(error);
+      const window = { retracted: left, represented: 0 };
+      this.emitTrace({ type: 'window:undone', agentName, retracted: left });
+      this.recordOperatorAction({
+        kind: 'undo-turn',
+        agent: agentName,
+        ...(requester ? { requester } : {}),
+        params: { turnIndex: checkpoint.turnIndex },
+        result: { sourceBranch: branch, targetBranch: branch, window },
+        error: reason,
+      });
+      throw new OperatorActionError(
+        'failed',
+        `Undo of ${agentName}'s turn ${checkpoint.turnIndex} was cut short: ${left} of the ${tail.length} rows it takes out of the window left it ` +
+          `(${reason}). redo() puts them back in their order, or another undo finishes it`,
+        { cause: error },
+      );
+    }
+    entry.window.lengthAfterUndo = cm.indexLength();
+    this.saveTurnCheckpoints(agentName, checkpoints);
     const window = { retracted: tail.length, represented: 0 };
     this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
     this.recordOperatorAction({
@@ -12825,28 +12902,68 @@ export class AgentFramework {
     return cm.indexLength();
   }
 
-  /** The bodies of `cm`'s window at ordinal `from` and after, in window order, by the shard that names each, and whether each is `agentName`'s own row. */
-  private windowTailFrom(cm: ContextManager, from: number, agentName: string): Array<{ id: MessageId; own: boolean }> {
-    const tail: Array<{ id: MessageId; own: boolean }> = [];
+  /**
+   * The bodies of `cm`'s window at ordinal `from` and after, in window
+   * order: each by the shard that names it, with its ordinal and sequence,
+   * and whether it is `agentName`'s own row.
+   */
+  private windowBodiesFrom(cm: ContextManager, from: number, agentName: string): WindowBody[] {
+    const bodies: WindowBody[] = [];
     let previous: StoredMessage | undefined;
     for (const row of cm.getPresentedMessages()) {
       const head = !previous || !continuesBody(previous, row);
       previous = row;
-      if (!head || (cm.ordinalOf(row.id) ?? -1) < from) continue;
-      tail.push({ id: row.id, own: isOwnRowOf(row.metadata, agentName) });
+      if (!head) continue;
+      const ordinal = cm.ordinalOf(row.id) ?? -1;
+      if (ordinal < from) continue;
+      bodies.push({ id: row.id, ordinal, sequence: row.sequence, own: isOwnRowOf(row.metadata, agentName) });
     }
-    return tail;
+    return bodies;
   }
 
   /**
-   * A redo of an undo on the window: first the rows presented since the
-   * undo leave the window as arrived and not presented (they enter again at
-   * the agent's next point, after the redone rows), so the redone rounds sit
-   * after the prefix their signed thinking was minted under; then the rows
-   * the undo took out enter it again, in their window order, but for one
-   * the store no longer holds. The checkpoint goes back.
+   * The agent's marks (Agent.heldReadMarks) that cover rows of `tail` by
+   * their ordinals in its window, read before an undo takes them out, each
+   * with the bodies it covers. A mark taken in legacy mode covers by
+   * sequence, which a redo leaves as it was, and one on another branch
+   * can't say, so neither is kept. A failure to read them is logged and
+   * keeps none: the redone rows then read as unread until the agent's
+   * next mark, as they did before redo gave marks again.
    */
-  private redoOnWindow(agent: Agent, entry: RedoEntry, requester?: OperatorRequester): {
+  private marksOverTail(agent: Agent, cm: ContextManager, tail: readonly WindowBody[]): RedoEntry['marks'] {
+    const marks: RedoEntry['marks'] = [];
+    try {
+      for (const mark of agent.heldReadMarks()) {
+        if (!coversByOrdinal(mark)) continue;
+        const cover = coverTest(mark, cm);
+        const covered = new Set(tail.filter((row) => cover(row) === 'covered').map((row) => row.id));
+        if (covered.size > 0) marks.push({ mark, covered });
+      }
+    } catch (error) {
+      console.error(`[operator] undo for ${agent.name}: could not read which of its marks cover the turn's rows; a redo leaves its marks as they are:`, error);
+    }
+    return marks;
+  }
+
+  /**
+   * A redo of an undo on the window. First the rows presented since the
+   * undo leave the window as arrived and not presented (they enter again at
+   * the agent's next point, after the redone rows), and with them any of
+   * the undo's own rows still in it (an undo cut short), so the redone
+   * rounds sit after the prefix their signed thinking was minted under.
+   * Presented since means in the window past the index length the undo
+   * left and not in it right after the undo: a body a later undo took out
+   * and its redo put back (`kept`) stays where it is, so undos redone in
+   * turn give back the window they took. Then the rows the undo took out
+   * enter it again, in their window order, but for one the store no longer
+   * holds. Each undo still to redo below this one (`below`, oldest first)
+   * notes which of the rows put back were in its window right after it
+   * (their ordinal before this undo was below the length it left), and the
+   * marks that covered the rows at the undo cover them again
+   * (retakeMarks). The checkpoint goes back, unless an undo cut short left
+   * it in place.
+   */
+  private redoOnWindow(agent: Agent, entry: RedoEntry, below: readonly RedoEntry[], requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
@@ -12854,15 +12971,28 @@ export class AgentFramework {
   } {
     const agentName = agent.name;
     const cm = agent.getContextManager();
-    const since = this.windowTailFrom(cm, entry.window.lengthAfterUndo, agentName).map((row) => row.id);
+    const { tail, lengthAfterUndo, kept } = entry.window;
+    const undoneIds = new Set(tail.map((row) => row.id));
+    const since = this.windowBodiesFrom(cm, 0, agentName)
+      .filter((row) => undoneIds.has(row.id) || (row.ordinal >= lengthAfterUndo && !kept.has(row.id)))
+      .map((row) => row.id);
     if (since.length > 0) cm.retractRows(since);
-    const back = entry.window.tail
+    const back = tail
       .filter((row) => { const status = cm.windowStatusOf(row.id); return status === 'undone' || status === 'out'; })
       .map((row) => row.id);
     if (back.length > 0) cm.presentRows(back);
+    const returned = new Set(back);
+    for (const older of below) {
+      for (const row of tail) {
+        if (returned.has(row.id) && row.ordinal < older.window.lengthAfterUndo) older.window.kept.add(row.id);
+      }
+    }
+    this.retakeMarks(agent, cm, entry, back, below);
     const checkpoints = this.getTurnCheckpoints(agentName);
-    checkpoints.push(entry.checkpoint);
-    this.saveTurnCheckpoints(agentName, checkpoints);
+    if (!checkpoints.some((checkpoint) => sameCheckpoint(checkpoint, entry.checkpoint))) {
+      checkpoints.push(entry.checkpoint);
+      this.saveTurnCheckpoints(agentName, checkpoints);
+    }
     const branch = this.store.currentBranch().name;
     const window = { retracted: since.length, represented: back.length };
     this.emitTrace({ type: 'window:undone', agentName, retracted: since.length, represented: back.length });
@@ -12876,11 +13006,55 @@ export class AgentFramework {
   }
 
   /**
+   * After a redo put `back` (the undo's rows, in window order) into the
+   * window again, at new ordinals past every mark: each mark the undo
+   * recorded (RedoEntry.marks) that the agent still holds is given again,
+   * covering the window as it stands up to the first row put back that the
+   * mark didn't cover at the undo. So a row the undone turn had read, and
+   * its reply answered, reads as read, shown and answered again, and one it
+   * hadn't reads as before; a row presented since the undo, which the redo
+   * took out and the agent's next point presents after, isn't covered. A
+   * mark the agent no longer holds (a compile moved it since the undo) is
+   * left as it is: what it covers is what the agent read later. Each undo
+   * still to redo below records the new mark in place of the old. A failure
+   * is logged and leaves the marks as they were: the rows put back then
+   * read as unread until the agent's next mark.
+   */
+  private retakeMarks(agent: Agent, cm: ContextManager, entry: RedoEntry, back: readonly MessageId[], below: readonly RedoEntry[]): void {
+    try {
+      const held = new Set(agent.heldReadMarks());
+      const replacements = new Map<ReadMark, ReadMark>();
+      for (const { mark, covered } of entry.marks) {
+        if (!held.has(mark) || replacements.has(mark)) continue;
+        const first = back.find((id) => !covered.has(id));
+        const length = first === undefined ? cm.indexLength() : cm.ordinalOf(first);
+        if (length === undefined) continue;
+        const next = readMarkThrough(cm, length);
+        if (next) replacements.set(mark, next);
+      }
+      if (replacements.size === 0) return;
+      agent.replaceReadMarks(replacements);
+      for (const older of below) {
+        for (const recorded of older.marks) recorded.mark = replacements.get(recorded.mark) ?? recorded.mark;
+      }
+    } catch (error) {
+      console.error(`[operator] redo for ${agent.name}: could not give its marks again over the rows put back; they read as unread until its next mark:`, error);
+    }
+  }
+
+  /**
    * Redo a previously undone turn for an agent, on its window (undoLastTurn):
    * no branch moves, the rows presented since the undo leave the window,
    * and the rows it took out enter it again, in their order, with `window`
-   * saying how many of each and a `window:undone` trace. Returns
-   * `{ redone: false }` if there's nothing to redo.
+   * saying how many of each and a `window:undone` trace; the agent's marks
+   * that covered them at the undo cover them again. Undos are redone newest
+   * first, each giving back the window it took. Returns
+   * `{ redone: false }` if there's nothing to redo. Refused
+   * (OperatorActionError 'failed') when the store is on another branch
+   * than the undo was: its rows' places are that branch's window's. A
+   * branch move through the framework (switchBranch, a rollback, a
+   * suppression, a failed surgery's restore) drops every redo entry
+   * (followBranchMove), so this is a move made past it.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
@@ -12906,13 +13080,17 @@ export class AgentFramework {
       return { redone: false };
     }
     const top = redoStack[redoStack.length - 1]!;
+    const branch = this.store.currentBranch().name;
+    if (top.branchName !== branch) {
+      throw new OperatorActionError('failed', `Cannot redo: ${agentName}'s undo was on its window on branch ${top.branchName}, and the store is on ${branch} now`);
+    }
     if (!this.presents(agent)) {
       throw new OperatorActionError('failed', `Cannot redo: ${agentName}'s undo was on its window, which isn't presented now`);
     }
     if (this.hasTurn(agentName) || this.turnAlive(agent)) {
       throw new OperatorActionError('agent-busy', `Cannot redo: a turn of ${agentName}'s is alive`);
     }
-    const result = this.redoOnWindow(agent, top, requester);
+    const result = this.redoOnWindow(agent, top, redoStack.slice(0, -1), requester);
     redoStack.pop();
     return result;
   }
@@ -13917,7 +14095,9 @@ export class AgentFramework {
   }
 
   /**
-   * Check if undo/redo is available for an agent.
+   * Check if undo/redo is available for an agent. `canRedo` is false where
+   * the newest undo was on another branch than the store's, which redo
+   * refuses; `redoDepth` counts every undo kept all the same.
    */
   getUndoRedoState(agentName: string): {
     canUndo: boolean;
@@ -13927,9 +14107,11 @@ export class AgentFramework {
   } {
     const checkpoints = this.getTurnCheckpoints(agentName);
     const redoStack = this.redoStacks.get(agentName);
+    // A redo is refused on another branch than its undo's (redo).
+    const top = redoStack?.at(-1);
     return {
       canUndo: checkpoints.length > 0,
-      canRedo: (redoStack?.length ?? 0) > 0,
+      canRedo: top !== undefined && top.branchName === this.store.currentBranch().name,
       undoDepth: checkpoints.length,
       redoDepth: redoStack?.length ?? 0,
     };
@@ -17244,6 +17426,11 @@ export class AgentFramework {
     // fork was handed as framing stays (AF-5), and the coalescer places the
     // newer occurrence after it.
     if (this.framedToAReader(p.messageId as MessageId)) return false;
+    // The coalescer asks isUnread before it removes; this asks again, so a
+    // row a reader has read is never taken back, whoever asks: a redo's
+    // marks given again (retakeMarks) cover a row the redone reply
+    // answered, and taking it back would leave that reply answering nothing.
+    if (!this.isUnreadStoredMessage(agent, p.messageId as MessageId)) return false;
     try {
       const cm = agent.getContextManager();
       const removed = removeStoredMessage(cm, p.messageId as MessageId);
@@ -19489,9 +19676,10 @@ export class AgentFramework {
    * since costs one request, as below. A part the strategy cut at its
    * per-message cap, or stripped an image from, counts as held, since a new
    * copy would meet the same. One a fold has summarized, a strategy's window
-   * has scrolled past, a throwing write left part-stored, or that no request
-   * since this agent started has held (and no failed start since has
-   * stored), is stored again at the next start,
+   * has scrolled past, an undo has taken out of the agent's window (#291),
+   * a throwing write left part-stored, or that no request since this agent
+   * started has held (and no failed start since has stored), is stored
+   * again at the next start,
    * so the agent has the current copy at the cost of one more row: a fold
    * between two starts leaves the request after it with the summary's word,
    * and the start after that stores it again. The rows to store come in the order gathered,
