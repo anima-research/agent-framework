@@ -623,10 +623,9 @@ function mcplResultText(content: McpToolResultContent[] | undefined): string {
  * An MCPL tools/call result the server marked `isError`, as a failure: its
  * text is the error, and with none, or only whitespace, as a server's error
  * answer reads it, the error says the server gave no words and that whether
- * the call did anything is unknown. Its other blocks aren't kept. The model's
- * dispatch and an in-process caller (`executeToolCall`,
- * `ModuleContext.callTool`) both take a server's error from here, so it reads
- * the same on each path. `callName` is the tool's name as it was called.
+ * the call did anything is unknown. Its other blocks aren't kept. An
+ * in-process caller (`executeToolCall`, `ModuleContext.callTool`) takes a
+ * server's error from here. `callName` is the tool's name as it was called.
  */
 function mcplToolFailure(content: McpToolResultContent[] | undefined, serverId: string, callName: string): ToolResult {
   const said = mcplResultText(content);
@@ -22626,18 +22625,17 @@ export class AgentFramework {
         return joined ?? alone;
       };
       // A server's error is a failure here too, as the model's dispatch
-      // reads it: its text (mcplToolFailure), without its other blocks, and
-      // its structured content, kept by presence; where a change joins an
-      // error that is structured content alone, that content's JSON, as below.
-      // A success is the server's own blocks and structured content, for the
-      // caller to use in process.
+      // reads it: its text, without its other blocks, and its structured
+      // content, kept by presence. A success is the server's own blocks and
+      // structured content, for the caller to use in process.
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
         const { data: blocks, ...failure } = direct;
-        const shown: ToolResult = taken && !(Array.isArray(blocks) && blocks.length) && Object.prototype.hasOwnProperty.call(direct, 'structured')
-          ? { ...failure, error: JSON.stringify(direct.structured) ?? 'null' }
-          : failure;
-        return withChange(shown, failure);
+        let shown: ToolResult = failure;
+        if (taken && !(Array.isArray(blocks) && blocks.length) && direct.structured != null) {
+          try { shown = { ...failure, error: JSON.stringify(direct.structured) }; } catch { /* past what the runtime's JSON.stringify can write */ }
+        }
+        return withChange(shown);
       }
       // RFC-005 §6.2: register an MCPL peer's references with this server, so
       // a stub later made of them is bound and fetch_reference can fetch
@@ -30751,8 +30749,8 @@ export class AgentFramework {
       ? { structured: result.structuredContent }
       : {};
     if (result.isError) {
-      // Its text as the model's dispatch reads it (mcplToolFailure). The raw
-      // content rides along for a script's structured result, the server's
+      // Its text (mcplToolFailure). The raw content rides along for a
+      // script's structured result, the server's
       // own account of the error; an in-process caller gets the text alone
       // (executeMcplToolCall).
       const content = Array.isArray(result.content) ? result.content as McpToolResultContent[] : undefined;

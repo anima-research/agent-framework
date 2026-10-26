@@ -457,7 +457,8 @@ framework registers a `toolsets` module with four constant tools:
 - `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
   and what can be opened, or one tool's signature, description, class and
   input schema. It
-  re-reads the server first, and says so when it couldn't; what that changed
+  re-reads each server that presents toolsets first, and says so when it
+  couldn't; what that changed
   is in the answer when look restates everything, and otherwise told as a
   notice;
 - `toolsets--close {server?, toolset?, instance?}` closes it.

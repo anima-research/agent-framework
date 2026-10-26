@@ -242,6 +242,35 @@ test('the puppet stores a server\'s error that is structured content alone as th
   }
 });
 
+test('the puppet stores a structured-only error\'s JSON when its tool change won\'t fit under the cap, and the change goes as a notice', async () => {
+  const { server } = await hintingServer({ content: [], structuredContent: { s: 'x'.repeat(980) }, isError: true });
+  const fw = await connectedTo(server, { toolResultInlineMaxChars: 1000 });
+  try {
+    const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
+    const text = storedResult(fw, toolUseId);
+    assert.match(text, /x{980}/);
+    assert.doesNotMatch(text, /peek\(\)/);
+    await waitFor(() => notices(fw).some((x) => x.includes('peek()')), 'the change told as a notice');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('the puppet reads a server\'s error whose structured content is null as one that said nothing, then the tool change', async () => {
+  const { server } = await hintingServer({ content: [], structuredContent: null, isError: true });
+  const fw = await connectedTo(server);
+  try {
+    const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
+    const text = storedResult(fw, toolUseId);
+    assert.match(text, /without saying what went wrong/);
+    assert.ok(text.indexOf('without saying') < text.indexOf('peek()'), 'the change after the error');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
 test('the puppet stores a structured-only result as 0.27.0 did when its tool change won\'t fit under the cap, and the change goes as a notice', async () => {
   const { server } = await hintingServer({ content: [], structuredContent: { s: 'x'.repeat(980) } });
   const fw = await connectedTo(server, { toolResultInlineMaxChars: 1000 });
@@ -380,6 +409,34 @@ test('a model\'s call whose result the host can\'t read still tells the tool cha
     await modelCalls(fw, [{ type: 'tool_use', id: 'toolu_deep', name: 'arc--status', input: {} }]);
     assert.doesNotMatch(resultFor(fw, 'toolu_deep'), /peek/, 'the failed call\'s result doesn\'t hold it');
     await waitFor(() => notices(fw).some((x) => x.includes('peek()')), 'the change told as a notice');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
+test('the puppet stores a server\'s error whose structured content the host can\'t write as 0.27.0 read it, then the tool change', { skip: !stringifyOverflows && 'this runtime writes the nesting out, so the host reads the content' }, async () => {
+  let rev = 0;
+  const server = await startScriptedServer({
+    advert: { ...ADVERT, pushEvents: true, featureSets: { ...(ADVERT.featureSets as Json), ...EVENTS } },
+    tools: [STATUS, PEEK],
+    listRev: () => rev,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, { open: [], _meta: { 'mcpl/hints': { rev: ++rev, tools: [] } } }); return; }
+      if (msg.method === 'tools/call') {
+        const meta = JSON.stringify({ 'mcpl/hints': { rev: ++rev, tools: [{ name: 'peek', visible: true }] } });
+        peer.ws.send(`{"jsonrpc":"2.0","id":${JSON.stringify(msg.id)},"result":{"content":[],"structuredContent":${nestedPastStringify},"isError":true,"_meta":${meta}}}`);
+        return;
+      }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  const fw = await connectedTo(server);
+  try {
+    const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
+    const text = storedResult(fw, toolUseId);
+    assert.match(text, /reported an error for arc--status without saying what went wrong/);
+    assert.ok(text.indexOf('without saying') < text.indexOf('peek()'), 'the change after the error');
   } finally {
     await fw.stop();
     await server.close();
