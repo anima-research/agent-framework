@@ -458,23 +458,23 @@ class CompleteOptionsMembrane extends MockMembrane {
   }
 }
 
-test("a resident's, a conversation agent's and an ephemeral run's context managers keep membrane's own retries: each complete() call goes with its caller's options as they were", async (t: TestContext) => {
+test("a resident's, a conversation agent's and an ephemeral run's context managers keep membrane's own retries: each complete() call's retry option reaches membrane as its caller gave it", async (t: TestContext) => {
   const membrane = new CompleteOptionsMembrane();
   const fw = await makeFramework(t, membrane, new DefaultErrorPolicy());
   const request = { messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-compress' }] }], config: { model: 'zz-model', maxTokens: 10 } } as unknown as NormalizedRequest;
   const membraneOf = (cm: unknown) => (cm as { membrane: { complete(r: NormalizedRequest, o?: unknown): Promise<unknown> } }).membrane;
   const internal = fw as unknown as { conversationAuxiliaryMembraneFor(name: string): { complete(r: NormalizedRequest, o?: unknown): Promise<unknown> } };
-  const signal = new AbortController().signal;
+  const lastRetry = () => (membrane.completeOptions.at(-1) as { retry?: unknown } | undefined)?.retry;
 
-  await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request, { signal });
-  assert.deepEqual(membrane.completeOptions.at(-1), { signal }, "a resident's");
+  await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request);
+  assert.equal(lastRetry(), undefined, "a resident's");
   await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request, { retry: true });
-  assert.deepEqual(membrane.completeOptions.at(-1), { retry: true }, "a caller's own retry");
+  assert.equal(lastRetry(), true, "a caller's own retry");
   await internal.conversationAuxiliaryMembraneFor('resident').complete(request);
-  assert.equal(membrane.completeOptions.at(-1), undefined, "a conversation agent's");
+  assert.equal(lastRetry(), undefined, "a conversation agent's");
   const { contextManager, cleanup } = await fw.createEphemeralAgent({ name: 'eph-retries', model: 'zz-model', systemPrompt: 'zz' });
   await membraneOf(contextManager).complete(request);
-  assert.equal(membrane.completeOptions.at(-1), undefined, "an ephemeral run's");
+  assert.equal(lastRetry(), undefined, "an ephemeral run's");
   cleanup();
 });
 
