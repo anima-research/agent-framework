@@ -126,10 +126,15 @@ export class MountWatcher {
       // another mount's directory, the mount's ignore list and editors' swap
       // and backup files. chokidar 4
       // compares a string given here with the whole absolute path, so the
-      // list itself would match nothing.
-      ignored: (path: string) => {
+      // list itself would match nothing. It asks without stats before it
+      // stats a path, asking again with them before it watches the path, and
+      // when a path it watches is removed. So where it gives no kind, no
+      // directory-only pattern matches: a directory one matches never passed
+      // the check with its stats, so it is never watched, and its removal
+      // never reported.
+      ignored: (path: string, stats?: Stats) => {
         const relative = this.toRelative(path);
-        return relative !== null && passedOverAt(relative, ignore, this.others) !== undefined;
+        return relative !== null && passedOverAt(relative, ignore, this.others, stats?.isDirectory() ?? false) !== undefined;
       },
       // Its filter for editors' files tested the whole path, so a directory
       // with a dot in its name hid every `*.swp` beneath it, and the walk

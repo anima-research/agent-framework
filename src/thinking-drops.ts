@@ -29,10 +29,11 @@ export interface CompiledForRequest {
   recordedAfter?: number;
 }
 
-/** What a stream's driver reads a call's dropped blocks against (`StartStreamResult`'s two fields, together). */
+/** What a stream's driver reads a call's dropped blocks against (`StartStreamResult`'s fields, together). */
 export interface StreamThinkingDrops {
   place: (entries: readonly ThinkingBindingEntry[]) => PlacedDrop[];
   recordedAfter?: number;
+  branch?: string;
 }
 
 /** A signed block's identity on the wire: a thinking block's signature, a redacted block's data. */
@@ -112,26 +113,19 @@ export function splitThinkingDrops(
 /** Binding failures the context manager's record doesn't track: the account's, not the conversation's. */
 const UNTRACKED_REASONS = new Set(['organization_binding_mismatch', 'end_user_binding_mismatch']);
 
-/**
- * When an agent's unexpected drops call for an operator alert: at the first call that shows any, and again only
- * when a call shows more than the alert last counted. Each call of a stream, and each stream until a strip takes
- * them out, drops the same blocks again, so an unchanged count isn't news. A call that shows no unexpected drop, its
- * report empty, absent or naming only expected ones, ends the incident: the blocks it counted no longer drop. The next
- * one alerts afresh. It's held in memory, so a restart mid-incident alerts once more, and an agent's removal ends its
- * incident (`forget`).
- */
 export class ThinkingLossIncidents {
-  private readonly alerted = new Map<string, number>();
+  private readonly alerted = new Map<string, { count: number; scope: string | undefined }>();
 
-  /** A call's report of `unexpected` drops for `agent`: the count to alert with, or undefined for no alert. */
-  observe(agent: string, unexpected: number): number | undefined {
-    if (unexpected === 0) {
+  /** A call's report of `count` drops for `agent` in `scope`: the count to alert with, or undefined for no alert. */
+  observe(agent: string, count: number, scope?: string): number | undefined {
+    const open = this.alerted.get(agent);
+    if (count === 0) {
       this.alerted.delete(agent);
       return undefined;
     }
-    if (unexpected <= (this.alerted.get(agent) ?? 0)) return undefined;
-    this.alerted.set(agent, unexpected);
-    return unexpected;
+    if (open && open.scope === scope && count <= open.count) return undefined;
+    this.alerted.set(agent, { count, scope });
+    return count;
   }
 
   /** The agent is gone: its incident, if one is open, ends with it. */
