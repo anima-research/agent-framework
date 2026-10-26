@@ -6,11 +6,10 @@
   the drafts tool's `read` shows them.
 - A draft held by an explicit send now gives the same cause wherever it's
   shown. The notice, the drafts tool's listing and `read`, and the catch-up
-  notice said the send was in "the same round", though a send also holds
-  back plain speech in the turn's later rounds, until new input arrives or a
-  budget restart starts a new stream, and in XML tool mode, which routes no
-  round live, in every round of the turn. The listing and the catch-up notice
-  now say "explicit send in its turn", and `read` says "an explicit send in
-  its turn held it back". The listing keeps its preview
-  of each draft's opening words, and the drafts tool's own description is
+  notice said the send was in "the same round", though a send can also hold
+  back plain speech in the turn's later rounds, or in XML tool mode, which
+  routes no round live, in any round of the turn. The listing and the
+  catch-up notice now say "explicit send in its turn", and `read` says "an
+  explicit send in its turn held it back". The listing keeps its preview of
+  each draft's opening words, and the drafts tool's own description is
   unchanged.

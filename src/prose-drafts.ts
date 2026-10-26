@@ -2,11 +2,10 @@
  * Held prose drafts: a resident's plain speech that was not sent.
  *
  * Plain speech is held back for reasons that are right in themselves: an
- * explicit send suppresses plain speech in its own round and the turn's later
- * rounds, until new conversational input arrives or a budget restart starts a
- * new stream, and in XML tool mode, which routes no round live, in every round
- * of the turn (so a "sent it" postscript is not posted twice), a turn may have
- * no destination, and a
+ * explicit send suppresses plain speech in its own round, and can suppress it
+ * in the turn's later rounds, or in XML tool mode, which routes no round live,
+ * in any round of the turn (so a "sent it" postscript is not posted twice), a
+ * turn may have no destination, and a
  * malformed or unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
