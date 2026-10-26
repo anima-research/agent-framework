@@ -556,7 +556,7 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
     assert.equal(readFileSync(join(staleStat.env.root, 'first', 'a.txt'), 'utf8'), 'first\n');
   });
 
-  test('a disk read while the store holds no whole record of what disk agreed says nothing helps until the store is reopened, even with its mount directory gone', async (t) => {
+  test("a disk read while the store holds no whole record of what disk agreed says nothing helps until the store is reopened, even with its mount directory gone, and a host's read is refused at the root's stage with what is at its path", async (t) => {
     const env = new Env(t);
     const store = env.store as unknown as { appendJson: (type: string, payload: unknown) => unknown };
     const append = store.appendJson;
@@ -574,6 +574,14 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
     assert.equal(await refused(m, 'read_image', { path: 'work/a.png' }),
       "The read_image did nothing: the workspace can't check its files against disk until its store is reopened: an append to its record of what disk last agreed with failed inside the store, "
       + "so that record may lack what the append held. Calling again won't change that; whoever runs this host can reopen it with a restart.");
+    await assert.rejects(m.readFileFromDisk('work/a.txt'), (err: unknown) => {
+      assert.ok(err instanceof WorkspaceReadError);
+      assert.equal(err.code, 'mount_unavailable');
+      assert.equal(err.stage, 'root');
+      assert.equal(err.errno, 'ENOENT');
+      assert.match(err.message, /^Mount unavailable: work: the workspace can't check its files against disk until its store is reopened: /);
+      return true;
+    });
   });
 
   test("a file on disk the workspace doesn't store says why, and what reads it", async (t) => {
