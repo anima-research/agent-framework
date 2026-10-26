@@ -465,8 +465,9 @@ test("a resident's, a conversation agent's and an ephemeral run's context manage
   const membraneOf = (cm: unknown) => (cm as { membrane: { complete(r: NormalizedRequest, o?: unknown): Promise<unknown> } }).membrane;
   const internal = fw as unknown as { conversationAuxiliaryMembraneFor(name: string): { complete(r: NormalizedRequest, o?: unknown): Promise<unknown> } };
   const lastRetry = () => (membrane.completeOptions.at(-1) as { retry?: unknown } | undefined)?.retry;
+  const signal = new AbortController().signal;
 
-  await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request);
+  await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request, { signal });
   assert.equal(lastRetry(), undefined, "a resident's");
   await membraneOf(fw.getAgent('resident')!.getContextManager()).complete(request, { retry: true });
   assert.equal(lastRetry(), true, "a caller's own retry");
