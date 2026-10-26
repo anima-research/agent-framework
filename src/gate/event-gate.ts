@@ -37,12 +37,13 @@ import type {
   JudgeEventSummary,
   JudgeFn,
   JudgeVerdict,
+  UpcomingWake,
 } from './types.js';
 
 // Re-export types consumers need
 export type {
   GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo, WakeLine,
-  JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions,
+  JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -200,6 +201,8 @@ interface DebounceState {
   events: PendingEvent[];
   /** When the batch's first event arrived (ms), for a judge's maxWaitMs. */
   firstAt: number;
+  /** When its timer fires (ms), as of its last re-arm (upcomingWakes). */
+  dueAt: number;
   /** The judge the batch goes to when it fires, as its rule held it when the
    *  batch began: a rule removed or changed meanwhile has its batch judged
    *  as the rule it was asked. Absent for a debounce. */
@@ -2071,6 +2074,10 @@ export class EventGate {
   // self-wake (an external wake supersedes it; the timer would otherwise
   // land as a redundant empty wake right after the turn).
   private selfWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** When each agent's pending self-wake fires, and what armed it
+   *  (upcomingWakes). Read only while its timer is in selfWakeTimers, so an
+   *  entry a fire or a cancel left behind says nothing. */
+  private selfWakeDue = new Map<string, { at: number; source: string }>();
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
@@ -3538,11 +3545,14 @@ export class EventGate {
     if (existing) {
       clearTimeout(existing.timer);
       existing.events.push(event);
-      existing.timer = setTimeout(() => this.fireDebounce(policy.name), delay(existing.firstAt, existing.judge));
+      const ms = delay(existing.firstAt, existing.judge);
+      existing.timer = setTimeout(() => this.fireDebounce(policy.name), ms);
+      existing.dueAt = Date.now() + ms;
     } else {
       const firstAt = Date.now();
-      const timer = setTimeout(() => this.fireDebounce(policy.name), delay(firstAt, judge));
-      this.debounceTimers.set(policy.name, { timer, events: [event], firstAt, ...(judge ? { judge } : {}) });
+      const ms = delay(firstAt, judge);
+      const timer = setTimeout(() => this.fireDebounce(policy.name), ms);
+      this.debounceTimers.set(policy.name, { timer, events: [event], firstAt, dueAt: firstAt + ms, ...(judge ? { judge } : {}) });
     }
   }
 
@@ -3755,6 +3765,7 @@ export class EventGate {
         ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
         events: events.map((e) => this.judgeEventSummary(e)),
         agentNames,
+        upcomingWakes: this.upcomingWakes(agentNames, policyName),
         signal: abort.signal,
       });
     } catch (err) {
@@ -3813,6 +3824,36 @@ export class EventGate {
   private currentJudge(policyName: string, asked: JudgeConfig): JudgeConfig {
     const now = this.config.policies.find((p) => p.name === policyName)?.behavior;
     return typeof now === 'object' && 'judge' in now ? now.judge : asked;
+  }
+
+  /**
+   * The gate's own timers that will wake `agentNames` with no new event, for
+   * the judge to weigh what waiting costs: each agent's pending self-wake
+   * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
+   * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
+   * when it fires; a judge rule's goes to the judge, so it only may).
+   */
+  upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
+    const wakes: UpcomingWake[] = [];
+    const now = this.now();
+    for (const name of agentNames) {
+      const due = this.selfWakeDue.get(name);
+      if (due && this.selfWakeTimers.has(name)) {
+        wakes.push({ at: due.at, certain: true, what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
+      }
+    }
+    if (this.sleepUntil > now && (this.sleepAgent === undefined || agentNames.includes(this.sleepAgent))) {
+      wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
+    }
+    for (const [name, state] of this.debounceTimers) {
+      if (name === exceptPolicy || state.events.length === 0) continue;
+      const n = state.events.length;
+      const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
+      wakes.push(state.judge
+        ? { at: state.dueAt, certain: false, what: `rule "${name}"'s batch of ${batch} goes to the judge` }
+        : { at: state.dueAt, certain: true, what: `rule "${name}"'s debounced batch of ${batch}` });
+    }
+    return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
 
   /** A batch's event as the judge is shown it. */
@@ -4218,6 +4259,7 @@ export class EventGate {
       );
     }, ms);
     this.selfWakeTimers.set(agentName, timer);
+    this.selfWakeDue.set(agentName, { at: this.now() + ms, source });
     this.emitTrace({
       type: 'gate:decision',
       eventType: 'selfwake:set',
@@ -4510,6 +4552,7 @@ export class EventGate {
       clearTimeout(timer);
     }
     this.selfWakeTimers.clear();
+    this.selfWakeDue.clear();
     // The sleep stays, with its note and agent, and its timer goes: fired
     // after a stop(), its wake reached a framework that had stopped, and the
     // timer held the process until the sleep's end. The next start() arms it

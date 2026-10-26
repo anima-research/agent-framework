@@ -3839,6 +3839,10 @@ export class AgentFramework {
           ? framework.primaryAgentName
           : names[0]),
         preview: (agentName) => framework.previewActivation(agentName),
+        // What else wakes the agent with no new event, beside the gate's own
+        // timers: a wake already queued for it, and a turn a provider cooldown
+        // holds until it ends.
+        upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
       });
       framework.eventGate = new EventGate({
         configPath,
@@ -4983,6 +4987,29 @@ export class AgentFramework {
       throw new MaintenanceWithdrawnError(`provider admission closed while stopping (${agentName})`);
     }
   }
+  /**
+   * Wakes the framework holds for `agentName` that need no new event: a
+   * request already queued for it (it runs as soon as the agent is free) and
+   * turns a provider cooldown holds until its end. The reply judge is told of
+   * them beside the gate's own timers, so it can weigh what waiting costs.
+   */
+  private upcomingWakesFor(agentName: string): import('./gate/types.js').UpcomingWake[] {
+    const wakes: import('./gate/types.js').UpcomingWake[] = [];
+    const queued = this.pendingRequests.filter((r) => r.agentName === agentName);
+    if (queued.length > 0) {
+      const reason = queued[0]!.reason;
+      wakes.push({
+        certain: true,
+        what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})`,
+      });
+    }
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown && cooldown.heldRequests.length > 0) {
+      wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
+    }
+    return wakes;
+  }
+
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
   }

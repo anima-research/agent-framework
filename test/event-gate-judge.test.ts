@@ -508,6 +508,47 @@ describe('judge rules: timing', () => {
   });
 });
 
+describe('judge rules: what waiting leaves the agent with', () => {
+  it("tells the judge the gate's own timers: a self-wake, a sleep's end, other rules' batches, not the rule it judges", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming.json', {
+      policies: [
+        { name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } },
+        { name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } },
+        { name: 'other-room', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 120000 } } },
+      ],
+    }), { judge: judge.fn });
+    const t0 = Date.now();
+    gate.armSelfWake('agent', 600);
+    gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    gate.evaluate(chat('hello'));
+    await sleep(160);
+    const wakes = judge.requests[0]!.upcomingWakes!;
+    assert.deepStrictEqual(wakes.map((w) => [w.what, w.certain]), [
+      ['rule "files"\'s debounced batch of 1 event', true],
+      ['rule "other-room"\'s batch of 1 event goes to the judge', false],
+      ['its own skip_reply timer', true],
+    ]);
+    const selfWake = wakes.find((w) => w.what.includes('skip_reply'))!;
+    assert.ok(Math.abs(selfWake.at! - (t0 + 600_000)) < 2_000, String(selfWake.at! - t0));
+    assert.ok(!wakes.some((w) => w.what.includes('"ambient"')), "the rule being judged isn't listed");
+    gate.dispose();
+  });
+
+  it("lists a sleep's end, and nothing once a self-wake has been cancelled by a turn", () => {
+    const { gate } = makeGate(writeConfig('upcoming-sleep.json', JUDGED));
+    gate.armSelfWake('agent', 60);
+    gate.onInferenceStarted('agent'); // a turn cancels a pending self-wake
+    gate.onInferenceEnded('agent');
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']), []);
+    gate.setSleep(300, undefined, 'agent');
+    const [wake] = gate.upcomingWakes(['agent']);
+    assert.strictEqual(wake!.what, 'the end of its sleep');
+    gate.dispose();
+  });
+});
+
 describe('judge rules without a judge', () => {
   it('wake as a debounce of the same quiet period, and gate_status says so', async () => {
     const { gate, wakes } = makeGate(writeConfig('unwired.json', JUDGED));
@@ -617,6 +658,17 @@ describe('the framework wires the reply judge', () => {
     await until(() => eventGate.getStatus().policies[0]!.judgeState!.verdicts.reply === 1, 'the verdict was recorded');
     await framework.runUntilIdle();
     assert.ok(membrane.calls.length >= 2, 'the reply woke the agent for a turn');
+  });
+
+  it("tells the judge the agent's pending skip_reply timer", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { membrane, eventGate } = await frameworkWith(t, { config: JUDGED });
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: it wakes itself soon' }]));
+    eventGate.armSelfWake('scout', 600);
+    eventGate.evaluate(chat('anyone?'));
+    await until(() => membrane.calls.length >= 1, 'the judge called the membrane');
+    const question = (membrane.calls[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.match(question, /<if_you_wait>\nIf you answer WAIT and nothing new arrives, scout is next woken by:\n- in 10 min: its own skip_reply timer\n<\/if_you_wait>/);
   });
 
   it('enabled: false leaves the judge unwired, and judge rules run as debounces', async (t) => {

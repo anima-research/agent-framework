@@ -16,5 +16,6 @@ export type {
   JudgeRequest,
   JudgeVerdict,
   ReplyJudgeOptions,
+  UpcomingWake,
 } from './types.js';
 export { ReplyJudge, DEFAULT_JUDGE_MODEL, DEFAULT_JUDGE_MAX_INPUT_TOKENS, type ReplyJudgeDeps } from './reply-judge.js';

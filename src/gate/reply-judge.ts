@@ -27,7 +27,7 @@
 
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
-import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions } from './types.js';
+import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
 /** The judge's model when the host names none. */
 export const DEFAULT_JUDGE_MODEL = 'claude-haiku-5-5';
@@ -77,6 +77,10 @@ export interface ReplyJudgeDeps {
   chooseAgent: (agentNames: string[]) => string | undefined;
   /** The request the agent would send if woken now, as a dry run (previewActivation). */
   preview: (agentName: string) => Promise<NormalizedRequest>;
+  /** What else will wake the agent with no new event, beyond the gate's own
+   *  timers the request carries: wakes the framework has queued or holds. A
+   *  provider that throws counts as knowing of none. */
+  upcomingWakes?: (agentName: string) => UpcomingWake[] | Promise<UpcomingWake[]>;
 }
 
 /** One message of the agent's context, rendered. */
@@ -163,6 +167,36 @@ function systemText(system: unknown): string {
   return '';
 }
 
+/** In how long, as the judge is told an upcoming wake. */
+function inWhile(at: number | undefined, now: number): string {
+  if (at === undefined) return 'as soon as it is free';
+  const s = Math.max(0, Math.round((at - now) / 1000));
+  if (s < 90) return `in ${s} s`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `in ${m} min`;
+  const h = Math.floor(m / 60);
+  return `in ${h} h${m % 60 ? ` ${m % 60} min` : ''}`;
+}
+
+/**
+ * What waiting would leave the agent with: what wakes it anyway, soonest
+ * first, or that nothing the host knows of is scheduled. A server's own
+ * timers (a heartbeat, a reminder) are listed only where the host was told
+ * of them, so the empty case says so.
+ */
+export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number): string {
+  const sorted = [...wakes].sort((a, b) => (a.at ?? now) - (b.at ?? now));
+  const lines = sorted.slice(0, 8).map((w) => `- ${inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${w.what}`);
+  const more = sorted.length > 8 ? [`- and ${sorted.length - 8} more`] : [];
+  return [
+    '<if_you_wait>',
+    ...(lines.length > 0
+      ? [`If you answer WAIT and nothing new arrives, ${agentName} is next woken by:`, ...lines, ...more]
+      : [`Nothing the host knows of is scheduled to wake ${agentName}: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).`]),
+    '</if_you_wait>',
+  ].join('\n');
+}
+
 /** Seconds or minutes ago, as the batch shows each event. */
 function ago(at: number, now: number): string {
   const s = Math.max(0, Math.round((now - at) / 1000));
@@ -199,6 +233,10 @@ export function judgeSystemPrompt(agentName: string): string {
     'something it is following needs it; let events go by when the talk is between others and does not need it,',
     'when it has already answered, or when replying would only add noise.',
     '',
+    "You're also told what will wake the agent anyway if you let the events go by. Waiting costs little when it",
+    "will be woken soon regardless; when nothing is scheduled, waiting means it may not see these events for a",
+    'long time, so weigh how much they matter.',
+    '',
     "Don't answer the messages yourself and don't speak as the agent. Answer with exactly one line:",
     '"REPLY: <a short reason>" to wake it, or "WAIT: <a short reason>" to let the events go by.',
   ].join('\n');
@@ -206,7 +244,7 @@ export function judgeSystemPrompt(agentName: string): string {
 
 /** The closing message: the batch, the agent's instructions, the question. */
 export function judgeQuestion(
-  request: Pick<JudgeRequest, 'events' | 'instructions'>, agentName: string, now: number, maxEventChars = Infinity,
+  request: Pick<JudgeRequest, 'events' | 'instructions' | 'upcomingWakes'>, agentName: string, now: number, maxEventChars = Infinity,
 ): string {
   // Newest first into the listing's share, shown oldest first; the rest are
   // counted, so a long held batch can't crowd out the context.
@@ -230,6 +268,7 @@ export function judgeQuestion(
     ...lines,
     '</new_events>',
   ];
+  parts.push('', ifYouWait(request.upcomingWakes ?? [], agentName, now));
   if (request.instructions && request.instructions.trim()) {
     parts.push('', `<instructions_from_${agentName.replace(/[^A-Za-z0-9_-]/g, '_')}>`, request.instructions.trim(), '</instructions_from_' + agentName.replace(/[^A-Za-z0-9_-]/g, '_') + '>');
   }
@@ -245,6 +284,7 @@ export class ReplyJudge {
   private readonly effort: 'low' | 'medium' | 'high' | 'none';
   private readonly chooseAgent: ReplyJudgeDeps['chooseAgent'];
   private readonly preview: ReplyJudgeDeps['preview'];
+  private readonly extraWakes: ReplyJudgeDeps['upcomingWakes'];
   /** Characters per token, corrected from each response's reported input. */
   private charsPerToken = INITIAL_CHARS_PER_TOKEN;
   private readonly anchors = new Map<string, Anchor>();
@@ -270,6 +310,7 @@ export class ReplyJudge {
     this.effort = deps.options?.effort ?? 'low';
     this.chooseAgent = deps.chooseAgent;
     this.preview = deps.preview;
+    this.extraWakes = deps.upcomingWakes;
   }
 
   /** The gate's judge function. */
@@ -291,8 +332,18 @@ export class ReplyJudge {
     const preview = await this.preview(agentName);
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
 
+    let extra: UpcomingWake[] = [];
+    try {
+      extra = (await this.extraWakes?.(agentName)) ?? [];
+    } catch {
+      extra = [];
+    }
+    const upcoming = [...(request.upcomingWakes ?? []), ...extra];
+
     const system = judgeSystemPrompt(agentName);
-    const question = judgeQuestion(request, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken));
+    const question = judgeQuestion(
+      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken),
+    );
     const fixedChars = system.length + question.length;
 
     // The budget the document may fill, in characters at the current ratio.

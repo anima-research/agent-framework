@@ -272,6 +272,20 @@ export interface JudgeEventSummary {
   at: number;
 }
 
+/**
+ * Something that will (or, for a batch going to the judge, may) wake the
+ * agent with no new event: what the judge is told would happen if it answers
+ * wait and nothing else arrives.
+ */
+export interface UpcomingWake {
+  /** When (ms), when known; absent for one due as soon as the agent is free. */
+  at?: number;
+  /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
+  certain: boolean;
+  /** What it is, as the judge is told ("its own skip_reply timer"). */
+  what: string;
+}
+
 /** What the gate asks the reply judge for one batch. */
 export interface JudgeRequest {
   /** The rule whose batch this is. */
@@ -282,6 +296,10 @@ export interface JudgeRequest {
   events: JudgeEventSummary[];
   /** The agents the batch would wake. */
   agentNames: string[];
+  /** The gate's own timers that will wake those agents with no new event
+   *  (upcomingWakes): their self-wakes, a sleep's end, other rules' pending
+   *  batches. The judge adds what the framework knows besides. */
+  upcomingWakes?: UpcomingWake[];
   /** Aborted when the judge's time is up or the gate is disposed. */
   signal: AbortSignal;
 }
