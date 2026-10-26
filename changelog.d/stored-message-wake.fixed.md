@@ -9,8 +9,9 @@
   no longer on its store's current branch. A wake whose message reached the
   agent only in a request that failed, or whose channel the agent hasn't
   spoken in since it read the message, still starts its turn. It covers the
-  same wakes: channel messages other than a conversation fork's, push
-  events, a module event's one message, background-script wakes and the
-  gate's self-wake notices. Only the agent the message was stored for has
-  its wake judged this way: another resident's wake for a message in the
-  shared slot still starts its turn.
+  kinds of wake the rule for a message heard mid-turn covers: channel
+  messages other than a conversation fork's, push events, a module event's
+  one message, background-script wakes and the gate's self-wake notices.
+  Only the agent the message was stored for has its wake judged this way:
+  another resident's wake for a message in the shared slot still starts its
+  turn.
