@@ -461,8 +461,10 @@ export class ToolsetController {
   /**
    * Recovering: re-read tools/list (presence, declared definitions), then
    * toolsets/list (dynamic-tool state in full), so every tool the statement
-   * names is already known; each applies where it's read. What changed is
-   * told. (stdio and WebSocket deliver in order, so no early rev is held.)
+   * names is already known, unless tools/list failed: a tool the last list
+   * lacks then waits for a later recovery. Each applies where it's read. What
+   * changed is told. (stdio and WebSocket deliver in order, so no early rev is
+   * held.)
    */
   private async recover(): Promise<void> {
     const connection = this.connection;
@@ -470,7 +472,7 @@ export class ToolsetController {
     this.recovering = true;
     try {
       await this.ownToolList(connection);
-      // RFC §6.1: toolsets/list after tools/list, so every tool it names is known.
+      // RFC §6.1: toolsets/list after tools/list, so every tool it names is known, unless tools/list failed.
       if (connection !== this.connection) return;
       const lists = await this.ownToolsetList(connection, LIST_TIMEOUT_MS, 'recovery');
       if (connection !== this.connection) return;

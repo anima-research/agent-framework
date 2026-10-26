@@ -1138,8 +1138,11 @@ test('a recovery whose tools/list fails still reads toolsets/list, as connecting
     t.server.peer.notify('tools/hints', t.state.hint([]));
     await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'tools/list'), 'the recovery read tools/list');
     await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'toolsets/list'), 'and then toolsets/list');
+    await roundTrip(t);
+    await settle(400); // past the 200 ms recovery debounce
+    await roundTrip(t); // and the server has read whatever the host sent before it
     const order = t.server.received.slice(from).map((m) => m.method).filter((m) => m === 'tools/list' || m === 'toolsets/list');
-    assert.deepEqual(order.slice(0, 2), ['tools/list', 'toolsets/list'], 'tools/list first (RFC-014 §6.1)');
+    assert.deepEqual(order, ['tools/list', 'toolsets/list'], 'tools/list first (RFC-014 §6.1), and no further recovery');
   } finally { await t.done(); }
 });
 
