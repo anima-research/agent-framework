@@ -1743,13 +1743,15 @@ test("a wake to read a render neither carries its mark into a merge with other c
     await settles(internals.processInferenceRequests(), 'the merged pass');
     internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }));
     await settles(internals.processInferenceRequests(), 'the pass of two renders');
+    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-1' }));
+    await settles(internals.processInferenceRequests(), 'the pass of two wakes reading one render');
     internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }));
     await settles(internals.processInferenceRequests(), 'the lone pass');
   } finally {
     internals.startAgentStream = start;
     internals.deferredMessages.splice(0);
   }
-  assert.deepEqual(triggers.map((r) => r.readsDeferredWrite), [undefined, undefined, 'render-1'], 'merged with a plain wake, or one reading another render, it drops the mark; alone it keeps it');
+  assert.deepEqual(triggers.map((r) => r.readsDeferredWrite), [undefined, undefined, 'render-1', 'render-1'], 'merged with a plain wake, or one reading another render, it drops the mark; merged with wakes reading the same render, or alone, it keeps it');
 });
 
 test("a wake to read a stored message neither carries its mark into a merge with other causes nor absorbs another wake while parked", async (t) => {
@@ -1774,12 +1776,14 @@ test("a wake to read a stored message neither carries its mark into a merge with
     await settles(internals.processInferenceRequests(), 'the merged pass');
     internals.pendingRequests.push(wake({ readsStoredMessage: first }), wake({ readsStoredMessage: second }));
     await settles(internals.processInferenceRequests(), 'the pass of two messages');
+    internals.pendingRequests.push(wake({ readsStoredMessage: first }), wake({ readsStoredMessage: first }));
+    await settles(internals.processInferenceRequests(), 'the pass of two wakes reading one message');
     internals.pendingRequests.push(wake({ readsStoredMessage: first }));
     await settles(internals.processInferenceRequests(), 'the lone pass');
   } finally {
     internals.startAgentStream = start;
   }
-  assert.deepEqual(triggers.map((r) => r.readsStoredMessage), [undefined, undefined, first], 'merged with a plain wake, or one reading another message, it drops the mark; alone it keeps it');
+  assert.deepEqual(triggers.map((r) => r.readsStoredMessage), [undefined, undefined, first, first], 'merged with a plain wake, or one reading another message, it drops the mark; merged with wakes reading the same message, or alone, it keeps it');
 });
 
 test("a wake to read a render starts its turn until the render's row is at or below the watermark of the agent's answered requests on the current branch", async (t) => {

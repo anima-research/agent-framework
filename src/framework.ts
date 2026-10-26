@@ -15538,10 +15538,9 @@ export class AgentFramework {
       // coalesced batch it carries would go unassembled, a guard retry would
       // record the wake's author as its own, and a silent turn's resume would
       // take on the wake's prose routing. So the batch's other requests go
-      // back to the queue, wait for the turn as any wake does, and then start
-      // a turn of their own, as the quiesce path above parks them. The turn's
-      // continuations (isTurnContinuation) stay together, as they pass a
-      // quiesce together.
+      // back to the queue and wait for the turn as any wake does, as the
+      // quiesce path above parks them. The turn's continuations
+      // (isTurnContinuation) stay together, as they pass a quiesce together.
       if (requests.some((r) => resumesLogicalTurn(r.reason))) {
         const siblings = requests.filter((r) => !isTurnContinuation(r.reason));
         if (siblings.length > 0) {

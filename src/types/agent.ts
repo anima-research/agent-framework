@@ -553,9 +553,9 @@ export interface InferenceRequest {
   /** Host-owned: this wake's sole cause is this message, stored in its
    *  agent's store as it arrived, not deferred (its row's id). Once a
    *  request that carried the message was answered and, for a wake that
-   *  carries a channel, the agent has since published into that channel
-   *  having read it, or once the message isn't on its store's current
-   *  branch, the wake starts no turn. */
+   *  carries a channel and isn't marked `ambient`, the agent has since
+   *  published into that channel having read it, or once the message isn't
+   *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
   agentName: string;
   reason: string;

@@ -708,6 +708,33 @@ describe('a wake for a write heard mid-turn', () => {
     });
   }
 
+  const storedAsItArrives: Array<[string, string, (framework: AgentFramework) => unknown]> = [
+    ['a push with no channel', 'the build finished', unchanneled[0]![1]],
+    ["a module's one message", 'the kettle is on', unchanneled[1]![1]],
+    ["a background script's wake", 'finished: 42', unchanneled[2]![1]],
+    ['a channel message', 'also this', (framework) => framework.pushEvent(channelMessage(ROOM, 'm-1', 'also this'))],
+    ["the gate's self-wake notice", '[self-wake] your test timer', (framework) => internals(framework).eventGate!.armSelfWake('assistant', 1, 'test')],
+  ];
+  for (const [what, shown, write] of storedAsItArrives) {
+    it(`${what}, stored while the agent has no turn, gives its wake the stored row's id`, async () => {
+      const framework = await createFramework(what.includes('self-wake') ? { gate: { policies: [], default: 'always' } } : {});
+      stubChannelRegistry(framework, ROOM);
+      const triggers: Array<Record<string, unknown>> = [];
+      (framework as unknown as { startAgentStream: (agent: unknown, trigger: unknown) => Promise<unknown> }).startAgentStream =
+        async (_agent, trigger) => { triggers.push(trigger as Record<string, unknown>); return undefined; };
+      write(framework);
+      for (const end = Date.now() + 5000; triggers.length === 0 && Date.now() < end;) {
+        await framework.runUntilIdle();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const row = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .find((m) => JSON.stringify(m.content).includes(shown));
+      assert.ok(row, `${what} was stored`);
+      assert.deepEqual(triggers.map((r) => r.readsStoredMessage), [row.id], "its wake's turn would start for the row it names");
+      await framework.stop();
+    });
+  }
+
   // A refusal is the provider's answer to the request that carried the
   // write: a turn after it would compile the same context. A channel's wake
   // still waits for the agent to speak there.

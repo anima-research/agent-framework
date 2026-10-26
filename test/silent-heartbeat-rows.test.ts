@@ -814,9 +814,10 @@ describe('replies to a [Continue] turn', () => {
     const x = await make({ membrane, physicalWindowTokens: 200_000, deliver: opts.deliver, agent: { strategy } });
     const internal = x.framework as unknown as {
       providerAccelerationDefaultCooldownMs: number; providerAccelerationJitterMs: number;
-      providerAccelerationCooldowns: Map<string, unknown>; pendingRequests: unknown[];
+      providerAccelerationCooldowns: Map<string, { until: number }>; pendingRequests: unknown[];
+      releaseProviderAccelerationCooldown(agentName: string): void;
     };
-    internal.providerAccelerationDefaultCooldownMs = 1_000; // the shortest hold there is
+    internal.providerAccelerationDefaultCooldownMs = 60_000;
     internal.providerAccelerationJitterMs = 0;
     try {
       membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
@@ -828,7 +829,9 @@ describe('replies to a [Continue] turn', () => {
       assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is held');
       await wake(x, opts.event);
       opts.whileHeld?.(x);
-      await waitFor(() => internal.providerAccelerationCooldowns.size === 0, 'the cooldown\'s release');
+      assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is still held');
+      internal.providerAccelerationCooldowns.get('assistant')!.until = Date.now();
+      internal.releaseProviderAccelerationCooldown('assistant');
       await x.framework.runUntilIdle();
     } catch (error) {
       await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true });
