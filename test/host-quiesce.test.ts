@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -1417,42 +1417,6 @@ test('quiesce survives a historical rollback + restart (host mode lives outside 
 
     framework = await AgentFramework.create(config());
     assert.equal(framework.getHostModeStatus().quiesced, false, 'resume cleared the recovery file durably');
-  } finally {
-    await framework.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('a serving boot recovers a stranded deferred-write queue regardless of the mode flag', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-stranded-'));
-  const storePath = join(dir, 'store');
-  const config = () => ({
-    storePath,
-    membrane: new MockMembrane().asMembrane(),
-    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
-    modules: [],
-  });
-  let framework = await AgentFramework.create(config());
-  let before: number;
-  try {
-    before = framework.getAgent('agent')!.getContextManager().getMessageCount();
-    await framework.stop();
-    // The state an older build could leave behind: flag cleared, queue not.
-    mkdirSync(join(storePath, 'recovery'), { recursive: true });
-    writeFileSync(join(storePath, 'recovery', 'host-mode.json'), JSON.stringify({ version: 1, quiesced: false }));
-    writeFileSync(join(storePath, 'recovery', 'deferred-writes.json'), JSON.stringify({
-      version: 1,
-      pending: [{ id: 'stranded-1', participant: 'user', content: [{ type: 'text', text: 'stranded' }] }],
-    }));
-
-    framework = await AgentFramework.create(config());
-    assert.equal(framework.getHostModeStatus().quiesced, false);
-    assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'recovered at boot');
-    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
-      .map((m) => (m.content[0] as { text: string }).text);
-    assert.deepEqual(texts, ['stranded']);
-    const queue = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: unknown[] };
-    assert.equal(queue.pending.length, 0, 'acked durably');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

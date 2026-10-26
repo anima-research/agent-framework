@@ -10,7 +10,7 @@
  * (sent-rows.test.ts): a round with a call, a final reply, and the
  * cumulative response membrane gives at a stream's end.
  */
-import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
+import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockYieldingStream } from './mock-membrane.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
@@ -65,12 +65,21 @@ export class WireMembrane {
   /** Told of each request as it is made, before its stream is built. */
   onRequest?: (agent: string, request: NormalizedRequest) => void;
   private readonly scripts = new Map<string, NormalizedResponse[][]>();
+  private readonly holds = new Map<string, Promise<void>>();
 
   /** Queue one activation (one stream's responses) for `agent`. */
   script(agent: string, ...activation: NormalizedResponse[]): void {
     const queue = this.scripts.get(agent) ?? [];
     queue.push(activation);
     this.scripts.set(agent, queue);
+  }
+
+  /**
+   * Hold `agent`'s next stream: its request is made and recorded, so its
+   * turn is alive, but the stream yields nothing until `released` settles.
+   */
+  hold(agent: string, released: Promise<void>): void {
+    this.holds.set(agent, released);
   }
 
   /** The requests `agent` made, in order. */
@@ -84,6 +93,16 @@ export class WireMembrane {
     this.onRequest?.(agent, request);
     const activation = this.scripts.get(agent)?.shift() ?? [final()];
     const stream = new MockYieldingStream(activation, true);
+    const released = this.holds.get(agent);
+    if (released) {
+      this.holds.delete(agent);
+      const events = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* (): AsyncGenerator<StreamEvent> {
+        await released;
+        const inner = events();
+        for (let next = await inner.next(); !next.done; next = await inner.next()) yield next.value;
+      };
+    }
     this.streams.push({ agent, request, stream, activation });
     return stream;
   }

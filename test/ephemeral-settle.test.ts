@@ -773,7 +773,7 @@ describe('runEphemeralToCompletion settle signal', () => {
       const result = await runStartedEphemeral(framework, agent, contextManager);
       assert.strictEqual(result.speech, 'Done.');
       assert.strictEqual(returned.length, 1);
-      assert.ok(returned[0] !== '' && !returned[0]!.startsWith('held:'), `the module's context answers the stored row's id: ${returned[0]}`);
+      assert.ok(returned[0] && contextManager.getMessage(returned[0]), `the module's context answers the stored row's id: ${returned[0]}`);
       assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
       const stored = contextManager.getAllMessages().map((m) =>
         `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);

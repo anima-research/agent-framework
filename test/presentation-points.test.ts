@@ -234,6 +234,9 @@ describe('presentation points (#291)', () => {
     assert.equal(h.inWindow('mira', 'arrived between frames'), true, "the logical turn's end presents it");
   });
 
+  // puppet-tool-call.test.ts's two cases of this, ported from the deferral
+  // queue's, were its twins once AF-6 made presentation mandatory; their
+  // checks are here.
   it("a message arriving while the puppet holds the agent enters the window after the pair; a pair a turn replaced waits for that turn's end", async () => {
     const h = await boot();
     const quiet = console.log;
@@ -241,7 +244,8 @@ describe('presentation points (#291)', () => {
     try {
       const puppet = h.framework.puppetToolCall('mira', 'test--wait', { gate: 'p' });
       await until(() => h.gates.entered.has('p'), 'the puppet call waiting');
-      h.internals.addMessage('user', [text('hey, you there?')], undefined, { forAgent: 'mira' });
+      const arrived = h.internals.addMessage('user', [text('hey, you there?')], undefined, { forAgent: 'mira' });
+      assert.ok(arrived && h.cm('mira').getMessage(arrived), 'stored at once, and answered by its stored id');
       assert.equal(h.inWindow('mira', 'hey, you there?'), false, 'stored, and out of the window while the puppet holds the agent');
       h.gates.release('p');
       await puppet;
@@ -256,6 +260,7 @@ describe('presentation points (#291)', () => {
       h.internals.activeTurnTokens.set('mira', 9999);
       h.gates.release('q');
       await replaced;
+      assert.equal(h.internals.activeTurnTokens.get('mira'), 9999, "the turn's token is not clobbered");
       const cm = h.cm('mira');
       const pair = cm.getAllMessages().slice(-2);
       assert.deepEqual(pair.map((m) => m.content[0]!.type), ['tool_use', 'tool_result'], 'stored now, back to back');

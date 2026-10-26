@@ -1390,7 +1390,7 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts a body the store shards as one notice, and the same text stored again as a notice of its own', async () => {
-      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       // Shard every notice into one message per block, as a strategy's ingress
@@ -1415,7 +1415,7 @@ describe('notices about an agent\'s own action', () => {
       const stored = cm.getAllMessages().filter((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === 'discord-send-failed');
       assert.deepEqual(stored.map((m) => m.shardIndex), [0, 1, 0, 1, 0, 1], 'each body is stored as two shards');
       assert.equal(stored[2]!.bodyGroupId, stored[0]!.bodyGroupId, 'the same text is stored again under the same group id');
-      assert.deepEqual(state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag), ['first', 'second', 'third']);
+      assert.deepEqual(state.releasedWindow(agent)!.unread.map((m) => m.metadata.tag), ['first', 'second', 'third']);
     });
 
     // #291: read means in the agent's window as of its consumed mark, not
@@ -1424,13 +1424,13 @@ describe('notices about an agent\'s own action', () => {
     // every notice goes on. (Before AF-6 made presentation mandatory, cases
     // here read a legacy-mode mark across branch points.)
     it("counts as read only what the agent's window held at its mark, and on another branch, nothing", async () => {
-      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown): { unread: Array<{ metadata: { tag?: unknown } }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.metadata.tag);
+      const tags = () => state.releasedWindow(agent)!.unread.map((m) => m.metadata.tag);
 
       assert.equal(cm.windowMode(), 'presented', 'the window was written down at its registration');
       const shown = notice('presented, then read');

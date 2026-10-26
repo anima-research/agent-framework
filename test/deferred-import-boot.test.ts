@@ -115,14 +115,23 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     } finally { h.close(); }
   });
 
+  // host-quiesce.test.ts's case of a queue stranded beside a cleared
+  // host-mode record, ported to this importer, was this case's twin; its
+  // record and checks are here.
   it('a serving boot stores a mirrored queue once, in the window by the boot\'s pass, and a second boot stores nothing', async () => {
     const h = await host();
     try {
       h.writeQueue([entry('m1', 1, 'mirrored')]);
+      // The state an older build could leave behind: the host-mode record
+      // cleared, the queue not.
+      writeFileSync(join(h.storePath, 'recovery', 'host-mode.json'), JSON.stringify({ version: 1, quiesced: false }));
       let framework = await h.boot();
       const traces: TraceEvent[] = [];
       framework.onTrace((event) => { traces.push(event); }, { replay: true });
       try {
+        assert.equal(framework.getHostModeStatus().quiesced, false, 'a serving boot');
+        assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'nothing is held');
+        assert.deepEqual(h.readQueue().pending, [], 'the record is cleared');
         const [row] = withText(framework, 'mirrored');
         assert.ok(row);
         assert.equal(framework.getAgent('agent')!.getContextManager().windowStatusOf(row.id), 'in', 'presented at rest by the boot pass');

@@ -128,12 +128,14 @@ function postponedReleases(framework: AgentFramework, error: Error, when: 'befor
   if (when === 'before stop()') postpone();
   else watchdog.stop = function (this: unknown) { postpone(); return stop.call(this); };
   const owner = framework as unknown as Record<string, unknown>;
-  const usual = (owner.releasedWindow as (agent: unknown, held: Set<string>) => unknown).bind(framework);
-  owner.releasedWindow = (agent: { name: string }, held: Set<string>) => {
+  const usual = (owner.releasedWindow as (agent: unknown) => unknown).bind(framework);
+  // The released window is read for the agent alone (#291 took the queue's
+  // held writes, its second argument and its `held` answer, away).
+  owner.releasedWindow = (agent: { name: string }) => {
     if (agent.name === 'first') throw error;
-    if (agent.name !== 'second') return usual(agent, held);
+    if (agent.name !== 'second') return usual(agent);
     unreadPassed.push(agent.name);
-    return { unread: [], held: new Map() };
+    return { unread: [] };
   };
   return () => { delete owner.releasedWindow; watchdog.stop = stop; };
 }

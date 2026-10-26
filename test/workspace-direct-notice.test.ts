@@ -185,12 +185,18 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, agents?:
   return h;
 }
 
-test("an undo of the turn that wrote a direct mount gives the notice once, at the next start, and that start's request carries it", async (t) => {
+// Since #291 an undo moves no branch: it takes the turn out of the agent's
+// window, and the workspace asks the window (useWindow) whether the turn
+// that wrote is still in it. (This test once had a twin, the same undo as a
+// branch move, which ran without the presentation index; since AF-6 every
+// framework presents, and its checks are here.)
+test("on the window, an undo of the turn that wrote a direct mount moves no branch and gives the notice once, at the next start, and that start's request carries it", async (t) => {
   const h = await harness(t);
   await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
   assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n');
-  assert.equal(h.framework.undoLastTurn('scout').undone, true);
-
+  const undone = h.framework.undoLastTurn('scout');
+  assert.equal(undone.undone, true);
+  assert.equal(undone.fromBranch, undone.toBranch, 'no branch moved');
   const [first] = await h.turn([say('back')]);
   assert.equal(carries(first), true);
   assert.equal(h.notices().length, 1);
@@ -198,39 +204,26 @@ test("an undo of the turn that wrote a direct mount gives the notice once, at th
   // A notice about the agent's own writes is its own row (#291's audience stamp).
   assert.deepEqual(stored.metadata, { system: true, kind: 'workspace-head-move', mounts: ['ref'], audience: ['scout'], ownRowOf: 'scout' });
   assert.match(JSON.stringify(first!.messages), new RegExp(TEXT.replace(/[.*+?^${}()|[\]\\`]/g, '\\$&').slice(0, 60)));
-  // Later starts carry the one notice in its place, and store no other.
-  const [later] = await h.turn([say('still here')]);
-  assert.equal(carries(later), true);
-  assert.equal(h.notices().length, 1);
-  assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
-});
-
-// Since #291 an undo moves no branch: it takes the turn out of the agent's
-// window, and the workspace asks the window (useWindow) whether the turn
-// that wrote is still in it.
-test("on the window, an undo of the turn that wrote a direct mount moves no branch and gives the notice once, at the next start, and that start's request carries it", async (t) => {
-  const h = await harness(t);
-  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
-  const undone = h.framework.undoLastTurn('scout');
-  assert.equal(undone.undone, true);
-  assert.equal(undone.fromBranch, undone.toBranch, 'no branch moved');
-  const [first] = await h.turn([say('back')]);
-  assert.equal(carries(first), true);
-  assert.equal(h.notices().length, 1);
   const [later] = await h.turn([say('still here')]);
   assert.equal(carries(later), true, 'later starts carry the one notice in its place');
   assert.equal(h.notices().length, 1, 'and store no other');
   assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
 });
 
+// (This test once had a twin, a redo as a branch move back to the branch
+// that held the write, which ran without the presentation index; since
+// AF-6 every framework presents, and its checks are here.)
 test('on the window, a redo of the turn that wrote finds nothing due, and a head that never moved stores no notice', async (t) => {
   const h = await harness(t);
   await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
   await h.turn([say('again')]);
   assert.equal(h.notices().length, 0, "the window holds the turn that wrote");
   assert.equal(h.framework.undoLastTurn('scout').undone, true, "the later turn's undo");
+  assert.equal(h.workspace.headMoveNotice('scout'), null, 'the writing turn is still in the window');
   assert.equal(h.framework.undoLastTurn('scout').undone, true, "the writing turn's undo");
+  assert.notEqual(h.workspace.headMoveNotice('scout'), null, 'a notice is due');
   assert.equal(h.framework.redo('scout').redone, true);
+  assert.equal(h.workspace.headMoveNotice('scout'), null, 'and none once the redo puts the writing turn back');
   const [request] = await h.turn([say('back')]);
   assert.equal(carries(request), false);
   assert.equal(h.notices().length, 0);
@@ -336,18 +329,6 @@ test('a head that never moved stores no notice, a write turn\'s own rounds inclu
   assert.deepEqual(requests.map(carries), requests.map(() => false));
   assert.deepEqual(h.notices(), []);
   assert.equal(h.workspace.headMoveNotice('scout'), null);
-});
-
-test('a redo back to the branch that holds the latest write finds nothing due', async (t) => {
-  const h = await harness(t);
-  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
-  h.framework.undoLastTurn('scout');
-  assert.notEqual(h.workspace.headMoveNotice('scout'), null);
-  assert.equal(h.framework.redo('scout').redone, true);
-  assert.equal(h.workspace.headMoveNotice('scout'), null);
-  const [first] = await h.turn([say('forward')]);
-  assert.equal(carries(first), false);
-  assert.deepEqual(h.notices(), []);
 });
 
 test("a move to a branch that doesn't carry the notice gives it again", async (t) => {
