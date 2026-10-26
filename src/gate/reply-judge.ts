@@ -232,6 +232,11 @@ export function judgeQuestion(
     ...(i > 0 ? [`- (${i} earlier ${i === 1 ? 'event' : 'events'} in this batch not listed)`] : []),
     ...lines,
     '</new_events>',
+    ...(request.events.some((e) => e.addressed) ? [] : [
+      '',
+      `None of these events is a mention, a reply or a DM to ${agentName}: those wake it without asking you. `
+        + 'A message can still ask it something by name.',
+    ]),
   ];
   if (request.instructions && request.instructions.trim()) {
     parts.push('', `<instructions_from_${agentName.replace(/[^A-Za-z0-9_-]/g, '_')}>`, request.instructions.trim(), '</instructions_from_' + agentName.replace(/[^A-Za-z0-9_-]/g, '_') + '>');

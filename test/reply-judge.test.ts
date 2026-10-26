@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
+import { ReplyJudge, cut, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeRequest } from '../src/gate/types.js';
 
 function msg(participant: string, text: string): NormalizedMessage {
@@ -43,6 +43,15 @@ function conversation(n: number, size = 400): NormalizedMessage[] {
   for (let i = 0; i < n; i++) out.push(msg(i % 3 === 0 ? 'Scout' : `user${i % 5}`, `message ${i} ` + 'x'.repeat(size)));
   return out;
 }
+
+describe('reply judge: the question', () => {
+  it("says no event is a mention, a reply or a DM to the agent when none is, and doesn't when one is", () => {
+    const line = 'None of these events is a mention, a reply or a DM to Scout: those wake it without asking you. A message can still ask it something by name.';
+    assert.ok(judgeQuestion(judgeRequest(), 'Scout', Date.now()).includes(line));
+    const addressed = judgeRequest({ events: [{ eventType: 'mcpl:channel-incoming', addressed: true, content: 'Scout?', at: Date.now() }] });
+    assert.strictEqual(judgeQuestion(addressed, 'Scout', Date.now()).includes('None of these events'), false);
+  });
+});
 
 describe('reply judge: verdicts', () => {
   it('parses REPLY and WAIT lines, with or without markdown', () => {
