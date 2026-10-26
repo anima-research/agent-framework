@@ -1295,15 +1295,6 @@ test('a push\'s change that nothing takes is told as a notice (in process: a pus
   assert.match(told.join('\n'), /peek\(\)/);
 });
 
-test('close with nothing named, after a group the host opened was declared, says nothing is open', async () => {
-  const { hub, c } = tappedController();
-  c.setGroupOpen('cave', true);
-  c.manifestChanged({ toolHints: true, toolsets: { cave: { title: 'Cave' } } });
-  const result = await new ToolsetsModule(hub, () => null).handleToolCall({ id: 'c1', name: 'close', input: { server: 'arc' } } as never);
-  assert.ok(result.isError);
-  assert.match(String(result.error), /nothing is open on arc/);
-});
-
 test('a tool a recovery\'s list puts in a toolset leaves the model\'s tool list at the next refresh, and is told so', async () => {
   const tools: Json[] = TOOLS.map((x) => ({ ...x }));
   const t = await setup(() => false, {}, ADVERT, tools);
@@ -1833,9 +1824,11 @@ test('a notice describes a definition it shows in two instances only once', asyn
   try {
     t.state.open = [{ toolset: 'game', instance: 'g1', title: 'G1' }, { toolset: 'game', instance: 'g2', title: 'G2' }];
     await look(t.fw);
+    await waitFor(() => notices(t.fw).some((x) => x.includes('[arc/game:g2]')), 'look\'s change told');
     const before = notices(t.fw).length;
     t.server.peer.notify('tools/hints', t.state.hint([{ name: 'play', instance: 'g1', visible: true }, { name: 'play', instance: 'g2', visible: true }]));
-    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('[arc/game:g2]')), 'the change told');
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('play(')), 'the change told');
+    await roundTrip(t);
     const text = notices(t.fw).slice(before).join('\n');
     assert.match(text, /\[arc\/game:g1\]/);
     assert.equal(text.split('play(').length - 1, 2, 'the tool in each');
@@ -1911,7 +1904,7 @@ test('a first sentence is cut by characters, never inside one', async () => {
   } finally { await t.done(); }
 });
 
-test('a group the host opened, which the manifest then declares and later drops, is no longer open: act is refused', async () => {
+test('a group the host opened, which the manifest then declares, is no longer open: close says nothing is open, and once the manifest drops it act is refused', async () => {
   let advert: Json = ADVERT;
   const t = await setup((msg, peer) => {
     if (msg.method === 'mcpl/manifest') { peer.reply(msg.id, { version: '0.5', pushEvents: true, ...advert }); return true; }
@@ -1928,6 +1921,9 @@ test('a group the host opened, which the manifest then declares and later drops,
   try {
     await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'cave' });
     await changeManifest({ ...ADVERT, toolsets: { ...(ADVERT.toolsets as Json), cave: { title: 'Cave' } } });
+    const closed = await callTool(t.fw.framework, 'toolsets--close', { server: 'arc' });
+    assert.ok(closed.isError);
+    assert.match(resultText(closed), /nothing is open on arc/);
     await changeManifest(ADVERT);
     const gated = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'dig', args: {} });
     assert.ok(gated.isError);
