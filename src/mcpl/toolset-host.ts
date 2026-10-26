@@ -462,7 +462,8 @@ export class ToolsetController {
    * Recovering: re-read tools/list (presence, declared definitions), then
    * toolsets/list (dynamic-tool state in full), so every tool the statement
    * names is already known, unless tools/list failed: a tool the last list
-   * lacks then waits for a later recovery. Each applies where it's read. What
+   * lacks then stays unknown until a later change or list starts a recovery.
+   * Each applies where it's read. What
    * changed is told. (stdio and WebSocket deliver in order, so no early rev is
    * held.)
    */

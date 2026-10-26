@@ -2167,7 +2167,7 @@ test('a tool whose schema holds a literal nested very deep or a type that isn\'t
   } finally { await t.done(); }
 });
 
-test('a literal is written out up to 65 levels deep and cut to … past that, whatever the runtime\'s stack, and look shows a schema past the bound as too deep', async () => {
+test('whatever the runtime\'s stack, a literal is written out up to 65 levels deep and cut to … past that, and look shows a schema\'s JSON whose deepest object is up to 64 levels below it and says too deep past that', async () => {
   const { t, holding, held } = await holdingServer();
   try {
     holding.add('tools/list');

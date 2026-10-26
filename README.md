@@ -498,7 +498,7 @@ while the call is out, the result is dropped and the change with it, and
 `toolsets--look` shows the state it left. Notices and reminders
 need the server's `pushEvents` grant, like any delivery; without it, a change
 that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told with its
-definition until text describing it has reached the model, except that a puppet's open or look whose result
+definition until text describing it has reached the model, except that a puppet's open, close or look whose result
 the store refuses has already counted it. Suggestions are shown, never acted on. Each
 `ended` id is told once while the
 host runs (told ids are kept in memory), short of rare interleavings, such as a
