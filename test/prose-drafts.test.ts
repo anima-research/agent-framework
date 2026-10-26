@@ -449,7 +449,7 @@ describe('held prose drafts, end to end', () => {
       // Round 2's draft gives the cause its notice gave wherever it's shown.
       const secondLine = list!.split('\n').find((l) => l.includes(`${ids[1]} · `));
       assert.ok(secondLine?.includes(' · explicit send in its turn · '), `the listing gives the turn's send as the reason: ${list}`);
-      assert.ok(read!.includes(`${ids[1]} — held; held `) && read!.includes('(an explicit send in its round or an earlier one of its turn held it back)'),
+      assert.ok(read!.includes(`${ids[1]} — held; held `) && read!.includes('(an explicit send in its turn held it back)'),
         `read gives the same cause: ${read}`);
       assert.match(resend!, new RegExp(`${ids[0]}: delivered to #room \\(Guild One\\) \\(${ROOM}\\), message posted-2`));
       const sent = h.publishes().slice(1);
@@ -2241,6 +2241,37 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
       assert.ok(words.includes(`so resending ${copy.id} could post it twice (to send it anyway: drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
       assert.ok(!words.includes(`draftIds: ["${free.id}", "${copy.id}"], destination`), 'no plain resend offered for the copy');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: a round before the send is held too, and read gives it the turn's send as its cause", async () => {
+    const h = await harness({ xml: true });
+    try {
+      const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+      await h.turn([
+        createMockResponse([text('Looking it up first.'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+        {
+          ...createMockResponse([
+            text('Looking it up first.'), call('l1', 'channel_list', {}), done('l1'),
+            text('Beside the send.'), explicitSend('s1'), done('s1'),
+            text('After the send.'),
+          ]),
+          toolCalls: [],
+        },
+      ]);
+      const held = h.drafts().reverse();
+      assert.deepEqual(held.map((d) => d.text), ['Looking it up first.', 'Beside the send.', 'After the send.']);
+      assert.ok(held.every((d) => d.reason === 'explicit-send'));
+      await h.turn([
+        createMockResponse([drafts('d1', { action: 'read', draftIds: [held[0]!.id] })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const read = h.toolResults().at(-1)!;
+      assert.ok(read.includes(`${held[0]!.id} — held; held `) && read.includes('(an explicit send in its turn held it back)'),
+        `read gives the draft from before the send a cause true of it: ${read}`);
     } finally {
       await h.close();
     }
