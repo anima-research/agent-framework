@@ -1305,6 +1305,16 @@ export class Agent {
   private readonly unsentSince = new Map<string, number>();
 
   /**
+   * A host's hook, called with the messages of each compile built to send
+   * (never a dry run), as the compile is recorded: what the request carries,
+   * after compression and the window have done their work. The framework
+   * uses it to tell when an MCPL toolset's announcement has left the context
+   * (RFC-014 §8.3 reminders). It must not change the messages; one that
+   * throws is logged, and the start goes on.
+   */
+  onCompiledToSend?: (messages: readonly unknown[]) => void;
+
+  /**
    * The newest content of `namespace` among this agent's rows stored since
    * its last compile built to send (unsentSince), and whether every part of
    * it is among them: rows a start stored whose compile then didn't record
@@ -1364,6 +1374,14 @@ export class Agent {
    *  filter (isAnotherAgentsInjection): a compile of a shared store without
    *  that filter would mix them in here. */
   private noteRenderedInjections(result: CompileResult): void {
+    // The host's look at what this request carries (onCompiledToSend).
+    if (this.onCompiledToSend) {
+      try {
+        this.onCompiledToSend(result.messages);
+      } catch (err) {
+        console.error(`[agent] ${this.name}: the host's compile observer failed:`, err);
+      }
+    }
     const provenance = result.provenance;
     // The rows stored before this compile on its branch have been compiled
     // to send, whether the request held them or a fold or the strategy's
@@ -2437,6 +2455,7 @@ export class Agent {
           id: block.id,
           name: block.name,
           input: block.input,
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'text') {
         speechContent.push(block);

@@ -34,6 +34,18 @@ const AUDIT_STUB = 'Tool result withheld by the guard. The tool has already exec
 const UNSAVED_STUB = 'Tool result withheld by the guard. The tool has already executed. Its result went to ' +
   "the guard's audit record (framework/tool-result-guard), for an operator, though saving that record had failed " +
   'when the result arrived.';
+const REFUSED_AUDIT_STUB = "Tool result withheld by the guard. The tool didn't run. Its result is kept in " +
+  "the guard's audit record (framework/tool-result-guard), for an operator.";
+const REFUSED_UNSAVED_STUB = "Tool result withheld by the guard. The tool didn't run. Its result went to " +
+  "the guard's audit record (framework/tool-result-guard), for an operator, though saving that record had failed " +
+  'when the result arrived.';
+const ERROR_AUDIT_STUB = "Tool result withheld by the guard. The call returned an error, and this notice can't say " +
+  "whether the tool ran. Its result is kept in the guard's audit record (framework/tool-result-guard), for an operator.";
+const ERROR_UNSAVED_STUB = "Tool result withheld by the guard. The call returned an error, and this notice can't say " +
+  "whether the tool ran. Its result went to the guard's audit record (framework/tool-result-guard), for an operator, " +
+  'though saving that record had failed when the result arrived.';
+const contentById = (blocks: Array<{ toolUseId?: string; content?: unknown }>) =>
+  Object.fromEntries(blocks.map((block) => [block.toolUseId, block.content]));
 
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
@@ -204,11 +216,12 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     assert.ok(!JSON.stringify(retry).includes(image));
     assert.equal(retry.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_use').length, 3);
     const retried = retry.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
-    assert.ok(retried.length === 3 && retried.every((b) => b.content === AUDIT_STUB),
+    const stubs = { text: AUDIT_STUB, image: AUDIT_STUB, error: ERROR_AUDIT_STUB };
+    assert.deepEqual(contentById(retried as Array<{ toolUseId?: string; content?: unknown }>), stubs,
       'the retry already says where each original is');
     const guarded = toolResults(h.framework);
     assert.equal(guarded.length, 3);
-    assert.ok(guarded.every((block) => block.content === AUDIT_STUB));
+    assert.deepEqual(contentById(guarded as Array<{ toolUseId?: string; content?: unknown }>), stubs);
     assert.equal(guarded.find((b) => b.toolUseId === 'error')?.isError, true);
     assert.deepEqual(h.module.speeches, ['continued']);
     assert.ok(strategy.snapshots.every((s) => !s.includes('original-text-payload') && !s.includes(image)),
@@ -223,18 +236,72 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     assert.deepEqual(audit[0], historical[0], 'redaction only appends; original Chronicle record is unchanged');
     const original = structuredClone(audit[0]);
     extension(h.framework).update('assistant', { tool_result_guard: false });
-    assert.ok(toolResults(h.framework).every((block) => block.content === AUDIT_STUB));
+    assert.deepEqual(contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>), stubs);
     await h.framework.stop();
     originalStopped = true;
     const restarted = await AgentFramework.create(h.base);
     try {
       assert.equal(extension(restarted).get('assistant').tool_result_guard, false, 'explicit disable persists');
-      assert.ok(toolResults(restarted).every((block) => block.content === AUDIT_STUB));
+      assert.deepEqual(contentById(toolResults(restarted) as Array<{ toolUseId?: string; content?: unknown }>), stubs);
       assert.deepEqual((restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as unknown[])[0], original);
       const preview = await restarted.previewActivation('assistant');
       assert.doesNotMatch(JSON.stringify(preview), /original-text-payload|original-error-payload/);
     } finally { await restarted.stop(); }
   } finally { if (!originalStopped) await h.framework.stop(); }
+});
+
+const ranBarredFailed = () => createMockResponse([
+  { type: 'tool_use', id: 'ran', name: 'test--read', input: {} },
+  { type: 'tool_use', id: 'barred', name: 'test--send_message', input: {} },
+  { type: 'tool_use', id: 'failed', name: 'test--read', input: {} },
+  { type: 'tool_use', id: 'unflagged', name: 'test--read', input: {} },
+], 'tool_use');
+const failedResult = {
+  failed: { success: false, isError: true, error: 'the read failed' },
+  unflagged: { success: false, isError: false, error: 'nothing matched' },
+};
+
+test("a withheld batch says a refused call's tool didn't run, an error result's may not have, and one that ran did", async () => {
+  const h = await harness([[ranBarredFailed(), refused()], [answer()]],
+    { toolResultGuard: true, allowedTools: ['test--read'] }, failedResult);
+  let staged: Record<string, unknown> | undefined;
+  h.membrane.onSubmit = () => { staged = contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>); };
+  try {
+    await h.run();
+    assert.deepEqual(h.module.calls.sort(), ['failed', 'ran', 'unflagged'], 'the refused call never reached its tool');
+    assert.deepEqual(staged, {
+      ran: 'Tool result withheld by the guard. The tool has already executed.',
+      barred: "Tool result withheld by the guard. The tool didn't run.",
+      failed: "Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.",
+      unflagged: 'Tool result withheld by the guard. The tool has already executed.',
+    }, 'the history reads the same while the batch is staged');
+    const expected = { ran: AUDIT_STUB, barred: REFUSED_AUDIT_STUB, failed: ERROR_AUDIT_STUB, unflagged: AUDIT_STUB };
+    const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(contentById(retried as Array<{ toolUseId?: string; content?: unknown }>), expected, 'the retry reads them');
+    assert.deepEqual(contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>), expected,
+      'and so does the history');
+  } finally { await h.framework.stop(); }
+});
+
+test("when the audit can't be saved, each placeholder sent says what its stub says of whether the tool ran", async () => {
+  const h = await harness([[ranBarredFailed(), answer()]], { toolResultGuard: true, allowedTools: ['test--read'] }, failedResult);
+  const store = h.framework.getStore();
+  const sync = store.sync.bind(store);
+  (store as { sync: () => void }).sync = () => {
+    if (h.framework.getAgent('assistant')!.toolResultGuard.hasPending) throw new Error('disk full');
+    sync();
+  };
+  try {
+    await h.run();
+    assert.deepEqual(contentById(h.membrane.streams[0].receivedToolResults[0] as Array<{ toolUseId?: string; content?: unknown }>), {
+      ran: 'Tool result withheld by the guard. The tool has already executed.',
+      barred: "Tool result withheld by the guard. The tool didn't run.",
+      failed: "Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.",
+      unflagged: 'Tool result withheld by the guard. The tool has already executed.',
+    });
+    assert.deepEqual(contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>),
+      { ran: UNSAVED_STUB, barred: REFUSED_UNSAVED_STUB, failed: ERROR_UNSAVED_STUB, unflagged: UNSAVED_STUB });
+  } finally { (store as { sync: () => void }).sync = sync; await h.framework.stop(); }
 });
 
 test('successful physical rounds admit results; refusal affects only the newest batch', async () => {
@@ -1940,6 +2007,17 @@ test('#277: a withheld original is written to the workspace, and its stub names 
   } finally { await h.framework.stop(); }
 });
 
+test('an error result whose original is in a workspace file tells the agent to read it before calling again', async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
+  (h.module.results as Record<string, ToolResult>).one = { success: false, isError: true, error: 'the read failed' };
+  try {
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    assert.match(stub, /^Tool result withheld by the guard\. The call returned an error, and this notice can't say whether the tool ran\. Its result is in workspace file work\/tool-results\/\S+-0-one\.txt\. Read it before calling again\.$/);
+    assert.doesNotMatch(stub, /refus|test-category/, "#159's line: no refusal or category in the context");
+  } finally { await h.framework.stop(); }
+});
+
 test('#281: a withheld result over the inline cap is written as stored, and its own note names the whole output', async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
   (h.module.results as Record<string, ToolResult>).one = { success: true, data: `long-${'x'.repeat(400)}` };
@@ -2100,6 +2178,22 @@ test('#277: the stub has the same text for each place the original can be', () =
     assert.equal(withheldResultNotice({ skipped }, true), AUDIT_STUB);
     assert.equal(withheldResultNotice({ skipped }, false), UNSAVED_STUB);
   }
+});
+
+test("an error result's stub says to read its original only where the file is known written", () => {
+  const error = "Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.";
+  const audit = "the guard's audit record (framework/tool-result-guard), for an operator";
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/a.txt' }, true, undefined, 'error'),
+    `${error} Its result is in workspace file work/tool-results/a.txt. Read it before calling again.`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, true, undefined, 'error'),
+    `${error} Writing its result to workspace file work/tool-results/x.txt failed, so it is kept only in ${audit}.`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/y.txt', unfinished: true }, true, undefined, 'error'),
+    `${error} Its result was still being written to workspace file work/tool-results/y.txt when this note ` +
+    `was made; if that file is missing, it is kept in ${audit}.`);
+  assert.equal(withheldResultNotice(null, true, undefined, 'error'), ERROR_AUDIT_STUB);
+  assert.equal(withheldResultNotice({ skipped: 'branch_changed' }, true, undefined, 'error'), ERROR_AUDIT_STUB);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/a.txt' }, true, undefined, 'refused'),
+    "Tool result withheld by the guard. The tool didn't run. Its result is in workspace file work/tool-results/a.txt.");
 });
 
 test('#277: direct API: a request after an aborted batch is compiled once its stub is annotated', async () => {

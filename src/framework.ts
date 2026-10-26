@@ -281,7 +281,7 @@ const isSilencingTool = (name: string): boolean => {
  *  send, though inspecting drafts is not). */
 const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
   if (isSilencingTool(call.name)) return true;
-  return bareToolName(call.name) === 'drafts'
+  return call.name === 'drafts'
     && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
 };
 
@@ -312,9 +312,9 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
  * Whether a call of one of these tools can change a round's routing
  * (routeRound): in locus and hybrid mode a silencing or world-publication
  * tool, or `drafts`, whose resend is an explicit send (isSilencingCall); in
- * explicit mode, where sends don't silence, only `skip_reply`, which keeps
- * the round private; in either, `think` under the private same-round policy,
- * which holds the round back. Disabled mode routes nothing.
+ * explicit mode, where sends don't silence, `skip_reply`, which keeps the
+ * round private, and `drafts`; in either, `think` under the private same-round
+ * policy, which holds the round back. Disabled mode routes nothing.
  */
 const changesRouting = (
   named: ReadonlySet<string>,
@@ -323,7 +323,7 @@ const changesRouting = (
 ): boolean => {
   if (mode === 'disabled') return false;
   for (const name of named) {
-    if (name === 'think' ? privateThink : mode !== 'explicit' || name === 'skip_reply') return true;
+    if (name === 'think' ? privateThink : mode !== 'explicit' || name === 'skip_reply' || name === 'drafts') return true;
   }
   return false;
 };
@@ -344,9 +344,9 @@ const ROUTING_TOOL_NAMED = new RegExp(
  * all name `say`, and `say_hello` doesn't. A coarse reading of what a script
  * may call (AgentFramework.scriptMayRoute): a comment or a string that
  * mentions a tool names it too, and `drafts` holds whatever the action its
- * call asks, though only a resend changes routing. A tool the code doesn't
- * spell out goes unseen: a name it builds at runtime or spells with escapes,
- * or one it picks by enumerating ALL_TOOLS or `tools`.
+ * call asks. A tool the code doesn't spell out goes unseen: a name it builds
+ * at runtime or spells with escapes, or one it picks by enumerating ALL_TOOLS
+ * or `tools`.
  */
 const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUTING_TOOL_NAMED) ?? []);
 
@@ -706,6 +706,10 @@ const PROSE_ROUTING_HELP =
   'Text without a destination is not delivered: it is held as a draft, and a notice\n' +
   'names it — reply e.g. ">>#channel {{unsent}}" to deliver your latest bounce draft\n' +
   'unchanged, or use the drafts tool to list, resend or dismiss any draft by id.\n' +
+  'With native tool calls, an unprefixed line written in a round that calls the\n' +
+  'drafts tool while the turn has no destination is held as a draft, with no\n' +
+  'notice that turn: a later turn\'s catch-up notice and the drafts listing show\n' +
+  'it. Only if it cannot be held does it bounce.\n' +
   '">>skip_reply {{unsent}}" sets the latest bounce aside. Send tools (send_message,\n' +
   'send_dm, …) are unaffected.';
 
@@ -748,12 +752,14 @@ const utilityOneLiner = (description: string): string => {
 
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { toolArgsProblems } from './tool-args.js';
+import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
+import { ToolsetsModule, resolveAct } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -1269,7 +1275,7 @@ interface TurnRouting {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send): counted, never drafted. */
+  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts`, and sends nothing else, after a send: counted, never drafted. */
   keptPrivate: number;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
@@ -1350,6 +1356,7 @@ interface ProseRound {
   routing: TurnRouting;
   notice: 'now' | 'later';
   keepPrivate?: boolean;
+  draftsRound?: boolean;
   /** The outgoing stream of the stream that queued the round. */
   onPublished?: SpeechPublished;
 }
@@ -1365,6 +1372,7 @@ interface RoundCall {
   name: string;
   cause: 'send' | 'private' | null;
   refused: boolean;
+  permitted: boolean;
 }
 
 /** Why a round's calls silence its prose, as silenceCauseOf reads them: a
@@ -2788,6 +2796,8 @@ interface StreamRequestNotes {
   stopped: boolean;
 }
 
+const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -3435,6 +3445,10 @@ export class AgentFramework {
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
+  /** MCPL RFC-014: every toolHints server's tool presence, for the
+   *  `toolsets` module's meta-tools and reminders. Made when the first
+   *  server configured with `toolHints: true` is set up; null until then. */
+  private toolsetHub: ToolsetHub | null = null;
   /** Inference routing policy from FrameworkConfig — stored so the MCPL
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
@@ -3993,6 +4007,9 @@ export class AgentFramework {
       // settings, and its tool prefix, which mustn't collide with a module
       // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
+      // RFC-014: a server configured with toolHints brings the toolsets
+      // module, whose name no prefix may take either.
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) moduleNames.add(TOOLSETS_MODULE);
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
         assertServerConfigBooleans(serverConfig);
@@ -4015,6 +4032,7 @@ export class AgentFramework {
         prefixesSeen.set(prefix, serverConfig.id);
       }
 
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) await framework.ensureToolsetsModule();
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -12444,10 +12462,15 @@ export class AgentFramework {
     // not silently run under different inference conditions than the
     // resident it serves. Only identity- and surface-defining fields are
     // overridden below.
+    const model = cfg.model ?? primaryConfig.model;
+    const inherited: AgentConfig = { ...primaryConfig };
+    if (model !== primaryConfig.model) {
+      for (const field of SUBCONSCIOUS_MODEL_FIELDS) delete inherited[field];
+    }
     const agentConfig: AgentConfig = {
-      ...primaryConfig,
+      ...inherited,
       name,
-      model: cfg.model ?? primaryConfig.model,
+      model,
       systemPrompt: cfg.systemPrompt,
       strategy: undefined, // its CM owns the windowed strategy instance
       // Prose is never auto-routed: a cadence-triggered turn carries no
@@ -15866,7 +15889,9 @@ export class AgentFramework {
   }
 
   /**
-   * Silenced plain speech: an explicit send holds it as resendable drafts; a
+   * Silenced plain speech: an explicit send holds it as resendable drafts (in
+   * a round that calls `drafts` and sends nothing else, 'drafts', its plain
+   * speech is kept and counted instead); a
    * deliberate silence (skip_reply, a silent turn, or a private think in
    * the same native round, where that policy applies: an XML-mode round has
    * no verbatim content to route live, so its prose is routed at the turn's
@@ -15879,13 +15904,13 @@ export class AgentFramework {
   private holdSilencedProse(
     agent: Agent,
     segments: string[],
-    cause: 'send' | 'private' | null,
+    cause: 'send' | 'private' | 'drafts' | null,
     privateThink: boolean,
     round: ProseRound,
   ): void {
     if (segments.length === 0) return;
     const routing = round.routing;
-    if (cause === 'private' || privateThink) {
+    if (cause === 'private' || privateThink || (cause === 'drafts' && agent.proseRouting !== 'hybrid')) {
       // Match explicit mode: skip_reply keeps publication private but can
       // still set a bounce aside. A private-think round interprets no text.
       if (cause === 'private' && !privateThink && agent.proseRouting === 'hybrid') {
@@ -15914,7 +15939,7 @@ export class AgentFramework {
     // re-bounce rule, unsentWords), not its routing syntax, and the
     // destination the resident wrote stays with it as a note.
     let privateCount = 0;
-    const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk }> = [];
+    const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean }> = [];
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
     for (const segment of segments) {
@@ -15945,13 +15970,14 @@ export class AgentFramework {
               text: words.text,
               note: `written for >>>${parsed.target}`,
               ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
+              deliberate: true,
             });
           }
         } else if (envelope.startsWith('>>>')) {
           // Malformed: an attempted destination that names none.
           delete routing.pin;
           routing.hybridHold = 'failed';
-          parts.push({ text: envelope });
+          parts.push({ text: envelope, deliberate: true });
         } else if (routing.hybridHold === 'private') {
           privateCount++;
         } else {
@@ -15960,7 +15986,12 @@ export class AgentFramework {
       }
     }
     routing.keptPrivate += privateCount;
-    this.holdProseDrafts(agent, parts, 'explicit-send', round);
+    if (cause === 'drafts') {
+      routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
+      this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later' });
+    } else {
+      this.holdProseDrafts(agent, parts, 'explicit-send', round);
+    }
     // The turn's receipt names them by their state at turn end; each was
     // named when it bounced.
     const drafts = routing.drafts;
@@ -16031,7 +16062,7 @@ export class AgentFramework {
 
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
     'explicit-send': 'an explicit send in the same round holds plain speech back',
-    'no-destination': 'it had no destination — after a routing envelope failed, plain speech waits for a new valid target',
+    'no-destination': 'it had no destination: plain speech with no target waits for one',
     bounced: 'its routing prefix bounced',
   };
 
@@ -16765,7 +16796,7 @@ export class AgentFramework {
         'the words remain only in your history',
       );
     }
-    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply or a private think)`);
+    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`);
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
@@ -17936,7 +17967,7 @@ export class AgentFramework {
   private async deliverProse(
     agent: Agent,
     rawText: string,
-    round: { notice?: 'now' | 'later'; keepPrivate?: boolean } = {},
+    round: { notice?: 'now' | 'later'; keepPrivate?: boolean; draftsRound?: boolean } = {},
   ): Promise<void> {
     // The direct entry delivers as a live round does: under the live turn's
     // routing.
@@ -17945,6 +17976,7 @@ export class AgentFramework {
       routing,
       notice: round.notice ?? 'later',
       keepPrivate: round.keepPrivate,
+      draftsRound: round.draftsRound,
     });
   }
 
@@ -18229,13 +18261,9 @@ export class AgentFramework {
         routing.keptPrivate++;
         continue;
       }
-      if (routing.hybridHold === 'failed') {
-        this.holdProseDrafts(agent, [envelope], 'no-destination', round);
-        continue;
-      }
       const sticky = routing.pin;
-      if (!allowLocus && !sticky) {
-        this.holdProseDrafts(agent, [envelope], 'no-destination', round);
+      if (routing.hybridHold === 'failed' || (!allowLocus && !sticky)) {
+        this.holdProseDrafts(agent, [envelope], 'no-destination', round.draftsRound ? { ...round, notice: 'later' } : round);
         continue;
       }
       const target = sticky ?? locus;
@@ -18349,6 +18377,22 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky) {
+        if (round.draftsRound) {
+          console.error(`[prose] ${name}: unprefixed — ${rawText.length} chars held with no notice (a drafts round, no destination)`);
+          const words = this.unsentWords(agent, rawText);
+          if (!('draft' in words)) {
+            const held = this.holdProseDrafts(
+              agent,
+              [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
+              'no-destination',
+              { ...round, notice: 'later' },
+            );
+            if (held.length === 0 && words.text.trim().length > 0) {
+              this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round);
+            }
+          }
+          return;
+        }
         this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round);
         return;
       }
@@ -19535,6 +19579,15 @@ export class AgentFramework {
       // Both produce ContextInjection[] that get merged before inference.
       let injections: ContextInjection[] | undefined;
 
+      // RFC-014 §8.3: each compile this agent sends says which open
+      // toolsets' announcements it still carries; the toolsets module's
+      // gatherContext reminds it of those that left.
+      if (this.toolsetHub && !agent.onCompiledToSend) {
+        const hub = this.toolsetHub;
+        const name = agent.name;
+        agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
+      }
+
       // Module gatherContext (fail-open, per-module timeout — the module's
       // contextTimeoutMs, else the registry default). Injections are
       // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
@@ -20083,8 +20136,9 @@ export class AgentFramework {
     // model writes it, so it carries only what delivery published, where it
     // published it. A round's text reaches it once the round's routing is
     // decided and its publish succeeds. Text that delivery withholds never
-    // does: a round a silencing tool, `skip_reply` or a private `think` keeps
-    // back, a hold, a bounce, a draft, or a round its stream never finished.
+    // does: a round a silencing tool, `skip_reply`, a `drafts` call or a
+    // private `think` keeps back, a hold, a bounce, a draft, or a round its
+    // stream never finished.
     // Nor does a publish the server doesn't confirm (SpeechPublished).
     // Emission to a server is gated in the registry (`channels.streaming`),
     // and `channels/publish` stays the authoritative send.
@@ -20166,8 +20220,10 @@ export class AgentFramework {
     // to prevent a redundant "sent it" postscript. Fresh injected input
     // clears it, because the following prose is a reply to a new message.
     // Why it is silenced decides what happens to the held words: an explicit
-    // send ('send') holds them as resendable drafts; a deliberate silence
-    // ('private': skip_reply, a silent control-plane turn) keeps them private.
+    // send ('send') holds them as resendable drafts, except in a round that
+    // calls `drafts` and sends nothing else, which keeps its plain speech; a
+    // deliberate silence ('private': skip_reply, a silent control-plane turn)
+    // keeps them private.
     let silenceCause: 'send' | 'private' | null = trigger?.suppressProse === true
       ? 'private'
       : (trigger?.reason === 'tool_result_guard_retry' ? this.guardRetryTurnSilenced.get(agent.name) : undefined) ?? null;
@@ -20452,6 +20508,7 @@ export class AgentFramework {
           }
 
           case 'tool-calls': {
+            const calls = event.calls.map(asCalled);
             // A tool-call response is a clean physical round: admit its
             // preceding results before storing/dispatching this new round.
             agent.toolResultGuard.accept();
@@ -20459,12 +20516,12 @@ export class AgentFramework {
             adoptInjectedRound();
             hadToolCalls = true;
             const toolRound = toolRounds++;
-            this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
-            this.recordEphemeralToolCalls(agent.name, event.calls.length);
+            this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, calls.length);
+            this.recordEphemeralToolCalls(agent.name, calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
               agentName: agent.name,
-              calls: event.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
+              calls: calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
             });
 
             // Build assistant content blocks for this round. Prefer the
@@ -20505,7 +20562,7 @@ export class AgentFramework {
               if (roundText) {
                 assistantBlocks.push({ type: 'text', text: roundText });
               }
-              for (const c of event.calls) {
+              for (const c of calls) {
                 assistantBlocks.push({
                   type: 'tool_use',
                   id: c.id,
@@ -20522,19 +20579,13 @@ export class AgentFramework {
               ? roundContent.filter((b) => b.type !== 'tool_result')
               : null);
 
-            // Note: max_tokens truncation cannot produce tool-calls events here.
-            // The membrane only yields 'tool-calls' when stop_reason is 'tool_use'
-            // (native API) or the closing </function_calls> tag is found (text parser).
-            // Truncated responses yield 'complete' with stop_reason 'max_tokens' directly.
-            // So all calls here have valid input — {} is legitimate for parameterless tools.
-
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
             // prefill path, from membrane 0.6.0, and absent on 0.5.x, which
             // doesn't declare it. The tool boundary reads it from the agent's
             // state.
             agent.enterWaitingForTools(
-              event.calls,
+              calls,
               stream,
               (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages,
             );
@@ -20566,8 +20617,8 @@ export class AgentFramework {
             // script runs doesn't move them.
             // Hybrid's `>>>` targets, sticky pin and hold apply as its delivery
             // runs, as for any queued hybrid delivery.
-            const roundToolNames = event.calls.map((c) => c.name);
-            const roundCalls = event.calls.map((c) => this.roundCallOf(agent.name, c));
+            const roundToolNames = calls.map((c) => c.name);
+            const roundCalls = calls.map((c) => this.roundCallOf(agent.name, c));
             const liveRound = !!this.channelRegistry && !!roundContent && roundContent.length > 0;
             if (liveRound) liveProseRouting = true;
             // Whether this round's tool-result batch (and anything queued
@@ -20630,6 +20681,10 @@ export class AgentFramework {
                 turnSilenced = true;
                 silenceCause = roundCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
               }
+              const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
+              const draftsCause = draftsRound
+                && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
+              const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
                 console.error(
@@ -20640,14 +20695,14 @@ export class AgentFramework {
                 if (turnSilenced) {
                   // In order behind earlier rounds' envelopes: the router
                   // state they leave is where this round's starts.
-                  const cause = silenceCause;
+                  const cause = draftsCause && silenceCause !== 'private' ? 'drafts' : silenceCause;
                   chainSpeech(
                     async () => this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts),
                     'mid-turn hybrid prose hold failed:',
                   );
                 } else if (!hasSameRoundPrivateThink) {
                   for (const seg of roundSegments) {
-                    chainSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, holdOpts), 'mid-turn hybrid prose delivery failed:');
+                    chainSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, roundOpts), 'mid-turn hybrid prose delivery failed:');
                   }
                 }
               } else if (turnProseRouting === 'explicit') {
@@ -20665,16 +20720,17 @@ export class AgentFramework {
                     `[prose] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                   );
                   for (const envelopes of roundAdmitted) {
-                    chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...holdOpts, keepPrivate }), 'mid-turn prose delivery failed:');
+                    chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...roundOpts, keepPrivate }), 'mid-turn prose delivery failed:');
                   }
                 }
               } else if (turnSilenced) {
                 console.error(
-                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause})`,
+                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause}${draftsCause ? ', a drafts round: kept' : ''})`,
                 );
                 // Never a silent black hole (n=8: the flying-scene reply):
-                // held as drafts the resident can resend, and named.
-                this.holdSilencedProse(agent, roundRuns, silenceCause, hasSameRoundPrivateThink, holdOpts);
+                // held as drafts the resident can resend, and named. A drafts
+                // round's is kept and counted instead.
+                this.holdSilencedProse(agent, roundRuns, draftsCause && silenceCause !== 'private' ? 'drafts' : silenceCause, hasSameRoundPrivateThink, holdOpts);
               } else if (hasSameRoundPrivateThink) {
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -20696,7 +20752,7 @@ export class AgentFramework {
               this.scriptRounds.delete(agent.name);
               displaced.withhold('a newer round replaced it before its scripts returned');
             }
-            const scriptCallIds = event.calls
+            const scriptCallIds = calls
               .filter((c) => c.name === CODE_EXECUTION_TOOL_NAME
                 && this.scriptMayRoute(agent.name, c, turnProseRouting, requestSnapshot.sameRoundThinkTextPolicy === 'private'))
               .map((c) => c.id);
@@ -20709,7 +20765,7 @@ export class AgentFramework {
               const round: ScriptRound = {
                 agent,
                 streamId: myStreamId,
-                scripts: new Map(event.calls.filter((c) => c.name === CODE_EXECUTION_TOOL_NAME).map((c) => [c.id, []])),
+                scripts: new Map(calls.filter((c) => c.name === CODE_EXECUTION_TOOL_NAME).map((c) => [c.id, []])),
                 pending: new Set(scriptCallIds),
                 route: () => {
                   // Only while this stream still owns the agent and waits on
@@ -20733,7 +20789,7 @@ export class AgentFramework {
               this.scriptRounds.set(agent.name, round);
             }
 
-            for (const call of event.calls) {
+            for (const call of calls) {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
               // `started` goes out once dispatch returns. Refusal sites inside
@@ -21271,9 +21327,10 @@ export class AgentFramework {
               // scan to avoid double-posting.
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
-                .map((b) => b as unknown as { name?: unknown; input?: unknown })
-                .filter((c): c is { name: string; input?: unknown } =>
-                  typeof c.name === 'string' && this.canAgentUseTool(agent.name, c.name));
+                .map((b) => b as unknown as { name?: unknown; input?: unknown; unparseableInput?: string })
+                .filter((c): c is { name: string; input?: unknown; unparseableInput?: string } =>
+                  typeof c.name === 'string' && markedInputRefusal({ ...c, name: c.name }) === undefined
+                  && this.canAgentUseTool(agent.name, c.name));
               const toolNames = toolCalls.map((c) => c.name);
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
@@ -22356,7 +22413,8 @@ export class AgentFramework {
     }
   }
 
-  private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+  private async executeToolCallFrom(given: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+    const call = asCalled(given);
     if (origin.kind === 'agent') {
       // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
       // denial here is a failure. It's this call's end, so it's traced here.
@@ -22366,6 +22424,11 @@ export class AgentFramework {
         return failure;
       }
     }
+    const marked = markedInputRefusal(call);
+    if (marked !== undefined) {
+      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: marked });
+      return { success: false, error: marked, isError: true };
+    }
 
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
     // Client-side programmatic tool calling for callers that await a tool's
@@ -22374,6 +22437,18 @@ export class AgentFramework {
     // its own.
     if (call.name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
+    }
+
+    // RFC-014: toolsets--act, resolved to the dynamic tool it calls, goes
+    // where a programmatic call of that tool goes, with its instance.
+    if (call.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const target = this.resolveToolsetAct(call);
+      if (!target.ok) return { success: false, error: target.error, isError: true };
+      if (origin.kind === 'agent') {
+        const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
+        if (failure) return failure;
+      }
+      return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
     }
 
     // MCPL tools go where the model's own call of the name goes, by the same
@@ -22423,7 +22498,74 @@ export class AgentFramework {
     return this.moduleRegistry.handleToolCall(call);
   }
 
-  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
+  /**
+   * RFC-014: the calls toolsets--act resolved to a server's dynamic tool,
+   * with the instance each is for (`_meta["mcpl/instance"]`, §5.5). The MCPL
+   * dispatch paths read it: such a call isn't refused as a dynamic tool
+   * called by name, and carries its instance. Nothing else about it differs
+   * from a direct call of the tool. Created on first use, so a framework
+   * assembled field by field (as unit tests do) needs no setup for it.
+   */
+  private toolsetActCalls?: WeakMap<ToolCall, { instance?: string }>;
+
+  /** A toolsets--act call resolved (resolveAct) to the call of the server's
+   *  tool it makes, under that tool's model-facing name and with its
+   *  arguments, its id kept; or the reason it can't be sent. */
+  private resolveToolsetAct(call: ToolCall): { ok: true; call: ToolCall; serverId: string; prefix: string; instance?: string } | { ok: false; error: string } {
+    const target = resolveAct(this.toolsetHub!, call.input);
+    if (!target.ok) return target;
+    const prefix = this.mcplServerConfigs.get(target.serverId)?.toolPrefix ?? `mcpl--${target.serverId}`;
+    const inner: ToolCall = { ...call, name: `${prefix}--${target.tool}`, input: target.args };
+    (this.toolsetActCalls ??= new WeakMap()).set(inner, target.instance !== undefined ? { instance: target.instance } : {});
+    return { ok: true, call: inner, serverId: target.serverId, prefix, ...(target.instance !== undefined ? { instance: target.instance } : {}) };
+  }
+
+  /**
+   * RFC-014 §8.2: a toolsets--act call from the agent (the model's, or a
+   * script's) goes down the path a direct call of the server's tool takes
+   * (dispatchMcplToolCall): its agent's allowedTools, the server's tool
+   * policy, the state exchange, RFC-005's reading of the result, the tool
+   * change shown after it, and RFC-007's lifecycle, which describes the call
+   * as that tool, with its arguments, before it opens. Only
+   * `_meta["mcpl/instance"]` is added. A call act can't resolve is refused
+   * before anything is sent.
+   */
+  private dispatchToolsetAct(agentName: string, call: ToolCall): void {
+    const target = this.resolveToolsetAct(call);
+    if (!target.ok) {
+      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: target.error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: TOOLSETS_MODULE,
+        result: this.refusedResult(agentName, call.id, target.error),
+      });
+      return;
+    }
+    const refusal = this.agentToolPermissionFailure(agentName, target.call);
+    if (refusal) {
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal });
+      return;
+    }
+    this.toolLifecycleEmitter?.retarget(agentName, call.id, target.call);
+    this.dispatchMcplToolCall(agentName, target.call, target.serverId, target.prefix);
+  }
+
+  /**
+   * RFC-014 §6.2: a tool result that goes to the agent, with the tool change
+   * its hints made (applied as the result was read) told after the server's
+   * content; taking it means it isn't told again as a notice. The result
+   * itself when there's none, as for every server without toolHints.
+   */
+  private withToolsetChange<R extends { content?: unknown }>(serverId: string, result: R): R {
+    const change = this.toolsetHub?.get(serverId)?.changeText(result) ?? '';
+    if (!change) return result;
+    return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: change }] };
+  }
+
+  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as
+   *  resolveMcplTool matched them, or as toolsets--act resolved them
+   *  (toolsetActCalls). Its RFC-014 tool change isn't shown with its result,
+   *  which goes to its caller, not necessarily to the agent: it's told as a
+   *  notice (ToolsetController.tellUnlessClaimed). */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized, so the call didn\'t run', isError: true };
@@ -22438,9 +22580,16 @@ export class AgentFramework {
     if (!isToolAllowed(toolName, config)) {
       return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
+    // RFC-014: a dynamic tool is called through toolsets--act, which marks
+    // the call it resolved (toolsetActCalls) with the instance it's for.
+    const act = this.toolsetActCalls?.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) return { success: false, error: dynamicRefusal, isError: true };
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     try {
-      const result = modern ? await modern.callTool(toolName, args) : await server!.sendToolsCall(toolName, args);
+      const result = modern
+        ? await modern.callTool(toolName, args)
+        : await server!.sendToolsCall(toolName, args, undefined, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined);
       // A server's error is a failure here too, as the model's dispatch
       // reads it: its text (mcplToolFailure), without its other blocks, and
       // its structured content, kept by presence. A success is the server's
@@ -22571,7 +22720,7 @@ export class AgentFramework {
   ): boolean {
     const ce = this.codeExecution;
     const input = call.input;
-    if (!ce || !this.canAgentUseTool(agentName, CODE_EXECUTION_TOOL_NAME)) return false;
+    if (!ce || !this.canAgentUseTool(agentName, CODE_EXECUTION_TOOL_NAME) || markedInputRefusal(call) !== undefined) return false;
     if (input === null || typeof input !== 'object' || Array.isArray(input)) return false;
     const fields = input as Record<string, unknown>;
     const action = fields.action ?? 'run';
@@ -23224,13 +23373,14 @@ export class AgentFramework {
     // however it turns out, as a direct call does: one refused here as one
     // the allowedTools refuses (a skip_reply as refused, another call for
     // nothing), and one the dispatcher refuses as roundCallOf reads it. The
-    // round reads its calls as a set, so each kind of call is kept once: the
-    // list stays as long as the agent's tool list, however many calls the
-    // script makes.
+    // round reads its calls as a set, so each kind of call (its name, cause,
+    // refusal and whether it was permitted) is kept once: the list stays as
+    // long as the agent's tool list, however many calls the script makes.
     const roundCalls = context.watch ? this.scriptRoundCalls.get(context.watch) : undefined;
     if (roundCalls) {
       const counted = this.roundCallOf(agentName, { name: toolName, input }, refusal !== undefined);
-      if (!roundCalls.some((c) => c.name === counted.name && c.cause === counted.cause && c.refused === counted.refused)) roundCalls.push(counted);
+      if (!roundCalls.some((c) => c.name === counted.name && c.cause === counted.cause
+        && c.refused === counted.refused && c.permitted === counted.permitted)) roundCalls.push(counted);
     }
     if (refusal !== undefined) return refused(refusal);
     const route = { toServer: false };
@@ -23976,6 +24126,13 @@ export class AgentFramework {
     return refusal;
   }
 
+  private markedInputFailure(agentName: string, call: ToolCall): ToolResult | undefined {
+    const error = markedInputRefusal(call);
+    if (error === undefined) return undefined;
+    this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error });
+    return this.refusedResult(agentName, call.id, error);
+  }
+
   /**
    * A dispatched call answered without running its tool. RFC-007's lifecycle
    * forgets it, and its result says it was refused (`ToolResult.refused`), both
@@ -24011,17 +24168,18 @@ export class AgentFramework {
    * A call as its round's routing counts it, made directly, or by a script
    * and reaching the host while a run or wait call of the round watches it
    * (ScriptRound). A skip_reply refused, because the agent's allowedTools
-   * doesn't name it or because this host can't set the wake it asks for, is
+   * doesn't name it, because its arguments are refused (markedInputRefusal)
+   * or because this host can't set the wake it asks for, is
    * marked refused: it keeps its own round private and silences nothing after
    * it. A refusal withholds the call's effect, not the model's choice to keep
    * its words private. Any other call the list refuses posted nothing, so it
    * gives no cause. A script's call the bridge refuses before dispatch
    * (`refusedHere`) counts as one the list refuses.
    */
-  private roundCallOf(agentName: string, call: { name: string; input?: unknown }, refusedHere = false): RoundCall {
-    const permitted = !refusedHere && this.canAgentUseTool(agentName, call.name);
+  private roundCallOf(agentName: string, call: { name: string; input?: unknown; unparseableInput?: string }, refusedHere = false): RoundCall {
+    const permitted = !refusedHere && markedInputRefusal(call) === undefined && this.canAgentUseTool(agentName, call.name);
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
-    return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused };
+    return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused, permitted };
   }
 
   /**
@@ -24032,7 +24190,7 @@ export class AgentFramework {
    * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
-    const refusal = this.agentToolPermissionFailure(agentName, call);
+    const refusal = this.agentToolPermissionFailure(agentName, call) ?? this.markedInputFailure(agentName, call);
     if (refusal) {
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
@@ -24052,6 +24210,15 @@ export class AgentFramework {
       return;
     }
 
+
+    // RFC-014: toolsets--act calls a server's dynamic tool, down the same
+    // path as a direct call of it (dispatchToolsetAct).
+    if (enrichedCall.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+      if (scriptWaiter) scriptWaiter.route.toServer = true;
+      this.dispatchToolsetAct(agentName, enrichedCall);
+      return;
+    }
 
     // Route MCPL tool calls to the appropriate server via prefix map
     const mcplMatch = this.resolveMcplTool(enrichedCall.name);
@@ -27001,6 +27168,10 @@ export class AgentFramework {
     // never gate this: queued marks are delivered in the background.
     this.readyMcplPlanes();
     this.deliverDiscordAwarenessInBackground('startup', 'host');
+    // RFC-014 §5.3: each toolHints server's open toolsets, read once its policy settled.
+    for (const server of this.mcplServerRegistry?.getAllServers() ?? []) {
+      if (server.isConnected) this.reattachToolsets(server);
+    }
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
@@ -27631,6 +27802,76 @@ export class AgentFramework {
   }
 
   /**
+   * The host capabilities offered to one server: the host's own, plus
+   * RFC-014's `toolHints` where its configuration asks for them. Without it,
+   * the very object every server is offered.
+   */
+  private mcplHostCapabilitiesFor(config: McplServerConfig): McplHostCapabilities {
+    const base = this.mcplHostCapabilities!;
+    return config.toolHints === true ? { ...base, toolHints: true } : base;
+  }
+
+  /** RFC-014: every toolHints server's presence, made on first use. */
+  private toolsets(): ToolsetHub {
+    return (this.toolsetHub ??= new ToolsetHub({
+      notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
+      log: (line) => console.error(`[mcpl] ${line}`),
+      listedName: (serverId, tool) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`,
+    }));
+  }
+
+  /** RFC-014: the `toolsets` module (toolsets--open, --act, --look,
+   *  --close), registered once, by the first server configured with
+   *  toolHints. Its tools don't change after that. */
+  private async ensureToolsetsModule(): Promise<void> {
+    const hub = this.toolsets();
+    const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
+    if (existing instanceof ToolsetsModule) return;
+    if (existing) {
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints needs that name for its meta-tools`);
+    }
+    await this.addModule(new ToolsetsModule(hub));
+  }
+
+  /** RFC-014 §5.3: after a (re)connect whose policy has settled, read what
+   *  the server holds open and adopt it. In the background: its notices are
+   *  written as they come. */
+  private reattachToolsets(connection: McplServerConnection): void {
+    const controller = this.toolsetHub?.get(connection.id);
+    if (!controller) return;
+    void controller.connected(connection).catch((error: unknown) => {
+      console.error(`[mcpl] ${connection.id}: reading its open toolsets failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  /**
+   * RFC-014 §8.3: a tool change with no result or event to ride on (a
+   * standalone tools/hints, a late result, a reconnect's adoption, a
+   * recovery) is told as a notice, which doesn't wake the agent. Like any
+   * delivery from a server into the conversation, it needs `pushEvents`
+   * (§6.1); without it the change is still tracked, and toolsets--look shows
+   * it. The text is the server's (its tool definitions, titles, reasons), so
+   * the notice names the server.
+   */
+  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): void {
+    const connection = this.mcplServerRegistry?.getServer(serverId);
+    if (!CapabilityGrant.of(connection).has('pushEvents')) {
+      console.error(`[mcpl] ${serverId}: a tool change was not told (pushEvents is not granted); ${META_TOOL_NAMES.look} shows it`);
+      return;
+    }
+    if (this.agents.size === 0) return;
+    try {
+      this.addMessage(
+        'user',
+        [{ type: 'text', text: `MCPL server "${serverId}", tool changes:\n${text}` }],
+        { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
+      );
+    } catch (error) {
+      console.error(`[mcpl] ${serverId}: a tool change notice could not be written:`, error);
+    }
+  }
+
+  /**
    * Connect a single MCPL server: register routing entries, open the
    * connection, wire events, and initialize feature sets / scopes /
    * checkpoints. Shared by startup (initializeMcpl) and the runtime
@@ -27786,6 +28027,8 @@ export class AgentFramework {
     let connection: McplServerConnection;
     // The transport the connect registered, which its own exchange is for.
     let registeredEpoch = 0;
+    // RFC-014: a toolHints server's meta-tools exist before it connects.
+    if (config.toolHints === true) await this.ensureToolsetsModule();
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
@@ -27795,11 +28038,14 @@ export class AgentFramework {
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
         connectionConfig,
-        this.mcplHostCapabilities,
+        this.mcplHostCapabilitiesFor(config),
         abort.signal,
         (registering) => {
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
+          // RFC-014 §6.1: hints apply as the connection reads them, from its
+          // first message, so the tap is on before any I/O can deliver one.
+          if (config.toolHints === true) this.toolsets().controllerFor(config).attach(registering);
         },
       );
     } catch (error) {
@@ -27878,6 +28124,8 @@ export class AgentFramework {
     // connected once its attempt settles, granted or not.
     if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      // RFC-014 §5.3: what the server holds open is the truth after a connect.
+      this.reattachToolsets(connection);
     }
     // A connection can make queued awareness work deliverable; it never
     // waits on it.
@@ -28117,6 +28365,15 @@ export class AgentFramework {
           ? (fetched as { revision: string }).revision : null;
       connection.manifestState.lastFetchedAt = Date.now();
       connection.droppedCapabilities = new Set(dropped);
+      // RFC-014 §5.1: the `toolsets` domain (toolHints, toolsets, surface),
+      // read from the manifest as fetched. A toolset removed ends its open
+      // instances; toolHints withdrawn makes every tool static. Its impact is
+      // surface-changed, applied, with no grant consequence (§17.6).
+      const declarations = toolsetDeclarationsOf(fetched);
+      const toolsetsChanged = config.toolHints === true
+        && JSON.stringify(declarations) !== JSON.stringify(connection.toolsetDeclarations);
+      connection.toolsetDeclarations = declarations;
+      if (toolsetsChanged) this.toolsetHub?.get(connection.id)?.manifestChanged(declarations);
 
       const newDeclared = Object.keys(this.featureSetManager?.getDeclaredFeatureSets(connection.id) ?? {});
       const newEnabled = newDeclared.filter((n) => this.featureSetManager?.isEnabled(connection.id, n));
@@ -28130,6 +28387,7 @@ export class AgentFramework {
         ...added.map((p) => ({ impact: 'capability-expansion-pending', subject: p, disposition: negotiated ? 'applied' : 'decision-needed' })),
         ...degraded.map((n) => ({ impact: 'feature-degraded', subject: n, disposition: 'applied' })),
         ...restored.map((n) => ({ impact: 'feature-restored', subject: n, disposition: negotiated ? 'applied' : 'decision-needed' })),
+        ...(toolsetsChanged ? [{ impact: 'surface-changed', subject: 'toolsets', disposition: 'applied' }] : []),
       ];
       this.emitTrace({
         type: 'mcpl:manifest-change-receipt',
@@ -29150,7 +29408,33 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      // RFC-014 §6.1 carrier 2: the tool change this push explains was
+      // applied as it was read; it's told after the event's own content. A
+      // push the host then refuses still tells its change, on its own.
+      const change = this.toolsetHub?.get(connection.id)?.changeText(params) ?? '';
+      const content = (params as { payload?: { content?: unknown } } | null)?.payload?.content;
+      if (!change || !Array.isArray(content)) {
+        if (change) this.recordToolsetNotice(connection.id, change, { invite: false });
+        await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+        return;
+      }
+      let refused = false;
+      const told = {
+        respond: (result: unknown) => {
+          if ((result as { accepted?: unknown } | null)?.accepted === false) refused = true;
+          responder?.respond(result);
+        },
+        respondError: (code: number, message: string, data?: unknown) => {
+          refused = true;
+          (responder?.respondError as ((code: number, message: string, data?: unknown) => void) | undefined)?.(code, message, data);
+        },
+      };
+      await this.pushHandler?.handlePushEvent(
+        connection.id,
+        { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
+        told as never,
+      );
+      if (refused) this.recordToolsetNotice(connection.id, change, { invite: false });
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -29350,6 +29634,9 @@ export class AgentFramework {
         // listeners can close it.
         if (connection.transportEpoch !== epoch || !connection.isConnected) return;
         this.handleToolsListChanged(connection.id);
+        // RFC-014 §5.2–5.3: what the server still holds open is adopted, and
+        // what it doesn't is closed; nothing is re-opened.
+        this.reattachToolsets(connection);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,
@@ -29512,6 +29799,8 @@ export class AgentFramework {
       // Lost for good (no reconnect, and the registry has dropped it): its
       // tools leave the agents' list, as a disconnect's do.
       if (!connection.willReconnect && this.mcplServerRegistry?.getServer(connection.id) !== connection) {
+        // RFC-014: its toolsets go with it; a next connection reads them again.
+        this.toolsetHub?.get(connection.id)?.detach(connection);
         this.handleToolsListChanged(connection.id);
       }
     });
@@ -29638,8 +29927,22 @@ export class AgentFramework {
         listedServers.add(server.id);
         const listed = new Set<string>();
         const repeated: string[] = [];
+        // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
+        // the conversation and called through toolsets--act, never offered
+        // here: every change to this list rebuilds the prompt cache. Their
+        // server, RFC-008 class and feature set are kept as any tool's are,
+        // so a call act makes is attributed, classed and state-exchanged as
+        // a direct call of the tool would be. The list was read through the
+        // server's tap, so its presence is current.
+        // A static↔dynamic move the server hinted applies here, at a list
+        // boundary (§4.2), and the agent is told where the tool went.
+        const presence = this.toolsetHub?.get(server.id);
+        const moves = presence?.presence.active ? presence.applyMoves() : [];
+        if (moves.length > 0) this.recordToolsetNotice(server.id, moves.join('\n'), { invite: false });
+        const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
+          const offered = !dynamic(tool.name);
           const namespacedName = `${prefix}--${tool.name}`;
           if (listed.has(namespacedName)) {
             if (!repeated.includes(tool.name)) repeated.push(tool.name);
@@ -29662,11 +29965,13 @@ export class AgentFramework {
               : undefined;
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
-          tools.push({
-            name: namespacedName,
-            description: tool.description ?? '',
-            inputSchema: schema,
-          });
+          if (offered) {
+            tools.push({
+              name: namespacedName,
+              description: tool.description ?? '',
+              inputSchema: schema,
+            });
+          }
           if (featureSet !== undefined) {
             toolFeatureSets.set(namespacedName, featureSet);
           }
@@ -29980,6 +30285,22 @@ export class AgentFramework {
       });
       return;
     }
+    // RFC-014: a dynamic tool isn't in the list; it's called through act,
+    // which marks the call it resolved (toolsetActCalls) with its instance.
+    const act = this.toolsetActCalls?.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) {
+      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'a dynamic tool, called through toolsets--act' });
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        toolName: call.name,
+        agentName,
+        moduleName: `mcpl:${serverId}`,
+        result: this.refusedResult(agentName, call.id, dynamicRefusal),
+      });
+      return;
+    }
 
     this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
@@ -30172,7 +30493,10 @@ export class AgentFramework {
       }
     }
 
-    legacy.sendToolsCall(toolName, args, stateParams)
+    legacy.sendToolsCall(toolName, args, stateParams, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined)
+      // RFC-014 §6.2: a call reports its own consequences; the tool change
+      // its result carried is told after the server's content.
+      .then((result) => this.withToolsetChange(serverId, result))
       .then(async (result) => {
         // RFC-005: register references and fetch the small ones, and every
         // one a script will read, before serialization, so their stubs carry

@@ -17,6 +17,7 @@ import type {
 import type { AgentConfig, SpeechContext } from '../src/types/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { fireNextYieldAsSet } from './helpers/capture-timers.js';
 
 // A module can tell one turn's work from another's: the tool calls made in an
 // agent's turn carry the turn's id (`ToolCall.callerTurnId`), its speech
@@ -342,27 +343,35 @@ test('a left script\'s call carries no turn, even while a script a turn waits on
     // the turn waits on. The left script's first call waits in the module
     // until the other script's call is there; its second call is dispatched
     // while the other script waits for that call's result, which waits for it.
+    const yields = fireNextYieldAsSet((framework as unknown as { codeExecution: { scripts: object } }).codeExecution.scripts, 60_000);
     const foregroundCalled = signal();
     const backgroundCalledDuring = signal();
+    const timedOut: string[] = [];
+    const held = (done: Promise<void>, what: string) => within(done, what).catch((err: Error) => {
+      timedOut.push(err.message);
+      throw err;
+    });
     recorder.onCall = async (call) => {
       const message = messageOf(call);
-      if (message === 'background, first') await within(foregroundCalled.done, 'the foreground script didn\'t call');
+      if (message === 'background, first') await held(foregroundCalled.done, 'the foreground script didn\'t call');
       else if (message === 'background, during') backgroundCalledDuring.resolve();
       else if (message === 'foreground') {
         foregroundCalled.resolve();
-        await within(backgroundCalledDuring.done, 'the background script didn\'t call again');
+        await held(backgroundCalledDuring.done, 'the background script didn\'t call again');
       }
     };
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'starting both' },
       { type: 'tool_use', id: 'call-bg', name: 'code_execution', input: {
-        yield_time_ms: 0,
+        yield_time_ms: 60_000,
         code: 'await tools["test--echo"]({ message: "background, first" });\nawait tools["test--echo"]({ message: "background, during" });',
       } } as ContentBlock,
       { type: 'tool_use', id: 'call-fg', name: 'code_execution', input: { code: 'await tools["test--echo"]({ message: "foreground" });' } } as ContentBlock,
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
     await runTurn(framework, 'go');
+    assert.deepEqual(yields, { fired: true }, 'the left script\'s run call yielded as its timer was set');
+    assert.deepEqual(timedOut, [], 'each call waited for its counterpart, not for the bound');
     const byMessage = (message: string) => recorder.calls.find((c) => messageOf(c) === message);
     const foreground = byMessage('foreground');
     const during = byMessage('background, during');
