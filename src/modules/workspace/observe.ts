@@ -1787,14 +1787,14 @@ function subtreeAgainst(dir: string, at: string): 'before' | 'holds' | 'after' {
 }
 
 /**
- * Whether a mount's ignore list covers a mount-relative path: the path itself
- * or any directory above it, as the walk's own test reads each entry by its
- * path and name.
+ * Whether a mount's ignore list covers a mount-relative path: the path itself,
+ * a directory or not, or any directory above it, as the walk's own test reads
+ * each entry by its path and kind.
  */
-export function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
+export function coveredByIgnore(relativePath: string, patterns: readonly string[], directory: boolean): boolean {
   const segments = relativePath.split('/').filter(Boolean);
   for (let i = 0; i < segments.length; i++) {
-    if (isIgnored(segments.slice(0, i + 1).join('/'), segments[i]!, patterns)) return true;
+    if (isIgnored(segments.slice(0, i + 1).join('/'), patterns, i < segments.length - 1 || directory)) return true;
   }
   return false;
 }
@@ -1839,42 +1839,89 @@ export function insideMount(relativePath: string, include: readonly string[] | u
 }
 
 /**
- * Whether the include's matcher can read `pattern`: a name or an `*.ext` glob,
- * which covers a file by its own name, or a `dir/**` glob, with no empty, `.`
- * or `..` segment, since those name no entry a path reaches. Where `\` is the
- * platform's separator, as on Windows, a pattern holding one can't name a
- * file either, since every path is read with `\` as a separator
- * (pathSegments). A pattern the matcher can't read would match nothing, and
- * take every file out of the mount unsaid, so the module refuses it.
+ * A pattern of `ignore` or `include`, read as gitignore reads it: its
+ * segments, each a name or a glob with `*` and `?` within it; whether it's a
+ * path from the mount's root (a leading or inner `/`, or a trailing `/**`)
+ * rather than a name at any depth; and whether it matches only directories (a
+ * trailing `/` or `/**`).
  */
-export function includePatternReadable(pattern: unknown, platformSep: string = sep): boolean {
-  const segment = (s: string): boolean => s.length > 0 && s !== '.' && s !== '..' && !(platformSep === '\\' && s.includes('\\'));
-  const name = (s: string): boolean => segment(s) && !s.includes('/') &&
-    (!s.includes('*') || (s.startsWith('*.') && s.length > 2 && !s.slice(1).includes('*')));
-  return typeof pattern === 'string' &&
-    (pattern.endsWith('/**') ? pattern.length > 3 && pattern.slice(0, -3).split('/').every((s) => segment(s) && !s.includes('*')) : name(pattern));
+type Pattern = { segments: Array<string | RegExp>; anchored: boolean; directory: boolean };
+
+const readings = new Map<string, Pattern | string>();
+
+function readPattern(pattern: string): Pattern | string {
+  let reading = readings.get(pattern);
+  if (reading === undefined) {
+    reading = parsePattern(pattern);
+    readings.set(pattern, reading);
+  }
+  return reading;
+}
+
+function parsePattern(pattern: string): Pattern | string {
+  if (pattern.startsWith('!')) return 'a leading "!" makes an exception in a .gitignore, and this list has none, so leave it out';
+  if (pattern.startsWith('#')) return 'a leading "#" marks a comment in a .gitignore, so leave comments out of the list';
+  if (pattern.includes('\\')) return '"\\" is an escape in a .gitignore and a separator on Windows, so no pattern here holds one, and "?" stands for one in a name';
+  if (pattern.endsWith(' ')) return 'a .gitignore drops trailing spaces, so remove them';
+  const anyDepth = pattern.startsWith('**/');
+  let body = anyDepth ? pattern.slice(3) : pattern;
+  const beneath = body.endsWith('/**');
+  const directory = beneath || body.endsWith('/');
+  body = body.slice(0, beneath ? -3 : directory ? -1 : undefined);
+  const anchored = (beneath && !anyDepth) || body.includes('/');
+  if (body.startsWith('/') && !anyDepth) body = body.slice(1);
+  const segments = body.split('/');
+  if (segments.some((s) => s === '' || s === '.' || s === '..')) return 'it has an empty, "." or ".." segment, which names no entry';
+  if (body.includes('**') || (anyDepth && anchored)) return '"**" is read only as a leading "**/" before one name, or a trailing "/**"';
+  const glob = (s: string): string | RegExp => /[*?]/.test(s)
+    ? new RegExp(`^${s.replace(/[.+^${}()|[\]*?]/g, (c) => (c === '*' ? '.*' : c === '?' ? '.' : `\\${c}`))}$`, 'su')
+    : s;
+  return { segments: segments.map(glob), anchored, directory };
+}
+
+function nameMatches(segment: string | RegExp, name: string): boolean {
+  return typeof segment === 'string' ? segment === name : segment.test(name);
+}
+
+function matchesEntry(pattern: Pattern, segments: readonly string[], directory: boolean): boolean {
+  if (pattern.directory && !directory) return false;
+  if (!pattern.anchored) return nameMatches(pattern.segments[0]!, segments[segments.length - 1]!);
+  return segments.length === pattern.segments.length && pattern.segments.every((s, i) => nameMatches(s, segments[i]!));
+}
+
+export function patternRefusal(pattern: unknown, list: 'ignore' | 'include'): string | undefined {
+  if (typeof pattern !== 'string') return "it isn't a string";
+  const reading = readPattern(pattern);
+  if (typeof reading === 'string') return reading;
+  if (list === 'ignore' && pattern.includes('[')) {
+    return '"[" starts a character class in a .gitignore, which this list doesn\'t read, so write each name out, with "?" for a "[" in it';
+  }
+  return undefined;
+}
+
+export function directoryAt(path: string, followSymlinks: boolean): Promise<boolean | undefined> {
+  if (!followSymlinks) return lstat(path).then((s) => s.isDirectory(), () => undefined);
+  return stat(path).then((s) => s.isDirectory(), () => lstat(path).then(() => false, () => undefined));
 }
 
 /**
- * Whether a mount's include covers a mount-relative path. Its patterns take
- * `ignore`'s forms, read for files: a name or `*.ext` pattern covers a path by
- * its own last segment, at any depth, and `dir/**` covers what lies beneath
- * `dir`, and not a file named `dir`. Unlike `ignore`, a pattern that matches
- * a directory's name covers nothing beneath it: each file is covered by its
- * own name, so `gate.json` covers `x/gate.json` and not `x/gate.json/run.sh`,
- * and a subtree is named with `dir/**`. A directory is no file, so it needs
- * no covering: where one is a scope, refusesAsOutside (index.ts) decides.
+ * Whether a mount's include covers a mount-relative path, read as a file: a
+ * pattern that matches only directories covers what lies beneath a directory
+ * it matches, and any other covers a file by its own name or path, and
+ * nothing beneath a directory it matches. So `gate.json` covers `x/gate.json`
+ * and not `x/gate.json/run.sh`, and a subtree is named with `dir/` or
+ * `dir/**`. A directory is no file, so it needs no covering: where one is a
+ * scope, refusesAsOutside (index.ts) decides.
  */
 function coveredByInclude(relativePath: string, include: readonly string[]): boolean {
-  const name = relativePath.slice(relativePath.lastIndexOf('/') + 1);
-  for (const pattern of include) {
-    if (pattern.endsWith('/**')) {
-      if (relativePath.startsWith(pattern.slice(0, -2))) return true;
-    } else if (pattern === name || (pattern.startsWith('*.') && name.endsWith(pattern.slice(1)))) {
-      return true;
-    }
-  }
-  return false;
+  const segments = relativePath.split('/');
+  return include.some((p) => {
+    const pattern = readPattern(p);
+    if (typeof pattern === 'string') return false;
+    if (!pattern.directory) return matchesEntry(pattern, segments, false);
+    for (let k = 1; k < segments.length; k++) if (matchesEntry(pattern, segments.slice(0, k), true)) return true;
+    return false;
+  });
 }
 
 /**
@@ -1883,7 +1930,7 @@ function coveredByInclude(relativePath: string, include: readonly string[]): boo
  * it (#276); one covering only something inside it does.
  */
 export function ignoreBeneath(scope: string, patterns: string[]): string[] {
-  return patterns.filter((pattern) => !coveredByIgnore(scope, [pattern]));
+  return patterns.filter((pattern) => !coveredByIgnore(scope, [pattern], true));
 }
 
 /**
@@ -1937,29 +1984,29 @@ export function inOtherMount(relativePath: string, others: readonly string[]): b
 }
 
 /**
- * Why a walk passes over an entry by design, by its mount-relative path and
- * its name: another mount's directory, the ignore list, or an editor's file
- * name. Undefined when none covers it.
+ * Why a walk passes over an entry by design, by its mount-relative path, its
+ * name and whether it's a directory: another mount's directory, the ignore
+ * list, or an editor's file name. Undefined when none covers it.
  */
-function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly string[]): string | undefined {
+function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly string[], directory: boolean): string | undefined {
   if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
-  if (isIgnored(relativePath, name, patterns)) return IGNORED;
+  if (isIgnored(relativePath, patterns, directory)) return IGNORED;
   if (EDITOR_FILE.test(name)) return EDITOR_FILE_REASON;
   return undefined;
 }
 
 /**
  * Why a sync without a path, and the watcher, pass over a mount-relative
- * path: the path itself or a directory above it is passed over by design, as
- * the walk reads each entry by its path and name. A path in another mount's
- * directory is that mount's, whatever else covers a directory above it.
- * Undefined when nothing covers it.
+ * path, a directory or not: the path itself or a directory above it is passed
+ * over by design, as the walk reads each entry by its path, name and kind. A
+ * path in another mount's directory is that mount's, whatever else covers a
+ * directory above it. Undefined when nothing covers it.
  */
-export function passedOverAt(relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+export function passedOverAt(relativePath: string, patterns: string[], others: readonly string[], directory: boolean): string | undefined {
   if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
   const segments = relativePath.split('/').filter(Boolean);
   for (let i = 0; i < segments.length; i++) {
-    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others, i < segments.length - 1 || directory);
     if (why !== undefined) return why;
   }
   return undefined;
@@ -1975,24 +2022,19 @@ export function passedOverBetween(scope: string, relativePath: string, patterns:
   const segments = relativePath.split('/').filter(Boolean);
   const from = scope === '' ? 0 : scope.split('/').filter(Boolean).length;
   for (let i = from; i < segments.length - 1; i++) {
-    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others, true);
     if (why !== undefined) return why;
   }
   return undefined;
 }
 
-/** Simple ignore patterns, as the watcher and the old walk read them. */
-export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
-  for (const pattern of patterns) {
-    if (pattern === name) return true;
-    if (pattern.endsWith('/**')) {
-      const prefix = pattern.slice(0, -3);
-      if (relativePath === prefix || relativePath.startsWith(prefix + '/')) return true;
-    }
-    if (!pattern.includes('/') && relativePath === pattern) return true;
-    if (pattern.startsWith('*.') && name.endsWith(pattern.slice(1))) return true;
-  }
-  return false;
+/** Whether an ignore pattern matches the entry at a mount-relative path, a directory or not, itself. */
+function isIgnored(relativePath: string, patterns: readonly string[], directory: boolean): boolean {
+  const segments = relativePath.split('/');
+  return patterns.some((p) => {
+    const pattern = readPattern(p);
+    return typeof pattern !== 'string' && matchesEntry(pattern, segments, directory);
+  });
 }
 
 /**
@@ -2044,12 +2086,11 @@ export async function walkScope(
   };
   // A walk that isn't named passes over a scope the mount passes over by
   // design, at it or a directory above it, as its parent's listing would pass
-  // over its entry: a name rule (a bare-name ignore entry, an editor's name)
-  // doesn't match what lies beneath, as a path rule (`cache/**`) does. So a
-  // listing, glob or grep there never starts tracking what the mount leaves
-  // out, and a stored copy beneath it is unobserved, as beneath any region
-  // passed over by design. Its region says how to take what's there in: a
-  // sync that names it, whose scope is walked (#276), below.
+  // over its entry. So a listing, glob or grep there never starts tracking
+  // what the mount leaves out, and a stored copy beneath it is unobserved, as
+  // beneath any region passed over by design. Its region says how to take
+  // what's there in: a sync that names it, whose scope is walked (#276),
+  // below.
   // Another mount's directory is passed over by every walk, named or not,
   // and no sync of this mount takes it in, so its region gives no advice.
   if (scope !== '' && inOtherMount(scope, view.others)) {
@@ -2058,7 +2099,10 @@ export async function walkScope(
     return walk;
   }
   if (!opts.named && scope !== '') {
-    const why = passedOverAt(scope, view.ignore, view.others);
+    let why = passedOverAt(scope, view.ignore, view.others, true);
+    if (why !== undefined && passedOverAt(scope, view.ignore, view.others, false) === undefined) {
+      if ((await directoryAt(join(rootReal, scope), view.followSymlinks)) === false) why = undefined;
+    }
     if (why !== undefined) {
       walk.others.set(scope, why);
       walk.incomplete.push({ path: scope, reason: `${why}: a sync that names this path takes in what's there, editors' files aside`, kind: 'ignored' });
@@ -2192,8 +2236,12 @@ export async function walkScope(
       // Another mount's directory is passed over by its real path too, so a
       // walk that reaches one through a link to a directory above it lists
       // none of that mount's names (nestedRootAtReal).
-      const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others)
+      let passedOver = passedOverBecause(childRel, entry.name, ignore, view.others, entry.isDirectory())
         ?? (!entry.isSymbolicLink() && nestedRootAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
+      if (passedOver === undefined && view.followSymlinks && entry.isSymbolicLink()) {
+        const asDirectory = passedOverBecause(childRel, entry.name, ignore, view.others, true);
+        if (asDirectory !== undefined && (await directoryAt(dir.at(entry.name), true)) === true) passedOver = asDirectory;
+      }
       if (passedOver !== undefined) {
         others.push([childRel, passedOver]);
         regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });
