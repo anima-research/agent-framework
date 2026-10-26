@@ -10,10 +10,10 @@
  * the idle second agent is presented it before any wake for it runs, so its
  * one request carries it.
  *
- * A todo test until the presentation points are wired with the flag on: it
- * runs, and fails at helperCarried on this build, where the message is still
- * held for the first agent's turn (the issue's outcome) and both contexts are
- * still in legacy mode.
+ * A plain test since the presentation points are wired under the flag
+ * (AF-4). Before them it failed at helperCarried, the issue's outcome: the
+ * message was still held for the first agent's turn when the second one's
+ * request was made.
  */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -149,9 +149,7 @@ async function run(duringFirstTurn: boolean): Promise<Result> {
   }
 }
 
-it("an agent woken for a message that arrives during another agent's turn gets a request that carries it", {
-  todo: '#291: green once the presentation points are wired under presentationIndex',
-}, async () => {
+it("an agent woken for a message that arrives during another agent's turn gets a request that carries it", async () => {
   const control = await run(false);
   console.log(`control, the message arriving while no turn is alive: ${JSON.stringify(control)}`);
   assert.equal(control.helperCarried, true, "control: the helper's request carries the message");

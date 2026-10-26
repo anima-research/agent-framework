@@ -121,6 +121,7 @@ import {
   asOwnRow,
   audienceOf,
   conversationForkSpec,
+  isOwnRowOf,
   residentSpec,
   sameSlot,
   storeOwnRow,
@@ -203,7 +204,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn } from './presentation.js';
+import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn, type PresentationOccasion } from './presentation.js';
 import { coverTest, covers, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
@@ -1556,7 +1557,35 @@ interface TurnCheckpoint {
   sequenceBefore: number;
   branchName: string;
   timestamp: number;
+  /**
+   * The agent's window index length before the turn (#291), recorded only
+   * where the presentation index presents for the agent: an undo on the
+   * window takes out the rows presented at this ordinal and after. Absent
+   * otherwise, so a checkpoint without the flag is what it was, and in
+   * checkpoints an earlier version recorded (an undo converts those:
+   * checkpointLength).
+   */
+  indexLengthBefore?: number;
+  /** The branch whose window `indexLengthBefore` is a length of: the store's branch then, as `branchName` is. */
+  windowBranch?: string;
 }
+
+/**
+ * A write a surgery's hold kept out of every store, with the flag on
+ * (AgentFramework.surgeryHeldWrites): what addMessage was given, or, for a
+ * write straight into a fork's store (`direct`), the fork's name and the row.
+ */
+interface SurgeryHeldWrite {
+  participant: string;
+  content: ContentBlock[];
+  metadata?: MessageMetadata;
+  opts?: FrameworkWriteOptions;
+  direct?: { agentName: string };
+  heldAt: number;
+}
+
+/** Where rows entered a window that its open turn weighs as arrivals (noteArrival): a tool boundary weighs what it hears itself. */
+const ARRIVAL_OCCASIONS: ReadonlySet<PresentationOccasion> = new Set<PresentationOccasion>(['turn-start', 'assembly', 'turn-end', 'at-rest']);
 
 type DiscordAwarenessDrainOutcome =
   | { status: 'delivered'; delivered: number; failed: number }
@@ -1976,9 +2005,73 @@ export class ProviderWaitNotSleptError extends Error {
   }
 }
 
+/**
+ * What a write through the framework's addMessage may say beyond its row
+ * (AgentFramework.addMessage).
+ */
+interface FrameworkWriteOptions {
+  /**
+   * Deliver into this registry agent's window instead of the primary's,
+   * with the deferral/turn-alive guard evaluated against THAT agent's
+   * turn state. Default (absent) is byte-identical to the historical
+   * primary-only behavior. Unknown names log and drop (loud, non-fatal:
+   * this is reachable from timer callbacks that may outlive an agent).
+   */
+  forAgent?: string;
+  /**
+   * Set when the message comes back from the deferred queue: the entry's
+   * one durable identity and its place in arrival order. A write stamps
+   * the id into `metadata.deferredWriteId` (boot dedup). A re-deferral
+   * moves the same logical entry back to pending under the same id and
+   * seq, instead of minting a second, independently replayable one, or
+   * moving it behind entries that arrived after it, and keeps the time
+   * it was first held.
+   */
+  fromQueue?: { id: string; seq: number; heldAt: number };
+  /** Set by addModuleMessage for a write it marked for a run or a fork
+   *  (PRIMARY_IF_UNREAD_KEY): any other write has the mark taken off. */
+  markedForRun?: true;
+  /** Out-param: where the message landed (RFC-006 needs to find it
+   *  again), and, for the wake that goes with it (readsRowFor), whether
+   *  it was held for its agent's live turn (`deferredId`) or stored and
+   *  not presented to that agent (`presented: false`, which only a
+   *  presenting store path sets). */
+  placement?: WritePlacement;
+  /**
+   * RFC-006 assembly: the named agent's turn is alive but its compile has
+   * not run yet (the same window the turn-start deferred flush writes
+   * in). While that agent's assembly runs (`assembling`), a message for
+   * THAT agent is stored directly instead of deferred, after what is
+   * queued for the agent, which is written first (flushForStart). When
+   * some of that stays queued, because a write that failed cut it or the
+   * host is quiesced, the message is deferred behind it. Outside the
+   * assembly it counts only for a write from the queue (stop()'s drain):
+   * any other write is weighed as if it weren't set.
+   */
+  bypassDeferralFor?: string;
+  /**
+   * Who the message is for, when that is decided before it gets here:
+   * the recipients admission delivered an inbound message to, or none
+   * for one a tune-out holds. Stamped on the row as `metadata.audience`
+   * (dendrite/audience.ts). Absent, the row is for nobody when its
+   * metadata carries a tune-out's hold; else for `forAgent` when the
+   * write names one; else, a write that names no agent, for the
+   * agents that take untargeted inbound in the slot it lands in
+   * (untargetedAudience): every resident on a residents' host.
+   */
+  audience?: readonly string[];
+}
+
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
+  /**
+   * Set by an undo on the window (#291, decision 4): the rows it took out of
+   * the agent's window, in window order, by the id that names each body and
+   * whether it was the agent's own; and the index length right after the
+   * undo, from which a redo first takes out what was presented since.
+   */
+  window?: { tail: Array<{ id: MessageId; own: boolean }>; lengthAfterUndo: number };
 }
 
 interface InferenceToolSnapshot {
@@ -3505,10 +3598,24 @@ export class AgentFramework {
   /**
    * The presentation index (#291, presentation.ts), under
    * FrameworkConfig.presentationIndex; null without it. Set once, in
-   * create(), before any agent is created. Inert until the presentation
-   * points are wired: only addMessage's stamp check (checkAudience) calls it.
+   * create(), before any agent is created. Each agent is taken on as it is
+   * registered (adoptPresentation), and from then on, for an agent whose
+   * window is presented (presents), a write is stored at once and enters
+   * the window at the agent's presentation points: its own rows as they
+   * are written, others' at its turn's start, at its tool boundary as the
+   * stream can carry them, at its turn's end, and at once while no turn of
+   * it is alive.
    */
   private presentation: AgentPresentation | null = null;
+  /** The arrival listener adoptPresentation installed for each agent, by its unsubscribe. */
+  private readonly presentationListeners = new Map<Agent, () => void>();
+  /**
+   * Writes a surgery's hold kept out of every store while the operator's
+   * switch was awaited, with the flag on (addMessage, and the writes into a
+   * fork's store), in arrival order. They are in memory only: the release
+   * replays them through the ordinary write path (releaseSurgeryHeldWrites).
+   */
+  private readonly surgeryHeldWrites: SurgeryHeldWrite[] = [];
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
   /**
@@ -3524,9 +3631,11 @@ export class AgentFramework {
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
-  /** The batched-wake lines already written (placeWakeLines), so every agent a
-   *  wake was for, and every later start of it, writes each at most once. */
-  private readonly placedWakeLines = new WeakSet<WakeLine>();
+  /** The batched-wake lines already written (placeWakeLines), and the agents
+   *  each was written for, so every later start of a wake writes each at
+   *  most once for its agent: the delivery agent alone, and with the
+   *  presentation index each resident a wake was for. */
+  private readonly placedWakeLines = new WeakMap<WakeLine, Set<string>>();
   /** Rounds of tool calls, by their results array, that a save_recent_image
    *  in the round counted by their share of the bound: such a round is
    *  stored by its share whether or not it fits (buildStoredToolResultContent). */
@@ -4229,6 +4338,17 @@ export class AgentFramework {
       ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
     {
       const hostMode = framework.readHostMode();
+      // The quiesced flags first, before anything is stored: a write that
+      // lands below (the boot-recovery flush) is then weighed as a write
+      // to a quiesced host is, and, with the presentation index, enters no
+      // window of another agent's until resume.
+      if (hostMode?.quiesced) {
+        framework.hostModeRecordMayBeQuiesced = true;
+        framework.quiesced = true;
+        framework.quiesceReason = hostMode.reason;
+        framework.quiescedAt = hostMode.since;
+        framework.eventGate?.setQuiesced(true);
+      }
       // Deferred writes are recovered REGARDLESS of the mode flag: a crash
       // between a resume's flag clear and the end of its flush must not
       // strand accepted messages. A flush acknowledges its batch once, after
@@ -4245,11 +4365,6 @@ export class AgentFramework {
         await framework.flushDeferredWrites('boot-recovery');
       }
       if (hostMode?.quiesced) {
-        framework.hostModeRecordMayBeQuiesced = true;
-        framework.quiesced = true;
-        framework.quiesceReason = hostMode.reason;
-        framework.quiescedAt = hostMode.since;
-        framework.eventGate?.setQuiesced(true);
         console.error(
           `[host-mode] ============================================================\n` +
           `[host-mode] BOOTING QUIESCED (persisted${hostMode.reason ? `: ${hostMode.reason}` : ''}, ` +
@@ -4278,6 +4393,11 @@ export class AgentFramework {
     // quiesced host holds the restart notices and redelivered mail as it
     // holds any write, and mail an entry of the restored queue carries is
     // left to that entry's landing (nissa's #546 finding 4).
+    // With the presentation index, first a pass over every agent taken on
+    // (repairAndRest): its own rows stored and not in its window, then what
+    // it is owed at rest, now that the stored rows are in. Each agent's
+    // window was written down at its registration, before them.
+    framework.presentation?.repairAndRest();
     framework.reconcileAgentRegistry(interruptedAgents);
 
     if (config.mcplServers && config.mcplServers.length > 0) {
@@ -6250,6 +6370,11 @@ export class AgentFramework {
       workspace.useHistory((agentName, messageId) =>
         this.agents.get(agentName)?.getContextManager().getMessage(messageId as MessageId) != null);
     }
+    // With the presentation index an undo moves no branch: the workspace asks
+    // the window whether the turn that wrote is still in it.
+    if (this.presentation && workspace === module && typeof workspace.useWindow === 'function') {
+      workspace.useWindow((agentName, afterSequence) => this.windowHoldsOwnRowsAfter(agentName, afterSequence));
+    }
     this.emitTrace({ type: 'module:added', moduleName: module.name });
   }
 
@@ -6415,6 +6540,11 @@ export class AgentFramework {
     // nothing about delivery: earlier rounds of this turn may have been
     // live-routed already, so "your output was not delivered" would be a
     // false claim. addMessage alone requests no inference: no loop.
+    // Presented as it is stored (#291) while this stream still owns the
+    // agent: it follows the stream's last request. Once the stream no longer
+    // does, a turn the marker isn't part of may hold the agent, so it waits
+    // out of the window for the agent's next point.
+    const ownsAgent = args.stream === undefined || closes !== undefined;
     try {
       storeOwnRow(
         agent,
@@ -6432,6 +6562,8 @@ export class AgentFramework {
                 `producing when it stopped was cut off there.`,
         }],
         { system: true, kind: 'turn-interrupted', reason },
+        undefined,
+        ownsAgent,
       );
     } catch (err) {
       console.error(`[turn-interrupted] could not record chronicle marker for ${agent.name}:`, err);
@@ -7941,6 +8073,11 @@ export class AgentFramework {
       // reopen below.
       this.runReleasesAfterResume();
       await this.flushDeferredWrites('resume');
+      // With the presentation index the quiesce froze every window but for
+      // each agent's own rows: what was stored meanwhile enters the window of
+      // each agent with no turn alive now; a draining turn's is presented at
+      // its own points.
+      for (const agent of [...this.agents.values()]) this.presentAtEndOf(agent);
       this.persistHostMode(null);
       this.hostModeRecordMayBeQuiesced = false;
     } finally {
@@ -9830,10 +9967,12 @@ export class AgentFramework {
       return { type: 'tool_result' as const, toolUseId: call.id, toolName: call.name, content, isError: false };
     });
     // The child's own rows, though the round is voiced as the parent's in a
-    // shared fork: the framing of what the child is, stored for it.
-    const metadata = asOwnRow({ kind: 'dendrite-pending-round', from: parent.name } as unknown as MessageMetadata, options.name);
-    child.addMessage(shared ? parent.name : options.name, structuredClone(pending), metadata);
-    child.addMessage('user', results, metadata);
+    // shared fork: the framing of what the child is, stored for it. The
+    // child isn't registered yet: its adoption there presents them.
+    const writer = { name: options.name, getContextManager: () => child };
+    const metadata = { kind: 'dendrite-pending-round', from: parent.name } as unknown as MessageMetadata;
+    storeOwnRow(writer, shared ? parent.name : options.name, structuredClone(pending), metadata);
+    storeOwnRow(writer, 'user', results, metadata);
   }
 
   /**
@@ -10586,6 +10725,7 @@ export class AgentFramework {
     // agent's wakes), and neither wake goes to a name that's gone.
     this.eventGate?.agentGone(name);
     this.agents.delete(name);
+    this.forgetPresentation(agent);
     this.agentConfigs.delete(name);
     this.thinkingLossIncidents.forget(name);
     this.toolImageLedgers.delete(name);
@@ -11003,6 +11143,10 @@ export class AgentFramework {
     );
     // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
+    // Its window is written down here, at its registration, after whatever
+    // its creator seeded into its context (a host's seed rows, a derived
+    // agent's framing), which the adoption presents as its own rows.
+    this.adoptPresentation(agent);
     // Kept while the run is live so the agent can itself be derived from.
     this.agentConfigs.set(agent.name, candidate.config);
     const run: EphemeralRun = {
@@ -11157,6 +11301,7 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
+        this.forgetPresentation(agent);
         this.thinkingLossIncidents.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
@@ -12814,12 +12959,26 @@ export class AgentFramework {
    *
    * The undone branch is saved so `redo()` can restore it.
    * Returns the checkpoint that was undone, or null if nothing to undo.
+   *
+   * With the presentation index (FrameworkConfig.presentationIndex), for an
+   * agent whose window is presented, an undo is the window's alone (#291,
+   * decision 4): the rows the turn's checkpoint saw enter the window after
+   * it leave it, the agent's own as undone and others' as arrived and not
+   * yet presented, which its next start presents again. Nothing is written
+   * to the record and no branch moves, so `fromBranch` and `toBranch` are
+   * both the store's branch, `window` says how many rows left, and a
+   * `window:undone` trace is emitted instead of `undo:completed`. The
+   * record, the workspace and `_config` mounts, MCPL checkpoints and the
+   * inference log are left as they are: rollbackToMessage is the
+   * record-level revert. It is refused while a turn of the agent's is
+   * alive, and allowed while another agent's is.
    */
   undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    window?: { retracted: number; represented: number };
   } {
     this.refuseOperatorAfterStop('undo');
     return this.runUndoLastTurn(agentName, requester);
@@ -12832,6 +12991,7 @@ export class AgentFramework {
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    window?: { retracted: number; represented: number };
   } {
     const agent = this.agents.get(agentName);
     if (!agent) {
@@ -12844,6 +13004,7 @@ export class AgentFramework {
     if (this.surgeryHold) {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
+    if (this.presents(agent)) return this.undoOnWindow(agent, requester);
 
     const checkpoints = this.getTurnCheckpoints(agentName);
     if (checkpoints.length === 0) {
@@ -12893,15 +13054,146 @@ export class AgentFramework {
   }
 
   /**
+   * An undo on the window (undoLastTurn, with the presentation index): the
+   * agent's newest checkpoint's tail of its window, the rows at the index
+   * length it recorded and after (checkpointLength), leaves it. The agent's
+   * own rows leave as undone, so no presentation point presents them again
+   * until a redo; others' rows leave as arrived and not presented, and its
+   * next presentation point presents them again, after what it holds then.
+   * The rows are named body by body, by the shard that names each, in
+   * window order, and kept for redo with the index length the undo left.
+   */
+  private undoOnWindow(agent: Agent, requester?: OperatorRequester): {
+    undone: boolean;
+    turnIndex?: number;
+    fromBranch?: string;
+    toBranch?: string;
+    window?: { retracted: number; represented: number };
+  } {
+    const agentName = agent.name;
+    // A turn alive (its start, its stream, its tools, a continuation or a
+    // provider hold's retry on its way) holds the window: its next rows
+    // would land on what the undo took out.
+    if (this.hasTurn(agentName) || this.turnAlive(agent)) {
+      throw new OperatorActionError('agent-busy', `Cannot undo: a turn of ${agentName}'s is alive`);
+    }
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    if (checkpoints.length === 0) return { undone: false };
+    const checkpoint = checkpoints.pop()!;
+    const cm = agent.getContextManager();
+    const tail = this.windowTailFrom(cm, this.checkpointLength(cm, checkpoint), agentName);
+    const own = tail.filter((row) => row.own).map((row) => row.id);
+    const others = tail.filter((row) => !row.own).map((row) => row.id);
+    // Own rows first, then others'. Each call takes its rows out whole or
+    // not at all; a throw leaves the checkpoint where it was, for another
+    // try, which finds what is still in the window past it.
+    if (own.length > 0) cm.retractRows(own, { undone: true });
+    if (others.length > 0) cm.retractRows(others);
+    this.saveTurnCheckpoints(agentName, checkpoints);
+    const branch = this.store.currentBranch().name;
+    let redoStack = this.redoStacks.get(agentName);
+    if (!redoStack) {
+      redoStack = [];
+      this.redoStacks.set(agentName, redoStack);
+    }
+    redoStack.push({ branchName: branch, checkpoint, window: { tail, lengthAfterUndo: cm.indexLength() } });
+    const window = { retracted: tail.length, represented: 0 };
+    this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
+    this.recordOperatorAction({
+      kind: 'undo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      params: { turnIndex: checkpoint.turnIndex },
+      result: { sourceBranch: branch, targetBranch: branch, window },
+    });
+    return { undone: true, turnIndex: checkpoint.turnIndex, fromBranch: branch, toBranch: branch, window };
+  }
+
+  /**
+   * Where a checkpoint's turn began in the agent's window: the index length
+   * it recorded, on the branch it recorded it on. A checkpoint recorded
+   * before the window was presented (an earlier version's, or one taken
+   * while the context was in legacy mode), or on another branch, is
+   * converted: the place of the first row in the window stored after the
+   * checkpoint's sequence, or the window's end when there is none.
+   */
+  private checkpointLength(cm: ContextManager, checkpoint: TurnCheckpoint): number {
+    if (checkpoint.indexLengthBefore !== undefined && checkpoint.windowBranch === cm.currentBranch().name) {
+      return checkpoint.indexLengthBefore;
+    }
+    for (const row of cm.getPresentedMessages()) {
+      if (row.sequence > checkpoint.sequenceBefore) return cm.ordinalOf(row.id) ?? cm.indexLength();
+    }
+    return cm.indexLength();
+  }
+
+  /** The bodies of `cm`'s window at ordinal `from` and after, in window order, by the shard that names each, and whether each is `agentName`'s own row. */
+  private windowTailFrom(cm: ContextManager, from: number, agentName: string): Array<{ id: MessageId; own: boolean }> {
+    const tail: Array<{ id: MessageId; own: boolean }> = [];
+    let previous: StoredMessage | undefined;
+    for (const row of cm.getPresentedMessages()) {
+      const head = !previous || !continuesBody(previous, row);
+      previous = row;
+      if (!head || (cm.ordinalOf(row.id) ?? -1) < from) continue;
+      tail.push({ id: row.id, own: isOwnRowOf(row.metadata, agentName) });
+    }
+    return tail;
+  }
+
+  /**
+   * A redo of an undo on the window: first the rows presented since the
+   * undo leave the window as arrived and not presented (they enter again at
+   * the agent's next point, after the redone rows), so the redone rounds sit
+   * after the prefix their signed thinking was minted under; then the rows
+   * the undo took out enter it again, in their window order, but for one
+   * the store no longer holds. The checkpoint goes back.
+   */
+  private redoOnWindow(agent: Agent, entry: RedoEntry & { window: NonNullable<RedoEntry['window']> }, requester?: OperatorRequester): {
+    redone: boolean;
+    fromBranch?: string;
+    toBranch?: string;
+    window?: { retracted: number; represented: number };
+  } {
+    const agentName = agent.name;
+    const cm = agent.getContextManager();
+    const since = this.windowTailFrom(cm, entry.window.lengthAfterUndo, agentName).map((row) => row.id);
+    if (since.length > 0) cm.retractRows(since);
+    const back = entry.window.tail
+      .filter((row) => { const status = cm.windowStatusOf(row.id); return status === 'undone' || status === 'out'; })
+      .map((row) => row.id);
+    if (back.length > 0) cm.presentRows(back);
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    checkpoints.push(entry.checkpoint);
+    this.saveTurnCheckpoints(agentName, checkpoints);
+    const branch = this.store.currentBranch().name;
+    const window = { retracted: since.length, represented: back.length };
+    this.emitTrace({ type: 'window:undone', agentName, retracted: since.length, represented: back.length });
+    this.recordOperatorAction({
+      kind: 'redo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      result: { sourceBranch: branch, targetBranch: branch, window },
+    });
+    return { redone: true, fromBranch: branch, toBranch: branch, window };
+  }
+
+  /**
    * Redo a previously undone turn for an agent.
    *
    * Switches back to the branch that was active before the last undo.
    * Returns false if there's nothing to redo.
+   *
+   * An undo on the window (undoLastTurn, with the presentation index) is
+   * redone on the window: no branch moves, the rows presented since the
+   * undo leave the window, and the rows it took out enter it again, in
+   * their order, with `window` saying how many of each and a
+   * `window:undone` trace in place of `redo:completed`.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
+    window?: { retracted: number; represented: number };
   } {
     this.refuseOperatorAfterStop('redo');
     const agent = this.agents.get(agentName);
@@ -12919,6 +13211,18 @@ export class AgentFramework {
     const redoStack = this.redoStacks.get(agentName);
     if (!redoStack || redoStack.length === 0) {
       return { redone: false };
+    }
+    const top = redoStack[redoStack.length - 1]!;
+    if (top.window) {
+      if (!this.presents(agent)) {
+        throw new OperatorActionError('failed', `Cannot redo: ${agentName}'s undo was on its window, which isn't presented now`);
+      }
+      if (this.hasTurn(agentName) || this.turnAlive(agent)) {
+        throw new OperatorActionError('agent-busy', `Cannot redo: a turn of ${agentName}'s is alive`);
+      }
+      const result = this.redoOnWindow(agent, top as RedoEntry & { window: NonNullable<RedoEntry['window']> }, requester);
+      redoStack.pop();
+      return result;
     }
 
     const { branchName, checkpoint } = redoStack.pop()!;
@@ -13100,6 +13404,12 @@ export class AgentFramework {
         this.readdDrained(free.flatMap((name) => this.drainDeferredFor(name)), 'post-surgery flush');
         this.ackDeferredWrites();
       }
+      // With the presentation index, what the hold kept in memory is
+      // replayed through the ordinary write path, in arrival order, so each
+      // idle reader takes it as it is stored; then each agent the hold
+      // reserved is presented what it is owed, as at a turn's end.
+      this.releaseSurgeryHeldWrites();
+      for (const name of reserved.keys()) this.presentAtEndOf(this.agents.get(name));
     };
   }
 
@@ -13863,12 +14173,19 @@ export class AgentFramework {
     const turnIndex = this.turnCounters.get(agentName) ?? 0;
     this.turnCounters.set(agentName, turnIndex + 1);
 
+    // With the presentation index, where the window stood before the turn:
+    // its start presented the turn's inputs before this, so they stay when
+    // it's undone.
+    const agent = this.agents.get(agentName);
+    const cm = agent?.getContextManager();
+    const windowed = this.presents(agent);
     const checkpoint: TurnCheckpoint = {
       agentName,
       turnIndex,
       sequenceBefore: this.store.currentSequence(),
       branchName: this.store.currentBranch().name,
       timestamp: Date.now(),
+      ...(windowed ? { indexLengthBefore: cm!.indexLength(), windowBranch: cm!.currentBranch().name } : {}),
     };
 
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -14066,6 +14383,7 @@ export class AgentFramework {
     }
     agent.onContextBudgetCompiled((budget, fit) => this.recordCompiledContextBudget(config.name, budget, fit));
     this.agents.set(config.name, agent);
+    this.adoptPresentation(agent);
     this.agentConfigs.set(config.name, config);
 
     // First non-ephemeral agent becomes the primary for message routing
@@ -14151,6 +14469,7 @@ export class AgentFramework {
       this.registry.register({ ...subconsciousSpec(name, primaryName), model: agentConfig.model }),
     );
     this.agents.set(name, agent);
+    this.adoptPresentation(agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
     this.subconsciousStrategy = strategy;
@@ -14644,18 +14963,36 @@ export class AgentFramework {
           // Everything queued for the agent waits for the turn-end flush, as
           // a held message does, rather than sitting in the window between
           // rounds the stream never showed it.
+          //
+          // With the presentation index (#291) nothing is queued: what arrived
+          // for the agent during the round is stored already, and out of its
+          // window. Here its window takes the round's rows (its reply, its
+          // results and the clock below, each presented as it was stored),
+          // then, unless the host is quiesced or the stream can't carry
+          // injected messages, its arrivals as a prefix cut at the first that
+          // can't join a live stream, by the same rule as the drain's, each
+          // body whole (presentAtBoundary). Those are what it hears, rendered
+          // after they are presented, since a render places only what the
+          // window holds. What the cut kept out waits for the turn's end. A
+          // held message is no resident's arrival, so it is never presented
+          // to one, nor heard. The mail a message carries was released, and
+          // the other residents weighed it, when it was stored.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
-          // What this boundary stored for the agent to hear, in store order,
-          // for a boundary that leaves it to the turn's next start as
+          // What this boundary stored or presented for the agent to hear, in
+          // order, for a boundary that leaves it to the turn's next start as
           // arrivals: that start's compile sends it.
-          const heard: Array<{ msg: DeferredWrite; id: MessageId; content: ContentBlock[] }> = [];
-          if (currentState.supportsInjectedMessages !== false) {
-            // A clock row due (storeDueClock) goes right after the round's
-            // results, ahead of what is drained below, and joins the stream
-            // the same way. A boundary that passed during the round can't
-            // stand between a tool's call and its results, so this clock
-            // reads the time it's written (clock-rows.ts).
-            const clock = this.storeDueClock(agent, 'tool-boundary');
+          const heard: Array<{ id: MessageId; participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
+          const presentsWindow = this.presents(agent);
+          const injects = currentState.supportsInjectedMessages !== false;
+          // A clock row due (storeDueClock) goes right after the round's
+          // results, ahead of what is drained below, and joins the stream
+          // the same way. A boundary that passed during the round can't
+          // stand between a tool's call and its results, so this clock
+          // reads the time it's written (clock-rows.ts).
+          const clock = injects ? this.storeDueClock(agent, 'tool-boundary') : undefined;
+          if (presentsWindow) {
+            heard.push(...this.presentation!.presentAtBoundary(agent, [replyId, resultsId, clock?.id], { injects }).heard);
+          } else if (injects) {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
@@ -14678,8 +15015,10 @@ export class AgentFramework {
               // here would put in the live turn what the next compile hides
               // (#232 gap 5).
               if (heldFromResidents(msg.metadata as Record<string, unknown> | undefined)) continue;
-              heard.push({ msg, id, content });
+              heard.push({ id, participant: msg.participant, content, ...(msg.metadata ? { metadata: msg.metadata } : {}) });
             }
+          }
+          if (injects) {
             // Rendered in one call: a render prepares as a compile does, so
             // the batch shares one preparation. The image limits count from
             // the batch's oldest message the render places to the newest, as
@@ -14718,9 +15057,9 @@ export class AgentFramework {
             if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
               midTurnInjections.push({
-                participant: h.msg.participant,
+                participant: h.participant,
                 content: asSent(i + first, h.content),
-                ...(h.msg.metadata ? { metadata: h.msg.metadata } : {}),
+                ...(h.metadata ? { metadata: h.metadata } : {}),
                 id: h.id,
               });
             });
@@ -14894,7 +15233,7 @@ export class AgentFramework {
             // stream to tell) leaves what it stored for the agent to the
             // turn's next start, as arrivals: a budget restart, or a
             // re-inference on these tool results.
-            for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
+            for (const { metadata, id } of heard) this.noteArrival(agent.name, metadata, id);
           }
 
           // A boundary that ends the stream (a result that ends the turn, a restart, a stopping framework) has
@@ -14994,6 +15333,15 @@ export class AgentFramework {
             // request.
             const submitted = agent.toolResultGuard.submissionResults(membraneResults);
             const injectedMessages = midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) }));
+            // With the presentation index, the hand-off (#785): the rows the
+            // stream is given next, its reply, its results and what it hears,
+            // in that order, must be the newest of its window, or the rounds
+            // noted from here on aren't vouched for, and their thinking is
+            // left out at the next compile rather than sent under a prefix its
+            // window doesn't hold.
+            const vouched = presentsWindow
+              ? this.presentation!.handOff(agent, [replyId, resultsId, ...midTurnInjections.map((injection) => injection.id)]).vouched
+              : true;
             // Before the round's reply exists, so the reply that comes next is the reply to this request.
             this.noteRoundSent(agent, currentState.stream, [
               { kind: 'reply', id: replyId, sent: replySent ?? [] },
@@ -15001,7 +15349,7 @@ export class AgentFramework {
               ...midTurnInjections.map((injection, i) => ({
                 kind: 'injected' as const, id: injection.id, participant: injectedMessages[i]!.participant, sent: injectedMessages[i]!.content,
               })),
-            ], replySent === null || replySent === undefined);
+            ], replySent === null || replySent === undefined || !vouched);
             currentState.stream.provideToolResults(
               submitted,
               midTurnInjections.length > 0 ? { injectedMessages } : undefined,
@@ -15499,8 +15847,7 @@ export class AgentFramework {
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
         // For the fork it is delivered to, not its own row.
-        const id = target.getContextManager().addMessage('user', content,
-          withAudience(AgentFramework.withStoredDigest(metadata, content), [target.name]));
+        const id = this.storeInFork(target, content, AgentFramework.withStoredDigest(metadata, content));
         // Delivered to the fork, so it is the latest delivered inbound too
         // (the channel context's `incoming`; the fallback locus under the
         // legacy rule), as a resident's delivery is below.
@@ -15511,7 +15858,8 @@ export class AgentFramework {
         if (this.conversationRouter.getBinding(channel)?.agentName === target.name) {
           this.conversationRouter.touch(channel);
         }
-        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        // A write a surgery holds (storeInFork's '') is traced when its release stores it.
+        if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
         if (decision.wake) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
@@ -15684,14 +16032,13 @@ export class AgentFramework {
       this.storeDueClock(agent, 'event');
     }
     // For the fork it is delivered to, not its own row.
-    const id = agent.getContextManager().addMessage('user', event.content,
-      withAudience(AgentFramework.withStoredDigest(messageMetadata, event.content), [agent.name]));
+    const id = this.storeInFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     // Delivered to the channel's fork: the latest delivered inbound, as for a
     // resident (the channel context's `incoming`; the fallback locus under
     // the legacy rule). A held or dropped message never is.
     if (admission.locus) this.noteDeliveredOrPark(event as Parameters<AgentFramework['noteDeliveredOrPark']>[0]);
     router.touch(channel);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (trigger) {
       this.pendingRequests.push({
@@ -15819,10 +16166,12 @@ export class AgentFramework {
           withoutReasoning, primaryNoticeTexts(templateRows));
         const seed = stripUnpairedToolBlocks(withoutNotices);
         logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
-        // The fork's own rows: its inheritance, stored for it.
+        // The fork's own rows: its inheritance, stored for it, and presented
+        // to it when it is taken on at its registration below.
+        const fork = { name, getContextManager: () => contextManager };
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
-          contextManager.addMessage(participant, msg.content, asOwnRow(undefined, name));
+          storeOwnRow(fork, participant, msg.content);
         }
       }
 
@@ -15839,6 +16188,7 @@ export class AgentFramework {
         model: config.model,
       }));
       this.agents.set(name, agent);
+      this.adoptPresentation(agent);
       this.agentConfigs.set(name, config);
       return agent;
     } catch (error) {
@@ -16044,6 +16394,9 @@ export class AgentFramework {
    */
   private sweepExpiredConversations(): void {
     if (!this.conversationRouter) return;
+    // With the presentation index no write reaches a store while a
+    // surgery holds it: the sweep waits for the release.
+    if (this.presentation && this.surgeryHold) return;
     const now = Date.now();
     if (now - this.lastConversationSweep < 60_000) return;
     this.lastConversationSweep = now;
@@ -16067,12 +16420,19 @@ export class AgentFramework {
         continue;
       }
       // Written for the fork's closing turn, as a [continue] row is for a
-      // continuation's: its own row.
+      // continuation's: its own row. Expiry keys on the fork's last activity
+      // alone, so a turn of the fork's may be alive: the row then stays out
+      // of that turn's window (present false) and enters it at the turn's
+      // end, before the closing turn starts. So it does while the host is
+      // quiesced.
+      const present = !this.hasTurn(agent.name) && !this.turnAlive(agent) && !this.quiesced;
       storeOwnRow(
         agent,
         'user',
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
         { channelId: binding.channelId, conversationClosure: true },
+        undefined,
+        present,
       );
       this.pendingRequests.push({
         agentName: binding.agentName,
@@ -19093,6 +19453,144 @@ export class AgentFramework {
   }
 
   /**
+   * Whether the presentation index presents for `agent` (#291): the flag
+   * on, the agent taken on, and its context in presented mode. Every
+   * flag-on path asks this, so a host without the flag, or an agent whose
+   * window stays in legacy mode, keeps the path it had.
+   */
+  private presents(agent: Agent | undefined): boolean {
+    return !!agent && !!this.presentation?.presenting(agent);
+  }
+
+  /**
+   * Take a newly registered agent on (presentation.adopt: its window
+   * written down, its own rows stored and not in it presented, its own-row
+   * sink installed), and weigh each row of another writer that enters its
+   * window at a start, at an end or at rest as its open turn's arrival
+   * (noteArrival), as the flushes these points replace weighed what they
+   * stored. A tool boundary weighs what it hears itself.
+   */
+  private adoptPresentation(agent: Agent): void {
+    const presentation = this.presentation;
+    if (!presentation) return;
+    presentation.adopt(agent);
+    this.presentationListeners.get(agent)?.();
+    this.presentationListeners.set(agent, presentation.onPresented(agent.name, (event) => {
+      if (!ARRIVAL_OCCASIONS.has(event.occasion) || this.agents.get(agent.name) !== agent) return;
+      let previous: StoredMessage | undefined;
+      for (const row of event.rows) {
+        // One body, one arrival, by the shard that names it.
+        const head = !previous || !continuesBody(previous, row);
+        previous = row;
+        if (head && !isOwnRowOf(row.metadata, agent.name)) this.noteArrival(agent.name, row.metadata, row.id);
+      }
+    }));
+  }
+
+  /**
+   * For the workspace's head-move notice (useWindow): whether `agentName`'s
+   * window still holds the first of its own rows stored after
+   * `afterSequence`, the store's head when it wrote a mount direct, which is
+   * the round that made the write. An undo on the window leaves the record
+   * and the branch as they were and takes the turn's own rows out of the
+   * window as undone, so this is where the agent's history no longer holds
+   * the write. True for an agent the index doesn't present for, and where
+   * no own row of its came after. Reads the record back from its newest
+   * row, 64 at a time, to that place.
+   */
+  private windowHoldsOwnRowsAfter(agentName: string, afterSequence: number): boolean {
+    const agent = this.agents.get(agentName);
+    if (!agent || !this.presents(agent)) return true;
+    const cm = agent.getContextManager();
+    let first: MessageId | undefined;
+    scan: for (let end = cm.getMessageCount(); end > 0;) {
+      const span = Math.min(end, 64);
+      const { messages } = cm.getMessageWindow(end - span, span, { resolveBlobs: false });
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const row = messages[i]!;
+        if (row.sequence <= afterSequence) break scan;
+        if (isOwnRowOf(row.metadata, agentName)) first = row.id;
+      }
+      end -= span;
+    }
+    return first === undefined || cm.windowStatusOf(first) !== 'undone';
+  }
+
+  /** Let a deregistered agent go from the presentation index (forget), its arrival listener with it. */
+  private forgetPresentation(agent: Agent): void {
+    // Read defensively, as releaseSurgeryHeldWrites is.
+    this.presentationListeners?.get(agent)?.();
+    this.presentationListeners?.delete(agent);
+    this.presentation?.forget(agent);
+  }
+
+  /**
+   * An agent's turn's end, or a moment its turn may have ended, with the
+   * flag on: what it is owed is presented (presentation.presentAtEnd),
+   * unless its logical turn is still alive (a token, a continuation or
+   * retry on its way, a stream, a tool cycle), whose own points present
+   * it. Idempotent; nothing for an agent the index doesn't present for.
+   */
+  private presentAtEndOf(agent: Agent | undefined): void {
+    if (agent && this.presents(agent)) this.presentation!.presentAtEnd(agent);
+  }
+
+  /**
+   * A channel message stored straight into a fork's own store, past
+   * addMessage's deferral, as the fork writes are (a correction
+   * handleMcplChannelIncoming delivers, a message routeConversationIncoming
+   * routes), stamped for the fork alone. With the flag on, while a surgery
+   * holds the store it is held in memory instead (surgeryHeldWrites) and ''
+   * returned; stored, it enters the fork's window at once when no turn of
+   * the fork's is alive, else at the fork's next point (afterStore).
+   */
+  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata): MessageId {
+    const presents = this.presents(target);
+    if (presents && this.surgeryHold) {
+      this.surgeryHeldWrites.push({ participant: 'user', content, metadata, direct: { agentName: target.name }, heldAt: Date.now() });
+      return '' as MessageId;
+    }
+    const id = target.getContextManager().addMessage('user', content, withAudience(metadata, [target.name]));
+    if (presents) this.presentation!.afterStore(target, [id]);
+    return id;
+  }
+
+  /**
+   * The writes a surgery's hold kept (surgeryHeldWrites), replayed in the
+   * order they arrived once the hold and its tokens are released, each by
+   * the path it was held on: addMessage's, or a fork's store. A fork gone
+   * since takes nothing, which is logged. A write that throws now is
+   * logged, and the rest go on.
+   */
+  private releaseSurgeryHeldWrites(): void {
+    // Read defensively: a framework built from its prototype, as some
+    // suites build one, holds none.
+    const held = this.surgeryHeldWrites?.splice(0) ?? [];
+    for (const write of held) {
+      try {
+        if (write.direct) {
+          const target = this.agents.get(write.direct.agentName);
+          if (!target) {
+            console.error(`[surgery] a channel message held for fork ${write.direct.agentName} has no fork to land in now, so it is dropped`);
+            continue;
+          }
+          if (!this.turnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
+            this.storeDueClock(target, 'event');
+          }
+          this.storeInFork(target, write.content, write.metadata ?? {});
+        } else {
+          this.addMessage(write.participant, write.content, write.metadata, write.opts);
+        }
+      } catch (error) {
+        console.error(`[surgery] a write held while the store was held couldn't be stored at its release:`, error);
+      }
+    }
+    if (held.length > 0) {
+      console.error(`[surgery] ${held.length} write(s) held while the store was held were replayed in arrival order`);
+    }
+  }
+
+  /**
    * Whether a round's turn was stopped while its results were built (a
    * spill's workspace write), which a tool boundary and a stream that
    * completed while its tools ran both await before they store anything:
@@ -19129,7 +19627,9 @@ export class AgentFramework {
    * None while the host is quiesced (the window is frozen for surgery), and
    * none in the residents' shared slot while another of its readers (the
    * subconscious among them, through its merged view) has a turn alive: the
-   * row would sit inside that turn without joining its stream. A clock that
+   * row would sit inside that turn without joining its stream. A reader the
+   * presentation index presents for doesn't count (sharedSlotBusy): the row
+   * is the agent's own, in no window but its own. A clock that
    * can't be planned or stored is logged and skipped: it never holds up what
    * it would have preceded. One whose write threw after it landed is the
    * window's all the same, so it's returned, and a tool boundary injects it.
@@ -19152,7 +19652,9 @@ export class AgentFramework {
     const before = this.storedCountOf(agent);
     let id: MessageId;
     try {
-      id = agent.getContextManager().addMessage('user', planned.content, metadata);
+      // The agent's own row, presented to it as it is stored (#291): each
+      // place the clock is written is one where it is in the next request.
+      id = storeOwnRow(agent, 'user', planned.content, metadata);
     } catch (err) {
       // A write can throw after its row landed, as when context-manager's own
       // propagation of it fails: what landed is read back from where the
@@ -19167,6 +19669,7 @@ export class AgentFramework {
       }
       console.error(`[clock] ${agent.name}: the clock row at ${occasion} landed though its write threw:`, err);
       id = landed[0]!.id;
+      agent.ownRowsStored([id]);
     }
     this.emitTrace({ type: 'message:added', messageId: id, source: `clock:${occasion}` });
     return { id, content: planned.content, metadata };
@@ -19197,17 +19700,17 @@ export class AgentFramework {
     if (this.slotHeldFrom(agent)) {
       for (const row of plan.rows) placed.add(row.at);
     } else {
-      const cm = agent.getContextManager();
       const before = this.storedCountOf(agent);
       const key = (mark: { namespace: string; contentHash: string; part: number }) => `${mark.namespace}\0${mark.contentHash}\0${mark.part}`;
       const traced = new Set<string>();
       try {
         for (const row of plan.rows) {
           // A stored injection is this agent's own context (#291's audience
-          // stamp): its own row, read by no other agent.
-          const id = cm.addMessage(row.participant, row.content, asOwnRow({
+          // stamp): its own row, read by no other agent, and presented to it
+          // as it is stored, before this start's compile.
+          const id = storeOwnRow(agent, row.participant, row.content, {
             system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: row.mark,
-          } as MessageMetadata, agent.name));
+          } as MessageMetadata);
           traced.add(key(row.mark));
           this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.mark.namespace}` });
         }
@@ -19229,6 +19732,9 @@ export class AgentFramework {
           if (!traced.has(key(mark))) {
             traced.add(key(mark));
             this.emitTrace({ type: 'message:added', messageId: copy.id, source: `context-injection:${mark.namespace}` });
+            // The row whose write threw landed: it enters the window as the
+            // others did.
+            agent.ownRowsStored([copy.id]);
           }
         }
         const rest = plan.rows.filter((row) => !kept.has(key(row.mark)));
@@ -19308,8 +19814,8 @@ export class AgentFramework {
    * accord (a clock row, a batched wake's line) waits: while the host is
    * quiesced, or, for a reader of the residents' shared slot (the
    * subconscious, which reads it through a merged view, included), while
-   * another reader of it has a turn alive, where it would land inside that
-   * turn.
+   * another reader of it that the presentation index doesn't present for
+   * has a turn alive, where it would land inside that turn.
    */
   private slotHeldFrom(agent: Agent): boolean {
     return this.quiesced || this.sharedSlotBusy(agent);
@@ -19399,7 +19905,9 @@ export class AgentFramework {
     if (!this.isOrdinaryResident(agent)) return;
     for (const name of this.registry.slotOwners(RESIDENTS_SLOT)) {
       const reader = this.agents.get(name);
-      if (reader && reader !== agent) this.noteArrival(reader.name, metadata, messageId);
+      // One the presentation index presents for weighs it as it enters its
+      // window, at its own boundary among them (noteStored).
+      if (reader && reader !== agent && !this.presents(reader)) this.noteArrival(reader.name, metadata, messageId);
     }
   }
 
@@ -19469,7 +19977,9 @@ export class AgentFramework {
     }];
     const metadata = asOwnRow({ system: true, kind: 'routing-notice' } as MessageMetadata, agent.name);
     try {
-      const id = agent.getContextManager().addMessage('user', content, metadata);
+      // Presented as it is stored: it rides this boundary's injection, or is
+      // in this start's compile.
+      const id = storeOwnRow(agent, 'user', content, metadata);
       this.lastAnnouncedLocus.set(agent.name, channel);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       console.error(`[routing] ${agent.name}: ${cause} re-pin ${prevPin ? qualifiedChannelName(prevPin) : '(none)'} -> ${qualifiedChannelName(channel)}`);
@@ -19510,7 +20020,8 @@ export class AgentFramework {
     }];
     const metadata = asOwnRow({ system: true, kind: 'routing-notice' } as MessageMetadata, agent.name);
     try {
-      const id = agent.getContextManager().addMessage('user', content, metadata);
+      // Presented as it is stored: it rides this boundary's injection.
+      const id = storeOwnRow(agent, 'user', content, metadata);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       return { participant: 'user', content, metadata, id };
     } catch (err) {
@@ -20094,6 +20605,7 @@ export class AgentFramework {
       }
       console.error(`[continue] ${agent.name}: the continuation row landed though its write threw:`, err);
       id = landed[0]!.id;
+      agent.ownRowsStored([id]);
     }
     this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
     console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
@@ -20101,11 +20613,13 @@ export class AgentFramework {
   }
 
   /** Whether another reader of the residents' shared slot has a turn alive,
-   *  so no row may be written there now (as storeDueClock checks). */
+   *  so no row may be written there now (as storeDueClock checks). A reader
+   *  the presentation index presents for doesn't count (#291): what is
+   *  stored during its turn stays out of its window until its next point. */
   private sharedSlotBusy(agent: Agent): boolean {
     if (!this.sharedSlotAgents.has(agent)) return false;
     for (const reader of this.sharedSlotAgents) {
-      if (reader !== agent && this.turnAlive(reader)) return true;
+      if (reader !== agent && !this.presents(reader) && this.turnAlive(reader)) return true;
     }
     return false;
   }
@@ -21100,6 +21614,10 @@ export class AgentFramework {
         this.readdDrained(this.drainDeferredFor(agent.name), 'failed-start flush');
         this.ackDeferredWrites();
       }
+      // With the presentation index, the start's end is its turn's: what
+      // arrived during it enters its window, unless its turn lives on (a
+      // retry on its way).
+      if (!tokenHandedOff) this.presentAtEndOf(agent);
     }
   }
 
@@ -21204,6 +21722,9 @@ export class AgentFramework {
       this.readdDrained(this.drainDeferredFor(agentName), 'continuation-drop flush');
       this.ackDeferredWrites();
     }
+    // With the presentation index, the turn's end; a frame that still holds
+    // its token presents at its own end instead.
+    this.presentAtEndOf(this.agents.get(agentName));
   }
 
   /**
@@ -21383,6 +21904,14 @@ export class AgentFramework {
       // goes on.
       this.flushForStart(agent, 'turn-start');
     }
+    // With the presentation index (#291) the turn's inputs are stored as they
+    // arrive, and enter its window here, before its checkpoint: its own rows
+    // not in it yet and its arrivals, in the order they were stored (a queue
+    // a flag-off run left is written first, above). Each arrival is weighed
+    // for the turn as the flush weighed what it stored (adoptPresentation).
+    // Fresh starts only, as the flush: a resumed turn takes in no new input
+    // but at its tool boundaries.
+    if (attempt === 0 && !resumesTurn && this.presents(agent)) this.presentation!.presentAtStart(agent, 'turn-start');
 
     // RFC-006 §5: deferred batches for this agent render now, at the assembly
     // boundary — after the deferred flush (same window: turn alive, compile
@@ -21439,6 +21968,8 @@ export class AgentFramework {
         this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
         this.ackDeferredWrites();
       }
+      // With the presentation index, the turn's end: what it is owed now.
+      this.presentAtEndOf(agent);
       return false;
     }
     // What was deferred for this agent while its assembly awaited renders is
@@ -21448,6 +21979,10 @@ export class AgentFramework {
     // agent's assembly placed in this agent's queue (freeze's `joined`,
     // vector 25). Not once the host is quiesced, when it waits for resume().
     if (assembled && !this.quiesced && this.deferredMessages.length > 0) this.flushForStart(agent, 'assembly');
+    // With the presentation index, what the assembly stored for this start,
+    // and what arrived for it meanwhile, enters its window now, as the
+    // flush stored it. Not while quiesced, when others' rows are frozen.
+    if (assembled && !this.quiesced && this.presents(agent)) this.presentation!.presentAtStart(agent, 'assembly');
 
     // The batched-wake lines the gate left to this start (WakeLine), decided
     // now that the turn's inputs are in and before its checkpoint: on the
@@ -21489,6 +22024,7 @@ export class AgentFramework {
             this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
             this.ackDeferredWrites();
           }
+          this.presentAtEndOf(agent);
           return false;
         }
       }
@@ -21804,6 +22340,11 @@ export class AgentFramework {
       // didn't record), when it's left out; the rest go to compile(), as do those
       // it would store while the window is held.
       injections = this.storeInjections(agent, injections);
+      // With the presentation index, the backstop before every compile,
+      // fresh or resumed: the agent's own rows stored since its start and not
+      // in its window yet (a write whose presentation failed) enter it now,
+      // before the compile takes its read mark.
+      if (this.presents(agent)) this.presentation!.presentAtStart(agent, 'compile');
 
       const {
         stream,
@@ -24363,6 +24904,12 @@ export class AgentFramework {
         this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
         this.ackDeferredWrites();
       }
+      // With the presentation index, the turn's end: what arrived during it,
+      // and what its boundaries cut, enters its window now, in the order it
+      // was stored. Keyed on the logical turn (presentAtEndOf): a successor
+      // that holds the token already, or a continuation on its way, keeps
+      // it for its own points.
+      if (frameReachedTerminal || handedOffTurnOver) this.presentAtEndOf(agent);
 
       // The logical turn has ended and its notices are written: record the
       // drafts they name as noticed (the store is synced first). A stream
@@ -24568,6 +25115,13 @@ export class AgentFramework {
       if (ownedToEnd) {
         storeOwnRow(agent, agentName, toolUse);
         storeOwnRow(agent, 'user', blocks);
+      } else if (this.presents(agent)) {
+        // With the presentation index the pair is stored now, back to back,
+        // and kept out of the window of the turn that replaced the
+        // reservation (present false): that turn's end presents it, as its
+        // own rows not yet in its window, both in one presentation.
+        storeOwnRow(agent, agentName, toolUse, undefined, undefined, false);
+        storeOwnRow(agent, 'user', blocks, undefined, undefined, false);
       } else {
         const heldAt = Date.now();
         this.deferredMessages.push(
@@ -24607,6 +25161,10 @@ export class AgentFramework {
         this.readdDrained(this.drainDeferredFor(agentName), 'puppet flush');
         this.ackDeferredWrites();
       }
+      // With the presentation index, the puppet's end: what arrived while it
+      // held the agent enters the window after the pair, and a pair a turn
+      // that replaced it left unpresented enters at that turn's end.
+      this.presentAtEndOf(this.agents.get(agentName));
     }
   }
 
@@ -26601,59 +27159,11 @@ export class AgentFramework {
     participant: string,
     content: ContentBlock[],
     metadata?: MessageMetadata,
-    opts?: {
-      /**
-       * Deliver into this registry agent's window instead of the primary's,
-       * with the deferral/turn-alive guard evaluated against THAT agent's
-       * turn state. Default (absent) is byte-identical to the historical
-       * primary-only behavior. Unknown names log and drop (loud, non-fatal:
-       * this is reachable from timer callbacks that may outlive an agent).
-       */
-      forAgent?: string;
-      /**
-       * Set when the message comes back from the deferred queue: the entry's
-       * one durable identity and its place in arrival order. A write stamps
-       * the id into `metadata.deferredWriteId` (boot dedup). A re-deferral
-       * moves the same logical entry back to pending under the same id and
-       * seq, instead of minting a second, independently replayable one, or
-       * moving it behind entries that arrived after it, and keeps the time
-       * it was first held.
-       */
-      fromQueue?: { id: string; seq: number; heldAt: number };
-      /** Set by addModuleMessage for a write it marked for a run or a fork
-       *  (PRIMARY_IF_UNREAD_KEY): any other write has the mark taken off. */
-      markedForRun?: true;
-      /** Out-param: where the message landed (RFC-006 needs to find it
-       *  again), and, for the wake that goes with it (readsRowFor), whether
-       *  it was held for its agent's live turn (`deferredId`) or stored and
-       *  not presented to that agent (`presented: false`, which only a
-       *  presenting store path sets). */
-      placement?: WritePlacement;
-      /**
-       * RFC-006 assembly: the named agent's turn is alive but its compile has
-       * not run yet (the same window the turn-start deferred flush writes
-       * in). While that agent's assembly runs (`assembling`), a message for
-       * THAT agent is stored directly instead of deferred, after what is
-       * queued for the agent, which is written first (flushForStart). When
-       * some of that stays queued, because a write that failed cut it or the
-       * host is quiesced, the message is deferred behind it. Outside the
-       * assembly it counts only for a write from the queue (stop()'s drain):
-       * any other write is weighed as if it weren't set.
-       */
-      bypassDeferralFor?: string;
-      /**
-       * Who the message is for, when that is decided before it gets here:
-       * the recipients admission delivered an inbound message to, or none
-       * for one a tune-out holds. Stamped on the row as `metadata.audience`
-       * (dendrite/audience.ts). Absent, the row is for nobody when its
-       * metadata carries a tune-out's hold; else for `forAgent` when the
-       * write names one; else, a write that names no agent, for the
-       * agents that take untargeted inbound in the slot it lands in
-       * (untargetedAudience): every resident on a residents' host.
-       */
-      audience?: readonly string[];
-    }
+    opts?: FrameworkWriteOptions,
   ): MessageId {
+    // What the caller gave, for a write a surgery's hold keeps (below),
+    // which its release replays as it came.
+    const given = metadata;
     // `deferredWriteId` is the framework's: a write from the queue is stored
     // under its own (withDeferredWriteId), and boot's dedup and a module's
     // handle (landedRow) find the write by it. Any other write through here
@@ -26703,6 +27213,26 @@ export class AgentFramework {
     if (!(opts?.fromQueue && audienceOf(metadata))) {
       metadata = withAudience(metadata, opts?.audience ?? this.defaultAudience(opts?.forAgent, metadata) ?? [agent.name]);
     }
+    // With the presentation index (#291), a write isn't deferred: it is
+    // stored at once, and each reader's window takes it at that reader's
+    // points (presentation.afterStore below). Only a surgery's hold keeps a
+    // write out of the store while the operator's switch is awaited: it is
+    // held in memory, as given, and its release replays it through here
+    // (releaseSurgeryHeldWrites). It goes in no window and no store before
+    // then, so its placement names only its agent.
+    const presents = this.presents(agent);
+    if (presents && this.surgeryHold && !opts?.fromQueue) {
+      const { placement, ...rest } = opts ?? {};
+      this.surgeryHeldWrites.push({
+        participant, content,
+        ...(given !== undefined ? { metadata: given } : {}),
+        ...(opts ? { opts: rest } : {}),
+        heldAt: Date.now(),
+      });
+      if (placement) placement.agent = agent.name;
+      return '' as MessageId;
+    }
+
     // A stamp no reader of the slot can read is a routing fault, traced once
     // for the write (not again when it comes back from the queue). The row
     // is stored as named.
@@ -26761,15 +27291,14 @@ export class AgentFramework {
     const assembledForStart = bypasses && !opts?.fromQueue;
     const behindQueue = assembledForStart && this.deferredMessages.length > 0 &&
       (this.quiesced ? this.queuedFor(agent.name) : this.flushForStart(agent, 'assembly'));
-    if (
-      !freshToolResult &&
-      (behindQueue ||
-        (!bypasses &&
-          (this.quiesced ||
-            midToolCycle ||
-            this.activeTurnTokens.has(agent.name) ||
-            this.activeStreams.has(agent.name))))
-    ) {
+    // Where a write waits for its agent's turn: the rule above, but for a
+    // write the agent's start assembled for itself.
+    const deferralHolds = !freshToolResult && !bypasses &&
+      (this.quiesced || midToolCycle || this.activeTurnTokens.has(agent.name) || this.activeStreams.has(agent.name));
+    // With the flag on only a write from the queue that a surgery's hold
+    // meets goes back to it, under its own id: what a flag-off run left
+    // queued, or stop()'s drain. What the rule above would queue is stored.
+    if (presents ? opts?.fromQueue !== undefined && this.surgeryHold !== null : !freshToolResult && (behindQueue || deferralHolds)) {
       // A re-deferral of a drained entry keeps its id and seq, and leaves the
       // un-acked set: one logical message, one durable identity, one place
       // in arrival order, whether or not the queue is persisted.
@@ -26796,16 +27325,34 @@ export class AgentFramework {
     // tool result (which takes none), or no turn of the agent's is alive, or
     // its turn is assembling before its compile, or it comes from stop()'s
     // drain, once every stream it could join has settled: the clock is in
-    // whatever request comes next.
-    if (takesClockBefore(participant, content, metadata, agent.name)) this.storeDueClock(agent, 'event');
+    // whatever request comes next. With the flag on, a write stored while a
+    // turn of the agent's is alive takes none either, as a fork's channel
+    // message doesn't: the clock would sit inside that turn. Its tool
+    // boundary or its next start takes the clock due.
+    if (takesClockBefore(participant, content, metadata, agent.name)
+      && (!presents || !this.turnAlive(agent) || this.assembling.has(agent.name))) {
+      this.storeDueClock(agent, 'event');
+    }
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
       opts?.fromQueue ? withDeferredWriteId(metadata, opts.fromQueue.id) : metadata,
     );
-    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    if (opts?.placement) {
+      opts.placement.agent = agent.name;
+      opts.placement.messageId = stored;
+      // Stored where the rule above would have queued it for its agent's
+      // turn: not in that agent's window until the turn's next point, so a
+      // wake for it reads it (readsRowFor), and a render placed for that
+      // turn isn't materialized by it. Never for a write a start assembled
+      // for itself, which its start presents before its compile.
+      if (presents && deferralHolds) opts.placement.presented = false;
+    }
     this.releaseLandedMail(metadata, agent.name);
     this.noteStored(agent, metadata, stored, opts?.bypassDeferralFor);
+    // Each reader of the row's slot whose turn isn't alive is presented it
+    // now (present at rest); the others at their next point.
+    if (presents) this.presentation!.afterStore(agent, [stored]);
     return stored;
   }
 
@@ -26851,6 +27398,8 @@ export class AgentFramework {
    *   slot holds, as on `main`: a reply after the message is in the message's
    *   own channel, but a message from another channel that lands between the
    *   gate's decision and its compile follows the message with no line.
+   *   With the presentation index (#291) each resident's start writes its
+   *   own line, its own row, which enters its own window alone.
    * - Two or more lines are all written, each naming its message, its age
    *   counted to now.
    * - None is written while the host is quiesced or another reader of the
@@ -26867,12 +27416,17 @@ export class AgentFramework {
    * left out, or whose write fails, stays undecided for a later fresh start.
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
+    // With the presentation index (#291) each resident the wake was for
+    // writes the line into its own window, as its own row, at its own start:
+    // a co-resident's line enters no other window, so it can't land under
+    // the message or after another resident's answer. Without it, the
+    // delivery agent's start alone writes the slot's one line.
     const slot = this.deliveryAgent();
-    if (!slot || agent !== slot) return;
-    const open = lines.filter((line) => !this.placedWakeLines.has(line));
+    if (!slot || (agent !== slot && !this.presents(agent))) return;
+    const open = lines.filter((line) => !this.placedWakeLines.get(line)?.has(agent.name));
     const held = this.slotHeldFrom(agent);
     const leftOut = held
-      || (lines.length === 1 && open.length === 1 && this.isNewestIn(slot, open[0].entry));
+      || (lines.length === 1 && open.length === 1 && this.isNewestIn(agent, open[0].entry));
     if (leftOut) {
       const reason = held ? 'held' : 'newest';
       for (const line of open) {
@@ -26887,28 +27441,33 @@ export class AgentFramework {
       return;
     }
     for (const line of open) {
-      // The delivery agent's own row: written for its start.
-      const metadata = asOwnRow({ source: 'gate:debounce', policies: line.policyNames } as MessageMetadata, slot.name);
+      // The agent's own row, written for its start, and presented to it as
+      // it is written: the delivery agent's, or with the presentation index
+      // the resident whose start this is.
+      const metadata = { source: 'gate:debounce', policies: line.policyNames } as MessageMetadata;
       // A line is the wake's context, not its cause, so a write that fails
       // doesn't fail the start: the line stays undecided, for a later fresh
       // start of the wake. One whose write threw after its row landed counts
       // as written, read back as the clock row's is.
-      const before = this.storedCountOf(slot);
+      const before = this.storedCountOf(agent);
       let id: MessageId;
       try {
-        id = slot.getContextManager().addMessage('user', [{ type: 'text', text: wakeLineText(line, Date.now()) }], metadata);
+        id = storeOwnRow(agent, 'user', [{ type: 'text', text: wakeLineText(line, Date.now()) }], metadata);
       } catch (err) {
         const landed = before === undefined ? undefined
-          : this.storedSince(slot, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', 'a batched wake\'s line');
+          : this.storedSince(agent, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', 'a batched wake\'s line');
         if (!landed || landed.length === 0) {
           console.error(`[gate] ${agent.name}: a batched wake's line could not be written${landed ? '' : ' (whether it landed is unknown)'}:`, err);
           continue;
         }
         console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
         id = landed[0]!.id;
+        agent.ownRowsStored([id]);
       }
       this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
-      this.placedWakeLines.add(line);
+      const placed = this.placedWakeLines.get(line) ?? new Set<string>();
+      placed.add(agent.name);
+      this.placedWakeLines.set(line, placed);
     }
   }
 
@@ -27021,7 +27580,10 @@ export class AgentFramework {
    *  the start now beginning (no tool boundary will weigh it), and one for
    *  every other resident's open turn. */
   private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId, bypassDeferralFor?: string): void {
-    if (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name) {
+    // An agent the presentation index presents for weighs the row as it
+    // enters its window (adoptPresentation's listener), or at the tool
+    // boundary that hears it, not here.
+    if (!this.presents(agent) && (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name)) {
       this.noteArrival(agent.name, metadata, stored);
     }
     this.noteForOtherResidents(agent, metadata, stored);
@@ -27518,8 +28080,9 @@ export class AgentFramework {
       // Held mail whose message just landed is released (Dendrite).
       this.releaseLandedMail(msg.metadata, agent.name);
       this.emitTrace({ type: 'message:added', messageId: id, source: `deferred-flush:${occasion}` });
-      this.noteArrival(agent.name, msg.metadata, id);
-      this.noteForOtherResidents(agent, msg.metadata, id);
+      // Weighed as assembled for this start: an arrival for the agent, and
+      // for every other resident's open turn.
+      this.noteStored(agent, msg.metadata, id, agent.name);
     }
     this.ackDeferredWrites();
     return this.queuedFor(agent.name);

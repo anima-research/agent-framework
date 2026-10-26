@@ -98,7 +98,7 @@ class Harness {
   traces: TraceEvent[] = [];
   private users = 0;
 
-  constructor(readonly agents: string[] = ['scout']) {
+  constructor(readonly agents: string[] = ['scout'], readonly options: { presentationIndex?: boolean } = {}) {
     mkdirSync(this.work, { recursive: true });
   }
 
@@ -112,6 +112,7 @@ class Harness {
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
       errorPolicy: { maxRetries: 1, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 0 } : { retry: false }) },
+      ...(this.options.presentationIndex ? { presentationIndex: true } : {}),
     });
     // As a host gives the workspace its store (connectome-host's index.ts).
     this.workspace.initStore(this.framework.getStore());
@@ -175,8 +176,8 @@ class Harness {
 
 const carries = (request: NormalizedRequest | undefined) => JSON.stringify(request?.messages ?? []).includes(NOTICE);
 
-async function harness(t: { after: (fn: () => Promise<void>) => void }, agents?: string[]): Promise<Harness> {
-  const h = new Harness(agents);
+async function harness(t: { after: (fn: () => Promise<void>) => void }, agents?: string[], options?: { presentationIndex?: boolean }): Promise<Harness> {
+  const h = new Harness(agents, options);
   await h.open();
   t.after(async () => {
     await h.framework.stop().catch(() => {});
@@ -203,6 +204,37 @@ test("an undo of the turn that wrote a direct mount gives the notice once, at th
   assert.equal(carries(later), true);
   assert.equal(h.notices().length, 1);
   assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
+});
+
+// With the presentation index (#291) an undo moves no branch: it takes the
+// turn out of the agent's window, and the workspace asks the window
+// (useWindow) whether the turn that wrote is still in it.
+test("on the window, an undo of the turn that wrote a direct mount moves no branch and gives the notice once, at the next start, and that start's request carries it", async (t) => {
+  const h = await harness(t, undefined, { presentationIndex: true });
+  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
+  const undone = h.framework.undoLastTurn('scout');
+  assert.equal(undone.undone, true);
+  assert.equal(undone.fromBranch, undone.toBranch, 'no branch moved');
+  const [first] = await h.turn([say('back')]);
+  assert.equal(carries(first), true);
+  assert.equal(h.notices().length, 1);
+  const [later] = await h.turn([say('still here')]);
+  assert.equal(carries(later), true, 'later starts carry the one notice in its place');
+  assert.equal(h.notices().length, 1, 'and store no other');
+  assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
+});
+
+test('on the window, a redo of the turn that wrote finds nothing due, and a head that never moved stores no notice', async (t) => {
+  const h = await harness(t, undefined, { presentationIndex: true });
+  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
+  await h.turn([say('again')]);
+  assert.equal(h.notices().length, 0, "the window holds the turn that wrote");
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the later turn's undo");
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the writing turn's undo");
+  assert.equal(h.framework.redo('scout').redone, true);
+  const [request] = await h.turn([say('back')]);
+  assert.equal(carries(request), false);
+  assert.equal(h.notices().length, 0);
 });
 
 test('an undo whose fork lands at exactly the store head the write saw gives the notice', async (t) => {

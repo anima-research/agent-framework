@@ -1,10 +1,11 @@
 /**
- * FrameworkConfig.presentationIndex (#291), as this release ships it: the
- * presentation module is constructed under the flag and checks each write's
- * audience stamp, and nothing presents yet. With the flag off, no window
- * index is written and the requests are what they were; with it on, they
- * are the same, every agent's context stays in legacy mode, and a write
- * stamped only for agents that can't read its slot is traced once.
+ * FrameworkConfig.presentationIndex (#291): the presentation module is
+ * constructed under the flag, takes each agent on as it is registered, and
+ * checks each write's audience stamp. With the flag off, no window index is
+ * written and the requests are what they were; with it on, each agent's
+ * window is written down and presented, a turn's requests are the same as
+ * without it where no other agent's turn overlaps it, and a write stamped
+ * only for agents that can't read its slot is traced once.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -67,7 +68,11 @@ async function run(presentationIndex: boolean | undefined) {
 const requests = (membrane: MockMembrane) => membrane.calls.map((c) => JSON.stringify({ system: c.system, messages: c.messages }));
 
 describe('FrameworkConfig.presentationIndex', () => {
-  it('off by default: no window index is written, and on, unwired, the requests are the same', async () => {
+  // Until AF-4 wired the presentation points, the flag-on run was pinned to
+  // legacy mode with nothing presented. Now each agent is taken on at its
+  // registration, so its window is written down and the turn's rows are
+  // presented; the requests of a turn no other turn overlaps stay the same.
+  it('off by default: no window index is written; on, each window is presented and the requests are the same', async () => {
     const off = await run(undefined);
     const on = await run(true);
     try {
@@ -75,13 +80,18 @@ describe('FrameworkConfig.presentationIndex', () => {
       assert.deepEqual(requests(on.membrane), requests(off.membrane), 'byte for byte, request by request');
       assert.equal(JSON.stringify(on.membrane.lastStream?.receivedToolResults), JSON.stringify(off.membrane.lastStream?.receivedToolResults),
         'and the round was given the same results');
-      for (const r of [off, on]) {
-        for (const name of ['mira', 'oren']) {
-          assert.equal(r.store.getStateLen(`agents/${name}/window`) ?? 0, 0, `no window index for ${name}`);
-          assert.equal(r.framework.getAgent(name)!.getContextManager().windowMode(), 'legacy', `${name} is in legacy mode`);
-        }
-        assert.deepEqual(r.traces.filter((t) => t.type.startsWith('presentation:')), [], 'nothing presented');
+      for (const name of ['mira', 'oren']) {
+        assert.equal(off.store.getStateLen(`agents/${name}/window`) ?? 0, 0, `off: no window index for ${name}`);
+        assert.equal(off.framework.getAgent(name)!.getContextManager().windowMode(), 'legacy', `off: ${name} is in legacy mode`);
+        assert.ok((on.store.getStateLen(`agents/${name}/window`) ?? 0) > 0, `on: a window index for ${name}`);
+        assert.equal(on.framework.getAgent(name)!.getContextManager().windowMode(), 'presented', `on: ${name}'s window is presented`);
       }
+      assert.deepEqual(off.traces.filter((t) => t.type.startsWith('presentation:')), [], 'off: nothing presented');
+      assert.ok(on.traces.some((t) => t.type === 'presentation:presented'), 'on: rows presented');
+      // mira's window holds every row of its turn, in the order its requests carried them.
+      const cm = on.framework.getAgent('mira')!.getContextManager();
+      assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), cm.getAllMessages().map((m) => m.id),
+        "with no other turn in the slot, mira's window is the record");
     } finally {
       await off.framework.stop();
       await on.framework.stop();

@@ -651,7 +651,11 @@ export class ApiServer {
 
     const result = this.framework.undoLastTurn(params.agentName);
 
-    if (result.undone) {
+    // An undo on the agent's window (#291, presentationIndex) moves no
+    // branch, so it says so as a window event, not a branch switch.
+    if (result.undone && result.window) {
+      this.broadcast('window:undone', { agentName: params.agentName, ...result.window, reason: 'undo' });
+    } else if (result.undone) {
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
@@ -669,7 +673,9 @@ export class ApiServer {
 
     const result = this.framework.redo(params.agentName);
 
-    if (result.redone) {
+    if (result.redone && result.window) {
+      this.broadcast('window:undone', { agentName: params.agentName, ...result.window, reason: 'redo' });
+    } else if (result.redone) {
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,

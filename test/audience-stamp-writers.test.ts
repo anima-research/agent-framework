@@ -33,28 +33,31 @@ interface Site {
   scopeText: string;
 }
 
+type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
+const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
+const child = (n: Node | undefined, field: string): Node | undefined => (n && isNode(n[field]) ? n[field] as Node : undefined);
+const isFunction = (n: Node | undefined) => n?.type === 'ArrowFunctionExpression' || n?.type === 'FunctionExpression';
+// A key's name: an identifier not computed, a string, or a private name.
+const keyName = (key: Node | undefined, computed: unknown): string | undefined => {
+  if (!key) return undefined;
+  if (!computed && key.type === 'Identifier') return key.name as string;
+  if (key.type === 'StringLiteral') return key.value as string;
+  if (key.type === 'PrivateName') return `#${(child(key, 'id')?.name as string)}`;
+  return undefined;
+};
+
 /**
- * Each reference in `sources` to a member named `addMessage`, read as Babel's
- * TypeScript parser reads the source: `x.addMessage`, `x?.addMessage` and
- * `x['addMessage']`, called or not, and an `addMessage` taken out of an
- * object by destructuring (its receiver is what is destructured, or
- * `(destructured)` where that isn't a declaration's value). Comments aren't
- * read.
+ * Walk each source as Babel's TypeScript parser reads it, telling `visit`
+ * of every node with the named scopes that enclose it (outermost first: a
+ * class, a method or function, a const holding a function or an object, a
+ * property holding a function), the source of the innermost of them (or of
+ * the file), the source of a node, and, for a destructuring pattern, what it
+ * destructures. Comments aren't read.
  */
-function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Site[] {
-  type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
-  const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
-  const child = (n: Node | undefined, field: string): Node | undefined => (n && isNode(n[field]) ? n[field] as Node : undefined);
-  const isFunction = (n: Node | undefined) => n?.type === 'ArrowFunctionExpression' || n?.type === 'FunctionExpression';
-  // A key's name: an identifier not computed, a string, or a private name.
-  const keyName = (key: Node | undefined, computed: unknown): string | undefined => {
-    if (!key) return undefined;
-    if (!computed && key.type === 'Identifier') return key.name as string;
-    if (key.type === 'StringLiteral') return key.value as string;
-    if (key.type === 'PrivateName') return `#${(child(key, 'id')?.name as string)}`;
-    return undefined;
-  };
-  const sites: Site[] = [];
+function walkSources(
+  sources: Array<{ name: string; text: string }>,
+  visit: (file: string, node: Node, scope: string[], scopeText: string, slice: (n: Node) => string, declared?: Node) => void,
+): void {
   for (const { name, text } of sources) {
     let program: Node;
     try {
@@ -63,7 +66,7 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
       throw new Error(`${name}: ${(error as Error).message}`);
     }
     const slice = (n: Node) => text.slice(n.start!, n.end!);
-    const visit = (node: Node, scope: string[], scopeText: string, declared?: Node): void => {
+    const walk = (node: Node, scope: string[], scopeText: string, declared?: Node): void => {
       let named: string | undefined;
       switch (node.type) {
         case 'ClassDeclaration': case 'ClassExpression': case 'FunctionDeclaration': case 'FunctionExpression':
@@ -80,29 +83,43 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
       }
       const innerScope = named ? [...scope, named] : scope;
       const innerText = named ? slice(node) : scopeText;
-      const site = (receiver: string) =>
-        sites.push({ file: name, line: node.loc!.start.line, receiver, scope: innerScope, scopeText: innerText });
-      if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression')
-        && keyName(child(node, 'property'), node.computed) === 'addMessage') {
-        site(slice(child(node, 'object')!));
-      }
-      if (node.type === 'ObjectPattern') {
-        for (const property of node.properties as Node[]) {
-          if (property.type === 'ObjectProperty' && keyName(child(property, 'key'), property.computed) === 'addMessage') {
-            site(declared ? slice(declared) : '(destructured)');
-          }
-        }
-      }
+      visit(name, node, innerScope, innerText, slice, declared);
       for (const [field, value] of Object.entries(node)) {
         if (field === 'leadingComments' || field === 'trailingComments' || field === 'innerComments') continue;
         // A declaration's pattern is told what it destructures.
         const from = node.type === 'VariableDeclarator' && field === 'id' ? child(node, 'init') : undefined;
-        if (Array.isArray(value)) { for (const v of value) if (isNode(v)) visit(v, innerScope, innerText); }
-        else if (isNode(value)) visit(value, innerScope, innerText, from);
+        if (Array.isArray(value)) { for (const v of value) if (isNode(v)) walk(v, innerScope, innerText); }
+        else if (isNode(value)) walk(value, innerScope, innerText, from);
       }
     };
-    visit(program, [], text);
+    walk(program, [], text);
   }
+}
+
+/**
+ * Each reference in `sources` to a member named `addMessage`, read as Babel's
+ * TypeScript parser reads the source: `x.addMessage`, `x?.addMessage` and
+ * `x['addMessage']`, called or not, and an `addMessage` taken out of an
+ * object by destructuring (its receiver is what is destructured, or
+ * `(destructured)` where that isn't a declaration's value). Comments aren't
+ * read.
+ */
+function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Site[] {
+  const sites: Site[] = [];
+  walkSources(sources, (file, node, scope, scopeText, slice, declared) => {
+    const site = (receiver: string) => sites.push({ file, line: node.loc!.start.line, receiver, scope, scopeText });
+    if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression')
+      && keyName(child(node, 'property'), node.computed) === 'addMessage') {
+      site(slice(child(node, 'object')!));
+    }
+    if (node.type === 'ObjectPattern') {
+      for (const property of node.properties as Node[]) {
+        if (property.type === 'ObjectProperty' && keyName(child(property, 'key'), property.computed) === 'addMessage') {
+          site(declared ? slice(declared) : '(destructured)');
+        }
+      }
+    }
+  });
   return sites;
 }
 
@@ -143,16 +160,14 @@ const DIRECT_WRITES: Record<string, { count: number; stamp: keyof typeof STAMPED
   'framework.ts AgentFramework.handleProcessEvent': { count: 1, stamp: 'queued', what: "the tool boundary's flush" },
   'framework.ts AgentFramework.flushForStart': { count: 1, stamp: 'queued', what: "a turn start's flush" },
   'framework.ts AgentFramework.releaseWindow': { count: 1, stamp: 'queued', what: "a released window's flush" },
-  'framework.ts AgentFramework.handleMcplChannelIncoming': { count: 1, stamp: 'audience', what: 'a channel message delivered to a fork' },
-  'framework.ts AgentFramework.routeConversationIncoming': { count: 1, stamp: 'audience', what: "a channel message routed to the channel's fork" },
-  'framework.ts AgentFramework.framePendingRound': { count: 2, stamp: 'own', what: "a derived agent's framing of its parent's pending round" },
-  'framework.ts AgentFramework.createConversationAgent': { count: 1, stamp: 'own', what: "a conversation fork's seed" },
-  'framework.ts AgentFramework.storeDueClock': { count: 1, stamp: 'own', what: 'a clock row' },
-  'framework.ts AgentFramework.repinTurnLocus': { count: 1, stamp: 'own', what: 'a routing notice' },
-  'framework.ts AgentFramework.addressedElsewhereNotice': { count: 1, stamp: 'own', what: 'a routing notice' },
-  'framework.ts AgentFramework.placeWakeLines': { count: 1, stamp: 'own', what: "a batched wake's line" },
-  // main's #782: an afterUser context injection stored where compile() placed it, this agent's own context.
-  'framework.ts AgentFramework.storeInjections': { count: 1, stamp: 'own', what: "a stored context injection, the agent's own context" },
+  // The two channel writes into a fork's store (a correction delivered to
+  // it, a message routed to the channel's fork) go through one helper.
+  'framework.ts AgentFramework.storeInFork': { count: 1, stamp: 'audience', what: "a channel message stored in a fork's store" },
+  // A derived agent's pending-round framing, a conversation fork's seed, the
+  // clock row, the routing notices, a batched wake's line and #782's stored
+  // injections were direct writes here, stamped with asOwnRow; since AF-4
+  // they go through storeOwnRow, which presents each as it is written
+  // (#291), so they are no longer listed.
 };
 
 const keyOf = (site: Site) => `${site.file} ${site.scope.join('.')}`;
@@ -247,4 +262,104 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
   const inFramework = scanAddMessageSites([{ name: 'framework.ts', text: 'export class AgentFramework { a() { this.addMessage(); } }\nclass Other { a() { this.addMessage(); } }' }]);
   assert.deepEqual(classify(inFramework).direct.map((s) => s.scope.join('.')), ['Other.a']);
   assert.throws(() => scanAddMessageSites([{ name: 'broken.ts', text: 'const = ;' }]), /^Error: broken\.ts: /);
+});
+
+/**
+ * Each call in `sources` of a function or method named `name`: where, in
+ * which scope, and how many arguments it is given.
+ */
+function scanCalls(sources: Array<{ name: string; text: string }>, name: string): Array<Site & { args: number }> {
+  const sites: Array<Site & { args: number }> = [];
+  walkSources(sources, (file, node, scope, scopeText) => {
+    if (node.type !== 'CallExpression' && node.type !== 'OptionalCallExpression') return;
+    const callee = child(node, 'callee');
+    const called = callee?.type === 'Identifier'
+      ? callee.name as string
+      : callee && (callee.type === 'MemberExpression' || callee.type === 'OptionalMemberExpression')
+        ? keyName(child(callee, 'property'), callee.computed)
+        : undefined;
+    if (called !== name) return;
+    sites.push({ file, line: node.loc!.start.line, receiver: name, scope, scopeText, args: (node.arguments as unknown[]).length });
+  });
+  return sites;
+}
+
+/**
+ * When each writer of an agent's own rows writes them, and so whether
+ * storeOwnRow may present the row in the agent's window as it is written
+ * (#291): an own row presented while a turn of the agent's is alive that
+ * the row isn't part of enters a window its requests don't carry.
+ * - turn: by the agent's live turn or act, for what its requests carry:
+ *   a stream's rounds, results and the notices its tool boundary injects,
+ *   a start's inputs before its compile, a puppet's pair under its own
+ *   reservation;
+ * - end: after its stream's last request, as the turn ends (its markers
+ *   and receipts);
+ * - unregistered: before the agent is registered, which presents its own
+ *   rows when it takes the agent on (a derived agent's inheritance and
+ *   framing, a conversation fork's seed);
+ * - held-back: where a turn the row isn't part of may hold the agent, so
+ *   the call passes `present` (its sixth argument), false then, and the
+ *   agent's next presentation point presents it.
+ */
+const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'unregistered' | 'held-back'; what: string }> = {
+  'agent.ts Agent.addAssistantResponse': { count: 1, when: 'turn', what: "a stream's round or final reply" },
+  'agent.ts Agent.doInference': { count: 1, when: 'turn', what: "the direct API path's reply" },
+  'framework.ts AgentFramework.storeDueClock': { count: 1, when: 'turn', what: 'a clock row: an event with no turn alive, a start, a tool boundary' },
+  'framework.ts AgentFramework.storeInjections': { count: 1, when: 'turn', what: "a start's stored injection, before its compile" },
+  'framework.ts AgentFramework.repinTurnLocus': { count: 1, when: 'turn', what: 'a routing notice, at a start or injected at a boundary' },
+  'framework.ts AgentFramework.addressedElsewhereNotice': { count: 1, when: 'turn', what: 'a routing notice injected at a boundary' },
+  'framework.ts AgentFramework.announceLocusIfChanged': { count: 1, when: 'turn', what: "a start's routing notice" },
+  'framework.ts AgentFramework.maybePrimeProseMode': { count: 1, when: 'turn', what: "a start's prose-mode primer" },
+  'framework.ts AgentFramework.noticeUnnoticedDrafts': { count: 1, when: 'turn', what: "a start's drafts notice" },
+  'framework.ts AgentFramework.noticeHeadMoves': { count: 1, when: 'turn', what: "a start's workspace head-move notice" },
+  'framework.ts AgentFramework.writeAutoContinueNotice': { count: 1, when: 'turn', what: "a continuation's [continue] row, at its start" },
+  'framework.ts AgentFramework.placeWakeLines': { count: 1, when: 'turn', what: "a batched wake's line, at its start" },
+  'framework.ts AgentFramework.runPuppetToolCall': { count: 4, when: 'held-back', what: "the puppet's pair: under its own reservation, or held back once a turn replaced it" },
+  'framework.ts AgentFramework.appendProseDeliveryReceipt': { count: 1, when: 'end', what: "a stream's delivery receipt, after its last request" },
+  'framework.ts AgentFramework.driveStream': { count: 1, when: 'end', what: 'the contained tool-wrapper prose marker' },
+  'framework.ts AgentFramework.updateRewindMarker': { count: 1, when: 'end', what: "a refusal rewind's marker" },
+  'framework.ts AgentFramework.noteInferenceExhausted': { count: 1, when: 'end', what: "an exhausted turn's [inference-failed] marker" },
+  'framework.ts AgentFramework.settleDeliberateCancel': { count: 1, when: 'held-back', what: "a stop's [turn-interrupted] marker, held back once the stream no longer owns the agent" },
+  'framework.ts AgentFramework.sweepExpiredConversations': { count: 1, when: 'held-back', what: "a fork's closure prompt, held back while a turn of the fork's is alive" },
+  'framework.ts AgentFramework.deriveAgent': { count: 2, when: 'unregistered', what: "a derived agent's inheritance and framing" },
+  'framework.ts AgentFramework.framePendingRound': { count: 2, when: 'unregistered', what: "a derived agent's framing of its parent's pending round" },
+  'framework.ts AgentFramework.createConversationAgent': { count: 1, when: 'unregistered', what: "a conversation fork's seed" },
+};
+
+it("every writer of an agent's own rows is classified by when it writes, and one that may write into another turn holds its row back", () => {
+  const src = fileURLToPath(new URL('../../src/', import.meta.url));
+  const sources: Array<{ name: string; text: string }> = [];
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) walk(full);
+      else if (name.endsWith('.ts')) sources.push({ name: full.slice(src.length), text: readFileSync(full, 'utf8') });
+    }
+  };
+  walk(src);
+  // storeOwnRow's own definition is in dendrite/audience.ts and calls nothing named so.
+  const calls = scanCalls(sources, 'storeOwnRow');
+  assert.ok(calls.length > 20, `found ${calls.length} own-row writes; the scan has lost them`);
+  const found: Record<string, number> = {};
+  for (const call of calls) found[keyOf(call)] = (found[keyOf(call)] ?? 0) + 1;
+  const listed = Object.fromEntries(Object.entries(OWN_ROW_WRITERS).map(([key, { count }]) => [key, count]));
+  assert.deepEqual(found, listed,
+    "each scope that stores an agent's own row is listed with when it writes: a new one is a writer to classify, one fewer a list to update");
+  for (const call of calls) {
+    const { when, what } = OWN_ROW_WRITERS[keyOf(call)]!;
+    if (when === 'held-back') continue;
+    assert.ok(call.args <= 5, `${where(call)} (${what}) is listed as presenting at its write, and passes \`present\``);
+  }
+  const heldBack = calls.filter((call) => OWN_ROW_WRITERS[keyOf(call)]!.when === 'held-back');
+  for (const key of Object.keys(OWN_ROW_WRITERS).filter((key) => OWN_ROW_WRITERS[key]!.when === 'held-back')) {
+    assert.ok(heldBack.some((call) => keyOf(call) === key && call.args === 6), `${key} holds a row back with storeOwnRow's \`present\``);
+  }
+  // A row whose write threw after it landed is told to the own-row sink by
+  // hand (ownRowsStored), only by a writer that presents at its write.
+  for (const call of scanCalls(sources, 'ownRowsStored')) {
+    if (call.file === 'dendrite/audience.ts' && call.scope.join('.') === 'storeOwnRow') continue;
+    const listing = OWN_ROW_WRITERS[keyOf(call)];
+    assert.ok(listing && listing.when !== 'held-back', `${where(call)} tells the sink of a row: its scope presents at its write`);
+  }
 });

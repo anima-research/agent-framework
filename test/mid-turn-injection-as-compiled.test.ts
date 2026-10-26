@@ -4,7 +4,7 @@
  * newest of its window (ContextManager.renderAsNewest), cut by the per-message
  * cap and with the image limits applied across the batch. One the render
  * can't place among the newest goes in as stored: the next compile sends it
- * from before its recent window.
+ * from before its recent window. The same with the presentation index on.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -80,7 +80,10 @@ class InterjectingModule implements Module {
   }
 }
 
-describe('a message injected at a tool boundary', () => {
+// Each case runs twice: as before, and with the presentation index (#291),
+// where the boundary presents what it injects before it renders it, since a
+// render places only what the agent's window holds.
+for (const presentationIndex of [false, true]) describe(`a message injected at a tool boundary${presentationIndex ? ', with the presentation index' : ''}`, () => {
   let tempDir: string;
   let membrane: MockMembrane;
   let module: InterjectingModule;
@@ -103,6 +106,7 @@ describe('a message injected at a tool boundary', () => {
       membrane: membrane.asMembrane(),
       agents: [{ name: agentName, model: 'test-model', systemPrompt: 'You are a robot pilot.', strategy: strategy as never }],
       modules: [module, ...modules],
+      ...(presentationIndex ? { presentationIndex: true } : {}),
     });
     module.framework = framework;
     return framework;
@@ -242,6 +246,11 @@ describe('a message injected at a tool boundary', () => {
     } as never));
     const cm = framework.getAgent('assistant')!.getContextManager();
     for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
+    // With the presentation index, rows written into the context past the
+    // framework enter the window at the agent's next point: here, before the
+    // reset presents its transition after them, as the history before a new
+    // topic is.
+    if (presentationIndex) (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('assistant'));
     await cm.resetHeadWindow('A new topic.');
     const nulls: number[] = [];
     renderWith((ids, real) => { const r = real(ids)!; nulls.push(r.filter((c) => c === null).length); return r; });

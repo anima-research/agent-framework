@@ -481,6 +481,25 @@ test('#196 finding 5: undo of a turn keeps the coalesced input that preceded it'
   assert.equal(r.result.coalesce.outcome, 'appended', 'after a branch switch nothing is replaceable');
 });
 
+// With the presentation index (#291) the undo is the window's: no branch
+// moves, and the input the undone turn's start presented stays in the
+// window, read by the request that carried it, so nothing makes it
+// replaceable again.
+test('#196 finding 5, on the window: undo of a turn keeps the coalesced input that preceded it', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => true }, framework: { presentationIndex: true } }); t.after(f.close);
+  await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
+  await f.framework.runUntilIdle();
+  await f.send('push/event', f.params('b', 'unread_before_undo', { key: 'b', initial: true }));
+  await f.turn();
+  assert(f.lastRequest().includes('unread_before_undo'));
+  const undone = f.framework.undoLastTurn('agent');
+  assert.equal(undone.fromBranch, undone.toBranch, 'no branch moved');
+  const window = JSON.stringify(f.framework.getAgent('agent')!.getContextManager().getPresentedMessages());
+  assert(window.includes('unread_before_undo'), "the input stays in the window the undone turn's start presented it to");
+  const r = await f.send('push/event', f.params('c', 'after_undo', { key: 'b' }));
+  assert.equal(r.result.coalesce.outcome, 'appended', 'the request that carried it read it');
+});
+
 test('a replacement while a turn is alive edits the deferred queue, not the live turn', async (t) => {
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; deferredMessages: unknown[] };

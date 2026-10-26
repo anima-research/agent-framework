@@ -20,8 +20,8 @@
     before, once an answered request covered the row (and, with a channel,
     the agent spoke there after), or once the row is gone.
   - `WritePlacement` gains `messageId` and `presented?: false` (a row stored
-    and not presented to its agent, whose turn was alive). Nothing sets
-    `presented` yet.
+    and not presented to its agent, whose turn was alive), which the
+    framework sets with `FrameworkConfig.presentationIndex` on.
 
   **Migration:** compare marks through `covers` and `markAtOrAfter` instead
   of reading `.sequence`; rename `readsDeferredWrite` to `readsRow`, and

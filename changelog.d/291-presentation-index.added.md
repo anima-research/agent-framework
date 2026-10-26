@@ -2,8 +2,7 @@
   own presentation index, the rows it was shown in the order its requests carried them, kept by context-manager
   (`presentRows`) beside the store's record. This release builds the index's module and constructs it under the
   option, which needs a context-manager with `ContextManager.presentRows` (create() refuses the option without one),
-  and presents nothing yet: with the option on, every compile and request is what it is with it off. It checks each
-  write's audience stamp, and a write stamped only for agents none of whom reads the slot it is stored in is traced
+  and wires its presentation points (see the entry for what they do). It checks each write's audience stamp, and a write stamped only for agents none of whom reads the slot it is stored in is traced
   as `presentation:unreadable-audience` and stored as named. The trace types the index will emit are in
   `TraceEvent` now: `presentation:presented`, `presentation:repaired`, `presentation:unreadable-audience`,
   `presentation:failed`, `presentation:hand-off-mismatch`, `presentation:retracted` and `window:undone`.
@@ -14,4 +13,4 @@
 - The own-row sink the presentation index presents an agent's own rows through, as they are written:
   `Agent.setOwnRowSink(sink)` and `Agent.ownRowsStored(ids)`, `OwnRowWriter.ownRowsStored?(ids)`, and a `present`
   argument on `storeOwnRow` (default true; `false` stores the row without telling the sink, for a row written where
-  a turn it isn't part of may be alive). Nothing installs a sink yet, so every write is as before.
+  a turn it isn't part of may be alive). The index installs it for each agent it takes on.

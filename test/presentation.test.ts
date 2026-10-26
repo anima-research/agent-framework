@@ -282,11 +282,21 @@ describe('the presentation module', () => {
     assert.equal(r.mira.has(arrival2), false);
   });
 
+  // context-manager's CM-9 writes a presentRows call as one record where the
+  // store has chronicle's batched append (appendManyToStateJsonWithIdentity),
+  // so a write that fails enters none of its rows; a store without it writes
+  // one record per row, and a write cut short there enters a prefix. The
+  // case below was the per-row one alone; it runs on that store now, with
+  // the batched store's beside it.
   it('a presentation cut short hears only the bodies that entered whole', async () => {
     const r = await rig();
     r.adoptAll();
     r.alive.add('mira');
     const ids = ['one', 'two', 'three'].map((t) => r.write(r.oren, 'someone', text(t), ['mira']));
+    const store = r.store as unknown as { appendManyToStateJsonWithIdentity?: unknown };
+    const batched = store.appendManyToStateJsonWithIdentity;
+    // A store without the batched append: each row its own record.
+    store.appendManyToStateJsonWithIdentity = undefined;
     const append = r.store.appendToStateJsonWithIdentity;
     let n = 0;
     r.store.appendToStateJsonWithIdentity = function (this: JsStore, id: string, item: unknown, by: string, at: string) {
@@ -301,12 +311,41 @@ describe('the presentation module', () => {
     } finally {
       console.error = error;
       r.store.appendToStateJsonWithIdentity = append;
+      delete store.appendManyToStateJsonWithIdentity;
     }
+    assert.equal(store.appendManyToStateJsonWithIdentity, batched, "the store's own batched append is back");
     assert.deepEqual(heard.map((h) => h.id), [ids[0]], 'the prefix that entered');
     assert.deepEqual(ids.map((id) => r.mira.has(id)), [true, false, false]);
     assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'tool-boundary']]);
     r.alive.delete('mira');
     assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), ids.slice(1), 'the rest at the next point');
+  });
+
+  it('a batched presentation that fails hears nothing, and its rows wait whole for the next point', { skip: typeof (JsStore.prototype as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity !== 'function' && 'chronicle has no batched append' }, async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const ids = ['one', 'two', 'three'].map((t) => r.write(r.oren, 'someone', text(t), ['mira']));
+    const store = r.store as unknown as { appendManyToStateJsonWithIdentity: (...args: unknown[]) => unknown };
+    const batched = store.appendManyToStateJsonWithIdentity;
+    store.appendManyToStateJsonWithIdentity = function (this: JsStore, id: unknown, ...rest: unknown[]) {
+      if (id === 'agents/mira/window') throw new Error('the store failed');
+      return batched.call(this, id, ...rest);
+    };
+    const error = console.error;
+    console.error = () => {};
+    let heard;
+    try {
+      heard = r.presentation.presentAtBoundary(r.mira, [], { injects: true }).heard;
+    } finally {
+      console.error = error;
+      delete (store as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity;
+    }
+    assert.deepEqual(heard, [], 'nothing entered');
+    assert.deepEqual(ids.map((id) => r.mira.has(id)), [false, false, false]);
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'tool-boundary']]);
+    r.alive.delete('mira');
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), ids, 'all of them at the next point');
   });
 
   it("the hand-off vouches when the window's newest rows are the rows sent, in order, and not when another came between", async () => {

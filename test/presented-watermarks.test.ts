@@ -1,13 +1,13 @@
 /**
  * Read marks once an agent's window is presented (#291, AF-3): what an agent
  * has read, been shown or answered is what its window held as of the mark,
- * not every row stored below the store's head then. Each case drives
- * presented mode directly through context-manager's presentRows (nothing in
- * the framework presents yet), on a residents' host, mira the primary and
- * oren, with the presentation index's module on (FrameworkConfig
- * .presentationIndex) where a case reads which windows hold a row. Beside
- * each, where the answer differs, the legacy-mode answer the same rows give,
- * which is the answer every host gets until it presents.
+ * not every row stored below the store's head then. Each case drives the
+ * window directly through context-manager's presentRows, writing rows into
+ * the contexts past the framework, on a residents' host, mira the primary
+ * and oren, with the presentation index's module on (FrameworkConfig
+ * .presentationIndex), which writes each window down as its agent is
+ * registered. Beside each, where the answer differs, the legacy-mode answer
+ * the same rows give, on a host without the flag.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -189,6 +189,12 @@ describe('read marks once windows are presented (#291)', () => {
     h.oren.markContextConsumed();
     assert.equal(h.internals.isUnreadStoredMessage(h.mira, row), true, 'nobody reads it');
     h.internals.presentation!.noteFramed(h.oren, [row]);
+    // Oren's window was written down at his registration, so the framing
+    // presents the row there, after the mark taken above: his mark covers
+    // it once a compile reads it (taken here). Before AF-4 his window stayed
+    // the record, and the earlier mark covered it by its sequence.
+    assert.equal(h.internals.isUnreadStoredMessage(h.mira, row), true, 'framed after his mark: not read yet');
+    h.oren.markContextConsumed();
     assert.equal(h.internals.isUnreadStoredMessage(h.mira, row), false, "read: its holder's mark covers it");
   });
 
@@ -219,7 +225,9 @@ describe('read marks once windows are presented (#291)', () => {
 
     it('an entry stays newest when an own row presented at its write follows it in the record, until it is presented after that row', async () => {
       for (const presented of [true, false]) {
-        const h = await boot();
+        // The legacy answer from a host without the flag, whose windows stay
+        // the record (until AF-4 the flag's host left them so).
+        const h = await boot({ presentationIndex: presented });
         if (presented) h.writeDown(h.mira, h.oren);
         const cm = h.mira.getContextManager();
         const arrived = h.store('the event', ['mira'], event);
@@ -237,7 +245,9 @@ describe('read marks once windows are presented (#291)', () => {
 
     it("a co-resident's own round stored after the entry doesn't make it not newest", async () => {
       for (const presented of [true, false]) {
-        const h = await boot();
+        // The legacy answer from a host without the flag, whose windows stay
+        // the record (until AF-4 the flag's host left them so).
+        const h = await boot({ presentationIndex: presented });
         if (presented) h.writeDown(h.mira, h.oren);
         h.store('the event', ['mira', 'oren'], event);
         h.oren.getContextManager().addMessage('oren', text("oren's reply"), asOwnRow(undefined, 'oren'));
@@ -248,7 +258,9 @@ describe('read marks once windows are presented (#291)', () => {
 
     it("a co-resident's clock row isn't this agent's last clock, nor a row not yet presented its newest", async () => {
       for (const presented of [true, false]) {
-        const h = await boot();
+        // The legacy answer from a host without the flag, whose windows stay
+        // the record (until AF-4 the flag's host left them so).
+        const h = await boot({ presentationIndex: presented });
         if (presented) h.writeDown(h.mira, h.oren);
         const clock = (owner: string, at: number) => asOwnRow({ system: true, kind: 'clock', clock: { at, onBoundary: false, zone: 'UTC' } } as MessageMetadata, owner);
         const mine = h.mira.getContextManager().addMessage('user', text('[clock] mira'), clock('mira', 1_000));

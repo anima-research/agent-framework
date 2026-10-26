@@ -1385,6 +1385,9 @@ export class Agent {
           if (row.sequence <= since) break scan;
           const mark = storedInjectionMarkOf(row.metadata);
           if (mark?.agent !== this.name || mark.namespace !== namespace) continue;
+          // A copy an undo took out of the window (#291) is in no window
+          // now, so it isn't the copy the agent will read.
+          if (this.contextManager.windowMode?.() === 'presented' && this.contextManager.windowStatusOf(row.id) === 'undone') continue;
           // Read from the newest back, the first copy met is the newest
           // content; its other parts pool with it.
           newest ??= { contentHash: mark.contentHash, parts: mark.parts, held: new Set() };
