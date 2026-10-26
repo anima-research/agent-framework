@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
+import { ReplyJudge, cut, ifYouWait, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeEventSummary } from '../src/index.js';
 import type { JudgeRequest } from '../src/gate/types.js';
 
@@ -242,6 +242,45 @@ describe('reply judge: the document', () => {
     });
     await assert.rejects(judge.judge(judgeRequest({ signal: abort.signal })), /stopped/);
     assert.strictEqual(requests.length, 0);
+  });
+
+  it('tells the judge what wakes the agent if it waits, soonest first, the framework\'s beside the gate\'s', async () => {
+    const { membrane, requests } = fakeMembrane();
+    const now = Date.now();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      upcomingWakes: () => [{ at: now + 3 * 3600_000 + 40 * 60_000, certain: true, what: 'a turn held by a provider cooldown, when it ends' }],
+    });
+    await judge.judge(judgeRequest({
+      upcomingWakes: [
+        { at: now + 12 * 60_000, certain: true, what: 'its own skip_reply timer' },
+        { at: now + 45_000, certain: false, what: 'rule "x"\'s batch of 2 events goes to the judge' },
+      ],
+    }));
+    const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.ok(last.includes([
+      '<if_you_wait>',
+      'If you answer WAIT and nothing new arrives, Scout is next woken by:',
+      '- in 45 s, maybe: rule "x"\'s batch of 2 events goes to the judge',
+      '- in 12 min: its own skip_reply timer',
+      '- in 3 h 40 min: a turn held by a provider cooldown, when it ends',
+      '</if_you_wait>',
+    ].join('\n')), last);
+    assert.ok(requests[0]!.system!.includes('what will wake the agent anyway'));
+  });
+
+  it('says when nothing the host knows of is scheduled, and a provider that throws counts as knowing none', async () => {
+    assert.match(ifYouWait([], 'Scout', Date.now()), /Nothing the host knows of is scheduled to wake Scout: if you answer WAIT, it isn't woken until a new event arrives/);
+    assert.match(ifYouWait([{ certain: true, what: 'a wake already queued (x)' }], 'Scout', Date.now()), /- as soon as it is free: a wake already queued \(x\)/);
+    const { membrane, requests } = fakeMembrane();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      upcomingWakes: () => { throw new Error('boom'); },
+    });
+    await judge.judge(judgeRequest());
+    assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
   });
 
   it('reads the primary agent its chooser names', async () => {
