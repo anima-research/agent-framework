@@ -857,27 +857,8 @@ export class Agent {
     return 'compatibility_default';
   }
 
-  /**
-   * The checks updateRuntimeSettings makes before it changes anything, run
-   * alone, so a caller can refuse a patch before applying anything else: a
-   * value out of range, a tail or pace for a strategy without live settings,
-   * or a lower budget it can't reach gradually. The strategy can still refuse
-   * what only it can judge, such as a gradual transition its configuration
-   * doesn't allow, when the update applies; that refusal also comes before
-   * anything changes.
-   * @internal For the framework's runtime-settings updates; not a host API.
-   */
-  checkRuntimeSettingsUpdate(patch: AgentRuntimeSettingsPatch): void {
-    this.validateRuntimeSettingsPatch(patch);
-    if (patch.contextBudgetTokens !== undefined && !patch.immediate
-        && patch.contextBudgetTokens < (this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS)
-        && !this.getHotContextSettings()) {
-      throw new Error('The active context strategy cannot prepare a smaller window live');
-    }
-  }
-
   updateRuntimeSettings(patch: AgentRuntimeSettingsPatch): AgentRuntimeSettingsSnapshot {
-    this.checkRuntimeSettingsUpdate(patch);
+    this.validateRuntimeSettingsPatch(patch);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     let appliedDefaultPace = false;
@@ -904,8 +885,10 @@ export class Agent {
         nextContextTarget = undefined;
         if (this.getHotContextSettings()) hotPatch.preparedWindowTokens = null;
       } else {
-        // checkRuntimeSettingsUpdate refused a paced decrease without one.
-        const hot = this.getHotContextSettings()!;
+        const hot = this.getHotContextSettings();
+        if (!hot) {
+          throw new Error('The active context strategy cannot prepare a smaller window live');
+        }
         if (patch.transitionPaceTokens === undefined && hot.transitionPaceTokens === undefined) {
           hotPatch.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
           appliedDefaultPace = true;

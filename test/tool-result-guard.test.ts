@@ -266,9 +266,13 @@ test('durable typed agent setting can be enabled, disabled, and explicitly reset
   let originalStopped = false;
   try {
     const ext = extension(h.framework);
-    for (const value of ['true', 1, null, {}]) {
-      assert.throws(() => ext.update('assistant', { tool_result_guard: value }), /must be a boolean/);
+    for (const value of ['yes', 1, null, {}]) {
+      assert.throws(() => ext.update('assistant', { tool_result_guard: value }), /tool_result_guard must be true or false, not /);
     }
+    ext.update('assistant', { tool_result_guard: 'true' });
+    assert.equal(ext.get('assistant').tool_result_guard, true, 'the text "true" reads as true');
+    ext.update('assistant', { tool_result_guard: 'false' });
+    assert.equal(ext.get('assistant').tool_result_guard, false, 'the text "false" reads as false');
     ext.update('assistant', { tool_result_guard: true });
     assert.equal(ext.get('assistant').tool_result_guard, true);
     await h.framework.stop();

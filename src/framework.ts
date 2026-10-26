@@ -759,6 +759,18 @@ const readExtensionSettings = (ext: AgentSettingsExtension, agentName: string): 
 const changedSettings = (before: Record<string, string>, now: Record<string, string>): string[] =>
   Object.keys(before).filter((key) => before[key] !== now[key]);
 
+const settingNumber = (name: string, value: unknown): number => {
+  // Number() reads null, false and blank text as 0, true as 1, and a list of one item as that item.
+  if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) return Number(value);
+  throw new Error(`${name} must be a number, not ${shownValue(value)}`);
+};
+
+const settingBoolean = (name: string, value: unknown): boolean => {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true' || value === 'false') return value === 'true';
+  throw new Error(`${name} must be true or false, not ${shownValue(value)}`);
+};
+
 /** First sentence (or line) of a description — what `utils list` shows. */
 const utilityOneLiner = (description: string): string => {
   const line = description.split('\n')[0]!;
@@ -6468,13 +6480,6 @@ export class AgentFramework {
 
   /** agent_settings extension for the spill gate (see spillOrTruncate). */
   private spillSettingsExtension(): AgentSettingsExtension {
-    const inlineCapOf = (patch: Record<string, unknown>): number => {
-      const n = Number(patch.tool_result_inline_max_chars);
-      if (!Number.isFinite(n) || n < 1000) {
-        throw new Error('tool_result_inline_max_chars must be a number >= 1000');
-      }
-      return Math.floor(n);
-    };
     return {
       properties: {
         tool_result_inline_max_chars: {
@@ -6502,14 +6507,14 @@ export class AgentFramework {
           tool_result_inline_max_chars_clamped_by: resolved?.clampedBy ?? null,
         };
       },
-      validate: (_agentName: string, patch: Record<string, unknown>) => {
-        inlineCapOf(patch);
-      },
       update: (agentName: string, patch: Record<string, unknown>) => {
-        const cap = inlineCapOf(patch);
-        this.toolResultInlineMaxCharsOverride.set(agentName, cap);
-        this.persistToolResultInlineCap(agentName, cap);
-        return { tool_result_inline_max_chars: cap };
+        const n = settingNumber('tool_result_inline_max_chars', patch.tool_result_inline_max_chars);
+        if (!Number.isFinite(n) || n < 1000) {
+          throw new Error('tool_result_inline_max_chars must be a number >= 1000');
+        }
+        this.toolResultInlineMaxCharsOverride.set(agentName, Math.floor(n));
+        this.persistToolResultInlineCap(agentName, Math.floor(n));
+        return { tool_result_inline_max_chars: Math.floor(n) };
       },
       reset: (agentName: string, keys?: string[]) => {
         if (!keys || keys.includes('tool_result_inline_max_chars')) {
@@ -6528,10 +6533,6 @@ export class AgentFramework {
   }
 
   private toolResultGuardSettingsExtension(): AgentSettingsExtension {
-    const enabledOf = (patch: Record<string, unknown>): boolean => {
-      if (typeof patch.tool_result_guard !== 'boolean') throw new Error('tool_result_guard must be a boolean');
-      return patch.tool_result_guard;
-    };
     const get = (name: string): Record<string, unknown> => {
       const guard = this.agents.get(name)?.toolResultGuard;
       return {
@@ -6563,10 +6564,7 @@ export class AgentFramework {
       },
       keys: ['tool_result_guard'],
       get,
-      validate: (_name, patch) => {
-        enabledOf(patch);
-      },
-      update: (name, patch) => set(name, enabledOf(patch)),
+      update: (name, patch) => set(name, settingBoolean('tool_result_guard', patch.tool_result_guard)),
       reset: (name) => set(name, undefined),
     };
   }
@@ -6581,10 +6579,6 @@ export class AgentFramework {
   }
 
   private closedChannelNoteSettingsExtension(): AgentSettingsExtension {
-    const onOf = (patch: Record<string, unknown>): boolean => {
-      if (typeof patch.closed_channel_note !== 'boolean') throw new Error('closed_channel_note must be a boolean');
-      return patch.closed_channel_note;
-    };
     const get = (name: string): Record<string, unknown> => ({ closed_channel_note: this.closedChannelNoteOn(name) });
     const set = (name: string, on: boolean | undefined): Record<string, unknown> => {
       if (!this.agents.has(name)) throw new Error(`Unknown agent: ${name}`);
@@ -6608,10 +6602,7 @@ export class AgentFramework {
       },
       keys: ['closed_channel_note'],
       get,
-      validate: (_name, patch) => {
-        onOf(patch);
-      },
-      update: (name, patch) => set(name, onOf(patch)),
+      update: (name, patch) => set(name, settingBoolean('closed_channel_note', patch.closed_channel_note)),
       reset: (name) => set(name, undefined),
     };
   }
@@ -7066,25 +7057,6 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
-    agent.checkRuntimeSettingsUpdate(patch);
-    const notes = this.preflightAgentRuntimeSettingsUpdate(agentName, patch, opts);
-    const result = this.applyAgentRuntimeSettingsUpdate(agentName, patch, opts);
-    for (const note of notes) console.warn(note);
-    return result;
-  }
-
-  /**
-   * The budget preflight updateAgentRuntimeSettings runs after the agent's
-   * own checks and before it applies: it refuses a lowering that would wedge
-   * the agent, and returns its notes for the caller to log once the patch
-   * has applied, since they say it is applying.
-   */
-  private preflightAgentRuntimeSettingsUpdate(
-    agentName: string,
-    patch: AgentRuntimeSettingsPatch,
-    opts?: { allowInfeasible?: boolean },
-  ): string[] {
-    const notes: string[] = [];
     // Feasibility preflight — only a budget-bearing patch can wedge, and only
     // on the immediate path (a paced descent leaves the compile budget alone
     // and converges only as far as the folded floor allows). Boot restore
@@ -7109,40 +7081,29 @@ export class AgentFramework {
             `OverBudget-wedge the agent. Lower the floor first (drain compression quarantine / ` +
             `advance the merge ladder), use a paced descent (no \`immediate\`), or pass allowInfeasible.`;
           if (!opts?.allowInfeasible) throw new BudgetPreflightError(msg, preview);
-          notes.push(`${msg} — applying anyway (allowInfeasible).`);
+          console.warn(`${msg} — applying anyway (allowInfeasible).`);
         } else if (preview.path === 'immediate' && !e.fits) {
-          notes.push(
+          console.warn(
             `[budget-preflight] ${agentName} remains over the folded floor at ` +
             `${patch.contextBudgetTokens} (floor renders ${e.finalTokens}); this patch does ` +
             `not lower the budget, so applying — drain quarantine / advance merges to clear it.`,
           );
         } else if (preview.path === 'paced' && preview.advisory && !preview.advisory.fits) {
-          notes.push(
+          console.warn(
             `[budget-preflight] paced descent for ${agentName} targets ` +
             `${preview.advisory.targetTokens} tokens, below the current folded floor — the ` +
             `transition will converge only as far as the floor allows (drain quarantine / ` +
             `advance merges to go lower). Applying; the live compile budget is unchanged.`,
           );
         }
-      } else if (preview.reason && this.agents.get(agentName)?.contextManagerAnswers()) {
-        // A manager that refuses its queries refuses the update too.
-        notes.push(
+      } else if (preview.reason && agent.contextManagerAnswers()) {
+        // A manager that refuses its queries refuses the update below too.
+        console.warn(
           `[budget-preflight] preview unavailable for ${agentName} (${preview.reason}); ` +
           `applying without preflight`,
         );
       }
     }
-    return notes;
-  }
-
-  /** updateAgentRuntimeSettings' changes, for a patch its check has passed. */
-  private applyAgentRuntimeSettingsUpdate(
-    agentName: string,
-    patch: AgentRuntimeSettingsPatch,
-    opts?: { persist?: boolean; requester?: OperatorRequester; note?: string },
-  ): AgentRuntimeSettingsSnapshot {
-    const agent = this.agents.get(agentName);
-    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.updateRuntimeSettings(patch);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
@@ -32054,11 +32015,6 @@ export class AgentFramework {
     });
     let result: ToolResult;
     const action = (call.input as { action?: unknown } | undefined)?.action;
-    // The settings an update or reset could change, as they stood before it
-    // applied anything, so a refusal can say exactly what it changed: what a
-    // check can't foresee (an extension without validate, a strategy's own
-    // refusal, a store write that fails) can still refuse after something
-    // applied.
     let before: SettingsReading | undefined;
     try {
       const input = (call.input ?? {}) as {
@@ -32084,24 +32040,15 @@ export class AgentFramework {
             data: { ...this.getAgentRuntimeSettings(agentName), ...extGet() },
           };
           break;
-        case 'cancel':
+        case 'cancel': {
+          const extra = Object.keys(input).filter((key) => key !== 'action');
+          if (extra.length > 0) {
+            throw new Error(`A cancel takes no settings; it has no ${extra.join(', ')}. Nothing in this call was changed.`);
+          }
           result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
           break;
+        }
         case 'update': {
-          const patch: AgentRuntimeSettingsPatch = {};
-          if (input.context_budget_tokens !== undefined) {
-            patch.contextBudgetTokens = Number(input.context_budget_tokens);
-          }
-          if (input.tail_tokens !== undefined) patch.tailTokens = Number(input.tail_tokens);
-          if (input.transition_pace_tokens !== undefined) {
-            patch.transitionPaceTokens = Number(input.transition_pace_tokens);
-          }
-          if (input.same_round_think_text_policy !== undefined) {
-            patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
-          }
-          // Immediate budget decrease: skip the paced descent; the next
-          // compile plans straight at the new budget (one-shot fold-down).
-          if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
           if (input.settings !== undefined) {
             throw new Error('`settings` lists names for a reset; to change a setting, give its name and new value');
           }
@@ -32112,6 +32059,20 @@ export class AgentFramework {
           if (unknown.length > 0) {
             throw new Error(`Unknown setting${unknown.length > 1 ? 's' : ''}: ${unknown.join(', ')}`);
           }
+          const patch: AgentRuntimeSettingsPatch = {};
+          if (input.context_budget_tokens !== undefined) {
+            patch.contextBudgetTokens = settingNumber('context_budget_tokens', input.context_budget_tokens);
+          }
+          if (input.tail_tokens !== undefined) patch.tailTokens = settingNumber('tail_tokens', input.tail_tokens);
+          if (input.transition_pace_tokens !== undefined) {
+            patch.transitionPaceTokens = settingNumber('transition_pace_tokens', input.transition_pace_tokens);
+          }
+          if (input.same_round_think_text_policy !== undefined) {
+            patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
+          }
+          // Immediate budget decrease: skip the paced descent; the next
+          // compile plans straight at the new budget (one-shot fold-down).
+          if (input.immediate !== undefined) patch.immediate = settingBoolean('immediate', input.immediate);
           // Route extension-owned keys to their modules; apply the core patch
           // only when it touches core keys (an extension-only update must not
           // disturb a converging budget transition).
@@ -32124,38 +32085,14 @@ export class AgentFramework {
             if (Object.keys(slice).length > 0) slices.push({ ext, slice });
           }
           const coreTouched = Object.keys(patch).length > 0;
-          // Everything that can be checked ahead is checked before anything
-          // applies: the names, the core settings' own checks and each
-          // extension's validate.
-          if (coreTouched) {
-            const agent = this.agents.get(agentName);
-            if (!agent) throw new Error(`Unknown agent: ${agentName}`);
-            agent.checkRuntimeSettingsUpdate(patch);
-          }
-          for (const { ext, slice } of slices) ext.validate?.(agentName, slice);
           // Reading them asks the context manager for the strategy's live
           // settings too, so one that can't give them refuses here.
           before = this.readAgentSettings(agentName, slices.map((s) => s.ext));
-          // Then what can refuse goes first. An extension without validate is
-          // checked only by its own update. The core settings come next: the
-          // budget preflight judges the agent as those updates left it, and
-          // the strategy can still refuse what only it can judge. Extensions
-          // that checked ahead come last.
+          const core = coreTouched
+            ? this.updateAgentRuntimeSettings(agentName, patch)
+            : this.getAgentRuntimeSettings(agentName);
           const extResults: Record<string, unknown> = {};
-          for (const { ext, slice } of slices.filter((s) => !s.ext.validate)) {
-            Object.assign(extResults, ext.update(agentName, slice));
-          }
-          let core: AgentRuntimeSettingsSnapshot;
-          if (coreTouched) {
-            const notes = this.preflightAgentRuntimeSettingsUpdate(agentName, patch);
-            core = this.applyAgentRuntimeSettingsUpdate(agentName, patch);
-            for (const note of notes) console.warn(note);
-          } else {
-            core = this.getAgentRuntimeSettings(agentName);
-          }
-          for (const { ext, slice } of slices.filter((s) => s.ext.validate)) {
-            Object.assign(extResults, ext.update(agentName, slice));
-          }
+          for (const { ext, slice } of slices) Object.assign(extResults, ext.update(agentName, slice));
           result = {
             success: true,
             data: {
