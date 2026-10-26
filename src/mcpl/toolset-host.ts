@@ -469,9 +469,9 @@ export class ToolsetController {
     if (!connection || !connection.isConnected) return;
     this.recovering = true;
     try {
-      const read = await this.ownToolList(connection);
+      await this.ownToolList(connection);
       // RFC §6.1: toolsets/list after tools/list, so every tool it names is known.
-      if (connection !== this.connection || !read) return;
+      if (connection !== this.connection) return;
       const lists = await this.ownToolsetList(connection, LIST_TIMEOUT_MS, 'recovery');
       if (connection !== this.connection) return;
       this.deliver(lists);
@@ -484,14 +484,12 @@ export class ToolsetController {
     }
   }
 
-  /** Whether the list was read; the tap applied it and told its change as it was read. */
-  private async ownToolList(connection: McplServerConnection): Promise<boolean> {
+  /** The tap applies the list and tells its change as it's read. */
+  private async ownToolList(connection: McplServerConnection): Promise<void> {
     try {
       await connection.sendToolsList();
-      return true;
     } catch (error) {
       this.log(`tools/list failed: ${this.failure(error)}`);
-      return false;
     }
   }
 

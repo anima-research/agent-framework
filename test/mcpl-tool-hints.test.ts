@@ -1124,7 +1124,7 @@ test('a toolsets/list naming a tool tools/list hasn\'t listed is recovered from,
   } finally { await t.done(); }
 });
 
-test('a recovery whose tools/list fails reads no toolsets/list', async () => {
+test('a recovery whose tools/list fails still reads toolsets/list, as connecting does', async () => {
   let failing = false;
   const t = await setup((msg, peer) => {
     if (msg.method !== 'tools/list' || !failing) return false;
@@ -1137,10 +1137,9 @@ test('a recovery whose tools/list fails reads no toolsets/list', async () => {
     t.state.next();
     t.server.peer.notify('tools/hints', t.state.hint([]));
     await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'tools/list'), 'the recovery read tools/list');
-    await roundTrip(t);
-    await settle(400); // past the 200 ms recovery debounce
-    await roundTrip(t); // and the server has read whatever the host sent before it
-    assert.ok(!t.server.received.slice(from).some((m) => m.method === 'toolsets/list'));
+    await waitFor(() => t.server.received.slice(from).some((m) => m.method === 'toolsets/list'), 'and then toolsets/list');
+    const order = t.server.received.slice(from).map((m) => m.method).filter((m) => m === 'tools/list' || m === 'toolsets/list');
+    assert.deepEqual(order.slice(0, 2), ['tools/list', 'toolsets/list'], 'tools/list first (RFC-014 §6.1)');
   } finally { await t.done(); }
 });
 
@@ -2159,6 +2158,27 @@ test('a tool whose schema holds a literal nested very deep or a type that isn\'t
     const peek = await look(t.fw, { server: 'arc', tool: 'peek' });
     assert.match(peek, /^peek\(\)\nclass: game\ninputSchema:/, 'no description where it isn\'t text, and only the class entries that are');
     assert.match(await look(t.fw, { server: 'arc', tool: 'fixed' }), /^fixed\(a\?: …, b\?: …, c\?: string =…, d\?: any, e\?: string\)\nFixed\./);
+  } finally { await t.done(); }
+});
+
+test('a literal is written out up to 65 levels deep and cut to … past that, whatever the runtime\'s stack, and look shows a schema past the bound as too deep', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('tools/list');
+    const before = notices(t.fw).length;
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => held.length === 1, 'the tool list asked for');
+    holding.clear();
+    const listed = TOOLS.filter((x) => x.name !== 'peek').map((x) => JSON.stringify(x)).join(',');
+    const dynamic = '"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true}';
+    const nested = (levels: number) => `${'{"a":'.repeat(levels)}1${'}'.repeat(levels)}`;
+    rawLine(t, `{"jsonrpc":"2.0","id":${JSON.stringify(held[0]!.id)},"result":{"tools":[${listed},`
+      + `{"name":"bounded","description":"Bounded.","inputSchema":{"type":"object","properties":{"a":{"const":${nested(65)}},"b":{"const":${nested(66)}}}},${dynamic}}],`
+      + `"_meta":{"mcpl/rev":${t.state.rev}}}}`);
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('bounded(')), 'the tool announced');
+    const line = notices(t.fw).slice(before).join('\n').split('\n').find((l) => l.includes('bounded('))!;
+    assert.ok(line.includes(`a?: ${nested(65)}, b?: …)`), line.slice(0, 200));
+    assert.match(await look(t.fw, { server: 'arc', tool: 'bounded' }), /inputSchema:\n\(nested too deeply to show\)/);
   } finally { await t.done(); }
 });
 

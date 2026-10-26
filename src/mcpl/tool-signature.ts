@@ -24,13 +24,17 @@ export interface HintedTool {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** How deep a server's value may nest and still be written out, the same on every runtime. */
+const DEEPEST = 64;
+
+function nestsWithin(value: unknown, depth = 0): boolean {
+  if (value === null || typeof value !== 'object') return true;
+  return depth <= DEEPEST && Object.values(value).every((v) => nestsWithin(v, depth + 1));
+}
+
 /** A schema's literal value (an enum's, a const or a default) as JSON, or … where it's nested too deeply to write. */
 function literal(value: unknown): string {
-  try {
-    return JSON.stringify(value) ?? 'null';
-  } catch {
-    return '…';
-  }
+  return nestsWithin(value) ? JSON.stringify(value) ?? 'null' : '…';
 }
 
 function typeSig(schema: JsonSchema | undefined, depth = 0): string {
@@ -116,7 +120,7 @@ export function firstSentence(text: unknown, max = 140): string {
 
 function canonicalJson(value: unknown, depth = 0): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (depth > 64) return '"…"';
+  if (depth > DEEPEST) return '"…"';
   if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v, depth + 1)).join(',')}]`;
   const obj = value as Record<string, unknown>;
   return `{${Object.keys(obj)
@@ -155,11 +159,7 @@ export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { descr
 
 /** A server's value as JSON, or a note where it's nested too deeply to show. */
 export function jsonText(value: unknown, space?: number): string {
-  try {
-    return JSON.stringify(value, null, space) ?? '';
-  } catch {
-    return '(nested too deeply to show)';
-  }
+  return nestsWithin(value) ? JSON.stringify(value, null, space) ?? '' : '(nested too deeply to show)';
 }
 
 /** A tool's signature, description, class and input schema, for `look` naming a tool. */
