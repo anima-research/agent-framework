@@ -2789,6 +2789,8 @@ interface StreamRequestNotes {
   stopped: boolean;
 }
 
+const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -12427,10 +12429,15 @@ export class AgentFramework {
     // not silently run under different inference conditions than the
     // resident it serves. Only identity- and surface-defining fields are
     // overridden below.
+    const model = cfg.model ?? primaryConfig.model;
+    const inherited: AgentConfig = { ...primaryConfig };
+    if (model !== primaryConfig.model) {
+      for (const field of SUBCONSCIOUS_MODEL_FIELDS) delete inherited[field];
+    }
     const agentConfig: AgentConfig = {
-      ...primaryConfig,
+      ...inherited,
       name,
-      model: cfg.model ?? primaryConfig.model,
+      model,
       systemPrompt: cfg.systemPrompt,
       strategy: undefined, // its CM owns the windowed strategy instance
       // Prose is never auto-routed: a cadence-triggered turn carries no
