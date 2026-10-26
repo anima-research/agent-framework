@@ -172,10 +172,11 @@ test('a nested mount whose directory is configured as disk spells it is that mou
     writeFileSync(join(dir, 'inner', 'x.txt'), 'inner\n');
     const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/INNER/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(read.success, false);
-    assert.equal(read.error, '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+    const refusal = '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".';
+    assert.equal(read.error, `The read did nothing: ${refusal}`);
     await assert.rejects(workspace.readFileFromDisk('outer/INNER/x.txt'),
       (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount');
-    assert.deepEqual(await workspace.readBinary('outer/INNER/x.txt'), { error: read.error });
+    assert.deepEqual(await workspace.readBinary('outer/INNER/x.txt'), { error: refusal });
   });
 
 test('a nested mount whose directory is configured in another spelling than disk\'s is that mount\'s in either',
@@ -191,11 +192,11 @@ test('a nested mount whose directory is configured in another spelling than disk
     const refusal = '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".';
     for (const path of ['outer/Inner/x.txt', 'outer/inner/x.txt']) {
       const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-      assert.equal(read.error, refusal, path);
+      assert.equal(read.error, `The read did nothing: ${refusal}`, path);
       assert.equal(workspace.resolveAbsolutePath(path), null, path);
     }
     const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/Inner/y.txt', content: 'y\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-    assert.equal(write.error, '"outer/inner/y.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/y.txt".');
+    assert.equal(write.error, 'The write did nothing: "outer/inner/y.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/y.txt".');
     assert.equal(existsSync(join(dir, 'inner', 'y.txt')), false);
     const synced = await call('sync', { path: 'outer/Inner' });
     assert.equal((synced.data as { totalSynced: number }).totalSynced, 0);
@@ -336,7 +337,7 @@ test('a name a mount\'s include doesn\'t cover is refused as given, whether disk
     for (const tool of ['read', 'write', 'ls', 'glob', 'grep', 'sync', 'materialize']) {
       const input = tool === 'glob' || tool === 'grep' ? { path, pattern: 's' } : tool === 'write' ? { path, content: 'x' } : { path };
       const result = await workspace.handleToolCall({ id: tool, name: tool, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-      assert.equal(result.error, refusal, `${tool} ${path}`);
+      assert.equal(result.error, `The ${tool} did nothing: ${refusal}`, `${tool} ${path}`);
     }
     await assert.rejects(workspace.readFileFromDisk(path),
       (err: unknown) => err instanceof WorkspaceReadError && err.code === 'outside_include' && err.message === refusal);
@@ -360,7 +361,7 @@ test("through a link a mount follows, the include judges where the path lands as
   symlinkSync('ELSE', join(dir, 'via'));
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/x.json' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false);
-  assert.ok(String(read.error).endsWith('Symlink escape detected: work/x.json'), String(read.error));
+  assert.ok(String(read.error).startsWith('The read did nothing: "work/x.json" leads through a symlink to a place outside its mount'), String(read.error));
   await assert.rejects(workspace.readFileFromDisk('work/x.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'escape');
   await call('sync', {});
   assert.equal((((await call('grep', { path: 'work', pattern: 'outside the include' })).structured) as { totalMatches: number }).totalMatches, 0);
@@ -488,9 +489,10 @@ test('past a nested mount\'s directory, an answer shows the path as given', { sk
   for (const name of ['HIDDEN.TXT', 'NOPE.TXT']) {
     const path = `outer/INNER/${name}`;
     const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-    assert.equal(read.error, `"outer/inner/${name}" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/${name}".`);
+    const refusal = `"outer/inner/${name}" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/${name}".`;
+    assert.equal(read.error, `The read did nothing: ${refusal}`);
     await assert.rejects(workspace.readFileFromDisk(path),
-      (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount' && err.message === read.error);
+      (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount' && err.message === refusal);
     for (const tool of ['ls', 'glob', 'grep', 'sync', 'materialize']) {
       const input = tool === 'glob' || tool === 'grep' ? { path, pattern: 'h' } : { path };
       const answer = JSON.stringify(await workspace.handleToolCall({ id: tool, name: tool, input } as Parameters<WorkspaceModule['handleToolCall']>[0]));
@@ -889,7 +891,7 @@ test('a file the workspace deleted, which disk comes to list in another case, is
   assert.equal((deleted.data as { path: string }).path, 'work/src/Name.txt');
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/src/Name.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false, 'the read takes nothing in');
-  assert.match(String(read.error), /work\/src\/Name\.txt was deleted in the workspace/);
+  assert.match(String(read.error), /^The read did nothing: "work\/src\/Name\.txt" was deleted in the workspace/);
   await call('materialize', { path: 'work/src/Name.txt', applyDeletions: true });
   assert.deepEqual(readdirSync(join(dir, 'src')).sort(), ['a.ts'], 'the deletion reached disk\'s file');
   const listed = await call('ls', { path: 'work', recursive: true });
@@ -905,7 +907,7 @@ test('a file the workspace deleted, which disk then changed and lists in another
   writeFileSync(join(dir, 'src', 'NAME.txt'), 'changed on disk\n');
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/src/Name.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false, 'the read takes nothing in');
-  assert.match(String(read.error), /work\/src\/Name\.txt is in conflict/);
+  assert.match(String(read.error), /^The read did nothing: "work\/src\/Name\.txt" is in conflict/);
   await call('sync', { path: 'work/src/Name.txt' });
   const status = (await call('status', {})).data as { work: { conflicts: number; pendingWorkspaceDeletions: number } };
   assert.deepEqual([status.work.conflicts, status.work.pendingWorkspaceDeletions], [0, 0], 'the sync settled the conflict and the deletion');
@@ -1072,7 +1074,7 @@ test('an entry\'s spelling takes no path out of a nested mount\'s directory that
   // Where both spellings lie in one nested mount's directory, the refusal
   // names disk's, as without the entries.
   const late = await call('write', { path: 'outer/inner/LATE.txt', content: 'x\n' });
-  assert.equal(late.error, '"outer/inner/LATE.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/LATE.txt".');
+  assert.equal(late.error, 'The write did nothing: "outer/inner/LATE.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/LATE.txt".');
   // As configured, a path is later's, and so is one the entry spelled as
   // configured gives that spelling.
   await refusedAs('write', { path: 'outer/later/y.txt', content: 'y\n' }, 'later');

@@ -47,7 +47,9 @@ import type { FileHandle } from 'node:fs/promises';
 import {
   type CheckedDir,
   type MountView,
+  LEAVES_MOUNT,
   NONBLOCK,
+  NOT_A_DIRECTORY,
   NOT_FOLLOWED,
   OUTSIDE_PARENT,
   ROOT_REPLACED,
@@ -232,7 +234,7 @@ export async function writeContained(
   createMode?: number,
 ): Promise<{ perm: number; widenRefused: boolean; modeKept: boolean }> {
   const checked = await parentFor(view, rootReal, rel, true);
-  if (checked.kind !== 'checked') throw new EffectFailed('a parent path is not a directory', false);
+  if (checked.kind !== 'checked') throw new EffectFailed(NOT_A_DIRECTORY, false);
   const parent = checked.dir;
   const root = checked.root;
   const target = parent.at(nameOf(rel));
@@ -258,8 +260,16 @@ export async function writeContained(
       touched = true;
       return handle;
     } catch (err) {
-      // O_EXCL refuses any entry: a file, a directory or a link.
-      if (errno(err) === 'EEXIST') throw new EffectFailed('something appeared at this path since it was checked', false);
+      // O_EXCL refuses any entry: a file, a directory or a link, one that
+      // leads nowhere included, which a followed observation reads as absent.
+      if (errno(err) === 'EEXIST') {
+        const link = (await lstat(target).catch(() => null))?.isSymbolicLink() === true;
+        const leads = link ? await stat(target).then(() => 'somewhere', (e: unknown) => errno(e)) : null;
+        throw new EffectFailed(leads === 'ENOENT' || leads === 'ENOTDIR'
+          ? 'a symlink that leads nowhere is at this path, and a push makes a file only where nothing is, forced or not; '
+            + 'whoever runs this host can remove the link or make it lead to a file, and a materialize then writes it'
+          : 'something appeared at this path since it was checked', false);
+      }
       throw new EffectFailed(`cannot create the file (${errno(err) ?? message(err)})`, false);
     }
   };
@@ -386,7 +396,7 @@ export async function writeContained(
  * it, and so does a create, before anything is made.
  */
 export async function refusedLanding(view: MountView, rootReal: string, rel: string, real: string): Promise<string | null> {
-  const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
+  const leaves = view.followSymlinks ? LEAVES_MOUNT : OUTSIDE_PARENT;
   if (!contained(rootReal, real)) return leaves;
   const holder = nestedAtReal(real, view.nested);
   if (holder) return namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, rel, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED;
@@ -566,7 +576,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     // The link itself is what is removed; a followed one must still lie inside.
     if (!view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
     const real = await realpath(target).catch(() => null);
-    if (real === null || !contained(rootReal, real)) throw new EffectFailed('a symlink that leaves the mount', false);
+    if (real === null || !contained(rootReal, real)) throw new EffectFailed(LEAVES_MOUNT, false);
     // One leading into a nested mount's directory is that mount's: the link
     // and the file it leads to are left as they are. Where that mount's
     // include leaves the place out, it's no mount's, and the link leaves this
@@ -574,7 +584,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     const holder = nestedAtReal(real, view.nested);
     if (holder) {
       const directory = holder.include !== undefined && await stat(real).then((s) => s.isDirectory(), () => false);
-      throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, directory) ? leadsInto(view.name, rel, holder) : 'a symlink that leaves the mount', false);
+      throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, directory) ? leadsInto(view.name, rel, holder) : LEAVES_MOUNT, false);
     }
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);
@@ -586,7 +596,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     if (!through.isFile()) throw new EffectFailed(through.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file', false);
     // One leading to a file this mount's own include leaves out leaves the
     // mount too, and that file isn't read for a hash (coversLanding).
-    if (!(await coversLanding(view, rootReal, real, rel))) throw new EffectFailed('a symlink that leaves the mount', false);
+    if (!(await coversLanding(view, rootReal, real, rel))) throw new EffectFailed(LEAVES_MOUNT, false);
     file = through;
   } else if (info.isDirectory()) {
     throw new EffectFailed('a directory', false);

@@ -56,18 +56,25 @@ import type { BigIntStats } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { relative, sep } from 'node:path';
 import { refusedLanding } from './effects.js';
+import { ROOT_UNCHECKED, errnoWayOn, errnoWords, onlyTheHost } from './answers.js';
 import {
   type CheckedDir,
   type MountView,
   NONBLOCK,
+  LEAVES_MOUNT,
+  NOT_A_DIRECTORY,
   NOT_FOLLOWED,
   OUTSIDE_PARENT,
+  ROOT_UNAVAILABLE,
   checkDir,
   checkRoot,
   errno,
   nameOf,
   parentOf,
 } from './observe.js';
+
+const DIRECTORY_THERE = 'A file can\'t be written over a directory; give another path.';
+const NOT_REGULAR_THERE = onlyTheHost('put a regular file there');
 
 /** An open that follows no link at the path, where the platform has one. */
 const NOFOLLOW = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
@@ -119,7 +126,26 @@ export const sameIdentity = (a: FileIdentity, b: FileIdentity): boolean =>
 export class FileChanged extends Error {}
 
 /** Why a direct write didn't happen, in words for its answer; disk is as it was. */
-export class WriteRefused extends Error {}
+export class WriteRefused extends Error {
+  constructor(message: string, readonly wayOn: string | null = null, readonly errno?: string) {
+    super(message);
+  }
+}
+
+const AFRESH = 'Calling again checks it afresh.';
+
+const NAME_ITS_OWN = "Calling again won't change that; if you know the file it leads to, name that file by its own path.";
+
+function refusedWayOn(reason: string, code?: string, hostsName = false): string | null {
+  if (reason === ROOT_UNAVAILABLE) {
+    return code === 'ENOENT' || code === 'ENOTDIR' ? onlyTheHost("put the mount's directory back at its path") : code !== undefined ? errnoWayOn(code, ROOT_UNCHECKED, true) : ROOT_UNCHECKED;
+  }
+  if (code !== undefined) return errnoWayOn(code, undefined, hostsName);
+  if (reason === NOT_FOLLOWED) return NAME_ITS_OWN;
+  if (reason === OUTSIDE_PARENT || reason === LEAVES_MOUNT) return "Calling again won't change that; the workspace writes only inside its mounts.";
+  if (reason === NOT_A_DIRECTORY) return "Calling again won't change that while something other than a directory stands where the path needs one; another path, or removing what stands there, would.";
+  return null;
+}
 
 /** A file's new bytes staged beside it, ready to be renamed over it (stageContained). */
 export interface Staged {
@@ -170,7 +196,8 @@ async function directoryOf(view: MountView, rootReal: string, rel: string, makeD
   const checked = await checkDir(view, rootReal, parentOf(rel), { create: makeDirectory });
   if (checked.kind === 'checked') return checked.dir;
   if (checked.kind === 'absent') throw new FileChanged(rel);
-  throw new WriteRefused(checked.outside ? OUTSIDE_PARENT : checked.reason);
+  const reason = checked.outside ? OUTSIDE_PARENT : checked.reason;
+  throw new WriteRefused(reason, refusedWayOn(reason, checked.errno));
 }
 
 /**
@@ -193,29 +220,31 @@ export async function stageContained(
   { makeDirectory = false }: { makeDirectory?: boolean } = {},
 ): Promise<Staged> {
   const root = await checkRoot(view, rootReal);
-  if ('reason' in root) throw new WriteRefused(root.reason);
+  if ('reason' in root) throw new WriteRefused(root.reason, refusedWayOn(root.reason, root.errno, true), root.errno);
   let parent = await directoryOf(view, rootReal, rel, makeDirectory);
   let path = parent.at(nameOf(rel));
   let info = await lstat(path, { bigint: true }).catch((err: unknown) => {
     if (errno(err) === 'ENOENT') return null;
-    throw new WriteRefused(`cannot stat the file (${errno(err) ?? String(err)})`);
+    throw new WriteRefused(`cannot stat the file (${errnoWords(errno(err))})`, errnoWayOn(errno(err)), errno(err));
   });
   if (info?.isSymbolicLink()) {
-    if (!view.followSymlinks) throw new WriteRefused(NOT_FOLLOWED);
+    if (!view.followSymlinks) throw new WriteRefused(NOT_FOLLOWED, NAME_ITS_OWN);
     // A followed link stands for the file it leads to, as a read takes it:
     // the write goes there, judged where it lands, and the link stays.
     const real = await realpath(path).catch((err: unknown) => {
-      throw new WriteRefused(errno(err) === 'ENOENT' ? "a symlink whose target doesn't exist" : `cannot resolve the symlink (${errno(err) ?? String(err)})`);
+      throw errno(err) === 'ENOENT'
+        ? new WriteRefused("a symlink whose target doesn't exist", onlyTheHost('remove the link or make it lead to a file'))
+        : new WriteRefused(`cannot resolve the symlink (${errnoWords(errno(err))})`, errnoWayOn(errno(err)), errno(err));
     });
     const leaves = await refusedLanding(view, rootReal, rel, real);
-    if (leaves !== null) throw new WriteRefused(leaves);
+    if (leaves !== null) throw new WriteRefused(leaves, refusedWayOn(leaves));
     const realRel = relativeTo(rootReal, real);
     parent = await directoryOf(view, rootReal, realRel, false);
     path = parent.at(nameOf(realRel));
     info = await lstat(path, { bigint: true }).catch((err: unknown) => {
       // Gone since realpath found it: another writer's change.
       if (errno(err) === 'ENOENT') throw new FileChanged(rel);
-      throw new WriteRefused(`cannot stat the file the symlink leads to (${errno(err) ?? String(err)})`);
+      throw new WriteRefused(`cannot stat the file the symlink leads to (${errnoWords(errno(err))})`, errnoWayOn(errno(err)), errno(err));
     });
     if (info.isSymbolicLink()) throw new FileChanged(rel);
   } else {
@@ -223,10 +252,10 @@ export async function stageContained(
     // lands where the mount may not act: in a nested mount's directory, or
     // on a file its own include leaves out (refusedLanding).
     const leaves = await refusedLanding(view, rootReal, rel, path);
-    if (leaves !== null) throw new WriteRefused(leaves);
+    if (leaves !== null) throw new WriteRefused(leaves, refusedWayOn(leaves));
   }
-  if (info?.isDirectory()) throw new WriteRefused('a directory');
-  if (info && !info.isFile()) throw new WriteRefused('not a regular file');
+  if (info?.isDirectory()) throw new WriteRefused('a directory', DIRECTORY_THERE);
+  if (info && !info.isFile()) throw new WriteRefused('not a regular file', NOT_REGULAR_THERE);
   // A fixed-length name, so a file whose own name is near the 255-byte limit can still be replaced.
   const temp = parent.at(`${STAGED_PREFIX}${randomUUID()}`);
   let made = false;
@@ -266,8 +295,8 @@ export async function stageContained(
     // A staged file that couldn't be made names the directory: a push's
     // write in place needs only the file, and this one needs both.
     throw new WriteRefused(made
-      ? `cannot write the staged file beside it (${errno(err) ?? String(err)})`
-      : `cannot make the staged file in its directory (${errno(err) ?? String(err)}): a direct write needs to write the file's directory as well as the file`);
+      ? `cannot write the staged file beside it (${errnoWords(errno(err))})`
+      : `cannot make the staged file in its directory (${errnoWords(errno(err))}): a direct write needs to write the file's directory as well as the file`, errnoWayOn(errno(err)), errno(err));
   }
 }
 
@@ -278,7 +307,7 @@ export async function stageContained(
  */
 export async function placedStill(staged: Staged): Promise<void> {
   if (!(await staged.root.stillHere())) throw new WriteRefused(ROOT_MOVED);
-  if (!(await staged.parent.stillHere())) throw new WriteRefused('the directory changed since it was checked');
+  if (!(await staged.parent.stillHere())) throw new WriteRefused('the directory changed since it was checked', AFRESH);
 }
 
 /**
@@ -309,13 +338,13 @@ export function checkUnchanged(staged: Staged, expected: { identity: FileIdentit
   try {
     now = lstatSync(staged.path, { bigint: true });
   } catch (err) {
-    if (errno(err) !== 'ENOENT') throw new WriteRefused(`cannot check that it hadn't changed (${errno(err) ?? String(err)})`);
+    if (errno(err) !== 'ENOENT') throw new WriteRefused(`cannot check that it hadn't changed (${errnoWords(errno(err))})`, errnoWayOn(errno(err)), errno(err));
     if (expected !== null) throw new FileChanged(staged.path);
     return;
   }
-  if (now.isSymbolicLink()) throw new WriteRefused('it became a symlink while this call was being applied');
-  if (now.isDirectory()) throw new WriteRefused('a directory');
-  if (!now.isFile()) throw new WriteRefused('not a regular file');
+  if (now.isSymbolicLink()) throw new WriteRefused('it became a symlink while this call was being applied', AFRESH);
+  if (now.isDirectory()) throw new WriteRefused('a directory', DIRECTORY_THERE);
+  if (!now.isFile()) throw new WriteRefused('not a regular file', NOT_REGULAR_THERE);
   // As a push's write, which opens the file for writing, would be refused:
   // the rename needs only the directory's permission, and would replace a
   // file its owner made read-only.
@@ -329,9 +358,9 @@ export function checkUnchanged(staged: Staged, expected: { identity: FileIdentit
       throw new FileChanged(staged.path);
     }
     if (code === 'EACCES' || code === 'EPERM') {
-      throw new WriteRefused(`a file the host's process may not write (${code}): its mode or owner keeps that process out, and calling again is refused until the file's owner, or whoever runs the host, changes that`);
+      throw new WriteRefused(`a file the host's process may not write (${errnoWords(code)}): its mode or owner keeps that process out, and calling again is refused until the file's owner, or whoever runs the host, changes that`);
     }
-    throw new WriteRefused(`cannot check that the host's process may write it (${code ?? String(err)})`);
+    throw new WriteRefused(`cannot check that the host's process may write it (${errnoWords(code)})`, errnoWayOn(code), code);
   }
   if (expected === null) return;
   let bytes: Buffer;
@@ -353,7 +382,7 @@ export function checkUnchanged(staged: Staged, expected: { identity: FileIdentit
     // ELOOP: a link put at the path since the lstat; EAGAIN: a pipe, with a
     // writer and nothing in it yet. Either is another writer's change.
     if (errno(err) === 'ENOENT' || errno(err) === 'ELOOP' || errno(err) === 'EAGAIN') throw new FileChanged(staged.path);
-    throw new WriteRefused(`cannot check that it hadn't changed (${errno(err) ?? String(err)})`);
+    throw new WriteRefused(`cannot check that it hadn't changed (${errnoWords(errno(err))})`, errnoWayOn(errno(err)), errno(err));
   }
   if (!sameIdentity(identityOf(after), expected.identity) || !bytes.equals(expected.bytes)) throw new FileChanged(staged.path);
 }
@@ -384,13 +413,13 @@ export function renameInto(staged: Staged): void {
     // The staged file is still the one this call wrote, not another put at its name.
     const temp = lstatSync(staged.temp, { bigint: true });
     if (!temp.isFile() || !sameIdentity(identityOf(temp), staged.tempIdentity)) {
-      throw new WriteRefused('another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was');
+      throw new WriteRefused('another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was', 'Calling again writes it afresh.');
     }
     otherLinks = otherLinksAt(staged.path);
     renameSync(staged.temp, staged.path);
   } catch (err) {
     if (err instanceof WriteRefused) throw err;
-    throw new WriteRefused(`cannot rename the staged file over it (${errno(err) ?? (err instanceof Error ? err.message : String(err))})`);
+    throw new WriteRefused(`cannot rename the staged file over it (${errnoWords(errno(err))})`, errnoWayOn(errno(err)), errno(err));
   }
   // Set once the rename has happened, so a count never stands for a split that didn't.
   staged.otherLinks = otherLinks;
