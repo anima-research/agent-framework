@@ -181,7 +181,7 @@ import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } 
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
-import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
+import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
@@ -804,7 +804,8 @@ const utilityOneLiner = (description: string): string => {
 
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
@@ -3659,6 +3660,7 @@ export class AgentFramework {
   private readonly thinkingLossIncidents = new ThinkingLossIncidents();
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
   private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
+  private readonly streamCarried = new WeakMap<YieldingStream, Set<MessageId>>();
   /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
@@ -10513,41 +10515,39 @@ export class AgentFramework {
     }
   }
 
-  /**
-   * Shed the newest turn: remove the newest message that isn't a system
-   * message or a system change, whoever wrote it, with the rest of its exchange (the tool_use
-   * turn paired with a tool result, and the whole of a body stored in
-   * shards). It adds no marker; the caller keeps one consolidated marker for
-   * the episode (updateRewindMarker). The returned record's descriptor says
-   * what was removed and its size, never the content, while the raw record
-   * survives in the chronicle log for forensics. Returns null when only
-   * system messages remain.
-   *
-   * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
-   * the shed after inference exhaustion (quarantinePoisonedHistory).
-   */
-  private shedNewestTurn(agent: Agent): RewindRecord | null {
+  private shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): RewindRecord | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
 
-    // Newest message that is not our own episode marker. We shed strictly
-    // newest-first, in sequence — INCLUDING the agent's own turns (poison lives
-    // in tool_use/narration turns too), because newest-first reaches whatever is
-    // poisoning the context if allowed to run deep enough. The one invariant:
+    // We shed strictly newest-first, in sequence — INCLUDING the agent's own
+    // turns (poison lives in tool_use/narration turns too), because
+    // newest-first reaches whatever is poisoning the context if allowed to run
+    // deep enough. The one invariant:
     // shed COMPLETE exchanges. Removing a `tool_result` also removes its paired
     // `tool_use` assistant turn, so we never leave an orphaned tool_use / signed
     // `thinking` block — which the API rejects with a 400 ("thinking blocks in
     // the latest assistant message cannot be modified"). We do NOT add a marker
     // here; the caller keeps one consolidated marker (updateRewindMarker).
-    // A system change, stamped or not, isn't a turn either.
+    const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
+    const callCarried = (start: number) => {
+      if (start <= 0) return false;
+      const turn = bodyRangeIn(all, start - 1);
+      return all.slice(turn.from, turn.to + 1).some((m) => hasBlock(m, 'tool_use')) && wasCarried(turn.from, turn.to);
+    };
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
       if (meta.system || isSystemChangeMessage(all[i] as { content: readonly ContentBlock[] })) continue;
-      idx = i; break;
+      const { from: start } = bodyRangeIn(all, i);
+      const body = all.slice(start, i + 1);
+      if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
+        && (wasCarried(start, i) || (body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start)))) {
+        idx = i; break;
+      }
+      i = start;
     }
     if (idx < 0) return null;
     // The newest message can be the last shard of a body (a document stored
@@ -13963,6 +13963,11 @@ export class AgentFramework {
                 kind: 'injected' as const, id: injection.id, participant: injectedMessages[i]!.participant, sent: injectedMessages[i]!.content,
               })),
             ], replySent === null || replySent === undefined);
+            const carried = this.streamCarried.get(currentState.stream);
+            if (carried) {
+              const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.map((injection) => injection.id) : [];
+              for (const id of [replyId, resultsId, ...injected]) if (id !== undefined) carried.add(id);
+            }
             currentState.stream.provideToolResults(
               submitted,
               midTurnInjections.length > 0 ? { injectedMessages } : undefined,
@@ -20686,6 +20691,7 @@ export class AgentFramework {
         thinkingRecordedAfter,
         thinkingBranch,
         noteRequestSent,
+        carriedBodies,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
@@ -20694,6 +20700,7 @@ export class AgentFramework {
       });
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
+      if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -21972,7 +21979,8 @@ export class AgentFramework {
             // If the agent is still waiting_for_tools when 'complete' fires
             // (shouldn't happen after incomplete-tool-call fix, but guard anyway),
             // flush pending blocks + inject error results for any remaining pending tools.
-            if (agent.state.status === 'waiting_for_tools') {
+            const waitedAtComplete = agent.state.status === 'waiting_for_tools';
+            if (waitedAtComplete) {
               console.warn(
                 `[framework] 'complete' event fired while agent '${agent.name}' is still waiting_for_tools. ` +
                 `Injecting error results for ${agent.getPendingToolIds().length} pending tool(s).`
@@ -22015,6 +22023,42 @@ export class AgentFramework {
               }
             }
 
+            const cut = waitedAtComplete ? undefined : cutOffRound(response);
+            if (cut) response = { ...response, content: cut.content };
+            const cutIds = new Set(cut?.calls.map((call) => call.id));
+            const cutCalls = cut?.calls.map((call) => this.roundCallOf(agent.name, call, true)) ?? [];
+            const cutPrivate = cutCalls.some((call) => call.refused);
+            // Not for XML-built calls: the same-round think policy applies only
+            // to a round with verbatim content, which membrane gives a native
+            // round and never an XML one, so it never reaches an XML round,
+            // cut or not.
+            const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.xml
+              && cut.calls.some((call) => call.name === 'think');
+            const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
+            if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
+              generationLost = true;
+              lifecyclePhase = 'aborted';
+              this.cancelSupersededStream(agent, stream);
+              return;
+            }
+            if (cut && cut.calls.length > 0) {
+              for (const { id, name, result } of cutResults!.completed) {
+                this.emitTrace({ type: 'tool:failed', module: 'framework', tool: name, callId: id, error: result.error ?? '' });
+              }
+              hadToolCalls = true;
+              const cutRound = toolRounds++;
+              if (turnProseRouting !== 'disabled' && (cutPrivate || (cutThinkPrivate && !liveProseRouting))) refusedWakeRounds.add(cutRound);
+              if (liveProseRouting) silence = mergeSilence(silence, roundSilenceOf(cutCalls, cutRound));
+              console.error(
+                `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside ${cut.calls.length} call(s) ` +
+                `(${cut.calls.map((call) => call.name).join(', ')}); stored with refused results, not run`,
+              );
+            } else if (cut?.unnamed) {
+              console.error(
+                `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside a tool-call block before any call was named; nothing ran`,
+              );
+            }
+
             // Add assistant response to context.
             // If we had tool calls, each round's blocks (thinking + text +
             // tool_use) were already stored as pendingAssistantBlocks and
@@ -22023,7 +22067,7 @@ export class AgentFramework {
             // double-store earlier rounds' text/thinking AND detach signed
             // thinking blocks from their tool_use turn (the API requires
             // thinking to precede tool_use in the same assistant turn).
-            const lastToolIdx = response.content.reduce(
+            const lastToolIdx = cutResults ? cut!.start - 1 : response.content.reduce(
               (last: number, b: ContentBlock, i: number) =>
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
@@ -22032,6 +22076,7 @@ export class AgentFramework {
             const terminalSent = lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content;
             const terminalContent = stampThinkingTokenEstimates(terminalSent, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
+            let refusedReplyId: MessageId | undefined;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
             // call, preserve its later prose exactly as ordinary history.
@@ -22061,14 +22106,29 @@ export class AgentFramework {
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
                 const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                if (response.stopReason === 'refusal') refusedReplyId = terminalId;
                 this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
               } else {
                 // Nothing after the last results: the rows are judged as of now, the last batch settled.
                 this.noteStreamEnd(agent, stream, undefined, false);
               }
+            } else if (cut?.unnamed && terminalContent.length === 0) {
+              this.noteStreamEnd(agent, stream, undefined, false);
             } else {
               const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              if (response.stopReason === 'refusal') refusedReplyId = terminalId;
               this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+            }
+            if (cutResults) {
+              agent.toolResultGuard.storeResults(cutResults.blocks, cutResults.wire, cutResults.completed,
+                this.silentTurnRowMetadata(agent.name), cutResults.keptCap);
+              agent.toolResultGuard.settleTurnEnded();
+            } else if (cut?.unnamed) {
+              agent.getContextManager().addMessage('user', [{
+                type: 'text',
+                text: '[tool-boundary] Your response was cut off at the output limit inside a tool-call block, before any call in it ' +
+                  'was named, so nothing ran. To make a call, send less in one response.',
+              }], { system: true, kind: 'cut-off-tool-block', ...this.silentTurnRowMetadata(agent.name) });
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
@@ -22149,7 +22209,7 @@ export class AgentFramework {
             if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, {
               stopReason: 'completed',
-              speech: guardedWrapperTool
+              speech: guardedWrapperTool || cutResults
                 ? ''
                 : terminalContent
                     .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
@@ -22197,15 +22257,15 @@ export class AgentFramework {
               // By the time a refusal reaches here, membrane's retries are
               // already spent — so this path is the escalation: rewind (if
               // enabled), then the reaction.
-              // Shed exactly one more (newest, in-sequence) turn and keep the
-              // single episode marker current. `budgetLeft` bounds the loop.
               const doRewind = (
                 budgetLeft: boolean,
                 onStep: (count: number) => void,
                 onGiveUp: () => void,
               ): void => {
+                const cm = agent.getContextManager();
+                if (refusedReplyId !== undefined && cm.getMessage(refusedReplyId)) removeStoredMessage(cm, refusedReplyId);
                 if (!budgetLeft) { onGiveUp(); return; }
-                const rec = this.shedNewestTurn(agent);
+                const rec = this.shedNewestTurn(agent, this.streamCarried.get(stream));
                 if (!rec) { onGiveUp(); return; }
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
@@ -22386,9 +22446,10 @@ export class AgentFramework {
               // scan to avoid double-posting.
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
-                .map((b) => b as unknown as { name?: unknown; input?: unknown; unparseableInput?: string })
-                .filter((c): c is { name: string; input?: unknown; unparseableInput?: string } =>
-                  typeof c.name === 'string' && markedInputRefusal({ ...c, name: c.name }) === undefined
+                .map((b) => b as unknown as { id?: unknown; name?: unknown; input?: unknown; unparseableInput?: string })
+                .filter((c): c is { id?: unknown; name: string; input?: unknown; unparseableInput?: string } =>
+                  typeof c.name === 'string' && !cutIds.has(c.id as string)
+                  && markedInputRefusal({ ...c, name: c.name }) === undefined
                   && this.canAgentUseTool(agent.name, c.name));
               const toolNames = toolCalls.map((c) => c.name);
               // A refused skip_reply isn't a silencing call; a plain one is.
@@ -22404,6 +22465,14 @@ export class AgentFramework {
               const runs = finalRuns;
               const segments = finalSegments;
 
+              const thinkPrivate = cutThinkPrivate && liveProseRouting;
+              const thinkHeld = (): void => {
+                if (segments.length > 0) {
+                  console.error(
+                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
+                  );
+                }
+              };
               if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
                   console.error(
@@ -22412,10 +22481,12 @@ export class AgentFramework {
                   this.recordProseSuppression(streamRouting, segments.length);
                 }
               } else if (turnProseRouting === 'hybrid') {
-                if (trailingSilence === 'private' && segments.length > 0) {
-                  this.holdSilencedProse(agent, runs, 'private', false, trailingHold, { target: null, when: trailingWhen });
+                if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
+                  this.holdSilencedProse(agent, runs, trailingSilence === 'private' ? 'private' : 'kept', thinkPrivate, trailingHold, { target: null, when: trailingWhen });
                 } else if (trailingSilence && trailingSilence !== 'private' && segments.length > 0) {
                   closingHeld = await this.routeSilencedHybrid(agent, runs, trailingSilence, false, trailingHold, resolveTurnLocus(), trailingWhen);
+                } else if (thinkPrivate) {
+                  thinkHeld();
                 } else if (segments.length > 0) {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
@@ -22427,28 +22498,34 @@ export class AgentFramework {
                   }
                 }
               } else if (turnProseRouting === 'explicit') {
-                if (segments.length > 0) {
+                if (thinkPrivate) {
+                  thinkHeld();
+                } else if (segments.length > 0) {
                   console.error(
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
                   );
                   for (const envelopes of admittedSegments) {
                     try {
-                      await this.deliverAdmittedProse(agent, envelopes, trailingHold);
+                      await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, keepPrivate: liveProseRouting && cutPrivate });
                     } catch (err) {
                       console.error('trailing prose delivery failed:', err);
                     }
                   }
                 }
               } else if (trailingSilence === 'private' || segments.length === 0
+                || (trailingSilence && thinkPrivate)
                 || (trailingSilence && sendHoldAt(trailingSilence, resolveTurnLocus()))) {
                 const sendHold = trailingSilence && trailingSilence !== 'private' ? sendHoldAt(trailingSilence, resolveTurnLocus()) : undefined;
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
-                  `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold ? 'turn silenced: send' : 'no trailing prose'})`,
+                  `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold || (trailingSilence && thinkPrivate) ? 'turn silenced: send' : 'no trailing prose'})`,
                 );
                 if (segments.length > 0) {
-                  closingHeld = this.holdSilencedProse(agent, runs, sendHold ?? 'private', false, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
+                  const cause = trailingSilence === 'private' ? 'private' : thinkPrivate ? 'kept' : sendHold ?? 'private';
+                  closingHeld = this.holdSilencedProse(agent, runs, cause, thinkPrivate, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
                 }
+              } else if (thinkPrivate) {
+                thinkHeld();
               } else {
                 // The turn's own locus, read from this stream's routing
                 // state. This dispatch runs AFTER the agent is idle (see PR
@@ -25298,10 +25375,22 @@ export class AgentFramework {
     return this.refusedResult(agentName, call.id, error);
   }
 
+  private async cutOffResults(agent: Agent, calls: readonly CutOffCall[]): Promise<{
+    completed: CompletedToolCall[]; blocks: ContentBlock[]; wire: MembraneToolResult[]; keptCap: number | undefined;
+  }> {
+    const completed: CompletedToolCall[] = calls.map((call) => (
+      { id: call.id, name: call.name, input: call.input, result: this.refusedResult(agent.name, call.id, cutOffRefusal(call)), durationMs: 0 }
+    ));
+    const { blocks, spilled, keptCap } = await this.buildStoredToolResultContent(agent.name, completed, undefined, undefined);
+    const wire = completed.map((tc) => this.toMembraneToolResult(tc.id, tc.result, undefined, spilled.get(tc.id), tc.name));
+    return { completed, blocks, wire, keptCap };
+  }
+
   /**
-   * A dispatched call answered without running its tool. RFC-007's lifecycle
-   * forgets it, and its result says it was refused (`ToolResult.refused`), both
-   * from here, so the two can't disagree.
+   * A call answered without running its tool: one the dispatcher refused, or
+   * one in the last round of a response the output limit cut off. RFC-007's
+   * lifecycle forgets it, and its result says it was refused
+   * (`ToolResult.refused`), both from here, so the two can't disagree.
    */
   private refusedResult(agentName: string, callId: string, error: string): ToolResult {
     this.toolLifecycleEmitter?.refuse(agentName, callId);
@@ -28030,7 +28119,7 @@ export class AgentFramework {
     if (!rec) {
       console.error(
         `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
-        `history is only system markers. Manual repair needed.`,
+        `history holds only system markers and rows a request leaves empty. Manual repair needed.`,
       );
       return;
     }

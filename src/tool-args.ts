@@ -91,6 +91,11 @@ export function markedInputRefusal(call: { name: string; unparseableInput?: stri
   return `Nothing was done: ${call.name} its arguments came in a response that didn't arrive whole and in order, so they can't be taken as this call's; call it again.`;
 }
 
+export function cutOffRefusal(call: { name: string }): string {
+  return `Nothing was done: ${call.name} didn't run, because the response it was in was cut off at the output limit. ` +
+    'To make the call, send less in one response: shorter text before it, shorter arguments, or fewer calls at once.';
+}
+
 export function asCalled<T extends { name: string; input?: unknown; unparseableInput?: string }>(call: T): T {
   return call.unparseableInput !== undefined && markedInputRefusal(call) === undefined ? { ...call, input: {} } : call;
 }
