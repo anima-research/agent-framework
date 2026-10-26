@@ -1910,12 +1910,14 @@ test('a group the host opened, which the manifest then declares, is no longer op
     if (msg.method === 'mcpl/manifest') { peer.reply(msg.id, { version: '0.5', pushEvents: true, ...advert }); return true; }
     return false;
   });
-  const manifests = () => t.methods().filter((m) => m === 'mcpl/manifest').length;
+  const count = (method: string) => t.methods().filter((m) => m === method).length;
+  // A manifest change is applied once the host asks for the tool list it rebuilds after it, which
+  // comes after the fetch (held back to one per five seconds) and its feature-set update.
   const changeManifest = async (next: Json) => {
-    const n = manifests();
+    const [manifests, lists] = [count('mcpl/manifest'), count('tools/list')];
     advert = next;
-    t.server.peer.notify('mcpl/manifestChanged', { revision: `r${n + 2}`, domains: ['toolsets'] });
-    await waitFor(() => manifests() > n, 'the manifest fetched again');
+    t.server.peer.notify('mcpl/manifestChanged', { revision: `r${manifests + 2}`, domains: ['toolsets'] });
+    await waitFor(() => count('mcpl/manifest') > manifests && count('tools/list') > lists, 'the manifest fetched again and applied');
     await roundTrip(t);
   };
   try {
