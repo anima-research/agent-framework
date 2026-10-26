@@ -10416,7 +10416,7 @@ export class AgentFramework {
    * Mark an inference refusal visibly: react on the message that holds the
    * refused agent's conversational locus (the most recent incoming channel
    * message that isn't a reaction, reaction removal, edit or deletion
-   * marker, apart from an edit the coalescer delivers on acceptance as the
+   * marker or a chat:system notice, apart from an edit the coalescer delivers on acceptance as the
    * agent's first view; an ephemeral run has none, so a subagent's refusal
    * marks no message) with a category-specific emoji. Best-effort —
    * failures are logged, never thrown, and non-Discord loci are silently
@@ -15648,7 +15648,10 @@ export class AgentFramework {
         channelId, ...(channelId !== undefined ? { channelServerId: occ.serverId } : {}),
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
-        ...systemNoticeMark(occ.tags),
+        // No systemNotice mark here: a render folds the batch's every
+        // occurrence, and only its latest's tags are at hand, so marking it
+        // would hide a folded message's channel whenever a notice came last.
+        // A batch of notices alone names its channel, as before rev 3.
         // A render folds the batch's every notice, so it asks nothing of the
         // agent only when each of them was marked ambient, not the latest
         // alone; only its wake is judged by what was read (readsDeferredWrite).
@@ -16306,9 +16309,14 @@ export class AgentFramework {
       // wake is marked ambient when its message's server tagged it
       // chat:ambient, or for a render, every notice the render stands for:
       // such a message asked nothing of the agent, so reading it was all its
-      // wake was for. One with neither tag is judged as addressed.
+      // wake was for, as for a chat:system notice. One with neither tag is
+      // judged as addressed.
       const read = requests.filter((r) => {
-        const to = r.channelId === undefined || r.ambient === true ? undefined : { serverId: r.source, channelId: r.channelId };
+        // A chat:system notice asks nothing either, ambient or not, and no
+        // speech is routed by it, so waiting for one in its channel would
+        // keep its wake forever.
+        const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
+          ? undefined : { serverId: r.source, channelId: r.channelId };
         return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to)
           : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to);
       });

@@ -65,10 +65,11 @@ export function isSystemNotice(tags: unknown): boolean {
 
 /**
  * Expand a raw tag list over the normative core closure, then resolve the
- * §16.3 mutual exclusions: `chat:addressed` cannot stand with `chat:ambient`
- * or `chat:system` after expansion, and addressed wins — a message that is
- * both specifically-to-you and background noise is specifically-to-you, and
- * something directed at the agent is not a notice, whoever sent it.
+ * §16.2 mutual exclusion: `chat:addressed` and `chat:ambient` cannot both
+ * stand after expansion, and addressed wins — a message that is both
+ * specifically-to-you and background noise is specifically-to-you.
+ * `chat:system` is another facet (kind, not addressing) and stands beside
+ * either: a pin in a DM is addressed by its place and still a notice.
  *
  * Pure; input order is preserved for the tags that survive, with implied
  * tags appended in first-cause order. Unknown and producer-namespaced tags
@@ -88,11 +89,9 @@ export function expandCoreTags(tags: readonly string[] | undefined): string[] {
     add(t);
     for (const implied of CORE_IMPLIES[t] ?? []) add(implied);
   }
-  if (seen.has('chat:addressed')) {
-    for (const excluded of ['chat:ambient', 'chat:system']) {
-      const i = out.indexOf(excluded);
-      if (i >= 0) out.splice(i, 1);
-    }
+  if (seen.has('chat:addressed') && seen.has('chat:ambient')) {
+    const i = out.indexOf('chat:ambient');
+    if (i >= 0) out.splice(i, 1);
   }
   return out;
 }

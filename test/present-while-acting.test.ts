@@ -2707,7 +2707,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+  for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted', 'chat:system']) {
     it(`a ${tag} marker injected mid-turn does not clear send suppression (#157)`, async () => {
       // Edits, deletions and reaction removals (RFC-001 core tags, delivered
       // as synthetic incoming messages by e.g. zulip_mcp#23) are markers

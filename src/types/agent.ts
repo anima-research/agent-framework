@@ -629,7 +629,8 @@ export interface InferenceRequest {
    * a join or the weather changing, not something anyone said. Such a wake
    * names no channel for its turn's plain speech, though it carries
    * `channelId`: a turn it starts alone resolves its locus as a heartbeat's
-   * does.
+   * does. Like an ambient one, a wake to read it is done once read. Never
+   * set on a coalesced render's wake, which may fold messages too.
    */
   systemNotice?: true;
   /**

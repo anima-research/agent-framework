@@ -1117,7 +1117,7 @@ test('non-conversational markers do not retarget the default publish locus (#157
   assert.equal(last?.threadId, undefined, 'and takes no thread from the one before it');
 });
 
-test('a world notice (chat:ambient + chat:system) leaves the default publish locus where the conversation is; one that names the agent does not (RFC-001 rev 3)', async () => {
+test('a chat:system notice leaves the default publish locus where the conversation is, ambient or addressed by its place (RFC-001 rev 3)', async () => {
   // The weather line that took a resident's DM reply into a world: tagged
   // as overheard chatter, it became the most recent inbound message.
   const { registry } = makeRegistry(undefined);
@@ -1128,12 +1128,14 @@ test('a world notice (chat:ambient + chat:system) leaves the default publish loc
     ['chat:ambient', 'chat:system', 'eidoverse:weather']));
   assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
     'the forecast must not become where unaddressed speech goes');
-  // Addressed drops chat:system at expansion (§16.3): a notice that names
-  // the agent is spoken to it, and retargets like any message.
-  const named = incoming('world', '* someone waves at you', undefined, ['chat:system', 'chat:mention']);
-  named.messages[0]!.messageId = 'm-named';
-  registry.handleIncoming('discord', named);
-  assert.deepEqual(registry.getDefaultPublishChannel(), discord('world'));
+  // A notice addressed by its place (a pin in a DM: chat:dm ⇒ addressed)
+  // is still a notice: kind and addressing are separate facets.
+  seedRegistered(registry, 'discord', 'dm');
+  const pin = incoming('dm', '[pinned a message]', undefined, ['chat:dm', 'chat:system']);
+  pin.messages[0]!.messageId = 'm-pin';
+  registry.handleIncoming('discord', pin);
+  assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
+    'a notice in a DM steers nothing either');
 });
 
 test('a marker on a NEVER-conversed channel leaves the locus null, not marker-anchored (#157)', async () => {

@@ -37,12 +37,14 @@ describe('chat:system tag rules', () => {
       ['chat:ambient', 'chat:system', 'eidoverse:weather']);
   });
 
-  it('chat:addressed drops chat:system, as it drops chat:ambient — directly or by closure', () => {
-    assert.deepEqual(expandCoreTags(['chat:system', 'chat:addressed']), ['chat:addressed']);
-    assert.deepEqual(expandCoreTags(['chat:system', 'chat:ambient', 'chat:mention']), ['chat:mention', 'chat:addressed']);
-    assert.deepEqual(expandCoreTags(['chat:dm', 'chat:system']), ['chat:dm', 'chat:addressed', 'chat:private']);
-    assert.equal(isMarkerTagged(expandCoreTags(['chat:system', 'chat:mention']), false), false,
-      'a notice that names the agent is spoken to it');
+  it('chat:system is its own facet: addressing leaves it standing, so a notice in a DM is still a notice', () => {
+    // chat:dm ⇒ chat:addressed by place: a pin in a DM is addressed and
+    // still nobody's speech.
+    const pinInDm = expandCoreTags(['chat:dm', 'chat:system']);
+    assert.deepEqual(pinInDm, ['chat:dm', 'chat:addressed', 'chat:private', 'chat:system']);
+    assert.equal(isMarkerTagged(pinInDm, false), true, 'it still steers nothing');
+    assert.deepEqual(expandCoreTags(['chat:ambient', 'chat:system', 'chat:mention']), ['chat:system', 'chat:mention', 'chat:addressed'],
+      'addressed still drops ambient, and only ambient');
   });
 });
 
@@ -112,6 +114,26 @@ describe('chat:system wakes name no channel for the turn', () => {
     assert.equal(i.pendingRequests[0]!.systemNotice, true, 'the weather line is a notice');
     assert.equal(i.pendingRequests[0]!.channelId, 'world:commons', 'it still says where it came from');
     assert.equal(i.pendingRequests[1]!.systemNotice, undefined, 'overheard speech is not');
+    i.pendingRequests.length = 0;
+    await framework.stop();
+  });
+
+  it('the push lane marks a notice wake too', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework) as unknown as {
+      pendingRequests: InferenceRequest[];
+      handleMcplPushEvent(event: Record<string, unknown>): unknown;
+    };
+    const push = (tags: string[]) => i.handleMcplPushEvent({
+      type: 'mcpl:push-event', serverId: 'body', featureSet: 'body.home', eventId: `e-${Math.random()}`,
+      timestamp: new Date().toISOString(), content: [{ type: 'text', text: 'plugin synced' }],
+      origin: {}, tags, triggerInference: true,
+    });
+    await push(['chat:ambient', 'chat:system']);
+    await push(['chat:ambient']);
+    assert.equal(i.pendingRequests.length, 2);
+    assert.equal(i.pendingRequests[0]!.systemNotice, true);
+    assert.equal(i.pendingRequests[1]!.systemNotice, undefined);
     i.pendingRequests.length = 0;
     await framework.stop();
   });
