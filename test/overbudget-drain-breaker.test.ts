@@ -32,6 +32,7 @@ function makeHarness(tick: () => Promise<void>) {
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map();
   fw.overBudgetDrainInFlight = new Set();
+  fw.overBudgetDrains = new Set();
   fw.opsAlertLastSent = new Map();
   fw.pendingRequests = [];
   fw.traceListeners = [];

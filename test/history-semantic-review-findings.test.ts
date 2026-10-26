@@ -20,6 +20,15 @@ class FakeService {
   searchKs: number[] = [];
   /** When set, /delete answers this status instead of deleting. */
   deleteStatus: number | null = null;
+  /** When set, /delete answers 404 while the namespace holds nothing, as
+   *  /stats does, the way a service may answer for a namespace that doesn't
+   *  exist. */
+  deleteNeedsIndex = false;
+  /** When set, /stats answers 200 with JSON that isn't stats, as a page
+   *  shown while the service restarts may. */
+  statsNotStats = false;
+  /** When set, /upsert answers this status instead of indexing. */
+  upsertStatus: number | null = null;
   server!: Server;
   url = '';
   async start(): Promise<void> {
@@ -32,6 +41,7 @@ class FakeService {
         const json = (code: number, o: unknown): void => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
         if (!m) return json(404, {});
         if (m[2] === 'stats') {
+          if (this.statsNotStats) return json(200, { namespace: 'n' });
           if (this.items.size === 0) return json(404, { error: { message: 'no such namespace' } });
           const by: Record<string, { count: number; max_ts: null; min_ts: null; max_cursor: number | null }> = {};
           for (const it of this.items.values()) {
@@ -42,6 +52,7 @@ class FakeService {
           return json(200, { namespace: 'n', model: 'fake', dim: 1, count: this.items.size, by_kind: by });
         }
         if (m[2] === 'upsert') {
+          if (this.upsertStatus !== null) return json(this.upsertStatus, { error: { message: 'upsert failed' } });
           const items = (JSON.parse(body) as { items: Item[] }).items;
           let inserted = 0, unchanged = 0;
           for (const it of items) { if (this.items.get(it.id)?.text === it.text) unchanged++; else inserted++; this.items.set(it.id, it); }
@@ -49,6 +60,7 @@ class FakeService {
         }
         if (m[2] === 'delete') {
           if (this.deleteStatus !== null) return json(this.deleteStatus, { error: { message: 'delete failed' } });
+          if (this.deleteNeedsIndex && this.items.size === 0) return json(404, { error: { message: 'no such namespace' } });
           const ids = (JSON.parse(body) as { ids: string[] }).ids;
           let n = 0; for (const id of ids) if (this.items.delete(id)) n++;
           this.deleted.push(...ids);
@@ -94,7 +106,10 @@ class StubCm {
   }
   getSummariesInRange() { return this.summaries; }
   getMessage(id: string) { return this.messages.find((m) => m.id === id) ?? null; }
-  getSummary(id: string) { return this.summaries.find((s) => s.id === id) ?? null; }
+  getSummary(id: string) {
+    const s = this.summaries.find((x) => x.id === id);
+    return s ? { ...s, created: s.createdMs } : null;
+  }
   onMessage(l: Listener) { this.listeners.add(l); return () => this.listeners.delete(l); }
   edit(id: string, text: string) {
     const m = this.getMessage(id)!;
@@ -115,7 +130,7 @@ describe('semantic sync: Greptile #173 findings', () => {
   const svc = new FakeService();
   before(() => svc.start());
   after(() => svc.stop());
-  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; svc.deleteStatus = null; svc.searchKs.length = 0; });
+  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; svc.deleteStatus = null; svc.deleteNeedsIndex = false; svc.statsNotStats = false; svc.upsertStatus = null; svc.searchKs.length = 0; });
 
   function mod(cm: StubCm): HistoryModule {
     const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0 } });
@@ -148,7 +163,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     const m = mod(new StubCm(store, summaries));
     const r = await m.syncSemanticIndex(300)!;
     assert.equal(r.more, true);
-    assert.ok(svc.items.has('sum:s1'), 'summary indexed while the message backlog is still draining');
+    assert.ok(svc.items.has(`sum:s1@${T0 + 5}`), 'summary indexed while the message backlog is still draining');
     await m.stop();
   });
 
@@ -181,7 +196,8 @@ describe('semantic sync: Greptile #173 findings', () => {
     await m.stop();
   });
 
-  it('re-review #1: a failing /delete does not freeze indexing; the removal is retried on the next tick', async () => {
+  it('re-review #1: a failing /delete does not freeze indexing; the removal is retried on the next tick', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
     const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
     const m = mod(cm);
     await m.syncSemanticIndex();
@@ -191,25 +207,150 @@ describe('semantic sync: Greptile #173 findings', () => {
     await m.syncSemanticIndex();
     assert.ok(svc.items.has('msg:c'), 'new messages still index while /delete fails');
     assert.ok(svc.items.has('msg:a'));
+    assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
+      '[history/semantic] index "n": delete failed, 1 removal(s) re-queued: the semantic index service answered the '
+        + 'delete request with an error (HTTP 500: delete failed)',
+    ]);
     svc.deleteStatus = null;
     await m.syncSemanticIndex();
     assert.ok(!svc.items.has('msg:a'), 'the queued removal is retried once /delete works');
     await m.stop();
   });
 
-  it('re-review #1: a 404 from /delete (service without the route) drops the removals instead of retrying forever', async () => {
-    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+  it('re-review #1: a 404 from /delete (service without the route) drops the removals instead of retrying forever', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
+    const cm = new StubCm([
+      msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'),
+      msg('d', T0 + 3, 'fourth message'), msg('e', T0 + 4, 'fifth message'),
+    ]);
+    let state: unknown = null;
+    const ctx = { getState: () => state, setState: (v: unknown) => { state = v; } } as never;
+    const pending = () => (state as { semanticPending: { edited: string[]; removed: string[] } }).semanticPending;
     const m = mod(cm);
+    await m.start(ctx);
     await m.syncSemanticIndex();
     cm.remove('a');
+    cm.edit('b', '');
     cm.messages.push(msg('c', T0 + 2, 'a new message after the removal'));
     svc.deleteStatus = 404;
     await m.syncSemanticIndex();
     assert.ok(svc.items.has('msg:c'), 'new messages still index when /delete is missing');
+    assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
+      '[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 removal(s) and '
+        + '1 edit(s) down to nothing indexable. Later removals and edits down to nothing indexable are dropped too, '
+        + 'until the host restarts or binds the history module again: the semantic index service answered the delete '
+        + 'request with an error (HTTP 404: delete failed)',
+    ]);
     svc.calls.length = 0;
     svc.deleteStatus = null;
+    // A later removal is dropped as it comes, not queued.
+    cm.remove('c');
+    assert.deepEqual(pending().removed, []);
+    // A later edit down to nothing indexable makes no call and isn't kept,
+    // and an indexable edit still reaches the index.
+    cm.edit('d', '');
+    cm.edit('e', 'fifth message, reworded');
     await m.syncSemanticIndex();
-    assert.ok(!svc.calls.includes('delete'), `removal retried after a 404: ${JSON.stringify(svc.calls)}`);
+    assert.ok(!svc.calls.includes('delete'), `/delete called after the route was found missing: ${JSON.stringify(svc.calls)}`);
+    assert.deepEqual(pending(), { edited: [], removed: [] });
+    assert.equal(svc.items.get('msg:e')?.text, 'fifth message, reworded');
+    assert.equal(warned.mock.calls.length, 1);
+    await m.stop();
+  });
+
+  it('the route-missing warning names what its pass dropped: removals, edits down to nothing indexable, or both', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
+    const later = '. Later removals and edits down to nothing indexable are dropped too, until the host restarts or binds '
+      + 'the history module again: the semantic index service answered the delete request with an error (HTTP 404: '
+      + 'delete failed)';
+    // A pass whose delete held only a removal.
+    const cm1 = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+    const m1 = mod(cm1);
+    await m1.syncSemanticIndex();
+    svc.deleteStatus = 404;
+    cm1.remove('a');
+    await m1.syncSemanticIndex();
+    await m1.stop();
+    // A pass whose delete held only an edit down to nothing indexable.
+    svc.deleteStatus = null;
+    svc.items.clear();
+    const cm2 = new StubCm([msg('p', T0, 'first message'), msg('q', T0 + 1, 'second message')]);
+    const m2 = mod(cm2);
+    await m2.syncSemanticIndex();
+    svc.deleteStatus = 404;
+    cm2.edit('q', '');
+    await m2.syncSemanticIndex();
+    await m2.stop();
+    assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
+      `[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 removal(s)${later}`,
+      '[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 edit(s) down to '
+        + `nothing indexable${later}`,
+    ]);
+  });
+
+  it('a 404 from /delete in a pass whose /stats answered with something that isn\'t stats is re-queued, not read as a missing route', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
+    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'), msg('c', T0 + 2, 'third message')]);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    cm.remove('a');
+    cm.edit('b', '');
+    svc.statsNotStats = true;
+    svc.deleteStatus = 404;
+    svc.calls.length = 0;
+    await m.syncSemanticIndex();
+    assert.ok(svc.calls.includes('delete'), `a pass whose /stats wasn't 404 made no /delete call: ${JSON.stringify(svc.calls)}`);
+    assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
+      '[history/semantic] index "n": delete failed, 1 removal(s) and 1 edit(s) down to nothing indexable re-queued: the '
+        + 'semantic index service answered the delete request with an error (HTTP 404: delete failed)',
+    ]);
+    svc.statsNotStats = false;
+    svc.deleteStatus = null;
+    await m.syncSemanticIndex();
+    assert.deepEqual(svc.deleted, ['msg:a', 'msg:b']);
+    assert.ok(!svc.items.has('msg:a'));
+    assert.ok(!svc.items.has('msg:b'));
+    await m.stop();
+  });
+
+  it('a removal before this store\'s index is made is dropped without a call, and later removals still reach the index', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
+    svc.deleteNeedsIndex = true;
+    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'), msg('c', T0 + 2, 'third message')]);
+    const m = mod(cm);
+    // Before the first pass, while /stats answers 404: one message removed,
+    // and one edited down to nothing indexable.
+    cm.remove('a');
+    cm.edit('b', '');
+    await m.syncSemanticIndex();
+    // /stats answered 404, and no /delete was called.
+    assert.deepEqual(svc.calls, ['stats', 'upsert']);
+    assert.deepEqual([...svc.items.keys()], ['msg:c']);
+    // With the index made, a later removal reaches it, and only that one.
+    cm.remove('c');
+    await m.syncSemanticIndex();
+    assert.deepEqual(svc.deleted, ['msg:c']);
+    assert.equal(svc.items.size, 0);
+    assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), []);
+    await m.stop();
+  });
+
+  it('a failing re-upsert of an edit is logged under its index', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
+    const cm = new StubCm([msg('a', T0, 'first message')]);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    cm.edit('a', 'first message, reworded');
+    svc.upsertStatus = 503;
+    await m.syncSemanticIndex();
+    const lines = warned.mock.calls.map((c) => String(c.arguments[0]));
+    assert.ok(
+      lines.includes(
+        '[history/semantic] index "n": edit re-upsert failed, 1 edit(s) re-queued: the semantic index service answered '
+          + 'the upsert request with an error (HTTP 503: upsert failed)',
+      ),
+      JSON.stringify(lines),
+    );
     await m.stop();
   });
 
@@ -264,7 +405,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     const sums = [1, 2, 3].map((i) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T0, endMs: T0 + 1, firstSequence: 0, lastSequence: 1, createdMs: T0 + 5 }));
     const m = mod(new StubCm([], sums));
     for (let i = 0; i < 5; i++) await m.syncSemanticIndex(1);
-    assert.deepEqual([...svc.items.keys()].sort(), ['sum:s1', 'sum:s2', 'sum:s3']);
+    assert.deepEqual([...svc.items.keys()].sort(), [1, 2, 3].map((i) => `sum:s${i}@${T0 + 5}`));
     await m.stop();
   });
 
@@ -329,6 +470,45 @@ describe('semantic sync: Greptile #173 findings', () => {
     assert.ok(hit, 'the message is still a hit');
     assert.ok(!hit.snippet.includes('SECRET'), `stale snippet served: ${hit.snippet}`);
     assert.equal(hit.snippet, 'public part.');
+    await m.stop();
+  });
+
+  it("a hit's snippet keeps up to 400 units of its text, one fewer where the 400th would split a surrogate pair", async () => {
+    // One code point, two UTF-16 units, so after the "x" the 400th unit is the first half of the 200th of them.
+    const grin = '\u{1F600}';
+    const cm = new StubCm([msg('e', T0, `x${grin.repeat(250)}`)]);
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+    m.bind(cm as unknown as ContextManager);
+    await m.syncSemanticIndex();
+    const res = await m.handleToolCall({ id: 'c', name: 'semantic_search', input: { query: 'x' } });
+    const hit = (res.data as { hits: Array<{ id: string; snippet: string }> }).hits.find((h) => h.id === 'msg:e');
+    assert.ok(hit, 'the message is a hit');
+    assert.equal(hit.snippet, `x${grin.repeat(199)}…`);
+    await m.stop();
+  });
+
+  it("with maxChars at 400, a hit's snippet is its text cut there at a whole character", async () => {
+    // maxChars cuts the current text the snippet is built from. After the "x", the 400th unit is the first half of a pair.
+    const grin = '\u{1F600}';
+    const cm = new StubCm([msg('e', T0, `x${grin.repeat(250)}`)]);
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0, maxSyncBeforeSearch: 0, maxChars: 400 } });
+    m.bind(cm as unknown as ContextManager);
+    await m.syncSemanticIndex();
+    const res = await m.handleToolCall({ id: 'c', name: 'semantic_search', input: { query: 'x' } });
+    const hit = (res.data as { hits: Array<{ id: string; snippet: string }> }).hits.find((h) => h.id === 'msg:e');
+    assert.ok(hit, 'the message is a hit');
+    assert.equal(hit.snippet, `x${grin.repeat(199)}`);
+    await m.stop();
+  });
+
+  it("the text indexed is cut at maxChars at a whole character, a message's and a summary's", async () => {
+    const grin = '\u{1F600}';
+    const summary = { id: 's1', level: 1, content: `x${grin.repeat(250)}`, tokens: 3, startMs: T0, endMs: T0 + 1, firstSequence: 0, lastSequence: 1, createdMs: T0 + 5 };
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0, maxChars: 400 } });
+    m.bind(new StubCm([msg('e', T0, `x${grin.repeat(250)}`)], [summary]) as unknown as ContextManager);
+    await m.syncSemanticIndex();
+    assert.equal(svc.items.get('msg:e')?.text, `x${grin.repeat(199)}`);
+    assert.equal(svc.items.get(`sum:s1@${T0 + 5}`)?.text, `x${grin.repeat(199)}`);
     await m.stop();
   });
 

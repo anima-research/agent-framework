@@ -6,7 +6,7 @@
  * drive a real AgentFramework whose membrane answers with classified errors
  * carrying retryAfterMs.
  */
-import { describe, it, test } from 'node:test';
+import { describe, it, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,9 +15,10 @@ import { JsStore } from '@animalabs/chronicle';
 import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { AgentFramework, ApiServer } from '../src/index.js';
+import { AgentFramework, ApiServer, ProviderWaitNotSleptError } from '../src/index.js';
 import { ProviderWaits, waitDeadline, PROVIDER_WAIT_RECORD_TYPE } from '../src/provider-waits.js';
-import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { forkAgentName } from '../src/mcpl/conversation-router.js';
 
 function withStoreDir<T>(fn: (path: string) => Promise<T> | T): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), 'provider-waits-'));
@@ -640,6 +641,25 @@ async function framework(path: string, membrane: WaitingMembrane) {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** A stated wait ends at a `Date.now()` time, and these tests check that it
+ *  binds after steps that take real time, which a loaded host can stretch
+ *  past it. `holdClock` holds `Date` still from here on: call it before the
+ *  framework is built, since ProviderWaits takes `Date.now` then, and the
+ *  framework reads `Date.now()` at each hold and release. The hold's own
+ *  timers stay real. `outlast(wait)` lets real time pass the wait while the
+ *  clock stays inside it, the condition load makes, so a test fails there
+ *  unless the clock is held; `pass(wait)` then moves the clock past it, and
+ *  `advance(ms)` moves it by less, for what is timed inside the wait. */
+function holdClock(t: TestContext) {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  return {
+    outlast: (waitMs: number) => sleep(waitMs + 100),
+    pass: (waitMs: number) => t.mock.timers.tick(waitMs + 1),
+    advance: (ms: number) => t.mock.timers.tick(ms),
+  };
+}
+
 const auxRequest = (model: string) => ({
   messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-compress' }] }],
   config: { model, maxTokens: 16 },
@@ -652,10 +672,12 @@ function silence() {
   return { lines, restore: () => { console.error = orig; } };
 }
 
-test('a primary 429 with retry-after holds the turn, without a failure marker, and resumes once after it', async () => {
+test('a primary 429 with retry-after holds the turn, without a failure marker, and resumes once after it', async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
     const log = silence();
-    const membrane = new WaitingMembrane(1, 400);
+    const membrane = new WaitingMembrane(1, wait);
     const { fw, internal } = await framework(path, membrane);
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
@@ -665,10 +687,21 @@ test('a primary 429 with retry-after holds the turn, without a failure marker, a
       const health = fw.healthSnapshot() as { agents: Array<{ providerAdmission: { providerWaits: Array<{ model: string; until: string | null }> } }> };
       assert.equal(health.agents[0].providerAdmission.providerWaits[0].model, 'zz-model');
 
+      // Real time passes the wait before the next message arrives, as on a
+      // loaded host; the clock stays inside it, and so the hold stands.
+      await clock.outlast(wait);
+      assert.ok(internal.providerAccelerationCooldowns.has('resident'), 'the hold stands while the clock is inside the wait');
+      // A real clock stamps the arrival after the failed turn. Under the held
+      // one they would share a timestamp, and the hold would keep them as one
+      // request (sameInferenceRequest compares timestamps).
+      clock.advance(1);
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-arrived while waiting', metadata: {} });
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'an arrival during the wait is held, not inferred');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the hold keeps the failed turn and the arrival');
 
+      // The wait passes, and the hold's timer, a real one, releases the turn.
+      clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 2, 'the fresh compile after the wait');
       assert.equal(membrane.primary, 2, 'one fresh compile after the wait');
       const text = membrane.calls[1].messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join('\n');
@@ -885,7 +918,7 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
   await withStoreDir(async (path) => {
     const log = silence();
     const { fw } = await framework(path, new WaitingMembrane(0, undefined));
-    const stepping = fw as unknown as { waitForRetry(ms: number): Promise<void> };
+    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }): Promise<void> };
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const mocked = globalThis.setTimeout;
     const delays: number[] = [];
@@ -895,7 +928,7 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
     }) as unknown as typeof setTimeout;
     try {
       let done = false;
-      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000).then(() => { done = true; });
+      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }).then(() => { done = true; });
       t.mock.timers.tick(ONE_TIMER_MS);
       for (let i = 0; i < 20; i++) await Promise.resolve();
       assert.equal(done, false, "still waiting after one timer's worth");
@@ -978,13 +1011,13 @@ test('stop() cancels a retry wait on the path that does not own provider admissi
       },
     });
     const internal = fw as unknown as {
-      conversationAgentHomes: Map<string, string>;
+      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
       retryWaitWakers: Set<unknown>;
       startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
     };
     let stopped = false;
     try {
-      internal.conversationAgentHomes.set('resident', 'world:zz');
+      internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       const run = internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       for (let i = 0; i < 300 && internal.retryWaitWakers.size === 0; i++) await sleep(10);
@@ -1006,13 +1039,15 @@ test('stop() cancels a retry wait on the path that does not own provider admissi
 // Corrective round (room-225 #46189, #46418, #46371).
 // ---------------------------------------------------------------------------
 
-test('a non-retryable failure with a stated wait keeps its terminal disposition; the wait binds the calls after it', async () => {
+test('a non-retryable failure with a stated wait keeps its terminal disposition; the wait binds the calls after it', async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
     const log = silence();
-    const membrane = new WaitingMembrane(1, 400);
+    const membrane = new WaitingMembrane(1, wait);
     // The first primary call is refused outright (not retryable), with a hint.
     const refuse = (request: NormalizedRequest) => new MembraneError({
-      type: 'invalid_request', retryable: false, httpStatus: 400, retryAfterMs: 400,
+      type: 'invalid_request', retryable: false, httpStatus: 400, retryAfterMs: wait,
       message: 'zz request refused', rawError: { status: 400 }, rawRequest: request,
     });
     const stream = membrane.streamYielding.bind(membrane);
@@ -1030,18 +1065,25 @@ test('a non-retryable failure with a stated wait keeps its terminal disposition;
       assert.equal(markers().length, 1, 'the failure is terminal: its marker is written');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0, 0, 'the failed request is not retained for retry');
 
+      // Real time passes the wait before the later wake, as on a loaded host.
+      await clock.outlast(wait);
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the wait', metadata: {} });
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'a later wake is held by the stated wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the wake');
 
+      // The wait passes, and the hold's timer, a real one, releases the wake.
+      clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 2, 'the held wake after the wait');
       assert.equal(membrane.primary, 2, 'and runs once after it');
     } finally { await fw.stop(); log.restore(); }
   });
 });
 
-test('a primary wake parked behind an auxiliary call is held by the wait that call\'s failure records', async () => {
+test('a primary wake parked behind an auxiliary call is held by the wait that call\'s failure records', async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
     const log = silence();
     let entered!: () => void;
     let fail!: (error: Error) => void;
@@ -1059,14 +1101,21 @@ test('a primary wake parked behind an auxiliary call is held by the wait that ca
       for (let i = 0; i < 300 && !((gates.get('resident')?.primaryDepth ?? 0) > 0); i++) await sleep(10);
       assert.ok((gates.get('resident')?.primaryDepth ?? 0) > 0, 'the primary wake parked behind the auxiliary call');
 
-      fail(rateLimited(400));
+      fail(rateLimited(wait));
       await aux;
       // The run started above drives the parked wake to the boundary.
       for (let i = 0; i < 500 && !log.lines.some((line) => /binds at admission/.test(line)); i++) await sleep(10);
       assert.ok(log.lines.some((line) => /binds at admission/.test(line)), 'the parked wake reached the boundary');
       assert.equal(membrane.primary, 0, 'not started into the wait its parked-behind call recorded');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the wake');
+
+      // Real time passes the wait, as on a loaded host, and the wake stays held.
+      await clock.outlast(wait);
+      assert.equal(membrane.primary, 0, 'still held while the clock is inside the wait');
+      assert.ok(internal.providerAccelerationCooldowns.has('resident'), 'the hold stands');
 
       // The hold's timer releases it after the wait, and queues the wake again.
+      clock.pass(wait);
       for (let i = 0; i < 500 && internal.providerAccelerationCooldowns.has('resident'); i++) await sleep(10);
       assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold ended with the wait');
       await run;
@@ -1162,13 +1211,15 @@ test('an auxiliary call naming no model is held by the unreadable-records hold, 
   });
 });
 
-test("once the records read again, a hold takes the recorded wait's deadline: it neither stays indefinite nor ends early", async () => {
+test("once the records read again, a hold takes the recorded wait's deadline: it neither stays indefinite nor ends early", async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 900;
     const log = silence();
     const membrane = new WaitingMembrane(0, undefined);
     const { fw, internal } = await framework(path, membrane);
     try {
-      const recorded = internal.providerWaits.set('resident', 'zz-model', 900, 'zz recorded before the reads failed').wait;
+      const recorded = internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded before the reads failed').wait;
       const fail = unreadableWaits(internal);
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
@@ -1176,11 +1227,21 @@ test("once the records read again, a hold takes the recorded wait's deadline: it
 
       await sleep(100);
       fail.read = false;
+      // The records are read again once their retry interval (50 ms, in
+      // unreadableWaits) has passed on the clock too, well inside the wait.
+      clock.advance(50);
       await sleep(200);
       await fw.runUntilIdle();
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, recorded.until, 'the recorded deadline, not the stand-in');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
       assert.equal(membrane.primary, 0, 'and not before it');
 
+      // Real time passes the wait, as on a loaded host, and the turn stays held.
+      await clock.outlast(wait);
+      assert.ok(internal.providerAccelerationCooldowns.has('resident'), 'the hold stands while the clock is inside the wait');
+      assert.equal(membrane.primary, 0, 'still held while the clock is inside the wait');
+
+      clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 1, 'the held turn after that wait');
       assert.equal(membrane.primary, 1, 'the held turn runs once that wait passes');
     } finally { await fw.stop(); log.restore(); }
@@ -1193,8 +1254,9 @@ const accelerationLimited = (retryAfterMs: number, request: NormalizedRequest) =
   rawError: { status: 429 }, rawRequest: request,
 });
 
-test("releasing the stated wait of an organization-acceleration hold leaves AF's own pacing; another model's release leaves the hold", async () => {
+test("releasing the stated wait of an organization-acceleration hold leaves AF's own pacing; another model's release leaves the hold", async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
     const log = silence();
     const twentyMinutes = 20 * 60_000;
     const membrane = new WaitingMembrane(0, undefined);
@@ -1217,6 +1279,9 @@ test("releasing the stated wait of an organization-acceleration hold leaves AF's
       const statedUntil = hold.until;
       assert.ok(statedUntil >= before + twentyMinutes, 'its length is the stated wait');
 
+      // The operator releases 400 ms after the failure, so pacing restarted
+      // at the release would end past the failure's own.
+      clock.advance(400);
       const other = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-other', requesterName: 'zz-operator' });
       assert.equal(other.ok, true);
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, statedUntil, "another model's release leaves the hold");
@@ -1226,9 +1291,12 @@ test("releasing the stated wait of an organization-acceleration hold leaves AF's
       const paced = internal.providerAccelerationCooldowns.get('resident');
       assert.ok(paced, "AF's own pacing for the failure still holds");
       assert.ok(paced.until >= before + 1_000 && paced.until <= armedBy + 1_000, `held to AF's own pacing (${paced.until - before} ms after the failure)`);
+      // Real time passes that pacing, as on a loaded host, while the clock stays inside it.
+      await clock.outlast(1_000);
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'not before that pacing passes');
 
+      clock.pass(1_000);
       await waitFor(fw, () => membrane.primary >= 2, 'the held turn after that pacing');
       assert.equal(membrane.primary, 2, 'the held turn runs once it has');
     } finally { await fw.stop(); log.restore(); }
@@ -1563,7 +1631,7 @@ class FailingAt extends WaitingMembrane {
 }
 
 type NonOwning = Internal & {
-  conversationAgentHomes: Map<string, string>;
+  conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
   retryWaitWakers: Set<() => void>;
   pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
   startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
@@ -1584,11 +1652,12 @@ function drive(fw: AgentFramework): Promise<void> {
 
 /** Poll for `done`, driving the framework, with time only as an outer bound:
  *  a turn asleep in a retry wait keeps the drive busy, and that must fail the
- *  test, not hang it. */
+ *  test, not hang it. The bound runs on performance.now(), which a test that
+ *  holds Date still doesn't hold. */
 async function waitFor(fw: AgentFramework, done: () => boolean, what: string, boundMs = 5_000): Promise<void> {
-  const deadline = Date.now() + boundMs;
+  const deadline = performance.now() + boundMs;
   while (!done()) {
-    const left = deadline - Date.now();
+    const left = deadline - performance.now();
     if (left <= 0) throw new Error(`zz-timeout: ${what} did not happen within ${boundMs} ms`);
     // Not awaited: the poll's own sleep lets timers run (a drive with nothing
     // to do settles in microtasks, which would starve them).
@@ -1598,16 +1667,18 @@ async function waitFor(fw: AgentFramework, done: () => boolean, what: string, bo
 }
 
 async function conversationTurn(fw: AgentFramework, internal: NonOwning, text: string): Promise<void> {
-  internal.conversationAgentHomes.set('resident', 'world:zz');
+  internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
   fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text }]);
   await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
 }
 
 for (const site of ['stream', 'setup', 'throw'] as const) {
-  test(`a conversation agent treats a stated wait as a resident does (${site}): recorded, held without a retry in the turn, resumed once after it`, async () => {
+  test(`a conversation agent treats a stated wait as a resident does (${site}): recorded, held without a retry in the turn, resumed once after it`, async (t) => {
     await withStoreDir(async (path) => {
+      const clock = holdClock(t);
+      const wait = 400;
       const log = silence();
-      const membrane = new FailingAt(1, site, () => rateLimited(400));
+      const membrane = new FailingAt(1, site, () => rateLimited(wait));
       const { fw, internal } = await framework(path, membrane);
       const nonOwning = internal as NonOwning;
       const exhausted: unknown[] = [];
@@ -1616,11 +1687,18 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
         await conversationTurn(fw, nonOwning, 'zz-first');
         await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
         assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model');
+        assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
         assert.equal(membrane.primary, 1, 'no retry slept inside the turn');
-        assert.deepEqual(fw.providerWaitSnapshot('resident').map((wait) => wait.model), ['zz-model'], 'the wait is recorded');
+        assert.deepEqual(fw.providerWaitSnapshot('resident').map((stated) => stated.model), ['zz-model'], 'the wait is recorded');
         await drive(fw);
         assert.deepEqual(exhausted, [], 'a held turn is not settled as exhausted');
 
+        // Real time passes the wait, as on a loaded host, and the turn stays held.
+        await clock.outlast(wait);
+        assert.ok(internal.providerAccelerationCooldowns.has('resident'), 'the hold stands while the clock is inside the wait');
+        assert.equal(membrane.primary, 1, 'still held while the clock is inside the wait');
+
+        clock.pass(wait);
         await waitFor(fw, () => membrane.primary >= 2, 'the fresh compile after the wait');
         assert.equal(membrane.primary, 2, 'exactly one');
         assert.match(membrane.calls[1].messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join('\n'), /zz-first/);
@@ -1651,11 +1729,13 @@ test("a conversation agent's stated wait past an hour raises one ops alert and h
   });
 });
 
-test("a conversation agent's non-retryable failure that states a wait records it and isn't held; the wait holds the wake after it", async () => {
+test("a conversation agent's non-retryable failure that states a wait records it and isn't held; the wait holds the wake after it", async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
     const log = silence();
     const refused = () => new MembraneError({
-      type: 'rate_limit', retryable: false, httpStatus: 429, retryAfterMs: 400,
+      type: 'rate_limit', retryable: false, httpStatus: 429, retryAfterMs: wait,
       message: 'zz refused, with a hint', rawError: { status: 429 },
     });
     const membrane = new FailingAt(1, 'stream', refused);
@@ -1668,30 +1748,42 @@ test("a conversation agent's non-retryable failure that states a wait records it
       assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'a terminal failure is not held');
       assert.equal(membrane.primary, 1, 'nor retried');
 
+      // Real time passes the wait before the next wake, as on a loaded host.
+      await clock.outlast(wait);
       nonOwning.pendingRequests.push({ agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       await drive(fw);
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the next wake is held by the recorded wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the wake');
       assert.equal(membrane.primary, 1);
+      clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 2, 'the held wake after the wait');
     } finally { await fw.stop(); log.restore(); }
   });
 });
 
-test('a conversation agent closed during a stated-wait hold takes the hold with it: nothing is requeued for it past the deadline', async () => {
+test('a conversation agent closed during a stated-wait hold takes the hold with it: nothing is requeued for it past the deadline', async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
     const log = silence();
-    const membrane = new FailingAt(1, 'stream', () => rateLimited(400));
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(wait));
     const { fw, internal } = await framework(path, membrane);
     const nonOwning = internal as NonOwning;
     try {
       await conversationTurn(fw, nonOwning, 'zz-first');
+      // Real time passes the wait before the test looks for the hold, as on
+      // a loaded host; the clock stays inside it, so the hold is there.
+      await clock.outlast(wait);
       await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
-      const until = internal.providerAccelerationCooldowns.get('resident')!.until;
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
       nonOwning.disposeConversationAgent('resident');
       assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold goes with the agent');
 
-      // Past the moment its timer would have released it, plus a few turns.
-      while (Date.now() <= until + 50) await sleep(25);
+      // Past the moment its timer would have released it, on both clocks,
+      // plus a few turns: the clock first, so a timer left behind fires past
+      // the deadline.
+      clock.pass(wait);
+      await clock.outlast(wait);
       await sleep(50);
       assert.deepEqual(nonOwning.pendingRequests.filter((r) => r.agentName === 'resident'), [], 'nothing requeued for an agent that is gone');
       assert.equal(membrane.primary, 1);
@@ -1699,8 +1791,13 @@ test('a conversation agent closed during a stated-wait hold takes the hold with 
   });
 });
 
-test("a conversation agent's retry is held at the last boundary by a wait recorded while it slept", async () => {
+test("a conversation agent's retry is held at the last boundary by a wait recorded while it slept", async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    // Shorter than the retry's 1 s sleep, so real time passes the wait
+    // before the retry reaches its boundary, as load can; the clock stays
+    // inside it.
+    const wait = 400;
     const log = silence();
     // A failure with no stated wait: the error policy retries after 1 s.
     const flaky = () => new MembraneError({
@@ -1715,12 +1812,14 @@ test("a conversation agent's retry is held at the last boundary by a wait record
       await waitFor(fw, () => nonOwning.retryWaitWakers.size > 0, 'the turn asleep before its retry');
       // While the turn sleeps before its retry, a wait is recorded for its
       // model, as its own compression call's stated wait would be.
-      internal.providerWaits.set('resident', 'zz-model', 2_500, 'zz recorded while the turn slept');
+      internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the turn slept');
       await waitFor(fw, () => membrane.primary >= 2 || internal.providerAccelerationCooldowns.has('resident'),
         'the retry, sent or held');
       assert.equal(membrane.primary, 1, 'the retry is not sent inside the wait');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the retry is held by the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the retry');
 
+      clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the wait');
       assert.equal(membrane.primary, 2, 'exactly one call after the wait');
     } finally { await fw.stop(); log.restore(); }
@@ -1728,8 +1827,11 @@ test("a conversation agent's retry is held at the last boundary by a wait record
 });
 
 for (const who of ['resident', 'conversation agent'] as const) {
-  test(`a ${who}'s retry held at the last boundary leaves no inference open at the event gate`, async () => {
+  test(`a ${who}'s retry held at the last boundary leaves no inference open at the event gate`, async (t) => {
     await withStoreDir(async (path) => {
+      holdClock(t);
+      // Shorter than the retry's 1 s sleep, as in the test above.
+      const wait = 400;
       const log = silence();
       // A setup failure with no stated wait: the error policy retries after 1 s.
       const flaky = () => new MembraneError({
@@ -1751,7 +1853,7 @@ for (const who of ['resident', 'conversation agent'] as const) {
           internal.pendingRequests.push({ agentName: 'resident', reason: 'test', source: 'test', timestamp: Date.now() });
         } else void conversationTurn(fw, internal, 'zz-first').catch(() => {});
         await waitFor(fw, () => internal.retryWaitWakers.size > 0, 'the turn asleep before its retry');
-        internal.providerWaits.set('resident', 'zz-model', 3_000, 'zz recorded while the turn slept');
+        internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the turn slept');
         await waitFor(fw, () => membrane.primary >= 2 || internal.providerAccelerationCooldowns.has('resident'),
           'the retry, sent or held');
         assert.equal(membrane.primary, 1, 'the retry is held, not sent');
@@ -1762,6 +1864,62 @@ for (const who of ['resident', 'conversation agent'] as const) {
     });
   });
 }
+
+test('a budget restart held at the last boundary is inferring at the event gate again when it runs after the wait', async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    // Shorter than the retry's 1 s sleep, as in the tests above: the held
+    // clock keeps it binding when the retry wakes, however late that is.
+    const wait = 400;
+    const log = silence();
+    // The restart's stream fails to start, with no stated wait, so the error
+    // policy retries it after 1 s. A wait recorded while it sleeps holds the
+    // retry at the last boundary, which ends its turn at the gate. Once the
+    // wait has passed, the hold queues the restart again, and it runs as a
+    // turn that resumes: like any turn that runs, it is inferring at the gate,
+    // so the gate buffers debounced batches until it ends instead of
+    // delivering them meanwhile. Its stream is held open to read that.
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    class FailsThenHeld extends FailingAt {
+      override streamYielding(request: NormalizedRequest): YieldingStream {
+        if (this.primary === 0) return super.streamYielding(request);
+        this.calls.push(request);
+        this.primary++;
+        return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'zz-resumed' }])]);
+      }
+    }
+    const membrane = new FailsThenHeld(1, 'setup', () => new MembraneError({
+      type: 'server', retryable: true, httpStatus: 500,
+      message: 'zz overloaded, no hint', rawError: { status: 500 },
+    }));
+    const fw = await AgentFramework.create({
+      storePath: path, membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      gate: { config: { policies: [], default: 'skip' } },
+    });
+    const internal = fw as unknown as NonOwning & { eventGate: { inferenceDiagnostics(): { inferring: string[] } } };
+    try {
+      fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-first' }]);
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+      await waitFor(fw, () => internal.retryWaitWakers.size > 0, 'the restart asleep before its retry');
+      internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the restart slept');
+      await waitFor(fw, () => membrane.primary >= 2 || internal.providerAccelerationCooldowns.has('resident'),
+        'the retry, sent or held');
+      assert.equal(membrane.primary, 1, 'the retry is held, not sent');
+      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, [], 'the hold ends the turn at the gate');
+
+      // The wait passes, and the hold's timer, a real one, queues the restart.
+      clock.pass(wait);
+      await waitFor(fw, () => membrane.primary >= 2, 'the restart after the wait');
+      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['resident'], 'the restart is inferring while it runs');
+      release();
+      await waitFor(fw, () => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the restart to end');
+      assert.equal(membrane.primary, 2, 'one call after the wait');
+    } finally { release(); await fw.stop(); log.restore(); }
+  });
+});
 
 /** A direct message on an MCPL channel: with conversation routing, it spawns
  *  a conversation agent (a fork of the template) for its channel. */
@@ -1794,7 +1952,7 @@ test("a conversation agent's compression is refused by its own recorded wait, an
     try {
       fw.pushEvent(directMessage('zz:D1', 'zz-hello'));
       await fw.runUntilIdle();
-      const fork = 'conversation-zz-D1-g1';
+      const fork = forkAgentName('conversation', 'zz-server', 'zz:D1', 1);
       const agent = fw.getAgent(fork);
       assert.ok(agent, 'the direct message spawned a conversation agent');
       const compression = (agent.getContextManager() as unknown as {
@@ -1840,6 +1998,10 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
         assert.ok('error' in outcome, 'the run ends with an error');
         assert.match(outcome.error.message, /zz rate limit reached/);
         assert.match(outcome.error.message, /the provider asked to wait 1200 s; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now/);
+        // Marked, so a host needn't read the words.
+        assert.ok(outcome.error instanceof ProviderWaitNotSleptError, 'the rejection is a ProviderWaitNotSleptError');
+        assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
+        assert.equal(outcome.error.retryAfterMs, 20 * 60_000, 'it carries the stated wait');
         await sleep(100);
         assert.equal(membrane.primary, 1, 'no retry before the provider\'s time');
         assert.deepEqual(fw.providerWaitSnapshot(`zz-ephemeral-long-${site}`), [], 'nothing recorded for a single-use name');
@@ -1848,9 +2010,11 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
   });
 }
 
+// Each ending's words as published: a host may match them (connectome-host
+// 0.10.2 does, one pattern per ending), so they don't change.
 for (const [stated, says] of [
-  [Number.NaN, /the provider's stated wait is not a number/],
-  [Number.POSITIVE_INFINITY, /the provider asked to wait longer than can be represented/],
+  [Number.NaN, /the provider's stated wait is not a number, and an ephemeral run sleeps only a stated wait of 600 s or less, so it ends now\)$/],
+  [Number.POSITIVE_INFINITY, /the provider asked to wait longer than can be represented; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now\)$/],
 ] as const) {
   test(`an ephemeral run whose stated wait can't be represented (${stated}) ends at once too`, async () => {
     await withStoreDir(async (path) => {
@@ -1861,11 +2025,58 @@ for (const [stated, says] of [
         const outcome = await ephemeralRun(fw, `zz-ephemeral-${stated}`);
         assert.ok('error' in outcome, 'the run ends with an error');
         assert.match(outcome.error.message, says);
+        assert.ok(outcome.error instanceof ProviderWaitNotSleptError);
+        assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
+        assert.ok(Object.is(outcome.error.retryAfterMs, stated), `it carries ${stated}, not ${outcome.error.retryAfterMs}`);
         assert.equal(membrane.primary, 1);
       } finally { await fw.stop(); log.restore(); }
     });
   });
 }
+
+for (const [label, failure] of [
+  ['refused', () => new MembraneError({
+    type: 'invalid_request', retryable: false, httpStatus: 400,
+    message: 'zz the request was refused', rawError: { status: 400 },
+  })],
+  // Not retryable, so its stated wait is no reason to wait: it ends as any failure does.
+  ['not retryable, with a long stated wait', () => new MembraneError({
+    type: 'invalid_request', retryable: false, httpStatus: 400, retryAfterMs: 20 * 60_000,
+    message: 'zz the request was refused', rawError: { status: 400 },
+  })],
+] as const) {
+  for (const site of ['stream', 'setup', 'throw'] as const) {
+    test(`an ephemeral run that fails for another reason isn't marked as a stated wait (${label}, ${site})`, async () => {
+      await withStoreDir(async (path) => {
+        const log = silence();
+        const membrane = new FailingAt(1, site, failure);
+        const { fw } = await framework(path, membrane);
+        try {
+          const outcome = await ephemeralRun(fw, `zz-ephemeral-refused-${site}`);
+          assert.ok('error' in outcome, 'the run ends with an error');
+          assert.match(outcome.error.message, /zz the request was refused/);
+          assert.doesNotMatch(outcome.error.message, /stated wait/);
+          assert.ok(!(outcome.error instanceof ProviderWaitNotSleptError), 'a plain error');
+          assert.equal(outcome.error.name, 'Error');
+        } finally { await fw.stop(); log.restore(); }
+      });
+    });
+  }
+}
+
+test('a stated wait just past the cap is named in whole seconds rounded up, past the cap', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(600_001));
+    const { fw } = await framework(path, membrane);
+    try {
+      const outcome = await ephemeralRun(fw, 'zz-ephemeral-just-past');
+      assert.ok('error' in outcome, 'the run ends with an error');
+      assert.match(outcome.error.message, /the provider asked to wait 601 s; an ephemeral run doesn't sleep a stated wait longer than 600 s/);
+      assert.equal((outcome.error as ProviderWaitNotSleptError).retryAfterMs, 600_001);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
 
 test('an ephemeral run sleeps a stated wait within the framework cap and retries', async () => {
   await withStoreDir(async (path) => {
@@ -1896,13 +2107,15 @@ class WaitDuringCompile extends WaitingMembrane {
   }
 }
 
-test("a conversation agent's turn is held, sending nothing, when its own wait is recorded while the turn compiles", async () => {
+test("a conversation agent's turn is held, sending nothing, when its own wait is recorded while the turn compiles", async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
     const log = silence();
     let record: (() => void) | undefined;
     const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; });
     const { fw, internal } = await framework(path, membrane);
-    record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
+    record = () => internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the turn compiled');
     const nonOwning = internal as NonOwning;
     const traces: Array<{ type: string; error?: string }> = [];
     fw.onTrace((event) => {
@@ -1913,12 +2126,45 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
       assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the turn is held, as at the boundary');
       assert.ok(log.lines.some((line) => /binds after the compile/.test(line)));
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
       // The turn started, so it ends with one terminal event, as a failure site's hold does.
-      assert.deepEqual(traces.map((t) => t.type), ['inference:started', 'inference:failed']);
+      assert.deepEqual(traces.map((trace) => trace.type), ['inference:started', 'inference:failed']);
       assert.match(traces[1]!.error!, /^Provider wait: zz-model is held for resident until .*; no call was made$/);
 
+      // Real time passes the wait, as on a loaded host, and the turn stays held.
+      await clock.outlast(wait);
+      assert.ok(internal.providerAccelerationCooldowns.has('resident'), 'the hold stands while the clock is inside the wait');
+      assert.equal(membrane.sent, 0, 'still held while the clock is inside the wait');
+
+      clock.pass(wait);
       await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
       assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a stop made while that hold is reported finds nothing to stop: abortInference() from a listener of its inference:failed reports false", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; });
+    const { fw, internal } = await framework(path, membrane);
+    record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
+    // The compiled stream is cancelled, and the start's window closed, before
+    // the hold is reported: a host's listener of that report finds no turn
+    // it could stop, rather than a stop it takes and the hold then loses.
+    let taken: boolean | undefined;
+    fw.onTrace((event) => {
+      if (event.type === 'inference:failed' && (event as { agentName?: string }).agentName === 'resident' && taken === undefined) {
+        taken = fw.abortInference('resident', 'user');
+      }
+    });
+    try {
+      await conversationTurn(fw, internal as NonOwning, 'zz-first');
+      assert.equal(taken, false, 'abortInference took no stop');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
     } finally { await fw.stop(); log.restore(); }
   });
 });
@@ -1976,7 +2222,7 @@ test("the last boundary holds no agent the framework no longer has: a disposed f
     const nonOwning = internal as NonOwning;
     try {
       const agent = fw.getAgent('resident')!;
-      nonOwning.conversationAgentHomes.set('resident', 'world:zz');
+      nonOwning.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
       internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz recorded for the fork');
       nonOwning.disposeConversationAgent('resident');
       // Its retry wakes after the disposal and reaches the boundary.
@@ -2014,19 +2260,32 @@ const foreignRateLimit = (retryAfterMs: unknown) => Object.assign(new Error('zz 
 });
 
 for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) {
-  test(`a 429 from another copy of membrane that states a wait is recorded, not slept in the turn (${who})`, async () => {
+  const outcome = who === 'ephemeral run' ? 'ends the run at once, marked' : 'is recorded, not slept in the turn';
+  test(`a 429 from another copy of membrane that states a wait ${outcome} (${who})`, async (t) => {
     await withStoreDir(async (path) => {
+      const clock = holdClock(t);
       const log = silence();
       // An ephemeral run doesn't record: a wait past its cap ends it at once.
       const stated = who === 'ephemeral run' ? 1_200_000 : 400;
       const membrane = new FailingAt(1, 'stream', () => foreignRateLimit(stated));
       const { fw, internal } = await framework(path, membrane);
       const nonOwning = internal as NonOwning;
+      // Left to the error policy, the stated wait would be slept in the turn.
+      // With the clock held, the retry after that sleep is held at its last
+      // boundary, so only the policy's calls tell the two apart.
+      const policy = (fw as unknown as { errorPolicy: { onInferenceError(error: Error, agentName: string, attempt: number): unknown } }).errorPolicy;
+      const decide = policy.onInferenceError.bind(policy);
+      const toPolicy: string[] = [];
+      policy.onInferenceError = (error, agentName, attempt) => { toPolicy.push(error.message); return decide(error, agentName, attempt); };
+      const heldAt = Date.now();
       try {
         if (who === 'ephemeral run') {
           const outcome = await ephemeralRun(fw, 'zz-ephemeral-foreign');
           assert.ok('error' in outcome, 'the run ends with an error');
           assert.match(outcome.error.message, /the provider asked to wait 1200 s/);
+          assert.ok(outcome.error instanceof ProviderWaitNotSleptError);
+          assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
+          assert.equal(outcome.error.retryAfterMs, 1_200_000);
           assert.equal(membrane.primary, 1, 'never retried inside the stated wait');
           return;
         }
@@ -2035,10 +2294,16 @@ for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) 
           await fw.runUntilIdle();
         } else {
           await conversationTurn(fw, nonOwning, 'zz-first');
+          // The turn's stream runs on after the start returns.
+          await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
         }
-        assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'the stated wait is recorded');
+        // Real time passes the wait, as on a loaded host, while the clock stays inside it.
+        await clock.outlast(stated);
+        assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => [w.model, w.until]), [['zz-model', new Date(heldAt + stated).toISOString()]], 'the stated wait is recorded');
         assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the turn is held by it');
         assert.equal(membrane.primary, 1, 'not retried inside the wait');
+        assert.deepEqual(toPolicy, [], 'never left to the error policy');
+        clock.pass(stated);
         await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the wait');
         assert.equal(membrane.primary, 2, 'run once after it');
       } finally { await fw.stop(); log.restore(); }

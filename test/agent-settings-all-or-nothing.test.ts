@@ -147,12 +147,15 @@ describe('agent_settings checks a call\'s settings before it applies any, and sa
         headTokens: 10_000, tailTokens: 30_000, middleTokens: 410_000, middleChunkCount: 7,
         deepestLevel: 3, resolutions: {}, moves: 0, producedCount: 0,
       });
-      const refused = call({ action: 'update', context_budget_tokens: 260_000, immediate: true, tool_result_guard: true });
+      const refused = call({
+        action: 'update', context_budget_tokens: 260_000, immediate: true, tool_result_guard: true, closed_channel_note: false,
+      });
       assert.equal(refused.isError, true);
       assert.match(refused.error!, /^\[budget-preflight\] contextBudgetTokens=260000 would NOT fit/);
       assert.match(refused.error!, / Nothing in this call was changed\.$/);
       const now = settings(call);
       assert.equal(now.tool_result_guard, false);
+      assert.equal(now.closed_channel_note, true);
       assert.equal(now.contextBudgetTokens, 550_000);
     });
   });

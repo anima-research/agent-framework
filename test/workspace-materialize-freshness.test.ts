@@ -137,7 +137,7 @@ test('syncing the path resolves the divergence in the disk direction; a full syn
   assert.ok(((still.data as MaterializeData).skipped ?? []).some((s) => s.reason.includes('script.sh')),
     'a full sync leaves the conflict for an explicit resolution');
   const read = await call(module, 'read', { path: 'work/script.sh' });
-  assert.match(String((read.data as { content: string }).content), /echo v2/, 'the workspace edit survives');
+  assert.match(String((read.structured as { content: string }).content), /echo v2/, 'the workspace edit survives');
 
   // The remedy the skip reason points at: sync this path to adopt the disk version.
   await call(module, 'sync', { path: 'work/script.sh' });

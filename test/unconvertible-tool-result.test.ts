@@ -14,6 +14,7 @@ import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { scriptCall } from './helpers/script-call.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function cyclic(): Record<string, unknown> {
@@ -42,6 +43,8 @@ const RESULTS: Record<string, () => unknown> = {
   errerror: () => ({ success: false, isError: true, error: new Error('db timeout') }),
   nullerror: () => ({ success: false, isError: true, error: null }),
   quietfail: () => ({ success: false, error: 'unknown channel: c1', isError: false }),
+  // An unflagged failure whose own text starts like an error.
+  prefixquiet: () => ({ success: false, error: 'Error: quota is fine', isError: false }),
   noresult: () => undefined,
   nullresult: () => null,
   arrayresult: () => [],
@@ -274,14 +277,57 @@ test('a script reads a quiet failure as its error text, and an unusable result a
   const { framework } = await setUp(t, []);
   // A script's call is answered through the event loop, so it has to run.
   framework.start();
-  const script = (tool: string) => (framework as unknown as {
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<string>;
-  }).handleScriptToolCall('assistant', `odd--${tool}`, {});
-  assert.equal(await within(script('quietfail'), 10_000, 'the call'), 'unknown channel: c1');
-  assert.equal(await within(script('nulldataquiet'), 10_000, 'the call'), 'gone');
-  assert.equal(await within(script('cyclic'), 10_000, 'the call'), `Error: ${unconvertible('cyclic', 'Converting circular structure to JSON')}`);
-  assert.equal(await within(script('getterthrows'), 10_000, 'the call'), `Error: ${unreadable('getterthrows', 'a value with no text form')}`);
+  const script = (tool: string) => scriptCall(framework, 'assistant', `odd--${tool}`, {});
+  const answer = (text: string, isError: boolean) => ({ refused: false, content: [{ type: 'text', text }], structuredContent: null, isError });
+  // A failure the tool doesn't flag reads as the model reads it, isError
+  // false: the script's isError follows the result's flag, not its text.
+  assert.deepEqual(await within(script('quietfail'), 10_000, 'the call'), answer('unknown channel: c1', false));
+  assert.deepEqual(await within(script('nulldataquiet'), 10_000, 'the call'), answer('gone', false));
+  // Text that only starts like an error isn't flagged as one: the flag is
+  // the result's, not the text's prefix.
+  assert.deepEqual(await within(script('prefixquiet'), 10_000, 'the call'), answer('Error: quota is fine', false));
+  assert.deepEqual(await within(script('cyclic'), 10_000, 'the call'), answer(unconvertible('cyclic', 'Converting circular structure to JSON'), true));
+  assert.deepEqual(await within(script('getterthrows'), 10_000, 'the call'), answer(unreadable('getterthrows', 'a value with no text form'), true));
   await within(framework.stop(), 10_000, 'stop()');
+});
+
+test("a result the script's serializer can't convert reaches the script as an error, flagged as one", async (t) => {
+  // The dispatch's own check (storableToolResult) turns such a result into an
+  // error first, so these returns are reached only past it: here, with the
+  // dispatch answering a cyclic result directly.
+  const { framework } = await setUp(t, []);
+  const internals = framework as unknown as { dispatchScriptToolCall: () => Promise<ToolResult> };
+  const reason = 'Converting circular structure to JSON';
+  const expectFailure = (answer: Awaited<ReturnType<typeof scriptCall>>) => {
+    assert.equal(answer.refused, false);
+    if (answer.refused) return;
+    assert.equal(answer.isError, true);
+    assert.equal(answer.structuredContent, null);
+    const text = (answer.content[0] as { text: string }).text;
+    assert.ok(text.startsWith("tool 'odd--cyclic' returned a result that can't be converted to JSON, so the script can't receive it"), text);
+    assert.ok(text.includes(reason), text);
+  };
+  internals.dispatchScriptToolCall = async () => ({ success: true, data: cyclic() });
+  expectFailure(await scriptCall(framework, 'assistant', 'odd--cyclic', {}));
+  internals.dispatchScriptToolCall = async () => ({ success: true, structured: cyclic() });
+  expectFailure(await scriptCall(framework, 'assistant', 'odd--cyclic', {}));
+  // The tool's own error, copied into the failure, is cut, so the failure fits any script's memory.
+  internals.dispatchScriptToolCall = async () => ({ success: false, isError: true, error: 'e'.repeat(100_000), structured: cyclic() });
+  const long = await scriptCall(framework, 'assistant', 'odd--cyclic', {});
+  expectFailure(long);
+  if (!long.refused) {
+    const text = (long.content[0] as { text: string }).text;
+    assert.ok(text.length < 20_000 && text.includes('characters dropped here'), String(text.length));
+  }
+  // So is the reason, as a serializer's error with a long message gives it.
+  internals.dispatchScriptToolCall = async () => ({ success: true, structured: { toJSON() { throw new Error('r'.repeat(100_000)); } } });
+  const reasoned = await scriptCall(framework, 'assistant', 'odd--cyclic', {});
+  assert.equal(reasoned.refused, false);
+  if (!reasoned.refused) {
+    const text = (reasoned.content[0] as { text: string }).text;
+    assert.ok(text.startsWith("tool 'odd--cyclic' returned a result that can't be converted to JSON"), text.slice(0, 200));
+    assert.ok(text.length < 20_000 && text.includes('characters dropped here'), String(text.length));
+  }
 });
 
 test("the read_image tool's own handler gets the same check", async (t) => {
@@ -378,6 +424,6 @@ test("the direct Agent API reads each field of its caller's result once", async 
   ];
   const built = (agent as unknown as { buildToolResultMessages(r: unknown[]): Array<{ content: Array<{ content: string }> }> })
     .buildToolResultMessages(results);
-  assert.deepEqual(built[0].content.map((block) => block.content), [JSON.stringify('the payload'), 'what failed']);
+  assert.deepEqual(built[0].content.map((block) => block.content), ['the payload', 'what failed']);
 });
 

@@ -27,12 +27,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 20
+          node-version: '22.12.0'
 
       # The same check `npm version` runs first (see CONTRIBUTING.md): an
       # open issue labelled release-hold stops the release. Both jobs that
-      # release need this one and check again themselves, so a held tag
-      # reaches neither npm nor the GitHub release notes. A dispatch on a
+      # release need this one and check again themselves, each when it
+      # runs, so a hold open at this check stops both. A dispatch on a
       # branch releases nothing, so it isn't held.
       - name: Release holds
         if: startsWith(github.ref, 'refs/tags/v')
@@ -49,13 +49,75 @@ jobs:
       - name: Build
         run: npm run build
 
+      # As many test files at once as the runner has cores, as ci.yml's
+      # Build & Test runs them, so a release's gate runs the suite as a pull
+      # request's did.
       - name: Test
-        run: npm test
+        run: |
+          AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length")
+          echo "cores: $AF_TEST_CONCURRENCY (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
+          export AF_TEST_CONCURRENCY
+          npm test
+
+  # The tarball npm publish makes from this tree, installed alone into an
+  # empty directory with its dependencies from npm (linked, so each package
+  # reaches only the dependencies it declares), and loaded under Node and
+  # under bun: a file missing from `files`, a dependency only
+  # devDependencies supplied, or a bin npm's link can't run fails here, not
+  # for whoever installs the release. A job of its own, so the install
+  # scripts it runs never see the publish job's id-token; publish needs it,
+  # the GitHub release notes don't. Dispatched on a branch, it runs too,
+  # and nothing is published. The job stops at 40 minutes, not at GitHub's
+  # 6 hours: above the check's own limits (10 minutes each for npm pack and
+  # npm install, a minute for each load), so the check names what hung.
+  pack-check:
+    name: Packed release installs on its own (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    # The engines floor and current LTS: the check's load hook goes in through
+    # register below Node 22.15 and through registerHooks from there, so each
+    # branch a host takes runs before a release.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', 24]
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      # As publish installs, so a build that came to need a dependency's
+      # install script fails here rather than in publish.
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      # npm publish builds again first, through prepublishOnly, from the
+      # same sources.
+      - name: Build
+        run: npm run build
+
+      # bun loads the package's `bun` export target, which Node never reads.
+      # 1.3.14 is the bun connectome-host's CI runs this package under.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Packed release installs on its own
+        run: node scripts/pack-installs-alone.mjs
 
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    needs: build-and-test
+    needs: [build-and-test, pack-check]
     if: startsWith(github.ref, 'refs/tags/v')
 
     # OIDC trusted publishing: GitHub mints a short-lived id-token, npm CLI
@@ -89,12 +151,19 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      # --ignore-scripts: this job holds the id-token, and neither the build
+      # nor npm publish needs a dependency's install script. The pack-check
+      # job's install of the packed release runs them, as an install from
+      # npm does, without the id-token.
       - name: Install dependencies
-        run: npm install
+        run: npm install --ignore-scripts
 
       - name: Build
         run: npm run build
 
+      # This publishes from the tree, not the tarball pack-check checked: npm
+      # skips a package's own lifecycle scripts for a tarball, so publishing
+      # one would also skip prepublishOnly's release-hold check.
       - name: Publish
         run: npm publish --access public --provenance
         env:
@@ -108,7 +177,10 @@ jobs:
     needs: build-and-test
     # Deliberately independent of the npm publish job: some consumers run
     # github-clone checkouts, and release notes must exist even when npm
-    # publish fails — the two jobs succeed or fail on their own.
+    # publish fails — the two jobs succeed or fail on their own. Both need
+    # the build job, so a failed build stops both; past it, so do a tag with
+    # no changelog section, which neither can release, and an open release
+    # hold, which each checks.
     if: startsWith(github.ref, 'refs/tags/v')
 
     # issues: read lets the release-hold check list the holds.
@@ -121,29 +193,31 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
       # Checked again here, as prepublishOnly checks it again in the
-      # publish job: a hold filed after the build job's check stops these
-      # notes as it stops the npm publish.
+      # publish job, each when its job reaches it: a hold filed after the
+      # build job's check stops whichever of the two checks after it. A
+      # hold filed between the two checks can stop one and not the other.
       - name: Release holds
         run: node scripts/release-holds.mjs
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # The notes are the tag's CHANGELOG.md section. GitHub refuses a
+      # release body over 125,000 characters, as it refused v0.22.3's (run
+      # 39167578309, HTTP 422), so the script cuts a section longer than
+      # 120,000 characters at an entry's start and closes with a link to the
+      # whole section at the tag. It fails the step for a tag with no
+      # section.
       - name: Mirror changelog section into release notes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          # Section header is '## X.Y.Z — YYYY-MM-DD'; match the version
-          # field exactly (string compare, no regex escaping needed).
-          awk -v ver="$ver" '
-            /^## / { if (in_section) exit; if ($2 == ver) { in_section = 1; next } }
-            in_section { print }
-          ' CHANGELOG.md | sed '/./,$!d' > notes.md
-          if ! [ -s notes.md ]; then
-            echo "::error::No CHANGELOG.md section found for ${ver}."
-            exit 1
-          fi
+          node scripts/release-notes.mjs "$GITHUB_REF_NAME" notes.md
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
           else

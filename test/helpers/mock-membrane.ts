@@ -35,6 +35,10 @@ export function createMockResponse(
     usage: { inputTokens: 10, outputTokens: 5 },
     details: {
       raw: {},
+      // membrane's type requires stop details and model information on
+      // every response, and the MCPL inference router reads both.
+      stop: { reason: stopReason, wasTruncated: false },
+      model: { requested: 'mock-model', actual: 'mock-model', provider: 'mock' },
     },
   } as unknown as NormalizedResponse;
 }
@@ -56,7 +60,12 @@ export class MockYieldingStream implements YieldingStream {
     { injectedMessages?: Array<{ participant?: string; content: unknown[] }> } | undefined
   > = [];
 
-  constructor(private responses: NormalizedResponse[]) {
+  /**
+   * @param supportsInjectedMessages what each tool-calls event declares, as
+   *   membrane does after 0.5.87 (true on its native path, false on its XML
+   *   prefill path); left out, the event doesn't say, as on 0.5.87.
+   */
+  constructor(private responses: NormalizedResponse[], private supportsInjectedMessages?: boolean) {
     this.processResponse(0);
   }
 
@@ -85,7 +94,11 @@ export class MockYieldingStream implements YieldingStream {
     }
 
     if (response.usage) {
-      this.events.push({ type: 'usage', usage: response.usage } as StreamEvent);
+      // A response may carry the round report its usage event closes
+      // (`round`, a test-only field), as membrane 0.6.0's yielding streams
+      // send it.
+      const round = (response as { round?: unknown }).round;
+      this.events.push({ type: 'usage', usage: response.usage, ...(round ? { round } : {}) } as StreamEvent);
     }
 
     if (response.toolCalls.length > 0) {
@@ -108,6 +121,9 @@ export class MockYieldingStream implements YieldingStream {
           // provider order — lets the framework store the assistant turn
           // verbatim and (≥0.5.72) route the round's prose live.
           roundContent: response.content,
+          ...(this.supportsInjectedMessages !== undefined
+            ? { supportsInjectedMessages: this.supportsInjectedMessages }
+            : {}),
         },
       } as StreamEvent);
     } else {
@@ -163,10 +179,28 @@ export class MockYieldingStream implements YieldingStream {
   }
 }
 
+/**
+ * A stream that yields nothing until `released` settles, cancel included: a
+ * stream whose teardown stop() has to wait for.
+ */
+export class HeldStream extends MockYieldingStream {
+  constructor(private readonly released: Promise<void>, responses: NormalizedResponse[]) {
+    super(responses);
+  }
+
+  override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+    await this.released;
+    const inner = super[Symbol.asyncIterator]();
+    for (let next = await inner.next(); !next.done; next = await inner.next()) yield next.value;
+  }
+}
+
 export class MockMembrane {
   responses: NormalizedResponse[] = [];
   calls: NormalizedRequest[] = [];
   lastStream: MockYieldingStream | null = null;
+  /** What the streams' tool-calls events declare (see MockYieldingStream). */
+  supportsInjectedMessages: boolean | undefined = undefined;
   private responseIndex = 0;
 
   pushResponse(response: NormalizedResponse): void {
@@ -181,11 +215,16 @@ export class MockMembrane {
     return this.responses[this.responseIndex++];
   }
 
+  /** The direct Agent API's call, recorded and answered as complete is. */
+  async stream(request: NormalizedRequest, _options?: unknown): Promise<NormalizedResponse> {
+    return this.complete(request);
+  }
+
   streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
     this.calls.push(request);
     const remaining = this.responses.slice(this.responseIndex);
     this.responseIndex = this.responses.length;
-    const stream = new MockYieldingStream(remaining);
+    const stream = new MockYieldingStream(remaining, this.supportsInjectedMessages);
     this.lastStream = stream;
     return stream;
   }

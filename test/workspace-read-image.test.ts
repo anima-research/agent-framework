@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -8,6 +8,7 @@ import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse as createStreamResponse } from './helpers/mock-membrane.js';
+import { changedAfterFstat, countingLoads } from './helpers/file-handle.js';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../src/types/module.js';
 import type { ProcessEvent, ToolCall, ToolResult } from '../src/types/events.js';
 
@@ -378,6 +379,17 @@ test('extension and user-visible name do not override magic-byte MIME detection'
   expectImageResult(result, 'work/mismatch.jpg', TINY_IMAGES.png);
 });
 
+test('an image that grows past maxFileSize after the open is refused without loading more than the limit and the byte after it', async (t) => {
+  const { mountDir, workspace } = setupWorkspace(t, { maxFileSize: 100 });
+  const path = join(mountDir, 'growing.png');
+  writeFileSync(path, TINY_IMAGES.png.bytes);
+  assert.ok(TINY_IMAGES.png.bytes.length <= 100, 'within the limit at the open');
+  const { result, loaded } = await countingLoads(() => changedAfterFstat(path, () => appendFileSync(path, Buffer.alloc(4096)),
+    () => callReadImage(workspace, 'work/growing.png')));
+  assert.equal(result.error, 'Image file exceeds max size (100 bytes): work/growing.png');
+  assert.ok(loaded <= 101, `loaded ${loaded} bytes: no more than the limit, and the one byte that shows the file goes on`);
+});
+
 test('unknown mount, mount root, directory, unknown/truncated/empty/oversize files fail closed', async (t) => {
   const { mountDir, workspace } = setupWorkspace(t, { maxFileSize: 16 });
   mkdirSync(join(mountDir, 'folder'));
@@ -432,7 +444,7 @@ test('lexical traversal and symlink escape fail without leaking absolute paths',
   const traversal = await callReadImage(workspace, 'work/../outside/outside.png');
   assert.equal(traversal.success, false);
   assert.equal(traversal.isError, true);
-  assert.equal(traversal.error, 'Path traversal detected: "work/../outside/outside.png" resolves outside mount "work"');
+  assert.equal(traversal.error, 'Path traversal detected: "work/../outside/outside.png" climbs above the root of mount "work".');
   assert.ok(!traversal.error?.includes(root));
 
   const escape = await callReadImage(workspace, 'work/escape.png');
@@ -683,4 +695,84 @@ test('bare read_image dispatch falls back to disk when the tree blob is utf-8 ma
   assert.ok(imageBlock?.source);
   assert.equal(imageBlock!.source!.data, image.bytes.toString('base64'), 'bytes must be the DISK bytes, exact');
   assert.equal(imageBlock!.source!.mediaType, 'image/png');
+});
+
+/** A well-formed PNG of exactly `size` bytes: the tiny one with an ancillary
+ *  chunk of zeros after its header, which the workspace's structure check
+ *  reads past (it checks chunk lengths and order, not their CRCs). */
+function pngOfSize(size: number): Buffer {
+  const tiny = TINY_IMAGES.png.bytes;
+  const headerEnd = PNG_SIGNATURE.length + 25; // IHDR: length, type, 13 bytes, CRC
+  const padding = size - tiny.byteLength - 12;
+  return Buffer.concat([
+    tiny.subarray(0, headerEnd),
+    u32be(padding), Buffer.from('tEXt', 'ascii'), Buffer.alloc(padding), Buffer.alloc(4),
+    tiny.subarray(headerEnd),
+  ]);
+}
+
+/** The workspace module with its own read_image hidden, so the framework's
+ *  read_image reads the file itself (readBinary), as it does for a workspace
+ *  module from before that tool. */
+class WorkspaceWithoutReadImage extends WorkspaceModule {
+  override getTools(): ReturnType<WorkspaceModule['getTools']> {
+    return super.getTools().filter((tool) => tool.name !== 'read_image');
+  }
+}
+
+test("read_image refuses an image over this host's 5 MB limit in words that name it as this host's, whichever way it reads the file", async (t) => {
+  // About 5.5 MB, a multiple of 3 so the handler's estimate from base64 is
+  // exact; the mount's own size limit is raised past it, so only the
+  // framework's per-image limit refuses it.
+  const size = 5_767_167;
+  const image = pngOfSize(size);
+  assert.equal(image.byteLength, size);
+  const ways = [
+    { what: "the workspace module's handler", make: (config: ConstructorParameters<typeof WorkspaceModule>[0]) => new WorkspaceModule(config), said: `~${size}` },
+    { what: 'its own read, for a workspace without the tool', make: (config: ConstructorParameters<typeof WorkspaceModule>[0]) => new WorkspaceWithoutReadImage(config), said: `${size}` },
+  ];
+  for (const { what, make, said } of ways) {
+    const root = mkdtempSync(join(tmpdir(), 'af-read-image-limit-'));
+    const mountDir = join(root, 'mount');
+    mkdirSync(mountDir, { recursive: true });
+    writeFileSync(join(mountDir, 'big.png'), image);
+    const membrane = new MockMembrane();
+    const workspaceModule = make({
+      mounts: [{ name: 'work', path: mountDir, mode: 'read-write', watch: 'never', maxFileSize: 8 * 1024 * 1024 }],
+    });
+    membrane.pushResponse(createStreamResponse([
+      { type: 'tool_use', id: 'img-big-1', name: 'read_image', input: { path: 'work/big.png' } },
+    ], 'tool_use'));
+    membrane.pushResponse(createStreamResponse([{ type: 'text', text: 'Done.' }]));
+    const framework = await AgentFramework.create({
+      storePath: join(root, 'framework.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'mock', systemPrompt: 'test' }],
+      modules: [workspaceModule, createInferenceKickModule()],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    workspaceModule.initStore(framework.getStore());
+    t.after(async () => {
+      await framework.stop().catch(() => {});
+      rmSync(root, { recursive: true, force: true });
+    });
+    // In the workspace's tree too: on a mount that isn't direct, readBinary,
+    // which the framework's own read uses, reads only the tree, and the tree
+    // takes in no binary from disk.
+    const store = framework.getStore();
+    store.treeSet('workspace/work/tree', 'big.png', { blobHash: store.storeBlob(image, 'image/png'), size, mode: 0o644 });
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'Read work/big.png', metadata: {} });
+    await framework.runUntilIdle();
+
+    const live = membrane.lastStream?.receivedToolResults[0] as Array<{ toolUseId: string; isError: boolean; content: unknown }> | undefined;
+    assert.ok(live, `${what}: the tool result must reach the live round`);
+    assert.equal(live![0]!.toolUseId, 'img-big-1', what);
+    assert.equal(live![0]!.isError, true, what);
+    assert.equal(
+      live![0]!.content,
+      `read_image: "work/big.png" is ${said} bytes — over the 5242880-byte limit this host sends per image`,
+      what,
+    );
+  }
 });

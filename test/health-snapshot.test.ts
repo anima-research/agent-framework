@@ -96,3 +96,21 @@ describe('HealthModule snapshot timestamp resilience', () => {
     );
   });
 });
+
+describe('HealthModule snapshot error text', () => {
+  it('cuts a recent error at 400 units without halving a surrogate pair', async () => {
+    // 399 units, then an emoji whose two units straddle the 400-unit cut.
+    const error = `${'e'.repeat(399)}😀 and on`;
+    const entries = [
+      { sequence: 0, entry: { timestamp: 1751900000000, agentName: 'a', requestId: 'r0', success: false, error, request: {}, durationMs: 1 } },
+    ];
+    const health = new HealthModule({ timeZone: 'UTC' });
+    health.bind(frameworkStub(entries), {} as JsStore);
+
+    const result = await health.handleToolCall(snapshotCall());
+
+    assert.equal(result.success, true, `snapshot failed: ${result.error}`);
+    const shown = (result.data as { inferences: { recentErrors: Array<{ error: string }> } }).inferences.recentErrors[0]!.error;
+    assert.equal(shown, 'e'.repeat(399), 'the cut leaves the emoji out whole');
+  });
+});

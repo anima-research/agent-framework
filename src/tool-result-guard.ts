@@ -3,8 +3,9 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
-import { isStateExistsError } from './module-registry.js';
-import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { ensureStateRegistered } from './module-registry.js';
+import { classifyBlock } from './mcpl/references.js';
+import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
@@ -18,7 +19,7 @@ export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
  *  left the stub's branch when the file would have been committed
  *  (`branch_changed`), or because the batch used its deadline before this
  *  write could start (`batch_deadline`); or null when no file is written at all (no writable
- *  workspace, or the host is stopping). */
+ *  mount without an include, or the host is stopping). */
 export type WithheldSpill =
   | { path: string; error?: string; unfinished?: true }
   | { skipped: 'workspace_unanswered' | 'branch_changed' | 'batch_deadline' }
@@ -86,10 +87,13 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
 /**
  * What a withheld result's stub keeps of it: the fields of its data that its
  * tool marked as saying what it acted on (ToolResult.keepWhenWithheld), in
- * the order marked, serialized as a stored result is. Past the inline cap
- * they're cut, with a note that says so and where the whole result is, since
- * a later field can then be cut away entirely. Undefined when it keeps
- * nothing, as for a failed result (agent-framework #277). A write's file
+ * the order marked, serialized as a stored result is. Past `maxChars`, the
+ * inline cap or less (storeResults' keptCap), they're cut, with a note that
+ * says so and where the whole result is, since a later field can then be cut
+ * away entirely. Undefined when it keeps nothing, as for a failed result
+ * (agent-framework #277), one whose claims can't be read whole
+ * (resultClaimsOf), or one whose data is MCP's embedded resource, whose
+ * fields can't be kept apart from its contents or its uri. A write's file
  * list is evidence of what it did, rarely what drew a refusal, and keeping it
  * is what shows a clobbered file when the receipt is withheld.
  */
@@ -98,15 +102,28 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   if (!result.success || result.isError || !keys?.length || !data || typeof data !== 'object' || Array.isArray(data)) {
     return undefined;
   }
+  // MCP's embedded resource is its contents: shown as text, it's the very
+  // body the guard withheld, and a field picked out of it, such as
+  // `resource`, is data that shows its uri. So it keeps nothing.
+  if (classifyBlock(data).kind === 'embedded') return undefined;
   const fields = data as Record<string, unknown>;
   const kept = Object.fromEntries(keys.filter((key) => Object.hasOwn(fields, key)).map((key) => [key, fields[key]]));
   if (Object.keys(kept).length === 0) return undefined;
-  const whole = toolResultDataToHistoryString(kept);
+  // Data that RFC-005 shows as text, such as a reference's stub, keeps that
+  // text: picked out of it, a kept uri would lose the type that makes it a
+  // reference, and be written out of the stub that hides it.
+  // The kept fields are shown as the whole result claims (resultClaimsOf), so
+  // a never elsewhere in it still withholds a kept link's uri. Where a value
+  // stops that walk, such as a getter that throws, which the audit's JSON
+  // doesn't read, what the rest claims is unknown, and nothing is kept.
+  const claims = resultClaimsOf(fields);
+  if (claims === null) return undefined;
+  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept, undefined, { claims });
   if (!maxChars || whole.length <= maxChars) return whole;
   // Never half a surrogate pair: the stub goes to the provider as text, so
   // the cut can be one character short of the cap.
   const head = safeSlice(whole, 0, maxChars);
-  return `${head} [cut at the inline cap: ${head.length} of these fields' ${whole.length} ` +
+  return `${head} [cut: ${head.length} of these fields' ${whole.length} ` +
     'characters; the whole result is where this note says]';
 }
 
@@ -295,11 +312,7 @@ export class ToolResultGuard {
   private write(record: Record<string, unknown>): void {
     const store = this.cm.getStore();
     if (!this.registered) {
-      try {
-        store.registerState({ id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
-      } catch (error) {
-        if (!isStateExistsError(error)) throw error;
-      }
+      ensureStateRegistered(store, { id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
       this.registered = true;
     }
     store.appendToStateJson(TOOL_RESULT_GUARD_AUDIT_STATE, record);
@@ -314,15 +327,16 @@ export class ToolResultGuard {
       : JSON.parse(json);
   }
 
-  /** `inlineCap` is the cap the caller stored `content` under; what a stub
-   *  keeps of a withheld result is cut at it too. */
+  /** `keptCap` is where what a stub keeps of a withheld result is cut: the
+   *  cap the caller stored `content` under, less the stub's notice room where
+   *  its message's bound sets it (toolResultShare, tool-image-ledger.ts). */
   storeResults(
     content: ContentBlock[],
     wireResults: ToolResult[],
     originals: CompletedToolCall[],
     metadata: MessageMetadata | undefined,
-    /** The cap the results were stored under: what a stub keeps is cut there too. */
-    inlineCap: number | undefined,
+    /** Where what a stub keeps is cut. */
+    keptCap: number | undefined,
   ): MessageId {
     if (!this.enabled) return this.cm.addMessage('user', content, metadata);
     if (this.pending) {
@@ -356,7 +370,7 @@ export class ToolResultGuard {
     const kept = new Map<number, string>();
     for (const [index, block] of content.entries()) {
       const result = block.type === 'tool_result' ? results.get(block.toolUseId) : undefined;
-      const text = result ? keptWhenWithheld(result, inlineCap) : undefined;
+      const text = result ? keptWhenWithheld(result, keptCap) : undefined;
       if (text !== undefined) kept.set(index, text);
     }
     // Compression hold (CM >= 0.12): placed BEFORE onNewMessage fires, so no
@@ -498,8 +512,9 @@ export class ToolResultGuard {
 
   /**
    * Turn a withheld batch's notices into stubs that say where each original
-   * is (agent-framework #277): written to the workspace when a writable mount
-   * takes it, else kept in the audit record. A stub also keeps the file
+   * is (agent-framework #277): written to the workspace when it has a
+   * writable mount without an include, not configured direct, to take it, else kept in the audit
+   * record. A stub also keeps the file
    * lists its tool marked. Its own unedited placeholder is
    * the only thing it edits: an operator's later edit, removal or rollback
    * stands.
@@ -597,8 +612,8 @@ export class ToolResultGuard {
               if (block.type !== 'tool_result') return [];
               if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
               const spill = spills.get(index) ?? null;
-              // No file was written: no writable workspace, or the framework
-              // was stopping.
+              // No file was written: no writable mount without an include
+              // that isn't configured direct, or the framework was stopping.
               if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
               if ('skipped' in spill) return [{ toolUseId: block.toolUseId, skipped: spill.skipped }];
               return [{ toolUseId: block.toolUseId, path: spill.path,

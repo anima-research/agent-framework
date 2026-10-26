@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/agent-framework",
-  "version": "0.22.1",
+  "version": "0.27.0",
   "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
   "repository": {
     "type": "git",
@@ -17,22 +17,23 @@
     }
   },
   "files": [
-    "dist",
+    "dist/src",
     "src"
   ],
   "bin": {
-    "agent-framework-mcp": "./dist/src/api/mcp-server.js",
-    "agent-framework-recover": "./dist/src/recovery/recover-cli.js"
+    "agent-framework-mcp": "dist/src/api/mcp-server.js",
+    "agent-framework-recover": "dist/src/recovery/recover-cli.js"
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755)\"",
+    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755); fs.copyFileSync('src/code-execution/quickjs.wasm', 'dist/src/code-execution/quickjs.wasm')\"",
+    "predev": "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/src/code-execution', { recursive: true }); fs.copyFileSync('src/code-execution/quickjs.wasm', 'dist/src/code-execution/quickjs.wasm')\"",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "pretest": "mkdir -p dist/test/fixtures && cp test/fixtures/*.mjs dist/test/fixtures/",
-    "test": "node --test --test-force-exit dist/test/*.test.js",
-    "preversion": "node scripts/release-holds.mjs",
+    "test": "node --import ./dist/test/helpers/force-exit-blocking-stdout.js --test --test-force-exit ${AF_TEST_CONCURRENCY:+--test-concurrency=$AF_TEST_CONCURRENCY} --test-timeout=600000 dist/test/*.test.js",
+    "preversion": "node scripts/release-bump.mjs && node scripts/release-holds.mjs",
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
     "prepublishOnly": "node scripts/release-holds.mjs && npm run build"
   },
@@ -48,20 +49,23 @@
   "license": "MIT",
   "dependencies": {
     "@animalabs/chronicle": "^0.4.0",
-    "@animalabs/context-manager": "^0.14.0",
-    "@animalabs/membrane": "^0.5.87",
+    "@animalabs/context-manager": "^0.22.0",
+    "@animalabs/membrane": "^0.7.1",
+    "@modelcontextprotocol/client": "^2.3.1",
     "chokidar": "^4.0.3",
     "discord.js": "^14.25.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@animalabs/mcpl-core": "0.4.0",
+    "@babel/parser": "^7.29.9",
+    "@modelcontextprotocol/server": "^2.3.1",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.13",
-    "discord.js": "^14.25.1",
     "tsx": "^4.21.0",
-    "typescript": "^5.7.0"
+    "typescript": "^7.0.2"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.12.0"
   }
 }

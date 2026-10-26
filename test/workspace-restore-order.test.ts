@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
 import type { WorkspaceModuleState } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -165,4 +166,28 @@ test('a fresh (non-restart) start still initializes mounts at zero', async (t) =
   assert.equal(status.lastMaterializedSeq, 0);
   assert.equal(status.lastMaterializedBranch, null);
   assert.equal(status.canMaterialize, true);
+});
+
+test('a restart stopped before its saved state is applied leaves the stored state as it was', async (t) => {
+  const { store, makeModule } = setup(t);
+  const { saved } = await runFirstSession(store, makeModule);
+  const saves: unknown[] = [];
+  const ctx = { ...makeCtx({ isRestart: true, saved }), setState: (state: unknown) => { saves.push(state); } } as unknown as ModuleContext;
+
+  // Stopped before initStore(), as a create() that fails after starting it
+  // stops it (#389).
+  const notWired = makeModule();
+  await notWired.start(ctx);
+  await notWired.stop();
+
+  // Stopped after an initStore() that threw once it had taken the store and
+  // made the mounts, before it applied the saved state.
+  const failedInit = makeModule();
+  await failedInit.start(ctx);
+  const open = t.mock.method(DiskAgreement.prototype, 'open', () => { throw new Error('the journal is unreadable'); });
+  assert.throws(() => failedInit.initStore(store), /the journal is unreadable/);
+  open.mock.restore();
+  await failedInit.stop();
+
+  assert.deepEqual(saves, [], 'neither stop saved over the stored state');
 });

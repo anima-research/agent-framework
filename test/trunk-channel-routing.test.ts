@@ -32,14 +32,20 @@ import type {
   EventResponse,
 } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
+import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ContextInjection } from '@animalabs/context-manager';
 
+/** A channel on the fixture's discord server. */
+const discord = (channelId: string) => ({ serverId: 'discord', channelId });
+
 /** Reach the private per-turn routing state (its triggering channel) + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
   return framework as unknown as {
-    turnRouting: Map<string, { triggerChannel?: string }>;
+    turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string } }>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -157,7 +163,11 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
 
@@ -193,10 +203,19 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.match(text, /channel_decline/);
     assert.match(text, /optionally set acknowledge/);
     assert.match(text, /Doing nothing is also fine\./);
-    // 2026-08-05 accuracy pass: the delivery model must be stated correctly —
-    // direct addresses still arrive; un-@'d follow-ups to a reply do not.
-    assert.match(text, /address you directly/);
-    assert.match(text, /follow-ups to your reply will NOT reach you/);
+    // #406: what else reaches the agent is each server's delivery (slack-mcpl
+    // keeps its own subscription), so the invitation says only what holds on
+    // every server.
+    assert.match(
+      text,
+      /a channel you haven't opened\. Messages there that address you, such as an @-mention, reach you whether or not you open it\./,
+    );
+    // Here nobody decided to keep the channel closed, so a reply opens it, as
+    // speech does, and the invitation says so, with how to reply without
+    // opening it.
+    assert.match(text, /\n1\. Reply — write your reply this turn prefixed with ">>#portables"; it will be delivered there, which opens the channel\. To reply without opening it, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/);
+    assert.match(text, /2\. Open the channel — call channel_open/);
+    assert.doesNotMatch(text, /invisible to you|follow-ups to your reply|without joining/);
     // No surface-tracked tally on this event → no missed-count sentence.
     assert.doesNotMatch(text, /passed there without you/);
     await framework.stop();
@@ -208,7 +227,11 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
 
@@ -273,8 +296,12 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
-      proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
+      proseTargetFor: (c: { serverId: string; channelId: string }) => { asked.push(`${c.serverId}/${c.channelId}`); return '@_reim0n'; },
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i.handleMcplPushEvent(dmEvent('m3'));
@@ -291,15 +318,21 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i2.handleMcplPushEvent(dmEvent('m4'));
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
-    assert.match(t2, /Reply without joining isn't available here/);
-    assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
+    assert.match(t2, /\n1\. Reply — no single-word target reaches this channel unambiguously/);
+    assert.match(t2, /check whether discord exposes a send tool that can address it\. Replying there opens the channel\. To reply without opening it, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/,
+      'the hint promises no tool, and says what replying does');
+    assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'opening stays available');
     await fw2.stop();
 
     // A registry stand-in without proseTargetFor: a whitespace-free guess, never the spaced label.
@@ -308,12 +341,257 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i3.handleMcplPushEvent(dmEvent('m5'));
     assert.match(textOf(fw3), /prefixed with ">>discord:dm:1555"/);
     await fw3.stop();
+  });
+
+  it('in a channel the agent closed or declined itself, the invitation says a reply leaves it closed', async () => {
+    const textOf = (framework: Awaited<ReturnType<typeof makeFramework>>) =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const mention = (id: string) => ({
+      type: 'mcpl:push-event' as const,
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: `discord_msg_${id}`,
+      content: [{ type: 'text' as const, text: 'Antra: can you look at this?' }],
+      origin: { source: 'discord', messageId: id, mcplChannelId: 'discord:G1:C7', channelName: 'portables' },
+      tags: ['chat:mention', 'chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: `i-${id}`,
+      triggerInference: false,
+    });
+    for (const target of ['#portables', undefined]) {
+      const framework = await makeFramework();
+      const asked: string[] = [];
+      internals(framework).channelRegistry = {
+        ensureChannelRegistered: () => {},
+        isChannelOpen: () => false,
+        // A reply leaves this channel closed: the agent closed or declined it.
+        speechOpens: (c: { serverId: string; channelId: string }) => { asked.push(`${c.serverId}/${c.channelId}`); return false; },
+        getDesiredState: () => 'closed',
+        getChannelLabel: () => undefined,
+        getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+        proseTargetFor: () => target,
+        inboundOnlyServer: () => undefined,
+        stopAll: () => {},
+      };
+      internals(framework).handleMcplPushEvent(mention(`m-${target ?? 'none'}`));
+      const text = textOf(framework);
+      assert.deepEqual(asked, ['discord/discord:G1:C7'], 'asked about this channel on the server it came from');
+      // What else reaches the agent from a channel left closed is its server's
+      // to say (#406), so the line says only that the channel stays closed.
+      assert.match(text, target
+        ? /\n1\. Reply — write your reply this turn prefixed with ">>#portables"; it will be delivered there, and the channel stays closed\.\n/
+        : /\n1\. Reply — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; check whether discord exposes a send tool that can address it\. Replying there leaves the channel closed\.\n/);
+      assert.doesNotMatch(text, /opens the channel|decline it first|follow-ups to your reply/);
+      await framework.stop();
+    }
+  });
+
+  it('a direct message carries no invitation: all of a DM reaches the agent, open or closed', async () => {
+    // A DM registers closed, and stays closed until the agent answers it, or for good once the
+    // agent closes it. An invitation on its messages would repeat a block whose premise is false
+    // there: there is no other traffic to miss, and nothing to join.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getChannelLabel: () => undefined,
+      getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
+      proseTargetFor: () => '@_reim0n',
+      inboundOnlyServer: () => undefined,
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: 'discord_msg_m6',
+      content: [{ type: 'text', text: '_reim0n: you there?' }],
+      origin: { source: 'discord', messageId: 'm6', mcplChannelId: 'discord:dm:1555', isDM: true, authorName: '_reim0n' },
+      // As discord-mcpl tags a DM, after the host's core-tag closure.
+      tags: ['chat:dm', 'chat:addressed', 'chat:private'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i6',
+      triggerInference: false,
+    });
+    const text = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /you there\?/);
+    assert.doesNotMatch(text, /Channel invitation/);
+    await framework.stop();
+  });
+
+  it('the invitation offers no reply into a channel its server declared inbound-only, and says why', async () => {
+    // pocket-body's live transcript: another agent speaking in the room arrives
+    // on it addressed, and the host publishes nothing into it, so a ">>" reply would
+    // only be refused.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getDescriptor: () => ({ label: 'Body · ears', direction: 'inbound' }),
+      getChannelLabel: () => 'Body · ears',
+      proseTargetFor: () => '#ears',
+      inboundOnlyServer: (channel: { channelId: string }) => (channel.channelId === 'body:ears' ? 'pocket-body' : undefined),
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'pocket-body',
+      featureSet: 'body',
+      eventId: 'ears_1',
+      content: [{ type: 'text', text: 'Fable: Linn, can you hear me?' }],
+      origin: { source: 'pocket-body', messageId: 'e1', mcplChannelId: 'body:ears', channelName: 'Body · ears' },
+      tags: ['chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i-e1',
+      triggerInference: false,
+    });
+
+    const text = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /Channel invitation/);
+    assert.match(
+      text,
+      /1\. Replying there isn't available: pocket-body declared this channel inbound-only, so nothing you write is posted into it\. To speak there, use pocket-body's own tools\./,
+    );
+    assert.doesNotMatch(text, /prefixed with ">>/);
+    assert.match(text, /channel_open with channelId "body:ears"/, 'opening it, to hear the room, stays available');
+    await framework.stop();
+  });
+
+  it('the invitation adds a # only where the channel\'s name lacks one, and names an unlabelled channel by its id', async () => {
+    // #406's run: slack-mcpl registers "#general (acme)" and its push carries no
+    // channelName, so the invitation named the place "##general (acme)".
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const labels: Record<string, string> = {
+      'slack:C1': '#general (acme)',
+      'slack:C2': '#random',
+      // A lazily registered channel carries its id as its label.
+      'slack:C3': 'slack:C3',
+    };
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getDescriptor: (c: { channelId: string }) => ({ label: labels[c.channelId] }),
+      getChannelLabel: (_serverId: string, id: string) => labels[id],
+      inboundOnlyServer: () => undefined,
+      stopAll: () => {},
+    };
+    const textOf = () =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const mention = (channel: string, id: string) => ({
+      type: 'mcpl:push-event' as const,
+      serverId: 'slack',
+      featureSet: 'slack.messaging',
+      eventId: `slack_msg_${channel}_${id}`,
+      content: [{ type: 'text' as const, text: 'U2: @UBOT can you look at this?' }],
+      origin: { source: 'slack', messageId: id, channelId: channel, mcplChannelId: `slack:${channel}`, authorName: 'U2' },
+      tags: ['chat:mention', 'chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: `i-${id}`,
+      triggerInference: false,
+    });
+
+    i.handleMcplPushEvent(mention('C1', '101.1'));
+    const t1 = textOf();
+    assert.match(t1, /addressed you in #general \(acme\) —/);
+    assert.doesNotMatch(t1, /##/);
+    assert.match(t1, /prefixed with ">>slack:C1"/, 'a spaced label is never the guess');
+
+    i.handleMcplPushEvent(mention('C2', '102.1'));
+    const t2 = textOf();
+    assert.match(t2, /addressed you in #random —/);
+    assert.match(t2, /prefixed with ">>#random"/, 'the guess strips the label\'s own # before adding one');
+    assert.doesNotMatch(t2, /##/);
+
+    // A label that is only the id names nothing, as at the other places that name a channel.
+    i.handleMcplPushEvent(mention('C3', '103.1'));
+    const t3 = textOf();
+    assert.match(t3, /addressed you in "slack:C3" —/);
+    assert.match(t3, /prefixed with ">>slack:C3"/);
+    assert.doesNotMatch(t3, /#slack:C3/);
+    await framework.stop();
+  });
+
+  it('channel_open and channel_close leave what a channel delivers to its server', () => {
+    // #406: slack-mcpl keeps its own subscription, so opening a Slack
+    // conversation needn't bring its other messages, and closing it needn't stop them.
+    const registry = new ChannelRegistry({} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {});
+    const description = (name: string) => registry.getChannelTools().find((t) => t.name === name)?.description ?? '';
+    assert.match(description('channel_open'), /What an open channel delivers to you depends on its MCPL server\./);
+    assert.doesNotMatch(description('channel_open'), /start receiving|ongoing traffic|subscribe/);
+    assert.match(
+      description('channel_close'),
+      /Messages that address you still reach you; what else stops reaching you depends on its server\./,
+    );
+    assert.doesNotMatch(description('channel_close'), /stop receiving/);
+  });
+
+  it('the "Now open" notice leaves what an open channel delivers to its server', async () => {
+    // #406's run: after the policy's "Ongoing traffic from this channel will reach you",
+    // an unsubscribed Slack conversation's next ordinary message never arrived.
+    const framework = await makeFramework();
+    const notice = internals(framework) as unknown as {
+      recordChannelAutoOpenNotice(
+        agentName: string | undefined,
+        serverId: string,
+        channels: Array<{ channelId: string; label?: string }>,
+        cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
+      ): void;
+    };
+    const lastText = () =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+
+    // Each form an agent can read: a delivery or a send opens one channel, and
+    // only the subscription policy opens several at once.
+    notice.recordChannelAutoOpenNotice('scout', 'slack', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'opened-by-delivery');
+    const one = lastText();
+    assert.match(
+      one,
+      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again\./,
+    );
+    assert.doesNotMatch(one, /will reach you/);
+
+    notice.recordChannelAutoOpenNotice('scout', 'slack', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'subscription-policy');
+    const two = lastText();
+    assert.match(
+      two,
+      /Selected for opening by subscription policy: slack:C1, slack:C2\. The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want one of them, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again\./,
+    );
+    assert.doesNotMatch(two, /will reach you/);
+    await framework.stop();
   });
 
   it('a channel-incoming trunk turn records its triggering channel', async () => {
@@ -324,10 +602,10 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 1, 'the trunk should have run one turn');
-    assert.equal(
+    assert.deepEqual(
       internals(framework).turnRouting.get('scout')?.triggerChannel,
-      'discord:guild:chanA',
-      'the turn must be routed to the channel that triggered it',
+      discord('discord:guild:chanA'),
+      'the turn must be routed to the channel that triggered it, on its server',
     );
     await framework.stop();
   });
@@ -340,9 +618,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 1, 'the trunk should wake for the DM');
-    assert.equal(
+    assert.deepEqual(
       internals(framework).turnRouting.get('scout')?.triggerChannel,
-      'discord:dm:42',
+      discord('discord:dm:42'),
       'the DM reply must route to the DM channel, not the global locus',
     );
     await framework.stop();
@@ -357,7 +635,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ans A' }]));
     framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
     await framework.runUntilIdle();
-    assert.equal(i.turnRouting.get('scout')?.triggerChannel, 'discord:guild:chanA');
+    assert.deepEqual(i.turnRouting.get('scout')?.triggerChannel, discord('discord:guild:chanA'));
 
     // ...then a DM turn OVERWRITES it — the next turn's reply must never inherit
     // the previous turn's channel (the concurrency hazard this fix removes).
@@ -365,9 +643,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     framework.pushEvent(dmPushEvent('42', 'now in a DM'));
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 2, 'both turns should have run');
-    assert.equal(
+    assert.deepEqual(
       i.turnRouting.get('scout')?.triggerChannel,
-      'discord:dm:42',
+      discord('discord:dm:42'),
       'the routing state must reflect the CURRENT turn’s channel, not chanA',
     );
     await framework.stop();
@@ -378,22 +656,22 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i = framework as unknown as {
       initializeMcpl(servers: unknown[]): Promise<void>;
       channelRegistry: {
-        resolveLocus(agentName: string): string | null;
-        buildChannelContext(agentName?: string): { defaultOutgoing?: { channelId: string } } | undefined;
+        resolveLocus(agentName: string): { serverId: string; channelId: string } | null;
+        buildChannelContext(agentName: string | undefined, serverId: string): { defaultOutgoing?: { channelId: string } } | undefined;
       };
-      turnRouting: Map<string, { triggerChannel?: string; locus?: string }>;
+      turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string }; locus?: { serverId: string; channelId: string } }>;
     };
     // The real registry, with no servers: its resolver reads the framework's turn state.
     await i.initializeMcpl([]);
-    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:chanA' });
-    assert.equal(i.channelRegistry.resolveLocus('scout'), 'discord:guild:chanA',
+    i.turnRouting.set('scout', { triggerChannel: discord('discord:guild:chanA') });
+    assert.deepEqual(i.channelRegistry.resolveLocus('scout'), discord('discord:guild:chanA'),
       'the locus a turn freezes comes from its trigger channel');
-    assert.equal(i.channelRegistry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'discord:guild:chanA',
-      'and the agent is told the same channel');
+    assert.equal(i.channelRegistry.buildChannelContext('scout', 'discord')?.defaultOutgoing?.channelId, 'discord:guild:chanA',
+      'and its server is told the same channel');
     // A re-pin moved the turn's locus: a later start of the turn tells the
     // agent where its speech now lands.
-    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:chanA', locus: 'discord:dm:42' });
-    assert.equal(i.channelRegistry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'discord:dm:42');
+    i.turnRouting.set('scout', { triggerChannel: discord('discord:guild:chanA'), locus: discord('discord:dm:42') });
+    assert.equal(i.channelRegistry.buildChannelContext('scout', 'discord')?.defaultOutgoing?.channelId, 'discord:dm:42');
     await framework.stop();
   });
 
@@ -433,7 +711,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const triggerAtStart: Array<string | undefined> = [];
     framework.onTrace((event) => {
       if (event.type !== 'inference:started') return;
-      triggerAtStart.push(internals(framework).turnRouting.get('scout')?.triggerChannel);
+      triggerAtStart.push(internals(framework).turnRouting.get('scout')?.triggerChannel?.channelId);
       if (triggerAtStart.length === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back' }]));
     });
 
@@ -463,7 +741,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     // turn (an InferenceRequest with no channelId). startAgentStream must clear
     // the entry up front so routeSpeech falls back to the global locus rather
     // than replaying the stale channel.
-    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:stale' });
+    i.turnRouting.set('scout', { triggerChannel: discord('discord:guild:stale') });
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as {
       startAgentStream(agent: unknown, trigger?: unknown): Promise<void>;
@@ -554,7 +832,7 @@ describe('Residents read one message slot', () => {
 
   type Internals = {
     addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
-    turnRouting: Map<string, { triggerChannel?: string }>;
+    turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string } }>;
     activeTurnTokens: Map<string, number>;
     deferredMessages: unknown[];
     channelRegistry: unknown;
@@ -585,10 +863,10 @@ describe('Residents read one message slot', () => {
     const i = framework as unknown as Internals;
     const routed: Array<{ agent: string; text: string; locus: string | null }> = [];
     const registry: Record<string, unknown> = {
-      resolveLocus: (name: string) => i.turnRouting.get(name)?.triggerChannel ?? 'chan-default',
-      routeSpeech: async (agent: string, text: string, locus?: string | null) => {
-        routed.push({ agent, text, locus: locus ?? null });
-        return locus ? { delivered: true, channelId: locus } : null;
+      resolveLocus: (name: string) => i.turnRouting.get(name)?.triggerChannel ?? discord('chan-default'),
+      routeSpeech: async (agent: string, text: string, locus?: { serverId: string; channelId: string } | null) => {
+        routed.push({ agent, text, locus: locus?.channelId ?? null });
+        return locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null;
       },
       getDefaultPublishChannel: () => null,
       isChannelOpen: () => true,
@@ -689,7 +967,7 @@ describe('Residents read one message slot', () => {
       agent: 'shade',
       run: () => {
         i.addMessage('Antra', [{ type: 'text', text: 'shade, over here please' }],
-          { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+          { channelId: 'discord:dm:antra', serverId: 'discord', tags: ['chat:addressed'] });
       },
     };
     framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
@@ -735,9 +1013,9 @@ describe('Residents read one message slot', () => {
     // scout's boundary stores it after, re-pinning the turn there.
     pause.during = async () => {
       i.addMessage('Antra', [{ type: 'text', text: 'shade, a word' }],
-        { channelId: 'discord:dm:xenia', tags: ['chat:addressed'] }, { forAgent: 'shade' });
+        { channelId: 'discord:dm:xenia', serverId: 'discord', tags: ['chat:addressed'] }, { forAgent: 'shade' });
       i.addMessage('Antra', [{ type: 'text', text: 'scout, over here please' }],
-        { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+        { channelId: 'discord:dm:antra', serverId: 'discord', tags: ['chat:addressed'] });
     };
     framework.pushEvent(residentIncoming('discord:guild:chanA', 'scout, take a look', 'scout', false));
     await framework.runUntilIdle();
@@ -764,7 +1042,7 @@ describe('Residents read one message slot', () => {
     let queued = -1;
     pause.during = async () => {
       i.addMessage('Antra', [{ type: 'text', text: 'shade, over here please' }],
-        { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+        { channelId: 'discord:dm:antra', serverId: 'discord', tags: ['chat:addressed'] });
       queued = i.deferredMessages.length;
     };
     framework.pushEvent(residentIncoming('discord:guild:chanC', 'scout, a word', 'scout', false));
