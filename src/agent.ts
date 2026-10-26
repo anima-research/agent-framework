@@ -865,6 +865,7 @@ export class Agent {
    * what only it can judge, such as a gradual transition its configuration
    * doesn't allow, when the update applies; that refusal also comes before
    * anything changes.
+   * @internal For the framework's runtime-settings updates; not a host API.
    */
   checkRuntimeSettingsUpdate(patch: AgentRuntimeSettingsPatch): void {
     this.validateRuntimeSettingsPatch(patch);
