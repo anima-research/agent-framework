@@ -741,20 +741,23 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
 
 type SettingsReading = {
   core: Record<string, string>;
-  exts: Map<AgentSettingsExtension, Record<string, string>>;
+  exts: Map<AgentSettingsExtension, { touched: readonly string[]; fields: Record<string, string> }>;
 };
 
 const readExtensionSettings = (ext: AgentSettingsExtension, agentName: string): Record<string, string> => {
   const values = ext.get(agentName);
-  return Object.fromEntries(ext.keys.map((key) => [key, JSON.stringify(values[key] ?? null)]));
+  return Object.fromEntries(Object.entries(values).map(([key, value]) =>
+    [key, value === undefined ? 'undefined' : JSON.stringify(value)]));
 };
 
 const changedSettings = (before: Record<string, string>, now: Record<string, string>): string[] =>
-  Object.keys(before).filter((key) => before[key] !== now[key]);
+  [...new Set([...Object.keys(before), ...Object.keys(now)])].filter((key) => before[key] !== now[key]);
 
 const settingNumber = (name: string, value: unknown): number => {
-  // Number() reads null, false and blank text as 0, true as 1, and a list of one item as that item.
-  if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) return Number(value);
+  if (typeof value === 'number') return value;
+  // Number() reads null, false and blank text as 0, true as 1, and a list of one number or numeric text as that number.
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN;
+  if (!Number.isNaN(n)) return n;
   throw new Error(`${name} must be a number, not ${shownValue(value)}`);
 };
 
@@ -8871,7 +8874,7 @@ export class AgentFramework {
   }
 
   /** Load resident-set inline caps from framework state, dropping (loudly)
-   *  anything that fails the same validation the live update enforces. A
+   *  anything Number() doesn't read as a finite number of at least 1000. A
    *  failed read is logged and boot goes on without them: nothing is lost,
    *  since persistToolResultInlineCap reads the stored caps again before it
    *  writes one. */
@@ -31955,7 +31958,7 @@ export class AgentFramework {
       });
   }
 
-  private readAgentSettings(agentName: string, exts: AgentSettingsExtension[]): SettingsReading {
+  private readAgentSettings(agentName: string, touched: ReadonlyMap<AgentSettingsExtension, readonly string[]>): SettingsReading {
     const s = this.getAgentRuntimeSettings(agentName);
     const saved = this.agents.get(agentName)?.getRuntimeSettingsOverrides() ?? {};
     return {
@@ -31967,7 +31970,7 @@ export class AgentFramework {
         transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
         same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
       },
-      exts: new Map(exts.map((ext) => [ext, readExtensionSettings(ext, agentName)])),
+      exts: new Map([...touched].map(([ext, keys]) => [ext, { touched: keys, fields: readExtensionSettings(ext, agentName) }])),
     };
   }
 
@@ -31975,17 +31978,21 @@ export class AgentFramework {
     if (!before) return 'Nothing in this call was changed.';
     let changed: string[];
     try {
-      const now = this.readAgentSettings(agentName, [...before.exts.keys()]);
+      const now = this.readAgentSettings(agentName, new Map([...before.exts].map(([ext, { touched }]) => [ext, touched])));
       changed = [
         ...changedSettings(before.core, now.core),
-        ...[...before.exts].flatMap(([ext, values]) => changedSettings(values, now.exts.get(ext)!)),
+        ...[...before.exts].flatMap(([ext, { touched, fields }]) => {
+          const differ = changedSettings(fields, now.exts.get(ext)!.fields);
+          const own = ext.keys.filter((key) => differ.includes(key));
+          return own.length > 0 ? own : differ.length > 0 ? touched : [];
+        }),
       ];
     } catch {
-      return 'Whether anything in this call was changed couldn\'t be read back; action "get" shows the settings as they stand.';
+      return 'Whether anything in this call was changed couldn\'t be read back.';
     }
     return changed.length === 0
-      ? 'Nothing in this call was changed.'
-      : `Changed before the refusal: ${changed.join(', ')}; nothing else in this call was.`;
+      ? 'No setting reads differently after this call.'
+      : `Changed before the refusal: ${changed.join(', ')}; no other setting reads differently.`;
   }
 
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
@@ -32026,8 +32033,9 @@ export class AgentFramework {
         case 'cancel': {
           const extra = Object.keys(input).filter((key) => key !== 'action');
           if (extra.length > 0) {
-            throw new Error(`A cancel takes no settings; it has no ${extra.join(', ')}. Nothing in this call was changed.`);
+            throw new Error(`A cancel doesn't take ${extra.join(', ')}: it takes no settings`);
           }
+          before = this.readAgentSettings(agentName, new Map());
           result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
           break;
         }
@@ -32067,7 +32075,7 @@ export class AgentFramework {
             if (Object.keys(slice).length > 0) slices.push({ ext, slice });
           }
           const coreTouched = Object.keys(patch).length > 0;
-          before = this.readAgentSettings(agentName, slices.map((s) => s.ext));
+          before = this.readAgentSettings(agentName, new Map(slices.map((s) => [s.ext, Object.keys(s.slice)])));
           const core = coreTouched
             ? this.updateAgentRuntimeSettings(agentName, patch)
             : this.getAgentRuntimeSettings(agentName);
@@ -32092,9 +32100,7 @@ export class AgentFramework {
         case 'reset': {
           const extra = Object.keys(input).filter((key) => key !== 'action' && key !== 'settings');
           if (extra.length > 0) {
-            throw new Error(
-              `A reset takes only \`settings\`, a list of setting names; it has no ${extra.join(', ')}`,
-            );
+            throw new Error(`A reset doesn't take ${extra.join(', ')}: give the names to reset in \`settings\``);
           }
           let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
           const extResetKeys = new Map<AgentSettingsExtension, string[]>();
@@ -32118,6 +32124,7 @@ export class AgentFramework {
                 (ext) => typeof name === 'string' && ext.keys.includes(name),
               );
               if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
+              if (!owner.reset) throw new Error(`${String(name)} can't be reset`);
               const list = extResetKeys.get(owner) ?? [];
               list.push(name as string);
               extResetKeys.set(owner, list);
@@ -32131,7 +32138,7 @@ export class AgentFramework {
           const extResets: Array<[AgentSettingsExtension, string[] | undefined]> = resetsAllSettings
             ? [...extensions.values()].map((ext) => [ext, undefined])
             : [...extResetKeys];
-          before = this.readAgentSettings(agentName, extResets.map(([ext]) => ext));
+          before = this.readAgentSettings(agentName, new Map(extResets.map(([ext, list]) => [ext, list ?? ext.keys])));
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);
@@ -32162,7 +32169,7 @@ export class AgentFramework {
       const reason = error instanceof Error ? error.message : String(error);
       result = {
         success: false,
-        error: action === 'update' || action === 'reset'
+        error: action === 'update' || action === 'reset' || action === 'cancel'
           ? `${/[.!?]$/.test(reason.trim()) ? reason.trim() : `${reason.trim()}.`} ${this.settingsChangedSince(agentName, before)}`
           : reason,
         isError: true,
