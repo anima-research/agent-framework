@@ -1275,7 +1275,7 @@ interface TurnRouting {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts` after a send: counted, never drafted. */
+  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts`, and sends nothing else, after a send: counted, never drafted. */
   keptPrivate: number;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
@@ -15823,8 +15823,8 @@ export class AgentFramework {
 
   /**
    * Silenced plain speech: an explicit send holds it as resendable drafts (in
-   * a round that calls `drafts`, 'drafts', its plain speech is kept and
-   * counted instead); a
+   * a round that calls `drafts` and sends nothing else, 'drafts', its plain
+   * speech is kept and counted instead); a
    * deliberate silence (skip_reply, a silent turn, or a private think in
    * the same native round, where that policy applies: an XML-mode round has
    * no verbatim content to route live, so its prose is routed at the turn's
@@ -20059,8 +20059,9 @@ export class AgentFramework {
     // clears it, because the following prose is a reply to a new message.
     // Why it is silenced decides what happens to the held words: an explicit
     // send ('send') holds them as resendable drafts, except in a round that
-    // calls `drafts`, which keeps its plain speech; a deliberate silence
-    // ('private': skip_reply, a silent control-plane turn) keeps them private.
+    // calls `drafts` and sends nothing else, which keeps its plain speech; a
+    // deliberate silence ('private': skip_reply, a silent control-plane turn)
+    // keeps them private.
     let silenceCause: 'send' | 'private' | null = trigger?.suppressProse === true
       ? 'private'
       : (trigger?.reason === 'tool_result_guard_retry' ? this.guardRetryTurnSilenced.get(agent.name) : undefined) ?? null;
@@ -20524,6 +20525,8 @@ export class AgentFramework {
                 silenceCause = roundCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
               }
               const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
+              const draftsCause = draftsRound
+                && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
@@ -20535,7 +20538,7 @@ export class AgentFramework {
                 if (turnSilenced) {
                   // In order behind earlier rounds' envelopes: the router
                   // state they leave is where this round's starts.
-                  const cause = draftsRound && silenceCause !== 'private' ? 'drafts' : silenceCause;
+                  const cause = draftsCause && silenceCause !== 'private' ? 'drafts' : silenceCause;
                   chainSpeech(
                     async () => this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts),
                     'mid-turn hybrid prose hold failed:',
@@ -20565,12 +20568,12 @@ export class AgentFramework {
                 }
               } else if (turnSilenced) {
                 console.error(
-                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause}${draftsRound ? ', a drafts round: kept' : ''})`,
+                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause}${draftsCause ? ', a drafts round: kept' : ''})`,
                 );
                 // Never a silent black hole (n=8: the flying-scene reply):
                 // held as drafts the resident can resend, and named. A drafts
                 // round's is kept and counted instead.
-                this.holdSilencedProse(agent, roundRuns, draftsRound && silenceCause !== 'private' ? 'drafts' : silenceCause, hasSameRoundPrivateThink, holdOpts);
+                this.holdSilencedProse(agent, roundRuns, draftsCause && silenceCause !== 'private' ? 'drafts' : silenceCause, hasSameRoundPrivateThink, holdOpts);
               } else if (hasSameRoundPrivateThink) {
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,

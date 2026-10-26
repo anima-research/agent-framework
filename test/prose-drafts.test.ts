@@ -1256,6 +1256,40 @@ describe('held prose drafts, end to end', () => {
     });
   }
 
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode} mode: a round that sends and also calls drafts holds the prose beside the send, and its notice offers it`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        await h.turn([
+          createMockResponse([text('A reply meant for the room.'), explicitSend('s1'), drafts('l1', { action: 'list' })], 'tool_use'),
+          createMockResponse([]),
+        ]);
+        const [held] = h.drafts();
+        assert.deepEqual([held?.text, held?.reason], ['A reply meant for the room.', 'explicit-send']);
+        assert.ok(h.texts().some((t) => !t.startsWith('[delivered]') && t.includes(held!.id)), 'a notice offers it before the turn ends');
+      } finally {
+        await h.close();
+      }
+    });
+
+    it(`${mode} mode: after a round that sends and calls drafts, the resend round's narration is kept, and the cycle ends`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        const lines = [1, 2, 3, 4, 5, 6].map((i) => resendWhileOffered(h, `Resending that now (${i}).`, `r${i}`));
+        await h.turn([
+          createMockResponse([text('A reply meant for the room.'), explicitSend('s1'), drafts('l1', { action: 'list' })], 'tool_use'),
+          ...lines,
+          createMockResponse([]),
+        ]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere', 'A reply meant for the room.'],
+          'the paragraph is resent once, and no narration line is posted');
+        assert.deepEqual(h.drafts(), []);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
   it('a line beside a dismiss is kept private too, not held (#701)', async () => {
     const h = await harness();
     try {
