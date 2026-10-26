@@ -147,7 +147,7 @@ test('a read, write, edit and delete spelled in another case act on disk\'s file
     assert.deepEqual(pushed(), [], 'the write is held under the name disk lists, so listing the mount moves nothing');
 
     const deleted = await call('delete', { path: 'work/SRC/B.TS' });
-    assert.deepEqual(deleted.data, { path: 'work/src/b.ts', deleted: true });
+    assert.deepEqual(deleted.data, { path: 'work/src/b.ts', deleted: true, disk: 'done' });
     assert.equal(existsSync(join(dir, 'src', 'b.ts')), false);
     const after = await call('ls', { path: 'work', recursive: true });
     assert.deepEqual((after.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);

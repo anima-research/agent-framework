@@ -9858,7 +9858,7 @@ export class AgentFramework {
       'restart) the call fails and writes nothing — it never substitutes an older ' +
       'image. When other tool calls in the same batch are still running, the save ' +
       'waits for them so their images are counted. Receipts carry source tool call, MIME, byte size and SHA-256. Saved ' +
-      'files are visible via workspace tools and the /files/ endpoint.',
+      'files are visible via workspace tools.',
     inputSchema: {
       type: 'object',
       properties: {

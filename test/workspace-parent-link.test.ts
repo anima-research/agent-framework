@@ -575,7 +575,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
       assert.equal(write.success, false, 'the write pushed through the link');
       assert.ok(String(write.error).includes(linkedReason(target)), String(write.error));
       assert.deepEqual(await pending(m), { pendingChanges: 1, pendingWorkspaceDeletions: 0 }, 'the refused write is owed');
-      assert.deepEqual(await call(m, 'delete', { path: 'work/l/new.txt' }), { path: 'work/l/new.txt', deleted: true });
+      assert.deepEqual(await call(m, 'delete', { path: 'work/l/new.txt' }), { path: 'work/l/new.txt', deleted: true, disk: 'done' });
       assert.deepEqual(await pending(m), { pendingChanges: 0, pendingWorkspaceDeletions: 0 });
       const pushed = await call(m, 'materialize', { path: 'work/l/new.txt', applyDeletions: true });
       assert.deepEqual([pushed.materialized, pushed.deleted ?? [], pushed.skipped ?? []], [[], [], []], JSON.stringify(pushed));
@@ -628,10 +628,11 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     assert.deepEqual(deleted.data, {
       path: 'work/c.txt',
       deleted: true,
+      disk: 'done',
       note: 'nothing was unlinked: when last observed, disk held a file at work/c.txt that the workspace never took in '
         + '(conflict: store-origin-collision), and a sync observes whatever disk holds there',
     });
-    assert.deepEqual(deleted.keepWhenWithheld, ['path', 'deleted', 'note']);
+    assert.deepEqual(deleted.keepWhenWithheld, ['path', 'deleted', 'disk', 'note']);
     const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
     assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
     assert.equal(readFileSync(join(env.dir, 'c.txt'), 'utf8'), 'disk text\n', 'disk keeps its file');
@@ -655,6 +656,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     assert.deepEqual(await call(m, 'delete', { path: 'work/x.txt' }), {
       path: 'work/x.txt',
       deleted: true,
+      disk: 'done',
       note: 'nothing was unlinked: when last observed, disk held a file at work/x.txt that the workspace never took in '
         + '(conflict: both-changed), and a sync observes whatever disk holds there',
     });
@@ -682,7 +684,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     await call(m, 'sync', { path: 'work/x.txt' });
     assert.equal((m as any).agreement.get('work', 'x.txt')?.kind, 'absent', 'the other branch recorded disk\'s absence');
     env.store.switchBranch(main);
-    assert.deepEqual(await call(m, 'delete', { path: 'work/x.txt' }), { path: 'work/x.txt', deleted: true });
+    assert.deepEqual(await call(m, 'delete', { path: 'work/x.txt' }), { path: 'work/x.txt', deleted: true, disk: 'done' });
     const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
     assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
   });
@@ -693,7 +695,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     const m = await env.open(t);
     await call(m, 'write', { path: 'work/c.txt', content: 'agent text\n' });
     // No push met disk's file, so nothing records it, and the answer has no note.
-    assert.deepEqual(await call(m, 'delete', { path: 'work/c.txt' }), { path: 'work/c.txt', deleted: true });
+    assert.deepEqual(await call(m, 'delete', { path: 'work/c.txt' }), { path: 'work/c.txt', deleted: true, disk: 'done' });
     assert.deepEqual(await pending(m), { pendingChanges: 0, pendingWorkspaceDeletions: 0 });
     assert.equal(readFileSync(join(env.dir, 'c.txt'), 'utf8'), 'disk text\n');
     await call(m, 'sync', { path: 'work/c.txt' });
