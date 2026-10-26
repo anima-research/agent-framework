@@ -3389,6 +3389,7 @@ export class AgentFramework {
   private readonly thinkingLossIncidents = new ThinkingLossIncidents();
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
   private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
+  private readonly streamCarried = new WeakMap<YieldingStream, Set<MessageId>>();
   /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
@@ -10184,41 +10185,41 @@ export class AgentFramework {
     }
   }
 
-  private shedNewestTurn(agent: Agent, refusedReply?: MessageId): RewindRecord | null {
+  private shedNewestTurn(agent: Agent, refusedReply?: MessageId, carried?: ReadonlySet<MessageId>): RewindRecord | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
 
-    // Newest message that is not our own episode marker. We shed strictly
-    // newest-first, in sequence — INCLUDING the agent's own turns (poison lives
-    // in tool_use/narration turns too), because newest-first reaches whatever is
-    // poisoning the context if allowed to run deep enough. The one invariant:
+    // We shed strictly newest-first, in sequence — INCLUDING the agent's own
+    // turns (poison lives in tool_use/narration turns too), because
+    // newest-first reaches whatever is poisoning the context if allowed to run
+    // deep enough. The one invariant:
     // shed COMPLETE exchanges. Removing a `tool_result` also removes its paired
     // `tool_use` assistant turn, so we never leave an orphaned tool_use / signed
     // `thinking` block — which the API rejects with a 400 ("thinking blocks in
     // the latest assistant message cannot be modified"). We do NOT add a marker
     // here; the caller keeps one consolidated marker (updateRewindMarker).
-    const fedNoRequest = (from: number, to: number): boolean => {
-      const body = all.slice(from, to + 1);
-      return (refusedReply !== undefined && body.some((m) => m.id === refusedReply))
-        || body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null);
-    };
     const uncounted: Array<{ from: number; to: number }> = [];
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
       if (meta.system) continue;
-      const body = bodyRangeIn(all, i);
-      if (fedNoRequest(body.from, i)) {
-        uncounted.push({ from: body.from, to: i });
-        i = body.from;
-        continue;
+      const { from: start } = bodyRangeIn(all, i);
+      const body = all.slice(start, i + 1);
+      if ((refusedReply !== undefined && body.some((m) => m.id === refusedReply))
+        || body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)) {
+        uncounted.push({ from: start, to: i });
+      } else if (!carried || body.some((m) => carried.has(m.id))) {
+        idx = i; break;
       }
-      idx = i; break;
+      i = start;
     }
-    if (idx < 0) return null;
+    if (idx < 0) {
+      for (const { from: start, to } of uncounted) removeStoredMessages(cm, all[start], all[to]);
+      return null;
+    }
     // The newest message can be the last shard of a body (a document stored
     // in shards). context-manager removes a shard only with the rest of its
     // body, so the rewind takes the whole body.
@@ -13237,6 +13238,11 @@ export class AgentFramework {
                 kind: 'injected' as const, id: injection.id, participant: injectedMessages[i]!.participant, sent: injectedMessages[i]!.content,
               })),
             ], replySent === null || replySent === undefined);
+            const carried = this.streamCarried.get(currentState.stream);
+            if (carried) {
+              const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.map((injection) => injection.id) : [];
+              for (const id of [replyId, resultsId, ...injected]) if (id !== undefined) carried.add(id);
+            }
             currentState.stream.provideToolResults(
               submitted,
               midTurnInjections.length > 0 ? { injectedMessages } : undefined,
@@ -19795,6 +19801,7 @@ export class AgentFramework {
         placeDrops,
         thinkingRecordedAfter,
         noteRequestSent,
+        carriedBodies,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
@@ -19803,6 +19810,7 @@ export class AgentFramework {
       });
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
+      if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -21271,15 +21279,13 @@ export class AgentFramework {
               // By the time a refusal reaches here, membrane's retries are
               // already spent — so this path is the escalation: rewind (if
               // enabled), then the reaction.
-              // Shed exactly one more (newest, in-sequence) turn and keep the
-              // single episode marker current. `budgetLeft` bounds the loop.
               const doRewind = (
                 budgetLeft: boolean,
                 onStep: (count: number) => void,
                 onGiveUp: () => void,
               ): void => {
                 if (!budgetLeft) { onGiveUp(); return; }
-                const rec = this.shedNewestTurn(agent, refusedReplyId);
+                const rec = this.shedNewestTurn(agent, refusedReplyId, this.streamCarried.get(stream));
                 if (!rec) { onGiveUp(); return; }
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
