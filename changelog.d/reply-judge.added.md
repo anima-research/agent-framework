@@ -8,7 +8,7 @@
   - `effort`: default `"low"`; `"none"` sends none, for a provider without Anthropic's `output_config`.
   - `enabled: false` leaves it unwired.
 - How the judge calls its model:
-  - Its calls are bound as compression's are: under a hold on the agent or on the model, a call is refused without being made, and the batch takes `onError`'s path; a call is withdrawn under a surgery or a stop; and a call that fails records the model's wait and arms the host hold. None of them waits on the agent's turn, which stops the judge instead.
+  - The agent's provider holds bind its calls, but where compression waits out a hold, a judge call is refused without being made: under a hold on the agent or on the call's model, and, as compression's are, under a surgery or at stop. A refused call takes `onError`'s path. A call that fails records the wait its provider states, if any, so the judge's next call on that model is refused until it ends, and holds nothing else: the judge usually runs on another model than the agent's. None of them waits on the agent's turn, which stops the judge instead.
   - Each request's usage counts as the judged agent's, in its usage tally and the session's totals, as a turn's does.
   - It always uses membrane's native formatter: an XML-formatted request would end in a prefill, which current Claude models refuse.
   - It reads a fixed tail: the newest of the conversation in whole messages, up to about 6,700 characters (the newest message always, up to the 12,000 a message renders), the agent's system prompt cut to 850, and the batch's listing to 2,160: its newest events, shown oldest first, the newest always listed, each event's text cut to 200, and the rest counted. That's a few thousand tokens a request, with no prompt caching.

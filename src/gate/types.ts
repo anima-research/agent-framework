@@ -64,10 +64,10 @@ export interface PassiveSampleConfig {
  * and answers reply or wait. On reply the
  * batch is delivered as a debounce's is; on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
- * judged afresh. A batch holding an event addressed to the agent
- * (`chat:addressed`) wakes it without asking the judge. A judge that fails or
- * times out wakes the agent (fail open), unless the host set its `onError` to
- * `"skip"`.
+ * judged afresh. Where a judge is wired, an event addressed to the agent
+ * (`chat:addressed`) wakes it as an `always` rule does, without the judge, and
+ * joins no batch. A judge that fails or times out wakes the agent (fail open),
+ * unless the host set its `onError` to `"skip"`.
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */

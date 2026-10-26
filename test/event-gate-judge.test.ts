@@ -884,26 +884,40 @@ describe('wake_add_rule with judge', () => {
     assert.strictEqual(after.usage.outputTokens - (before?.usage.outputTokens ?? 0), 9);
   });
 
-  it("a judge call that finds a spent quota arms the host hold, and the agent's next turn parks behind it", async (t) => {
+  it("a judge call that fails records its model's wait and holds nothing else: the agent's turn still goes out, and the next judge call is refused", async (t) => {
     const { MembraneError } = await import('@animalabs/membrane');
     const { framework, membrane } = await judgeFramework(t, {}, { providerHold: () => ({ holdMs: 60_000, reason: 'weekly quota spent' }) });
-    (membrane as unknown as { complete: () => Promise<unknown> }).complete = async () => {
-      throw new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, message: "This request would exceed your account's rate limit.", rawError: { status: 429 } });
+    let judgeCalls = 0;
+    const complete = membrane.complete.bind(membrane);
+    (membrane as unknown as { complete: (r: { assistantParticipant?: string }) => Promise<unknown> }).complete = async (request) => {
+      if (request.assistantParticipant !== 'reply-judge') return complete(request as never);
+      judgeCalls++;
+      throw new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 60_000, message: "This request would exceed your account's rate limit.", rawError: { status: 429 } });
     };
-    const internal = framework as unknown as { eventGate: { judgeFn: JudgeFn }; providerAccelerationCooldowns: Map<string, { reason: string; failures: number; heldRequests: unknown[] }> };
-    await assert.rejects(internal.eventGate.judgeFn({
+    const internal = framework as unknown as {
+      eventGate: { judgeFn: JudgeFn };
+      providerAccelerationCooldowns: Map<string, unknown>;
+      providerWaits?: { active(agentName: string, model: string): unknown };
+    };
+    const request = () => internal.eventGate.judgeFn({
       policyName: 'ambient',
       events: [{ eventType: 'mcpl:push-event', addressed: false, content: 'lol', at: Date.now() }],
       agentNames: ['scout'],
       signal: new AbortController().signal,
-    }), /rate limit/);
-    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')?.reason, 'weekly quota spent');
-    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')?.failures, 1, 'one failure, counted once');
+    });
+    await assert.rejects(request(), /rate limit/);
+    assert.strictEqual(internal.providerAccelerationCooldowns.size, 0, 'no hold on the agent, though the host would grant one');
+    assert.ok(internal.providerWaits!.active('scout', 'claude-haiku-5-5'), "the judge's model waits");
+    assert.ok(!internal.providerWaits!.active('scout', 'test-model'), "the agent's own model doesn't");
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
     const streams = membrane.calls.length;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'here' }]));
     assert.strictEqual(framework.nudgeAgent('scout').ok, true);
-    await Promise.race([framework.runUntilIdle(), sleep(1_000)]);
-    assert.strictEqual(membrane.calls.length, streams, "the agent's turn makes no call");
-    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')!.heldRequests.length, 1, 'its request is held behind the hold');
+    await Promise.race([framework.runUntilIdle(), sleep(3_000)]);
+    assert.ok(membrane.calls.length > streams, "the agent's turn sent its request");
+    const refused = await request().then(() => undefined, (err: unknown) => err);
+    assert.strictEqual((refused as { providerAdmission?: unknown } | undefined)?.providerAdmission, 'deferred');
+    assert.strictEqual(judgeCalls, 1, 'the second judge call is refused without being made');
   });
 
   it('a judge call the gate stops is no provider failure: it arms no hold', async (t) => {
@@ -942,6 +956,29 @@ describe('wake_add_rule with judge', () => {
     assert.match(String((refused as Error)?.message), /withdrawn/);
     assert.strictEqual((refused as { providerAdmission?: unknown }).providerAdmission, 'deferred');
     assert.strictEqual(calls, 0);
+  });
+
+  it("a judge call on a model the provider holds is refused without being made, and the agent's own model isn't held", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework, membrane } = await judgeFramework(t, {});
+    let calls = 0;
+    (membrane as unknown as { complete: () => Promise<unknown> }).complete = async () => { calls++; throw new Error('no call expected'); };
+    const internal = framework as unknown as {
+      eventGate: { judgeFn: JudgeFn };
+      recordProviderWait(agentName: string, model: string, error: Error): unknown;
+      providerWaits?: { active(agentName: string, model: string): unknown };
+    };
+    const wait = new MembraneError({ type: 'rate_limit', retryable: true, retryAfterMs: 60_000, message: 'slow down', rawError: { status: 429 } });
+    assert.ok(internal.recordProviderWait('scout', 'claude-haiku-5-5', wait), "premise: the judge's model waits");
+    const refused = await internal.eventGate.judgeFn({
+      policyName: 'ambient',
+      events: [{ eventType: 'mcpl:push-event', addressed: false, content: 'lol', at: Date.now() }],
+      agentNames: ['scout'],
+      signal: new AbortController().signal,
+    }).then(() => undefined, (err: unknown) => err);
+    assert.strictEqual((refused as { providerAdmission?: unknown } | undefined)?.providerAdmission, 'deferred');
+    assert.strictEqual(calls, 0);
+    assert.ok(!internal.providerWaits!.active('scout', 'test-model'), "the agent's own model isn't held");
   });
 
   it('under a hold on the whole agent, the judge makes no call, and records nothing', async (t) => {

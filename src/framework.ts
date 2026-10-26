@@ -4983,7 +4983,15 @@ export class AgentFramework {
     gate.auxiliaryInFlight++;
     try { return await run(); }
     catch (error) {
-      this.recordAuxiliaryFailure(agentName, model, error);
+      // Compression can be the first call to find a spent quota (idle agent,
+      // scheduled maintenance). Record a stated wait for this call's model,
+      // and arm the host hold so later passes wait at the gate instead of
+      // retrying into it; this pass still fails to its caller.
+      const agent = this.agents.get(agentName);
+      if (agent && error instanceof Error) {
+        if (model !== undefined) this.recordProviderWait(agentName, model, error);
+        this.holdProviderAcceleration(agent, error, undefined, true);
+      }
       throw error;
     }
     finally {
@@ -5013,27 +5021,14 @@ export class AgentFramework {
       throw new MaintenanceWithdrawnError(`provider admission closed while stopping (${agentName})`);
     }
   }
-  /**
-   * An auxiliary call can be the first to find a spent quota (idle agent,
-   * scheduled maintenance). Record a stated wait for the call's model, and arm
-   * the host hold so later calls wait at the gate instead of retrying into it;
-   * the call still fails to its caller.
-   */
-  private recordAuxiliaryFailure(agentName: string, model: string | undefined, error: unknown): void {
-    const agent = this.agents.get(agentName);
-    if (agent && error instanceof Error) {
-      if (model !== undefined) this.recordProviderWait(agentName, model, error);
-      this.holdProviderAcceleration(agent, error, undefined, true);
-    }
-  }
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
   }
   /**
-   * The reply judge's calls: bound as the agent's other auxiliary calls are,
-   * except that none waits on the agent's turn, which stops the judge instead.
-   * Under a hold that parks the whole agent, a call is refused without being
-   * made, and records nothing.
+   * The reply judge's calls. None waits: under the agent's holds a call is
+   * refused without being made, and the agent's turn stops the judge. A call
+   * that fails records the wait its provider states, if any, and holds
+   * nothing else.
    */
   private judgeMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
@@ -5056,7 +5051,7 @@ export class AgentFramework {
       }
       try { return await run(); }
       catch (error) {
-        if (!(isMembraneError(error) && error.type === 'abort')) this.recordAuxiliaryFailure(agentName, model, error);
+        if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
         throw error;
       }
     });
