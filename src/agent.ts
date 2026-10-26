@@ -6,6 +6,7 @@ import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { carriedBlock, type SentRow } from './sent-rows.js';
+import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
@@ -517,6 +518,40 @@ export class Agent {
   /** Whether a stored participant is this agent's own voice. */
   isOwnParticipant(participant: string): boolean {
     return this.ownParticipants.has(participant);
+  }
+
+  /**
+   * How another agent's rounds go out in this agent's requests (#291, answer
+   * 13): `'raw'`, as stored, or `'transcript'` (foreign-rounds.ts), a line
+   * per call and per result and no thinking, the same in every compile and
+   * in what a tool boundary injects. The framework sets `'transcript'` for an
+   * agent that watches another's slot once its window follows the
+   * presentation index (the persistent subconscious); every other agent
+   * reads no other agent's rounds.
+   */
+  private foreignRounds: 'raw' | 'transcript' = 'raw';
+
+  /** Set how another agent's rounds go out in this agent's requests (see foreignRounds). */
+  setForeignRounds(mode: 'raw' | 'transcript'): void {
+    this.foreignRounds = mode;
+  }
+
+  /**
+   * A stored row as this agent's requests carry it, for a row a tool
+   * boundary injects: another participant's row as a transcript where this
+   * agent is sent other agents' rounds so (setForeignRounds), its own and
+   * every row otherwise as stored. An injected row holds no tool block (the
+   * boundary cuts at one), so what changes is its thinking.
+   */
+  injectedAsSent(participant: string, content: ContentBlock[]): ContentBlock[] {
+    if (this.foreignRounds !== 'transcript' || this.isOwnParticipant(participant)) return content;
+    return foreignRowAsSent(content);
+  }
+
+  /** A compile's messages with other agents' rounds as this agent is sent them (setForeignRounds). */
+  private foreignRoundsAsSent(messages: NormalizedMessage[]): NormalizedMessage[] {
+    if (this.foreignRounds !== 'transcript') return messages;
+    return transcribeForeignRounds(messages, (participant) => this.isOwnParticipant(participant));
   }
 
   /**
@@ -1635,7 +1670,7 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const messages = this.presentOwnTurns(withoutTokenEstimates(compiled.messages));
+      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1877,6 +1912,8 @@ export class Agent {
     // compression path.)
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
+    // Another agent's rounds go out as this agent is sent them (setForeignRounds).
+    messages = this.foreignRoundsAsSent(messages);
     messages = messages
       .map((m) => ({ ...m, content: m.content.filter(carriedBlock) }))
       .filter((m) => m.content.length > 0);

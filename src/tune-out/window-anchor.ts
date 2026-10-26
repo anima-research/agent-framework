@@ -1,0 +1,139 @@
+/**
+ * Where the persistent subconscious's window starts (#291, AF-5).
+ *
+ * The subconscious reads a tune-out's held traffic through a windowed
+ * passthrough strategy: everything from the anchor on, the anchor at the
+ * oldest active tune-out's start (the coordinator's anchorSubconscious).
+ * While its window is the record, a start is a sequence, and the window is
+ * every row stored at it or after. Once its window follows the presentation
+ * index, the window is the rows in the order it was shown them, and a start
+ * is an index ordinal: the row at it and every row presented after it.
+ *
+ * A tune-out's start can't be turned into an ordinal once and for all at its
+ * enter. The subconscious's window grows only at its own points, so a row
+ * stored before the start can still be out of its window then (its turn
+ * alive, the host quiesced), and would be presented after the start, inside
+ * the window. Converting the sequence again later (a restart, another
+ * tune-out's enter) can give another ordinal, and so another window, once
+ * rows have been presented out of record order. So each tune-out's start is
+ * fixed once, at the first moment no row the subconscious is owed stored
+ * before the start is out of its window: the ordinal just past the last row
+ * in its window stored before the start, which leaves every such row out
+ * (0 when there is none). Others' rows enter a window in record order, so
+ * that is where the first row stored at the start or after entered, unless
+ * one of the subconscious's own rows was presented ahead of them, at its
+ * write, in the turn the tune-out began in; that row stays out too, the turn
+ * having been before the tune-out. The coordinator keeps the ordinal
+ * (subconsciousWindowFixed), and from then on the start is set by it,
+ * clamped to the window's length on a branch whose window is shorter (a
+ * rollback), never converted again.
+ */
+import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
+import type { SubconsciousWindowStart } from './coordinator.js';
+import type { TraceEvent } from '../types/trace.js';
+
+/** The windowed strategy's anchor setters and read, as the anchor uses them. */
+export interface AnchoredStrategy {
+  setAnchor(sequence: number): void;
+  setAnchorOrdinal(ordinal: number): void;
+  getAnchorOrdinal(): number | undefined;
+}
+
+/** What the anchor reads of the framework. */
+export interface SubconsciousWindowAnchorHost {
+  /** The subconscious's name, for its traces. */
+  readonly agentName: string;
+  /** Its context manager while it is registered. */
+  cm(): Pick<ContextManager, 'indexLength' | 'getPresentedMessages' | 'ordinalOf'> | undefined;
+  /** Its windowed strategy. */
+  strategy(): AnchoredStrategy | null;
+  /** Whether its window follows the presentation index, so its places are ordinals. */
+  presents(): boolean;
+  /** The rows it is owed that its window doesn't hold yet, one per body (AgentPresentation.owedOf). */
+  owed(): readonly Pick<StoredMessage, 'sequence'>[];
+  /** Keep a start fixed for `epochIds` (TuneOutCoordinator.subconsciousWindowFixed). */
+  fixed(epochIds: readonly string[], ordinal: number): void;
+  emitTrace(event: Omit<Extract<TraceEvent, { type: 'tune-out:subconscious-window' }>, 'timestamp' | 'traceId'>): void;
+}
+
+/** The subconscious's window start, set by sequence in legacy mode and by a fixed ordinal once its window is presented. */
+export class SubconsciousWindowAnchor {
+  /** A start whose ordinal isn't fixed yet: some row older than it is still out of the window. */
+  private pending: SubconsciousWindowStart | null = null;
+
+  constructor(private readonly host: SubconsciousWindowAnchorHost) {}
+
+  /**
+   * Set the window start (the coordinator's setSubconsciousAnchor). In
+   * legacy mode by its sequence, as before the index. In presented mode by
+   * its ordinal when one was fixed, clamped to the window's index length
+   * and traced when past it; else by its sequence for now, converted as the
+   * strategy converts one, and the ordinal is fixed (see the module doc) as
+   * soon as no row the subconscious is owed stored before the start is out
+   * of its window, now or at a later presentation (presented). Never
+   * throws: a set that fails is logged, and the anchor stays where it was.
+   */
+  set(start: SubconsciousWindowStart): void {
+    try {
+      const strategy = this.host.strategy();
+      if (!strategy) return;
+      if (!this.host.presents()) {
+        this.pending = null;
+        strategy.setAnchor(start.sequence);
+        return;
+      }
+      if (start.ordinal !== undefined) {
+        this.pending = null;
+        const length = this.host.cm()?.indexLength() ?? 0;
+        const ordinal = Math.min(start.ordinal, length);
+        strategy.setAnchorOrdinal(ordinal);
+        if (ordinal !== start.ordinal) {
+          this.host.emitTrace({
+            type: 'tune-out:subconscious-window', agentName: this.host.agentName,
+            epochIds: [...start.epochIds], how: 'clamped', ordinal, kept: start.ordinal,
+          });
+        }
+        return;
+      }
+      this.pending = start;
+      strategy.setAnchor(start.sequence);
+      this.tryFix();
+    } catch (error) {
+      console.error(`[tune-out] the subconscious's window start couldn't be set, so it stays where it was:`, error);
+    }
+  }
+
+  /** Rows entered the subconscious's window (the presentation index's onPresented): a start waiting to be fixed may be fixable now. */
+  presented(): void {
+    if (!this.pending) return;
+    try {
+      this.tryFix();
+    } catch (error) {
+      console.error(`[tune-out] the subconscious's window start couldn't be fixed at this presentation; the next one tries again:`, error);
+    }
+  }
+
+  /** Fix the pending start's ordinal, once no row owed and stored before it is out of the window. */
+  private tryFix(): void {
+    const pending = this.pending;
+    if (!pending || !this.host.presents()) return;
+    if (this.host.owed().some((row) => row.sequence < pending.sequence)) return;
+    const cm = this.host.cm();
+    const strategy = this.host.strategy();
+    if (!cm || !strategy) return;
+    // Just past the last row in the window stored before the start.
+    let ordinal = 0;
+    for (const row of cm.getPresentedMessages()) {
+      if (row.sequence >= pending.sequence) continue;
+      const at = cm.ordinalOf(row.id);
+      if (at !== undefined && at + 1 > ordinal) ordinal = at + 1;
+    }
+    this.pending = null;
+    strategy.setAnchorOrdinal(ordinal);
+    this.host.fixed(pending.epochIds, ordinal);
+    this.host.emitTrace({
+      type: 'tune-out:subconscious-window', agentName: this.host.agentName,
+      epochIds: [...pending.epochIds], how: 'fixed', ordinal,
+    });
+  }
+}

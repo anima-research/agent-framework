@@ -906,6 +906,26 @@ export type TraceEvent =
       returned: number;
     })
 
+  /**
+   * The persistent subconscious's window start was set by index ordinal
+   * (#291): `fixed`, a tune-out's start fixed once no row the subconscious
+   * is owed stored before the start was out of its window, and kept for its
+   * epochs; `clamped`, a kept start (`kept`) past its window's index length
+   * on the store's branch now (one a rollback made shorter), set at the
+   * length instead.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:subconscious-window';
+      agentName: string;
+      /** The tune-outs that start there. */
+      epochIds: string[];
+      how: 'fixed' | 'clamped';
+      /** The ordinal the window starts at now. */
+      ordinal: number;
+      /** For `clamped`, the ordinal kept for them. */
+      kept?: number;
+    })
+
   // Dendrite: agent registry and lifecycle.
   // `agent-created` is the consent event: it names the kind of agent, what
   // ends it, and what happens to it when its spawner ends.

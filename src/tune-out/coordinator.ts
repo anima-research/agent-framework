@@ -86,6 +86,27 @@ export type QueuedHeldMessage = Pick<StoredMessage, 'participant' | 'content' | 
   heldAt?: number;
 };
 
+/**
+ * Where the persistent subconscious's window starts (#291, AF-5): at the
+ * oldest active tune-out's start, never forward past one, so a tune-out's
+ * reader sees every message it held. `sequence` is where the tune-out
+ * started in the record (its startedAtSequence), which places the start
+ * while the subconscious's window is the record. Once its window follows the
+ * presentation index, the start is a place in that window, an index
+ * ordinal, fixed once per tune-out and recorded (`ordinal`;
+ * TuneOutCoordinator.subconsciousWindowFixed), since a row stored before
+ * the start can be presented after it, and the sequence converted again
+ * then gives another window. `epochIds` are the active tune-outs starting
+ * there: one, or a channel's and the all-except hold's begun at the same
+ * sequence.
+ */
+export interface SubconsciousWindowStart {
+  sequence: number;
+  /** The start as the subconscious's index ordinal, once fixed for one of `epochIds`. */
+  ordinal?: number;
+  epochIds: readonly string[];
+}
+
 /** The deferred write a stored row landed from, when it came through the queue. */
 function writeIdOf(m: Pick<StoredMessage, 'metadata'>): string | undefined {
   const writeId = (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
@@ -239,8 +260,30 @@ export interface TuneOutFrameworkHooks {
   residentMessageChars?: () => number | undefined;
   /** Current chronicle head sequence (window anchor for new epochs). */
   currentSequence: () => number;
-  /** Move the subconscious window anchor (never forward past active epochs). */
-  setSubconsciousAnchor: (sequence: number) => void;
+  /**
+   * Move the subconscious window anchor to `start`, the oldest active
+   * tune-out's (never forward past active epochs): by its sequence while
+   * the subconscious's window is the record, by its ordinal once that is
+   * known, and else by an ordinal the framework fixes for it and reports
+   * (subconsciousWindowFixed).
+   */
+  setSubconsciousAnchor: (start: SubconsciousWindowStart) => void;
+  /**
+   * Whether the subconscious's window keeps index ordinals (its context
+   * manager presents rows, #291), so each tune-out's window start is kept as
+   * one (`subconscious/<primary>/window-starts`). Left out, or false, none
+   * is kept or read, and the anchor goes by sequence alone.
+   */
+  subconsciousWindowOrdinals?: () => boolean;
+  /**
+   * How many of the residents' stored messages `keep` keeps that the
+   * persistent subconscious hasn't been shown yet: with the presentation
+   * index, those its window doesn't hold; else those stored after its last
+   * compile. A cancel the subconscious makes itself gives it a report turn
+   * when any of its tune-out's are, since it wrote its note without them.
+   * Left out, none are.
+   */
+  unseenBySubconscious?: (keep: (m: Pick<StoredMessage, 'metadata'>) => boolean) => number;
   /** True when a channel is bound to a conversation-fork agent. */
   isForkBound: (channel: ChannelRef) => boolean;
   /** Gate privileged-users list (#77: privileged authors wake, like mentions). */
@@ -334,7 +377,6 @@ export class TuneOutCoordinator {
 
   /** Restart cadence + expiry timers and re-anchor after a process restart. */
   resumeActiveEpochs(): void {
-    let oldestAnchor: number | null = null;
     for (const { serverId, channelId, params } of this.listActive()) {
       // An epoch whose deadline passed while the process was down cancels
       // immediately — the resident gets their backlog on the schedule they
@@ -345,9 +387,6 @@ export class TuneOutCoordinator {
       }
       this.startCadence(serverId, channelId, params.cadenceSeconds);
       this.armExpiry(serverId, channelId, params);
-      if (oldestAnchor === null || params.startedAtSequence < oldestAnchor) {
-        oldestAnchor = params.startedAtSequence;
-      }
     }
     const scope = this.getAllExcept();
     if (scope) {
@@ -355,14 +394,131 @@ export class TuneOutCoordinator {
         this.cancelAllExcept('duration', 'duration elapsed');
       } else {
         this.armScopeTimers(scope.params);
-        if (oldestAnchor === null || scope.params.startedAtSequence < oldestAnchor) {
-          oldestAnchor = scope.params.startedAtSequence;
-        }
       }
     }
-    if (oldestAnchor !== null) {
-      this.hooks.setSubconsciousAnchor(oldestAnchor);
+    // A window start kept for a tune-out that ended while the process was
+    // down, its cancel's own forget not written, goes now.
+    this.pruneWindowStarts();
+    this.anchorSubconscious();
+  }
+
+  /** The tune-outs active now, a channel's and the all-except hold, with where each started in the record. */
+  private activeStarts(): Array<{ epochId: string; sequence: number }> {
+    const starts = this.listActive().map(({ params }) => ({ epochId: params.epochId, sequence: params.startedAtSequence }));
+    const scope = this.getAllExcept();
+    if (scope) starts.push({ epochId: scope.params.epochId, sequence: scope.params.startedAtSequence });
+    return starts;
+  }
+
+  /**
+   * Set the subconscious's window start to the oldest active tune-out's
+   * (setSubconsciousAnchor), with its ordinal when one was fixed for it. The
+   * all-except hold counts with the channels' tune-outs, wherever this is
+   * called, so a channel's tune-out entered during an older hold leaves the
+   * start at the hold's. Nothing when none is active: the anchor stays where
+   * it was, as a cancel leaves it.
+   */
+  private anchorSubconscious(): void {
+    const active = this.activeStarts();
+    if (active.length === 0) return;
+    const sequence = Math.min(...active.map((e) => e.sequence));
+    const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
+    const starts = this.ordinalsKept() ? this.readWindowStarts() : {};
+    const ordinal = epochIds.map((id) => starts[id]).find((o) => o !== undefined);
+    this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds });
+  }
+
+  // ==========================================================================
+  // Window starts (the subconscious's, by ordinal)
+  // ==========================================================================
+
+  /** Where each active tune-out's window start is kept, by ordinal: a snapshot state, on each branch its own. */
+  private get windowStartsStateId(): string {
+    return `subconscious/${this.hooks.primaryName() ?? 'default'}/window-starts`;
+  }
+
+  /** Whether the subconscious's window keeps ordinals, so its starts are kept (subconsciousWindowOrdinals). */
+  private ordinalsKept(): boolean {
+    try {
+      return this.hooks.subconsciousName() != null && this.hooks.subconsciousWindowOrdinals?.() === true;
+    } catch {
+      return false;
     }
+  }
+
+  /**
+   * Each tune-out's window start as an ordinal, by epoch id, as kept on the
+   * store's branch now. A state that can't be read, or isn't this format
+   * (`{ v: 1, starts }`), reads as none kept, and is written over at the
+   * next fix, with a line saying so.
+   */
+  private readWindowStarts(): Record<string, number> {
+    let raw: unknown;
+    try {
+      raw = this.channelRegistry.readCoordinatorState(this.windowStartsStateId);
+    } catch (err) {
+      console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) can't be read, so none is kept:`, err);
+      return {};
+    }
+    if (raw == null) return {};
+    const state = raw as { v?: unknown; starts?: unknown };
+    if (state.v !== 1 || !state.starts || typeof state.starts !== 'object') {
+      console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) aren't in a form this version reads, so none is kept; the next fix writes over them`);
+      return {};
+    }
+    const starts: Record<string, number> = {};
+    for (const [epochId, ordinal] of Object.entries(state.starts as Record<string, unknown>)) {
+      if (typeof ordinal === 'number' && Number.isInteger(ordinal) && ordinal >= 0) starts[epochId] = ordinal;
+    }
+    return starts;
+  }
+
+  /** Keep `starts`; a write that fails is logged, and the anchor the strategy holds stays as it is. */
+  private writeWindowStarts(starts: Record<string, number>): void {
+    try {
+      this.channelRegistry.writeCoordinatorState(this.windowStartsStateId, { v: 1, starts });
+    } catch (err) {
+      console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) couldn't be written, so a restart fixes them again:`, err);
+    }
+  }
+
+  /**
+   * The framework fixed the subconscious's window start for `epochIds` at
+   * `ordinal` (its index ordinal, #291): kept for each of them still active,
+   * so a later anchor (another tune-out's enter, a restart) sets that
+   * ordinal again rather than converting the tune-out's sequence anew.
+   */
+  subconsciousWindowFixed(epochIds: readonly string[], ordinal: number): void {
+    if (!this.ordinalsKept()) return;
+    const active = new Set(this.activeStarts().map((e) => e.epochId));
+    const starts = this.readWindowStarts();
+    let changed = false;
+    for (const epochId of epochIds) {
+      if (!active.has(epochId) || starts[epochId] === ordinal) continue;
+      starts[epochId] = ordinal;
+      changed = true;
+    }
+    if (changed) this.writeWindowStarts(starts);
+  }
+
+  /** An ended tune-out's window start goes. */
+  private forgetWindowStart(epochId: string): void {
+    if (!this.ordinalsKept()) return;
+    const starts = this.readWindowStarts();
+    if (!(epochId in starts)) return;
+    delete starts[epochId];
+    this.writeWindowStarts(starts);
+  }
+
+  /** The window starts of tune-outs no longer active go. */
+  private pruneWindowStarts(): void {
+    if (!this.ordinalsKept()) return;
+    const starts = this.readWindowStarts();
+    const active = new Set(this.activeStarts().map((e) => e.epochId));
+    const stale = Object.keys(starts).filter((epochId) => !active.has(epochId));
+    if (stale.length === 0) return;
+    for (const epochId of stale) delete starts[epochId];
+    this.writeWindowStarts(starts);
   }
 
   private armExpiry(serverId: string, channelId: string, params: TuneOutParams): void {
@@ -523,11 +679,7 @@ export class TuneOutCoordinator {
 
     // Window anchor: start of the OLDEST active tune-out. Never move the
     // anchor forward here — an older active epoch owns it.
-    const oldest = this.listActive().reduce(
-      (min, e) => Math.min(min, e.params.startedAtSequence),
-      params.startedAtSequence,
-    );
-    this.hooks.setSubconsciousAnchor(oldest);
+    this.anchorSubconscious();
 
     this.divertedSinceInvocation.set(this.key(serverId, channelId), 0);
     if (this.readerAvailable()) this.startCadence(serverId, channelId, params.cadenceSeconds);
@@ -704,20 +856,27 @@ export class TuneOutCoordinator {
     // dump can't give the resident whole follow the notice, each a row of its
     // own with its own content, as its view can't have them until they're
     // stored. A cancel the subconscious makes itself gets the notice and the
-    // turn when some do, since it wrote its note before it could see them,
-    // and when it wrote no note and the dump left any message out, since
-    // nothing else then covers it. Otherwise its note speaks for what it saw.
+    // turn when some do, or when some of the epoch's stored messages are ones
+    // it hasn't been shown yet (unseenBySubconscious: those that came in
+    // during its own turn, say), since it wrote its note before it could see
+    // them, and the notice says how many; and when it wrote no note and the
+    // dump left any message out, since nothing else then covers it.
+    // Otherwise its note speaks for what it saw.
     const selfCancel = source === 'subconscious';
-    if (subName && (!selfCancel || heldForReport.length > 0 || (!subconsciousNote && truncated > 0))) {
+    const unseen = subName && selfCancel ? this.unseenBySubconscious(ofEpoch) : 0;
+    if (subName && (!selfCancel || heldForReport.length > 0 || unseen > 0 || (!subconsciousNote && truncated > 0))) {
       const truncNote = truncated > 0
         ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
         : '';
       const heldNote = heldForReport.length > 0
         ? ` Still held at the cancel, so your view may not have them yet: the ${heldForReport.length} message${heldForReport.length === 1 ? '' : 's'} after this one.`
         : '';
+      const unseenNote = unseen > 0
+        ? ` ${unseen === 1 ? 'One of its held messages' : `${unseen} of its held messages`} came in after you last looked; your view has ${unseen === 1 ? 'it' : 'them'} now.`
+        : '';
       this.hooks.addMessage(
         'user',
-        [{ type: 'text', text: `[Tune-out cancelled: ${this.shown(serverId, channelId)} — ${reason}.${truncNote}${heldNote}]` }],
+        [{ type: 'text', text: `[Tune-out cancelled: ${this.shown(serverId, channelId)} — ${reason}.${truncNote}${heldNote}${unseenNote}]` }],
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
@@ -757,8 +916,19 @@ export class TuneOutCoordinator {
     this.readerCursor.delete(this.key(serverId, channelId));
     this.readerHandedWrites.delete(this.key(serverId, channelId));
     this.readerReturned.delete(this.key(serverId, channelId));
+    this.forgetWindowStart(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
+  }
+
+  /** How many stored messages `keep` keeps the subconscious hasn't been shown (the hook's count), 0 where the host can't say. */
+  private unseenBySubconscious(keep: (m: Pick<StoredMessage, 'metadata'>) => boolean): number {
+    try {
+      return this.hooks.unseenBySubconscious?.(keep) ?? 0;
+    } catch (err) {
+      console.error('[tune-out] could not count the held messages the subconscious has not been shown, so none is counted:', err);
+      return 0;
+    }
   }
 
   // ==========================================================================
@@ -867,8 +1037,7 @@ export class TuneOutCoordinator {
       source,
     };
     this.writeScope({ params, wakeCount: 0 });
-    const oldest = this.listActive().reduce((min, e) => Math.min(min, e.params.startedAtSequence), params.startedAtSequence);
-    this.hooks.setSubconsciousAnchor(oldest);
+    this.anchorSubconscious();
     this.armScopeTimers(params);
     this.hooks.emitTrace({
       type: 'tune-out:entered', serverId: except.serverId, channelId: except.channelId, epochId: params.epochId,
@@ -1059,6 +1228,7 @@ export class TuneOutCoordinator {
         this.readerReturned.delete(key);
       }
     }
+    this.forgetWindowStart(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
     this.announce(except, epochId, 'released', `[Focus: ${primary ?? 'the resident'} released — ${reason}.]`);
     return { ok: true };
@@ -1281,7 +1451,10 @@ export class TuneOutCoordinator {
   /**
    * One subconscious turn: a system-framed trigger notice (bracket style —
    * what happened, never what to say) plus standing dispositions, then an
-   * inference request. The merged view supplies the actual traffic.
+   * inference request. Its view supplies the actual traffic: the merged
+   * record while its window is the record, and with the presentation index
+   * (#291) what its window holds, which takes what it hasn't been shown at
+   * the turn's start, the notice included.
    */
   private invokeSubconscious(
     serverId: string,

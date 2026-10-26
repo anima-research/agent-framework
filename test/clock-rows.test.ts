@@ -686,11 +686,41 @@ describe('clock rows in the framework', () => {
     } finally { await x.framework.stop(); }
   });
 
+  // #291, AF-5: a message a tune-out holds is stored at once, whatever the
+  // resident's turn, where it waited behind the turn. Stored during the
+  // turn, it takes no clock row: the clock is the resident's own row, and it
+  // would sit inside that turn. The turn's tool boundary takes the clock due.
+  it('writes no clock before a held message stored during a turn, though one is due', async () => {
+    const x = await make();
+    const heldWrite = (text: string) =>
+      (x.framework as any).addMessage('antra', [{ type: 'text', text }], { tuneOut: { epochId: 'e1' } });
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm'), [{ type: 'text', text: 'ok' }]);
+      setClock('2026-10-21T11:05:10Z');
+      let storedAtOnce = false;
+      x.mod.during = () => {
+        setClock('2026-10-21T11:16:10Z');
+        heldWrite('held mid-turn');
+        storedAtOnce = rows(x.framework).some((r) => textOf(r) === 'held mid-turn');
+      };
+      await wake(x, event('go'), [ping], [{ type: 'text', text: 'done' }]);
+      assert.ok(storedAtOnce, 'stored while the tool ran, not deferred behind the turn');
+      const all = rows(x.framework);
+      const held = indexOfText(all, 'held mid-turn');
+      assert.ok(!isClock(all[held - 1]!), 'no clock before it, though 11:10 had passed: it would sit inside the turn');
+      assert.ok(all.slice(held + 1).some(isClock), "the turn's tool boundary takes the clock due, after it");
+    } finally { await x.framework.stop(); }
+  });
+
   it('the subconscious takes no clock of its own', async () => {
     const x = await make(undefined, { framework: { subconscious: { enabled: true, systemPrompt: 'notice' } } });
     try {
       assert.ok(x.framework.getAgent('assistant')!.clock, 'the resident has one');
-      assert.equal(x.framework.getAgent('Subconscious')!.clock, undefined, 'its merged view carries the resident\'s');
+      // Its view carries the resident's clocks: its merged view, and with the
+      // presentation index its window, which takes the resident's clock rows
+      // by its observe edge (#291).
+      assert.equal(x.framework.getAgent('Subconscious')!.clock, undefined, 'its view carries the resident\'s');
     } finally { await x.framework.stop(); }
   });
 

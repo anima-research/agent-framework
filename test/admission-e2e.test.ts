@@ -126,7 +126,10 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  it('gap 5 — a held message arriving mid-turn is stored, not injected into the live turn', async () => {
+  // A held message is stored at once, whatever the resident's turn (#291,
+  // AF-5): it was deferred behind the turn and stored at its tool boundary,
+  // and is now in the store while the tool still waits, so its reader has it.
+  it('gap 5 — a held message arriving mid-turn is stored at once, not injected into the live turn', async () => {
     const gate = new GateModule();
     const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
     try {
@@ -134,10 +137,8 @@ describe('admission: the hold is decided once, before any side effect', () => {
       enter(f, 'noisy');
       const { loop } = await blockInTool(f, gate);
       await incoming(f, 'noisy', 'n1', 'held while acting');
-      await eventually(
-        () => internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('held while acting')) || has(f, 'held while acting'),
-        'held message arrived',
-      );
+      await eventually(() => has(f, 'held while acting'), 'held message stored while the tool waits');
+      assert.ok(!internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('held while acting')), 'and nothing of it is queued');
       gate.release('g1');
       await loop;
       assert.ok(held(find(f, 'held while acting')), 'stored with the hold record');
@@ -150,7 +151,10 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  it('gap 7 — a held message still in the deferred queue at cancel is in the release', async () => {
+  // A held message arriving mid-turn is stored at once now (#291, AF-5), so
+  // the release reads it from the record; one a quiesce queues is still read
+  // from the queue (the twin below), until the queue goes (AF-6).
+  it('gap 7 — a held message stored mid-turn, before the cancel, is in the release', async () => {
     const gate = new GateModule();
     const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
     try {
@@ -158,7 +162,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
       enter(f, 'noisy', { backlogCap: 10 });
       const { loop } = await blockInTool(f, gate);
       await incoming(f, 'noisy', 'n1', 'deferred and held');
-      await eventually(() => internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('deferred and held')), 'held message deferred');
+      await eventually(() => has(f, 'deferred and held'), 'held message stored mid-turn');
       assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
       // The cancel wakes the resident (after this turn) and the reader; the
       // mock answers every further request so neither wake is left streaming.
@@ -168,6 +172,30 @@ describe('admission: the hold is decided once, before any side effect', () => {
       const release = textOf(find(f, '<tuned-out-backlog'));
       assert.match(release, /messages=1/, 'the deferred message is counted');
       assert.match(release, /antra: deferred and held/, 'and listed');
+    } finally { await f.close(); }
+  });
+
+  it('gap 7 (quiesce) — a held message a quiesce queues is in a release made during it', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const epochId = internals(f).channelRegistry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      await f.framework.quiesce();
+      // As admission stores a held message (a quiesce pauses the MCPL data
+      // plane, so this one comes in past it), for the primary.
+      (f.framework as unknown as { addMessage(p: string, c: unknown[], m: Record<string, unknown>): string })
+        .addMessage('antra', [{ type: 'text', text: 'queued by the quiesce' }], {
+          tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+        });
+      assert.ok(internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('queued by the quiesce')), 'premise: the quiesce queued it');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      f.alwaysRespond();
+      await f.framework.resume();
+      await eventually(() => has(f, '<tuned-out-backlog'), 'the release lands at resume');
+      const release = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(release, /messages=1/, 'the queued message is counted');
+      assert.match(release, /antra: queued by the quiesce/, 'and listed');
     } finally { await f.close(); }
   });
 
@@ -181,7 +209,9 @@ describe('admission: the hold is decided once, before any side effect', () => {
       enter(f, 'noisy', { backlogCap: 10 });
       const { loop } = await blockInTool(f, gate);
       await incoming(f, 'noisy', 'n1', 'held before the crash');
-      await eventually(() => internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('held before the crash')), 'held message deferred');
+      // Stored at once (#291, AF-5), where it was deferred behind the turn;
+      // the release itself, for the resident, still waits for the turn.
+      await eventually(() => has(f, 'held before the crash'), 'held message stored');
       assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
       // The epoch is ended durably; the release, still deferred, is too.
       assert.ok(existsSync(recovery), 'the deferred queue was persisted by the cancel');

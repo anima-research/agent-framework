@@ -24,6 +24,8 @@ import {
   type ForkReaderConfig,
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, type QueuedHeldMessage, type ReaderInvocation } from './tune-out/coordinator.js';
+import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
+import { residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
 import type {
   MessageId,
@@ -2444,13 +2446,10 @@ interface EphemeralRun {
 // index's observe rule reads it too, and is exported here as before.
 export { heldFromResidents } from './presentation.js';
 
-/**
- * What a reader of the residents' shared message slot does not see: held
- * messages. Used by every resident, and by a context derived from one when
- * it is reopened.
- */
-const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
-  !heldFromResidents(message.metadata as Record<string, unknown> | undefined);
+// What a reader of the residents' shared message slot does not see (held
+// messages, and the other residents' stored context injections) is
+// residentViewFilter, in context-options.ts beside the subconscious's view,
+// where a host that opens these contexts itself takes them from.
 
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
 interface DerivingContextManager {
@@ -2472,7 +2471,8 @@ interface ContextDerivationRecord {
   branch: string;
   atSequence: number;
   solve: 'reuse' | 'fresh';
-  slots?: { messageNamespace: string | null; contextNamespace: string | null };
+  /** The slots the derived context reads: its parent's, and the slots merged beside them (the subconscious's residents' slot, null). */
+  slots?: { messageNamespace: string | null; contextNamespace: string | null; auxiliaryNamespaces?: Array<string | null> };
 }
 
 /** `ContextManager.reopenDerived`, absent on versions without derivation. */
@@ -3373,6 +3373,8 @@ export class AgentFramework {
   private subconsciousAgentName: string | null = null;
   /** Its windowed strategy — the coordinator moves the anchor on tune-out entry. */
   private subconsciousStrategy: WindowedPassthroughStrategy | null = null;
+  /** Where the persistent subconscious's window starts, by sequence or by a fixed ordinal (#291, AF-5). */
+  private subconsciousAnchor: SubconsciousWindowAnchor | null = null;
   /** Its config (speak_in_channel gate, voice block provenance). */
   private subconsciousConfig: SubconsciousConfig | null = null;
   /** Tune-out coordinator (issue #77); non-null iff a reader is configured + channels. */
@@ -4484,8 +4486,12 @@ export class AgentFramework {
             return chars;
           },
           currentSequence: () => framework.store.currentSequence(),
-          setSubconsciousAnchor: (sequence) =>
-            framework.subconsciousStrategy?.setAnchor(sequence),
+          // By sequence while its window is the record; by a fixed ordinal
+          // once the presentation index presents for it (window-anchor.ts).
+          setSubconsciousAnchor: (start) => framework.subconsciousAnchor?.set(start),
+          subconsciousWindowOrdinals: () => framework.presents(
+            framework.subconsciousAgentName ? framework.agents.get(framework.subconsciousAgentName) : undefined),
+          unseenBySubconscious: (keep) => framework.unseenBySubconscious(keep),
           isForkBound: (channel) =>
             framework.registry.list().some((record) => sameChannel(framework.homeOf(record.name), channel)),
           isPrivilegedAuthor: (authorId) =>
@@ -10117,13 +10123,16 @@ export class AgentFramework {
             '@animalabs/context-manager cannot reopen (ContextManager.reopenDerived)',
         );
       }
+      // A derived context keeps the view it was derived with, its parent's
+      // (context-manager's derive carries the parent's filter), back to the
+      // agent the chain of shared derivations started from.
+      const viewFilter = this.liveViewFilterOf(this.viewOwnerOf(record));
       return reopen.call(ContextManager, {
         store: this.store,
         derivation,
         strategy: strategy ?? new PassthroughStrategy(),
         membrane: this.membrane,
-        // A context derived from a reader of the shared slot keeps that reader's view.
-        ...(derivation.slots?.messageNamespace === null ? { viewFilter: RESIDENT_VIEW_FILTER } : {}),
+        ...(viewFilter ? { viewFilter } : {}),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
     }
@@ -10142,6 +10151,9 @@ export class AgentFramework {
     //   branch of its own (a shared fork's), merges nothing: an auxiliary
     //   view reads a namespace on this context's branch, which would show
     //   another branch's rows as that slot's.
+    // Either way, through the view it was opened with (liveViewFilterOf), so
+    // an ended agent's context compiles as its live one did: the residents'
+    // view leaves out the other residents' stored context injections too.
     const own = record.ownSlot;
     if (own?.namespace === null) {
       if (!record.namespace) {
@@ -10150,7 +10162,7 @@ export class AgentFramework {
       return ContextManager.open({
         store: this.store,
         namespace: record.namespace,
-        viewFilter: RESIDENT_VIEW_FILTER,
+        viewFilter: residentViewFilter(record.name),
         strategy: strategy ?? new PassthroughStrategy(),
         membrane: this.membrane,
         debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -10166,18 +10178,54 @@ export class AgentFramework {
         entry.slot !== undefined && entry.slot.branch === undefined && entry.slot.namespace !== namespace);
     const auxiliaryMessageViews = [...new Set(observed.map(({ slot }) => slot.namespace))]
       .map((ns) => (ns === null ? {} : { namespace: ns }));
-    const observesResidents = observed.filter(({ slot }) => sameSlot(slot, RESIDENTS_SLOT));
-    const hidesHeld = observesResidents.length > 0 && !observesResidents.some(({ edge }) => edge.includeHeld === true);
+    const viewFilter = this.liveViewFilterOf(record);
     return ContextManager.open({
       store: this.store,
       namespace,
       isolate: true,
       ...(auxiliaryMessageViews.length > 0 ? { auxiliaryMessageViews } : {}),
-      ...(hidesHeld ? { viewFilter: RESIDENT_VIEW_FILTER } : {}),
+      ...(viewFilter ? { viewFilter } : {}),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
+  }
+
+  /**
+   * The view an agent's live context was opened with, by where its rows go
+   * and what it observes (context-options.ts): a resident's, on the
+   * residents' slot, or for an isolated agent that watches that slot, the
+   * residents' view when its edge leaves held traffic out, and the
+   * subconscious's when it shows it. Undefined for an isolated agent that
+   * watches no residents' slot on its branch (a worker, a conversation
+   * fork), whose context was opened with no filter.
+   */
+  private liveViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
+    if (record.ownSlot?.namespace === null) return residentViewFilter(record.name);
+    const residents = record.relationships.observes.filter((edge) => {
+      const slot = this.registry.observedSlotOf(edge);
+      return slot !== undefined && slot.branch === undefined && sameSlot(slot, RESIDENTS_SLOT);
+    });
+    if (residents.length === 0) return undefined;
+    return residents.some((edge) => edge.includeHeld === true) ? subconsciousViewFilter(record.name) : residentViewFilter(record.name);
+  }
+
+  /**
+   * The agent a chain of shared derivations started from, whose view each
+   * derived context in it inherited: `record` itself when it isn't one, and
+   * the newest record the registry has of a parent otherwise, back to one
+   * that isn't (or one the registry no longer knows, by its name).
+   */
+  private viewOwnerOf(record: AgentRecord): AgentRecord {
+    let current = record;
+    const seen = new Set<string>();
+    while (current.inherit?.mode === 'shared' && !seen.has(current.name)) {
+      seen.add(current.name);
+      const parent = this.registry.inspect(current.inherit.from);
+      if (!parent) break;
+      current = parent;
+    }
+    return current;
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -14328,7 +14376,8 @@ export class AgentFramework {
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
-      namespace: `agents/${config.name}`,
+      // The residents' shared slot, through a resident's view (below).
+      ...residentContextOptions(config.name),
       strategy: config.strategy ?? new PassthroughStrategy(),
       // Context Manager complete() calls are auxiliary work; the primary
       // streaming agent keeps the original Membrane.
@@ -14345,8 +14394,9 @@ export class AgentFramework {
       // Another agent's stored context injections (stored-injections.ts) are
       // that agent's context, not conversation: they stay out of this view,
       // and so out of its folds, as the residents share this slot. The
-      // resident filter keeps held (tuned-out) rows out as before.
-      viewFilter: (message) => RESIDENT_VIEW_FILTER(message) && !isAnotherAgentsInjection(message.metadata, config.name),
+      // resident filter keeps held (tuned-out) rows out as before. Both are
+      // residentViewFilter (context-options.ts), which the reopen of an
+      // ended resident's context takes too.
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -14402,6 +14452,14 @@ export class AgentFramework {
    * excludes; the backlog is precisely what it exists to see. Windowed
    * passthrough, no memory pyramid: its durable output is what it delivers
    * into the resident's window, which accumulates there.
+   *
+   * With the presentation index (#291) the merge is the record its window is
+   * presented from, not its compile: the residents' rows enter its window by
+   * its observe edge's rule (observedRowFor) at its own points, as any
+   * agent's arrivals do, so none lands inside its live turn; its window
+   * starts at the oldest active tune-out's start, fixed as an ordinal
+   * (SubconsciousWindowAnchor); and a resident's rounds go out to it as a
+   * transcript (foreign-rounds.ts).
    */
   private async createSubconsciousAgent(cfg: PersistentReaderConfig): Promise<Agent> {
     const primaryName = this.primaryAgentName;
@@ -14414,24 +14472,27 @@ export class AgentFramework {
       throw new Error(`subconscious name "${name}" collides with a registered agent`);
     }
 
-    const strategy = new WindowedPassthroughStrategy({
+    // Its own slot, with the residents' shared un-namespaced slot merged
+    // read-only, the tune-out's stamped messages included. The filter, which
+    // context-manager applies to the merged view too, leaves out only the
+    // residents' stored context injections (stored-injections.ts): their
+    // context, which this agent never saw while they were placed unstored.
+    // With the presentation index the merged slot stays the record its
+    // window is presented from: a window presents only rows its record
+    // holds. The shape is subconsciousContextOptions (context-options.ts),
+    // which a reopen of its context and a host's audit open take too.
+    const options = subconsciousContextOptions({
+      serves: primaryName,
+      name,
       reAnchorFraction: cfg.reAnchorFraction,
       // Mirror the principal's per-message truncation ceiling so both see
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
+    const strategy = options.strategy as WindowedPassthroughStrategy;
     const contextManager = await ContextManager.open({
       store: this.store,
-      namespace: `subconscious/${primaryName}`,
-      isolate: true,
-      // The residents' shared un-namespaced slot, merged read-only, with the
-      // tune-out's stamped messages included. The filter, which context-
-      // manager applies to the merged view too, leaves out only the
-      // residents' stored context injections (stored-injections.ts): their
-      // context, which this agent never saw while they were placed unstored.
-      auxiliaryMessageViews: [{}],
-      viewFilter: (message) => !isAnotherAgentsInjection(message.metadata, name),
-      strategy,
+      ...options,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
@@ -14461,7 +14522,11 @@ export class AgentFramework {
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
+    // Reads the shared slot through its merged view: its bound counts toward
+    // a cancel's dump (residentMessageChars), and while its window is the
+    // record its live turn holds the framework's own rows for the slot
+    // (sharedSlotBusy), which a presented window doesn't need.
+    this.sharedSlotAgents.add(agent);
     // An attention tenant of the resident it serves: reads the shared slot
     // through its merged view (held traffic included), never a broadcast
     // recipient, and outlives policy epochs.
@@ -14473,6 +14538,22 @@ export class AgentFramework {
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
     this.subconsciousStrategy = strategy;
+    this.subconsciousAnchor = new SubconsciousWindowAnchor({
+      agentName: name,
+      cm: () => this.agents.get(name)?.getContextManager(),
+      strategy: () => this.subconsciousStrategy,
+      presents: () => this.presents(this.agents.get(name)),
+      owed: () => {
+        const sub = this.agents.get(name);
+        return sub && this.presentation ? this.presentation.owedOf(sub) : [];
+      },
+      fixed: (epochIds, ordinal) => this.tuneOutCoordinator?.subconsciousWindowFixed(epochIds, ordinal),
+      emitTrace: (event) => this.emitTrace(event),
+    });
+    // With its window presented, a resident's rounds go out to it as a
+    // transcript, its own as stored (foreign-rounds.ts, #291 answer 13):
+    // the one change its requests take at the switch.
+    if (this.presents(agent)) agent.setForeignRounds('transcript');
     this.subconsciousConfig = cfg;
     return agent;
   }
@@ -14511,6 +14592,26 @@ export class AgentFramework {
     }
     this.readerForks = true;
     this.subconsciousConfig = cfg;
+  }
+
+  /**
+   * How many of the residents' stored rows `keep` keeps the persistent
+   * subconscious hasn't been shown (the coordinator's unseenBySubconscious),
+   * one per body: with the presentation index, those its window doesn't
+   * hold, which it takes at its next point; else those its consumed mark
+   * doesn't cover, stored after its last compile. 0 with no subconscious,
+   * and for a row its mark can't speak for.
+   */
+  private unseenBySubconscious(keep: (m: Pick<StoredMessage, 'metadata'>) => boolean): number {
+    const sub = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+    if (!sub) return 0;
+    const cm = sub.getContextManager();
+    const head = (m: StoredMessage): boolean => (m.shardIndex ?? 0) === 0;
+    if (this.presents(sub)) return cm.getUnpresentedMessages().filter((m) => head(m) && keep(m)).length;
+    const primary = this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined;
+    if (!primary) return 0;
+    const unread = coverTest(sub.getConsumedWatermark(), cm);
+    return primary.getContextManager().getAllMessages().filter((m) => head(m) && keep(m) && unread(m) === 'not-covered').length;
   }
 
   /**
@@ -14579,6 +14680,17 @@ export class AgentFramework {
           }],
           metadata: { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger },
         });
+        // The held rows the framing hands the fork are presented to it
+        // (#291, AF-5): with the presentation index they enter its window
+        // when its run takes it on, after its framing row, and it holds them
+        // while it lives (presentedToAnyone), so no module or coalescer takes
+        // out a row a reader was handed. Its view filter, the residents' it
+        // inherits, keeps them out of its compiles, where the framing shows
+        // them. A row still queued behind a quiesce or a surgery, named by
+        // its held handle, is stored later, and isn't handed this way.
+        this.presentation?.noteFramed(fork.agent, backlog
+          .filter((m) => heldWriteId(m.id) === undefined && heldFromResidents(m.metadata as Record<string, unknown> | undefined))
+          .map((m) => m.id));
         this.emitTrace({
           type: 'tune-out:reader-fork',
           agentName: name,
@@ -15053,12 +15165,15 @@ export class AgentFramework {
             // (writeDrainedInOrder) is the exception: by now a summary may
             // stand in for it, or the anchor be past it, and then it goes in
             // where the next compile doesn't send it.
+            // Another agent's row goes in as the agent's compiles send it
+            // (Agent.injectedAsSent: the subconscious is sent a resident's
+            // rows without their thinking, #291).
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
             if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
               midTurnInjections.push({
                 participant: h.participant,
-                content: asSent(i + first, h.content),
+                content: agent.injectedAsSent(h.participant, asSent(i + first, h.content)),
                 ...(h.metadata ? { metadata: h.metadata } : {}),
                 id: h.id,
               });
@@ -19476,7 +19591,11 @@ export class AgentFramework {
     presentation.adopt(agent);
     this.presentationListeners.get(agent)?.();
     this.presentationListeners.set(agent, presentation.onPresented(agent.name, (event) => {
-      if (!ARRIVAL_OCCASIONS.has(event.occasion) || this.agents.get(agent.name) !== agent) return;
+      if (this.agents.get(agent.name) !== agent) return;
+      // The subconscious's window start waits for its window to take every
+      // row older than a tune-out's start (window-anchor.ts).
+      if (agent.name === this.subconsciousAgentName) this.subconsciousAnchor?.presented();
+      if (!ARRIVAL_OCCASIONS.has(event.occasion)) return;
       let previous: StoredMessage | undefined;
       for (const row of event.rows) {
         // One body, one arrival, by the shard that names it.
@@ -27295,10 +27414,28 @@ export class AgentFramework {
     // write the agent's start assembled for itself.
     const deferralHolds = !freshToolResult && !bypasses &&
       (this.quiesced || midToolCycle || this.activeTurnTokens.has(agent.name) || this.activeStreams.has(agent.name));
+    // A message a tune-out holds from the residents (heldFromResidents) is
+    // stored at once, whatever its target's turn, flag on or off (#291,
+    // AF-5; P1 on #793). No resident is shown it: the residents' view filter
+    // leaves it out, and the presentation index presents it to no resident,
+    // so stored during a resident's turn it lands inside no request that
+    // resident's turn is shown. Its readers read it from the record, the
+    // subconscious through its view of the residents' slot and a reader fork
+    // from the backlog it is handed, so deferred behind the resident's turn
+    // it was missing from the very reader that is there while the resident
+    // is busy. A quiesce, which freezes what every manager holds while its
+    // folds run, and a surgery's hold still keep it out of the store, as
+    // they keep any write; so does a held write still queued for its target
+    // from one, which it waits behind, so held messages land in the order
+    // they arrived.
+    const heldWrite = opts?.fromQueue === undefined && heldFromResidents(metadata as Record<string, unknown> | undefined)
+      && !this.quiesced && this.surgeryHold === null
+      && !this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name
+        && heldFromResidents(m.metadata as Record<string, unknown> | undefined));
     // With the flag on only a write from the queue that a surgery's hold
     // meets goes back to it, under its own id: what a flag-off run left
     // queued, or stop()'s drain. What the rule above would queue is stored.
-    if (presents ? opts?.fromQueue !== undefined && this.surgeryHold !== null : !freshToolResult && (behindQueue || deferralHolds)) {
+    if (presents ? opts?.fromQueue !== undefined && this.surgeryHold !== null : !freshToolResult && !heldWrite && (behindQueue || deferralHolds)) {
       // A re-deferral of a drained entry keeps its id and seq, and leaves the
       // un-acked set: one logical message, one durable identity, one place
       // in arrival order, whether or not the queue is persisted.
@@ -27328,9 +27465,12 @@ export class AgentFramework {
     // whatever request comes next. With the flag on, a write stored while a
     // turn of the agent's is alive takes none either, as a fork's channel
     // message doesn't: the clock would sit inside that turn. Its tool
-    // boundary or its next start takes the clock due.
+    // boundary or its next start takes the clock due. So does a held write
+    // stored during a turn with the flag off (heldWrite above): the clock is
+    // the resident's own row, and it would sit inside that turn.
+    const heldMidTurn = heldWrite && deferralHolds;
     if (takesClockBefore(participant, content, metadata, agent.name)
-      && (!presents || !this.turnAlive(agent) || this.assembling.has(agent.name))) {
+      && (presents ? !this.turnAlive(agent) || this.assembling.has(agent.name) : !heldMidTurn)) {
       this.storeDueClock(agent, 'event');
     }
     const stored = agent.getContextManager().addMessage(
@@ -29291,6 +29431,22 @@ export class AgentFramework {
   }
 
   /**
+   * A row an agent's window holds, by its id, from whichever slot its
+   * manager merges: getMessage reads the manager's own slot alone, and the
+   * subconscious hears the residents' rows at its tool boundary from the slot
+   * it watches (#291). Null in legacy mode, where nothing is heard from
+   * another slot, and for a row the window doesn't hold.
+   */
+  private windowRowOf(cm: ContextManager, id: MessageId): StoredMessage | null {
+    try {
+      if (cm.windowMode() !== 'presented') return null;
+      return cm.getPresentedMessages().find((m) => m.id === id) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Every row so far, judged as of now (roundRows), noted. A note the context manager writes nothing for (false)
    * ends the stream's notes, with a line saying so: where the stream's compile no longer wrote the branch's record, or
    * the branch has none, no later note could write either; where its store failed, a later one might, and stopping
@@ -29301,12 +29457,15 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     try {
       const ids = notes.rounds.flatMap((row) => row.id === undefined ? [] : [row.id]);
+      const injected = new Set(notes.rounds.flatMap((row) => row.kind === 'injected' && row.id !== undefined ? [row.id] : []));
       const rendered = cm.renderAsNewest(ids);
       const carried = new Map<MessageId, { participant: string; content: ContentBlock[] } | null>();
       ids.forEach((id, i) => {
-        const stored = cm.getMessage(id);
+        const stored = cm.getMessage(id) ?? (injected.has(id) ? this.windowRowOf(cm, id) : null);
         const content = rendered ? rendered[i]! : stored?.content ?? null;
-        carried.set(id, stored && content ? { participant: stored.participant, content } : null);
+        // An injected row as the boundary sent it (Agent.injectedAsSent).
+        const sent = content && stored && injected.has(id) ? agent.injectedAsSent(stored.participant, content) : content;
+        carried.set(id, stored && sent ? { participant: stored.participant, content: sent } : null);
       });
       const rows = roundRows(notes.rounds, (id) => carried.get(id) ?? null);
       if (!notes.note(rows)) {

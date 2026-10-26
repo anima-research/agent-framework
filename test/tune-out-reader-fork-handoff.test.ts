@@ -1,17 +1,24 @@
 /**
- * The framework's side of handing a reader fork what is queued behind the
- * resident's turn, on a real framework with a real deferred queue: a
- * resident whose turn waits on a tool, a tuned-out channel on the MCPL
- * fixture, and addressed messages that wake the reader.
+ * The framework's side of handing a reader fork what a tune-out held while
+ * the resident's turn runs, on a real framework: a resident whose turn waits
+ * on a tool, a tuned-out channel on the MCPL fixture, and addressed messages
+ * that wake the reader. It is the reader-fork arm of #793's P1 (#291, AF-5).
+ *
+ * A held message is stored at once, whatever the resident's turn (#291,
+ * AF-5): no resident is shown it, so it can't land inside one of their
+ * turns, and a reader is handed it from the record while the resident is
+ * still busy, the moment it is there for. (Until AF-5 the framework deferred
+ * it behind the resident's turn, and the reader was handed it by its
+ * deferred write's held handle; that is what this file pinned, and those
+ * assertions are rewritten here for stored rows.)
  *
  * Only the fork itself is stubbed (`deriveAgent`, `runEphemeralToCompletion`),
  * so this runs without the Dendrite builds of chronicle and context-manager.
  * It checks what the stub is given: the framing's backlog and
- * `heldMessageIds`, which name each queued message by the held handle of its
- * deferred write; the `tune-out:reader-fork` counts; that a landed row
- * carries the same write id as `metadata.deferredWriteId`, so nothing is
- * handed twice; and that a fork whose derive fails gives its messages back
- * to the next reader (`tune-out:reader-fork-failed`).
+ * `heldMessageIds`, which name each message by its stored id; the
+ * `tune-out:reader-fork` counts; that a fork whose derive fails gives its
+ * messages back to the next reader (`tune-out:reader-fork-failed`); and that
+ * nothing is handed twice.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,7 +30,6 @@ import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult, 
 import { AgentFramework } from '../src/index.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
-import { heldHandle } from '../src/held-writes.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
@@ -73,8 +79,8 @@ async function waitFor(what: string, cond: () => boolean, timeoutMs = 20_000): P
 
 interface DeriveCall { name: string; framing: Array<{ content: ContentBlock[]; metadata: { heldMessageIds?: string[] } }> }
 
-describe('reader forks: the framework hands on what is queued behind the resident turn', () => {
-  it('names queued messages by their write handles, gives a failed fork\'s messages to the next reader, and hands nothing twice once they land', { timeout: 120_000 }, async () => {
+describe("reader forks: the framework hands on what a tune-out held while the resident's turn runs", () => {
+  it("names held messages stored mid-turn by their stored ids, gives a failed fork's messages to the next reader, and hands nothing twice", { timeout: 120_000 }, async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'tune-out-reader-handoff-'));
     const commandPath = join(tempDir, 'commands.txt');
     writeFileSync(commandPath, '');
@@ -117,10 +123,12 @@ describe('reader forks: the framework hands on what is queued behind the residen
       assert.ok(stubbed.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 200, maxWakes: 5 }, 'agent-tool').ok);
       const forks = () => traces.filter((t) => t.type === 'tune-out:reader-fork') as Array<TraceEvent & { held: number; queued: number }>;
       const failures = () => traces.filter((t) => t.type === 'tune-out:reader-fork-failed') as Array<TraceEvent & { returned: number; reported: boolean }>;
-      const queuedIdOf = (needle: string) => stubbed.deferredMessages.find((m) => textOf(m.content).includes(needle))?.id;
+      const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages() as unknown as Array<{ id: string; content: ContentBlock[]; metadata?: { deferredWriteId?: string } }>;
+      const storedIdOf = (needle: string) => stored().find((m) => textOf(m.content as never).includes(needle))?.id;
       const say = (kind: 'ambient' | 'addressed', id: string, text: string) => appendFileSync(commandPath, `${kind} ${id} ${text}\n`);
 
-      // The resident's turn waits on a tool, so what arrives is queued.
+      // The resident's turn waits on a tool; what the tune-out holds
+      // meanwhile is stored at once.
       let waiting!: () => void;
       const inTool = new Promise<void>((resolve) => { waiting = resolve; });
       module.hold = new Promise<void>((resolve) => { release = resolve; });
@@ -136,15 +144,19 @@ describe('reader forks: the framework hands on what is queued behind the residen
       say('ambient', 'a2', 'AMB-2 more chatter');
       say('addressed', 'x3', 'ADDR-3 hey scout, your build is stuck');
       await waitFor('the first fork', () => forks().length === 1);
-      const ids = ['AMB-1', 'AMB-2', 'ADDR-3'].map((s) => queuedIdOf(s));
-      assert.ok(ids.every((id) => typeof id === 'string'), 'all three are still queued');
+      const ids = ['AMB-1', 'AMB-2', 'ADDR-3'].map((s) => storedIdOf(s));
+      assert.ok(ids.every((id) => typeof id === 'string'), "all three are stored, though the resident's turn still waits");
+      assert.equal(stubbed.deferredMessages.filter((m) => /AMB-|ADDR-/.test(textOf(m.content as never))).length, 0, 'and none is queued');
       assert.equal(forks()[0]!.held, 3);
-      assert.equal(forks()[0]!.queued, 3, 'the trace counts them as queued');
+      assert.equal(forks()[0]!.queued, 0, 'the trace counts none as queued');
       const framing = derives[0]!.framing[0]!;
-      assert.deepEqual(framing.metadata.heldMessageIds, ids.map((id) => heldHandle(id!)), "each is named by its deferred write's held handle");
+      assert.deepEqual(framing.metadata.heldMessageIds, ids, 'each is named by its stored id');
       const shown = textOf(framing.content as never);
       for (const s of ['AMB-1 chatter', 'AMB-2 more chatter', 'ADDR-3 hey scout']) assert.ok(shown.includes(s), `the framing shows ${s}`);
-      assert.ok(shown.includes("arrived while scout's turn was running"), shown);
+      assert.ok(!shown.includes('still queued'), 'and says none is still queued');
+      for (const s of ['AMB-1', 'AMB-2', 'ADDR-3']) {
+        assert.equal(stored().find((m) => textOf(m.content as never).includes(s))?.metadata?.deferredWriteId, undefined, `${s} came through no queue`);
+      }
 
       // A fork whose derive fails gives its message back.
       failNextDerive = true;
@@ -155,18 +167,16 @@ describe('reader forks: the framework hands on what is queued behind the residen
       say('addressed', 'x5', 'ADDR-5 hello?');
       await waitFor('the next fork', () => forks().length === 2);
       assert.equal(forks()[1]!.held, 2, 'it is handed ADDR-4 again, and ADDR-5');
+      assert.deepEqual(derives[2]!.framing[0]!.metadata.heldMessageIds, [storedIdOf('ADDR-4'), storedIdOf('ADDR-5')]);
       const second = textOf(derives[2]!.framing[0]!.content as never);
       assert.ok(second.includes('ADDR-4 are you there') && second.includes('ADDR-5 hello?'), second);
       assert.ok(!second.includes('AMB-1'), 'and nothing the first fork was handed');
 
-      // The turn ends: the queued writes land under their write ids.
+      // The turn ends; nothing held is written again.
       release();
-      await waitFor('the queue drains', () => stubbed.deferredMessages.length === 0);
       await framework.runUntilIdle();
-      const stored = framework.getAgent('scout')!.getContextManager().getAllMessages() as unknown as Array<{ content: ContentBlock[]; metadata?: { deferredWriteId?: string } }>;
-      for (const [i, s] of ['AMB-1', 'AMB-2', 'ADDR-3'].entries()) {
-        const row = stored.find((m) => textOf(m.content as never).includes(s));
-        assert.equal(row?.metadata?.deferredWriteId, ids[i], `${s} landed carrying its write id`);
+      for (const s of ['AMB-1', 'AMB-2', 'ADDR-3']) {
+        assert.equal(stored().filter((m) => textOf(m.content as never).includes(s)).length, 1, `${s} is stored once`);
       }
 
       // So the next reader, with the resident idle, is handed only what is new.
@@ -176,7 +186,7 @@ describe('reader forks: the framework hands on what is queued behind the residen
       assert.equal(forks()[2]!.queued, 0, 'ADDR-6 was stored directly');
       const last = textOf(derives[3]!.framing[0]!.content as never);
       assert.ok(last.includes('ADDR-6 one more'), last);
-      for (const s of ['AMB-1', 'AMB-2', 'ADDR-3', 'ADDR-4', 'ADDR-5']) assert.ok(!last.includes(s), `and not ${s}, now stored`);
+      for (const s of ['AMB-1', 'AMB-2', 'ADDR-3', 'ADDR-4', 'ADDR-5']) assert.ok(!last.includes(s), `and not ${s}, handed before`);
     } finally {
       release();
       console.error = orig;

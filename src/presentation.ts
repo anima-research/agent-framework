@@ -410,7 +410,13 @@ export class AgentPresentation {
         state.pinnedLegacy = 'the window is not in presented mode after its write-down';
         this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'adopt', error: state.pinnedLegacy });
       }
-      if (!state.pinnedLegacy) this.repair(agent);
+      if (!state.pinnedLegacy) {
+        this.repair(agent);
+        // A reader fork is framed before it is taken on (noteFramed at its
+        // derivation, adopt at its run's registration): the held rows it was
+        // handed enter its window now, after its framing row.
+        this.presentFramed(agent);
+      }
     }
     if (!state.pinnedLegacy) agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
   }
@@ -605,20 +611,29 @@ export class AgentPresentation {
    * A reader fork was handed held rows as framing (AF-5): those not in its
    * window yet are presented there, when the module presents for it, and
    * the fork counts as holding every one of them (holders, `'framing'`),
-   * however its window filters held rows, until it is let go (forget).
+   * however its window filters held rows, until it is let go (forget). A
+   * fork framed before it is taken on has them presented at its adopt. Its
+   * window's filter (the residents', which a reader fork inherits) keeps
+   * them out of its compiles, where its framing row shows them; nothing
+   * else of its window moves.
    */
   noteFramed(agent: PresentedAgent, rowIds: readonly MessageId[]): void {
     const set = this.framed.get(agent.name) ?? new Set<MessageId>();
     for (const id of rowIds) set.add(id);
     this.framed.set(agent.name, set);
-    if (!this.presenting(agent)) return;
-    try {
-      const cm = agent.getContextManager();
-      const unpresented = new Set(cm.getUnpresentedMessages().map((m) => m.id));
-      this.present(agent, unique(rowIds).filter((id) => unpresented.has(id)), 'framing');
-    } catch (error) {
-      this.failed(agent, 'framing', error);
-    }
+    this.presentFramed(agent);
+  }
+
+  /**
+   * The rows the agent is owed and its window doesn't hold yet, one per
+   * body (its first shard not in the window), in record order: its own rows
+   * and its arrivals, frozen or not, whatever its turn. None for an agent the
+   * module doesn't present for. The subconscious's window start is fixed
+   * once no row it is owed stored before the start is among them.
+   */
+  owedOf(agent: PresentedAgent): StoredMessage[] {
+    if (!this.presenting(agent)) return [];
+    return this.pending(agent, true).map((body) => body.shards[0]!);
   }
 
   // --------------------------------------------------------------------------
@@ -702,6 +717,23 @@ export class AgentPresentation {
   private presentAtRest(agent: PresentedAgent, occasion: 'turn-end' | 'at-rest'): StoredMessage[] {
     if (!this.presenting(agent) || this.host.turnAlive(agent.name)) return [];
     return this.presentPending(agent, occasion, !this.host.frozen());
+  }
+
+  /** The rows the agent was handed as framing (noteFramed) that its window doesn't hold yet, presented in the order handed. */
+  private presentFramed(agent: PresentedAgent): void {
+    const framed = this.framed.get(agent.name);
+    if (!framed || framed.size === 0) return;
+    try {
+      if (!this.presenting(agent)) return;
+      const cm = agent.getContextManager();
+      // presentRows refuses a row the window holds already, and a reader
+      // fork derived from a presented window holds those rows its parent's
+      // window was written down with.
+      const unpresented = new Set(cm.getUnpresentedMessages().map((m) => m.id));
+      this.present(agent, [...framed].filter((id) => unpresented.has(id)), 'framing');
+    } catch (error) {
+      this.failed(agent, 'framing', error);
+    }
   }
 
   /** The own-row sweep: the agent's own rows not in its window, presented in record order, traced as a repair. */
