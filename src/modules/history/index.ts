@@ -1150,7 +1150,8 @@ export class HistoryModule implements Module {
                   hint:
                     (pageFull
                       ? 'More matching messages exist. '
-                      : `Stopped after scanning ${scanned} messages of the window without reaching its end. `) +
+                      : `Stopped after scanning ${scanned} messages of the window without reaching its end` +
+                        (page.length === 0 ? ', so returning none is not a negative result for the window. ' : '. ')) +
                     `Continue by repeating this call with the same from/to/channelId/author plus ` +
                     `the fields of \`resume\` (windowOffset:${resume.windowOffset}, offset:${resume.offset}, afterId).`,
                 };

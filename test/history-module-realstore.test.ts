@@ -447,3 +447,34 @@ describe('HistoryModule on a real store: a search that stops at maxScan with no 
     assert.doesNotMatch(d.hint, /No match/);
   });
 });
+
+describe('HistoryModule on a real store: an author-filtered extract that stops at maxScan with nothing returned', () => {
+  const rows = (): Row[] => {
+    const now = Date.now();
+    const out: Row[] = [];
+    for (let i = 0; i < 6; i++) out.push({ text: `bob${i}`, channel: 'c', author: 'bob', ms: now - (20 - i) * MIN });
+    for (let i = 0; i < 4; i++) out.push({ text: `antra${i}`, channel: 'c', author: 'antra', ms: now - (10 - i) * MIN });
+    return out;
+  };
+
+  it('says returning none is not a negative result for the window, with or without a channel', async () => {
+    const { mod } = build(rows());
+    for (const channel of [{}, { channelId: 'c' }]) {
+      const d = await call(mod, 'extract', { author: 'antra', maxScan: 3, ...channel });
+      assert.equal(d.truncated, true);
+      assert.deepEqual(d.messages, []);
+      assert.equal(
+        d.hint.split(' Continue')[0],
+        'Stopped after scanning 3 messages of the window without reaching its end, so returning none is not a negative result for the window.',
+      );
+    }
+  });
+
+  it('does not say so when the stopped scan returned messages', async () => {
+    const { mod } = build(rows());
+    const d = await call(mod, 'extract', { author: 'bob', maxScan: 3, channelId: 'c' });
+    assert.equal(d.truncated, true);
+    assert.equal(d.messages.length, 3);
+    assert.doesNotMatch(d.hint, /negative result/);
+  });
+});
