@@ -18,6 +18,7 @@ import { storableToolResult } from '../src/module-registry.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
+import { captureTimers, fireTimer, type CapturedTimer } from './helpers/capture-timers.js';
 
 /** Wait for a condition, failing after 15 s rather than hanging the run. */
 const until = async (cond: () => boolean, what: string) => {
@@ -1293,31 +1294,6 @@ describe('a round whose run or wait call watches a script that can change its ro
     yieldWhen?: (run: WatchedRun) => boolean;
     onReturn?: (returned: { running: boolean }) => void;
   };
-  type Captured = { handle: ReturnType<typeof setTimeout>; due: () => void };
-  /**
-   * Runs `fn`, one synchronous stretch of the runner's code, with setTimeout
-   * passing through to the real one and recording each timer of `ms` it sets,
-   * and restores setTimeout in a finally. Firing a captured timer early is
-   * clearing its handle and running its callback, the runner's own.
-   */
-  const captureTimers = <T>(ms: number, fn: () => T): { result: T; timers: Captured[] } => {
-    const realSetTimeout = globalThis.setTimeout;
-    const timers: Captured[] = [];
-    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
-      const handle = realSetTimeout(callback, delay, ...args);
-      if (delay === ms) timers.push({ handle, due: () => callback(...args) });
-      return handle;
-    }) as typeof setTimeout;
-    try {
-      return { result: fn(), timers };
-    } finally {
-      globalThis.setTimeout = realSetTimeout;
-    }
-  };
-  const fire = ({ handle, due }: Captured) => {
-    clearTimeout(handle);
-    due();
-  };
   /**
    * Makes the run's own yield, the timer its yield_time_ms sets, come due once
    * `when` holds rather than on the clock. The timer is the runner's, set as
@@ -1343,7 +1319,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       const poll = setInterval(() => {
         if (!when(run)) return;
         clearInterval(poll);
-        fire(timers[0]);
+        fireTimer(timers[0]);
       }, 5);
       // The wait settles at the yield, or when the run ends: either way there is nothing left to fire.
       void waited.finally(() => clearInterval(poll));
@@ -1362,7 +1338,7 @@ describe('a round whose run or wait call watches a script that can change its ro
    */
   const timeOutOnEvent = (run: WatchedRun, tool: string, ms: number, count: number, when: () => boolean) => {
     const call = run.call;
-    const timers: Captured[] = [];
+    const timers: CapturedTimer[] = [];
     run.call = (id: number, name: string, args: string) => {
       if (name !== tool) return call.apply(run, [id, name, args]);
       const { result: called, timers: set } = captureTimers(ms, () => call.apply(run, [id, name, args]));
@@ -1380,7 +1356,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       if (!when()) return;
       clearInterval(poll);
       if (timers.length !== count) throw new Error(`${timers.length} calls to ${tool} had set their timeouts when they were to come due, not ${count}`);
-      timers.forEach(fire);
+      timers.forEach(fireTimer);
     }, 5);
   };
   /**

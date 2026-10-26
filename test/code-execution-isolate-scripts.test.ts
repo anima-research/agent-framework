@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { ChildCapacity, type CallAnswer } from '../src/code-execution/isolate/runner.js';
 import { AgentScripts, ScriptRefusal, type ScriptCallContext, type ScriptsConfig, type ScriptsHost } from '../src/code-execution/isolate/scripts.js';
 import { renderOutput } from '../src/code-execution/isolate/output.js';
+import { fireNextYieldAsSet } from './helpers/capture-timers.js';
 
 // With this file's own extension, as the runner names its entry, so the runtime runs a file that exists.
 const FAKE_CHILD = fileURLToPath(new URL(`./helpers/fake-child-entry${extname(fileURLToPath(import.meta.url))}`, import.meta.url));
@@ -372,7 +373,6 @@ test('a second call on a script another call is waiting on is refused, with noth
 
 test('a left script that crashes or reaches its limit wakes its agent', async () => {
   const { scripts, wakes } = setup({ config: { yieldMs: 100, lifetimeMs: 1_500 } });
-  // Each yields at once, before its child has started, so it's left running when it ends.
   const crash = await scripts.run('alice', `await tools.echo({}); __crash();`, 0);
   const limit = await scripts.run('alice', `await tools.slow({ key: 'l' });`, 0);
   for (let i = 0; i < 400 && scripts.running('alice') > 0; i++) await new Promise((r) => setTimeout(r, 10));
@@ -405,7 +405,7 @@ test("a script's calls carry the turn of the call watching when each reaches the
   let answer!: () => void;
   const held = new Promise<void>((resolve) => (answer = resolve));
   const { scripts } = setup({
-    config: { yieldMs: 100 },
+    config: { yieldMs: 100, maxYieldMs: 60_000, lifetimeMs: 120_000 },
     host: {
       dispatch: async (_agent, name, args, context) => {
         contexts.push({ name, ...context });
@@ -419,8 +419,9 @@ test("a script's calls carry the turn of the call watching when each reaches the
       },
     },
   });
-  // The run yields at once, before its child has started, so every call comes under a wait.
-  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, 0);
+  const yields = fireNextYieldAsSet(scripts, 60_000);
+  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, 60_000);
+  assert.deepEqual(yields, { fired: true }, 'the run yielded as its timer was set');
   assert.equal(r.running, true);
   const first = { turnId: 1, endTurn: false };
   const firstWait = scripts.wait('alice', r.scriptId, 30_000, first);

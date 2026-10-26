@@ -12,6 +12,1047 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.27.0 — 2026-10-26
+
+### Breaking
+
+- **Hosts and residents with gate policies that name a channel:** a
+  `match.channel` in the registered form, such as
+  `discord:<guild>:<channel>` or `discord:<guild>:*`, now meets every event
+  in that channel, not only the messages that arrive while it's open
+  (#702).
+
+  **Check your config for:**
+  - any `match.channel` in the registered form (for Discord, starting
+    `discord:`) without `scope: ["mcpl:channel-incoming"]`;
+  - any `keyBy: "channelId"`, whatever its policy matches.
+
+  **What such a policy now does:**
+  - **Quieter:** a `defer` channel policy stops the channel's push events
+    waking the resident, including an @-mention in that channel while it's
+    closed, which a later addressed rule used to take. A `passive_sample`
+    one wakes on its every-Nth only (with `passthrough`, the others go on to
+    later rules). A `debounce` one batches and delays them, and a
+    `rate_limit` one can deny them.
+  - **Louder:** an `always` channel policy ahead of a `defer` rule wakes on
+    every reaction, edit and voice report in that channel.
+  - **A later policy can lose events:** a later policy, such as one naming
+    the channel's raw id, no longer receives the pushes an earlier
+    registered-form policy now matches, though no pattern matches fewer
+    events than before. Neither the shadow lint, which compares patterns as
+    written, nor `wake_add_rule`'s before/after table, whose probes name no
+    channel, shows this.
+  - **Counting:** every `rate_limit` and `passive_sample` with `keyBy:
+    "channelId"` counts a channel's push events with its messages, under its
+    registered id. A push was counted under its raw id, or in the shared
+    bucket when it carried none, as a voice report doesn't. So a channel's
+    messages and pushes now share one bucket or counter, and voice reports
+    in different channels no longer share one.
+  - **A host that builds its own `EventGate` with `resolveRouteChannel`:**
+    its resolver, which routed batched wakes, now also decides which channel
+    policies a push meets and how `keyBy: "channelId"` counts it.
+    `EventGate`'s default resolver gives no push a registered id, so with it
+    a push matches and counts by its own id, as before.
+
+  **Migration:** to keep a registered-form channel policy to the channel's
+  messages, closed channels' addressed ones included, add `tagsAny:
+  ["chat:ambient", "chat:addressed"]` to it. Those are Discord's message
+  tags, and its reactions, edits, deletes, voice reports and catch-ups carry
+  neither; another adapter's markers may carry `chat:addressed`. To keep it
+  to exactly what it caught before, add `scope: ["mcpl:channel-incoming"]`,
+  since a registered-form pattern matched no push before. Neither changes
+  how `keyBy: "channelId"` now counts. A pattern written as `*<raw id>`,
+  which matched both paths before, matches as it did, and now also matches a
+  push that names its channel only by `mcplChannelId`, such as a voice
+  report.
+
+  **Unchanged:** which policy an event meets stays as it was in a config
+  whose rules for the push events it receives (addressed messages,
+  reactions, voice reports and the rest) come before its channel policies
+  and aren't `passthrough`, and for a channel policy scoped to
+  `mcpl:channel-incoming`. Counting with `keyBy: "channelId"` changes even
+  there, as above.
+
+  **Why:** a message in an open channel arrives through `channels/incoming`
+  with the registered id, but every other event arrives as a push: an
+  addressed message in a closed channel, a message in a channel the adapter
+  subscribes to without opening, and in any channel a reaction, an edit, a
+  delete, a voice report or a missed-message catch-up. A push's own channel
+  id is the adapter's raw one (a bare Discord snowflake), or none, as on a
+  voice report, so a registered-form pattern missed all of those, and each
+  fell through to a later policy. The pattern is now tested against the
+  event's own id and, when that misses, against the registered id the
+  framework resolves for the push: its origin's `mcplChannelId`, or, for a
+  Discord origin without one, its guild and channel (`discord:dm:<channel>`
+  when it names no guild, as a DM's doesn't). A push whose origin names its
+  channel neither way, from another adapter, still matches by its raw id
+  alone.
+
+- **Hosts and custom `errorPolicy` authors:** the framework is now the one
+  retry layer for its turns. A turn passes `retry: false` to membrane, so
+  membrane sends a failed round once and the error reaches the framework,
+  where since membrane 0.7 membrane's own schedules (up to ten minutes at a
+  529) ran inside each of the framework's attempts, out of its sight. Each
+  retry is now a fresh compile, its wait is traced, and a stop cancels it.
+  The default error policy decides on membrane's schedules
+  (`@animalabs/membrane/retry`; `MEMBRANE_RETRY_SETTINGS` unless a host
+  passes `new DefaultErrorPolicy(settings)` as `errorPolicy`), where it
+  retried any retryable failure three times, 1, 2 then 4 s apart:
+  - a 529, or an overloaded error mid-stream, gets the overloaded schedule:
+    seven tries, jittered waits from 10 s doubling to five minutes;
+  - a 429 gets at least five tries on the base schedule;
+  - any other retryable failure, a stream deadline included (membrane itself
+    leaves a deadline to its caller), gets three tries, 1 s then 2 s, and so
+    does an error that isn't a MembraneError;
+  - a provider's stated wait is waited when it is longer than the backoff, up
+    to ten minutes (the framework's provider-hold cap), as before;
+  - a failure that isn't retryable ends at once, as before.
+  A custom `ErrorPolicy` now sees failures membrane used to retry first (a
+  5xx, a 529, a dropped connection, a 429), so it decides those itself.
+  **Migration:** decide with membrane's own helpers (`classifyFailure`,
+  `retryDecision`), as the default policy does, or wrap the now exported
+  `DefaultErrorPolicy`. **Unchanged:** the provider holds before the policy
+  (a resident's stated waits and acceleration 429s), refusal re-issues
+  (`refusalRetries`), a direct caller of `Agent.startStream` (it keeps
+  membrane's retries; `ActivationRequestOptions.membraneRetries: false` is
+  what the framework passes), and calls that aren't turns (the MCPL
+  inference router, compression and other host calls keep membrane's
+  retries).
+
+- **Residents and hosts:** an agent's own `channel_close` or `channel_decline` now holds against
+  its own speech there. A send tool's call (`send_message`, `reply_message`, `send_dm`,
+  `send_file`, `send_files`), plain speech, or a draft's resend into a channel the agent closed or
+  declined publishes there and leaves the channel closed. Before, it opened the channel, recorded
+  that open over the agent's close, and announced "[channels] Now open: … your own message into the
+  closed channel opened it." That holds where the agent's close failed at the server and left the
+  channel's transport open too: the words go out there, and the close stays the decision on record,
+  where speech used to reopen the channel. Words that wait on a channel's lifecycle work, or on an
+  open they started, go into the channel as it stands once the agent closes or declines it
+  meanwhile, or a module closes it, where they were refused with "a decision to close the channel
+  came before these words went out". They're still refused where the channel's address kept
+  changing until the tries ran out, and a channel whose last open the server answered for another
+  channel takes no words as it stands until an open of it is answered for this channel, since a
+  publish by its id may not reach it. Speech into any other closed channel, one nobody decided
+  about (such as a DM that woke the agent) or one a machine closed, opens it as before, with that
+  notice, and a close a machine decides while words wait still refuses them.
+  - **Who needs to act:** an agent that closed a channel and wants its ongoing traffic again opens
+    it with `channel_open`; speaking there no longer does. Messages that address the agent still
+    arrive while a channel is closed.
+  - **What residents read:** where an agent's words land in a channel it closed or declined, the
+    send tool's answer, for routed speech the turn's `[delivered]` line, or in `explicit` routing
+    mode, which has no such line, a line of its own at the turn's end, says that the channel stays
+    closed, and, as each holds for the agent reading it, that messages addressing it still reach
+    it, that `channel_open` opens it, and how to turn the note off. The first is left out for an
+    agent whose window isn't where those messages land, such as an ephemeral run's; `channel_open`
+    where the agent's `allowedTools` leave it out, or on a server that's up but whose grant lacks
+    `channels.lifecycle`, where no channel can open; and the last where `allowedTools` leave
+    `agent_settings` out. In `explicit` mode, speech still being delivered when a tool ends the
+    turn gets the line once it's delivered, and a line that comes while another turn is under way
+    waits for that turn's next tool call, where that turn is shown it, or for its end. The agent
+    turns the note off for good with `agent_settings`' new `closed_channel_note`, which is on by
+    default. A conversation agent gets none: `channel_open` is refused to it, and its settings end
+    with its conversation. In a channel the agent's words leave closed, one it closed or declined,
+    one a module closed, or a closed one on a server that's up without `channels.lifecycle`, the
+    `sleep` tool's default announcement says "I'll still see messages addressed to me, but won't
+    respond until I wake." A send tool's call into a channel the agent tuned out keeps the
+    tune-out, as it has since 0.23.0, and its answer now says so: "… stays tuned out: your words
+    there don't end the tune-out, so its traffic still goes to your subconscious until the tune-out
+    ends. Call tune_out with channelId … and mode "cancel" for it to resume normal attention;
+    cancelling delivers the diverted backlog." The last sentence is `tune_out`'s own refusals' one,
+    naming the channel as they do, for an agent whose `allowedTools` hold `tune_out`. The same
+    setting turns that line off. A send a `code_execution` script makes keeps the server's receipt
+    alone, since the script parses it, and the agent gets the note or the tune-out line in its
+    window instead, as a notice.
+  - **What the invitation says:** the closed-channel invitation's first option now says what
+    replying does there. In a channel the agent closed or declined itself, or a module closed, a
+    reply no longer opens the channel, and the option says so: "1. Reply — … it will be delivered
+    there, and the channel stays closed." Before, it said "… which opens the channel" there too. It
+    says the same on a server whose grant lacks `channels.lifecycle`, where nothing opens. In any
+    other closed channel, where a reply still opens the channel, it adds how to reply without
+    opening it: "To reply without opening it, decline it first (option 3): a channel you've
+    declined stays closed when you speak there." It leaves that out in a tuned-out channel, which
+    `channel_decline` refuses. What else reaches the agent from a channel left closed is its
+    server's to say (#406): on discord-mcpl, the channel's later messages that don't address the
+    agent don't arrive as they're posted, and anima-research/discord-mcpl#97 has discord-mcpl say
+    so on its push.
+  - **What residents notice,** by our reading of discord-mcpl's and zulip_mcp's code: on
+    discord-mcpl, opening a channel also turns on its reaction forwarding, and closing it turns
+    that off. A reply in a guild channel the agent closed used to reopen it, and so turn its
+    reactions on. Now reactions to that reply arrive only where the agent opens the channel or
+    turns them on with `set_reaction_visibility`. DMs are unaffected: discord-mcpl requests no DM
+    reaction events. discord-mcpl's `channels/open` also lifts a mute set with `mute_channel`, so a
+    reply that opens a muted channel nobody decided about, or one a machine closed, unmutes it, as
+    before; a channel the agent closed keeps its mute. On zulip_mcp, an answer's topic comes from
+    the last message delivered as `channels/incoming`, and a closed stream's mentions are pushed
+    instead, so in a stream the agent closed, every answer goes to the topic of the stream's last
+    message from before the close, where a reply used to reopen the stream.
+  - **What hosts notice,** by our reading of discord-mcpl's and connectome-host's code: on
+    discord-mcpl, a channel the agent closed keeps delivering the messages that address the agent
+    as push events, as any closed channel's are, where a reply used to reopen it and switch them to
+    `channels/incoming`. Host code that acts on `channels/incoming`, such as connectome-host's
+    outage reply, doesn't see them there. Nor does a turn with no trigger, such as a heartbeat,
+    come to speak there: where it speaks moves only with `channels/incoming` messages.
+- **Hosts with modules that close channels:** a module's `channel_close` through its own tool call
+  (`ctx.callTool`) without a machine source is now recorded with the source `module-tool`, where it
+  was `agent-tool`. Speech leaves such a channel closed, as it does one the agent closed, but gives
+  no note, since the module owns the way back. In connectome-host that's the `mentions` channel
+  mode: a reply to a mention in a channel in that mode stays a reply, and the invitation there says
+  the channel stays closed. Policy doesn't lift such a close, and a machine's close doesn't replace
+  it. Of the agent's close and a module's, the later one is the one on record. A module's close is
+  never refused as a machine's close of an explicit open; only one naming a machine source is.
+  - **Who needs to act:** a module's close made before this change was recorded as `agent-tool`,
+    which can't be told apart from the agent's own, so after the upgrade such a channel reads as
+    one the agent closed, and the agent's words there carry the note. Setting the channel's mode
+    again (connectome-host's `channel_mode` with `mentions`) records the close as the module's.
+- **Direct `ChannelRegistry` consumers:** `openIfClosedForSend()` answers a new `status`,
+  `stays-closed`, for a channel a send leaves closed without trying to open it: one the agent
+  closed or declined, one a module closed, or a closed one on a server that's up but whose grant
+  lacks `channels.lifecycle`, where it answered `open-failed` or opened the channel. For an open
+  channel on such a server that isn't decided open, it answers `already-open` without trying an
+  open, where it answered `open-failed`. `speechOpens(channel)` says whether the agent's words
+  there open the channel, and `speechLeavesClosed(channel)` whether they go into it and leave it
+  closed. `closedByAgent(channel)`, `lifecycleWithheld(serverId)`, `tuneOutEnd(channel)` and
+  `resolveSendTarget(channelId, serverId?)`, which names the one channel a send went to from a
+  composite or raw id, and opens nothing, are new too.
+- **Prompt cache:** `channel_close`'s description and `agent_settings`' input schema change, so the
+  first request after the upgrade that carries those tools misses the cache from its tool block on.
+
+- **Scripts, hosts and modules that read the workspace's `read`, `grep`,
+  `edit` or `edit_many` results:** each now answers as the text the model
+  reads, with its fields beside it in `structured`. The model read each as
+  one line of JSON, a page's lines escaped inside it. It now reads a header
+  of the result's fields, one `key: value` to a line (`path: …`,
+  `totalLines: …`, `nextOffsetChars: null`), then labelled sections: a
+  page's `--- content ---`, grep's matches by file and version (`N:` for a
+  match, `N-` for a line of its context, as grep writes them), what grep
+  skipped, and a receipt's `--- files ---` and `--- changed ---`. A value
+  outside a page's content and a receipt's changed lines that holds a line
+  break (LF, CR, VT, FF, NEL, U+2028 or U+2029) or starts with `"`, such as
+  a path or a line grep matched, is written as a JSON string, so a value
+  shown as it is never starts with `"`. A control character in a file
+  reaches the model as itself, where JSON wrote an escape such as `\u001b`.
+
+  **Who needs to act:**
+  - a `code_execution` script that parses one of these results' text as
+    JSON (`JSON.parse(result.content[0].text)`): read
+    `result.structuredContent`, which holds the fields the JSON held;
+  - a host or module that reads these results' fields from `result.data`,
+    through `executeToolCall` or `ctx.callTool`: read `result.structured`.
+    connectome-host reads either since 0.11.0
+    (anima-research/connectome-host#324), and needs that version or later:
+    before it, its file viewers show such a file as empty.
+
+  **What a page holds:** a page is held to the call's result limit as its
+  text measures it, where it was measured as JSON, and so is a receipt.
+  - A model's page holds more of a file whose lines JSON escapes: at the
+    default 24,000 characters, a page of this repository's
+    `src/modules/workspace/index.ts` now ends at line 475, where it ended at
+    line 454. A spilled result's notice sizes the read-back page it suggests
+    the same way, so below a cap of about 12,300 characters it suggests a
+    longer one than before.
+  - A script's page is never shorter than before, since a page's text is
+    shorter than its JSON, unless the text quotes its path or a note. A script's answer carries the result's fields, a
+    page's content among them, beside the text, and the limit counts the
+    text alone. A script's limit counts each character at the six bytes it
+    takes at most in the answer, and only a control character takes more
+    than three, so the two together can pass what the script takes only on
+    a page of more than half that limit (about 3.7 million characters at
+    the default 128 MiB of script memory) that holds control characters.
+    Such a page answers `ResultTooLarge`, which cuts nothing, and the script
+    reads a smaller page.
+
+  **Unchanged:** the tools' descriptions and inputs; the words of their
+  notes; their errors, which were text already; the results of `write`,
+  `delete`, `ls`, `glob`, `status`, `materialize`, `sync` and the other
+  workspace tools, whose fields stay in `data`; and a page for a call made
+  in process without a result limit, which holds to its line limit alone.
+
+- **Hosts:** agent-framework now requires `@animalabs/context-manager`
+  ^0.22.0 (was ^0.20.0). A host whose own context-manager range is still
+  below it gets two copies, and a `ContextManager` built from its own copy
+  isn't the one agent-framework's types take: connectome-host's `main`,
+  with ^0.20.1, fails to typecheck where the two meet, installed with npm
+  or bun. context-manager 0.22.0's own breaking change reaches every host
+  too: a `maxLiveImages`, `maxLiveImageBytes` or `maxCompressionImageBytes`
+  of 0, documented as no limit, now means up to `imageCeiling` (500 images
+  by default) or `imageByteCeiling` (24 MiB), and so does a value above its
+  ceiling (context-manager's 0.22.0 notes). **Migration:** move the host's
+  own context-manager range to ^0.22.0 with this release; with it,
+  connectome-host's `main` installs one copy and typechecks.
+
+- **Code that calls `ChannelRegistry` or `ConversationRouter` directly:** a
+  channel the registry acts on is a `ChannelRef`, `{ serverId, channelId }`
+  (exported as a type), where it was a bare channel id, since two MCPL
+  servers can register the same id.
+  - `routeSpeech` and `deliverSpeech` take the locus as a `ChannelRef` (or
+    `null`), and `resolveLocus` and `getDefaultPublishChannel` return one.
+    `getDescriptor`, `isChannelOpen`, `inboundOnlyServer` and
+    `proseTargetFor` take one. `getChannelServerId` is removed: a ref names
+    its server.
+  - `buildChannelContext(agentName, serverId)` builds the channel context one
+    server is told, and `incomingFor(agentName)` gives the message the agent
+    is replying to, with its channel.
+  - `ChannelRegistryOptions.homeChannelResolver` and `activeChannelResolver`
+    return a `ChannelRef`.
+  - `sendOutgoingChunk` and `sendOutgoingComplete` take only the
+    destination the publish went to. A bare channel id, which they resolved
+    again at each call and dropped where two servers register it, is no
+    longer taken.
+  - `ConversationRouter`'s `bind`, `touch`, `unbind` and `getBinding` take a
+    `ChannelRef`, `channelForAgent` returns one, and a `ConversationBinding`
+    carries `serverId`.
+  - **Migration:** pass `{ serverId, channelId }`. An inbound event, a
+    publish outcome's `destination` and `channel_list` each carry the server.
+    `resolveProseTarget`'s answer, `openIfClosedForSend`'s, `channel_open`'s
+    result data, a gate wake's `WakeProvenance` (as `routeServerId`) and
+    `onRouteFailure`'s info now carry it too, and `InferenceRequest` carries
+    it as `channelServerId`, beside `channelId`. A stream's chunk and
+    `complete` take the publish outcome's `destination`. For a name given as a
+    string, `channelsNamed(name)` gives the channels it means, by its id or
+    its `serverId:channelId` form, and `nameShown(ref)` the name an agent is
+    shown for a channel.
+  - **Unchanged:** `startTyping`, `stopTyping` and `publishForAgent` still
+    accept a bare id, as connectome-host's activity and notices modules pass
+    one, and also take a ref or a `serverId:channelId` name. Where two
+    servers register the id, what a bare id does changes, as Fixed says:
+    typing shows in each server's channel, and `publishForAgent` refuses it.
+    `InferenceRequest.channelId` stays. No tool's description or schema
+    changes.
+
+### Added
+
+- **Hosts:** `AgentConfig.autoContinue` (default off): a turn the model ends
+  itself, with prose or with nothing, is followed by another turn straight
+  away, until the agent calls `skip_reply` (or another tool that ends the
+  turn), ends on a `>>skip_reply` / `>>>skip_reply` envelope, or reaches
+  `maxConsecutive` continuations in a row (default 3, 1 to 20). The count
+  starts again on any wake with a cause of its own (a silent heartbeat tick
+  isn't one). As the next turn starts it reads a short `[continue]` row
+  naming the agent, saying another turn starts, how to stop and that
+  unmarked words are sent as usual (and, on the last continuation, that it
+  waits for the next event after it); the row is written only when the
+  continuation is that turn's whole cause, never for a wake that doesn't run.
+  The next turn keeps the turn's locus unless a batched message names
+  another channel. Its wake has reason `auto-continue`. Not continued:
+  refusals, `max_tokens` cut-offs, the stall guard's ends, silent heartbeat
+  ticks, a turn whose closing prose bounced, ephemeral runs, conversation forks, an
+  agent offered no way to stop, and a quiesce (which drops a queued
+  continuation); a ` !` continuation runs instead. Each continuation is a
+  full inference: an agent that answers and ends its turn gets at least one
+  more per answer. A malformed setting is refused when the agent is built,
+  naming the value's kind, never the value. New exported types
+  `AutoContinueConfig` and `AutoContinueRun` (`InferenceRequest.autoContinueRun`).
+  See docs/auto-continue.md.
+
+- `WakeProvenance.line` (optional) carries a batched wake's `[Gate: …]` line
+  when the gate hands it to the wake rather than writing it (`WakeLine`, now
+  exported: its event's entry, its policies, the channel it names and when
+  the event arrived; `wakeLineText` renders it as of a time), and
+  `InferenceRequest.wakeLines` carries it on the wake's request for the
+  turn's start to write or leave out. A host that builds its
+  own `EventGate` with `isNewestEntry` and handles `requestInference` itself
+  receives the line there instead of in the window.
+
+- MCPL RFC-014 (tool presence, toolsets and surfaces), host side, opt-in per server with `toolHints: true` (default false; off, nothing changes). The server's dynamic tools leave the tool list and are announced in the conversation as they become visible and invisible; the new `toolsets` module's `toolsets--open`, `toolsets--act`, `toolsets--look` and `toolsets--close` open toolsets and instances, call dynamic tools, and close them. `toolsets--act` goes down the same path as a direct call of the server's tool (allowedTools, tool policy, state exchange, result reading, RFC-007 observers, who see that tool), adding only `_meta["mcpl/instance"]`; it checks arguments against the instance's current definition first, with a bounded check that never runs a server's `pattern`. Hint changes apply as each message is read, in rev order, late results and refused pushes included; a skipped rev recovers through `tools/list` then `toolsets/list`, which is also read after every (re)connect. Changes are told after a call's result, after the push that explains them, or as `mcpl-toolsets` notices (a call whose result doesn't go to the agent included). When an open toolset's announcement leaves an agent's context, a reminder is stored at its next start. New: `Agent.onCompiledToSend`, the hook that tells which announcements a request carries, and `ToolLifecycleEmitter.retarget`, which describes an act call as the tool it calls. See the README's "Tool presence and toolsets".
+
+- A module's `queryMessages` and `addMessage` take `{ forAgent }`, naming
+  the agent whose window they read or write: a conversation fork's or a
+  running sub-agent's own store, or, for an ordinary resident, the
+  residents' shared slot. For the subconscious, it's its own store, not
+  the residents' slot its compile merges in. Left out, they read and write
+  the delivery agent's window, as before: the primary's, or the first
+  agent's when none is primary. A name that isn't a registered agent, or
+  the empty name, throws, naming the registered ones, so a typo isn't read
+  as an empty window and a write for a launcher that has gone is heard. A
+  module's `gatherContext(agentName)` can then read the window of the
+  agent it gathers for, as retrieval does to key its block to that agent's
+  own opening message, and a host can deliver an async subagent's result
+  to the window of the fork or sub-agent that launched it, rather than to
+  the residents' slot.
+  - **A targeted write** is held while its agent's turn is alive, as a
+    write for the primary is. For an ephemeral run or a conversation fork,
+    whose window nothing reads after it's released, a write it never read
+    goes to the primary at its release, as the write itself, through the
+    primary's own delivery. It's read as a notice is: once it's below the
+    target's consumed watermark, which a compile built to send moves when
+    it commits (a row that compile's strategy left out counts as read too),
+    and a tool round moves when it injects messages into a stream that
+    declares it carries them. So a write that waited for its target's end (a
+    run's end, made after its last tool round or any on membrane's XML
+    prefill path, or a fork's last turn), one stored while it was idle and
+    never sent, one stored at a tool round that ended the turn, and one
+    injected into a stream that didn't declare it carries injections go to
+    the primary. One still
+    queued at the release is also stored in the target's own window, kept
+    for investigation, as a queued notice is. A queued one goes as it was
+    written; a stored one the store split into shards goes as one text,
+    whole. The framework's own writes for a run or a fork are unchanged.
+  - **`getMessage`, `editMessage` and `removeMessage`** still read the
+    delivery agent's window (the primary's, or the first agent's when none
+    is primary), so they don't take an id or handle for a row in a fork's
+    or a sub-agent's window: read it with `queryMessages` and the same
+    `forAgent`. The residents' shared slot is the primary's window too, for
+    a primary that's an ordinary resident, so there they do.
+    `metadata.external` with a target throws, since its id map is read in
+    the primary's window.
+
+- `PublishRefusalReason` gains `shared-id`: `publishForAgent` refuses a name
+  that means more than one registered channel, before anything goes out. A
+  ref picks one, as a server-qualified name does where it names one channel
+  alone.
+
+- `AgentFramework.getRequestCompileStats(request)` gives the render stats of the dry compile that
+  built a request `previewActivation` returned: context-manager's `CompileResult.renderStats`, what
+  that compile selected, by kind, without the injections merged in after it. So a host can show
+  the makeup of an agent's next request without sending one
+  (anima-research/connectome-host#425). It's null for a request that is sent, and when the
+  agent's strategy records no stats.
+
+- `thinkingBinding.binds` in an agent's config says the agent's model binds
+  its signed thinking to the conversation before it. context-manager 0.22.0
+  keeps a record of what each branch sent
+  (anima-research/context-manager#155), so that thinking can then be left out
+  once its earlier conversation changes, rather than sent and refused or
+  dropped. It's off by default.
+  - **What compiles are told:** each compile the agent sends, a framework
+    turn's, `previewActivation`'s and the direct API's, gets
+    `thinkingBinding` (`binds`, `dropBlock`, and the agent's name as
+    `participant`) and `identity`, digests of the request's system text,
+    tools, model and the rest of what it carries ahead of its messages.
+    `previewContextSettings` passes the binding too.
+  - **What streams note:** at each tool boundary and at its end, a framework
+    stream tells the context manager which stored rows its requests carried
+    as stored (`noteRequestSent`), naming the compile it was built from, so
+    their thinking is kept at the next compile. The direct API
+    (`runInference`) notes nothing, so with `binds` set, each direct-API
+    reply's thinking is left out at the compile after it's stored.
+  - **No budget restart mid-turn:** with `physicalWindowTokens` set as well,
+    `maxStreamTokens` no longer starts a new stream at a tool boundary, since
+    the new stream's compile can take the turn's earlier reasoning out of the
+    request. The window check still does, whatever the context manager.
+  - **An ops alert:** with `dropBlock` set too, where a compile reports where
+    the branch's record began (`thinkingRecordedAfter`), a block the provider
+    drops that the record doesn't account for raises `thinking-binding-loss`,
+    once per agent per incident and again if a call drops more. A reply stored
+    before the record began, or a drop for the account's binding (its
+    organization or end user), doesn't count. The provider reports drops only
+    on a request that carries the drop control.
+- `Agent.addAssistantResponse` returns the stored message's id.
+  `runInference()`'s doc says that with `binds` set, its compile writes the
+  context manager's record, so it's for a time when none of the agent's
+  requests is streaming: a stream open meanwhile then has its later notes
+  write nothing. `compileContext()` isn't told the binding, and touches no
+  record.
+
+- `thinkingBinding.dropBlock` in an agent's config asks the provider to drop
+  a signed thinking block whose earlier conversation has changed, as a fold
+  changes it, rather than refuse the request. An account that enforces
+  thinking-signature binding answers such a request with a 400; with the
+  setting, it drops the blocks that no longer match and answers. Where an
+  account doesn't enforce it, the provider decides for itself what to do with
+  such a block, and the setting has it drop them too. The setting is off by
+  default.
+  - **What's sent:** `thinking.block_binding.prefix_mismatch_behavior:
+    "drop_block"` with the `thinking-binding-controls-2026-08-01` beta, which
+    membrane's Anthropic and Bedrock adapters carry. It has no effect through
+    other adapters, or where the host sends a thinking config of its own,
+    through `request.extra` or `providerParams`, which replaces membrane's.
+    Any other model carries it only while thinking is on. A model whose
+    thinking is always on (Fable, Mythos) gets an adaptive thinking config
+    to carry it, with the agent's `thinking.display` when that's set, so on
+    such a model `display` takes effect only with this setting. membrane
+    notes that the Mythos family has refused thinking configs with a 400
+    before, so on a Mythos model the setting may fail every request.
+  - **What's reported:** on a framework turn, each call's dropped blocks, and
+    any shown to the model though they failed the check, appear in its
+    `inference:usage` trace as `thinking`. A call that dropped blocks, and
+    every later call of its stream, isn't used to calibrate the context
+    strategy's token estimates, since the provider doesn't bill a block it
+    dropped and the strategy still counts it. Where the strategy still sends
+    the blocks a fold left bound to a conversation the request no longer
+    holds, the provider drops them on every call until a later fold takes
+    them out of the context, and while they're sent, no stream calibrates and
+    the estimates keep the value they had. The direct API carries the setting
+    too, but reports nothing of it.
+
+- `ToolResult.dataIsContent` says a result's array `data` is a protocol result's content, in which every element is a block, of a type the host can show or not. The model then reads each element as itself, as a reference's stub, or as a marker saying what it was, never as the array's JSON. agent-framework sets it on an MCPL tool's result, and a module that returns a content array can set it too.
+
+- **A direct workspace mount can be written:** the workspace no longer refuses a mount with `backend: 'direct'` whose `mode` isn't `'read-only'`, and one that names no `mode` is writable, as any mount with none is. Its `write`, `edit`, `edit_many` and `delete` land on disk when they answer, or don't happen, and none of its files go into the store. The settings a direct mount refuses are otherwise as before.
+  - **A write is whole:** the new bytes are staged beside the file, in `.workspace-staged-<id>`, at the file's mode, special bits included as far as the kernel lets the process set them, and renamed over it, so a reader beside the agent never sees half a file, an edited `0755` script stays `0755`, and a process killed mid-write leaves the old file whole. A process that dies between staging and its rename leaves the staged file, which `ls` and `git status` show by that name and nothing sweeps; so does a refused write whose removal of its staged file fails, or whose directory another writer moved meanwhile. A new file takes `0666` less the process's umask, as a shell's would. The file's owner and group become the process's and the ones its directory gives a new file, and an ACL or extended attribute on it isn't carried over, as with any write that renames over a file. A file the process may not write is refused, as a store-backed push's write is, and so is a file in a directory it may not write, where the staged file is made. A file with other hard links gets a file of its own at its path, the other links keep the old text, and the answer's `note` says so. Nothing is synced, so a power loss or a kernel crash can lose a write its answer said had landed.
+  - **An edit is planned against disk's text as it is now,** by the store-backed kind's planner, and its answer is a store-backed edit's, changed region included. Just before the rename, the file is checked unchanged since the edit read it, by its bytes, read again, and by its device, inode, size, mode, owner, group and change times. A file another writer changed meanwhile is read and planned again, three attempts in all, so the edit lands on top of that change, and it's refused where its match is gone or now occurs a different number of times, where a file changed at every attempt, or where the next read refuses it as any read would, with nothing written. The answer's `note` says when a file was read again. The bytes are compared because a kernel that stamps files from a coarse clock, as Linux before 6.13 does, can leave a same-size change made within one tick unstamped.
+  - **`edit_many`** checks every edit in every file, stages every file and checks each unchanged before it renames any, so a full disk while staging, or another writer's change, is met before any file is replaced. If a rename then fails partway, the files before it are written and the rest are as they were, the answer names each file's outcome, and nothing puts the written ones back. A refusal says the call wrote none of its edits. Two paths that reach one file, through a link or as hard links, are refused, so the file is named one way.
+  - **`delete`** unlinks the file through the mount's boundary, as a store-backed push's deletion does, a followed link's entry included. One that fails after reaching the file says the file may be gone.
+  - **Links:** on a mount that doesn't follow links, a write, edit or deletion at a link is refused. On one that follows them, a write or edit goes to the file the link leads to, where that stays inside the mount, and the link stays.
+  - **After an undo or another move of the store's head,** the files stay as the departed turns left them. At the agent's next start, opening, continuing or resuming, the framework stores one notice in its history, before that start's compile, for each mount the agent wrote direct whose latest such write its history no longer holds, whether the mount runs direct now or as `'chronicle'`: "Writes to `<mount>` from turns the history no longer holds are still on disk. If it's a git checkout, `git status` and `git diff` show them; a `git checkout` of a file drops every unstaged change in it, including the ones the history still holds." Each agent is told only of its own writes. Whether the notice was given is judged by its own presence in the history: an undo that takes it away gives it again, a redo back to the latest write needs none, and going back to a branch told earlier, after another branch's notice, gives it again. The latest write's position and the notice are saved at a clean stop, in a global record the store keeps whatever branch it's on, with the mount's configured root, so a restart on another branch, such as an offline rollback's, still gives the notice, a mount left out of one session's config keeps its positions for the next, and a mount whose path changed gets none at its new path, while its old path's are kept for when it's back; a crash loses the positions of writes made since the last one, and a later move away from those writes isn't told; it can also repeat a notice given since then. A record the store can't read leaves a session with no positions to restore, and the record as it was; one that reads but isn't of the shape saved is replaced at that session's stop. A head that moves away under a running turn and comes back before the agent's next start loses the notice for the writes made while it was away.
+  - **Tool descriptions:** `write`, `edit`, `edit_many` and `delete` gain a sentence about the direct kind only on a host with a writable direct mount. `ls` without a path, and `status`, give such a mount's `mode` as `'read-write'` where its config names none.
+- **The framework's own files pass over a mount configured direct:** tool-result spill files, saved MCP payloads and fetched references go to the first writable mount without an include that isn't direct, so none lands in a checkout, where `git status` would show it and an undo would leave it. A host whose only writable mount is direct gets no spill file and no stored reference, and the truncation note, and the stub for an MCP payload it can't show, say no mount that keeps its files in the store can hold it. `getMounts()` gives `backend: 'direct'` for a mount configured direct, whether it runs direct this session or, while the store holds work there that disk lacks, as `'chronicle'`. While a mount configured direct runs as `'chronicle'`, it takes no `write`, `edit`, `edit_many`, `delete` or `writeBinary`, which would stay in the store: each is refused, saying why and that a `sync` of a held path or a `materialize` naming the mount settles what's held, after which a start runs it direct. Its start alert says the same, and no longer says to configure it `'chronicle'` to materialize it, and `getMounts()` gives it as `'read-only'` for that session.
+
+### Changed
+
+- The workspace's `read` shows a file's text as it is, and says so. A line page shows a CRLF file's lines without the CR before each line feed, and leaves out a BOM. A line whose own text ends in a CR shows its line end's CR too, since `edit` reads a CR before a line feed as part of the line end, so text copied from the line still matches it. Its note says when the file has CRLF ends or a BOM, counting a mix of CRLF and LF ends and the lines that show both CRs. It also says when the file isn't valid UTF-8: each invalid byte sequence shows as U+FFFD, `edit` refuses the file, and `write` replaces it whole. Before, each line of a CRLF file ended in a CR, a BOM came first in the first line as U+FEFF, and invalid bytes showed as U+FFFD with no note. A character page still reads the stored text as it is, BOM and CRs included.
+- On a page for a call that carries a `resultMaxChars`, such as a model's or a running script's, a line over 2,000 characters is cut, with a marker that gives the `offsetChars` and `limitChars` that read its rest. Before, a line page showed every line whole, however long.
+- A `read` page stops before its result would pass `resultMaxChars`, the most of it that can reach its caller whole. For a model's call that's its agent's inline cap, 24,000 characters by default, within which a result is stored whole unless its round's results together pass the readers' bound; for a running script's call it's what the script's memory takes, 7,456,527 characters at the default 128 MiB. Its note says where to continue: the `offset` after its last line, or for a character page the `offsetChars` it also gives as `nextOffsetChars`, with the `limitChars` left of what it was asked for, so a reader that follows the notes ends where it asked to. Where even a page's first line would pass the limit, that line is cut shorter, at the most the page has room for. Where a page's last line is cut, its note names the `offsetChars` where that line's rest starts and the `limitChars` that reads it to the line's end, before the next line's `offset` if the file goes on. A page always moves on, so where its own fields (the path and its notes) and the least it can show pass a small limit, it passes the limit. At 1,000 characters, a page with no notes does that only for a path of about 690 characters or more. Its notes take room from that: with all three notes on a file's text and a conflict's, a path of 101 to 137 characters does it, and a note that names a symlink's target, as one saying disk couldn't be checked can, takes as much room as the target is long. Before, a page of up to 2,000 lines, or of `limitChars` characters, went out whole, and for a result that passed the limit the framework kept only its start, cut mid-JSON, writing the whole of it to a workspace file where the agent has one. A caller that pages 2,000 lines at a time and starts the next page at line 2,001 now starts where the note says. A running `code_execution` script's call has that larger limit, so its line pages still stop at the line limit, 2,000 by default, and its character pages at `limitChars`, unless a page would pass that. Its line pages cut a line over 2,000 characters and leave out CRs and a BOM, as a model's do, and a character page gives it the stored text exactly. A call made in process, through `handleToolCall`, `executeToolCall` or `ModuleContext.callTool`, carries no `resultMaxChars` unless its caller sets one. Its line pages stop at the line limit alone and show every line whole, as they did before, though now without the CRs and the BOM.
+- The workspace's `grep` leaves out a CRLF end's CR, for matching as well as display, as `read` does, so `foo$` finds a CRLF file's line too, as it does under ripgrep's `--crlf`. A match's text and context are its lines as `read` shows them, but each line whole, where a `read` page for a call with a result limit cuts a line over 2,000 characters. A BOM isn't part of the first line, and a file with CRLF ends says so in its result's `lineEndings` (`CRLF`, or `mixed`). Before, a CRLF file's lines ended in a CR, so `foo$` missed them and a match's text copied into an edit carried the CR. A pattern written to find the CR of a CRLF line end no longer matches, except on a line whose own text ends in a CR, which keeps its line end's CR as `read` shows it. When a pattern names a CR, as a literal one or as `\r`, `\x0d`, `\u000d`, `\cM` or `\015`, and a file it searched has CRLF ends, the result's `note` says how many files searched have them and names them, each as `CRLF` or `mixed`, up to 20 and then how many more. It also says that a character `read` shows every CR in the workspace's copy, or in disk's file on a direct mount where the host has one. A pattern that names U+FEFF, over a file that starts with a BOM, gets a note that names the files that start with one and says a BOM isn't part of the first line. So a `grep` for `\r` or `^\uFEFF` still finds which of the files it searches have CRLF ends or a BOM. A CR that doesn't come before a line feed is still part of its line.
+- The workspace's `read` first takes in a change on disk to a file the workspace holds, as a listing and an `edit` do, and shows that text. Its note says so when disk's copy had changed since the workspace last agreed with it. It also says when disk's copy couldn't be checked, or disk has none and nothing records whether it was deleted there, so it shows the workspace's copy; where the check gave up because the selected branch kept changing, it says to read again. A file disk deleted answers that disk deleted it and the deletion was taken in, and a file disk made binary or too large answers that it's on disk but not stored. Where the path's stored copy is a draft and disk changed or deleted it too, the read shows the draft, and its note names the conflict and the ways to settle it, a sync, or a forced materialize on a mount that isn't read-only: for a deletion, a sync of the path takes it and removes the workspace's copy. Before, a read of a path the workspace held didn't look at disk, so it could show a copy another writer had since changed; a path it didn't hold was observed, as now.
+- A direct mount's `read` and `grep` show a file's text as a store-backed mount's do, with the same pages, cut lines, notes and `lineEndings`. Only the disk check is a store-backed mount's alone, since a direct mount reads disk as it is and keeps no copy of its own.
+
+- A conversation fork's or an ephemeral run's `sleep` and `wake` are refused, with a result saying that nothing was set or changed, and why. The gate's sleep quiets the whole agent, so a fork's sleep held back the primary's wakes until the sleep or the fork ended, and a fork's `wake` ended the primary's own sleep. Where a fork can call `skip_reply`, the refusal names its `wake_in_seconds` as the way to come back to the conversation later. The primary's sleep is unchanged, and still quiets the messages its forks would wake on.
+
+- A batched (debounced) wake for one MCPL message that is still the newest
+  entry in the agent's window runs without its `[Gate: 1 event matched] …
+  already shown above at arrival; this is a batched wake, not new content`
+  line. The line says which messages a wake is for, and for that one message,
+  right above it, it said nothing new: on a resident whose addressed messages
+  wake through a 5 s debounce, a third of the window was these lines, four in
+  five of them right under the one message they named. The wake itself, its
+  provenance and the reply's channel are unchanged. The line stays whenever it
+  says something: several messages in the batch, anything stored after the
+  message (the agent's own turn, another message), a turn running or a write
+  waiting, a message a tune-out holds, and content the line quotes (events not
+  stored at arrival). The gate asks the framework (`isNewestEntry`, by the
+  message's server, channel and message id, or a push event's event id); a
+  gate built without it writes every line, as before. A clock row stored after
+  the message doesn't count against it. The gate asks when the batch fires,
+  and the turn compiles later: a provider hold or a compression in flight can
+  leave room for another message to be stored in between. So when the message
+  is still the newest at the fire, the gate hands the line to the wake, and
+  the turn's start decides, after its own inputs land: if anything is stored
+  after the message by then, the line is written there, after what arrived and
+  before the start's own notices, with the same words and its age counted to
+  then, once, at the start of the agent the window belongs to, before its
+  answer. Another resident reading that window places none (every resident
+  gets every batched wake), so its request shows what the window holds, as
+  before. No start writes one while the host is quiesced or another resident
+  reading that window has a turn alive, where it would land inside that turn,
+  as a clock row waits then too; that start's request goes without it, and it
+  is written only if another fresh start of the wake comes. A line left out is
+  decided again if the provider holds the turn and its fresh start runs later;
+  if the first start's own notices then follow the message, as a routing
+  notice does when the turn's channel changed, the line is written. A retry of
+  the same start decides nothing. Each fresh start that leaves a line out
+  traces `gate:wake-line-omitted`, with its reason (`newest` or `held`); a
+  line whose write fails is logged and left for a later start. A turn that
+  never starts for the wake, or one that starts as the continuation of a turn
+  already running, writes no line and traces none.
+
+- `maxSyncPerTick` and `maxSyncBeforeSearch` are now the most items one
+  pass writes to the semantic index: what the service reports each upsert
+  inserted or updated, with each queued edit counted as one. Deletes aren't
+  counted. A pass stops where that runs out, inside a millisecond's
+  summaries or a page of messages too, and the next pass goes on from
+  there. Their documentation had called them the most items a pass would
+  push, which no pass kept: the message walk checked once per page of 256,
+  and messages the overlap behind the cursor found new went uncounted. A
+  pass still re-sends items the service holds unchanged, such as the
+  overlap's, and those spend no budget and need no embedding, so
+  re-sending them can't use a pass up. A search that finds a pass already running waits for that pass,
+  under its budget.
+
+- Each MCPL server is told only of its own channels in
+  `context/beforeInference`'s channel context (SPEC §14.4): `incoming` and
+  `defaultOutgoing` only when that channel is the server's, and `candidates`
+  only its own open channels. Every capable server was told the same
+  context, other servers' channels included, by their ids alone, which a
+  server registering the same id would read as its own. A server that read
+  other servers' channels from it no longer hears of them.
+- A `[prose-routing]` bounce that lists the channels its target could mean
+  gives its resend examples with the first of them written as one token,
+  such as `>>a:general {{unsent}}` and `destination: "a:general"`, where it
+  gave `>>#channel` and `"#channel"` whatever it listed.
+- The `mcpl:conversation-spawned`, `-spawn-failed`, `-unrouted`,
+  `-binding-orphaned`, `-closed` and `-disposed` traces carry the channel's
+  `serverId`, and a refusal's failure log names its locus as the agent is
+  shown it.
+- `inference:started` carries the server of its `channelId` as `serverId`,
+  so a host that posts back to the turn's channel can name it where two
+  servers register the id. `inference:tokens` and `inference:content_block`
+  carry the id alone.
+- `channel_list` gives a channel whose id names another channel too, another
+  server's channel with that id or another channel's server-qualified id, a
+  `name`: its server-qualified id, where that names it alone, which
+  `channelId` takes, and a `>>` target too where it is one token. Other rows
+  are as they were.
+- The results of `channel_open`, `channel_close` and `channel_decline` carry
+  the channel's `serverId` in their `data`.
+- An open that a tune-out overtook ends as `channel_open`'s refusal of a
+  tuned-out channel does, saying how the tune-out ends: by cancelling it,
+  which delivers the diverted backlog, or, for a channel no name picks
+  alone, by itself.
+- A fork's channel refusals quote its channel and what the call asked for.
+- A `serverId` given to `channel_publish`, whose schema has none, is read
+  beside a `channelId` as that exact pair, and with no `channelId` as the
+  default channel's id on that server, where it was ignored.
+- A drafts resend whose destination names a channel that takes no posts is
+  refused before anything is sent, as a `>>` target naming one is; before,
+  the send refused its first draft.
+- In explicit mode, a start whose wake names no channel, such as a budget
+  restart or a re-inference, keeps typing in the channel the turn shows,
+  starting it again where a stop or a failed start ended it, and its token
+  traces carry that channel's id, where they carried none.
+
+- An `afterUser` context injection, a module's `gatherContext` or an MCPL
+  `beforeInference` hook's, is appended to the agent's window at the start
+  that gathers it, as the message `compile()` would have placed
+  (participant `system_context:<namespace>`), so it stays where the agent
+  saw it. Where the window ends on a user message, as at a turn's start and
+  a restart after tool results, that's where `compile()` placed it.
+  Before, `compile()` placed it after the newest user message at each
+  start, so it moved every turn and at each restart after a tool result:
+  every reply after its old place lost its thinking on a model that binds
+  thinking to everything before it, and the previous turn's cached prefix
+  was rewritten. The first start after upgrading stores each
+  injection once, so that request's cached prefix ends where the injection
+  used to be placed.
+  - **What's stored again:** a source's unchanged content isn't stored again
+    while the copy the agent will read as current has it whole: the one its
+    last request held, or a newer one a start stored whose compile then
+    didn't record (it threw, or the start failed before it). An injection that would
+    leave nothing in a request (no block but blank text) isn't stored, and
+    is placed as before. Changed content is appended then (see where it
+    lands, below), and the earlier copy stays, so each change adds a row
+    until a fold summarizes it. A copy a fold has summarized, or a
+    strategy's window has passed, is stored again, as one more row, at the
+    start after the first request that no longer holds it, so that one
+    request has the summary's word for it, or, past the window, goes
+    without it. So is one after the host restarts or the window changes
+    branch. A copy a start stored whose compile then threw isn't stored
+    again by an error policy's retry of that start, since no request has
+    had it yet, and content that changed back while a compile failed is
+    stored again (where the window can't be read then, one request later).
+    A copy the strategy cut
+    at its per-message cap counts as held, since a new one would be cut the
+    same. A copy whose source stops giving it stays in the window until a
+    fold, where before it was gone at once.
+  - **Where it lands:** appended to the window. Where the window ends on the
+    agent's own reply (a wake with nothing new), a changed injection lands
+    after that reply, and `[Continue]` still ends the request, after it.
+    Where another participant spoke last (another resident, a visitor),
+    the request ends on the injection, after that message; `compile()`
+    placed it after the last user message, before it.
+    `system` and `beforeUser` injections are placed by `compile()` as
+    before. While the host is quiesced, or another reader of the residents'
+    shared slot has a turn alive, nothing is stored: `compile()` places a
+    changed one.
+    A request that ends on an injection `compile()` placed (in a window
+    with no user message, or a held window where a changed injection is
+    placed rather than stored) gets no `[Continue]` after it, and a tool
+    loop's prompt doesn't carry past it, as before.
+  - **A stored injection is history to the strategy:** it's sharded,
+    selected by the budget and folded like any message, where a placed one
+    went whole. Under the windowed-passthrough strategy, an injection larger
+    than `maxMessageTokens` reaches the request cut to it, with the cap's
+    omission marker. The autobiographical strategy, with
+    `adaptiveResolution` on, stores a message over twice
+    `targetChunkTokens` in shards of about `targetChunkTokens` each, and
+    caps each shard on its own.
+  - **Host authors:** a stored injection is a row of the agent's window, so
+    `getAllMessages`, `queryMessages` and a module's reads return it. Its
+    metadata carries `system: true`, `kind: 'context-injection'` and
+    `contextInjection: { agent, namespace, contentHash, part, parts }`. The
+    newly exported `storedInjectionMarkOf` reads it as the framework's own
+    views do. A reader that answers "what did someone say" should leave such
+    rows out. Every other agent's view (another resident sharing the slot,
+    the subconscious) leaves them out, and a conversation fork's seed leaves
+    out its template's, though a summary that folded one in is seeded as
+    summaries are. The history module's semantic index leaves their rows
+    out, though a summary that folded one in is indexed as summaries are; its
+    `extract`, `search`, `stats` and `overview` list them under their
+    participant, as they list clock rows, every resident's in a shared slot,
+    and a channel-filtered read leaves them out, as they carry no channel.
+  - **Module authors:** `gatherContext` returns `ModuleContextInjection[]`,
+    whose `placedEachCompile: true` keeps an injection placed by `compile()`
+    at each start, near the end, as before, at the cost of the thinking of
+    every reply after its old place. It's for context meant to stay near the
+    end, such as instructions moved off `system`. An existing module's
+    `ContextInjection[]` is still accepted. An MCPL server's injection can't
+    opt out.
+
+- In an MCPL tool's result, or a module's, a link (MCP's `resource_link`) the host can't fetch whose uri may carry a credential now shows a stub that says why it can't be fetched, with no uri, where the result's JSON showed the uri. So an agent no longer sees that uri, and has no other handle on the link here. Such a uri has userinfo, or a query or fragment parameter that has a value and is named like a signed URL's or a token, such as `X-Amz-Signature`, `sig`, `hm`, `token`, `access_token` or `key`, compared by letters and digits alone, so `accessToken` and `token[]` count too. A parameter's value that is itself a uri is read the same way, whether absolute (an image proxy's `?url=` holding a percent-encoded signed URL), protocol-relative, or relative with a query or fragment (a login's `?next=%2Freset%3Ftoken%3D…`), and also once decoded again where a redirector encoded it twice, each read and decode a level, up to four; a uri reached deeper counts too, and one in another encoding, such as base64, isn't read. RFC-005 §5 gives the reason: signed URLs and query capabilities are bearer credentials that look like locations. So does a link to a uri that any reference in the same result marks `disposition: never`, or to a uri that shows as the same text (a label's cleaning drops controls and bidi marks and trims surrounding space, and a lone surrogate shows as U+FFFD), or, where no reference in the result names the uri (a link names it without claiming anything), whose reference from an earlier result, as the host's record of the uri holds it, did (the latest reference until its bytes are saved, then the one they were verified against), since RFC-005 §5 removes such a uri unconditionally. An ordinary link with a query, such as `watch?v=…`, and an anchor such as `#token`, which has no value, still show their uri. A standard MCP server's result, a modern server's or an MCP-only one's, isn't read this way: its links show their uri as the server sent it.
+- In a script's structured result, from an MCPL peer or a module, a reference arrives as its object without its uri, as before, except a link (MCP's `resource_link`), which carries `uri` where the model's line for it shows the uri. One the fetcher would refuse carries `unfetchable`, the words a stub gives in place of advising `fetch_reference`, as one that counts as expired carries `expired`. Both give why a `fetch_reference` with the object's `refId` would be refused, as the result's references claim it, so a link whose line shows its uri carries them too. An MCPL peer's link reached a script as the unknown-block notice, and a module's as its fields, its uri among them. A script's view reads the claims of every reference it shows, those nested in a block's fields included, so a `disposition: never` nested in one block withholds that uri from a link elsewhere in the same result, where the model's line, which shows a block and not its fields, can still show it. A link's object carries its uri only where the model's line for the result shows it, by the claims that line reads and the uri's record as that line leaves the registry, before the script lane's own registrations, so a script never sees, through a result's blocks, a uri the model's line withholds, within 2,000 references in one result: past that, either can lose an earlier result's `never`, and a script reading a module's content array can lose it where the line, rendering in order, hasn't yet. A result's structured content reaches a script as sent, as before. A script's demand fetch of an MCPL peer's references reads the same claims as its view, as a module's does, so a uri a reference nested in a block calls expired isn't fetched.
+- A uri inline data marks `disposition: never` beside its data, which is withheld, is withheld from every other block of the result too, such as a link naming it, as a reference's `never` is (RFC-005 §5).
+- Inline data beside an empty `uri` reaches a script as sent, from an MCPL peer as from a module, where 0.26.1 and 0.26.2 gave a script an MCPL peer's as the withheld notice. An empty uri carries nothing a credential could ride on. Inline data beside one that also claims a disposition is still withheld.
+- A tool result's data that can't be read through to apply RFC-005's rules, or shown once it has been, shows `[Result not shown: the tool ran, but its result couldn't be read through, checked for references and shown, so this host withheld it.]` on the model's lane, in the stored and sent copies alike, with a log line naming the tool and the error. It was shown with none of its references' claims where the walk reading them stopped and the render's didn't, or, for data no JSON can hold, such as a cycle or a BigInt, a getter that throws, or data too deep to write, the copies' serializer threw. So a host passing such a result to the direct Agent API gets the notice where it got an exception, with the tool-result guard off; with it on, its archive of the result, and the fields it keeps of a result it withholds, still throw, as before, as does an error result whose own error field can't be read. A script meets it as a failure naming the tool, on its text route as on its structured view, and from an MCPL peer's structured view as a result it can't convert.
+
+### Fixed
+
+- A start now applies the recipe's wake rules to an existing `gate.json`, where it only appended rules under new names before (#654). The gate keeps the recipe it last applied beside `gate.json`, in `gate.recipe.json`, and merges the recipe against it at each start:
+  - a rule the recipe dropped goes, and a renamed rule takes its new name at the recipe's place, rather than landing behind a catch-all while its old name keeps matching;
+  - a rule the recipe added, moved or redefined takes its place and definition;
+  - a rule edited at run time or by hand keeps its definition, even when the recipe drops or changes it, and a rule added at run time stays where it is;
+  - a rule both recipes declare that was removed at run time comes back at its recipe place;
+  - a recipe rule moved at run time, as `wake_add_rule` with a position does, keeps `gate.json`'s order;
+  - an unedited `default` takes the recipe's.
+
+  Each start that merges into an existing `gate.json` and changes something logs one line naming the rules it added, removed, updated, restored, moved and kept, and the `gate:config-reconciled` trace carries the same lists. Rules are compared by what the gate reads, so a recipe rule that `wake_add_rule` wrote back unchanged still follows the recipe. Where `gate.json` or the recipe names a rule twice, the merge can't run, so a start only appends the rules `gate.json` lacks, as before, and removes, redefines and records nothing. The log and the gate's status say why, and status keeps it until the gate is next created.
+  - **The first start after upgrading** has no recorded recipe, so it removes and redefines nothing. It puts the rules that match the recipe into the recipe's order, and names the rules that differ from the recipe or aren't in it. A rule that differs can be removed, and the next start restores it from the recipe.
+- `wake_add_rule`'s result names the rules no probe event reaches (`notProbed`), such as one scoped to `external-message`, so its probe rows of `default:skip` don't read as their effect (#654).
+
+- `workspace--grep`'s `glob` filter matches a file's name at any depth when
+  it holds no `/`, as ripgrep's `--glob` does, so `*.ts` or `*.{ts,tsx}`
+  finds those files wherever they lie in what's searched (#694). It was
+  tested only against the path from the mount's root, so with no `path` it
+  let through only the files at a mount's root, and with a `path` below the
+  root, a directory or a file, it let through none, answering "no matches"
+  for files that were there. The path is still tried too, so every file a
+  filter let through before still passes. A filter with a `/` is still
+  matched from the mount's root, whatever the `path`, or read mount-prefixed
+  in the mount its first segment names.
+- Where a `path` and the directory a `workspace--grep` filter with a `/`
+  names before its first wildcard or brace lie apart, neither holding the
+  other, as `path: "project/src"` and `glob: "components/*.tsx"` do, the
+  grep is now refused, saying how the filter is read, where it answered
+  "no matches". `workspace--glob` is refused the same way where its
+  pattern is read mount-prefixed, as `path: "project/src"` and
+  `pattern: "project/lib/*.ts"` are, unless the `path` lies in another
+  mount's directory, which is said to be that mount's, as grep says it.
+  Where the `path` isn't a file, the refusal also names the filter or
+  pattern that reaches beneath it, mount-prefixed
+  (`project/src/components/*.tsx`), unless it has an empty, `.` or `..`
+  segment.
+
+- A tool presentation file or a description defaults file saved as UTF-8 with
+  a leading byte order mark, as some Windows editors save a hand-edited file,
+  is read like the same file without one. Each was refused as "isn't valid
+  JSON". For a presentation file, none of its settings applied, and
+  `set_tool_visibility` and `set_tool_description` refused to write until it
+  was repaired (#758). For a defaults file, the descriptions it sets didn't
+  apply. Exactly one leading U+FEFF is skipped, as `gate.json` already does
+  (#395).
+
+- On a server that's up but whose grant lacks `channels.lifecycle`, speech, a draft's resend or a
+  send's open step no longer tries to open a channel that isn't open, since nothing opens there:
+  the words go into the channel as it stands, and a send answers `already-open` or `stays-closed`.
+  Before, speech and resends there were refused, with "… this host isn't permitted to open or close
+  the … server's channels", or with "the channel isn't confirmed open" where a retarget had left it
+  unconfirmed, and a send's open failed and was traced as `mcpl:channel-open-failed`.
+- The latest deliberate close is the one on record: the agent's `channel_close` over its own
+  decline, its `channel_decline` over its own close, and either over a module's close, or a
+  module's close over the agent's, now record themselves. Before, a channel the agent had already
+  declined kept the decline when it closed it, and the reverse. A machine close of a channel with
+  no record at all, one registered lazily or on a server whose grant lacks `channels.lifecycle`,
+  now leaves it the default it had, where it used to record its own source, which policy never
+  lifts (#417). Records written before this change keep their source, so a channel a machine closed
+  before the upgrade still isn't opened by policy.
+- `channel_decline` of a channel decided open that isn't open at the transport, whose open failed
+  or is still on its way, now records the decline, where it was refused with "… is open, or set to
+  open, so there's nothing to decline". That's the decline the invitation offers as the way to
+  reply without opening a channel. Where its transport may be open, as with an open on its way, the
+  decline closes it through the channel's lifecycle queue, as any decline does. A channel open at
+  the transport is still refused, now with "… is open, so there's nothing to decline", and so is a
+  tuned-out channel, as before.
+- `channel_close`'s description and the "[channels] Now open" and policy notices' last sentence now
+  say that a channel the agent closes stays closed until it opens it with `channel_open`, and that
+  neither speaking there, the subscription policy nor its server's own default opens it again.
+- The closed-channel invitation is no longer added to a direct message (`chat:dm`), all of which
+  reaches the agent whether the DM is open or not. Where no single-word target reaches a channel,
+  it no longer says to open the channel to reply: it suggests checking whether the server has a
+  send tool that can address the channel, and says what replying there does.
+
+- The estimator calibration sample hands the context strategy the system
+  prompt and tool definitions the request sent, beside the provider's input
+  total, so the strategy compares that total with an estimate of the whole
+  request, not of its compiled window alone (context-manager #323). Before,
+  a tool-heavy agent's calibration multiplier learned its tool schemas as a
+  per-token rate, or sat at 1.00 rejecting every sample as out of band. A
+  context-manager without the second argument ignores it, 0.20.0 included,
+  so the multiplier learns as before until the host runs a context-manager
+  release with context-manager #324.
+
+- A deferred write that throws after it's stored, whose store can't be read back to tell whether it landed, is now looked up by its id at the boundary that wrote it, so it counts as written there, where it landed, and at a tool boundary it's injected with what that boundary stores, before the turn's later replies. Before, it was queued as a doubt and counted at a later flush where it first landed, ahead of later replies whose requests never held it. That's still so, as a known limit, for a write that can be neither read back nor looked up there: on an account where the provider enforces its binding of signed thinking to the prefix it was made with, a later request replaying the signed thinking of a reply stored after it, whose request didn't carry it, is refused with a 400 (context-manager #155). A recompile before the next tool boundary, such as a retry, carries such a copy where it was stored, and the boundary that then finds it injects it again, as before, so a later request replaying the signed thinking of a reply made after that boundary is refused the same way.
+- Looking a held write up by its id no longer fails because another message's blob is missing: where context-manager's query throws, the branch is scanned without blobs, and only the rows that match are read with theirs. Before, every such write stayed a doubt, holding what was queued behind it for its agent, and each read logged it again. The lines saying a store can't be searched, and that a drain holds what's queued behind such a write, are now said once per write until a lookup succeeds. The first is said again when its failure changes, and names the query's own error, which names the missing blob.
+- A module's `onProcess` response that throws as the framework applies it (at an edit of a held write that may already be stored while its store can't be searched, an edit of a message the store doesn't hold, or any store error) no longer ends the event's processing. The response stops where it threw, as before: what came before the throw stays applied, the operation that threw may have taken effect in part or whole, and the rest of it, its state update and inference request included, isn't. A line now names the module and where it threw, `process:completed` and the process log name the response with where it threw (`ModuleProcessResponse.threw`), and the other modules' responses, a `tool-call` event's dispatch, the event's trace and its process log go on. Before, the throw escaped the event's processing and all of these were lost. `EventResponse`'s docs, the README and two comments no longer say a response is applied atomically, which it wasn't: they say it's applied in order, up to a throw.
+- The log line for a held write settled through a stored row a module names says when that row is one shard of a body, rather than that the whole write was stored.
+
+- The eager reference fetch, which fetches an MCPL tool result's small references before the agent sees the result, now keeps to its own limit (#747). A fetch it starts reads no further than the first chunk past the server's eager limit (`autofetch.maxBytes`, 256 KiB by default). Before, only the size a reference claimed was held to that limit, so a body larger than its claim was read and saved whole, up to the host's 256 MiB ceiling. Once its fetch of a reference fails, for any reason, the eager fetch doesn't choose that reference again at later results, where it used to try at each: its stub offers `fetch_reference`, which still works. A reference that claims no more than the eager limit but whose body runs past it is now read twice: up to the limit by the eager fetch, then whole by the next fetch that wants it, `fetch_reference` or a script's own fetch of its references. Before, the eager fetch read it whole once, and later fetches got its saved copy.
+- Each caller of the reference fetcher now waits no longer than its own timeout, counted from its own call and covering the workspace save: 10 s for the eager fetch, and 60 s for `fetch_reference` and a script's references. A caller that joined a fetch already in flight used to keep that fetch's timer and byte ceiling. So an eager fetch that joined a `fetch_reference` could hold the tool result for 60 s, and a `fetch_reference` that joined an eager fetch failed at its 10 s. Now, when the fetch it joined stops on a narrower byte limit than the caller's own, the caller fetches again under its own, and when it stops at its time limit, the caller fetches again if it has more time left than that fetch's starter's whole timeout. A fetch that succeeds still answers every caller waiting on it, an eager fetch that joined a wider one included.
+
+- MCP's embedded resource, `{ type: 'resource', resource: { uri, text } }` or `{ …, resource: { uri, blob } }`, which RFC-005 §8.1 reads as an ordinary inline block, showed as `[Reference not shown: it arrived without a link.]` on the lanes RFC-005 governs: an MCPL peer's or a module's tool result, a script's view of either, and the push, channel and injection lanes. So its contents never reached the agent. Its contents now show as the block they make: its text as text, and a blob of an image type as an image, of an audio type as audio (in a tool result, the audio marker), and of any other type as a marker naming its type and size. A script's view gets that block too, an image or audio blob as inline data. Its uri isn't shown. One that also claims a disposition is withheld, as inline data that claims one is, and one that claims `never` marks its uri `never` for the result, so a link to that uri in the same result shows its stub. One with both text and a blob, or neither, shows a marker. At any depth in a tool result's data, it's the text its stored copy shows: its uri under `resource` no longer counts there as a reference's. Content whose only block is an embedded resource with blank text is empty, as content with only blank text is: such a push or channel message is refused, and such a render result is nothing happened. A withheld result whose data is an embedded resource keeps nothing in the guard's notice, since its text is the body withheld. A standard MCP server's result is read as before.
+
+- A message that arrives during a turn's tool call, and that the strategy
+  renders as `null`, is injected into the live stream as stored again. The
+  memory strategy gives `null` for a message before its recent window (a
+  batch bigger than that window), and for every message while a head
+  window a topic change reset hasn't filled yet. Since 0.24.1, such a
+  message was left out of the live round, and a `[not shown]` system line
+  was stored in its place. But the next compile sends it raw, in order,
+  after the tool result, so the agent didn't hear it mid-turn, the line was
+  false, and the next request differed from the live rounds anyway. The
+  `[not shown]` line, and the log line naming what was left out, are gone.
+  A clock row the render gives `null` goes in as stored too. As stored
+  still differs from the next request where its per-message cap or an
+  image limit reaches such a message, since the render neither cuts it nor
+  counts its images: a batch with more images than `maxLiveImages`, for
+  one. It differs too for a single message too big for the recent window,
+  which the strategy stores in parts.
+
+- `semantic_search` keeps a summary apart from another branch's summary with
+  the same id. A branch made from an earlier point, as an undo makes one,
+  mints summary ids its parent already used, and the index held one item per
+  id, so the branch that synced last replaced the other's summary there. A
+  summary is now indexed as `sum:<id>@<created>`, by the time it was minted,
+  which a branch that inherits it keeps. A hit whose time isn't this branch's
+  summary's is dropped as off-branch and counted in `index.droppedOffBranch`.
+  Hits still show the id as `sum:<id>`. An item from before, under the id
+  alone, can hold another branch's summary, so it's never a hit. It's
+  counted as off-branch when its id names no summary on this branch, and
+  otherwise isn't counted, since it may hold this branch's own.
+- Each branch sends its own messages and summaries to the index. The sync
+  cursors are kept in the history module's state, which the store's branches
+  carry, where they were the service's one watermark for every branch. So a
+  message or summary stored on a branch with cursors and left before a sync
+  is sent once that branch syncs again, whatever another branch sent
+  meanwhile. A branch with no message cursor yet, from before the upgrade or
+  made at a point before its first pass after it, starts its walk at the
+  service's watermark, as before. A deleted index starts the cursors over,
+  and cursors kept for another namespace aren't used. A cursor is taken as
+  no later than the index's newest item of its kind, so an index that keeps
+  its namespace and loses its newest items, as a restore from an older
+  backup leaves it, gets them again from the next pass, as before.
+- **Hosts:** after upgrading, each branch a pass syncs embeds every summary
+  it holds once more under its new key, a one-time cost on the embed service
+  of one embedding per summary, and deletes the summary's old item,
+  `sum:<id>`, where the service has `/delete`. Where it doesn't, the old items
+  stay, and search leaves them out. Until a branch's passes have sent its
+  summaries under the new key, a search on it can miss one: the search's
+  own catch-up writes up to `maxSyncBeforeSearch` items first (256 by
+  default), and background passes write the rest, up to `maxSyncPerTick` a
+  tick.
+  A summary only on a branch no pass syncs keeps its old item, unless
+  another branch's pass sends a summary with its id.
+  Messages start from the service's watermark, as before. The history
+  module's state gains `semanticCursors`. Going back to an earlier release
+  leaves summaries indexed under the new keys out of its searches until the
+  index is rebuilt. An index restored from a backup taken before this
+  release needs rebuilding too: search leaves out its older summaries' old
+  items, and no pass sends again a summary a branch's cursor covers.
+
+- **A module's `gatherContext()` that answers after its timeout adds
+  nothing,** and no longer prints the line about blocks the system prompt
+  can't carry. It was still pushed into the list the registry returns for
+  the turn. When another module was still being waited for, it landed there
+  before the list was returned, so it reached the turn's request. Otherwise
+  it landed afterwards, and when another module had answered in time, a
+  turn for an agent that isn't a conversation fork keeps that list while it
+  waits for MCPL servers' `beforeInference`, so a late answer arriving
+  during that wait reached the request too.
+- **A module whose `gatherContext()` throws before returning a promise is
+  skipped,** logged as a module that rejects is. The throw left the
+  registry's `gatherContext()`, and the turn then went without every
+  module's injections. A module whose `gatherContext()` returns an array
+  without a promise has it taken as its answer, where it lost every module's
+  injections the same way. One that answers with something other than an
+  array is skipped and logged, where a string answered through a promise
+  was spread into the turn's injections one character each.
+
+- Modules' context injections now come in the modules' registration order,
+  whatever order their `gatherContext` calls finish in, so `compile()`
+  places what it places in a fixed order and a stored injection's content
+  doesn't change with timing. Before, they came in the order the modules
+  finished. A module whose answer is an array holding something other than
+  an object (such as `null` or a string), or a `system` entry whose content
+  isn't an array of objects (such as `[image, null]`, or an array with a
+  hole), is skipped and logged; before, its entries were kept and
+  reached the turn's start.
+
+- A message that arrives while an agent's turn is alive, and that the turn
+  hears at a tool boundary, no longer also starts a turn of its own after
+  that turn when nothing is left for it (#264). When the scheduler comes to
+  start its wake, the wake is dropped if a request that carried the message
+  has been answered and, for a wake that carries a channel, unless its
+  server marked the message ambient, the agent has since published into that
+  channel: in its plain speech, with a `>>` or `>>>` address, in a sleep's
+  announcement, with `channel_publish`, by resending a draft, or with a send
+  tool whose channel the framework records (`send_message`, `reply_message`,
+  `send_dm`, `send_file`, `send_files`). A script's publish counts only in
+  the turn that started the script, and as made having read what the agent
+  had read when it started. Such a wake whose channel the agent hasn't
+  spoken in since the message was read still starts its turn, and so does
+  one whose message reached the agent only in a request that failed. A
+  message its server marked ambient asked nothing of the agent, so its wake
+  is dropped once a request that carried it has been answered; one with
+  neither tag is judged as addressed. This covers channel messages, push
+  events, a module event's one message, background-script wakes and the
+  gate's self-wake notices. Console and API input, a module event that adds
+  several messages or whose event or message names a channel, a prose bounce
+  notice and a tune-out cancellation keep their wakes. A render's wake to
+  read it counts the render as read on the same terms: one that carries a
+  channel now also waits for the agent to publish there, unless every notice
+  the render folds was marked ambient, and then it's dropped once read, as
+  before. `EventGate`'s `addMessage` and `requestInference` hooks take an
+  optional `placement` and `after` (`WritePlacement`), which a host that
+  builds its own gate passes on to have the self-wake notice's wake dropped
+  too.
+
+- An MCPL server's `inference/request` on a host that sets no
+  `inferenceRouting` policy is refused before it reaches the provider, with
+  `-32603` and a message naming `inferenceRouting`. Before, it went to the
+  provider with the model `default`, a name the Anthropic API doesn't
+  recognize (its token-counting endpoint answers 404 `not_found_error` for
+  it), and a failed inference comes back to the server as `-32603` with the
+  provider's message. The framework doesn't choose a model for the server: a
+  model it picked would run, on whatever credentials and at whatever price
+  it carries, for a server the operator never chose it for. A host whose
+  provider served a model named `default`, through a membrane
+  `beforeRequest` hook, a proxy or another adapter, loses server inference
+  until it sets `inferenceRouting`. The capability grant is unchanged.
+- A policy that names no model for a request's feature set refuses that
+  request the same way, naming the feature set, where it sent an empty
+  model on to the provider. A policy entry that is empty or not a string
+  names no model: an empty `wildcards` entry is passed over, as empty
+  `byFeature` and `overrides` entries already were, and an override or
+  feature set named like an `Object.prototype` member (such as
+  `constructor`) no longer reads one.
+- Each refusal is traced as `mcpl:inference_fail`, with `model: null` and
+  no `mcpl:inference_start`, so a trace watcher still sees the failure it saw
+  when the request failed at the provider. The first refusal for each server
+  is logged, naming what to set; with a policy, so is the first for each
+  feature set it names no model for.
+
+- `read_image`'s refusal of an image over 5 MB now says it's over the limit this host sends per image, where it called that a model limit: a route to a model can take a larger image. What it refuses is unchanged.
+
+- Two MCPL servers can register the same channel id (MCPL requires one to be
+  unique only within a server's connection), and the framework now tells
+  their channels apart wherever it acts on one, instead of taking whichever
+  server registered the id first, or refusing the id outright.
+  - A turn's plain speech, its typing indicator and its outgoing stream go to
+    the channel on the server the turn's message came from. Speech to a
+    shared id was refused as ambiguous, with a failure marker, and typing
+    showed on the server that registered the id first. The `[routing]` and
+    `[channels]` notices, the turn's receipt, a bounce, the drafts'
+    destinations and the channel tools' results and refusals name such a
+    channel by its server-qualified id, `serverId:channelId`.
+  - `channel_publish` and the subconscious's `speak_in_channel` refuse a
+    shared id, naming each candidate by its server-qualified id, and take
+    that form in `channelId` to name one server's channel. Both posted on the
+    server that registered the id first. `tune_out` does the same, where it
+    tuned out the channel on the server that registered the id first, and its
+    result names the channel as the agent can name it back.
+    `channel_open`, `channel_close` and `channel_decline` take the form too,
+    alone, and a `serverId` beside a `channelId` names that server's channel
+    with that exact id. The refusal names each candidate so it can be told
+    apart, without "not found". Ids hold colons, so two channels'
+    server-qualified ids can be one string, as `a`'s `b:room` and `a:b`'s
+    `room` are: such a name is refused as a shared id is, and a channel no
+    string picks alone is named by its id and server, `"b:room" on server
+    "a"`. No tool's description or schema changes.
+  - The subconscious's `cancel_tuneout` reads a name as `tune_out` does: it
+    refuses a name two registered channels answer to, naming both, and takes
+    the server-qualified form, where it cancelled the one on the server that
+    registered the id first. Its `deliver_summary` refuses such a name too,
+    and tags the summary with the channel's server, where it stored the id
+    alone. Tune-out's notices, and the reasons its wakes
+    give, name such a channel by its server-qualified id, and `tune_out`
+    refuses a channel because a conversation is bound to it only when that
+    conversation is bound to that server's channel.
+  - A `>>` or `>>>` target takes the server-qualified id, and a shared id or
+    label is refused with its candidates named so each can be told apart.
+    `>>b:general` matched nothing, and a shared label's candidates read as
+    the same id twice. `prose_help`'s reference shows the form. A `<@id>`
+    mention or an `@name` that one person's DMs on two servers answer to is
+    refused with both named apart, where a mention was refused as matching
+    no DM. A closed-channel invitation for a channel whose id another server
+    shares offers a `>>` reply naming its server.
+  - A host's bare id to `startTyping` or `stopTyping` types in each server's
+    channel with that id, so connectome-host's activity indicator shows in
+    both, rather than on the first registered server. Where two servers reach
+    one platform channel, two bots can show typing there.
+  - `publishForAgent` refuses a shared bare id, where it posted on the first
+    registered server. A host that passes the server as a ref is answered
+    there, as one that passes `serverId:channelId` is where that names one
+    channel alone.
+  - A push's channel is registered for the server that pushed it, whatever
+    another server registers, and its reply goes back through that server.
+    A push leaves the entry of another server's channel with that id as it
+    was.
+  - Within a turn, a `>>` or `>>>` target, a drafts resend's destination,
+    and the `channelId` of `channel_publish`, `channel_open`,
+    `channel_close`, `channel_decline`, `tune_out` and the subconscious's
+    `cancel_tuneout`, `speak_in_channel` and `deliver_summary`, that name
+    the id of a channel the turn has been in (the channel of the message it
+    answers, and any a mid-turn message or `channel_open` moved it to) mean
+    that channel on its server, and, where two of the turn's channels on
+    two servers have that id, neither, with each named. Where another
+    server registers the same id, such a reply
+    goes back where the message came from, where it was refused as a shared
+    id; once that channel's server no longer registers it, the call is
+    refused, where it went out through, or acted on, another server's
+    channel with the id. A tool call takes the turn's channels only
+    when it is made inside the turn, and a script's call only when the turn
+    that started the script is the one waiting on it, so a script left
+    running after its turn takes none, and a later turn's channels aren't
+    lent to it.
+  - `channel_publish` with no `channelId` posts to its default channel, the
+    latest message's, on the server that message came from, and is refused
+    once that server no longer registers the channel, where it went out
+    through another server that registers the id. The refusal names no other
+    channel to post to, since the one with that id that remains is another
+    server's.
+  - A wake that names its channel without the server, such as a host's
+    inference request, by an id two servers share or that no registered
+    channel has, gives the turn no channel and no fallback. Its speech isn't
+    published, as before, and the agent is no longer told its speech lands in
+    the first registered server's channel.
+  - The deprecated conversation routing gives each server's channel its own
+    fork, where a second server's channel with the same id reached the first
+    one's fork. A fork's `channel_publish` and `channel_close` of its home's
+    id act on its home, on its server, where they acted on the first
+    registered server's channel, and a home its server no longer registers is
+    refused as such. An addressed wake's route applies to the fork homed on
+    that server's channel only.
+  - Coalesced work for a channel is admitted only while its own server
+    registers the channel, not another server's channel with the same id.
+  - A batched gate wake's summary lists two servers' channels with one id
+    apart, each with its count, where it merged them into one line under
+    the first one's label.
+  - Two servers' wakes on one channel id at one moment are two wakes to a
+    provider hold, where one was dropped as the other's duplicate.
+  - The registry keeps each channel under its server and id together, so
+    server `a`'s channel `b:room` and server `a:b`'s channel `room`, which a
+    key joined with a colon gave one entry, are two.
+
+- Every problem a wake rule has is named, where these used to change what a rule does without a word:
+  - a `behavior` that isn't an object, `"always"`, `"defer"` or `"skip"`, which was saved as `"always"`, waking on every event the rule matches. That covered a typo such as `"deffer"`, and in membrane's XML tool mode the object form `wake_add_rule`'s description showed, since there `behavior` arrives as text;
+  - a match field of the wrong type, such as `tagsAny: "chat:ambient"`, `channel: 12345`, `match: "discord"` or a `filter` whose `type` isn't `text` or `regex`, and an entry of the wrong type, or `""`, in a list, which were dropped, so the rule matched more than it named;
+  - a field name that's a slip for one the gate reads at that level: the same ignoring case; one edit away, or more for a long name, a quarter of what follows the part the two names share (`pasthrough`, `keyby`, `polices`); or, at three characters or more, a part of it (`tags`, `interval` for `refillIntervalMs`); or a name holding the whole name of a field its object doesn't give, which is that field under another name (`matchTags` with no `match`, `debounceMs` in a `behavior`), but for gate.json's own fields, where such a name can be a label of the file. Beside the field it holds, such a name does nothing, as before (`channelNote` beside `channel`). A slip was ignored, so the field meant was missing: `pasthrough: true` made a governor consume the events it should let fall through. Each field the name could be a slip for is named (`tags` for `tagsAny`, `tagsAll` or `tagsNone`);
+  - a field the gate reads at another level of the rule, such as a match's `tagsAny` beside `name`, or a filter's `pattern` straight in `match`, which was ignored, so the rule matched more than it named. It's named with where the gate reads it: `Policy "quiet": it has "tagsAny", a field of "match", which the gate doesn't read here, so the rule matches every event.`;
+  - a `rate_limit` or `passive_sample` `keyBy`, or a `resets`, of the wrong type, which was dropped;
+  - a behavior object holding two kinds, of which `debounce`, then `rate_limit`, then `passive_sample` was used, whatever their order.
+- `wake_add_rule` and `addGatePolicy` refuse a rule with any problem, naming every one, those of each kind a behavior object holds included, and save nothing, since their caller is there to fix it. `wake_add_rule`'s own parameters are checked the same way: a slip of one is refused, such as `matches` with no `match`, which saved a rule matching every event, and so is a field of `match`, `rateLimit` or `passiveSample` given as a parameter of its own, such as `tagsAny`, which used to be saved without it, naming the parameter it belongs in, and showing it there where it belongs in only one and its value can be shown whole. Any refusal of `wake_add_rule`'s also names each other parameter it doesn't take, which a saved rule's `ignoredFields` names.
+- gate.json and the host's starting rules (`FrameworkConfig.gate.config`) are what a deployment already runs, so there a rule with a problem is read the way the gate read it before, and each problem is named in `gate_status`'s `errors` and a `[gate]` log line; the rest of the file loads. A rule that skips or defers is read past its problem the same way, holding back what it held back before, and its note says so: `Read so, it skips every event it now matches, as earlier releases did.` A rule is left out only where the gate refused it before: a rule that isn't an object or has no `name`; a behavior that's a list or holds none of the three kinds; a `rate_limit` or `passive_sample` that isn't an object or lacks `tokens`, `refillIntervalMs` or `every`, or has `tokens` at or under 0; a `debounce`, `tokens`, `refillIntervalMs` or `every` that isn't a finite number; an invalid regular expression in a `filter`; and a `passthrough` that isn't a boolean, or is `true` on a behavior that doesn't count. Under a default that holds events back, `"skip"` or `"defer"`, a gate.json or starting config that leaves out a rule that could wake the agent isn't used, as before, since that would hold back what the rule was written to wake on: a start runs the host's starting rules, or none, which hears every event, and a reload keeps the rules in force. A later start doesn't add starting rules that would leave gate.json unused that way, and says so. So, wherever the gate loaded the file before, no event that woke the agent before goes quiet. An empty entry in `scope`, which only narrows a rule, since no event's type is `""`, is read as written whatever the rule does.
+- A number outside the gate's range, which the gate refused whole in gate.json before and ran as given from the starting rules, is read in both with a note, and `wake_add_rule` and `addGatePolicy` refuse each. Read so, no event the starting rules woke the agent on is held back, though a batch can go out later or sooner:
+  - a `debounce` under 100 ms is read as 100 ms, so events further apart than the debounce given and closer than 100 ms, each its own batch before, share one: the agent wakes fewer times, and the batch goes out 100 ms after the last of its burst, or later where it's held, as any batch is, while the agent's turn runs;
+  - a `debounce` over 300000 ms is read as 300000 ms, so its batch goes out sooner, but for one over 2147483647 ms, the most a timer takes, which Node and Bun 1.4.3 ran after 1 ms: its batch now goes out after five minutes;
+  - a `rate_limit` `refillIntervalMs` of 0 refills at once, so the rule limits nothing, where it refilled the bucket once, through a division by 0, and then never; one under 0 is read as never refilling, as it ran, so the rule wakes the agent on its first `tokens` events and none after;
+  - a `passive_sample` `every` at or under 0 is read as 1, and a fractional one as its next whole number, as they ran.
+- gate.json's own fields are read as the gate read them before, with a note, wherever it loaded the file. One that's a list is read as no rules under the default `"always"`. A slip of `policies`, such as `"polices"`, a name the gate doesn't read, a list of rules parked under one, such as `"disabled"` or `"rules"`, included, a field of a rule at the file's top, such as `"channel"`, and a `policies` that isn't a list each do nothing: a note names each, a slip with what the file's default then does (`gate.json has "polices" (did you mean "policies"?), which the gate doesn't read, and it has no rules, so under its default, "skip", every event is held back.`), and where `policies` writes no rules the file has none, so under `"skip"` or `"defer"` it holds back every event, as it did. A `policies` holding nothing, such as `"policies": {}`, writes no rules, as `[]` does. A change keeps each such name as written and adds a `policies` list beside it, or writes the list in place of a `policies` holding nothing.
+- A change through `wake_add_rule`, `wake_remove_rule`, `addGatePolicy` or `removeGatePolicy` edits gate.json's own list of rules by name: every rule it doesn't change is written back as it was written, with its problems and the fields the gate doesn't read, and the rules in force are read from what was written, so what gate.json still holds that the gate reads past or leaves out stays named until someone fixes it. A `"comment"` survives a write now, where a write used to write the rules as the gate held them. A rule a change leaves out of force, or gives another behavior, loses its counters, buckets and timers, as at a reload, so a rule that comes back, or that a change gives another behavior, starts afresh. Its pending debounce batch is then sent as its timer would have sent it, held while an agent is inferring or the host is quiesced, and so it is at a reload, which delivered it at once. A batch whose delivery throws is named in a `[gate]` log line and dropped, and the change or reload goes on as made; so is one its timer sends, or one held for an agent's turn, which before threw uncaught, stopping a host with no handler for that. Rules that share a name share its state, and a change or reload keeps it only where those rules keep their behaviors, in order: a reload compared each with the last of them, so with two rules of a name, a change can reset their state, or keep it where it changed. A rule the gate leaves out can be replaced, or removed, by its name. A gate.json that's JSON the gate doesn't use is edited the same way, and only what loads is written: a change that doesn't mend what keeps it out is refused, naming that and what would bring it into force, and the file stays as its operator wrote it, where a change used to write the rules in force over it, losing its other rules, its own fields and its default; a change that replaces or removes by name the rule keeping it out brings it into force. When gate.json is missing, a change edits the list of the text whose rules are in force the same way, so a rule it leaves out keeps its name there too. A gate.json with no list of rules a change could edit without writing over what it holds (a list, a `policies` that isn't one and holds something, or JSON that isn't an object) refuses a change, an addition or a removal, and saves nothing; a removal there used to answer that no rule had the name, and an addition used to write the rules in force over the file. That refusal, like one over a gate.json that can't be read or isn't JSON, and one at a start that didn't use gate.json, says what the gate runs meanwhile, and what has to change first. A write of gate.json that fails says whether gate.json was changed: one that fails at its open leaves it as it was, and one that fails after may leave it holding the whole change, part of it or nothing. A change over a gate.json the gate doesn't use that would leave it with no rules in force is refused, naming what runs meanwhile, since such a file holds events back by default, so every event would be held back. A removal by a name that isn't a non-empty string, from JavaScript, finds no rule, so it can't remove the rules gate.json holds with no name.
+- `gate_status`'s `errors` says what the start did with the host's starting rules, apart from gate.json's load error, until the next start: how it read them, rules it couldn't use, and rules it couldn't add to gate.json. When adding the starting rules to a gate.json that loaded failed, the load that followed cleared the error, so the missing rules went unmentioned. When the start's own write of gate.json fails and leaves the rules in force unsaved, another entry says so until gate.json is written or loads; if that write leaves gate.json unable to load, the gate runs the rules it read and the ones it was adding, where it used to drop them, and that entry names what they hold that the gate reads past or leaves out. The entry for a gate.json that isn't used, or can't be read or isn't JSON, now says what's in force instead: the rules of the last gate.json the gate used, the rules a start read from gate.json and was adding when its write left gate.json unable to load, the host's starting rules, or none. `gate_status`'s `configSource` is `"initial"` while the starting rules are in force, where it said `"default"` while they ran in place of a gate.json that didn't load.
+- A `null` is a field left out, and so is `""`, which is named in a note, with what leaving it out does where that's more than no constraint: a `match` left out matches every event, and a `behavior` is `"always"`. In a rule the gate reads, a match left with nothing that narrows it, once something in it was dropped, left out as `""` or unread, matches every event, and a note says so; in a refusal of such a rule, where nothing was saved, the note gives that as the reason its problems matter: read without what's wrong in its match, as earlier releases read it, the rule would match every event. A gate.json holding `"channel": ""`, as `wake_add_rule` could save before, loads as it did, with the field left out. Where the gate refused a rule or a gate.json for a `null` or `""`, in a `passthrough`, a behavior's kind or gate.json's `default`, it now loads without it. A `filter` whose `pattern` is `""` narrows nothing and is left out, with a note. For `wake_add_rule`, a `null` or `""` parameter is left out too, so a call whose only behavior is `null` is refused as one with none, where it was saved as `"always"`. A field name the gate reads nowhere that's no slip, such as `"comment"`, changes nothing, so it loads, and `gate_status`'s `errors` names it with the fields its place holds. `wake_add_rule` leaves it out of the rule it saves and names it in the result's `ignoredFields`, and `addGatePolicy` tells a new `onIgnoredFields` callback, or the log.
+- `wake_add_rule` refuses a `position` other than `"append"` or `"prepend"`, and an `insertBefore` or `insertAfter` that isn't a string, which were ignored, so the rule was appended. A refused `behavior` points at `debounceMs`, `rateLimit` and `passiveSample`. Its description's example now gives `debounceMs: 60000` in place of `behavior: { debounce: 60000 }`, which its schema, a string enum, didn't admit.
+- **What a deployment will notice:**
+  - A gate.json holding a rule the gate refused before now loads, with that rule left out and named, under `"always"`, or where the rule skips, defers or has no tokens. A reload or a start applies its other rules, where a reload kept the rules the gate had and a start ran the host's starting rules, or none. So under `"always"`, a rule after the one left out that skips, defers, rate-limits or samples can now hold back an event those rules woke on, and one that debounces can delay it: that's the case where an event that woke the agent before can go quiet.
+  - A rule that skips or defers, with a problem the gate read past before, is read as before, holding back every event it then matched, and now says so.
+  - A starting rule with a `debounce` under 100 ms or over 300000 ms, or a `refillIntervalMs` of 0, runs as read above, where it ran as given: a burst under a short debounce wakes the agent fewer times, a debounce over 2147483647 ms waits five minutes where it ran after 1 ms, and a refill interval of 0 no longer stops the rule after its one refill.
+  - A batch a timer or an agent's turn sends, whose delivery throws, as `addMessage` does with no agent configured, is named in the log and dropped, where it was thrown uncaught.
+  - `wake_add_rule` and `addGatePolicy` refuse a rule holding a field at another level than its own, and `wake_add_rule` a field of `match`, `rateLimit` or `passiveSample` given on its own; such a rule used to be saved without it. A gate.json written with such a field loads as before, with the field named.
+  - A starting rule the gate refused before is named at start. One used to make the gate run all of the starting rules as given, from memory, so these ran and woke the agent: a `rate_limit` without `refillIntervalMs`, a `debounce` given as text such as `"60000"`, a `passthrough` that isn't a boolean, which ran as its truthiness, `passthrough: true` on `"always"`, and a rule with no `name` that wakes, such as on `"always"`. Now, under a starting default of `"always"`, such a rule is left out and the rest run; under `"skip"` or `"defer"`, none of the starting rules is used, and the start runs gate.json's rules, or none, which hears every event. connectome-host's recipes hold none of them.
+  - A first start writes the host's starting rules to gate.json as given, a rule left out included, as before, and runs each as read, but writes none the gate refuses whole, and then starts with no rules, as a host without them does; gate.json, read the same way, names each problem at every load until someone fixes it. A later start adds, as given, the starting rules whose names gate.json lacks; a rule gate.json holds keeps its name even where the gate leaves it out, so the host's rule of that name doesn't replace the operator's. Where gate.json has no list of rules to add them to, a list or a `policies` that isn't one and holds something, a later start writes nothing over it and runs them under gate.json's default, unsaved, until gate.json changes and loads, and `gate_status` says so, with `configSource` `"initial"`, where it used to write them over the file, losing what it held. Where gate.json has no rules of its own, with no list, an empty one or one holding only rules the gate leaves out, and, under its default, one of the starting rules that could wake the agent can't be put in force, left out, with no name, or kept out by a rule of gate.json's of its name that the gate leaves out, or they're refused whole and that default holds events back, gate.json isn't used at that start, which runs as one without it does: the starting rules under their own default, as earlier releases ran them once what they wrote over it or into it wouldn't load, or once they refused gate.json's rule, or no rules where the starting rules are refused whole. `gate_status` names the rule left out and the way back, and a change through the gate is refused until gate.json changes.
+  - A rule a slip already saved in a valid form, such as `"always"` saved from a typo or `match: {}` from a dropped field, loads as it was saved, since the slip is no longer in it.
+
+- A tool result's content array with a block agent-framework couldn't show, such as inline audio, an image with no media type or no data, or a block of a type it doesn't know, was stored, and sent to the model, as the whole array's JSON. Inline data's base64 went into the agent's context and history, and so did a block's uri, and an image beside it went as base64 text instead of an image. Each block now shows on its own, in the stored copy and the one the model reads alike: as itself, as a reference's stub, or as a marker saying what it was and why it isn't shown. Beside an image, the model reads them as blocks while the result's links and markers fit its inline cap together, and past that it reads the stored text, cut at the cap. Inline audio reads `[Audio not shown: this host's tool results carry only text and images (<type>, <size>).]`, and the other blocks read the markers the push lane shows for them. An MCPL tool's result is content whatever its blocks' types. Any other array, such as a module's that doesn't set `dataIsContent`, is content only when every element is a block of one of MCP's types (text, image, audio, resource, resource_link). Any other array is data, written as JSON as before. Results stored before the upgrade keep the text they were stored with.
+- MCP's `resource_link` is a reference (RFC-005 §8.1): its `uri`, `name`, `mimeType` and `size` (as `sizeBytes`) make its record, with no disposition. On every lane, a link `fetch_reference` can fetch shows as a reference's stub, with its name, type and size. In a tool result, whose JSON showed every link's uri, one it can't fetch shows as `[resource link "<name>": <uri>, <type>; not fetched]`, keeping the uri, the agent's only handle on it, as a standard MCP server's link shows. That holds at any depth in a tool result's data too, where a link's fields were written as data, and a link whose uri is empty, null or not a string is the marker that says so. A link that names no uri at all is the marker as a block of a content array the model reads, and at depth, or in a script's view of a module's result, stays data, as before, since its fields hold no uri this reads. That covers a uri that isn't http(s), one off its server's origin, one from a server with no address, and a link no server delivered. Where the uri may carry a credential, the link shows a stub instead (under Changed), and so does a link whose uri is a `data:` uri, which holds its content rather than naming where it lies. On every other lane, a link that can't be fetched shows the stub that says why it can't be fetched, with no uri, where the push lane showed an unknown-block marker. A link is registered with the server that sent it, but it's never fetched eagerly or on a script's demand: a uri a link names is fetched only when a block of the result that isn't a link names it too. A link's claims never replace a reference's in the registry, so a later link to a uri can't lift its expiry or its digest check.
+- A reference's stub now offers `fetch_reference` only where a fetch can reach the reference through a server that delivered it and the reference hasn't expired, as the servers' configs have it. Where two frameworks in one process configure one server id at different urls, a stub reads the address recorded most recently by a framework that hasn't since removed the server or stopped. A framework records its servers' addresses as it configures them and again as it starts. Otherwise it ends with why `fetch_reference` would refuse, without what calling again can do. The stub reads an expiry from the references in its result where they name its uri, and the fetch from the reference as the host last recorded it, so where one result names a uri both expired and fresh, the stub says it's expired while a fetch can succeed. A fetch's own limits, a spent budget or a claim over its ceiling, still apply when it's made. That covers a server with no address, such as a stdio one, a server the host doesn't know, one whose address doesn't parse, a uri off its server's origin, one with a user name or password, or a scheme the fetcher doesn't fetch. A third-party origin and a refused scheme are described there without naming the origins or the scheme. Before, the stub offered the fetch for any reference a server delivered. A server's id in a stub, or in `fetch_reference`'s refusal, is bounded and stripped of controls, as a label is, and so is a scheme in that refusal.
+- A label in a stub (a name, a type, a server's id, a provenance or a saved path) loses any line or paragraph separator (U+2028, U+2029), as it loses control characters.
+- A script's demand fetch of a reference not yet fetched reads that reference's own digest and expiry, where it read whatever an earlier reference to the same uri had claimed.
+- Inline data beside an empty `uri` is shown as any inline data is, on every lane, where it was withheld as data that also claimed a link.
+- On the tool-result lane, an image whose data or media type is an empty string shows its marker, as on the push lane, where it was sent to the model as an image with that field empty.
+
+- A wake-rule change no longer destroys a gate.json that won't load. `wake_add_rule` and `wake_remove_rule` (and `addGatePolicy` and `removeGatePolicy`) started from the rules in force when gate.json was there but wasn't JSON or held a policy the gate refused, and they wrote those rules straight over the file, so whatever it held, such as an operator's unfinished edit, was lost. A gate.json that holds a policy the gate refuses is now edited in place instead, with that policy kept as written. A change over one that isn't JSON, or that the gate can't read at all, such as one it lacks permission for, is refused, naming why and what the gate runs meanwhile, and nothing is written over it, so what it holds stays as it is, until it's JSON the gate can read.
+- The gate's files are reloaded when their text changes. At most once a second, gate.json is read again and applied when its text differs from the text whose rules are in force, and the privileged-users file is read again and loaded when its text differs from the text last read. A gate.json that holds the text in force again after failing to load, as after a `chmod` that makes it readable, has its error cleared, and nothing is applied again. gate.json's reload compared only its mtime, so two writes in one clock tick, a write between its read and its stat, or a read that only looked (`getGatePolicyNames`, or a change that wrote nothing) left a new gate.json unapplied until it next changed, and a `chmod` that made it readable again wasn't noticed. `isPrivilegedUser`, which tune-out's wake classification calls for each diverted message, read and parsed the privileged-users file on every call, and while it couldn't be read each call added another copy of its error to `gate_status`'s `errors`. A clock stepped backwards now makes the next check run, rather than holding off both reloads until the clock catches up. A missing file is told apart from one that's there but can't be reached, such as behind a directory the process can't search: only a missing gate.json keeps the rules in force without an error, and only a missing privileged-users file means no one is privileged.
+- A privileged-users file loads entry by entry. An entry of its list that's a non-empty string, or a safe integer (a whole number within 2^53 - 1 of zero), is a user id. Any other entry is skipped and named in the file's error, including a number too large for JSON to read exactly, whose rounded value could be another user's id. A file that isn't JSON, or isn't a list or `{"userIds": [...]}`, is that file's error, and the list that last loaded stays in effect, as for a file that can't be read (at startup, that's no one). Such a file used to load as no one privileged, without a word, and an entry that wasn't an id was loaded as text. An empty author id is never privileged, while the agent sleeps as for tune-out.
+- `gate_status` reads both files again, at most once a second, before it answers, and its `errors` holds each problem once: gate.json's, what the start did with the host's starting rules, and the privileged-users file's. A gate.json load no longer clears the start's notice, which stays until the next start, or the privileged-users file's error, and a privileged-users file that loads again, or is removed, clears its own. The starting rules the start couldn't save stay named until gate.json holds what's in force, as it does once it loads or a change is written. When gate.json's error changes, a `[gate]` log line says it couldn't be read and why, and the `gate:config-error` trace is emitted, not at every read that fails the same way. A gate.json that stopped loading used to reach only the trace.
+- `wake_remove_rule` and `removeGatePolicy` clear the removed rule's state (delivering its pending debounce batch, and dropping its rate-limit and sampling counters) only once gate.json is written. A write that failed used to leave the rule in force with its state already cleared.
+
 ## 0.26.2 — 2026-10-24
 
 ### Fixed
