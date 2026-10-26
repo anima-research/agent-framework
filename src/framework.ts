@@ -751,6 +751,7 @@ import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
+import { Heartbeat, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -3492,6 +3493,8 @@ export class AgentFramework {
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
   private judgeWired = false;
+  /** The heartbeat (FrameworkConfig.heartbeat), when the host turns it on. */
+  private heartbeat: Heartbeat | null = null;
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
@@ -3951,6 +3954,28 @@ export class AgentFramework {
       });
     }
 
+    // The heartbeat, when the host turns it on: the agent's own schedule of
+    // wakes. heartbeat-mcpl beside it would wake the agent twice and offer
+    // its tools under the same names, so that's refused.
+    if (config.heartbeat !== undefined && config.heartbeat !== false) {
+      if ((config.mcplServers ?? []).some((s) => s.id === 'heartbeat')) {
+        throw new Error(
+          'FrameworkConfig.heartbeat is on beside an MCPL server with the id "heartbeat" (heartbeat-mcpl): both would wake '
+          + 'the agent, and their tools share the names heartbeat--…. Remove the server to use the framework\'s heartbeat '
+          + '(heartbeat.importFrom can bring its schedule and reminders along), or turn heartbeat off to keep the server.',
+        );
+      }
+      const opts = config.heartbeat === true ? {} : config.heartbeat;
+      framework.heartbeat = new Heartbeat({
+        statePath: opts.statePath
+          ?? (config.storePath ? join(config.storePath, 'config', 'heartbeat.json') : './data/heartbeat.json'),
+        timeZone: framework.timeZone,
+        ...(opts.defaults ? { defaults: opts.defaults } : {}),
+        ...(opts.importFrom ? { importFrom: opts.importFrom } : {}),
+        deliver: (wake) => framework.deliverHeartbeat(wake),
+      });
+    }
+
     // Liveness watchdog: fail hard if the main thread wedges (opt-in).
     if (config.watchdog?.enabled === true) {
       const { LivenessWatchdog } = await import('./runtime/liveness-watchdog.js');
@@ -4240,6 +4265,7 @@ export class AgentFramework {
     // if it ended while stopped. Before the loop's first pass, so that a wake
     // owed now joins the requests already pending in one turn.
     this.eventGate?.resumeSleep();
+    this.heartbeat?.start();
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -4730,8 +4756,9 @@ export class AgentFramework {
     // Stop typing indicators, and forget the registry's channels
     step(() => this.channelRegistry?.stopAll());
 
-    // Dispose EventGate (clear debounce timers)
+    // Dispose EventGate (clear debounce timers), and stop the heartbeat's timers
     step(() => this.eventGate?.dispose());
+    step(() => this.heartbeat?.stop());
     step(() => this.livenessWatchdog?.stop());
     AgentFramework.diagnosed.delete(this);
 
@@ -5046,7 +5073,66 @@ export class AgentFramework {
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
+    // The heartbeat's ticks and reminders wake every resident it delivers to.
+    if (this.heartbeat && this.heartbeatTargets().includes(agentName)) wakes.push(...this.heartbeat.upcomingWakes());
     return wakes;
+  }
+
+  /** The agents the heartbeat wakes: every resident but conversation forks and the subconscious, as a push event's default broadcast. */
+  private heartbeatTargets(): string[] {
+    return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+  }
+
+  /**
+   * Deliver one of the heartbeat's wakes, as heartbeat-mcpl's push events
+   * were, past the gate's rules and through a sleep, like the agent's own
+   * skip_reply timer. A silent tick stores no prompt: its turn is a silent
+   * heartbeat (silent-heartbeat.ts), prose suppressed. A message-mode tick
+   * and a reminder store their text, and wake each resident, which drops its
+   * wake once a request that carried the text is answered.
+   */
+  private deliverHeartbeat(wake: HeartbeatWake): void {
+    const targets = this.heartbeatTargets();
+    if (wake.kind === 'heartbeat' && wake.silent) {
+      console.error(`[heartbeat] silent scheduled wake ${logValue(wake.eventId)}`);
+      for (const agentName of targets) {
+        this.pendingRequests.push({
+          agentName, reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+          suppressProse: true,
+          silentHeartbeat: { eventId: wake.eventId, serverId: 'heartbeat' },
+        });
+      }
+      return;
+    }
+    const placement: import('./gate/event-gate.js').WritePlacement = {};
+    const metadata = wake.kind === 'reminder'
+      ? { source: 'reminder', serverId: 'heartbeat', reminderId: wake.reminderId, recurring: wake.recurring, eventId: wake.eventId }
+      : { source: 'heartbeat', serverId: 'heartbeat', reason: wake.reason, eventId: wake.eventId };
+    const id = this.addMessage('user', [{ type: 'text', text: wake.text }], metadata as MessageMetadata, { placement });
+    this.emitTrace({ type: 'message:added', messageId: id, source: wake.kind === 'reminder' ? 'heartbeat:reminder' : 'heartbeat' });
+    for (const agentName of targets) {
+      this.pendingRequests.push({
+        agentName, reason: wake.kind, source: 'heartbeat', timestamp: Date.now(),
+        ...this.readsDeferredFor(placement, agentName),
+      });
+    }
+  }
+
+  /** Handle a call to one of the heartbeat's tools. */
+  private dispatchHeartbeatToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'heartbeat', tool: call.name, callId: call.id, input: call.input });
+    let result: ToolResult;
+    try {
+      result = this.heartbeat!.handleToolCall(call.name, call.input);
+    } catch (err) {
+      result = { success: false, error: `${call.name} failed: ${errorMessage(err)}`, isError: true };
+    }
+    this.emitTrace({
+      type: result.isError ? 'tool:failed' : 'tool:completed',
+      module: 'heartbeat', tool: call.name, callId: call.id, durationMs: 0,
+      ...(result.isError ? { error: result.error } : {}),
+    });
+    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'heartbeat', result });
   }
 
   private auxiliaryMembraneFor(agentName: string): Membrane {
@@ -6370,6 +6456,7 @@ export class AgentFramework {
       ...this.mcplTools,
       ...channelTools,
       ...gateTools,
+      ...(this.heartbeat?.getTools() ?? []),
       this.buildAgentSettingsTool(),
       ...(this.getWorkspaceModule()
         ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL,
@@ -24243,6 +24330,12 @@ export class AgentFramework {
     // Route sleep / wake tools
     if ((enrichedCall.name === 'sleep' || enrichedCall.name === 'wake') && this.eventGate) {
       this.dispatchSleepToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // Route the heartbeat's tools (heartbeat--…)
+    if (this.heartbeat?.ownsTool(enrichedCall.name)) {
+      this.dispatchHeartbeatToolCall(agentName, enrichedCall);
       return;
     }
 
