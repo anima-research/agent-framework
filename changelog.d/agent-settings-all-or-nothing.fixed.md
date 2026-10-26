@@ -15,11 +15,6 @@
   refusal: …", naming each setting whose applied or saved value differs from
   before the call, or, if the settings can't be read back, that whether
   anything changed couldn't be.
-- `agent_settings` refuses an update that names something that isn't a setting
-  (`Unknown setting: tail_token`), or names `settings`, which only a reset
-  reads, where it dropped the name unseen and answered as if the call had
-  succeeded. A reset refuses a name beside `settings` the same way, where it
-  dropped the name and reset everything.
 - The budget preflight's notes, such as a paced descent that will converge
   only as far as the folded floor, are logged once the budget has applied,
   not before a refusal that leaves it unapplied.
