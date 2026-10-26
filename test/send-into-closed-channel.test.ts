@@ -145,8 +145,10 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
     setStateJson: (_id: string, value: unknown) => { frameworkState = value; },
   };
   framework.agents = new Map([['sol', agentStub()]]);
-  // Conversation agents by their home channel; sol isn't one.
+  // Conversation agents by their home channel, and ephemeral runs by name;
+  // sol is neither.
   framework.conversationAgentHomes = new Map();
+  framework.ephemeralRuns = new Map();
   const windowMessages: string[] = [];
   /** Whose window each of those was addressed to: addMessage's forAgent, or
    *  undefined for the primary agent's. */
@@ -233,7 +235,7 @@ test("a send into a channel the agent closed says so, what still reaches the age
   assert.deepEqual(settings.update('sol', { closed_channel_note: false }), { closed_channel_note: false });
   assert.deepEqual(state()?.closedChannelNotes, { sol: false });
   assert.ok(!(await reply()).data.includes('[closed channel]'), 'no note once turned off');
-  assert.throws(() => settings.update('sol', { closed_channel_note: 'off' }), /closed_channel_note must be a boolean/);
+  assert.throws(() => settings.update('sol', { closed_channel_note: 'off' }), /closed_channel_note must be true or false, not "off"/);
 
   // Reset brings the default back.
   assert.deepEqual(settings.reset('sol'), { closed_channel_note: true });
@@ -749,7 +751,7 @@ test("closed_channel_note is an agent_settings key, kept in the framework's stat
     const off = settings(framework, { action: 'update', closed_channel_note: false });
     assert.equal(off.data?.closed_channel_note, false);
     assert.equal(off.data?.tool_result_guard, true, "turning the note off leaves the other setting's value");
-    assert.match(String(settings(framework, { action: 'update', closed_channel_note: 'no' }).error), /closed_channel_note must be a boolean/);
+    assert.match(String(settings(framework, { action: 'update', closed_channel_note: 'no' }).error), /closed_channel_note must be true or false, not "no"/);
 
     await framework.stop();
     framework = await AgentFramework.create(config());
@@ -857,11 +859,8 @@ test("a sleep announced into a channel the agent or a module closed says the age
   assert.deepEqual(published.splice(0), [{ channelId: 'discord:g1:343434', text: quiet }]);
   routing.locus = ref(channelId);
 
-  // A conversation agent's announcement reads the same: the words follow the channel.
-  framework.conversationAgentHomes.set('sol', channelId);
-  slept = await sleep({ seconds: 600 });
-  framework.conversationAgentHomes.delete('sol');
-  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+  // A conversation agent announces nothing: its sleep is refused before the
+  // announcement (dispatchSleepToolCall; event-gate-sleep.test.ts).
 
   // Hybrid routing announces to the locus as locus mode does.
   framework.agents.set('sol', agentStub({ proseRouting: 'hybrid' }));

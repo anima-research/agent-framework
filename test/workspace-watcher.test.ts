@@ -1126,6 +1126,7 @@ describe('MountWatcher ignores what a walk passes over by design (connectome-hos
     mkdirSync(join(root, 'cache'), { recursive: true });
     mkdirSync(join(root, 'drafts~'), { recursive: true });
     for (const other of others) mkdirSync(join(root, other), { recursive: true });
+    for (const f of files) mkdirSync(join(root, dirname(f)), { recursive: true });
     let ready = false;
     const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore }, others);
     try {
@@ -1157,6 +1158,35 @@ describe('MountWatcher ignores what a walk passes over by design (connectome-hos
     it(`passes over another mount's directory nested in this one, and reports what lies beside it (${backend})`, async () => {
       const files = ['inner/mount/x.txt', 'inner/kept.txt', 'kept.txt'];
       assert.deepEqual(await reported(collectOn, [], files, ['inner/kept.txt', 'kept.txt'], ['inner/mount']), ['inner/kept.txt', 'kept.txt']);
+    });
+
+    it(`passes over a directory a trailing "/" names, and reports a file of that name (${backend})`, async () => {
+      assert.deepEqual(await reported(collectOn, ['out/'], ['out/x.txt', 'deep/out/y.txt', 'sub/out', 'kept.txt'], ['sub/out', 'kept.txt']), ['kept.txt', 'sub/out']);
+    });
+
+    it(`reports nothing when a directory a trailing "/" names is removed, and reports a file of that name removed (${backend})`, async () => {
+      const root = join(tmp, 'work');
+      for (const f of ['out/x.txt', 'sub/out', 'kept.txt']) {
+        mkdirSync(join(root, dirname(f)), { recursive: true });
+        writeFileSync(join(root, f), 'x');
+      }
+      let ready = false;
+      const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore: ['out/'] });
+      try {
+        await waitFor(() => ready, 'expected the watcher to be ready', 10_000);
+        await changesFlow(root, batches, ['', 'sub']);
+        rmSync(join(root, 'out'), { recursive: true });
+        unlinkSync(join(root, 'sub/out'));
+        writeFileSync(join(root, 'after.txt'), 'x');
+        const seen = (p: string) => batches.flat().some((c) => c.path === p);
+        await waitFor(() => seen('sub/out') && seen('after.txt'), 'expected sub/out and after.txt to be reported', 10_000);
+        await wait(SETTLE_MS);
+      } finally {
+        await watcher.stop();
+      }
+      const changes = batches.flat().filter((c) => !isProbe(c.path));
+      assert.deepEqual(changes.filter((c) => c.path === 'out' || c.path.startsWith('out/')), []);
+      assert.ok(changes.some((c) => c.path === 'sub/out' && c.op === 'deleted'), JSON.stringify(changes));
     });
   }
 
