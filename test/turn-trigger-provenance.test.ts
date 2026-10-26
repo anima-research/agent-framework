@@ -1212,6 +1212,14 @@ describe('private wins, one way', () => {
       await rig.framework.runUntilIdle();
       return rig.routed.slice(before);
     };
+    const hostUndo = async (rig: Rig) => {
+      const cm = rig.framework.getAgent('scout')!.getContextManager();
+      const { messages } = cm.queryMessages({});
+      let newest = messages.length - 1;
+      while (newest >= 0 && messages[newest]!.participant === 'user') newest--;
+      assert.ok(newest > 0, 'control: there is a turn to undo');
+      await cm.switchBranch(cm.branchAt(messages[newest - 1]!.id, `undo-${Date.now()}-${messages.length}`));
+    };
     const acrossRestart = async (before: (rig: Rig) => Promise<void>, after: (rig: Rig) => Promise<void>) => {
       const storeDir = mkdtempSync(join(tmpdir(), 'surface-restart-test-'));
       try {
@@ -1298,122 +1306,47 @@ describe('private wins, one way', () => {
       }
     });
 
-    for (const fromPrivate of [true, false]) {
-      it(`a nudge after a ${fromPrivate ? 'private turn and a silent heartbeat tick speaks in no channel' : 'channel turn and a silent heartbeat tick speaks as on main'}`, async () => {
-        const rig = await surfaceRig();
-        try {
-          if (fromPrivate) await privateTurn(rig); else await roomTurn(rig);
-          const starts = rig.starts.length;
-          rig.i.pendingRequests.push({ agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(), suppressProse: true });
-          await rig.until(() => rig.starts.length > starts && idle(rig), 'the silent tick');
-          await rig.framework.runUntilIdle();
-          assert.deepEqual((await nudge(rig)).map((r) => r.locus), fromPrivate ? [] : [LOUNGE]);
-        } finally {
-          await rig.close();
-        }
-      });
-    }
-
-    for (const step of ['an undo', 'a redo'] as const) {
-      it(`a nudge after ${step}, following a channel turn, speaks in no channel: the turn it retakes isn't known`, async () => {
-        const rig = await surfaceRig();
-        try {
-          await roomTurn(rig);
-          await roomTurn(rig);
-          assert.ok(rig.framework.undoLastTurn('scout').undone);
-          if (step === 'a redo') assert.ok(rig.framework.redo('scout').redone);
-          assert.deepEqual(await nudge(rig), []);
-          assert.ok(rig.texts().some((t) => t.startsWith('[delivered]') && t.includes('kept private (private turn')), 'the resident is told');
-          await roomTurn(rig);
-          assert.deepEqual((await nudge(rig)).map((r) => r.locus), [LOUNGE], 'a public turn since makes it known again');
-        } finally {
-          await rig.close();
-        }
-      });
-    }
-
-    it("a nudge after the operator switches back to a branch that ends on a private exchange speaks in no channel", async () => {
+    it("a nudge after the host's own undo, twice, back to a private question speaks in no channel", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
-        const undone = rig.framework.undoLastTurn('scout');
-        assert.ok(undone.undone && undone.fromBranch);
         await roomTurn(rig);
-        await rig.framework.switchBranch(undone.fromBranch!);
+        await hostUndo(rig);
+        await hostUndo(rig);
+        const newest = rig.framework.getAgent('scout')!.getContextManager().getAllMessages().at(-1);
+        assert.equal(readInboundSource(newest?.metadata)?.kind, 'surface', `control: the context ends on the operator's question: ${JSON.stringify(newest)}`);
         assert.deepEqual(await nudge(rig), []);
       } finally {
         await rig.close();
       }
     });
 
-    it("a nudge after a rewind shed the channel turn that followed a private exchange speaks in no channel", async () => {
+    it("an unstick after the operator hides messages, in a context that never held private input, speaks as on main, in the fallback channel", async () => {
       const rig = await surfaceRig();
       try {
-        await privateTurn(rig);
-        await roomTurn(rig);
-        const internalsOf = rig.framework as unknown as { shedNewestTurn(agent: unknown): { removedIds: unknown[] } | null };
-        assert.ok(internalsOf.shedNewestTurn(rig.framework.getAgent('scout')), 'control: the channel turn was shed');
-        assert.deepEqual(await nudge(rig), []);
-      } finally {
-        await rig.close();
-      }
-    });
-
-    it("a nudge after the operator hides a range across a channel turn that followed a private exchange speaks in no channel", async () => {
-      const rig = await surfaceRig();
-      try {
-        await privateTurn(rig);
         const store = (rig.framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage
           .bind(rig.framework);
-        store('bob', [{ type: 'text', text: 'how is the build?' }], { messageId: 'd1', channelId: ROOM });
+        store('bob', [{ type: 'text', text: 'spam' }], { messageId: 'x1', channelId: ROOM });
+        store('bob', [{ type: 'text', text: 'more spam' }], { messageId: 'x2', channelId: ROOM });
         await roomTurn(rig);
-        store('bob', [{ type: 'text', text: 'thanks' }], { messageId: 'd2', channelId: ROOM });
         const hidden = await (rig.framework as unknown as {
           handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; hidden?: number; error?: string }>;
-        }).handleHostCommand('discord', { command: 'hide', agentName: 'scout', fromMessageId: 'd1', toMessageId: 'd2' });
-        assert.ok(hidden.ok && (hidden.hidden ?? 0) >= 3, `control: the range took the channel turn's reply too: ${JSON.stringify(hidden)}`);
-        assert.deepEqual(await nudge(rig), []);
+        }).handleHostCommand('discord', { command: 'hide', agentName: 'scout', fromMessageId: 'x1', toMessageId: 'x2' });
+        assert.ok(hidden.ok && hidden.hidden === 2, `control: the two messages were hidden: ${JSON.stringify(hidden)}`);
+        assert.deepEqual((await unstick(rig)).map((r) => r.locus), [LOUNGE]);
       } finally {
         await rig.close();
       }
     });
 
-    for (const step of ['undo', 'redo'] as const) {
-      it(`another agent's ${step} on the shared store leaves this agent's nudge after its channel turn in no channel`, async () => {
-        const rig = await surfaceRig({ otherAgents: ['ranger'] });
-        try {
-          const settled = () => ['scout', 'ranger'].every((name) => rig.framework.getAgent(name)!.state.status === 'idle');
-          const channelTurn = async (agentName: string) => {
-            const before = rig.routed.length;
-            const starts = rig.starts.length;
-            rig.i.pendingRequests.push({ ...roomWake(), agentName });
-            await rig.until(() => rig.starts.length > starts && settled(), `${agentName}'s channel turn`);
-            await rig.framework.runUntilIdle();
-            assert.deepEqual(rig.routed.slice(before).map((r) => r.locus), [ROOM], `control: ${agentName}'s turn spoke in its channel`);
-          };
-          await channelTurn('scout');
-          if (step === 'undo') {
-            await channelTurn('ranger');
-            assert.ok(rig.framework.undoLastTurn('scout').undone);
-          } else {
-            assert.ok(rig.framework.undoLastTurn('scout').undone);
-            await channelTurn('ranger');
-            assert.ok(rig.framework.redo('scout').redone);
-          }
-          const before = rig.routed.length;
-          const streams = rig.streams.length;
-          assert.ok(rig.framework.nudgeAgent('ranger', 'host-console').ok);
-          await rig.until(() => rig.streams.length > streams && settled(), "ranger's nudged turn to run");
-          await rig.framework.runUntilIdle();
-          assert.deepEqual(rig.routed.slice(before), []);
-        } finally {
-          await rig.close();
-        }
-      });
-    }
-
-    it("after a restart, a nudge following a channel turn speaks in no channel: the turn it retakes isn't known", async () => {
+    it("after a restart, a nudge following a channel turn speaks as on main, in the fallback channel", async () => {
       await acrossRestart(roomTurn, async (rig) => {
+        assert.deepEqual((await nudge(rig)).map((r) => r.locus), [LOUNGE]);
+      });
+    });
+
+    it("after a restart, a nudge following a private turn speaks in no channel", async () => {
+      await acrossRestart(privateTurn, async (rig) => {
         assert.deepEqual(await nudge(rig), []);
       });
     });
@@ -1434,9 +1367,12 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge parked behind an auxiliary call, while the operator undoes the channel turn before it, speaks in no channel", async () => {
+    it("a nudge parked behind an auxiliary call, while the host removes the private exchange before it, speaks as on main, in the fallback channel", async () => {
       const rig = await surfaceRig();
       try {
+        const cm = rig.framework.getAgent('scout')!.getContextManager();
+        await privateTurn(rig);
+        const exchange = cm.getAllMessages().map((m) => m.id);
         await roomTurn(rig);
         const gate = (rig.framework as unknown as {
           providerGate(name: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> };
@@ -1446,12 +1382,13 @@ describe('private wins, one way', () => {
         const streams = rig.streams.length;
         assert.ok(rig.framework.nudgeAgent('scout', 'host-console').ok);
         await rig.until(() => gate.idleWaiters.length > 0, 'the nudge to park');
-        assert.ok(rig.framework.undoLastTurn('scout').undone, 'the operator undoes while it waits');
+        cm.removeMessages(exchange[0]!, exchange.at(-1)!);
+        assert.ok(!stored(rig).includes('for your eyes only'), 'control: the private exchange is gone while the nudge waits');
         gate.auxiliaryInFlight = 0;
         for (const resolve of gate.idleWaiters.splice(0)) resolve();
         await rig.until(() => rig.streams.length > streams && idle(rig), 'the nudged turn to run');
         await rig.framework.runUntilIdle();
-        assert.deepEqual(rig.routed.slice(before), []);
+        assert.deepEqual(rig.routed.slice(before).map((r) => r.locus), [LOUNGE]);
       } finally {
         await rig.close();
       }

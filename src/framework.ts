@@ -2994,7 +2994,6 @@ export class AgentFramework {
    *  rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
   private privateInputStored: Set<string> = new Set();
-  private retakeBasis = new Map<string, number>();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
@@ -10210,7 +10209,6 @@ export class AgentFramework {
     }
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
-    this.retakeBasis?.clear();
     return { descriptor, removedIds };
   }
 
@@ -10721,7 +10719,6 @@ export class AgentFramework {
           const hidden = messagesIn(runs);
           const rangeIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
           for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
-          this.retakeBasis?.clear();
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hidden} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -10751,7 +10748,6 @@ export class AgentFramework {
         const hidden = messagesIn(runs);
         const hiddenIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
         for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
-        this.retakeBasis?.clear();
         console.error(
           `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -11246,8 +11242,6 @@ export class AgentFramework {
 
     this.materializeConfigMountAfterBranchSwitch();
 
-    this.retakeBasis?.clear();
-
     // Push onto redo stack
     let redoStack = this.redoStacks.get(agentName);
     if (!redoStack) {
@@ -11312,7 +11306,6 @@ export class AgentFramework {
     const currentBranch = this.store.currentBranch();
 
     this.store.switchBranch(branchName);
-    this.retakeBasis?.clear();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -11461,7 +11454,6 @@ export class AgentFramework {
     // arrivals during the awaited switch (see surgeryHold).
     const hold = { verb, agentName, since: Date.now() };
     this.surgeryHold = hold;
-    this.retakeBasis?.clear();
     // Maintenance calls parked at a provider gate wake, find the hold and are
     // withdrawn, so the wait for running maintenance can't wait on them.
     for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -12277,9 +12269,8 @@ export class AgentFramework {
     return request;
   }
 
-  private retakeIsPrivate(agentName: string): boolean {
-    const turnId = this.retakeBasis?.get(agentName);
-    return turnId === undefined || this.isPrivateTurn(turnId);
+  private retakeIsPrivate(agent: Agent): boolean {
+    return agent.getContextManager().getAllMessages().some((m) => this.isPrivateInput(m.metadata));
   }
 
   /**
@@ -12358,7 +12349,6 @@ export class AgentFramework {
   private evictTurnCheckpoints(agentName: string): void {
     this.turnCounters.delete(agentName);
     this.redoStacks.delete(agentName);
-    this.retakeBasis?.delete(agentName);
     // Diagnostics maps are also keyed by agent name and never evicted —
     // spawn-and-dispose fleets would grow them for the session's life.
     this.staleWarnAt.delete(agentName);
@@ -19455,7 +19445,7 @@ export class AgentFramework {
       trigger = own;
     }
 
-    if (attempt === 0 && trigger && (trigger as MarkedRequest)[RETAKE] && trigger.nonChannelOrigin !== true && this.retakeIsPrivate(agent.name)) {
+    if (attempt === 0 && trigger && (trigger as MarkedRequest)[RETAKE] && trigger.nonChannelOrigin !== true && this.retakeIsPrivate(agent)) {
       trigger = { ...trigger, channelId: undefined, channelServerId: undefined, addressed: false, nonChannelOrigin: true };
     }
 
@@ -19543,7 +19533,6 @@ export class AgentFramework {
     if (opensTurn) {
       routing.nonChannelOrigin = trigger?.nonChannelOrigin === true || privateInput;
       if (routing.nonChannelOrigin) this.notePrivateTurn(routing.turnId);
-      if (!trigger?.suppressProse) this.retakeBasis?.set(agent.name, routing.turnId);
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, with its server, and none for a heartbeat
       // / no-trigger turn, which falls back to the global default rather

@@ -27,17 +27,20 @@
   turn stands when its start reads it, so a turn that took in private input
   after causing it counts, even after the wake was queued. An operator's
   `nudge` or `unstick`, or an `inference.request` through the API server or
-  its MCP tool (`agent_request_inference`), speaks as before only when the
-  turn it retakes is known to be public, as it stands when the retake starts:
-  the agent's latest turn in this run other than a silent heartbeat tick, with
-  no silent heartbeat tick since it that took in private input, and no `undo`,
-  `redo`, hide, operator surgery (a branch switch, rollback or suppression) or
-  rewind shed since it. Otherwise, after a restart too, the retake is private,
-  and its delivery receipt says how to publish with a send. A script's wake
-  message is private input, as a private surface's message is, when the
-  script's start turn is private as the message is stored or injected: a turn
-  that reads it is private, and a tool boundary that injects it makes its turn
-  private from there.
+  its MCP tool (`agent_request_inference`), answers the agent's context as it
+  stands, so it is private exactly when, as it starts, the agent's stored
+  history holds private input: a private surface's message, or a script's wake
+  message that counts as private input. That holds however the context came to
+  end where it does, through the framework's `undo`, `redo` or operator
+  surgery, a host's own move of its branch, or a restart. A retake whose
+  history holds none speaks as before, so on a host with no private surface it
+  always does. Otherwise it is private, even after a channel turn, and even
+  where the context now shows that input only in a summary, and its delivery
+  receipt says how to publish with a send. A script's wake message is private
+  input, as a private surface's message is, when the script's start turn is
+  private as the message is stored or injected: a turn that reads it is
+  private, and a tool boundary that injects it makes its turn private from
+  there.
 
   In locus and hybrid mode, a private turn that holds a channel's message
   tells its resident which channels' messages it holds and that its plain
