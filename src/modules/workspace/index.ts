@@ -2361,7 +2361,7 @@ export class WorkspaceModule implements Module {
    * (a write naming none tells no agent).
    *
    * A success's `disk` says where the file stands on disk as the workspace
-   * last saw it, as the write tool's answer does; the call doesn't read disk.
+   * last saw it, as the write tool's answer does.
    *
    * A write whose tree entry is set but that then fails returns success
    * false with `data: { inChronicle: true }`: its copy on disk was refused,
@@ -3648,9 +3648,10 @@ export class WorkspaceModule implements Module {
    * downstream agents. And, apart from it, why a write whose bytes reached
    * disk left the file's mode as disk had it (`modeKept`), and, for a
    * deletion that cleared a conflict naming a disk file the workspace never
-   * took in, that nothing was unlinked (`note`). The caller holds the mount's
-   * turn and has settled the path first (settleBeforeMutation, or a pass over
-   * the path, as an edit makes).
+   * took in, that nothing was unlinked (`note`). And the answer's `disk` for
+   * the path, unless it was refused. The caller holds the mount's turn and has
+   * settled the path first (settleBeforeMutation, or a pass over the path, as
+   * an edit makes).
    */
   private async commitToolChange(
     mount: MountState,
