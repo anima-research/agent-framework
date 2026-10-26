@@ -1718,7 +1718,7 @@ function parsePattern(pattern: string): Pattern | string {
   const beneath = body.endsWith('/**');
   const directory = beneath || body.endsWith('/');
   body = body.slice(0, beneath ? -3 : directory ? -1 : undefined);
-  const anchored = beneath || body.includes('/');
+  const anchored = (beneath && !anyDepth) || body.includes('/');
   if (body.startsWith('/')) body = body.slice(1);
   if (body.includes('**') || (anyDepth && anchored)) return '"**" is read only as a leading "**/" before one name, or a trailing "/**"';
   const segments = body.split('/');
@@ -1927,12 +1927,11 @@ export async function walkScope(
   };
   // A walk that isn't named passes over a scope the mount passes over by
   // design, at it or a directory above it, as its parent's listing would pass
-  // over its entry: a name rule (a bare-name ignore entry, an editor's name)
-  // doesn't match what lies beneath, as a path rule (`cache/**`) does. So a
-  // listing, glob or grep there never starts tracking what the mount leaves
-  // out, and a stored copy beneath it is unobserved, as beneath any region
-  // passed over by design. Its region says how to take what's there in: a
-  // sync that names it, whose scope is walked (#276), below.
+  // over its entry. So a listing, glob or grep there never starts tracking
+  // what the mount leaves out, and a stored copy beneath it is unobserved, as
+  // beneath any region passed over by design. Its region says how to take
+  // what's there in: a sync that names it, whose scope is walked (#276),
+  // below.
   // Another mount's directory is passed over by every walk, named or not,
   // and no sync of this mount takes it in, so its region gives no advice.
   if (scope !== '' && inOtherMount(scope, view.others)) {
@@ -1941,7 +1940,11 @@ export async function walkScope(
     return walk;
   }
   if (!opts.named && scope !== '') {
-    const why = passedOverAt(scope, view.ignore, view.others, true);
+    let why = passedOverAt(scope, view.ignore, view.others, true);
+    if (why !== undefined && passedOverAt(scope, view.ignore, view.others, false) === undefined) {
+      const directory = await lstat(join(rootReal, scope)).then((s) => s.isDirectory() || (view.followSymlinks && s.isSymbolicLink()), () => true);
+      if (!directory) why = undefined;
+    }
     if (why !== undefined) {
       walk.others.set(scope, why);
       walk.incomplete.push({ path: scope, reason: `${why}: a sync that names this path takes in what's there, editors' files aside`, kind: 'ignored' });

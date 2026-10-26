@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
+import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
 
 const TREE = 'workspace/work/tree';
@@ -67,7 +68,7 @@ async function synced(t: TestContext, files: string[], mount: Partial<MountConfi
 
 describe('ignore reads gitignore\'s forms', () => {
   test('a trailing "/" passes over a directory of that name at any depth, and not a file of that name', async (t) => {
-    const env = new Env(t, ['build/a.js', 'x/build/b.js', 'y/build', 'keep.txt']);
+    const env = new Env(t, ['build/a.js', 'x/build/b.js', 'x/build/inner/build/c.js', 'y/build', 'keep.txt']);
     const m = await env.open({ ignore: ['build/'] });
     await call(m, 'sync', { mount: 'work' });
     assert.deepEqual(env.tree(), ['keep.txt', 'y/build']);
@@ -77,6 +78,37 @@ describe('ignore reads gitignore\'s forms', () => {
     const directory = await call(m, 'sync', { path: 'work/x/build' });
     assert.deepEqual(directory.ignored, [{ mount: 'work', path: 'x/build',
       note: "this mount's ignore list covers it, so a sync without a path won't maintain it" }]);
+    // The pattern that covers a named directory doesn't apply beneath it (#276), at any depth.
+    assert.deepEqual(env.tree(), ['keep.txt', 'x/build/b.js', 'x/build/inner/build/c.js', 'y/build']);
+  });
+
+  test('a sync naming a path where disk has a file, and history has entries beneath it, doesn\'t say a directory-only pattern covers the file', async (t) => {
+    const env = new Env(t, ['build/a.js']);
+    const m = await env.open({ ignore: ['build/'] });
+    await call(m, 'sync', { path: 'work/build' });
+    assert.deepEqual(env.tree(), ['build/a.js']);
+    rmSync(join(env.dir, 'build'), { recursive: true });
+    writeFileSync(join(env.dir, 'build'), 'a build script');
+    const file = await call(m, 'sync', { path: 'work/build' });
+    assert.equal(file.ignored, undefined);
+  });
+
+  test('a listing naming a file that a directory-only pattern names doesn\'t say the list covers it', async (t) => {
+    const env = new Env(t, ['build', 'keep.txt']);
+    const m = await env.open({ ignore: ['build/'] });
+    const res = await m.handleToolCall({ id: 't', name: 'ls', input: { path: 'work/build' } });
+    assert.ok(!JSON.stringify(res).includes('ignored by the mount'), JSON.stringify(res));
+  });
+
+  test('a file the watcher reports, named like a directory-only pattern, is taken in', async (t) => {
+    const env = new Env(t, ['keep.txt']);
+    const m = await env.open({ ignore: ['build/'] });
+    await call(m, 'sync', { mount: 'work' });
+    mkdirSync(join(env.dir, 'sub'));
+    writeFileSync(join(env.dir, 'sub/build'), 'a build script');
+    const changes: FsChange[] = [{ path: 'sub/build', op: 'created' }];
+    await (m as unknown as { handleFsChanges(mount: string, changes: FsChange[]): Promise<void> }).handleFsChanges('work', changes);
+    assert.deepEqual(env.tree(), ['keep.txt', 'sub/build']);
   });
 
   test('a leading or inner "/" anchors a pattern at the mount\'s root', async (t) => {
@@ -87,6 +119,7 @@ describe('ignore reads gitignore\'s forms', () => {
   test('a leading "**/" before one name matches it at any depth', async (t) => {
     assert.deepEqual(await synced(t, ['cache/a', 'x/cache/b', 'x/y/cache', 'keep.txt'], { ignore: ['**/cache'] }), ['keep.txt']);
     assert.deepEqual(await synced(t, ['cache/a', 'x/cache/b', 'x/y/cache', 'keep.txt'], { ignore: ['**/cache/'] }), ['keep.txt', 'x/y/cache']);
+    assert.deepEqual(await synced(t, ['cache/a', 'x/cache/b', 'x/y/cache', 'keep.txt'], { ignore: ['**/cache/**'] }), ['keep.txt', 'x/y/cache']);
   });
 
   test('a trailing "/**" passes over what lies beneath a directory from the root, and not a file of its name', async (t) => {
@@ -113,6 +146,11 @@ describe('include reads gitignore\'s forms, for files', () => {
     const res = await m.handleToolCall({ id: 't', name: 'read', input: { path: 'work/x/gate.json' } });
     assert.equal(res.success, false);
     assert.match(String(res.error), /outside the mount's include/);
+  });
+
+  test('"**/" before one name, and a leading "/" with a trailing "/", read as in ignore', async (t) => {
+    const files = ['docs/a.md', 'x/docs/b.md', 'cache/c', 'y/cache/d', 'cache.txt'];
+    assert.deepEqual(await synced(t, files, { include: ['/docs/', '**/cache/'] }), ['cache/c', 'docs/a.md', 'y/cache/d']);
   });
 
   test('a "?" stands for a "[" in a name, which a pattern can\'t hold', async (t) => {
@@ -146,6 +184,9 @@ describe('a pattern of another form is refused when the module is built', () => 
       assert.throws(() => new WorkspaceModule({ mounts: [mount(['node_modules', pattern])] }), (err: unknown) => err instanceof Error
         && err.message === `[workspace] Mount "work": ignore pattern ${shown} isn't read: ${why}. ${FORMS}`, shown);
     }
+    const include: MountConfig = { name: 'work', path: '/tmp/x', mode: 'read-write', include: ['gate.json', '!gate.json'] };
+    assert.throws(() => new WorkspaceModule({ mounts: [include] }), (err: unknown) => err instanceof Error
+      && err.message === `[workspace] Mount "work": include pattern "!gate.json" isn't read: ${cases[0]![1]}. ${FORMS}`, 'include');
   });
 
   test('ignore may be empty, and must be a list', () => {

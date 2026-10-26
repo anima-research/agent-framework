@@ -101,7 +101,8 @@ export interface MountConfig {
   /** Poll interval in ms for checking watched root identity changes (default: 2000) */
   watchRootPollMs?: number;
   /**
-   * Patterns in these of gitignore's forms, each read as gitignore reads it:
+   * Patterns in these of gitignore's forms, each covering the files
+   * gitignore's reading of it covers:
    * - A name, matched at any depth: ".git", "node_modules". Within a name,
    *   "*" matches any run of characters and "?" any one: "*.pyc",
    *   "npm-debug.log*".
@@ -111,14 +112,16 @@ export interface MountConfig {
    * - A leading or inner "/" makes a path from the mount's root: "/dist"
    *   covers only the root's dist, and "a/b" only the root's a/b.
    * - "**" as the first segment, before one name, matches that name at any
-   *   depth, as the name alone does.
+   *   depth, as the name alone does; with a trailing "/**" as well, it reads
+   *   as the name with a trailing "/".
    * - A trailing "/**" covers a directory from the root and what lies
    *   beneath it: "node_modules/**" covers only the root's node_modules, and
    *   no file of that name.
    * The module refuses, when it's built, a pattern of any other form, such as
    * a leading "!" or "#", a "[", a "\", a trailing space, "**" anywhere
    * else, or an empty, "." or ".." segment, naming the pattern and why. A
-   * "?" stands for a "[" or "\" in a name.
+   * "?", which matches any one character, can stand for a "[" or "\" in a
+   * name.
    *
    * A sync without a path and the watcher pass over what the list covers,
    * and over entries with an editor's swap or backup file name whatever it
@@ -256,7 +259,8 @@ export interface MountConfig {
    *
    * Left out, the mount holds everything under its path. Given, it's a list
    * of at least one pattern, and the module refuses one `ignore` would
-   * refuse, so `[id].tsx` is refused and `?id].tsx` names that file.
+   * refuse, so `[id].tsx` is refused, and `?id].tsx` covers that file and any
+   * other name that differs from it only in that character.
    */
   include?: string[];
   /**

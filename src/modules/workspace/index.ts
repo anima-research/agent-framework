@@ -6042,7 +6042,7 @@ export class WorkspaceModule implements Module {
         allSkipped.push({ mount: name, path: relativePath, reason: DIRECT_SYNC_SKIPPED });
         continue;
       }
-      let isDir = false;
+      let namedDirectory = false;
       const pass = await this.withMount(mount, async () => {
         if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
         if (!relativePath) {
@@ -6052,11 +6052,13 @@ export class WorkspaceModule implements Module {
         }
         // An explicit path: the workspace takes disk's state there.
         const prefix = relativePath + '/';
-        isDir =
-          await lstat(join(mount.config.path, relativePath)).then((s) => s.isDirectory(), () => false) ||
+        const atDisk = await lstat(join(mount.config.path, relativePath)).catch(() => null);
+        const isDir =
+          atDisk?.isDirectory() === true ||
           store.treeList(mount.treeStateId, prefix).length > 0 ||
           this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
           this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
+        namedDirectory = atDisk === null ? isDir : atDisk.isDirectory();
         // named: ignore patterns covering the path asked for don't apply
         // beneath it (a directory scope's walk; a path scope doesn't walk).
         const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn, named: true };
@@ -6115,7 +6117,7 @@ export class WorkspaceModule implements Module {
       // without a path passes over it, so nothing else keeps it current
       // (agent-framework #276). A path in another mount's directory isn't
       // synced at all, and the note says so.
-      const passedOver = passedOverAt(relativePath, this.ignoreOf(mount), this.othersOf(name), isDir);
+      const passedOver = passedOverAt(relativePath, this.ignoreOf(mount), this.othersOf(name), namedDirectory);
       if (passedOver !== undefined) {
         allIgnored.push({
           mount: name,
