@@ -19,11 +19,23 @@ import {
 export interface OfflineRecoveryBranchOptions {
   storePath: string;
   agentName: string;
-  /** Preferred: Discord message that remains as the last visible anchor. */
+  /**
+   * Preferred: Discord message that remains as the last visible anchor. On
+   * an agent's window that was presented (#291) the branch is cut at the
+   * write that presented the anchor, so rows stored after the anchor and
+   * before that write stay on the branch: those the window took after the
+   * anchor enter it again at the agent's next presentation point, after the
+   * anchor. Only rows stored after the cut are removed and counted.
+   */
   messageId?: string;
-  /** Exact internal ContextManager message ID that remains as the anchor. */
+  /** Exact internal ContextManager message ID that remains as the anchor (the cut as for `messageId`). */
   contextId?: string;
-  /** Backward-compatible alternative: remove the newest N context entries. */
+  /**
+   * Backward-compatible alternative: remove the newest N context entries,
+   * counted in the agent's window once it was presented (#291), and in the
+   * record before that; the anchor is the entry before them, cut as for
+   * `messageId`.
+   */
   messages?: number;
   /** Exact Discord messages to suppress on the new branch. */
   suppressMessageIds?: string[];
@@ -119,6 +131,16 @@ export async function createOfflineRecoveryBranch(
     let targetIndex: number;
     let removedCount: number;
     let carriers: DiscordMessageMetadataCarrier[];
+    // Once the agent's window was presented (#291), the branch cut is the
+    // write that presented the anchor (branchSequenceOf), not the anchor's
+    // own place in the record: the rows stored after the anchor and before
+    // that write stay on the branch, and those the window took after the
+    // anchor are arrivals again there. Only the rows stored after the cut
+    // are removed, and only they are counted, carried and checked.
+    const presented = contextManager.windowMode() === 'presented';
+    const firstRemovedAfter = (index: number, anchor: StoredWindowMessage): number => presented
+      ? firstIndexAfterCut(contextManager!, index, total, contextManager!.branchSequenceOf(anchor.id))
+      : index + 1;
 
     if (options.messageId) {
       // Search backward in bounded windows: recovery anchors are normally near
@@ -134,8 +156,9 @@ export async function createOfflineRecoveryBranch(
       }
       target = located.message;
       targetIndex = located.index;
-      removedCount = total - located.index - 1;
-      carriers = collectDiscordCarriers(contextManager, located.index + 1, total);
+      const firstRemoved = firstRemovedAfter(targetIndex, target);
+      removedCount = total - firstRemoved;
+      carriers = collectDiscordCarriers(contextManager, firstRemoved, total);
     } else if (options.contextId) {
       const located = findInternalMessageFromTail(contextManager, total, options.contextId.trim());
       if (!located) {
@@ -143,8 +166,28 @@ export async function createOfflineRecoveryBranch(
       }
       target = located.message;
       targetIndex = located.index;
-      removedCount = total - located.index - 1;
-      carriers = collectDiscordCarriers(contextManager, located.index + 1, total);
+      const firstRemoved = firstRemovedAfter(targetIndex, target);
+      removedCount = total - firstRemoved;
+      carriers = collectDiscordCarriers(contextManager, firstRemoved, total);
+    } else if (presented) {
+      // Counted back in the agent's window, whose order isn't the record's:
+      // the anchor is the window's row `count` before its newest.
+      const window = contextManager.getPresentedMessages();
+      if (count! >= window.length) {
+        throw new Error(
+          `Cannot remove ${count} message(s) — history has ${window.length}; at least one must remain.`,
+        );
+      }
+      const anchor = window[window.length - 1 - count!]!;
+      const located = findInternalMessageFromTail(contextManager, total, String(anchor.id));
+      if (!located) {
+        throw new Error(`The recovery anchor ${String(anchor.id)}, ${count} back in the window, is not in this context's record.`);
+      }
+      target = located.message;
+      targetIndex = located.index;
+      const firstRemoved = firstRemovedAfter(targetIndex, target);
+      removedCount = total - firstRemoved;
+      carriers = collectDiscordCarriers(contextManager, firstRemoved, total);
     } else {
       // Count mode remains for compatibility. Read only the target plus suffix,
       // avoiding full-history materialization and attachment blob inflation.
@@ -175,7 +218,7 @@ export async function createOfflineRecoveryBranch(
       total,
       [
         ...(removedCount > 0 ? [{
-          start: targetIndex + 1,
+          start: total - removedCount,
           end: total - 1,
           fromId: '',
           toId: '',
@@ -426,6 +469,30 @@ function findInternalMessageFromTail(
     end = start;
   }
   return null;
+}
+
+/**
+ * The first slot index after `targetIndex` whose row was stored after
+ * `cut`, or `total` when none was: the rows a branch cut at `cut` leaves
+ * behind, the slot being in store order, start there. Read in bounded,
+ * blob-free windows.
+ */
+function firstIndexAfterCut(
+  contextManager: ContextManager,
+  targetIndex: number,
+  total: number,
+  cut: number,
+): number {
+  for (let offset = targetIndex + 1; offset < total; offset += RECOVERY_SCAN_WINDOW) {
+    const messages = contextManager.getMessageWindow(
+      offset,
+      Math.min(RECOVERY_SCAN_WINDOW, total - offset),
+      { resolveBlobs: false },
+    ).messages;
+    const at = messages.findIndex((message) => message.sequence > cut);
+    if (at >= 0) return offset + at;
+  }
+  return total;
 }
 
 function validateAnchorBoundary(

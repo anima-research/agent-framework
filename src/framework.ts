@@ -33,6 +33,7 @@ import type {
   MessageQuery,
   StoredMessage,
   TokenBudget,
+  WindowStatus,
 } from '@animalabs/context-manager';
 import {
   bodyGroupRun,
@@ -41,6 +42,7 @@ import {
   locateMessageIndices,
   removeStoredMessage,
   removeStoredMessages,
+  storedIdsBetween,
 } from './stored-removal.js';
 import type {
   FrameworkConfig,
@@ -49,6 +51,7 @@ import type {
   ProviderHoldHook,
   ErrorAction,
   FrameworkState,
+  PresentationRetractReason,
   TraceEvent,
   TraceEventListener,
   InferenceLogEntry,
@@ -207,7 +210,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn, type PresentationOccasion } from './presentation.js';
+import { AgentPresentation, asCompiled, heldFromResidents, isInjectableMidTurn, readerFacts, type PresentationOccasion } from './presentation.js';
 import { coverTest, covers, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
@@ -2353,11 +2356,16 @@ interface HostCommandParams {
   requesterName?: string;
 }
 
+/** A stored row as a blob-free window read gives it (getMessageWindow). */
+type StoredWindowMessage = ReturnType<ContextManager['getMessageWindow']>['messages'][number];
+
 /** Descriptor of a single refusal-driven rewind (see shedNewestTurn). */
 interface RewindRecord {
   /** Content-free, safe-to-replay description of what was withheld. */
   descriptor: string;
-  /** All message ids removed in this shed (a tool exchange removes 2+). */
+  /** Every message id this shed set aside, newest first (a tool exchange
+   *  sets aside 2+): taken out of the agent's window on a presented one,
+   *  removed from the record on one that is still the record. */
   removedIds: MessageId[];
 }
 
@@ -3796,6 +3804,8 @@ export class AgentFramework {
       // host), always stamps agent origin (see there).
       callTool: (call) => this.executeToolCallFrom(call, { kind: 'module' }),
       notifyOps: (kind, agentName, message, data) => this.notifyOps(kind, agentName, message, data),
+      windowStatusOf: (id, opts) => this.windowStatusFor(id, opts),
+      observes: (observer, observed) => this.observesOwnRowsOf(observer, observed),
     });
   }
 
@@ -4308,8 +4318,12 @@ export class AgentFramework {
     // agent taken on (repairAndRest): its own rows stored and not in its
     // window, then what it is owed at rest, now that the stored rows are in.
     // Each agent's window was written down at its registration, before them.
+    // Then each window lets go of the rows its record no longer holds that no
+    // live context heard removed (retractAbsentRows): an offline recovery's
+    // suppressions, made with the host stopped through one agent's context.
     framework.wakeForUnpresentedTuneOutRows();
     framework.presentation?.repairAndRest();
+    framework.presentation?.retractAbsentRows();
     framework.reconcileAgentRegistry(interruptedAgents);
 
     if (config.mcplServers && config.mcplServers.length > 0) {
@@ -11461,44 +11475,69 @@ export class AgentFramework {
   }
 
   /**
-   * Shed the newest turn: remove the newest message that isn't a system
-   * message, whoever wrote it, with the rest of its exchange (the tool_use
-   * turn paired with a tool result, and the whole of a body stored in
-   * shards). It adds no marker; the caller keeps one consolidated marker for
-   * the episode (updateRewindMarker). The returned record's descriptor says
-   * what was removed and its size, never the content, while the raw record
-   * survives in the chronicle log for forensics. Returns null when only
-   * system messages remain.
+   * Shed the newest turn: take the newest message that isn't a system
+   * message out of what the agent is sent, whoever wrote it, with the rest
+   * of its exchange (the tool_use turn paired with a tool result, and the
+   * whole of a body stored in shards). It adds no marker; the caller keeps
+   * one consolidated marker for the episode (updateRewindMarker). The
+   * returned record's descriptor says what was set aside and its size,
+   * never the content. Returns null when only system messages remain.
+   *
+   * On a presented window (#291) the shed is the window's: the newest rows
+   * of the agent's own window, in its order, leave it as an undone turn's
+   * do (retractRows with `undone`), so no presentation point brings them
+   * back, and the record keeps them, as the marker says. No other agent's
+   * window, nor its cache prefix or signed thinking, changes. A row the
+   * agent is never sent is passed over: a system_change row, a row a
+   * tune-out holds from residents (for an agent whose window leaves them
+   * out), and another agent's stored context injection. On a window that is
+   * still the record, the rows are removed from it, as before the index,
+   * and leave every other window that held them.
    *
    * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
    * the shed after inference exhaustion (quarantinePoisonedHistory).
    */
   private shedNewestTurn(agent: Agent): RewindRecord | null {
     const cm = agent.getContextManager();
-    const all = cm.getAllMessages();
+    const windowed = this.presents(agent);
+    const all = windowed ? cm.getPresentedMessages() : cm.getAllMessages();
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
+    // In the window, the rows the agent is sent: a held row is in a
+    // resident's written-down window and left out by its view, as another
+    // agent's injection is, and a system_change row is the host's.
+    const hidesHeld = windowed && readerFacts(this.registry, agent.name).hidesHeld;
+    const passedOver = (m: StoredMessage): boolean => {
+      const meta = (m.metadata ?? {}) as Record<string, unknown>;
+      if (meta.system) return true;
+      if (!windowed) return false;
+      return hasBlock(m, 'system_change')
+        || (hidesHeld && heldFromResidents(meta))
+        || isAnotherAgentsInjection(m.metadata, agent.name);
+    };
 
     // Newest message that is not our own episode marker. We shed strictly
-    // newest-first, in sequence — INCLUDING the agent's own turns (poison lives
-    // in tool_use/narration turns too), because newest-first reaches whatever is
-    // poisoning the context if allowed to run deep enough. The one invariant:
-    // shed COMPLETE exchanges. Removing a `tool_result` also removes its paired
-    // `tool_use` assistant turn, so we never leave an orphaned tool_use / signed
-    // `thinking` block — which the API rejects with a 400 ("thinking blocks in
-    // the latest assistant message cannot be modified"). We do NOT add a marker
-    // here; the caller keeps one consolidated marker (updateRewindMarker).
+    // newest-first, in sequence (in window order on a presented window) —
+    // INCLUDING the agent's own turns (poison lives in tool_use/narration
+    // turns too), because newest-first reaches whatever is poisoning the
+    // context if allowed to run deep enough. The one invariant: shed
+    // COMPLETE exchanges. Shedding a `tool_result` also sheds its paired
+    // `tool_use` assistant turn, so we never leave an orphaned tool_use /
+    // signed `thinking` block — which the API rejects with a 400 ("thinking
+    // blocks in the latest assistant message cannot be modified"). We do NOT
+    // add a marker here; the caller keeps one consolidated marker
+    // (updateRewindMarker).
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
-      const meta = (all[i].metadata ?? {}) as { system?: unknown };
-      if (meta.system) continue;
+      if (passedOver(all[i]!)) continue;
       idx = i; break;
     }
     if (idx < 0) return null;
     // The newest message can be the last shard of a body (a document stored
-    // in shards). context-manager removes a shard only with the rest of its
-    // body, so the rewind takes the whole body.
+    // in shards). context-manager removes, and takes out of a window, a
+    // shard only with the rest of its body, so the rewind takes the whole
+    // body.
     const first = bodyRangeIn(all, idx).from;
     const members = all.slice(first, idx + 1);
     const msg = all[idx];
@@ -11513,10 +11552,12 @@ export class AgentFramework {
       .filter((b) => typeOf(b) === 'text')
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
-    // Determine the complete exchange to remove, newest first.
+    // Determine the complete exchange to shed, newest first.
     const removedIds: MessageId[] = members.map((m) => m.id).reverse();
     // Where the exchange starts: this body, or the tool_use turn paired with it.
     let from = first;
+    // Each body by its first shard, which names it to retractRows.
+    const heads: MessageId[] = [all[first]!.id];
     let descriptor: string;
     if (toolBlocks.length > 0) {
       // Pair the tool_result with the tool_use assistant turn right before
@@ -11528,6 +11569,7 @@ export class AgentFramework {
         if (turnMembers.some((m) => hasBlock(m, 'tool_use'))) {
           from = turn.from;
           removedIds.push(...turnMembers.map((m) => m.id).reverse());
+          heads.unshift(all[turn.from]!.id);
         }
       }
       const sz = toolBlocks.reduce(
@@ -11541,8 +11583,15 @@ export class AgentFramework {
       descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
+    if (windowed) {
+      // One call for the whole exchange, so it is never half applied.
+      cm.retractRows(heads, { undone: true });
+      this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...removedIds].reverse(), reason: 'shed' });
+      return { descriptor, removedIds };
+    }
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
+    this.retractRemovedElsewhere(cm, removedIds, 'rewind');
     return { descriptor, removedIds };
   }
 
@@ -12051,7 +12100,13 @@ export class AgentFramework {
           const refs = refsIn(runs);
           const hidden = messagesIn(runs);
           const rangeIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
-          for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
+          // The rows leave every other window that holds them too (#291),
+          // those removed before a failure among them.
+          try {
+            for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
+          } finally {
+            this.retractRemovedElsewhere(cm, rangeIds as MessageId[], 'hide');
+          }
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hidden} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -12080,7 +12135,11 @@ export class AgentFramework {
         const refs = refsIn(runs);
         const hidden = messagesIn(runs);
         const hiddenIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
-        for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
+        try {
+          for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
+        } finally {
+          this.retractRemovedElsewhere(cm, hiddenIds as MessageId[], 'hide');
+        }
         console.error(
           `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -12114,7 +12173,10 @@ export class AgentFramework {
     // Message-granular mode: branch the chronicle at the message that should
     // become the new tail (ContextManager.branchAt — origin-sequence-based
     // time-travel branching; see chronicle's rfc-state-item-origins addendum).
-    // No turn checkpoints involved, so this reaches past turn boundaries.
+    // No turn checkpoints involved, so this reaches past turn boundaries. The
+    // n messages are counted back from the newest of the agent's window on a
+    // presented one (#291), where branchAt cuts at the write that presented
+    // the target: rows the cut keeps return to arrivals (returnedToArrivals).
     if (typeof params.messages === 'number' && params.messages > 0) {
       const agent = this.agents.get(agentName)!;
       if (agent.state.status !== 'idle') {
@@ -12122,14 +12184,20 @@ export class AgentFramework {
       }
       const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
       const cm = agent.getContextManager();
-      const total = cm.getMessageCount();
+      // Counted in what the agent is shown: its window's rows on a presented
+      // window (#291), whose order isn't the record's, and the record's rows
+      // on one that is still the record.
+      const windowRows = this.presents(agent) ? cm.getPresentedMessages() : undefined;
+      const total = windowRows ? windowRows.length : cm.getMessageCount();
       if (n >= total) {
         return {
           ok: false,
           error: `Cannot remove ${n} message(s) — history has ${total}; at least one must remain.`,
         };
       }
-      const target = cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
+      const target = windowRows
+        ? windowRows[total - 1 - n]!
+        : cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
       try {
         const r = await this.rollbackToMessage(agentName, {
           messageId: String(target.id),
@@ -12144,6 +12212,7 @@ export class AgentFramework {
         return {
           ok: true,
           messagesRemoved: r.messagesRemoved,
+          ...(r.returnedToArrivals !== undefined ? { returnedToArrivals: r.returnedToArrivals } : {}),
           removedRefs: r.removedRefs,
           markers: r.markers,
           lastVisible: r.lastVisible,
@@ -13033,6 +13102,15 @@ export class AgentFramework {
     /** Whether awareness marks were scheduled; never a delivery claim. */
     markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
+    /**
+     * On a presented window (#291), the rows after the target in the
+     * agent's window that the cut kept in the record: stored before the
+     * write that presented the target, they left the window as arrived and
+     * not presented, and enter it again at the agent's next presentation
+     * point, after the target. Not counted in `messagesRemoved`, and not
+     * marked. Set only on a presented window.
+     */
+    returnedToArrivals?: number;
   }> {
     this.refuseOperatorAfterStop('roll back');
     const logBase: OperatorLogInput = {
@@ -13045,7 +13123,7 @@ export class AgentFramework {
     try {
       const marks = checkedDiscordAwarenessMarks(opts.marks);
       this.refuseMarksWithoutLedger(marks);
-      const { cm, tailMessageId, messagesRemoved, discarded } = this.planRollback(agentName, opts.messageId);
+      const { cm, tailMessageId, messagesRemoved, discarded, returnedToArrivals } = this.planRollback(agentName, opts.messageId);
       const removedRefs = extractDiscordAwarenessRefs(discarded);
       const selection = selectDiscordAwarenessRefs(discarded, marks);
       const sourceBranch = this.store.currentBranch().name;
@@ -13119,9 +13197,12 @@ export class AgentFramework {
       console.error(
         `[operator] rollback agent=${agentName} to=${tailMessageId}` +
           `${tailMessageId !== opts.messageId ? ` (requested ${opts.messageId}, snapped to end of body group)` : ''}` +
-          ` removed=${messagesRemoved} branch=${branchName} marks=${describeMarkers(markers)}` +
+          ` removed=${messagesRemoved}` +
+          `${returnedToArrivals ? ` returnedToArrivals=${returnedToArrivals}` : ''}` +
+          ` branch=${branchName} marks=${describeMarkers(markers)}` +
           ` by=${describeRequester(opts.requester)}`,
       );
+      const returned = returnedToArrivals !== undefined ? { returnedToArrivals } : {};
       this.recordOperatorAction({
         ...logBase,
         result: {
@@ -13129,6 +13210,7 @@ export class AgentFramework {
           targetBranch: branchName,
           tailMessageId,
           messagesRemoved,
+          ...returned,
           discordRefs: removedRefs.length,
           markers,
         },
@@ -13142,6 +13224,7 @@ export class AgentFramework {
         removedRefs,
         markers,
         lastVisible: await this.lastVisiblePreview(agentName),
+        ...returned,
       };
     } catch (error) {
       this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
@@ -13277,6 +13360,9 @@ export class AgentFramework {
             { cause: error },
           );
         }
+        // Every other window on the fork that holds a removed row lets it go
+        // too (#291): the fork's record no longer holds it. It never throws.
+        this.retractRemovedElsewhere(cm, removedIds as MessageId[], 'suppress');
         // Every redaction committed: the body change has landed and the fork
         // is safe to serve from. Activating the marker batch is bookkeeping
         // about a world-side effect; if it fails, the suppression still
@@ -13335,8 +13421,25 @@ export class AgentFramework {
    * changing anything. Never bisects a body group: chronicle refuses that
    * for removals and branchAt has no such guard, so the target snaps to the
    * group's last shard.
+   *
+   * The rows removed are those the branch cut leaves behind: the slot's
+   * rows after the target stored after the sequence branchAt cuts at
+   * (branchSequenceOf). That is every row after the target, but on a
+   * presented window (#291), where the cut is the write that presented the
+   * target, rows stored after the target and before that write stay in the
+   * record. Those of them the agent's window holds were presented after
+   * the target: they leave the window as arrived and not presented
+   * (`returnedToArrivals`, set only on a presented window), and enter it
+   * again at the agent's next point. A rollback that neither removes a row
+   * nor returns one is refused as a no-op.
    */
-  private planRollback(agentName: string, messageId: string) {
+  private planRollback(agentName: string, messageId: string): {
+    cm: ContextManager;
+    tailMessageId: string;
+    messagesRemoved: number;
+    discarded: StoredWindowMessage[];
+    returnedToArrivals?: number;
+  } {
     const agent = this.agents.get(agentName);
     if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
     const cm = agent.getContextManager();
@@ -13348,12 +13451,47 @@ export class AgentFramework {
     const run = bodyGroupRun(cm, requestedIndex);
     const targetIndex = run.to;
     const tailMessageId = run.toId;
-    const messagesRemoved = total - targetIndex - 1;
-    if (messagesRemoved <= 0) {
-      throw new OperatorActionError('invalid', `Message ${messageId} is already the tail of the active branch`);
+    const after = total - targetIndex - 1;
+    let discarded: StoredWindowMessage[] = after > 0
+      ? cm.getMessageWindow(targetIndex + 1, after, { resolveBlobs: false }).messages
+      : [];
+    let returnedToArrivals: number | undefined;
+    if (this.presents(agent)) {
+      const cut = cm.branchSequenceOf(tailMessageId as MessageId);
+      // The slot is in store order, so the rows the cut leaves are a suffix.
+      const firstRemoved = discarded.findIndex((m) => m.sequence > cut);
+      discarded = firstRemoved < 0 ? [] : discarded.slice(firstRemoved);
+      returnedToArrivals = this.rowsPresentedAfterCut(cm, cut);
     }
-    const discarded = cm.getMessageWindow(targetIndex + 1, messagesRemoved, { resolveBlobs: false }).messages;
-    return { cm, tailMessageId, messagesRemoved, discarded };
+    const messagesRemoved = discarded.length;
+    if (messagesRemoved <= 0 && !returnedToArrivals) {
+      throw new OperatorActionError('invalid', after > 0
+        // Rows follow it in the record, but the cut keeps every one of them,
+        // and the window took none of them after it.
+        ? `Message ${messageId} is already the tail of ${agentName}'s window: every message stored after it was stored ` +
+          'before the write that presented it, where the branch is cut, and none entered the window after it, so a ' +
+          'rollback to it would change nothing'
+        : `Message ${messageId} is already the tail of the active branch`);
+    }
+    return { cm, tailMessageId, messagesRemoved, discarded, ...(returnedToArrivals !== undefined ? { returnedToArrivals } : {}) };
+  }
+
+  /**
+   * How many rows of `cm`'s window a branch cut at `cut` keeps in the record
+   * and out of the window: stored at or before the cut, and presented by a
+   * write after it. Read from the window's newest row back: every row's
+   * cut (branchSequenceOf, the write that presented it, or its own sequence
+   * for a row the write-down presented) grows in window order.
+   */
+  private rowsPresentedAfterCut(cm: ContextManager, cut: number): number {
+    const window = cm.getPresentedMessages();
+    let returned = 0;
+    for (let i = window.length - 1; i >= 0; i--) {
+      const row = window[i]!;
+      if (cm.branchSequenceOf(row.id) <= cut) break;
+      if (row.sequence <= cut) returned++;
+    }
+    return returned;
   }
 
   /**
@@ -13403,9 +13541,21 @@ export class AgentFramework {
     agentName: string,
     target: { rollbackTo: string } | { suppress: string[] },
   ): SurgeryMarksPreview {
-    const messages = 'rollbackTo' in target
-      ? this.planRollback(agentName, target.rollbackTo).discarded
-      : this.planSuppression(agentName, [...new Set(target.suppress.map(String))]).targeted;
+    const plan = 'rollbackTo' in target
+      ? this.planRollback(agentName, target.rollbackTo)
+      : undefined;
+    const messages = plan
+      ? plan.discarded
+      : this.planSuppression(agentName, [...new Set((target as { suppress: string[] }).suppress.map(String))]).targeted;
+    // On a presented window (#291): which of the rows no live window holds,
+    // and, for a rollback, which rows the cut keeps that leave the window.
+    const presented = this.presents(this.agents.get(agentName));
+    const windowFacts = presented
+      ? {
+          neverPresented: messages.filter((m) => this.holderNames(m.id as MessageId, m.metadata).length === 0).length,
+          ...(plan?.returnedToArrivals !== undefined ? { returnedToArrivals: plan.returnedToArrivals } : {}),
+        }
+      : {};
     const scopeView = (scope: DiscordAwarenessScope): SurgeryMarksPreview['scopes'][DiscordAwarenessScope] => {
       const { refs } = selectDiscordAwarenessRefs(messages, { scope });
       const channels = new Map<string, number>();
@@ -13419,9 +13569,33 @@ export class AgentFramework {
     return {
       messagesRemoved: messages.length,
       addressable: extractDiscordAwarenessRefs(messages).length,
+      ...windowFacts,
       emoji: this.discordAwarenessEmoji,
       scopes: { addressed: scopeView('addressed'), all: scopeView('all') },
     };
+  }
+
+  /**
+   * The live agents whose window holds a row now (#291): each whose context
+   * reads it `'in'` (windowStatusOf), every agent whose window is still the
+   * record and whose record holds it among them. A row a tune-out holds from
+   * residents is held by no agent whose window leaves such rows out: a
+   * write-down took them in, and its view never shows them.
+   */
+  private holderNames(id: MessageId, metadata?: unknown): string[] {
+    const held = heldFromResidents(metadata as Record<string, unknown> | undefined);
+    const names: string[] = [];
+    for (const agent of this.agents.values()) {
+      const cm = agent.getContextManager();
+      try {
+        if (cm.isClosed() || cm.windowStatusOf(id) !== 'in') continue;
+      } catch {
+        continue;
+      }
+      if (held && readerFacts(this.registry, agent.name).hidesHeld) continue;
+      names.push(agent.name);
+    }
+    return names;
   }
 
   /** The awareness ledger's batches and retract requests, for operator surfaces. */
@@ -16916,6 +17090,23 @@ export class AgentFramework {
     return this.presentation?.framedToAny(messageId) ?? false;
   }
 
+  /**
+   * Rows just removed from the record through `remover`, taken out of every
+   * other live agent's window that still holds them (the presentation
+   * index's retractRemoved, #291): context-manager tombstones a removal in
+   * the remover's window only. Each row leaves at its own place, so no
+   * other row's place moves; a window on a branch whose record still holds
+   * the row, and one that is still the record, keep it. A window that can't
+   * be repaired is logged and the removal stands. Called after every
+   * removal in place: a hide, a suppression on its fork, a coalescer's or a
+   * module's removal, a suppression a start finishes, and a shed from a
+   * window that is still the record. A rollback needs none: it is a branch
+   * cut, made at the same place in every window.
+   */
+  private retractRemovedElsewhere(remover: ContextManager, ids: readonly MessageId[], reason: PresentationRetractReason): void {
+    this.presentation?.retractRemoved(remover, ids, reason);
+  }
+
   private removePlacement(p: CoalescingPlacement): boolean {
     // A placement with no stored row (a write a surgery's hold keeps) can't
     // be removed: it is stored at the hold's release.
@@ -16926,13 +17117,16 @@ export class AgentFramework {
     // consumed watermark of every agent whose slot or presented window holds
     // the row, #291), so a row presented to a window and never consumed there
     // is taken back as one never presented is, and leaves every window that
-    // held it with the record (context-manager's removal): no request that
-    // carried it was answered, so no later request's prefix needs it. A row
-    // a reader fork was handed as framing stays (AF-5), and the coalescer
-    // places the newer occurrence after it.
+    // held it with the record: the remover's by context-manager's removal,
+    // every other one's by retractRemovedElsewhere. No request that carried
+    // it was answered, so no later request's prefix needs it. A row a reader
+    // fork was handed as framing stays (AF-5), and the coalescer places the
+    // newer occurrence after it.
     if (this.framedToAReader(p.messageId as MessageId)) return false;
     try {
-      removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
+      const cm = agent.getContextManager();
+      const removed = removeStoredMessage(cm, p.messageId as MessageId);
+      this.retractRemovedElsewhere(cm, removed, 'coalescer');
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
       return true;
     } catch (err) {
@@ -27465,7 +27659,8 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
     const cm = agent.getContextManager();
-    removeStoredMessage(cm, this.storedIdOf(cm, id));
+    // The row leaves every window that held it, not only the delivery agent's.
+    this.retractRemovedElsewhere(cm, removeStoredMessage(cm, this.storedIdOf(cm, id)), 'module');
   }
 
   private getMessage(id: MessageId): ModuleMessage | null {
@@ -27515,6 +27710,28 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const stored = cm.queryMessages(filter);
     return { ...stored, messages: stored.messages.map((row) => asModuleRow(row, cm)) };
+  }
+
+  /** A module's window lookup (ModuleContext.windowStatusOf, #291): where
+   *  a row stands with the delivery agent's window, or the named agent's,
+   *  which must be registered, as for a query: an unknown name, or the
+   *  empty one, throws, naming the registered ones. */
+  private windowStatusFor(id: MessageId, opts?: { forAgent?: string }): WindowStatus {
+    const named = opts?.forAgent;
+    const agent = named === undefined ? this.deliveryAgent() : named === '' ? undefined : this.agents.get(named);
+    if (!agent) {
+      if (named !== undefined) throw this.unknownAgentError(named, 'A query');
+      throw new Error('No agents configured');
+    }
+    return agent.getContextManager().windowStatusOf(this.storedIdOf(agent.getContextManager(), id));
+  }
+
+  /** Whether `observer` reads `observed`'s own rows through an observe edge
+   *  (ModuleContext.observes, #291): one of its edges reads a slot
+   *  `observed` owns, as the presentation index reads its edges. */
+  private observesOwnRowsOf(observer: string, observed: string): boolean {
+    if (observer === observed) return false;
+    return readerFacts(this.registry, observer).observed.some((slot) => slot.owners.includes(observed));
   }
 
   private createFrameworkState(): FrameworkState {
@@ -28719,7 +28936,19 @@ export class AgentFramework {
               `${interval.fromId}..${interval.toId} is only partially present`,
           );
         }
+        // Read before the removal: each agent was taken on before this runs,
+        // so the rows leave every window that holds them (#291). Only the
+        // windows' repair needs them, so a read that fails names the ends
+        // alone, and the boot's pass over every window (retractAbsentRows),
+        // later in the start, takes out the rest.
+        let removed: MessageId[];
+        try {
+          removed = storedIdsBetween(cm, String(from.id), String(to.id));
+        } catch {
+          removed = [from.id, to.id];
+        }
         removeStoredMessages(cm, from, to);
+        this.retractRemovedElsewhere(cm, removed, 'resume');
       }
       // The body is the surgery's own effect, which the operator chose: it
       // is finished. Marks wait on no crash: a prepared batch is retired,
@@ -33277,6 +33506,12 @@ export class AgentFramework {
         const WINDOW = 25;
         const cm = agent.getContextManager();
         const total = cm.getMessageCount();
+        // On a presented window (#291) only the rows the agent's window
+        // holds are its context: another agent's round, a row not presented
+        // to it yet, or one undone or shed, isn't, so its images aren't
+        // either, and messagesBack counts the rows it holds.
+        const windowed = this.presents(agent);
+        let held = 0;
         let scanned = 0;
         for (let end = total; end > 0 && scanned < MAX_SCAN && collecting(); end -= WINDOW) {
           const start = Math.max(0, end - WINDOW);
@@ -33284,12 +33519,14 @@ export class AgentFramework {
           const { messages } = cm.getMessageWindow(start, end - start, { resolveBlobs: wantedRef === null });
           scanned += end - start;
           for (let i = messages.length - 1; i >= 0 && collecting(); i--) {
+            if (windowed && (!messages[i] || cm.windowStatusOf(messages[i]!.id) !== 'in')) continue;
+            held++;
             const content = messages[i]?.content;
             if (!Array.isArray(content)) continue;
             // Another agent's stored context injection isn't in this agent's
             // view (stored-injections.ts), so its images aren't either.
             if (isAnotherAgentsInjection(messages[i]?.metadata, agentName)) continue;
-            const messagesBack = total - (start + i);
+            const messagesBack = windowed ? held : total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {
                 type?: string;

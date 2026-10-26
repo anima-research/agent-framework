@@ -5,6 +5,7 @@ import type {
   MessageMetadata,
   MessageQuery,
   ContextInjection,
+  WindowStatus,
 } from '@animalabs/context-manager';
 import type {
   Module,
@@ -128,6 +129,11 @@ export class ModuleRegistry {
     message: string,
     data?: Record<string, unknown>,
   ) => void;
+  /** The window lookups ModuleContext.windowStatusOf and observes give
+   *  modules (#291), when the framework offers them. Readonly-public, as
+   *  notifyOpsFn is. */
+  readonly windowStatusOfFn?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
+  readonly observesFn?: (observer: string, observed: string) => boolean;
 
   constructor(
     store: JsStore,
@@ -144,6 +150,10 @@ export class ModuleRegistry {
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
       notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
+      /** Where a row stands with an agent's window (ModuleContext.windowStatusOf). */
+      windowStatusOf?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
+      /** Whether one agent observes another's own rows (ModuleContext.observes). */
+      observes?: (observer: string, observed: string) => boolean;
     }
   ) {
     this.store = store;
@@ -158,6 +168,8 @@ export class ModuleRegistry {
     this.onTraceFn = options.onTrace;
     this.callToolFn = options.callTool;
     this.notifyOpsFn = options.notifyOps;
+    this.windowStatusOfFn = options.windowStatusOf;
+    this.observesFn = options.observes;
   }
 
   /**
@@ -659,6 +671,10 @@ class ModuleContextImpl implements ModuleContext {
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
+  /** Offered only when the registry was given the framework's lookups, so
+   *  a module can tell a framework that has them from one that hasn't. */
+  readonly windowStatusOf?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
+  readonly observes?: (observer: string, observed: string) => boolean;
 
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
@@ -696,6 +712,10 @@ class ModuleContextImpl implements ModuleContext {
     this.pushEventFn = pushEvent;
     this.onTraceFn = onTrace;
     this.callToolFn = callTool;
+    const windowStatusOf = registry.windowStatusOfFn;
+    if (windowStatusOf) this.windowStatusOf = (id, opts) => windowStatusOf(id, opts);
+    const observes = registry.observesFn;
+    if (observes) this.observes = (observer, observed) => observes(observer, observed);
 
     // Load external ID map from state if exists
     const state = this.getState<{ externalIdMap?: Record<string, string> }>();

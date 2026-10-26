@@ -42,7 +42,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, asOwnRow } from '../src/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import {
   FALLBACK_MEDIA_TYPE,
@@ -430,6 +430,35 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(first[0]!.source, 'attachment');
       assert.strictEqual(first[0]!.sha256, sha(GIF));
       assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not the other agent's image");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("another agent's own row, which the caller's window never held, takes no slot: index 0 is the attachment (#291)", async () => {
+    let orens = '';
+    const h = await startTurn({
+      prefix: 'sri-other-own-row-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      // After the attachment, a row stored as another agent's own (oren's
+      // round, in a slot prime shares): in the record, never in prime's window.
+      seedHistory: (framework) => {
+        orens = String(framework.getAgent('prime')!.getContextManager().addMessage('oren', [
+          { type: 'text', text: "oren's picture" },
+          { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+        ] as ContentBlock[], asOwnRow(undefined, 'oren')));
+      },
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+      assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not oren's image");
+      assert.strictEqual(h.framework.getAgent('prime')!.getContextManager().windowStatusOf(orens as never), 'out', "prime's window never held oren's row");
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

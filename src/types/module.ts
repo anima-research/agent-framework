@@ -4,6 +4,7 @@ import type {
   MessageMetadata,
   StoredMessage,
   ContextInjection,
+  WindowStatus,
 } from '@animalabs/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
 import type { TraceEventListener } from './trace.js';
@@ -433,6 +434,38 @@ export interface ModuleContext {
    * empty window.
    */
   queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult;
+
+  /**
+   * Where a stored row stands with an agent's window (#291), the rows its
+   * requests are given, before its view's filter (context-manager's
+   * `windowStatusOf`): `'in'` when the window holds it, which is every row
+   * its record holds while the window is still the record; `'undone'` when
+   * it was taken out as an undone turn's, or shed after a refusal; `'out'`
+   * when it is stored and not in the window (not presented to the agent
+   * yet, or taken back to arrived); `'absent'` when the agent's record
+   * doesn't hold it (removed, never stored on its branch, or in a slot it
+   * doesn't read). For the delivery agent (the primary's, or the first
+   * agent's when none is primary), or with `opts.forAgent`, the named
+   * agent, which must be registered, as for queryMessages: a name that
+   * isn't throws. A tool that reads the record for an agent, such as the
+   * history module's, says with it which of the rows it returns the agent
+   * isn't being shown.
+   *
+   * Optional: a framework from before the presentation index, or a host's
+   * own context, doesn't offer it. Call as `ctx.windowStatusOf?.(...)`.
+   */
+  windowStatusOf?(id: MessageId, opts?: { forAgent?: string }): WindowStatus;
+
+  /**
+   * Whether `observer` reads `observed`'s own rows through an observe edge
+   * (dendrite's relationships): one of its edges reads a slot `observed`
+   * owns. Seeing another agent's rounds is a declared relationship (#291,
+   * decision 1), so a tool that reads the record for an agent leaves out
+   * another agent's own rows its window doesn't hold unless this is true.
+   * False for a name the registry doesn't know. Optional, as
+   * windowStatusOf is, and offered with it.
+   */
+  observes?(observer: string, observed: string): boolean;
 
   /**
    * Get info about all agents.

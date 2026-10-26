@@ -1806,8 +1806,13 @@ describe('queued context maintenance timer', () => {
     });
     strategy.framework = framework;
     const cm = framework.getAgent('agent')!.getContextManager();
+    // Each row enters the agent's window as it is stored, as a write for an
+    // idle agent does (#291): a rollback cuts at the write that presented its
+    // target (AF-7), so one to m1 removes m2. Two rows a later point
+    // presented together would leave the rollback nothing to remove.
     const first = String(cm.addMessage('user', [{ type: 'text', text: 'm1' }]));
-    cm.addMessage('user', [{ type: 'text', text: 'm2' }]);
+    cm.presentRows([first as never]);
+    cm.presentRows([cm.addMessage('user', [{ type: 'text', text: 'm2' }])]);
     const internals = framework as unknown as {
       noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
       overBudgetDrains: Set<Promise<void>>;
@@ -2166,8 +2171,11 @@ describe('queued context maintenance timer', () => {
     });
     strategy.framework = framework;
     const cm = framework.getAgent('agent')!.getContextManager();
+    // Each row presented as it is stored (#291), so the rollback to m1 cuts
+    // before m2 (AF-7), as in the test above.
     const first = String(cm.addMessage('user', [{ type: 'text', text: 'm1' }]));
-    cm.addMessage('user', [{ type: 'text', text: 'm2' }]);
+    cm.presentRows([first as never]);
+    cm.presentRows([cm.addMessage('user', [{ type: 'text', text: 'm2' }])]);
     const internals = framework as unknown as {
       surgeryHold: unknown;
       noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;

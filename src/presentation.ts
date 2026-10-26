@@ -51,7 +51,7 @@ import type { AgentName, MessageSlotRef, ObserveEdge } from './dendrite/types.js
 import type { WindowOrdinal } from './read-marks.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
 import { nameAsStored } from './text-as-stored.js';
-import type { TraceEvent } from './types/trace.js';
+import type { PresentationRetractReason, TraceEvent } from './types/trace.js';
 
 export { heldFromResidents } from './dendrite/audience.js';
 
@@ -263,7 +263,7 @@ export type PresentationOccasion =
 /** A context manager as the module uses it. */
 export type WindowManager = Pick<ContextManager,
   'presentRows' | 'getUnpresentedMessages' | 'getPresentedMessages' | 'ordinalOf' | 'indexLength'
-  | 'windowMode' | 'getMessage' | 'currentBranch' | 'isClosed'>;
+  | 'windowMode' | 'getMessage' | 'currentBranch' | 'isClosed' | 'retractRemoved' | 'retractAbsentRows'>;
 
 /** An agent as the module presents to it. The framework's Agent is one. */
 export interface PresentedAgent {
@@ -670,6 +670,79 @@ export class AgentPresentation {
       if (ids.has(rowId) && !inWindow.has(agent)) holders.push({ agent, via: 'framing' });
     }
     return holders;
+  }
+
+  /**
+   * Rows removed from the record through `remover` (a context manager of a
+   * live agent's, or one opened apart from them), taken out of every other
+   * live agent's window that still holds them: context-manager tombstones a
+   * removal in the remover's own window only, and another window on the
+   * same slot, or merging it, keeps the row's place (CM-T) while its listing
+   * and its compile leave the row out. Each row leaves at its own place, so
+   * no other row's place moves, and a cursor or watermark kept by place
+   * stays good. A window on a branch whose record still holds the row (a
+   * fork, a derived agent's view made before the removal) keeps it, as does
+   * a window that is still the record, which is never written to here
+   * (context-manager's retractRemoved passes over both). Each window's rows
+   * taken out are traced (presentation:retracted, with `reason`), and a
+   * window that couldn't be repaired is logged and passed by: the removal
+   * stands. `ids` names every row removed, a body by each of its shards.
+   * Returns what left each window. Never throws.
+   */
+  retractRemoved(remover: WindowManager | undefined, ids: readonly MessageId[], reason: PresentationRetractReason): Array<{ agent: AgentName; ids: MessageId[] }> {
+    const named = unique(ids).filter((id) => id !== '');
+    if (named.length === 0) return [];
+    const visited = new Set<WindowManager>(remover ? [remover] : []);
+    const out: Array<{ agent: AgentName; ids: MessageId[] }> = [];
+    for (const agent of this.host.liveAgents()) {
+      const cm = agent.getContextManager();
+      if (visited.has(cm)) continue;
+      visited.add(cm);
+      try {
+        // A window that is still the record holds no place for the row:
+        // checked here as well as by the call, which writes nothing then.
+        if (cm.isClosed() || cm.windowMode() !== 'presented') continue;
+        const taken = cm.retractRemoved(named);
+        if (taken.length === 0) continue;
+        out.push({ agent: agent.name, ids: taken });
+        this.host.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: taken, reason });
+      } catch (error) {
+        console.error(`[presentation] could not take ${named.length} removed row(s) out of ${agent.name}'s window (${reason}); the removal stands: ${describe(error)}`);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * At boot, after every live agent is taken on: take out of each window
+   * the module presents for every row it holds that its record no longer
+   * does (context-manager's retractAbsentRows), as retractRemoved takes out
+   * the rows a live removal named. These are rows removed where no live
+   * context heard it: by an offline recovery's suppressions, with the host
+   * stopped, through the one context it opened, and removals whose own
+   * tombstone failed. Traced as presentation:retracted with `boot`; a
+   * window that couldn't be repaired is logged and passed by. Each agent's
+   * context is open with every slot it merges by then, so a row of a slot
+   * it merges isn't taken for removed. Never throws.
+   */
+  retractAbsentRows(): Array<{ agent: AgentName; ids: MessageId[] }> {
+    const out: Array<{ agent: AgentName; ids: MessageId[] }> = [];
+    const visited = new Set<WindowManager>();
+    for (const agent of this.host.liveAgents()) {
+      const cm = agent.getContextManager();
+      if (visited.has(cm)) continue;
+      visited.add(cm);
+      try {
+        if (!this.presenting(agent)) continue;
+        const taken = cm.retractAbsentRows();
+        if (taken.length === 0) continue;
+        out.push({ agent: agent.name, ids: taken });
+        this.host.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: taken, reason: 'boot' });
+      } catch (error) {
+        console.error(`[presentation] could not take removed rows out of ${agent.name}'s window at boot: ${describe(error)}`);
+      }
+    }
+    return out;
   }
 
   /** Whether a reader fork was handed the row as framing (noteFramed), and

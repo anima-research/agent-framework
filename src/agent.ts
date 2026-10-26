@@ -2082,17 +2082,23 @@ export class Agent {
     return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
   }
 
-  /** Stored rows that follow a request-only turn, memoized on the store's
-   * cached message array (ContextManager returns the same array until the
-   * store changes). */
+  /** Stored rows that follow a request-only turn, memoized on the window's
+   * cached row array (ContextManager returns the same array until the
+   * window changes): the rows a compile sends are the window's (#291), and
+   * a write another agent stores, which the window doesn't take, leaves the
+   * memo as it was. A context without a window reads the record, the same
+   * array as the window's for a single slot that is still the record. */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
     const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
     const cm = this.contextManager as Partial<ContextManager>;
-    if (typeof cm.getAllMessages !== 'function') return empty;
+    const read = typeof cm.getPresentedMessages === 'function' ? () => cm.getPresentedMessages!()
+      : typeof cm.getAllMessages === 'function' ? () => cm.getAllMessages!()
+      : undefined;
+    if (!read) return empty;
     try {
-      const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
+      const stored = read() as unknown as readonly StoredRowLike[];
       if (this.requestOnlyIndex?.source === stored) return this.requestOnlyIndex.index;
       const index = indexRequestOnlyRows(stored, this.name);
       this.requestOnlyIndex = { source: stored, index };

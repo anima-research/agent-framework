@@ -512,6 +512,16 @@ const result = await framework.rollbackToMessage('cairn', {
 // result.markers: { status: 'none' | 'queued' | 'not-scheduled', ... }
 ```
 
+An agent's context follows its own window (#291), so the cut is the write
+that presented the target: a rollback removes only the rows stored after
+that write, and the rows stored before it that the window took after the
+target leave the window and enter it again at the agent's next presentation
+point (`returnedToArrivals`, on the result and the preview). The preview's
+`neverPresented` counts the messages it removes that no agent's window
+holds. A removal in place (a `hide`, a suppression on its fork, a module's
+or the coalescer's removal) takes the rows out of every other agent's window
+that held them too, each at its own place.
+
 - **`marks`** is `'none'` (the default), or `{ scope: 'addressed' | 'all', refs? }`.
   `addressed` covers messages tagged `chat:addressed` (mentions, replies to
   the bot, DMs). Passing a preview's `refs` binds the choice to exactly that
