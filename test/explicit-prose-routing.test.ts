@@ -2841,19 +2841,21 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  for (const [mode, label, text] of [
-    ['hybrid', 'names no destination', '>>>\nThe plan is X.'],
-    ['hybrid', 'names a channel that does not resolve', '>>>#missing The plan is X.'],
-    ['explicit', 'names a channel that does not resolve', '>>#missing The plan is X.'],
+  for (const [mode, label, text, plan] of [
+    ['hybrid', 'names no destination', '>>>\nThe plan is X.', []],
+    ['hybrid', 'names a channel that does not resolve', '>>>#missing The plan is X.', []],
+    ['explicit', 'names a channel that does not resolve', '>>#missing The plan is X.', []],
+    ['hybrid', 'names a channel whose delivery fails', '>>>#alpha The plan is X.', ['false']],
+    ['explicit', 'names a channel whose delivery fails', '>>#alpha The plan is X.', ['false']],
   ] as const) {
     it(`a private ${mode} turn's envelope that ${label} keeps its words private, with no draft`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text }] as ContentBlock[]));
       const framework = await createFramework(mode);
-      const routed = stubRegistry(framework);
+      const routed = stubRegistry(framework, [...plan]);
       feedTurn(framework, 2, [{ type: 'text', text: 'Ordinary words.' }] as ContentBlock[]);
       trigger(framework, true);
       await framework.runUntilIdle();
-      assert.deepEqual(routed, []);
+      assert.deepEqual(routed.map((r) => r.text), plan.length ? ['The plan is X.'] : [], 'control: only a resolved envelope is attempted');
       const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
       assert.deepEqual(drafts.map((d) => d.text), [], 'nothing holds the words to resend');
       const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('was not delivered'));
@@ -2903,6 +2905,47 @@ describe('explicit prose routing', () => {
       assert.deepEqual(drafts.map((d) => d.text), ['First words.'], "nothing holds the private turn's words to resend");
       const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('chan-alpha'));
       assert.ok(notice?.includes(outcome === 'throw' ? "It isn't held as a draft" : 'It was kept private'), `the resident is told: ${notice}`);
+      await framework.stop();
+    });
+  }
+
+  for (const [mode, prefix] of [['hybrid', '>>>'], ['explicit', '>>']] as const) {
+    it(`a private ${mode} turn's bare {{unsent}} resend whose delivery fails keeps the draft it sent, and offers it again`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}#missing First words.` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework, ['false']);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: `${prefix}#alpha {{unsent}}` }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed.map((r) => r.text), ['First words.'], 'control: the resend was attempted');
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), ['First words.'], 'the draft it sent stays held');
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('chan-alpha'));
+      assert.ok(notice?.includes(`It is held as draft ${drafts[0]!.id}`), `the resident is offered it again: ${notice}`);
+      await framework.stop();
+    });
+
+    it(`a private ${mode} turn's round that calls the drafts tool holds none of its plain words as a draft`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: `${prefix}#missing First words.` },
+        { type: 'tool_use', id: 'd1', name: 'drafts', input: { action: 'list' } },
+        { type: 'text', text: 'Private narration.' },
+        { type: 'tool_use', id: 'd2', name: 'drafts', input: { action: 'list' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing]') && t.includes('#missing')), 'control: the envelope before it bounced');
+      assert.deepEqual(routed, []);
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), [], 'nothing holds the words to resend');
       await framework.stop();
     });
   }
