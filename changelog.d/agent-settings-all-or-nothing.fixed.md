@@ -6,12 +6,13 @@
   settings first, so a call refused for its `tail_tokens` had already
   changed its inline cap.
 - An `agent_settings` update, reset or cancel refusal ends by saying what the
-  call changed. One made before anything applied ends "Nothing in this call
-  was changed." One made after names each setting that reads differently
-  than before the call ("Changed before the refusal: …; no other setting
-  reads differently."), or says "No setting reads differently after this
-  call.", or, if the settings can't be read back, says that whether anything
-  changed couldn't be.
+  call changed. One made before the settings are read, such as for a name
+  the call can't take or a core value of the wrong type, ends "Nothing in
+  this call was changed." One made after names each setting that reads
+  differently than before the call ("Changed before the refusal: …; no other
+  setting reads differently."), or says "No setting reads differently after
+  this call.", or, if the settings can't be read back, says that whether
+  anything changed couldn't be.
 - `agent_settings` reads `immediate`, `tool_result_guard` and
   `closed_channel_note` given as the text `"true"` or `"false"` as that
   boolean. Before, `immediate: "false"` applied a lower budget at once where

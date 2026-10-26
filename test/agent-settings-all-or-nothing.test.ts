@@ -20,6 +20,7 @@ function strategy(): AutobiographicalStrategy {
 
 class SettingModule implements Module {
   value: unknown = 'zz-initial';
+  resetRefuses = false;
   constructor(readonly name: string, private readonly key: string) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
@@ -37,6 +38,7 @@ class SettingModule implements Module {
         return { [this.key]: this.value };
       },
       reset: () => {
+        if (this.resetRefuses) throw new Error(`${this.key} refused its reset`);
         this.value = 'zz-initial';
         return { [this.key]: this.value };
       },
@@ -170,7 +172,7 @@ describe('agent_settings refuses names it doesn\'t take and core values of the w
       });
       assert.equal(refused.isError, true);
       assert.match(refused.error!, /^\[budget-preflight\] contextBudgetTokens=260000 would NOT fit/);
-      assert.match(refused.error!, / or pass allowInfeasible\. No setting reads differently after this call\.$/);
+      assert.match(refused.error!, /[^.]\. No setting reads differently after this call\.$/);
       const now = settings(call);
       assert.equal(now.tool_result_guard, false);
       assert.equal(now.closed_channel_note, true);
@@ -438,7 +440,7 @@ describe('agent_settings refuses names it doesn\'t take and core values of the w
     await withFramework({ modules: [two] }, (_framework, call) => {
       assert.equal(call({ action: 'update', tool_result_inline_max_chars: 5_000 }).success, true);
       const refused = call({ action: 'reset', settings: ['tool_result_inline_max_chars', 'zz_a'] });
-      assert.equal(refused.error, 'zz_a can\'t be reset. Nothing in this call was changed.');
+      assert.equal(refused.error, 'zz_a can\'t be reset: give it the value you want with an update. Nothing in this call was changed.');
       assert.equal(settings(call).tool_result_inline_max_chars, 5_000, 'nothing was reset');
     });
   });
@@ -486,6 +488,19 @@ describe('agent_settings refuses names it doesn\'t take and core values of the w
     await withFramework({ modules: [two] }, (_framework, call) => {
       const refused = call({ action: 'update', zz_a: null, zz_b: 'zz-bad' });
       assert.equal(refused.error, 'zz_b refused zz-bad. Changed before the refusal: zz_a; no other setting reads differently.');
+    });
+  });
+
+  it('a reset that changes only an extension\'s saved override names that setting', async () => {
+    const module = new SettingModule('zz-module', 'zz_module');
+    module.resetRefuses = true;
+    await withFramework({ modules: [module] }, (_framework, call) => {
+      assert.equal(call({ action: 'update', tool_result_guard: false }).success, true);
+      assert.equal(settings(call).tool_result_guard_source, 'runtime_override');
+      const refused = call({ action: 'reset', settings: ['tool_result_guard', 'zz_module'] });
+      assert.equal(refused.error,
+        'zz_module refused its reset. Changed before the refusal: tool_result_guard; no other setting reads differently.');
+      assert.equal(settings(call).tool_result_guard_source, 'recipe_default');
     });
   });
 

@@ -32124,7 +32124,7 @@ export class AgentFramework {
                 (ext) => typeof name === 'string' && ext.keys.includes(name),
               );
               if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
-              if (!owner.reset) throw new Error(`${String(name)} can't be reset`);
+              if (!owner.reset) throw new Error(`${String(name)} can't be reset: give it the value you want with an update`);
               const list = extResetKeys.get(owner) ?? [];
               list.push(name as string);
               extResetKeys.set(owner, list);
