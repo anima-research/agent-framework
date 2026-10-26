@@ -2886,6 +2886,27 @@ describe('explicit prose routing', () => {
     });
   }
 
+  for (const [mode, prefix, outcome] of [['hybrid', '>>>', 'false'], ['hybrid', '>>>', 'throw'], ['explicit', '>>', 'false']] as const) {
+    it(`a private ${mode} turn's resend that adds its own words to {{unsent}} holds no new draft when its delivery ${outcome === 'throw' ? 'throws' : 'fails'}`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}#missing First words.` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework, [outcome]);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: `${prefix}#alpha Private note. {{unsent}}` }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed.map((r) => r.text), ['Private note. First words.'], 'control: the resend was attempted');
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), ['First words.'], "nothing holds the private turn's words to resend");
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('chan-alpha'));
+      assert.ok(notice?.includes(outcome === 'throw' ? "It isn't held as a draft" : 'It was kept private'), `the resident is told: ${notice}`);
+      await framework.stop();
+    });
+  }
+
   it("hybrid keeps a private turn's unprefixed prose on its surface", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');

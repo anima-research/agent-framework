@@ -60,13 +60,15 @@
   private turn's unprefixed speech is no longer bounced and held as a draft to
   resend: a notice says it was kept private and how to publish. An envelope
   that bounces in a private turn, because it names no destination, names one
-  that doesn't resolve, or can't be delivered, isn't held as a draft either:
-  its notice says the words were kept private and how to publish. Where an
-  earlier bounce is still held, either notice says that `{{unsent}}` names
-  that draft, not these words. In every mode, words a send silenced are held
-  as drafts, as in any turn. Speech handlers are told a private turn's speech
-  is private (`SpeechContext.nonChannelOrigin`), and the built-in Discord
-  module posts none of it and edits its thoughts into no message.
+  that doesn't resolve, or can't be delivered, isn't held as a draft either,
+  words it adds to an `{{unsent}}` resend included: its notice says the words
+  were kept private and how to publish, or, when the send threw, that they may
+  have gone out. Only a bare `{{unsent}}` resend keeps the draft it sent.
+  Where an earlier bounce is still held, either notice says that `{{unsent}}`
+  names that draft, not these words. In every mode, words a send silenced are
+  held as drafts, as in any turn. Speech handlers are told a private turn's
+  speech is private (`SpeechContext.nonChannelOrigin`), and the built-in
+  Discord module posts none of it and edits its thoughts into no message.
 
   A private turn's `channel_publish` must name its channel: a call without
   `channelId` is refused, a conversation fork's included, and the refusal says

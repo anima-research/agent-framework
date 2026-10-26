@@ -18909,7 +18909,8 @@ export class AgentFramework {
   ): void {
     const name = agent.name;
     round.routing.lastEnvelopeBounced = true;
-    if (after.outcome === 'unknown' && !after.substituted) {
+    const privateTurn = round.routing.nonChannelOrigin === true && !(after.substituted && text.trim() === '{{unsent}}');
+    if (after.outcome === 'unknown' && (!after.substituted || privateTurn)) {
       // Words with no draft behind them, whose send threw, may have gone
       // out. Like an unknown outcome, that is marker-only: holding them as a
       // draft would invite a duplicate post.
@@ -18928,7 +18929,6 @@ export class AgentFramework {
       console.error(`[prose] ${name}: ${text.length} chars may not have been delivered — ${reason}`);
       return;
     }
-    const privateTurn = round.routing.nonChannelOrigin === true && !after.substituted;
     const words = privateTurn ? undefined : this.unsentWords(agent, text, after.substituted);
     let draft: Draft | undefined;
     let inherited: InheritedRisk | undefined;
