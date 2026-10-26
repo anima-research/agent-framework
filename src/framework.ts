@@ -22227,8 +22227,11 @@ export class AgentFramework {
         return failure;
       }
     }
-    const marked = this.markedInputFailure(call.callerAgentName ?? '__ephemeral__', call, false);
-    if (marked) return marked;
+    const marked = markedInputRefusal(call);
+    if (marked !== undefined) {
+      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: marked });
+      return { success: false, error: marked, isError: true };
+    }
 
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
     // Client-side programmatic tool calling for callers that await a tool's
@@ -23925,11 +23928,10 @@ export class AgentFramework {
     return refusal;
   }
 
-  private markedInputFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
+  private markedInputFailure(agentName: string, call: ToolCall): ToolResult | undefined {
     const error = markedInputRefusal(call);
     if (error === undefined) return undefined;
     this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error });
-    if (!reportRefusal) return { success: false, error, isError: true };
     return this.refusedResult(agentName, call.id, error);
   }
 

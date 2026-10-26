@@ -228,6 +228,30 @@ test('in a turn where no round was routed live, a refused marked skip_reply sile
   } finally { await h.close(); }
 });
 
+for (const live of [true, false]) {
+  test(`${live ? 'in a round routed live' : 'in a turn where no round was routed live'}, a null-marked skip_reply counts as the call with no arguments that ran`, async () => {
+    const h = await harness();
+    try {
+      const routed = captureRouting(h.framework);
+      const call = marked('null', 'skip_reply', { wake_in_seconds: 5 });
+      if (!live) asTurnWithNoLiveRound(h.membrane, call);
+      const results = await h.turn([{ type: 'text', text: 'Public round prose' } as ContentBlock, call]);
+      assert.equal(results[0]!.isError, false, 'the skip_reply ran');
+      assert.ok(!routed.includes('Public trailing prose'), 'and silences what follows, as a skip_reply that ran does');
+    } finally { await h.close(); }
+  });
+}
+
+test('the module registry answers a marked call with the refusal, as a failure', async () => {
+  const h = await harness();
+  try {
+    const registry = (h.framework as unknown as { moduleRegistry: { handleToolCall(call: ToolCall): Promise<{ success: boolean; error?: string; isError?: boolean }> } }).moduleRegistry;
+    const result = await registry.handleToolCall({ id: 'direct', name: 'probe--move', input: {}, unparseableInput: '' });
+    assert.deepEqual(result, { success: false, error: 'Nothing was done: probe--move its arguments never arrived; call it again with them whole.', isError: true });
+    assert.equal(h.effects.length, 0);
+  } finally { await h.close(); }
+});
+
 test('a refused marked code_execution call starts no script, and its round does not wait for one', async () => {
   const h = await harness();
   try {
