@@ -1704,3 +1704,191 @@ test('a restart under the same id with toolHints keeps what the host told: an en
     assert.equal(told(), 1, 'told once, across the restart');
   } finally { await t.done(); }
 });
+
+const withPresence = (name: string, presence: 'static' | 'dynamic') => TOOLS.map((x) => (x.name === name ? { ...x, _meta: { ...(x._meta as Json | undefined), 'mcpl/presence': presence } } : x));
+
+async function movingServer(moved: Json[]) {
+  let phase: 'off' | 'move' | 'hold' = 'off';
+  let release: (() => void) | null = null;
+  const t = await setup((msg, peer, state) => {
+    if (msg.method !== 'tools/list' || phase === 'off') return false;
+    const answer = () => peer.reply(msg.id, { tools: moved, _meta: { 'mcpl/rev': state.rev } });
+    if (phase === 'move') {
+      phase = 'hold';
+      answer();
+    } else {
+      release = answer;
+    }
+    return true;
+  });
+  const moveAndHold = async () => {
+    phase = 'move';
+    t.state.next();
+    t.server.peer.notify('tools/hints', t.state.hint([]));
+    await waitFor(() => release !== null, 'the rebuild\'s tools/list asked for');
+  };
+  return { t, moveAndHold, release: () => release?.() };
+}
+
+test('RFC-014 §4.2: a tool a list moves to static is called both ways until the tool list shows it, then by its listed name', async () => {
+  const { t, moveAndHold, release } = await movingServer(withPresence('peek', 'static'));
+  try {
+    await moveAndHold();
+    const viaAct = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: {} });
+    assert.equal(resultText(viaAct), 'peek done', 'act still calls it, where the tool list put it');
+    const byName = await t.fw.framework.executeToolCall({ id: 'early', name: 'arc--peek', input: {} } as never);
+    assert.equal(resultText(byName), 'peek done', 'its listed name calls it, where the server\'s latest list put it');
+    release();
+    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the rebuild shows peek');
+    assert.equal(resultText(await t.fw.framework.executeToolCall({ id: 'late', name: 'arc--peek', input: {} } as never)), 'peek done');
+    assert.equal(resultText(await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: {} })), 'peek is not a dynamic tool: static — called by name, as arc--peek. Call it there.');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
+test('RFC-014 §4.2: a tool a list moves to dynamic is called both ways until the tool list drops it, then through act', async () => {
+  const { t, moveAndHold, release } = await movingServer(withPresence('status', 'dynamic'));
+  try {
+    await moveAndHold();
+    const byName = await t.fw.framework.executeToolCall({ id: 'early', name: 'arc--status', input: {} } as never);
+    assert.equal(resultText(byName), 'status done', 'its listed name still calls it, where the tool list put it');
+    assert.equal(resultText(await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'status', args: {} })), 'status done', 'act calls it, where the server\'s latest list put it');
+    release();
+    await waitFor(() => !t.fw.framework.getAllTools().some((x) => x.name === 'arc--status'), 'the rebuild drops status');
+    const late = await t.fw.framework.executeToolCall({ id: 'late', name: 'arc--status', input: {} } as never);
+    assert.match(String(late.error), /status is a dynamic tool of arc, called with toolsets--act/);
+    assert.equal(resultText(await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'status', args: {} })), 'status done');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
+test('RFC-014 §4.2: a static tool the tool list hasn\'t published isn\'t taken through act', async () => {
+  const newt = { name: 'newt', description: 'A newt.', inputSchema: { type: 'object', properties: {} } };
+  const { t, moveAndHold, release } = await movingServer([...withPresence('peek', 'static'), newt]);
+  try {
+    await moveAndHold();
+    const viaAct = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'newt', args: {} });
+    assert.ok(viaAct.isError);
+    assert.equal(resultText(viaAct), 'newt is not a dynamic tool: static — called by name, as arc--newt. Call it there.');
+    release();
+    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--newt'), 'the rebuild publishes newt');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
+test('RFC-014 §4.2: look names a tool by the definition act would check, wherever act would take it', async () => {
+  const { t, moveAndHold, release } = await movingServer(withPresence('peek', 'static'));
+  try {
+    const hinted = { name: 'peek', visible: false, definition: { description: 'Peek, from a hint.', inputSchema: { type: 'object', properties: { far: { type: 'boolean' } } } } };
+    t.server.peer.notify('tools/hints', t.state.hint([hinted]));
+    // The server's own statement keeps restating the definition (RFC §6.1), as the move's recovery reads it.
+    t.state.statement.push(hinted);
+    await roundTrip(t);
+    await moveAndHold();
+    assert.match(resultText(await callTool(t.fw.framework, 'toolsets--look', { server: 'arc', tool: 'peek' })), /^peek\(far\?: boolean\)[\s\S]*Peek, from a hint\./, 'act would still take it, so look shows the hint\'s definition');
+    release();
+    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the rebuild shows peek');
+    assert.match(resultText(await callTool(t.fw.framework, 'toolsets--look', { server: 'arc', tool: 'peek' })), /Peek around\./, 'act wouldn\'t, so look shows the listed one');
+  } finally {
+    release();
+    await t.done();
+  }
+});
+
+/** arc, whose tools/list moves peek to static once `move` is called, and a second server, slow, whose tools/list can be held. */
+async function arcAndSlow() {
+  let moved = false;
+  const t = await setup((msg, peer, state) => {
+    if (msg.method !== 'tools/list' || !moved) return false;
+    peer.reply(msg.id, { tools: withPresence('peek', 'static'), _meta: { 'mcpl/rev': state.rev } });
+    return true;
+  });
+  let holdNext = false;
+  let held: (() => void) | null = null;
+  const slow = await startScriptedServer({
+    advert: { featureSets: ADVERT.featureSets },
+    tools: [TOOLS[0]!],
+    onList: (msg, peer) => {
+      if (!holdNext) return false;
+      holdNext = false;
+      held = () => peer.reply(msg.id, { tools: [TOOLS[0]!] });
+      return true;
+    },
+  });
+  await t.fw.framework.connectMcplServer({ id: 'slow', toolPrefix: 'slow', url: slow.url });
+  await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'slow--status'), 'slow listed');
+  const move = async () => {
+    moved = true;
+    holdNext = true;
+    t.state.next();
+    t.server.peer.notify('tools/hints', t.state.hint([]));
+    await waitFor(() => held !== null, 'the rebuild waits on slow');
+  };
+  const unmove = () => { moved = false; };
+  const release = () => { const h = held; held = null; h?.(); };
+  const toldMoved = () => notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length;
+  return { t, slow, move, unmove, release, toldMoved, async done() { release(); await t.done(); await slow.close(); } };
+}
+
+test('RFC-014 §4.2: a move is told once the rebuild has published every server\'s list, and a call by name before then still goes through', async () => {
+  const s = await arcAndSlow();
+  try {
+    await s.move();
+    assert.equal(s.toldMoved(), 0, 'not told while the rebuild waits on another server');
+    const byName = await s.t.fw.framework.executeToolCall({ id: 'early', name: 'arc--peek', input: {} } as never);
+    assert.equal(resultText(byName), 'peek done', 'the server\'s latest list put it there');
+    s.release();
+    await waitFor(() => s.toldMoved() === 1, 'told once the rebuild publishes');
+    assert.ok(s.t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the tool list shows it');
+  } finally { await s.done(); }
+});
+
+test('RFC-014 §4.2: a rebuild that never publishes leaves its moves to the one that does, which tells each once', async () => {
+  const s = await arcAndSlow();
+  const third = await startScriptedServer({ advert: { featureSets: ADVERT.featureSets }, tools: [TOOLS[0]!] });
+  try {
+    await s.move();
+    assert.equal(s.toldMoved(), 0, 'not told by the rebuild that waits');
+    await s.t.fw.framework.connectMcplServer({ id: 'third', toolPrefix: 'third', url: third.url });
+    await waitFor(() => s.t.fw.framework.getAllTools().some((x) => x.name === 'third--status' || x.name === 'arc--peek'), 'the newer rebuild published');
+    await waitFor(() => s.toldMoved() === 1, 'told by the rebuild that published');
+    s.release();
+    await waitFor(() => !(s.t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight, 'the older rebuild ended');
+    await roundTrip(s.t);
+    await nextMacrotask();
+    assert.equal(s.toldMoved(), 1, 'told once');
+  } finally {
+    await s.done();
+    await third.close();
+  }
+});
+
+test('RFC-014 §4.2: a move a list undoes while the rebuild waits on another server is never told, and the tool list follows the undoing', async () => {
+  const s = await arcAndSlow();
+  try {
+    await s.move();
+    s.unmove();
+    const lists = s.t.methods().filter((m) => m === 'toolsets/list').length;
+    s.t.state.next();
+    s.t.server.peer.notify('tools/hints', s.t.state.hint([]));
+    await waitFor(() => s.t.methods().filter((m) => m === 'toolsets/list').length > lists, 'the undoing list read');
+    s.release();
+    await waitFor(() => !s.t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek') && !(s.t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight, 'the tool list follows the undoing');
+    await roundTrip(s.t);
+    await nextMacrotask();
+    assert.equal(s.toldMoved(), 0, 'never told');
+  } finally { await s.done(); }
+});
+
+test('where no tool list has published a tool, presence decides where it is called', () => {
+  const { c, read } = tappedController();
+  assert.match(c.dynamicCallRefusal('peek', 'arc--peek') ?? '', /peek is a dynamic tool of arc/);
+  read({ kind: 'result', method: 'tools/list', params: {}, result: { tools: withPresence('peek', 'static') }, awaited: true });
+  assert.equal(c.dynamicCallRefusal('peek', 'arc--peek'), null);
+});

@@ -120,7 +120,7 @@ export class ToolPresence {
   private defs = new Map<string, Map<string, DefOverride>>();
   /** `ended` ids told to the agent, kept while the server still reports them (RFC §5.3). */
   private toldEnded = new Set<string>();
-  /** Moves a tools/list made that the model's tool list doesn't show yet: told at its next rebuild. */
+  /** Moves a tools/list made that the model's tool list doesn't show yet: told once a rebuild has published them. */
   private pendingMoves = new Map<string, Presence>();
   /** Digests of definitions the model has been shown with their first sentence. */
   readonly shown = new Set<string>();
@@ -133,6 +133,8 @@ export class ToolPresence {
     private readonly allowed: (tool: string) => boolean = () => true,
     /** How a static tool is named in the API tool list, for `look`. */
     private readonly listedName: (tool: string) => string = (tool) => tool,
+    /** Where the model's published tool list last put a tool, if it's there (shownAs). */
+    private readonly published: (tool: string) => Presence | undefined = () => undefined,
   ) {}
 
   // ── connection lifecycle ──
@@ -254,6 +256,15 @@ export class ToolPresence {
   presenceOf(name: string): Presence {
     if (!this.active) return 'static';
     return this.listedPresence(name);
+  }
+
+  /** RFC §4.2: "Until it applies the move, the tool keeps working where it
+   *  is." Whether the model has been shown a tool at `place`: in the tool list
+   *  last published, or in the latest announcement (its presence). Until a
+   *  rebuild applies a move the two differ, and a call is taken at either. */
+  shownAs(name: string, place: Presence): boolean {
+    if (!this.active) return place === 'static';
+    return this.published(name) === place || this.listedPresence(name) === place;
   }
 
   private listedPresence(name: string): Presence {
@@ -564,10 +575,15 @@ export class ToolPresence {
     return this.pendingMoves.size > 0;
   }
 
-  /** At a rebuild of the model's tool list (RFC §4.2): the static↔dynamic moves the lists made since the last one. */
-  applyMoves(): Array<{ name: string; to: Presence }> {
-    const out = [...this.pendingMoves].map(([name, to]) => ({ name, to }));
-    this.pendingMoves.clear();
+  /** The static↔dynamic moves the lists made since the last rebuild, still to be shown. */
+  moves(): Array<{ name: string; to: Presence }> {
+    return [...this.pendingMoves].map(([name, to]) => ({ name, to }));
+  }
+
+  /** At a rebuild of the model's tool list (RFC §4.2): those of `moves` still pending, now shown. */
+  applyMoves(moves = this.moves()): Array<{ name: string; to: Presence }> {
+    const out = moves.filter(({ name, to }) => this.pendingMoves.get(name) === to);
+    for (const { name } of out) this.pendingMoves.delete(name);
     return out;
   }
 
@@ -694,7 +710,7 @@ export class ToolPresence {
 
   /** Where a tool can be called from now, for `look` naming it. */
   toolStatus(tool: string): string {
-    if (this.presenceOf(tool) === 'static') return `static — in your tool list as ${this.listedName(tool)}`;
+    if (this.presenceOf(tool) === 'static') return `static — called by name, as ${this.listedName(tool)}`;
     const where = [...this.view().entries()].filter(([, e]) => e.tools.has(tool)).map(([k]) => k);
     const ts = this.toolsetOf(tool);
     return where.length

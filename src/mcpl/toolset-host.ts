@@ -7,7 +7,8 @@
  *
  * Hint changes apply as their message is read (RFC §6.1); a static↔dynamic
  * move takes effect when a tools/list states it (§4.1), and the model's tool
- * list shows it at its next rebuild (§4.2). The connection's read tap hands
+ * list shows it at its next rebuild; until then the tool is called at either
+ * place (§4.2). The connection's read tap hands
  * the controller every result of a hinted request (awaited or not, while no
  * more than 1,000 hinted requests await an answer), each tools/list whole, every push/event and every tools/hints, of the
  * current transport, synchronously and in arrival order, before anything
@@ -30,7 +31,7 @@ import { redactServerText } from './protocol-family.js';
 import { logDetail, logValueRedacted } from './log-value.js';
 import {
   ToolPresence, emptyChange, isEmptyChange, keyOf,
-  type ChangeSet, type MetaToolNames,
+  type ChangeSet, type MetaToolNames, type Presence,
 } from './tool-presence.js';
 import type { HintedTool } from './tool-signature.js';
 
@@ -69,6 +70,11 @@ export interface ToolsetHostDeps {
   log(line: string): void;
   /** How a static tool is named in the tool list (`prefix--tool`). */
   listedName(serverId: string, tool: string): string;
+  /** Where the model's published tool list last put a server's tool:
+   *  offered in it (static), listed but not offered (dynamic), or undefined
+   *  where it isn't published. RFC §4.2: until its move applies, a tool
+   *  keeps working where it is. */
+  published?(serverId: string, tool: string): Presence | undefined;
 }
 
 /** One server's RFC-014 state and traffic. Lives as long as the server's
@@ -99,6 +105,7 @@ export class ToolsetController {
       META_TOOL_NAMES,
       (tool) => isToolAllowed(tool, this.config),
       (tool) => deps.listedName(serverId, tool),
+      (tool) => deps.published?.(serverId, tool),
     );
   }
 
@@ -369,10 +376,11 @@ export class ToolsetController {
    * A dynamic tool called by its namespaced name, as if it were listed (a
    * model imitating an earlier call, a module): refused, so every call into
    * a toolset goes through act, which knows its instance and gates closed
-   * groups (RFC §5.4, §5.5). Null for any other tool.
+   * groups (RFC §5.4, §5.5). Null for any other tool, including one the
+   * model was last shown as static (shownAs: RFC §4.2, until its move applies).
    */
   dynamicCallRefusal(tool: string, calledAs: string): string | null {
-    if (!this.presence.active || !this.presence.tool(tool) || this.presence.presenceOf(tool) !== 'dynamic') return null;
+    if (!this.presence.active || !this.presence.tool(tool) || this.presence.shownAs(tool, 'static')) return null;
     return `There's no tool "${calledAs}" in your tool list, so nothing ran: ${tool} is a dynamic tool of ${this.serverId}, ` +
       `called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${tool}", args}. ${this.presence.toolStatus(tool)}.`;
   }
@@ -630,9 +638,10 @@ export class ToolsetController {
     this.deliver(this.presence.diff(before, this.presence.view()));
   }
 
-  /** At a rebuild of the model's tool list (RFC §4.2), tell where the tools the list moved went. */
-  applyMoves(): void {
-    const moved = this.presence.applyMoves();
+  /** At a rebuild of the model's tool list (RFC §4.2), tell where the tools it moved went: `moves`, those still pending, or every one pending. A move a list has undone since the rebuild listed the server asks for another rebuild, so the tool list follows. */
+  applyMoves(moves?: Array<{ name: string; to: Presence }>): void {
+    const moved = this.presence.applyMoves(moves);
+    if (moves?.some(({ name, to }) => this.presence.presenceOf(name) !== to)) this.deps.refreshTools(this.serverId);
     if (!moved.length) return;
     const cs = emptyChange();
     cs.notes.push(...moved.map(({ name, to }) => to === 'dynamic'

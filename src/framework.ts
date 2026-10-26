@@ -762,8 +762,8 @@ import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
-import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
-import { isEmptyChange } from './mcpl/tool-presence.js';
+import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
+import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
 import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
@@ -27646,12 +27646,19 @@ export class AgentFramework {
 
   /** RFC-014: every toolHints server's presence, made on first use. */
   private toolsets(): ToolsetHub {
-    return (this.toolsetHub ??= new ToolsetHub({
+    if (this.toolsetHub) return this.toolsetHub;
+    const listedName = (serverId: string, tool: string) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`;
+    return (this.toolsetHub = new ToolsetHub({
       notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
       canNotify: (serverId) => CapabilityGrant.of(this.mcplServerRegistry?.getServer(serverId)).has('pushEvents'),
       refreshTools: (serverId) => this.handleToolsListChanged(serverId),
       log: (line) => console.error(`[mcpl] ${line}`),
-      listedName: (serverId, tool) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`,
+      listedName,
+      published: (serverId, tool) => {
+        const name = listedName(serverId, tool);
+        if (this.mcplToolServers?.get(name) !== serverId) return undefined;
+        return this.mcplTools.some((t) => t.name === name) ? 'static' : 'dynamic';
+      },
     }));
   }
 
@@ -29766,6 +29773,7 @@ export class AgentFramework {
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
     const repeats: Array<{ serverId: string; tools: string[] }> = [];
+    const movesListed = new Map<string, { controller: ToolsetController; moves: Array<{ name: string; to: Presence }> }>();
 
     for (const server of [...this.mcplServerRegistry.getAllServers()]) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -29784,10 +29792,11 @@ export class AgentFramework {
         // a direct call of the tool would be. The list was read through the
         // server's tap, so its presence is current.
         // The static↔dynamic moves the lists made since the last rebuild
-        // reach the tool list here (§4.2), and the agent is told where each
-        // tool went, when a notice can be written.
+        // reach the tool list here (§4.2). The agent is told where each tool
+        // went once this refresh publishes the list, and not by a refresh that
+        // doesn't: the moves stay pending for one that does.
         const presence = this.toolsetHub?.get(server.id);
-        if (presence?.presence.active) presence.applyMoves();
+        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, moves: presence.presence.moves() });
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -29918,6 +29927,7 @@ export class AgentFramework {
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
     this.mcplListedServers = listedServers;
+    for (const [serverId, { controller, moves }] of movesListed) if (listedServers.has(serverId)) controller.applyMoves(moves);
     for (const { serverId, tools: repeatedTools } of repeats) {
       const one = repeatedTools.length === 1;
       const listed = repeatedTools.map((name) => logValue(name)).join(', ');

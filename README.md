@@ -464,9 +464,12 @@ framework registers a `toolsets` module with four constant tools:
 `server` can be left out when only one server has the name. Hint changes apply
 as their message is read, in `rev` order, whatever becomes of the message (a
 refused push, a result that came after its timeout). A move between static and
-dynamic takes effect when the server's `tools/list` states it: `toolsets--act`
-follows it then, and the tool list at its next rebuild, which the host asks for
-at once when its own re-read (after a reconnect or a lost `rev`) made the move.
+dynamic takes effect when the server's `tools/list` states it, and the tool
+list follows at its next rebuild, which the host asks for at once when its own
+re-read (after a reconnect or a lost `rev`) made the move. Until then the tool
+is called at either place, where the tool list shows it or where the server's
+latest list put it (RFC-014 §4.2: it keeps working where it was), and the agent
+is told where it went once that rebuild has published the list.
 A skipped rev re-reads `tools/list` and then `toolsets/list`, which the host
 also reads after every (re)connect, adopting what the server kept open and
 never re-opening anything.
@@ -494,7 +497,8 @@ stored `afterUser` injection (namespace `mcpl-toolsets`), at that agent's next
 start.
 
 A dynamic tool called by its prefixed name is refused, pointing at
-`toolsets--act`. Calls to an undeclared toolset's tools are refused while the
+`toolsets--act`, unless the tool list still offers it while a move waits for
+its rebuild. Calls to an undeclared toolset's tools are refused while the
 host has that group closed (RFC-014 §5.4). Projection and surface mode are not
 implemented: a `surface` server's static tools are listed like any server's.
 

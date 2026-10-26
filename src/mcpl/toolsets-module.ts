@@ -26,7 +26,7 @@ import type { EventResponse, Module, ModuleContext, ModuleContextInjection, Proc
 import type { ProcessEvent, ToolCall, ToolDefinition, ToolResult } from '../types/events.js';
 import { unknownToolMessage } from '../modules/unknown-tool.js';
 import { META_TOOL_NAMES, TOOLSETS_MODULE, type ToolsetController, type ToolsetHub } from './toolset-host.js';
-import { keyOf, type ChangeSet } from './tool-presence.js';
+import { keyOf, type ChangeSet, type ToolPresence } from './tool-presence.js';
 import { checkArgs, jsonText, renderToolDefinition, type HintedTool } from './tool-signature.js';
 import { McplRequestError } from './server-connection.js';
 
@@ -209,6 +209,14 @@ export type ActTarget = { ok: true; serverId: string; tool: string; instance?: s
  * several are open, a group the host has closed (RFC §5.4), and arguments
  * that don't fit the definition in force for that instance (RFC §6.1).
  */
+const hasInstances = (p: ToolPresence, ts: string | undefined): boolean => ts !== undefined && p.isDeclared(ts) && !!p.declared[ts]!.instances;
+
+/** The key whose definition act checks a call of `tool` against (RFC §6.1): an instance's own, else the toolset's, else the listed one. */
+function actKey(p: ToolPresence, tool: string, instance: string | undefined): string {
+  const ts = p.toolsetOf(tool);
+  return ts ? keyOf(ts, hasInstances(p, ts) ? instance : undefined) : keyOf('');
+}
+
 export function resolveAct(hub: ToolsetHub, input: unknown): ActTarget {
   try {
     const args = isObj(input) ? input : {};
@@ -217,13 +225,13 @@ export function resolveAct(hub: ToolsetHub, input: unknown): ActTarget {
     const c = owner(hub, args.server, (x) => !!x.presence.tool(tool), `a tool "${tool}"`);
     const p = c.presence;
     if (!p.tool(tool)) fail(`${c.serverId} has no tool "${tool}": ${META_TOOL_NAMES.look} {server:"${c.serverId}"} shows what's available`);
-    if (p.presenceOf(tool) === 'static') fail(`${tool} is not a dynamic tool: ${p.toolStatus(tool)}. Call it there.`);
+    if (!p.shownAs(tool, 'dynamic')) fail(`${tool} is not a dynamic tool: ${p.toolStatus(tool)}. Call it there.`);
     if (args.args !== undefined && !isObj(args.args)) fail('args must be an object of the tool\'s arguments');
     const callArgs = (args.args ?? {}) as Record<string, unknown>;
     let instance = str(args.instance);
     const ts = p.toolsetOf(tool);
     const declared = ts !== undefined && p.isDeclared(ts);
-    const withInstances = declared && !!p.declared[ts!]!.instances;
+    const withInstances = hasInstances(p, ts);
     if (withInstances && !instance) {
       // RFC §5.5: the instance rides in _meta; with exactly one open, it's that one.
       const open = p.openRecords(ts);
@@ -237,7 +245,7 @@ export function resolveAct(hub: ToolsetHub, input: unknown): ActTarget {
     // RFC §6.1: arguments are checked against the definition in force for
     // that instance: its own from hints (the legal moves of one game), else
     // the toolset's, else the listed one.
-    const key = ts ? keyOf(ts, withInstances ? instance : undefined) : keyOf('');
+    const key = actKey(p, tool, instance);
     const problem = checkArgs(p.defOf(key, tool).inputSchema, callArgs);
     if (problem) {
       fail(`Invalid arguments for ${tool} in ${p.label(key)}: ${problem}. Nothing was sent; ` +
@@ -475,7 +483,8 @@ export class ToolsetsModule implements Module {
     if (!p.tool(tool)) fail(`${c.serverId} has no tool "${tool}": ${META_TOOL_NAMES.look} {server:"${c.serverId}"} shows what's available`);
     const ts = p.toolsetOf(tool);
     const where = [...p.view().entries()].filter(([, e]) => e.tools.has(tool)).map(([k]) => k);
-    const key = instance && ts ? keyOf(ts, instance) : where[0];
+    // The definition act would check, wherever act would take the tool.
+    const key = !p.shownAs(tool, 'dynamic') ? undefined : instance && ts ? keyOf(ts, instance) : where[0] ?? actKey(p, tool, undefined);
     const def = key ? p.defOf(key, tool) : p.tool(tool)!;
     return textResult(`${renderToolDefinition(def)}\n${p.toolStatus(tool)}`);
   }
