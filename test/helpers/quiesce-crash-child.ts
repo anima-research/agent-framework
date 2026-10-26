@@ -37,8 +37,6 @@ if (!storePath || !MODES.includes(modeArg as Mode)) {
   process.exit(2);
 }
 const mode = modeArg as Mode;
-// Never hang the parent: an un-staged scenario is a failure, not a timeout.
-setTimeout(() => { console.error('quiesce-crash-child: exit point never reached'); process.exit(4); }, 30_000);
 
 class HangingStream implements YieldingStream {
   private pendingResolve: (() => void) | null = null;
@@ -131,7 +129,8 @@ if (mode === 'turn-start-ack') {
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
   framework.start();
   framework.nudgeAgent('agent', 'operator');
-  await new Promise(() => {});
+  await framework.runUntilIdle();
+  process.exit(4);
 }
 
 if (mode === 'redefer') {

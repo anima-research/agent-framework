@@ -113,9 +113,8 @@ const accelerationLimit = () => new MembraneError({
   rawError: { status: 429 },
 });
 
-/** A failure the default error policy retries at once. */
 const transientFailure = () => new MembraneError({
-  type: 'server', retryable: true, httpStatus: 500, retryAfterMs: 1,
+  type: 'server', retryable: true, httpStatus: 500,
   message: 'internal server error', rawError: { status: 500 },
 });
 
@@ -295,6 +294,21 @@ describe('silent heartbeat stored rows', () => {
       }
       assert.ok(!all.some((m) => JSON.stringify(m.content).includes(SILENT_HEARTBEAT_SEPARATOR)),
         'the separator is never stored as a row');
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it("stores a tick's changed context injection unstamped: history the resident saw, not the tick's speech", async () => {
+    const x = await make();
+    try {
+      let gathered = 0;
+      (x.mod as unknown as { gatherContext: () => Promise<unknown[]> }).gatherContext = async () =>
+        [{ namespace: 'lessons', position: 'afterUser', content: [{ type: 'text', text: `LESSON ${++gathered}` }] }];
+      await wake(x, ordinaryEvent('hello'), signed('sig-ordinary', 'ordinary reply'));
+      const before = stored(x.framework).length;
+      await wake(x, silentEvent(), TICK_TOOL_ROUND, TICK_TRAILING);
+      const injected = stored(x.framework).slice(before).filter((m) => m.metadata?.contextInjection);
+      assert.deepEqual(injected.map((m) => m.content), [[{ type: 'text', text: 'LESSON 2' }]], "the tick's start stored its changed injection");
+      assert.equal(injected[0]!.metadata?.silentHeartbeat, undefined, 'unstamped, so a retention policy for ticks leaves it');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
@@ -737,7 +751,50 @@ describe('replies to a [Continue] turn', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
-  it('a reply resumed after a provider cooldown follows the message that arrived during it, not [Continue]', async () => {
+  it("a restart that ends on the round's tool results and then a changed stored injection still reads its prompt", async () => {
+    const membrane = new QueuedStreamsMembrane();
+    const strategy = new OmitToolExchange();
+    strategy.omit = false;
+    const x = await make({ membrane, physicalWindowTokens: 200_000, deliver: false, agent: { strategy } });
+    try {
+      let gathered = 0;
+      (x.mod as unknown as { gatherContext: () => Promise<unknown[]> }).gatherContext = async () =>
+        [{ namespace: 'lessons', position: 'afterUser', content: [{ type: 'text', text: `LESSON ${++gathered}` }] }];
+      membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
+      await wake(x, ordinaryEvent('hello'));
+      membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], [createMockResponse(signed('sig-c2', 'all done'))]);
+      (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
+      await x.framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 3, 'first, the continued reply, its restart');
+      assert.equal(textOf(membrane.calls[2]!.messages.at(-1)!), `LESSON ${gathered}`, "the premise: the restart's request ends on a stored injection after the results");
+      const done = stored(x.framework).find((m) => m.content.some((b) => (b as { text?: string }).text === 'all done'))!;
+      assert.equal(done.metadata?.promptedBy?.text, '[Continue]', "the restart's reply follows the round's prompt");
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it("a restart that ends on the round's tool results and then an injection compile() places reads no prompt, as on main", async () => {
+    const membrane = new QueuedStreamsMembrane();
+    const strategy = new OmitToolExchange();
+    strategy.omit = false;
+    const x = await make({ membrane, physicalWindowTokens: 200_000, deliver: false, agent: { strategy } });
+    try {
+      (x.mod as unknown as { gatherContext: () => Promise<unknown[]> }).gatherContext = async () =>
+        [{ namespace: 'notes', position: 'afterUser', content: [{ type: 'text', text: 'PLACED NOTE' }], placedEachCompile: true }];
+      membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
+      await wake(x, ordinaryEvent('hello'));
+      membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], [createMockResponse(signed('sig-c2', 'all done'))]);
+      (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
+      await x.framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 3, 'first, the continued reply, its restart');
+      assert.equal(textOf(membrane.calls[2]!.messages.at(-1)!), 'PLACED NOTE', "the premise: the restart's request ends on the placed injection after the results");
+      const round = stored(x.framework).find((m) => m.content.some((b) => (b as { text?: string }).text === 'checking'))!;
+      assert.equal(round.metadata?.promptedBy?.text, '[Continue]', 'the premise: the round itself follows [Continue]');
+      const done = stored(x.framework).find((m) => m.content.some((b) => (b as { text?: string }).text === 'all done'))!;
+      assert.equal(done.metadata?.promptedBy, undefined, "a placed injection ends the tail, as on main, where every injection was placed");
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it("a reply resumed after a provider cooldown follows the message that arrived during it, not [Continue], and the message's wake then starts a turn of its own", async () => {
     // A reply to [Continue] stores a tool round and restarts at its boundary,
     // and the restart meets a 429 that holds the turn. A message arrives
     // during the cooldown, so the resumed compile ends on it, while the
@@ -756,28 +813,37 @@ describe('replies to a [Continue] turn', () => {
       membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
       await wake(x, ordinaryEvent('hello'));
       membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], accelerationLimit(),
-        [createMockResponse(signed('sig-r', 'resumed reply'))]);
+        [createMockResponse(signed('sig-r', 'resumed reply'))],
+        // The message's wake, which the cooldown held beside the restart,
+        // starts a turn of its own once the resumed turn ends.
+        [createMockResponse(signed('sig-w', 'wake reply'))]);
       (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
       await x.framework.runUntilIdle();
       assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is held');
       await wake(x, ordinaryEvent('arrived during the cooldown'));
       await waitFor(() => internal.providerAccelerationCooldowns.size === 0, 'the cooldown\'s release');
       await x.framework.runUntilIdle();
-      assert.equal(membrane.calls.length, 4, 'first, the continued reply, its held restart, the resumed attempt');
+      assert.equal(membrane.calls.length, 5, "first, the continued reply, its held restart, the resumed attempt, the message's wake's own turn");
 
       const resumed = membrane.calls[3]!.messages;
       assert.equal(textOf(resumed.at(-1)!), 'arrived during the cooldown');
       assert.ok(resumed.some((m) => textOf(m) === '[Continue]'), 'the round renders its [Continue]');
       assert.equal(rowWith(x.framework, 'resumed reply').metadata?.promptedBy, undefined);
+      // The message's wake starts its own turn after the resumed one, which
+      // already read the message: it has nothing new to read, so its request
+      // ends on [Continue].
+      assert.equal(textOf(membrane.calls[4]!.messages.at(-1)!), '[Continue]');
 
-      // Later, the window folds the round: no [Continue] is left to render.
+      // Later, the window folds the round, and the round's [Continue] with it.
       strategy.omit = true;
       membrane.queues.push([createMockResponse(signed('sig-later', 'later reply'))]);
       await wake(x, ordinaryEvent('later'));
-      const later = membrane.calls[4]!.messages;
+      const later = membrane.calls[5]!.messages;
       const replyAt = later.findIndex((m) => textOf(m) === 'resumed reply');
       assert.equal(textOf(later[replyAt - 1]!), 'arrived during the cooldown');
-      assert.ok(!later.some((m) => textOf(m) === '[Continue]'));
+      // The round's [Continue] went with the round. The one left is the wake's
+      // own turn's, before its reply.
+      assert.deepEqual(later.flatMap((m, i) => (textOf(m) === '[Continue]' ? [textOf(later[i + 1]!)] : [])), ['wake reply']);
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 

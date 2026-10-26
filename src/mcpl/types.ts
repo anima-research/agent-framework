@@ -193,6 +193,9 @@ export interface McplHostCapabilities {
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
+  /** RFC-014 §6.3: this host presents tool hints. Sent only to a server
+   *  whose config sets `toolHints: true`. */
+  toolHints?: boolean;
 }
 
 /** Channel capability leaves (§14.1). `observe` was the pre-0.5 name for
@@ -381,7 +384,9 @@ export interface McplServerConfig {
    *
    * `disabledCapabilities` takes precedence on conflict. `version` and
    * `featureSets` are not maskable here — feature sets have their own
-   * enable/disable knobs above.
+   * enable/disable knobs above — and neither are RFC-014's `toolHints`,
+   * `toolsets` and `surface`, which a server's own `toolHints` config turns
+   * off.
    */
   enabledCapabilities?: string[];
 
@@ -501,6 +506,20 @@ export interface McplServerConfig {
    * See src/mcpl/tool-lifecycle.ts.
    */
   toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
+
+  /**
+   * MCPL RFC-014 (tool presence, toolsets and surfaces). Default false: the
+   * host advertises nothing and treats every tool as static, byte for byte as
+   * before. When true, the host advertises `experimental.mcpl.toolHints`, and
+   * honours hints only from a server that advertised `toolHints` too. Then
+   * the server's static tools stay in the tool list as before, and its
+   * dynamic tools (toolset tools, `mcpl/presence: "dynamic"`) leave it: they
+   * are announced in the conversation as they become visible and invisible,
+   * and called through the `toolsets` module's `toolsets--act`, opened with
+   * `toolsets--open`, inspected with `toolsets--look` and closed with
+   * `toolsets--close`. Only `true` turns it on, and null counts as not set.
+   */
+  toolHints?: boolean;
 }
 
 // ============================================================================

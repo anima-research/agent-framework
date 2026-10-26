@@ -978,6 +978,7 @@ test("edit_many refuses a file whose stored copy is missing from the store, and 
   const { store, workspace, call, stored, file } = setup(t);
   await file('a.txt', 'alpha\n');
   await file('b.txt', 'beta\n');
+  assert.equal((await call('write', { path: 'work/b.txt', content: 'beta, a draft\n' })).success, true);
   const missing = store.treeGet(treeStateOf(workspace), 'b.txt')!.blobHash;
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
   const getBlob = store.getBlob;
@@ -988,7 +989,7 @@ test("edit_many refuses a file whose stored copy is missing from the store, and 
         { path: 'work/a.txt', oldString: 'alpha', newString: 'ALPHA' },
         { path: 'work/b.txt', oldString: 'beta', newString: 'BETA' },
       ],
-    })), 'The edit_many call stored none of its edits: 1 problem.\n\nedit 2: Blob not found for: work/b.txt');
+    })), "The edit_many call stored none of its edits: 1 problem.\n\nedit 2: The workspace's copy of work/b.txt is missing from the store, and disk's copy holds other contents, so it can't be restored, and edit 2 changed nothing. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
   } finally {
     delete s.getBlob;
   }

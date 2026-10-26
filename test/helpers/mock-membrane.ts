@@ -23,8 +23,8 @@ export function createMockResponse(
     .join('');
 
   const toolCalls = content
-    .filter((b): b is ContentBlock & { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> } => b.type === 'tool_use')
-    .map((b) => ({ id: b.id, name: b.name, input: b.input }));
+    .filter((b): b is ContentBlock & { type: 'tool_use'; id: string; name: string; input: Record<string, unknown>; unparseableInput?: string } => b.type === 'tool_use')
+    .map((b) => ({ id: b.id, name: b.name, input: b.input, ...(b.unparseableInput !== undefined ? { unparseableInput: b.unparseableInput } : {}) }));
 
   return {
     content,
@@ -110,6 +110,7 @@ export class MockYieldingStream implements YieldingStream {
           id: tc.id,
           name: tc.name,
           input: tc.input as Record<string, unknown>,
+          ...(tc.unparseableInput !== undefined ? { unparseableInput: tc.unparseableInput } : {}),
         })),
         context: {
           rawText: '',

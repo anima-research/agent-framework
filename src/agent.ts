@@ -9,6 +9,8 @@ import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './
 import { carriedBlock, type SentRow } from './sent-rows.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { scanFromTail } from './stored-removal.js';
+import { stableHash } from './stable-hash.js';
+import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   SYSTEM_CHANGE_PARTICIPANT,
@@ -18,7 +20,6 @@ import {
   changeWriteCheck,
   type TailRow,
   isSystemChangeMessage,
-  lastConversational,
   memoryHeadDeclarations,
   ownSystemChanges,
   systemChangeMetadata,
@@ -55,6 +56,13 @@ export interface ActivationRequestOptions {
   /** A request that will never be sent (a preview): compile it as a dry
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
+  /** Messages added to the compile's: a preview's stand-in for the context
+   *  injections a start would store before its compile
+   *  (stored-injections.ts), put where that compile would render them, as
+   *  the window's newest rows. A preview stores nothing, so the compile
+   *  doesn't weigh them against the budget or shape them as it would the
+   *  stored rows. */
+  appendedMessages?: NormalizedMessage[];
   /** `false`: the caller retries this stream's failures itself, so membrane
    *  sends a failed round once and hands the error up. The framework's turns
    *  pass it (its errorPolicy is their retry layer); a direct caller of
@@ -94,7 +102,8 @@ export interface StartStreamResult {
   request: NormalizedRequest;
   /** The request-only `[Continue]` prompt this request's reply follows, if
    *  any, read from the request: a new one when it ends on `[Continue]`;
-   *  else, when it ends on tool results, the prompt of the reply that called
+   *  else, when it ends on tool results, or on tool results and then
+   *  stored context injections alone, the prompt of the reply that called
    *  those tools (`toolLoopPrompt`); else none. The framework stamps the
    *  reply's rows with it (`metadata.promptedBy`), for later compiles to
    *  render it before them. */
@@ -144,16 +153,16 @@ import type {
   AgentRuntimeSettingsOverrides,
 } from './types/index.js';
 
-function stableHash(value: unknown): string {
-  const encode = (item: unknown): string => {
-    if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`;
-    if (item && typeof item === 'object') {
-      const record = item as Record<string, unknown>;
-      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${encode(record[key])}`).join(',')}}`;
-    }
-    return JSON.stringify(item) ?? 'null';
-  };
-  return createHash('sha256').update(encode(value)).digest('hex');
+
+/**
+ * Whether a request's messages, as sanitized, end on `agentName`'s own
+ * message, apart from `contextTail` stored context injections and system
+ * changes after it (counted over the messages the sanitizer keeps).
+ */
+function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, contextTail: number): boolean {
+  const own = messages[messages.length - 1 - contextTail];
+  return own !== undefined && own.participant === agentName
+    && messages.slice(messages.length - contextTail).every((m) => m.participant.startsWith('system_context:') || isSystemChangeMessage(m));
 }
 
 /** kv-unified's hash of a request's immutable prefix: its head's tools as
@@ -301,6 +310,11 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
     );
   }
   return { maxConsecutive: max };
+}
+
+/** A branch's key in Agent.unsentSince: its id and when it was created. */
+function branchKey(branch: { readonly id: string; readonly created: number }): string {
+  return `${branch.id}\u0000${branch.created}`;
 }
 
 /**
@@ -1332,6 +1346,202 @@ export class Agent {
   }
 
   /**
+   * The stored context injections of this agent's that the last compile it
+   * built to send rendered (stored-injections.ts), the framework's activation
+   * request's or the direct API's: for each namespace and content, the parts
+   * the compile held, and the branch it read. A compile built to send whose
+   * request then isn't sent (a stop, a failure) still records: its rows stay
+   * in the window all the same. Undefined before the first, as after a
+   * restart. The framework's same-content skip reads it (renderedInjection).
+   */
+  private renderedInjections?: {
+    branch: { readonly id: string; readonly created: number };
+    /** Per namespace, per content hash: the parts any copy of that content
+     *  holds, how many it has, and its newest copy's sequence. */
+    byNamespace: Map<string, Map<string, { parts: number; held: Set<number>; sequence: number }>>;
+  };
+
+  /**
+   * Per branch (by id and created), the point a stored injection on it has
+   * to come after to have been in no request yet (unsentInjection): the
+   * newest row of this agent's window on that branch when the first plan
+   * there since its last compile built to send (a start's, or a preview's,
+   * which stores nothing) asked about a unit, before that plan's start
+   * stored anything. Each compile built to send that records what it
+   * held unsets its branch's, a restart unsets them all, and a plan asks
+   * here before it stores a unit, so every one of this agent's stored
+   * injections on a branch after its point was stored since that compile.
+   * Kept per branch, so a start or preview on another branch doesn't move
+   * this one's past a copy no request has had.
+   */
+  private readonly unsentSince = new Map<string, number>();
+
+  /**
+   * A host's hook, called with the messages of each compile built to send
+   * (never a dry run), as the compile is recorded: what the request carries,
+   * after compression and the window have done their work. The framework
+   * uses it to tell when an MCPL toolset's announcement has left the context
+   * (RFC-014 §8.3 reminders). It must not change the messages; one that
+   * throws is logged, and the start goes on.
+   */
+  onCompiledToSend?: (messages: readonly unknown[]) => void;
+
+  /**
+   * The newest content of `namespace` among this agent's rows stored since
+   * its last compile built to send (unsentSince), and whether every part of
+   * it is among them: rows a start stored whose compile then didn't record
+   * (it threw, or the start failed before it), which no request has had
+   * yet, and which are newer than anything renderedInjection knows. Undefined when there are none, as at every
+   * start whose last compile was built and recorded. A fold between that
+   * start and the next (a host's own committing compile, or the compression
+   * an over-budget retry waits for) can summarize them all the same: the
+   * next request then has the summary's word for them, and the start after
+   * it stores them again, as after any fold. The window is read back 64
+   * rows at a time from the newest, stopping at that point.
+   */
+  unsentInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
+    let newest: { contentHash: string; parts: number; held: Set<number> } | undefined;
+    try {
+      const branch = branchKey(this.contextManager.currentBranchRef());
+      const since = this.unsentSince.get(branch);
+      if (since === undefined) {
+        const count = this.contextManager.getMessageCount();
+        const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
+        this.unsentSince.set(branch, top);
+        return undefined;
+      }
+      scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
+        const span = Math.min(end, 64);
+        const { messages } = this.contextManager.getMessageWindow(end - span, span, { resolveBlobs: false });
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const row = messages[i]!;
+          if (row.sequence <= since) break scan;
+          const mark = storedInjectionMarkOf(row.metadata);
+          if (mark?.agent !== this.name || mark.namespace !== namespace) continue;
+          // Read from the newest back, the first copy met is the newest
+          // content; its other parts pool with it.
+          newest ??= { contentHash: mark.contentHash, parts: mark.parts, held: new Set() };
+          if (mark.contentHash === newest.contentHash) newest.held.add(mark.part);
+        }
+        end -= span;
+      }
+    } catch (err) {
+      // Where the rows read before the failure held a copy, the newest of
+      // them is still the newest content (any unread row is older), and a
+      // part it lacks may be unread, so it's stored again at worst. Where
+      // they held none, the last request's record decides, as it did before
+      // this check: a copy a failed start stored is then stored again, or,
+      // where the source has changed back to what that request held, left
+      // newest for one more request. Either way the start goes on, where
+      // failing here would lose its turn.
+      console.error(`[injection] ${this.name}: could not read its window for copies stored since its last request, so ${newest ? 'the rows it read decide' : "that request's record decides"}:`, err);
+      if (!newest) return undefined;
+    }
+    return newest && { contentHash: newest.contentHash, whole: newest.held.size === newest.parts };
+  }
+
+  /** Record which of this agent's stored injections a compile built to send
+   *  rendered. Another agent's stored rows never reach this agent's compile,
+   *  since every compile of a shared store leaves them out by its view
+   *  filter (isAnotherAgentsInjection): a compile of a shared store without
+   *  that filter would mix them in here. */
+  private noteRenderedInjections(result: CompileResult): void {
+    // The host's look at what this request carries (onCompiledToSend).
+    if (this.onCompiledToSend) {
+      try {
+        this.onCompiledToSend(result.messages);
+      } catch (err) {
+        console.error(`[agent] ${this.name}: the host's compile observer failed:`, err);
+      }
+    }
+    const provenance = result.provenance;
+    // The rows stored before this compile on its branch have been compiled
+    // to send, whether the request held them or a fold or the strategy's
+    // window took them (the record below says which): the first plan there
+    // after it, a start's or a preview's, sets the point again
+    // (unsentInjection). Without provenance, which branch isn't known, so
+    // every branch's point goes, rather than one surviving a compile that
+    // held its rows.
+    if (provenance) this.unsentSince.delete(branchKey(provenance.branch));
+    else this.unsentSince.clear();
+    if (!provenance) {
+      this.renderedInjections = undefined;
+      return;
+    }
+    const byNamespace = new Map<string, Map<string, { parts: number; held: Set<number>; sequence: number }>>();
+    for (const [i, source] of provenance.messages.entries()) {
+      // Only a message rendered as an injection's participant can be one, so
+      // the store is read for those alone.
+      if (source.kind !== 'raw' || !result.messages[i]?.participant.startsWith('system_context:')) continue;
+      for (const body of source.bodies) {
+        const mark = this.storedMarkOf(body.messageId);
+        if (!mark) continue;
+        // A part counts as held when all its shards are there. One the
+        // strategy altered (cut at its per-message cap, an image stripped)
+        // counts too: a new copy would meet the same, so storing again
+        // would only add copies, every start. A part missing shards still
+        // says which content is newest.
+        const held = body.complete || (body.missing !== undefined && !body.missing.includes('shards'));
+        const contents = byNamespace.get(mark.namespace) ?? new Map();
+        byNamespace.set(mark.namespace, contents);
+        // Copies of the same content in view pool what they hold: the agent
+        // has each part that one of them holds.
+        const known = contents.get(mark.contentHash) ?? { parts: mark.parts, held: new Set<number>(), sequence: body.sequence };
+        if (held) known.held.add(mark.part);
+        known.sequence = Math.max(known.sequence, body.sequence);
+        contents.set(mark.contentHash, known);
+      }
+    }
+    this.renderedInjections = { branch: provenance.branch, byNamespace };
+  }
+
+  /**
+   * The newest content of `namespace` among this agent's stored injections
+   * that the last compile built to send rendered, by its newest copy: its
+   * content hash, and whether every part of that content was there in some
+   * copy, every shard, however the strategy shaped it. Undefined when none
+   * was, when this agent hasn't built a request since it started, or when
+   * the window's branch has changed since.
+   */
+  renderedInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
+    const rendered = this.renderedInjections;
+    const branch = this.contextManager.currentBranchRef();
+    if (!rendered || rendered.branch.id !== branch.id || rendered.branch.created !== branch.created) return undefined;
+    let newest: [string, { parts: number; held: Set<number>; sequence: number }] | undefined;
+    for (const entry of rendered.byNamespace.get(namespace) ?? []) {
+      if (!newest || entry[1].sequence > newest[1].sequence) newest = entry;
+    }
+    return newest ? { contentHash: newest[0], whole: newest[1].held.size === newest[1].parts } : undefined;
+  }
+
+  /**
+   * Whether compiled message `i` of `result` is a row of this agent's stored
+   * context injections (stored-injections.ts): rendered as an injection's
+   * participant, and each of its stored rows, by the compile's provenance,
+   * carrying this agent's mark. A speaker merely named like an injection's
+   * participant isn't one. Only such a message's rows are read, so a start
+   * reads the store for those alone.
+   */
+  private isStoredInjectionRow(result: CompileResult, i: number): boolean {
+    const source = result.provenance?.messages[i];
+    return source?.kind === 'raw' && source.bodies.length > 0
+      && !!result.messages[i]?.participant.startsWith('system_context:')
+      && source.bodies.every((b) => this.storedMarkOf(b.messageId)?.agent === this.name);
+  }
+
+  /** A stored row's injection mark, or undefined for any other row, and for
+   *  one the store can't read just now, which is logged: a start doesn't fail
+   *  on it (the row then counts as no stored injection). */
+  private storedMarkOf(id: MessageId): ReturnType<typeof storedInjectionMarkOf> {
+    try {
+      return storedInjectionMarkOf(this.contextManager.getMessage(id)?.metadata);
+    } catch (err) {
+      console.error(`[injection] ${this.name}: could not read stored row ${id}, so it counts as no stored injection:`, err);
+      return undefined;
+    }
+  }
+
+  /**
    * Compile the context with injections (e.g. from MCPL servers), which the
    * context manager merges into the compiled messages. Without
    * `opts.dryRun` it commits as `compileContext` does: the consumed
@@ -1458,6 +1668,8 @@ export class Agent {
     const assemble = async (): Promise<NormalizedRequest> => {
       const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
+      // What it holds of the stored injections is what the agent last saw.
+      this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
       // The direct API declares on the head, with the caller's tools, so the
@@ -1666,8 +1878,11 @@ export class Agent {
       options.dryRun === true,
       compile,
     );
-    let { messages } = settled.compiled;
-    const { renderStats } = settled.compiled;
+    const compiledResult = settled.compiled;
+    let { messages } = compiledResult;
+    // It counts what the compile selected, so a preview's stand-ins
+    // (appendedMessages, below) aren't in it.
+    const { renderStats } = compiledResult;
     // What the request is built from, as the compile returned it: a block the provider drops is found again in
     // it, through the copies below, by its signature (placeThinkingDrops).
     const recordedAfter = settled.compiled.thinkingRecordedAfter;
@@ -1676,6 +1891,44 @@ export class Agent {
       ...(settled.compiled.provenance ? { provenance: settled.compiled.provenance } : {}),
       ...(recordedAfter !== undefined ? { recordedAfter } : {}),
     };
+    // Each message's place in the compile, or a preview's stand-in (null),
+    // for the count of stored rows the request ends on, below.
+    let origin: Array<number | null> = messages.map((_, i) => i);
+    // A request that's sent says which stored injections the agent now has in
+    // view, which the next start's same-content skip reads (stored-injections.ts).
+    if (!options.dryRun) this.noteRenderedInjections(compiledResult);
+    const appended = options.appendedMessages ?? [];
+    if (appended.length > 0) {
+      // Where a start's compile would render them, as the window's newest
+      // rows: last, unless the window has no user message, where the compile
+      // places the injections it's given at the end, after the window.
+      const sources = compiledResult.provenance?.messages;
+      let at = messages.length;
+      if (sources && !messages.some((m, i) => sources[i]?.kind !== 'injection' && m.participant.toLowerCase() === 'user')) {
+        while (at > 0 && sources[at - 1]?.kind === 'injection') at--;
+      }
+      origin = [...origin.slice(0, at), ...appended.map(() => null), ...origin.slice(at)];
+      messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
+    }
+    // The stored context injections and system changes the request ends on,
+    // in either order, counted over the messages the sanitizer below keeps
+    // (hasRenderedContent), since it drops a message it leaves empty, a placed
+    // blank injection among them. A change counts only under 'entries', since
+    // on the head they're left out below. [Continue] goes after them, and a
+    // tool loop's prompt is read from before them: they're context, not what
+    // woke the agent. An injection compile() places ends the tail, as on main,
+    // where every one was placed.
+    let contextTail = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (!hasRenderedContent(messages[i]!.content)) continue;
+      if (isSystemChangeMessage(messages[i]!)) {
+        if (entries) contextTail++;
+        continue;
+      }
+      const from = origin[i] ?? null;
+      if (from !== null && !this.isStoredInjectionRow(compiledResult, from)) break;
+      contextTail++;
+    }
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -1699,7 +1952,10 @@ export class Agent {
     // its tools and system text are already current. Under 'entries', the
     // change this assembly declares follows the compiled ones.
     if (!entries) messages = messages.filter((m) => !isSystemChangeMessage(m));
-    if (settled.declared) messages = [...messages, settled.declared];
+    if (settled.declared) {
+      messages = [...messages, settled.declared];
+      contextTail++;
+    }
 
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first
@@ -1722,25 +1978,32 @@ export class Agent {
 
     // The [Continue] prompt this request's reply follows, read from the
     // request itself: a new one when it ends on [Continue]; else, when it
-    // ends on tool results, the prompt of the reply that called those tools,
-    // whose tool loop this reply continues; else none. A request that ends
+    // ends on tool results (apart from stored context injections after
+    // them), the prompt of the reply that called those tools, whose tool
+    // loop this reply continues; else none. A request that ends
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
     // A system change isn't a turn: the request ends on what came before it,
     // and membrane places the change after the next user turn, which is the
     // [Continue] row when the agent's own turn is last.
     let continuePrompt: RequestOnlyPrompt | undefined;
-    const last = lastConversational(messages);
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
-    } else if (last?.participant === this.name) {
+    } else if (endsOnOwnMessage(messages, this.name, contextTail)) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
+      // Where stored context injections follow the agent's message, as a
+      // changed one does on a wake with nothing new, [Continue] goes after
+      // them, so the cue stays last: the block isn't taken for what woke
+      // the agent. Its reply's promptedBy puts it there in later compiles too,
+      // where they can recognise the reply (renderRequestOnlyRows).
       messages = [...messages, continueTurn()];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
     } else {
-      continuePrompt = toolLoopPrompt(last, index);
+      // What the request ends on apart from the stored injections and system
+      // changes after it, which aren't something the reply answers.
+      continuePrompt = toolLoopPrompt(messages.at(-1 - contextTail), index);
     }
 
     const request: NormalizedRequest = {
@@ -1930,10 +2193,10 @@ export class Agent {
     // ran. The stream driver collects it on that stream's terminal event, or
     // at the loop's end when the iterator closed without one, while the
     // stream still owns the agent. This clear is for the records no driver
-    // collects: a dropped turn's, whose stream no driver iterates; one whose
-    // stream's terminal came after another stream took the agent; or a
-    // cancel after the stream's complete event. A fresh stream must not
-    // inherit one and read its own later error as a deliberate stop.
+    // collects: a cancel of a stream no driver iterates; one whose stream's
+    // terminal came after another stream took the agent; or a cancel after
+    // the stream's complete event. A fresh stream must not inherit one and
+    // read its own later error as a deliberate stop.
     this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
@@ -2127,12 +2390,24 @@ export class Agent {
    * one is still ahead; otherwise the next start drops it. `reason` is
    * provenance for the framework's inference:aborted trace and marker
    * metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never reaches
-   * the provider.
+   * the provider. When the stream's cancel() throws, the throw goes on to
+   * the caller, and the agent still holds the stream, its cancel record as
+   * it was before the call.
    */
   cancelStream(reason?: string): void {
     if ('stream' in this._state && this._state.stream) {
+      // A cancel that throws leaves the stream going and the agent holding
+      // it, so this call's record is taken back, leaving any earlier one: a
+      // later end of that stream, an `error` the provider reports included,
+      // is not read as this stop's.
+      const earlier = this._pendingCancel;
       this._pendingCancel = { reason };
-      this._state.stream.cancel();
+      try {
+        this._state.stream.cancel();
+      } catch (error) {
+        this._pendingCancel = earlier;
+        throw error;
+      }
     } else {
       this._stopWithoutStream = { reason };
     }
@@ -2542,6 +2817,7 @@ export class Agent {
           id: block.id,
           name: block.name,
           input: block.input,
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'text') {
         speechContent.push(block);

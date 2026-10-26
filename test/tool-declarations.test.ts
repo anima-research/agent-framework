@@ -42,7 +42,7 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
         messages: rows.map((r) => ({ participant: r.participant, content: r.content })),
         systemInjections: (injections ?? []).filter((i) => i.position === 'system').flatMap((i) => i.content),
         // Each message a raw copy of its row, which the compile read with its metadata.
-        provenance: { messages: rows.map((r, sequence) => ({ kind: 'raw', bodies: [{ messageId: r.id, sequence, complete: true }] })) },
+        provenance: { messages: rows.map((r, sequence) => ({ kind: 'raw', bodies: [{ messageId: r.id, sequence, complete: true }] })), branch: { id: 'main', created: 0 } },
         rawBodies: new Map(rows.map((r) => [r.id, [{ ...r }]])),
       };
       if (!opts.firstChanged || o?.dryRun) return result;

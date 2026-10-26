@@ -71,7 +71,9 @@ function convertContent(content: string | McplContentBlock[], serverId: string):
 
 /**
  * Convert an MCPL wire-format context injection, from the server `serverId`,
- * to a context-manager ContextInjection.
+ * to a context-manager ContextInjection. It builds only these four fields,
+ * so a server can't opt an injection out of being stored
+ * (ModuleContextInjection.placedEachCompile, which only a module may set).
  */
 function convertMcplInjection(mcplInj: McplContextInjection, serverId: string): ContextInjection {
   return {

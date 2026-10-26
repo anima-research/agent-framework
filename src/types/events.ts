@@ -270,6 +270,13 @@ export interface ToolCall {
   name: string;
   /** Tool input */
   input: unknown;
+  /**
+   * membrane's marker (ToolUseContent.unparseableInput), present when `input`
+   * isn't the model's arguments. The framework refuses such a call without
+   * running it, except one whose text is JSON `null`, which runs as a call
+   * with no arguments.
+   */
+  unparseableInput?: string;
   /** The agent that made this tool call. Set by the framework dispatch layer. */
   callerAgentName?: string;
   /**
