@@ -281,8 +281,6 @@ const isSilencingTool = (name: string): boolean => {
  *  send, though inspecting drafts is not). */
 const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
   if (isSilencingTool(call.name)) return true;
-  // The framework's own tool, by the exact name it's dispatched under: a
-  // module's or server's `<prefix>--drafts` is another tool.
   return call.name === 'drafts'
     && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
 };
@@ -314,12 +312,9 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
  * Whether a call of one of these tools can change a round's routing
  * (routeRound): in locus and hybrid mode a silencing or world-publication
  * tool, or `drafts`, whose resend is an explicit send (isSilencingCall); in
- * explicit mode, where sends don't silence, only `skip_reply`, which keeps
- * the round private; in any of them `drafts`, whose round holds with no
- * notice what it would hold or bounce for lack of a destination, whatever the
- * action (#701), and
- * `think` under the private same-round policy, which holds the round back.
- * Disabled mode routes nothing.
+ * explicit mode, where sends don't silence, `skip_reply`, which keeps the
+ * round private, and `drafts`; in either, `think` under the private same-round
+ * policy, which holds the round back. Disabled mode routes nothing.
  */
 const changesRouting = (
   named: ReadonlySet<string>,
@@ -348,10 +343,10 @@ const ROUTING_TOOL_NAMED = new RegExp(
  * so `tools.say(...)`, `tools["say"]` and a prefixed `tools["chat--say"]`
  * all name `say`, and `say_hello` doesn't. A coarse reading of what a script
  * may call (AgentFramework.scriptMayRoute): a comment or a string that
- * mentions a tool names it too, and `drafts` counts whatever the action its
- * call asks, since any drafts call changes how its round holds (#701). A
- * tool the code doesn't spell out goes unseen: a name it builds at runtime or
- * spells with escapes, or one it picks by enumerating ALL_TOOLS or `tools`.
+ * mentions a tool names it too, and `drafts` holds whatever the action its
+ * call asks. A tool the code doesn't spell out goes unseen: a name it builds
+ * at runtime or spells with escapes, or one it picks by enumerating ALL_TOOLS
+ * or `tools`.
  */
 const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUTING_TOOL_NAMED) ?? []);
 
@@ -1280,7 +1275,7 @@ interface TurnRouting {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or that a round calling `drafts` would have held because a send silenced the turn (#701): counted, never drafted. */
+  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts` after a send: counted, never drafted. */
   keptPrivate: number;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
@@ -1354,12 +1349,7 @@ type SpeechPublished = (to: PublishDestination, text: string, messageId: string 
  * boundary on a stream that presents injected messages ('now'), or not at all
  * ('later'), which leaves the drafts to be named as holdProseDrafts says.
  * `keepPrivate` is a skip_reply round: its envelopes all stay in the context,
- * and none is sent, bounced or held. `draftsRound` is a round that calls
- * `drafts` (#701): what it would hold or bounce for lack of a destination is
- * held as a draft with no notice mid-turn ('later'), so nothing is offered now
- * for the next round to resend, and in a turn a send silenced, its plain
- * speech is kept in the context, counted (holdSilencedProse); everything else
- * is delivered, or bounced on a failure, as usual.
+ * and none is sent, bounced or held.
  */
 interface ProseRound {
   /** The routing state of the turn that queued the round. */
@@ -1382,7 +1372,6 @@ interface RoundCall {
   name: string;
   cause: 'send' | 'private' | null;
   refused: boolean;
-  /** Whether the call was dispatched: neither the agent's allowedTools nor the bridge refused it. */
   permitted: boolean;
 }
 
@@ -15834,9 +15823,8 @@ export class AgentFramework {
 
   /**
    * Silenced plain speech: an explicit send holds it as resendable drafts (in
-   * a round that calls `drafts`, 'drafts' (#701), its plain speech is kept
-   * and counted instead, and what a hybrid envelope addressed is held with no
-   * notice mid-turn, while the envelopes still move the router as below); a
+   * a round that calls `drafts`, 'drafts', its plain speech is kept and
+   * counted instead); a
    * deliberate silence (skip_reply, a silent turn, or a private think in
    * the same native round, where that policy applies: an XML-mode round has
    * no verbatim content to route live, so its prose is routed at the turn's
@@ -15884,8 +15872,6 @@ export class AgentFramework {
     // re-bounce rule, unsentWords), not its routing syntax, and the
     // destination the resident wrote stays with it as a note.
     let privateCount = 0;
-    // `deliberate`: a part an envelope addressed, a refused target's or a
-    // malformed one's included, as against plain speech.
     const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean }> = [];
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
@@ -15934,13 +15920,6 @@ export class AgentFramework {
     }
     routing.keptPrivate += privateCount;
     if (cause === 'drafts') {
-      // A round that calls `drafts` (#701): its envelopes have moved the
-      // router as above. Its plain speech is kept and counted, not held, so
-      // the narration an agent writes beside each call isn't offered back to
-      // it for resend. What an envelope addressed, a refused or malformed one
-      // included, is held as a draft as any silenced round's is, but with no
-      // notice mid-turn: resendable by id and named in the turn's receipt,
-      // with nothing offered now for the next round to resend.
       routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
       this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later' });
     } else {
@@ -18217,9 +18196,6 @@ export class AgentFramework {
       }
       const sticky = routing.pin;
       if (routing.hybridHold === 'failed' || (!allowLocus && !sticky)) {
-        // Beside a `drafts` call (#701), what has no destination is held as
-        // a draft with no notice mid-turn, so nothing is offered now for the
-        // next round to resend.
         this.holdProseDrafts(agent, [envelope], 'no-destination', round.draftsRound ? { ...round, notice: 'later' } : round);
         continue;
       }
@@ -18322,10 +18298,7 @@ export class AgentFramework {
       if ('error' in res) {
         // A target refused for speech drops the pin, which later text
         // follows: the text after the target was meant for that channel, not
-        // the earlier one, so it bounces too. (The refused target itself
-        // bounces in a round that calls `drafts` as well; the unprefixed text
-        // after it, left with no destination, is then held with no notice:
-        // #701.)
+        // the earlier one, so it bounces too.
         if (res.refusedChannelId) delete routing.pin;
         this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', round);
         return;
@@ -18338,11 +18311,6 @@ export class AgentFramework {
       const sticky = routing.pin;
       if (!sticky) {
         if (round.draftsRound) {
-          // Beside a `drafts` call (#701): held as a draft, not bounced, so
-          // there's no notice or wake offering it for resend now; a later
-          // listing shows it, and the next turn's catch-up names it. Its
-          // words are held as a bounce holds them (unsentWords): a bare
-          // `{{unsent}}` is the latest bounce itself, already held.
           console.error(`[prose] ${name}: unprefixed — ${rawText.length} chars held with no notice (a drafts round, no destination)`);
           const words = this.unsentWords(agent, rawText);
           if (!('draft' in words)) {
@@ -18352,11 +18320,6 @@ export class AgentFramework {
               'no-destination',
               { ...round, notice: 'later' },
             );
-            // Explicit mode writes no receipt to report a hold the journal
-            // refused, so it bounces as without a drafts call. If the
-            // bounce's own hold fails too, its notice says the words couldn't
-            // be held, and there's no draft to offer; if that hold succeeds,
-            // it's an ordinary bounce, which the bounce-wake cap bounds.
             if (held.length === 0 && words.text.trim().length > 0) {
               this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round);
             }
@@ -20096,8 +20059,7 @@ export class AgentFramework {
     // clears it, because the following prose is a reply to a new message.
     // Why it is silenced decides what happens to the held words: an explicit
     // send ('send') holds them as resendable drafts, except in a round that
-    // calls `drafts`, which keeps its plain speech and holds what its
-    // envelopes addressed with no notice (#701); a deliberate silence
+    // calls `drafts`, which keeps its plain speech; a deliberate silence
     // ('private': skip_reply, a silent control-plane turn) keeps them private.
     let silenceCause: 'send' | 'private' | null = trigger?.suppressProse === true
       ? 'private'
@@ -20561,24 +20523,7 @@ export class AgentFramework {
                 turnSilenced = true;
                 silenceCause = roundCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
               }
-              // In a round that calls `drafts`, with any action, what would be
-              // held or bounced for lack of a destination is held with no
-              // notice mid-turn, and in a silenced turn the round's plain
-              // speech stays in the context, counted, while what its
-              // envelopes addressed is held with no notice (#701). Offered
-              // mid-turn, such a line would be resent, and a resident that
-              // narrates each call would resend its narration round after
-              // round. What the round would deliver is delivered, and outside
-              // a silenced turn a refused target, a malformed envelope or a
-              // failed delivery still bounces, as each answers a deliberate
-              // send. XML tool mode routes a turn's prose once, at its end,
-              // with no notice mid-turn, so the loop can't form inside a turn
-              // there (across turns, explicit mode's bounce-wake cap bounds
-              // it), and its rounds are routed as before.
-              // A refused drafts call manages nothing, so it counts for
-              // nothing here either, as a refused send doesn't: its agent may
-              // have no other way back to its words than the bounce.
-              const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts');
+              const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
@@ -20608,9 +20553,7 @@ export class AgentFramework {
                 // envelopes all stay in the context (deliverProseEnvelope's
                 // keepPrivate), as the tool promises, and skip_reply then
                 // ends the turn at this round's tool results, unless it was
-                // refused, when the turn goes on to its next round. In a
-                // round that calls `drafts`, an envelope with no destination
-                // is held with no notice rather than bouncing (#701).
+                // refused, when the turn goes on to its next round.
                 if (!hasSameRoundPrivateThink) {
                   const keepPrivate = toolNames.some((n) => bareToolName(n) === 'skip_reply');
                   console.error(
@@ -20626,8 +20569,7 @@ export class AgentFramework {
                 );
                 // Never a silent black hole (n=8: the flying-scene reply):
                 // held as drafts the resident can resend, and named. A drafts
-                // round's is kept and counted instead, since locus speech has
-                // no envelopes (#701).
+                // round's is kept and counted instead.
                 this.holdSilencedProse(agent, roundRuns, draftsRound && silenceCause !== 'private' ? 'drafts' : silenceCause, hasSameRoundPrivateThink, holdOpts);
               } else if (hasSameRoundPrivateThink) {
                 console.error(

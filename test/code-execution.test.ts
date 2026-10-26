@@ -1208,9 +1208,6 @@ describe('a round whose run or wait call watches a script that can change its ro
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
     if (options.serveWakes) {
-      // A wake the test did not script (a bounce wake, say) gets an empty
-      // completion, so a regression fails the test's asserts instead of
-      // leaving its run waiting on a stream with no events.
       const streamYielding = membrane.streamYielding.bind(membrane);
       (membrane as unknown as { streamYielding: typeof streamYielding }).streamYielding = (request, opts) => {
         const internals = membrane as unknown as { responses: unknown[]; responseIndex: number };
@@ -1560,12 +1557,10 @@ describe('a round whose run or wait call watches a script that can change its ro
     } finally { await h.done(); }
   });
 
-  // A drafts resend is an explicit send, so it silences the turn's later
-  // rounds as send_message does: called from the round's script too. Its own
-  // round's prose, which the resend silences, is kept rather than held, as a
-  // drafts round's is (#701). This one
-  // names a draft there isn't, so it's refused and sends nothing, as a direct
-  // one would be, and still counts, as a direct one does.
+  // A drafts resend is an explicit send, so it silences its round as
+  // send_message does: called from the round's script too. This one names a
+  // draft there isn't, so it's refused and sends nothing, as a direct one
+  // would be, and still counts, as a direct one does.
   for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a drafts resend inside the script keeps its round's prose private and holds the turn's later prose as drafts`, async () => {
     const h = await scriptRound(mode, [
       createMockResponse([

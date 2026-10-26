@@ -1205,15 +1205,10 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  // #701: a resident that writes one line beside each call. Each of these
-  // rounds names the newest open draft a notice in its context has offered
-  // when it runs, as a resident answering the round's notice would, and ends
-  // the turn once none is open. A draft held with no notice isn't offered.
   const resendWhileOffered = (h: Awaited<ReturnType<typeof harness>>, line: string, callId: string) =>
     whileOffered(h, (id) => [text(line), drafts(callId, { action: 'resend', draftIds: [id], destination: ROOM })]);
   const dismissWhileOffered = (h: Awaited<ReturnType<typeof harness>>, line: string, callId: string) =>
     whileOffered(h, (id) => [text(line), drafts(callId, { action: 'dismiss', draftIds: [id] })]);
-  /** The ids of drafts a notice in the agent's context offered (a held-draft or bounce notice), in order. */
   const offeredIds = (h: Awaited<ReturnType<typeof harness>>): string[] => h.messages()
     .flatMap((m) => ((m.metadata as { draftIds?: string[] } | undefined)?.draftIds ?? []));
   function whileOffered(h: Awaited<ReturnType<typeof harness>>, blocks: (id: string) => ContentBlock[]) {
@@ -1244,11 +1239,6 @@ describe('held prose drafts, end to end', () => {
         assert.equal(draftsCalls.length, 1, 'one resend round: nothing new was offered after it');
         const receipt = h.texts().find((t) => t.startsWith('[delivered]'));
         if (mode === 'explicit') {
-          // Explicit mode's sends don't silence the turn, so the line has no
-          // destination: it's held, with no notice offering it, so nothing
-          // asks for the next resend. Explicit mode writes no receipt, so a
-          // later turn's catch-up notice is what names it: here the turn the
-          // paragraph's bounce wakes, or else the next one.
           const [held] = h.drafts();
           assert.deepEqual([held?.text, held?.reason], ['Resending that now (1).', 'no-destination']);
           assert.equal(receipt, undefined);
@@ -1393,8 +1383,6 @@ describe('held prose drafts, end to end', () => {
   it("hybrid mode: a round that calls skip_reply beside drafts stays wholly private: its ' !' asks for nothing (#701)", async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
     try {
-      // The turn's continuation check runs once its deliveries have; record
-      // what it finds rather than wait for a turn that shouldn't come.
       const asked: boolean[] = [];
       const fw = h.framework as unknown as { requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void };
       const check = fw.requestProseContinuation.bind(fw);
@@ -1443,8 +1431,6 @@ describe('held prose drafts, end to end', () => {
   it('XML tool mode is unchanged: a line beside a resend is held as a draft, as on main (#701)', async () => {
     const h = await harness({ xml: true });
     try {
-      // XML mode completes with the turn's whole content, as membrane parses
-      // it: each round's calls and then their results.
       const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
       await h.turn([
         createMockResponse([text('A paragraph for the room.'), explicitSend('s1')], 'tool_use'),
@@ -1466,10 +1452,6 @@ describe('held prose drafts, end to end', () => {
     const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'explicit' }] });
     try {
       const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
-      // Each wake's turn resends the newest draft a notice offered, with a
-      // line beside the call, as the narrating resident does: a round with
-      // the call, then XML mode's completion with its result. A stream takes
-      // every queued response, so each wake's are queued as its stream starts.
       let wakes = 0;
       const streamYielding = h.membrane.streamYielding.bind(h.membrane);
       (h.membrane as unknown as { streamYielding: typeof streamYielding }).streamYielding = (request, options) => {
@@ -1484,9 +1466,6 @@ describe('held prose drafts, end to end', () => {
         return streamYielding(request, options);
       };
       await h.turn([{ ...createMockResponse([text('A paragraph for the room.')]), toolCalls: [] }]);
-      // Bounce wakes are queued requests, served as the framework runs: run
-      // it until the second wake's line has bounced, then until it's idle,
-      // so a third wake, if one were queued, would have started.
       const idle = h.framework as unknown as { runUntilIdle(): Promise<void> };
       const secondBounced = () => h.drafts().some((d) => d.text === 'Resending that now (2).' && d.reason === 'bounced');
       for (let k = 0; k < 400 && !secondBounced(); k++) { await idle.runUntilIdle(); await new Promise((resolve) => setTimeout(resolve, 25)); }
@@ -1532,8 +1511,6 @@ describe('held prose drafts, end to end', () => {
   it('in a turn with a send, a line beside a drafts call the agent may not use is held as before: a refused call counts for nothing (#701)', async () => {
     const h = await harness();
     try {
-      // drafts is refused before dispatch (allowedTools), as a tool the
-      // agent wasn't given would be.
       const agent = h.framework.getAgent('scout')!;
       const canUse = agent.canUseTool.bind(agent);
       (agent as unknown as { canUseTool(name: string): boolean }).canUseTool = (name: string) => name !== 'drafts' && canUse(name);
