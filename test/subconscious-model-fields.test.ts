@@ -26,8 +26,8 @@ async function withSubconscious(resident: Partial<AgentConfig>, subconscious: Pa
 }
 
 function fieldsOf(framework: AgentFramework, name: string) {
-  const agent = framework.getAgent(name)! as unknown as { physicalWindowTokens?: number; thinkingDropBlock: boolean; model: string };
-  return { model: agent.model, physicalWindowTokens: agent.physicalWindowTokens, thinkingDropBlock: agent.thinkingDropBlock };
+  const agent = framework.getAgent(name)! as unknown as { physicalWindowTokens?: number; thinkingBinds: boolean; thinkingDropBlock: boolean; model: string };
+  return { model: agent.model, physicalWindowTokens: agent.physicalWindowTokens, thinkingBinds: agent.thinkingBinds, thinkingDropBlock: agent.thinkingDropBlock };
 }
 
 function storedConfig(framework: AgentFramework, name: string): AgentConfig | undefined {
@@ -35,16 +35,16 @@ function storedConfig(framework: AgentFramework, name: string): AgentConfig | un
 }
 
 describe('the subconscious and the resident\'s model fields', () => {
-  const resident: Partial<AgentConfig> = { physicalWindowTokens: 1_000_000, thinkingBinding: { dropBlock: true } };
+  const resident: Partial<AgentConfig> = { physicalWindowTokens: 1_000_000, thinkingBinding: { binds: true, dropBlock: true } };
 
   it('on another model, it carries neither the resident\'s window nor its binding, and the resident\'s config keeps both', async () => {
     const { framework, residentConfig } = await withSubconscious(resident, { model: 'model-b' });
     try {
-      assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingDropBlock: true });
-      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: undefined, thinkingDropBlock: false });
+      assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true });
+      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: undefined, thinkingBinds: false, thinkingDropBlock: false });
       for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
         assert.equal(config?.physicalWindowTokens, 1_000_000);
-        assert.deepEqual(config?.thinkingBinding, { dropBlock: true });
+        assert.deepEqual(config?.thinkingBinding, { binds: true, dropBlock: true });
       }
     } finally { await framework.stop(); }
   });
@@ -53,7 +53,7 @@ describe('the subconscious and the resident\'s model fields', () => {
     for (const subconscious of [{}, { model: 'model-a' }]) {
       const { framework } = await withSubconscious(resident, subconscious);
       try {
-        assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingDropBlock: true });
+        assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true });
       } finally { await framework.stop(); }
     }
   });
