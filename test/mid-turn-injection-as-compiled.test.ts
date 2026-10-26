@@ -263,6 +263,49 @@ describe('a message injected at a tool boundary', () => {
     assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(second));
   });
 
+  it("under the memory strategy's own render, a batch bigger than the recent window goes in whole, as the next request sends it", async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 4000, kvStableReachTokens: 8_000,
+      compressionModel: 'mock', targetChunkTokens: 100, autoTickOnNewMessage: false,
+    } as never));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 3; i++) {
+      cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} ` + Array.from({ length: 40 }, (_, k) => `word${k}`).join(' '))]);
+    }
+    const shots = [1, 2, 3, 4].map((i) => `SCREENSHOT${i}`);
+    const injected = await turnWith(shots.map((s) => [text(s), image()]));
+    const live = shots.map((s) => holding(injected, s));
+    assert.ok(live.every((c) => c !== ''), 'the premise: every screenshot went into the live round');
+    const next = await nextRequest();
+    assert.deepEqual(shots.map((s) => JSON.parse(next(s) || 'null')), live.map((c) => JSON.parse(c || 'null')));
+  });
+
+  it("under the memory strategy's own render, after a head window reset, a message the head has not filled up to goes in as the next request sends it", async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', headWindowTokens: 4000, compressionModel: 'mock',
+      autoTickOnNewMessage: false,
+    } as never));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
+    await cm.resetHeadWindow('A new topic.');
+    const injected = await turnWith([[text('AFTERRESET a short message')]]);
+    const live = holding(injected, 'AFTERRESET');
+    assert.notEqual(live, '', 'the premise: it went into the live round');
+    assert.deepEqual(JSON.parse((await nextRequest())('AFTERRESET')), JSON.parse(live));
+  });
+
+  it("under the memory strategy's own render, the message after a body bigger than the recent window goes in as the next request sends it", async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 300, kvStableReachTokens: 8_000,
+      targetChunkTokens: 200,
+    }));
+    const long = 'FIRSTLONG ' + Array.from({ length: 600 }, (_, i) => `word${i}`).join(' ');
+    const injected = await turnWith([[text('Intro. '), image(), text(long)], [text('SECONDSHORT and a few words more')]]);
+    const live = holding(injected, 'SECONDSHORT');
+    assert.notEqual(live, '', 'the premise: it went into the live round');
+    assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(live));
+  });
+
   it('goes in as stored where the strategy has no render', async () => {
     await create(new WindowedPassthroughStrategy({ maxMessageTokens: 50 }));
     renderWith(() => undefined);
