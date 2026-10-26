@@ -60,7 +60,7 @@ class TwoKeyModule implements Module {
       keys: ['zz_a', 'zz_b'],
       get: () => {
         if (this.unreadableAfterUpdate && this.updated) throw new Error('zz-unreadable');
-        return { ...this.values };
+        return Object.fromEntries(Object.entries(this.values).filter(([, value]) => value !== undefined));
       },
       update: (_agent, patch) => {
         this.updated = true;
@@ -477,6 +477,15 @@ describe('agent_settings refuses names it doesn\'t take and core values of the w
       const refused = call({ action: 'update', zz_first: null, zz_second: 'zz-bad' });
       assert.equal(refused.error, 'zz_second refused zz-bad. Changed before the refusal: zz_first; no other setting reads differently.');
       assert.equal(first.value, null);
+    });
+  });
+
+  it('an extension value its get leaves out while unset is named once the call sets it', async () => {
+    const two = new TwoKeyModule();
+    two.values.zz_a = undefined;
+    await withFramework({ modules: [two] }, (_framework, call) => {
+      const refused = call({ action: 'update', zz_a: null, zz_b: 'zz-bad' });
+      assert.equal(refused.error, 'zz_b refused zz-bad. Changed before the refusal: zz_a; no other setting reads differently.');
     });
   });
 
