@@ -313,9 +313,16 @@ test('a model\'s call whose tool change fits goes with its result even where a d
   }
 });
 
-test('a model\'s call whose result the host can\'t read still tells the tool change it carried, as a notice', async () => {
+const nestedPastStringify = `${'['.repeat(100_000)}${']'.repeat(100_000)}`;
+// The host reads a structured-only result with JSON.stringify, which throws on
+// this nesting where the runtime's stack runs out (Node 24) and writes it out
+// where it doesn't (Node 26).
+const stringifyOverflows = (() => {
+  try { JSON.stringify(JSON.parse(nestedPastStringify)); return false; } catch { return true; }
+})();
+
+test('a model\'s call whose result the host can\'t read still tells the tool change it carried, as a notice', { skip: !stringifyOverflows && 'this runtime writes the nesting out, so the host reads the result' }, async () => {
   let rev = 0;
-  const nestedPastStringify = `${'['.repeat(100_000)}${']'.repeat(100_000)}`;
   const server = await startScriptedServer({
     advert: { ...ADVERT, pushEvents: true, featureSets: { ...(ADVERT.featureSets as Json), ...EVENTS } },
     tools: [STATUS, PEEK],

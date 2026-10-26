@@ -489,7 +489,10 @@ fails after the result was read. A call's change also goes as a notice, ahead of
 result, when a later change goes to the agent before the call's caller has
 taken it, so changes are told in the order they were read (the agent's window
 can still show a call's result, a push's event, or a change its taker couldn't
-show after a change read later). Notices and reminders
+show after a change read later). The model's own call's change counts as told
+once its result is handed back: if the turn is stopped, or the agent is gone,
+while the call is out, the result is dropped and the change with it, and
+`toolsets--look` shows the state it left. Notices and reminders
 need the server's `pushEvents` grant, like any delivery; without it, a change
 that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told with its
 definition until text describing it has reached the model. Suggestions are shown, never acted on. Each

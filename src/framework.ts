@@ -22526,7 +22526,8 @@ export class AgentFramework {
   private puppetChanges?: Map<string, TakenChange[]>;
 
   /** RFC-014 §6.1: a change reaches the agent once, so it goes with a result
-   *  only where the result reaches an agent; null where it may not. */
+   *  only where the result is stored in an agent's window (the puppet's) or
+   *  handed to an agent awaiting it; null where it may not reach one. */
   private changeTaker(call: ToolCall): ((taken: TakenChange) => void) | null {
     if (call.callerAgentName === undefined) return null;
     const puppet = this.puppetChanges?.get(call.id);
@@ -22581,7 +22582,8 @@ export class AgentFramework {
   /** A programmatic call of an MCPL tool: `serverId` and `prefix` as
    *  resolveMcplTool matched them, or as toolsets--act resolved them
    *  (toolsetActCalls). Its RFC-014 tool change goes with its result only
-   *  where the result reaches an agent (changeTaker); any other caller's
+   *  where the result is stored in an agent's window or handed to an agent
+   *  awaiting it (changeTaker); any other caller's
    *  result may never reach one, so its change is told as a notice
    *  (ToolsetController.tellUnlessClaimed). */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
