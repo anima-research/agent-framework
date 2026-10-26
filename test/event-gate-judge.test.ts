@@ -1135,6 +1135,31 @@ describe('the framework wires the reply judge', () => {
     assert.match(question, /scout is next woken by:\n- [^\n]*: a wake already queued \(a queued test wake\)\n/);
   });
 
+  it("lists a turn a provider wait holds only when the wait has an end", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      recordProviderWait(agentName: string, model: string, error: Error): unknown;
+      holdForProviderWait(agent: unknown, wait: unknown, requests: unknown[]): boolean;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; what: string }>;
+      providerAccelerationCooldowns: Map<string, { until: number }>;
+      getAgent(name: string): unknown;
+    };
+    const holdFor = (retryAfterMs: number) => {
+      const wait = internal.recordProviderWait('scout', 'test-model', new MembraneError({
+        type: 'rate_limit', retryable: true, retryAfterMs, message: 'slow down', rawError: { status: 429 },
+      }));
+      assert.ok(internal.holdForProviderWait(internal.getAgent('scout'), wait, [{ agentName: 'scout', reason: 'held', source: 'test', timestamp: Date.now() }]));
+    };
+    holdFor(60_000);
+    const [held] = internal.upcomingWakesFor('scout');
+    assert.strictEqual(held?.what, 'a turn held by a provider cooldown, when it ends');
+    assert.ok(Number.isFinite(held!.at));
+    holdFor(Number.POSITIVE_INFINITY);
+    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')!.until, Number.POSITIVE_INFINITY, 'premise: now held until released');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
+  });
+
   it('enabled: false leaves the judge unwired, and judge rules run as debounces', async (t) => {
     const { membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { enabled: false } });
     assert.ok(eventGate.getStatus().errors.some((e) => e.includes('wires no reply judge')));

@@ -5042,7 +5042,7 @@ export class AgentFramework {
       });
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    if (cooldown && cooldown.heldRequests.length > 0) {
+    if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
     return wakes;
