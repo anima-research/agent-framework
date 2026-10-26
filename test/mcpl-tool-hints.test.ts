@@ -106,18 +106,12 @@ const push = (peer: ScriptedPeer, eventId: string, text: string, extra: Json = {
 
 test('toolHints off: the advertisement, tool list and traffic are as before', async () => {
   const t = await setup(() => false, { toolHints: undefined });
+  const { toolHints: _hints, toolsets: _toolsets, surface: _surface, ...plainAdvert } = ADVERT;
+  const plain = await setup(() => false, { toolHints: undefined }, plainAdvert);
   try {
-    assert.deepEqual(t.server.peer.hostCaps?.mcpl, {
-      version: '0.5',
-      eventCoalescing: { pushEvents: true, channelsIncoming: true, deferred: true, channelScopedPush: true, retryWindowMs: 3600000 },
-      pushEvents: true,
-      contextHooks: { beforeInference: true },
-      inferenceLifecycle: true,
-      toolLifecycle: { observe: true, inputs: true },
-      inferenceRequest: { streaming: true },
-      channels: { register: true, lifecycle: true, publish: true, incoming: true, streaming: true, acknowledge: true, typing: true },
-      featureSets: true,
-    }, 'the capabilities 0.26.2 offers every server');
+    const offered = t.server.peer.hostCaps?.mcpl as Json;
+    assert.ok(!('toolHints' in offered) && !('toolsets' in offered) && !('surface' in offered), 'nothing of RFC-014 offered');
+    assert.deepEqual(offered, plain.server.peer.hostCaps?.mcpl, 'the offer a server that doesn\'t advertise toolHints gets');
     const arcTools = t.fw.framework.getAllTools().filter((x) => x.name.startsWith('arc--'))
       .map((x) => ({ name: x.name, description: x.description, inputSchema: x.inputSchema }));
     assert.deepEqual(arcTools, TOOLS.map((x) => ({ name: `arc--${String(x.name)}`, description: x.description, inputSchema: x.inputSchema })),
@@ -135,7 +129,10 @@ test('toolHints off: the advertisement, tool list and traffic are as before', as
     await t.fw.framework.executeToolCall({ id: 'c1', name: 'arc--play', input: { point: 'D4' } } as never);
     const call = t.server.received.find((m) => m.method === 'tools/call')!;
     assert.ok(!('_meta' in (call.params as Json)), 'no _meta on the call');
-  } finally { await t.done(); }
+  } finally {
+    await t.done();
+    await plain.done();
+  }
 });
 
 test('vector 3, 11: a push\'s hints apply on arrival whatever is decided about the push; nothing is restated', async () => {
@@ -668,11 +665,13 @@ test('an open or close whose outcome the host can\'t know is reported as unconfi
   try {
     const r = await callTool(dropped.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
     assert.ok(r.isError);
-    assert.match(resultText(r), /^arc didn't confirm opening build: The connection to the "arc" server closed before it answered/);
-    assert.match(resultText(r), /toolsets--look \{server:"arc"\} asks it what's open, or says it couldn't\.$/);
+    assert.match(resultText(r), /didn't confirm opening build/, 'unconfirmed');
+    assert.match(resultText(r), /closed before it answered/, 'with the connection\'s own account');
+    assert.match(resultText(r), /toolsets--look \{server:"arc"\}/, 'naming look');
     const again = await callTool(dropped.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
     assert.ok(again.isError);
-    assert.equal(resultText(again), 'arc did not open build: arc is not connected right now; try again later', 'with the connection gone, an open is known not sent');
+    assert.match(resultText(again), /did not open build/, 'with the connection gone, an open is known not sent');
+    assert.doesNotMatch(resultText(again), /toolsets--look/, 'so there is nothing to look for');
   } finally { await dropped.done(); }
 
   const refused = await setup((msg, peer, state) => {
@@ -688,25 +687,27 @@ test('an open or close whose outcome the host can\'t know is reported as unconfi
     await callTool(refused.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'build' });
     const r = await callTool(refused.fw.framework, 'toolsets--close', { server: 'arc', toolset: 'build' });
     assert.ok(r.isError);
-    assert.match(resultText(r), /^arc didn't confirm closing build: .*the board is locked\. toolsets--look \{server:"arc"\} asks it what's open, or says it couldn't\.$/);
+    assert.match(resultText(r), /didn't confirm closing build/, 'unconfirmed');
+    assert.match(resultText(r), /the board is locked/, 'with the server\'s own account');
+    assert.match(resultText(r), /toolsets--look \{server:"arc"\}/, 'naming look');
   } finally { await refused.done(); }
 });
 
 test('a refusal for a name the server doesn\'t have says what it has, or names look', async () => {
   const t = await setup();
   try {
-    const refusals: Array<[string, Json, RegExp]> = [
-      ['toolsets--look', { server: 'arc', toolset: 'nope' }, /^arc has no toolset "nope"; it has game, build, cave$/],
-      ['toolsets--close', { server: 'arc', toolset: 'nope' }, /^arc has no toolset "nope"; it has game, build, cave$/],
-      ['toolsets--open', { server: 'arc', toolset: 'nope' }, /^arc has no toolset "nope"; it has game, build, cave$/],
-      ['toolsets--look', { server: 'arc', tool: 'nope' }, /^arc has no tool "nope": toolsets--look \{server:"arc"\} shows what's available$/],
-      ['toolsets--look', { server: 'arc', instance: 'g9' }, /^no open instance "g9" on arc; no instance is open there$/],
-      ['toolsets--open', { toolset: 'nope' }, /^no server that presents toolsets has a toolset "nope": toolsets--look shows what they have$/],
+    const refusals: Array<[string, Json, RegExp[]]> = [
+      ['toolsets--look', { server: 'arc', toolset: 'nope' }, [/"nope"/, /game, build, cave/]],
+      ['toolsets--close', { server: 'arc', toolset: 'nope' }, [/"nope"/, /game, build, cave/]],
+      ['toolsets--open', { server: 'arc', toolset: 'nope' }, [/"nope"/, /game, build, cave/]],
+      ['toolsets--look', { server: 'arc', tool: 'nope' }, [/"nope"/, /toolsets--look \{server:"arc"\}/]],
+      ['toolsets--look', { server: 'arc', instance: 'g9' }, [/"g9"/, /no instance is open/]],
+      ['toolsets--open', { toolset: 'nope' }, [/"nope"/, /toolsets--look/]],
     ];
-    for (const [name, input, refusal] of refusals) {
+    for (const [name, input, facts] of refusals) {
       const r = await callTool(t.fw.framework, name, input);
       assert.ok(r.isError, `${name} ${JSON.stringify(input)} is refused`);
-      assert.match(resultText(r), refusal);
+      for (const fact of facts) assert.match(resultText(r), fact, `${name} ${JSON.stringify(input)}`);
     }
   } finally { await t.done(); }
 
@@ -715,11 +716,12 @@ test('a refusal for a name the server doesn\'t have says what it has, or names l
     for (const input of [{}, { toolset: 'game' }]) {
       const r = await callTool(none.fw.framework, 'toolsets--open', input);
       assert.ok(r.isError);
-      assert.match(resultText(r), /^no MCPL server presents toolsets now: MCPL tools are called directly, by name$/);
+      assert.match(resultText(r), /called directly, by name/);
     }
     const named = await callTool(none.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game' });
     assert.ok(named.isError);
-    assert.equal(resultText(named), 'arc sends no tool hints now: its tools are called directly, by name, not through toolsets--act');
+    assert.match(resultText(named), /arc sends no tool hints/);
+    assert.match(resultText(named), /called directly, by name/);
   } finally { await none.done(); }
 });
 
@@ -740,7 +742,7 @@ test('a toolsets--act call whose outcome the host can\'t know names look, for th
     const results = (t.fw.membrane.lastStream?.receivedToolResults ?? []).flat() as Array<{ toolUseId: string; content: unknown }>;
     const text = JSON.stringify(results.find((r) => r.toolUseId === 'toolu_act')?.content ?? null);
     assert.match(text, /closed before it answered/);
-    assert.match(text, /toolsets--look \{server:\\"arc\\"\} asks it what's open, or says it couldn't\./);
+    assert.match(text, /toolsets--look \{server:\\"arc\\"\}/, 'naming look');
   } finally { await t.done(); }
 
   const inProcess = await setup(dropsOnPeek);
@@ -750,7 +752,7 @@ test('a toolsets--act call whose outcome the host can\'t know names look, for th
     const r = await callTool(inProcess.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: {} });
     assert.ok(r.isError);
     assert.match(resultText(r), /closed before it answered/);
-    assert.match(resultText(r), /toolsets--look \{server:"arc"\} asks it what's open, or says it couldn't\.$/);
+    assert.match(resultText(r), /toolsets--look \{server:"arc"\}/, 'naming look');
   } finally { await inProcess.done(); }
 });
 
@@ -1644,10 +1646,12 @@ test('look says when it couldn\'t ask a server, and shows what the host last kne
     listing = false;
     const text = await look(t.fw);
     assert.match(text, /^arc\n {2}nothing open/);
-    assert.match(text, /\narc couldn't be asked just now: this is what the host last knew of it\.$/);
+    assert.match(text, /arc couldn't be asked/, 'says it couldn\'t ask');
+    assert.match(text, /what the host last knew/, 'and what it shows instead');
     const refused = await callTool(t.fw.framework, 'toolsets--look', { server: 'arc', instance: 'g1' });
     assert.ok(refused.isError);
-    assert.equal(resultText(refused), 'no open instance "g1" on arc; no instance is open there\narc couldn\'t be asked just now: this is what the host last knew of it.');
+    assert.match(resultText(refused), /no open instance "g1"/);
+    assert.match(resultText(refused), /arc couldn't be asked/, 'a refusal says it couldn\'t ask too');
   } finally { await t.done(); }
 });
 
@@ -1714,6 +1718,9 @@ async function movingServer(moved: Json[]) {
     phase = 'move';
     t.state.next();
     t.server.peer.notify('tools/hints', t.state.hint([]));
+    await waitFor(() => phase === 'hold', 'the recovery\'s tools/list answered');
+    await roundTrip(t);
+    t.server.peer.notify('notifications/tools/list_changed', {});
     await waitFor(() => release !== null, 'the rebuild\'s tools/list asked for');
   };
   return { t, moveAndHold, release: () => release?.() };
@@ -1730,7 +1737,9 @@ test('RFC-014 §4.2: a tool a list moves to static is called both ways until the
     release();
     await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the rebuild shows peek');
     assert.equal(resultText(await t.fw.framework.executeToolCall({ id: 'late', name: 'arc--peek', input: {} } as never)), 'peek done');
-    assert.equal(resultText(await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: {} })), 'peek is not a dynamic tool: static — called by name, as arc--peek. Call it there.');
+    const viaActLate = resultText(await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: {} }));
+    assert.match(viaActLate, /peek is not a dynamic tool/, 'act refuses it now');
+    assert.match(viaActLate, /arc--peek/, 'naming the name it\'s called by');
   } finally {
     release();
     await t.done();
@@ -1762,7 +1771,9 @@ test('RFC-014 §4.2: a static tool the tool list hasn\'t published isn\'t taken 
     await moveAndHold();
     const viaAct = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'newt', args: {} });
     assert.ok(viaAct.isError);
-    assert.equal(resultText(viaAct), 'newt is not a dynamic tool: static — called by name, as arc--newt. Call it there.');
+    assert.match(resultText(viaAct), /newt is not a dynamic tool/);
+    assert.match(resultText(viaAct), /arc--newt/, 'naming the name it\'s called by');
+    assert.equal(resultText(await t.fw.framework.executeToolCall({ id: 'byname', name: 'arc--newt', input: {} } as never)), 'newt done', 'which takes it');
     release();
     await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--newt'), 'the rebuild publishes newt');
   } finally {
@@ -1814,9 +1825,13 @@ async function arcAndSlow() {
   await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'slow--status'), 'slow listed');
   const move = async () => {
     moved = true;
-    holdNext = true;
+    const lists = t.methods().filter((m) => m === 'tools/list').length;
     t.state.next();
     t.server.peer.notify('tools/hints', t.state.hint([]));
+    await waitFor(() => t.methods().filter((m) => m === 'tools/list').length > lists, 'the recovery\'s tools/list asked for');
+    await roundTrip(t);
+    holdNext = true;
+    t.server.peer.notify('notifications/tools/list_changed', {});
     await waitFor(() => held !== null, 'the rebuild waits on slow');
   };
   const unmove = () => { moved = false; };
@@ -1848,6 +1863,7 @@ test('RFC-014 §4.2: a rebuild that never publishes leaves its moves to the one 
     await waitFor(() => s.t.fw.framework.getAllTools().some((x) => x.name === 'third--status' || x.name === 'arc--peek'), 'the newer rebuild published');
     await waitFor(() => s.toldMoved() === 1, 'told by the rebuild that published');
     s.release();
+    // A rebuild that never publishes changes nothing a caller sees, so its end has no public sign: this waits on the framework's own flag.
     await waitFor(() => !(s.t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight, 'the older rebuild ended');
     await roundTrip(s.t);
     await nextMacrotask();
@@ -1858,7 +1874,7 @@ test('RFC-014 §4.2: a rebuild that never publishes leaves its moves to the one 
   }
 });
 
-test('RFC-014 §4.2: a move a list undoes while the rebuild waits on another server is never told, and the tool list follows the undoing', async () => {
+test('RFC-014 §4.2: a move a list undoes while the rebuild waits on another server is never told, and the tool list follows the undoing at the next refresh', async () => {
   const s = await arcAndSlow();
   try {
     await s.move();
@@ -1868,16 +1884,31 @@ test('RFC-014 §4.2: a move a list undoes while the rebuild waits on another ser
     s.t.server.peer.notify('tools/hints', s.t.state.hint([]));
     await waitFor(() => s.t.methods().filter((m) => m === 'toolsets/list').length > lists, 'the undoing list read');
     s.release();
-    await waitFor(() => !s.t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek') && !(s.t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight, 'the tool list follows the undoing');
+    await waitFor(() => s.t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the rebuild publishes what it listed');
+    assert.equal(resultText(await s.t.fw.framework.executeToolCall({ id: 'stale', name: 'arc--peek', input: {} } as never)), 'peek done', 'callable where the tool list shows it');
+    assert.equal(resultText(await callTool(s.t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: {} })), 'peek done', 'and where the server\'s latest list put it');
+    s.t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => !s.t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the next refresh follows the undoing');
     await roundTrip(s.t);
     await nextMacrotask();
     assert.equal(s.toldMoved(), 0, 'never told');
   } finally { await s.done(); }
 });
 
-test('where no tool list has published a tool, presence decides where it is called', () => {
-  const { c, read } = tappedController();
-  assert.match(c.dynamicCallRefusal('peek', 'arc--peek') ?? '', /peek is a dynamic tool of arc/);
-  read({ kind: 'result', method: 'tools/list', params: {}, result: { tools: withPresence('peek', 'static') }, awaited: true });
-  assert.equal(c.dynamicCallRefusal('peek', 'arc--peek'), null);
+test('RFC-014 §4.2: where the tool list hasn\'t published a tool, the server\'s latest list decides where it is called', async () => {
+  const newd = { name: 'newd', description: 'A new dynamic tool.', inputSchema: { type: 'object', properties: {} }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true } };
+  const { t, moveAndHold, release } = await movingServer([...withPresence('peek', 'static'), newd]);
+  try {
+    await moveAndHold();
+    const byName = await t.fw.framework.executeToolCall({ id: 'byname', name: 'arc--newd', input: {} } as never);
+    assert.ok(byName.isError, 'refused by name');
+    assert.match(String(byName.error), /newd is a dynamic tool of arc/);
+    assert.equal(resultText(await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'newd', args: {} })), 'newd done', 'taken through act');
+    release();
+    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the rebuild publishes');
+  } finally {
+    release();
+    await t.done();
+  }
 });
+

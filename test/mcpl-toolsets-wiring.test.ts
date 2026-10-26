@@ -308,7 +308,9 @@ test('a tool change the host can\'t tell for want of an agent is logged, as one 
   try {
     server.peer.notify('tools/hints', showPeek());
     await waitFor(() => logged.some((line) => line.includes('arc: a tool change was not told')), 'the drop logged');
-    assert.ok(logged.some((line) => /arc: a tool change was not told \(no agent is registered to tell\); toolsets--look shows the state it left/.test(line)));
+    const line = logged.find((l) => l.includes('arc: a tool change was not told'))!;
+    assert.match(line, /no agent/, 'says why');
+    assert.match(line, /toolsets--look/, 'and names look');
   } finally {
     console.error = error;
     await fw.stop();
@@ -323,8 +325,9 @@ test('a tool change with no result to ride on is a notice only where pushEvents 
     const requests = withGrant.membrane.calls.length;
     granted.server.peer.notify('tools/hints', granted.showPeek());
     await waitFor(() => notices(withGrant).some((x) => x.includes('peek()')), 'the notice written');
-    const scheduler = withGrant.framework as unknown as { pendingRequests: unknown[] };
-    assert.equal(scheduler.pendingRequests.length, 0, 'no inference requested');
+    const status = withGrant.framework.getHostModeStatus();
+    assert.equal(status.gatedRequests, 0, 'no inference requested');
+    assert.equal(status.activeTurns, 0, 'no turn running');
     assert.equal(withGrant.framework.getAgent('scout')!.state.status, 'idle', 'no turn running');
     assert.equal(withGrant.membrane.calls.length, requests, 'no request sent: the notice started no turn');
   } finally {

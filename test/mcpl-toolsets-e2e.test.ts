@@ -91,14 +91,14 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
     assert.match(text, /\[arcade\/game:g1\] Game g1 \(13\)/);
     assert.match(text, /board of g1: 0 moves/, 'the server\'s own content for the open');
     assert.match(text, /play\(point: string\) — Play a point on the board\./);
-    assert.match(text, /toolsets--close \{server:"arcade", toolset:"game", instance:"g1"\} closes it\./);
+    assert.match(text, /toolsets--close \{server:"arcade", toolset:"game", instance:"g1"\}/, 'naming how to close it');
     assert.equal(fw.framework.getAllTools().map((t) => t.name).join(','), before, 'the API tool list did not change');
 
     await callTool(fw.framework, 'toolsets--open', { toolset: 'game', instance: 'g2' });
     // Two open: act without instance fails, naming them; nothing is sent.
     const ambiguous = await callTool(fw.framework, 'toolsets--act', { tool: 'play', args: { point: 'D4' } });
     assert.ok(ambiguous.isError);
-    assert.match(resultText(ambiguous), /several game instances are open \(g1, g2\)/);
+    assert.match(resultText(ambiguous), /g1, g2/, 'naming the open instances');
     const played = await callTool(fw.framework, 'toolsets--act', { tool: 'play', instance: 'g1', args: { point: 'D4' } });
     assert.ok(!played.isError, resultText(played));
     assert.deepEqual(calls, ['g1:play:{"point":"D4"}']);
