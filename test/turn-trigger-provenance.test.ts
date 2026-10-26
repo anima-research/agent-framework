@@ -966,20 +966,21 @@ describe('private wins, one way', () => {
   it("a private turn's channel_publish that names no channel is refused, and says how to name one", async () => {
     const rig = await surfaceRig();
     try {
-      const results: Array<{ success: boolean; error?: string }> = [];
+      const results: Array<{ success: boolean; error?: string; refused?: boolean }> = [];
       const internalsOf = rig.framework as unknown as {
         dispatchChannelToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
         pushEvent(event: unknown): void;
       };
       const push = internalsOf.pushEvent.bind(rig.framework);
       internalsOf.pushEvent = (event: unknown) => {
-        const e = event as { type?: string; result?: { success: boolean; error?: string } };
+        const e = event as { type?: string; result?: { success: boolean; error?: string; refused?: boolean } };
         if (e.type === 'tool-result' && e.result) results.push(e.result);
         else push(event);
       };
       routingOf(rig.framework).nonChannelOrigin = true;
       internalsOf.dispatchChannelToolCall('scout', { id: 'c1', name: 'channel_publish', input: { content: 'hello' } });
       assert.equal(results[0]?.success, false, 'refused');
+      assert.equal(results[0]?.refused, true, 'before the call opened, so a host and the guard read that nothing ran');
       assert.match(results[0]!.error!, /private/, 'it says why');
       assert.match(results[0]!.error!, /channelId/, 'it says what to give');
       assert.match(results[0]!.error!, /channel_list/, 'and where to find an id, for an agent that may list them');

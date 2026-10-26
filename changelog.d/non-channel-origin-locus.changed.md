@@ -61,21 +61,25 @@
   resend: a notice says it was kept private and how to publish. An envelope
   that bounces in a private turn, because it names no destination, names one
   that doesn't resolve, or can't be delivered, isn't held as a draft either:
-  its notice says the words were kept private and how to publish. In every
-  mode, words a send silenced are held as drafts, as in any turn. Speech
-  handlers are told a private turn's speech is private
-  (`SpeechContext.nonChannelOrigin`), and the built-in Discord module posts
-  none of it and edits its thoughts into no message.
+  its notice says the words were kept private and how to publish. Where an
+  earlier bounce is still held, either notice says that `{{unsent}}` names
+  that draft, not these words. In every mode, words a send silenced are held
+  as drafts, as in any turn. Speech handlers are told a private turn's speech
+  is private (`SpeechContext.nonChannelOrigin`), and the built-in Discord
+  module posts none of it and edits its thoughts into no message.
 
   A private turn's `channel_publish` must name its channel: a call without
   `channelId` is refused, a conversation fork's included, and the refusal says
   `channel_list` shows the channel ids, to an agent that may call it. So must
   a script's whose starting turn is private, as that turn stands at the call,
   whichever turn watches the script then. `channel_publish`'s description says
-  so, so every agent's tool list changes once. A private turn's `channel_open`
-  doesn't move the locus, and says so. Its `sleep` announcement isn't posted.
-  When the model refuses (a refusal stop), a private turn's refusal reacts on
-  no message, and its failure record names no channel.
+  so, so every agent's tool list changes once. The model's call is refused
+  before it opens, as the dispatcher's other refusals are, so its result
+  carries `refused` (`ToolResult.refused`); a script's reaches the script as
+  an Error. A private turn's `channel_open` doesn't move the locus, and says
+  so. Its `sleep` announcement isn't posted. When the model refuses (a refusal
+  stop), a private turn's refusal reacts on no message, and its failure record
+  names no channel.
 
   The `[routing]` notice for speech with no channel now says it stays on the
   surface the agent was addressed from, if any.

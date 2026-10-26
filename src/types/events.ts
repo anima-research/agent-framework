@@ -216,9 +216,10 @@ export interface ToolResult {
    * path, the model's calls and a script's, sets it: the caller may not use
    * the tool (allowedTools), a `skip_reply` wake was refused, the call's MCPL
    * server is absent or still connecting, the host's policy for that server
-   * denies the tool, or a fork reached outside its channel. RFC-007's
-   * lifecycle refuses the call from the same place, so observers see no
-   * events for it. A check made after the call opened, such as a module's
+   * denies the tool, a fork reached outside its channel, or a private turn's
+   * `channel_publish` named no channel. RFC-007's lifecycle refuses the call
+   * from the same place, so observers see no events for it. A check made
+   * after the call opened, such as a module's
    * answer for a name it has no tool for or arguments that don't fit a
    * schema, is a failure whose text says nothing was done, as is an MCPL
    * request that couldn't be written. A programmatic call (`executeToolCall`,

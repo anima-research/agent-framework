@@ -2862,6 +2862,30 @@ describe('explicit prose routing', () => {
     });
   }
 
+  for (const [mode, prefix, privateText] of [
+    ['hybrid', '>>>', '>>>#missing Second words.'],
+    ['explicit', '>>', 'Second words.'],
+  ] as const) {
+    it(`a private ${mode} turn's kept-private notice says which earlier draft {{unsent}} still names`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}#missing First words.` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: privateText }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), ['First words.'], 'control: the channel turn\'s bounce is held as a draft');
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, []);
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('kept private'));
+      assert.ok(notice?.includes(`{{unsent}} still names draft ${drafts[0]!.id}, not these words.`), `the resident is told what {{unsent}} takes: ${notice}`);
+      await framework.stop();
+    });
+  }
+
   it("hybrid keeps a private turn's unprefixed prose on its surface", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');

@@ -18869,10 +18869,16 @@ export class AgentFramework {
     return { text: expanded, inheritedRisk };
   }
 
+  private unsentStillNames(agentName: string): string {
+    const latest = this.proseDrafts.latestBounce(agentName);
+    return latest ? ` {{unsent}} still names draft ${latest.id}, not these words.` : '';
+  }
+
   private keepPrivateTurnProse(agent: Agent, text: string): void {
     const notice =
       `[prose-routing] Your text (${text.length} chars) was kept private — this turn holds private input, so its ` +
-      `plain speech goes to no channel, and it isn't held as a draft. To publish, use ${privateTurnReach(agent)}.`;
+      `plain speech goes to no channel, and it isn't held as a draft. To publish, use ${privateTurnReach(agent)}.` +
+      this.unsentStillNames(agent.name);
     console.error(`[prose] ${agent.name}: ${text.length} chars kept private (private turn)`);
     const target = this.noticeTargetFor(agent.name, 'prose-bounce');
     if (!target) return;
@@ -18963,7 +18969,8 @@ export class AgentFramework {
           `${inherited || ownRisk ? ', confirmDuplicate: true' : ''}); ` +
           `drafts(action: "dismiss", draftIds: ["${draft.id}"]) sets it aside.`;
     const kept = privateTurn
-      ? `It was kept private: this turn holds private input, so it isn't held as a draft. To publish, use ${privateTurnReach(agent)}.`
+      ? `It was kept private: this turn holds private input, so it isn't held as a draft. To publish, use ${privateTurnReach(agent)}.` +
+        this.unsentStillNames(agent.name)
       : held;
     const risky = inherited && draft
       ? ` It includes the words of draft ${inherited.draftId}, which may already have been posted, so ${draft.id} ` +
@@ -31329,12 +31336,9 @@ export class AgentFramework {
       : this.turnRouting?.get(agentName)?.nonChannelOrigin === true);
     const error = this.privatePublishRefusal(agentName, call, privateTurn);
     if (error !== undefined) {
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      const result = this.refusedResult(agentName, call.id, error);
       this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
-      this.pushEvent({
-        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels',
-        result: { success: false, error, isError: true },
-      });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels', result });
       return;
     }
 
