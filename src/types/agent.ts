@@ -546,9 +546,10 @@ export interface InferenceRequest {
    *  agent while a turn was alive: a coalesced render placed in its queue
    *  (wakeToRead), or a message, notice or event whose wake was queued with
    *  it. Once a request that carried the write was answered and, for a wake
-   *  that carries a channel, the agent has since published into that
-   *  channel having read it, or once the write is in neither the agent's
-   *  queue nor its store's current branch, the wake starts no turn. */
+   *  that carries a channel and isn't marked `ambient`, the agent has since
+   *  published into that channel having read it, or once the write is in
+   *  neither the agent's queue nor its store's current branch, the wake
+   *  starts no turn. */
   readsDeferredWrite?: string;
   /** Host-owned: this wake's sole cause is this message, stored in its
    *  agent's store as it arrived, not deferred (its row's id). Once a

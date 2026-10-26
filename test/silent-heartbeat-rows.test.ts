@@ -817,7 +817,7 @@ describe('replies to a [Continue] turn', () => {
       providerAccelerationCooldowns: Map<string, { until: number }>; pendingRequests: unknown[];
       releaseProviderAccelerationCooldown(agentName: string): void;
     };
-    internal.providerAccelerationDefaultCooldownMs = 60_000;
+    internal.providerAccelerationDefaultCooldownMs = 10 * 60_000;
     internal.providerAccelerationJitterMs = 0;
     try {
       membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
