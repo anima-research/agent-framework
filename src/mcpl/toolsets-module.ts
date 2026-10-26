@@ -205,7 +205,7 @@ export type ActTarget = { ok: true; serverId: string; tool: string; instance?: s
  * or the reason it can't be sent. The framework then dispatches it exactly as
  * a direct call of that tool, with `_meta["mcpl/instance"]` added (RFC §5.5).
  * Refused here, before anything is sent: a tool no presenting server has, a
- * static tool (it's in the tool list), an instance that isn't named where
+ * tool the model hasn't been shown as dynamic (RFC §4.2), an instance that isn't named where
  * several are open, a group the host has closed (RFC §5.4), and arguments
  * that don't fit the definition in force for that instance (RFC §6.1).
  */

@@ -23939,7 +23939,7 @@ export class AgentFramework {
    * Find the MCPL server for a tool: [serverId, prefix], or null.
    * The tool listing decides: the server whose tools/list listed the name
    * (offered to the model, or an RFC-014 dynamic tool, which dispatch then
-   * refuses by that name), after its tool policy, as of the last tool refresh (a server that
+   * refuses by that name unless the published list or the latest announcement shows it as static), after its tool policy, as of the last tool refresh (a server that
    * closed since keeps its names until the next one). A name the listing
    * doesn't hold (invented by the model, or no longer listed) goes to the
    * longest matching prefix. Prefixes that meet, such as `foo` and
