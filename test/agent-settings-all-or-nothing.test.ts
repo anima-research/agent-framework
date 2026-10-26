@@ -62,7 +62,6 @@ async function withFramework(
     }],
     modules: options.modules ?? [],
   });
-  // The tool answers through a tool-result event; take it as it's pushed.
   const internal = framework as unknown as {
     pushEvent(event: unknown): void;
     dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void;
@@ -192,7 +191,6 @@ describe('agent_settings refuses what it can\'t take before anything applies, ap
   it('a reset the core refuses leaves the extensions\' settings as they were', async () => {
     await withFramework({ strategy: false }, (framework, call) => {
       assert.equal(call({ action: 'update', tool_result_inline_max_chars: 5_000 }).isError, undefined);
-      // A raised budget, so a reset-all returns to a smaller configured one.
       framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 150_000 });
       const refused = call({ action: 'reset' });
       assert.equal(refused.isError, true);
@@ -217,8 +215,6 @@ describe('agent_settings refuses what it can\'t take before anything applies, ap
   });
 
   it('the strategy\'s own refusal comes before any extension applies', async () => {
-    // An autobiographical strategy without kv-stable folding has live
-    // settings, but refuses a gradual transition when the update applies.
     const unpaced = new AutobiographicalStrategy({ recentWindowTokens: 30_000 });
     await withFramework({ strategy: unpaced }, (_framework, call) => {
       const refused = call({ action: 'update', context_budget_tokens: 60_000, tool_result_inline_max_chars: 5_000 });
@@ -280,7 +276,6 @@ describe('agent_settings refuses what it can\'t take before anything applies, ap
   it('a saved setting the strategy doesn\'t apply is named when a refused reset cleared it', async () => {
     await withFramework({ strategy: false }, (framework, call) => {
       assert.equal(call({ action: 'update', tool_result_inline_max_chars: 5_000 }).success, true);
-      // Saved under a strategy with live settings; this one doesn't apply it.
       (framework.getAgent('agent') as unknown as { runtimeSettingsOverrides: Record<string, unknown> })
         .runtimeSettingsOverrides.tailTokens = 20_000;
       (framework as unknown as { persistToolResultInlineCap: (...args: unknown[]) => void })
@@ -338,7 +333,6 @@ describe('agent_settings refuses what it can\'t take before anything applies, ap
         assert.equal(refused.error, `immediate must be true or false, not ${JSON.stringify(value)}. Nothing in this call was changed.`, JSON.stringify(value));
       }
       assert.equal(settings(call).contextBudgetTokens, 100_000);
-      // "false" asks for the paced descent, as false does.
       assert.equal(call({ action: 'update', context_budget_tokens: 60_000, immediate: 'false' }).success, true);
       let now = settings(call);
       assert.equal(now.transition, 'converging');

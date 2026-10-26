@@ -739,23 +739,16 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
   },
 };
 
-/**
- * An agent's settings as an agent_settings update or reset could change them,
- * each as text to compare: the core settings, and the given extensions' own
- * keys.
- */
 type SettingsReading = {
   core: Record<string, string>;
   exts: Map<AgentSettingsExtension, Record<string, string>>;
 };
 
-/** An extension's own keys as its get reads them, each as text to compare. */
 const readExtensionSettings = (ext: AgentSettingsExtension, agentName: string): Record<string, string> => {
   const values = ext.get(agentName);
   return Object.fromEntries(ext.keys.map((key) => [key, JSON.stringify(values[key] ?? null)]));
 };
 
-/** The keys whose text differs between two readings of the same settings. */
 const changedSettings = (before: Record<string, string>, now: Record<string, string>): string[] =>
   Object.keys(before).filter((key) => before[key] !== now[key]);
 
@@ -31962,16 +31955,11 @@ export class AgentFramework {
       });
   }
 
-  /** An agent's settings now, the core ones and the given extensions'. */
   private readAgentSettings(agentName: string, exts: AgentSettingsExtension[]): SettingsReading {
     const s = this.getAgentRuntimeSettings(agentName);
-    // What the agent keeps saved for each, too: a saved value the strategy
-    // doesn't apply can still be set or cleared, and is persisted.
     const saved = this.agents.get(agentName)?.getRuntimeSettingsOverrides() ?? {};
     return {
       core: {
-        // The budget it's set to, the one compiles plan at, and its transition
-        // all change with a budget update.
         context_budget_tokens: JSON.stringify([
           s.contextBudgetTokens, s.effectiveContextBudgetTokens, s.transition, saved.contextBudgetTokens ?? null,
         ]),
@@ -31983,11 +31971,6 @@ export class AgentFramework {
     };
   }
 
-  /**
-   * The sentence an agent_settings refusal ends with: what the call changed
-   * before it refused, read against how its settings stood before it applied
-   * anything. A refusal before then changed nothing.
-   */
   private settingsChangedSince(agentName: string, before: SettingsReading | undefined): string {
     if (!before) return 'Nothing in this call was changed.';
     let changed: string[];
@@ -32052,7 +32035,6 @@ export class AgentFramework {
           if (input.settings !== undefined) {
             throw new Error('`settings` lists names for a reset; to change a setting, give its name and new value');
           }
-          // A name that is no setting would otherwise be dropped unseen.
           const known = new Set<string>(['action', 'immediate', ...AgentFramework.AGENT_SETTINGS_CORE_KEYS]);
           for (const ext of extensions.values()) ext.keys.forEach((key) => known.add(key));
           const unknown = Object.keys(input).filter((key) => !known.has(key));
@@ -32085,8 +32067,6 @@ export class AgentFramework {
             if (Object.keys(slice).length > 0) slices.push({ ext, slice });
           }
           const coreTouched = Object.keys(patch).length > 0;
-          // Reading them asks the context manager for the strategy's live
-          // settings too, so one that can't give them refuses here.
           before = this.readAgentSettings(agentName, slices.map((s) => s.ext));
           const core = coreTouched
             ? this.updateAgentRuntimeSettings(agentName, patch)
@@ -32110,8 +32090,6 @@ export class AgentFramework {
           break;
         }
         case 'reset': {
-          // A reset takes its names in `settings`; anything else beside it
-          // would otherwise be dropped while everything is reset.
           const extra = Object.keys(input).filter((key) => key !== 'action' && key !== 'settings');
           if (extra.length > 0) {
             throw new Error(
@@ -32154,8 +32132,6 @@ export class AgentFramework {
             ? [...extensions.values()].map((ext) => [ext, undefined])
             : [...extResetKeys];
           before = this.readAgentSettings(agentName, extResets.map(([ext]) => ext));
-          // The core reset goes first: it is what refuses, at its check or
-          // where its strategy refuses, and it changes nothing when it does.
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);

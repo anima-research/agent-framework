@@ -6,7 +6,12 @@
   `action`, where it ignored the name and cancelled.
 - `agent_settings` refuses `null`, `true` or `false`, a list, an object or
   blank text for a numeric setting (`context_budget_tokens`, `tail_tokens`,
-  `transition_pace_tokens`, `tool_result_inline_max_chars`), where each was
-  read as a number: `tail_tokens: null` or `""` set the tail to 0, and
-  `tail_tokens: [20000]` set it to 20000. Text that reads as a number, such
-  as `"20000"`, is still taken.
+  `transition_pace_tokens`, `tool_result_inline_max_chars`). Each was read as
+  a number, and applied where that number was in range: `tail_tokens: null`,
+  `false` or `""` set the tail to 0, `true` set the tail or the pace to 1,
+  and a one-item list such as `[20000]` set any of the four to its item.
+  Text that reads as a number, such as `"20000"`, is still taken.
+- `agent_settings` refuses `immediate` given as anything but true or false,
+  or the text `"true"` or `"false"`. It was read with `Boolean()`, so `1`,
+  `"yes"` or a list applied a lower budget at once, and `0`, `null` or `""`
+  paced it.
