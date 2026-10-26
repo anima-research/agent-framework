@@ -404,6 +404,24 @@ describe('toolDeclarations in the framework', () => {
     }, undefined, { conversations: { templateAgent: 'alpha' } });
   });
 
+  it("copies a host's change row into a fork as no agent's own, so the fork's moves leave it", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')], system('v1'));
+      const hostChange = [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[];
+      alpha.getContextManager().addMessage('system', hostChange);
+      await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
+      const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent> };
+      const fork = await internals.createConversationAgent('alpha-fork', 'chanA');
+      const owners = () => fork.getContextManager().getAllMessages().filter(isChange).map((m) => (m.metadata as { agent?: string } | undefined)?.agent ?? 'host');
+      assert.deepEqual(owners(), ['host', 'alpha-fork'], "the host's row copied as no agent's own, the template's as the fork's");
+      await fork.buildActivationRequest([tool('a'), tool('b')], system('v2'));
+      assert.deepEqual(owners(), ['host'], "the fork's move took its own row and left the host's");
+    }, undefined, { conversations: { templateAgent: 'alpha' } });
+  });
+
   it("hides the residents' changes from the subconscious, which reads their slot", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;

@@ -85,6 +85,7 @@ import {
   isSystemChangeNotOwn,
   lastConversational,
   memoryHeadDeclarations,
+  ownSystemChanges,
   systemChangeMetadata,
   type HeadDeclaration,
   type HeadDeclarationStore,
@@ -14592,8 +14593,10 @@ export class AgentFramework {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
-        const { messages: compiledWhole, provenance } = await template.toolResultGuard.afterAnnotations(
+        const templateCompile = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const { messages: compiledWhole, provenance } = templateCompile;
+        const templatesOwnChanges = new Set([...ownSystemChanges(templateCompile, template.name)].flatMap((i) => compiledWhole[i]!.content));
         const templateRows = template.getContextManager().getAllMessages();
         // The template's stored context injections (stored-injections.ts) are
         // its context, not the conversation, so the seed leaves them out, as
@@ -14612,12 +14615,13 @@ export class AgentFramework {
         logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
-          // The template's system changes, as its compile shows them, become
+          // The template's own system changes, as its compile shows them, become
           // the fork's, with the template's head beside them, so the fork's
           // head matches its template's and its first start declares only its
           // own difference.
-          if (isSystemChangeMessage(msg)) contextManager.addMessage(participant, msg.content, systemChangeMetadata(name) as never);
-          else contextManager.addMessage(participant, msg.content);
+          if (isSystemChangeMessage(msg) && msg.content.every((block) => templatesOwnChanges.has(block))) {
+            contextManager.addMessage(participant, msg.content, systemChangeMetadata(name) as never);
+          } else contextManager.addMessage(participant, msg.content);
         }
         const templateHead = this.headDeclarations.read(template.name);
         if (templateHead) this.headDeclarations.write(name, templateHead);
