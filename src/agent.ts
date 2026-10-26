@@ -1178,8 +1178,9 @@ export class Agent {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs). Without a watermark, a reader that looks for one takes its own
     // side: the coalescer counts the message as read, and the framework's
-    // unreadNoticesForPrimary counts it as unread. A deferred write's wake
-    // reads the answered watermark instead (deferredWriteDone).
+    // unreadNoticesForPrimary counts it as unread. A wake for a deferred
+    // write or a stored message reads the answered watermark instead
+    // (deferredWriteDone, storedMessageDone).
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
     this.shownWatermark = this.consumedWatermark;

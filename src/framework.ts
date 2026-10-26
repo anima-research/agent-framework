@@ -4030,7 +4030,7 @@ export class AgentFramework {
         requestInference: (agentName, reason, source, provenance, after) => {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
-            ...framework.readsDeferredFor(after, agentName),
+            ...framework.readsWriteFor(after, agentName),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
             // as TELEMETRY fields — the host's stamp reads them.
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
@@ -5316,7 +5316,7 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsDeferredWrite === b.readsDeferredWrite &&
+      a.readsDeferredWrite === b.readsDeferredWrite && a.readsStoredMessage === b.readsStoredMessage &&
       (a.wakeLines ?? []).map(wakeLineKey).join('\n') === (b.wakeLines ?? []).map(wakeLineKey).join('\n');
   }
   /** Keep `request` among a hold's `held` requests, once by
@@ -13837,14 +13837,14 @@ export class AgentFramework {
     // Add messages. Only the framework writes the inbound envelope: one a
     // module's metadata carries (echoed from a server's event, say) is
     // dropped, and a surface event's messages carry the framework's own.
-    // The wakes below go by the one message a response adds (readsDeferredFor).
+    // The wakes below go by the one message a response adds (readsWriteFor).
     // A wake for several stays plain, and so does one for a channel's
     // message (its metadata, or its event's, names the channel), or for
     // console or API input: conversation, whose answer the module or the
     // surface carries where the framework records none.
     const eventChannel = (event as { metadata?: { channelId?: unknown } }).metadata?.channelId;
     const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
-    let added: { agent?: string; deferredId?: string } | undefined;
+    let added: { agent?: string; deferredId?: string; messageId?: string } | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
@@ -13854,7 +13854,7 @@ export class AgentFramework {
           metadata = rest;
         }
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
-        const placement: { agent?: string; deferredId?: string } = {};
+        const placement: { agent?: string; deferredId?: string; messageId?: string } = {};
         const id = this.addMessage(msg.participant, msg.content, metadata, { placement });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
@@ -13913,7 +13913,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            ...this.readsDeferredFor(added, agentName),
+            ...this.readsWriteFor(added, agentName),
           });
         }
       }
@@ -14150,7 +14150,7 @@ export class AgentFramework {
           addressed,
           ...ambientMark(event.tags),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
-          ...this.readsDeferredFor(placement, agentName),
+          ...this.readsWriteFor(placement, agentName),
         });
       }
     }
@@ -15822,7 +15822,7 @@ export class AgentFramework {
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
-          ...this.readsDeferredFor(placement, agentName),
+          ...this.readsWriteFor(placement, agentName),
         });
       }
     }
@@ -16094,10 +16094,10 @@ export class AgentFramework {
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
-          // and a wake for a deferred write is dropped once the agent is
-          // done with that write: neither may absorb an unrelated wake that
-          // would vanish with it.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}`;
+          // and a wake for a deferred write or a stored message is dropped
+          // once the agent is done with that write: neither may absorb an
+          // unrelated wake that would vanish with it.
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's
@@ -16123,10 +16123,9 @@ export class AgentFramework {
       // coalesced batch it carries would go unassembled, a guard retry would
       // record the wake's author as its own, and a silent turn's resume would
       // take on the wake's prose routing. So the batch's other requests go
-      // back to the queue, wait for the turn as any wake does, and then start
-      // a turn of their own, as the quiesce path above parks them. The turn's
-      // continuations (isTurnContinuation) stay together, as they pass a
-      // quiesce together.
+      // back to the queue and wait for the turn as any wake does, as the
+      // quiesce path above parks them. The turn's continuations
+      // (isTurnContinuation) stay together, as they pass a quiesce together.
       if (requests.some((r) => resumesLogicalTurn(r.reason))) {
         const siblings = requests.filter((r) => !isTurnContinuation(r.reason));
         if (siblings.length > 0) {
@@ -16193,18 +16192,21 @@ export class AgentFramework {
       }
 
       // A wake whose sole cause was a write deferred for this agent
-      // (readsDeferredWrite) has nothing left to do once a request that
+      // (readsDeferredWrite), or a message stored for it as it arrived
+      // (readsStoredMessage), has nothing left to do once a request that
       // carried that write was answered and, if the wake carries a channel
       // and isn't marked ambient, the agent has published there since, or
       // once the write is gone from the queue and the store's current
-      // branch: it starts no turn (deferredWriteDone). A wake is marked
-      // ambient when its message's server tagged it chat:ambient, or for a
-      // render, every notice the render stands for: such a message asked
-      // nothing of the agent, so reading it was all its wake was for. One
-      // with neither tag is judged as addressed.
-      const read = requests.filter((r) => r.readsDeferredWrite !== undefined
-        && this.deferredWriteDone(agent, r.readsDeferredWrite,
-          r.channelId === undefined || r.ambient === true ? undefined : { serverId: r.source, channelId: r.channelId }));
+      // branch: it starts no turn (deferredWriteDone, storedMessageDone). A
+      // wake is marked ambient when its message's server tagged it
+      // chat:ambient, or for a render, every notice the render stands for:
+      // such a message asked nothing of the agent, so reading it was all its
+      // wake was for. One with neither tag is judged as addressed.
+      const read = requests.filter((r) => {
+        const to = r.channelId === undefined || r.ambient === true ? undefined : { serverId: r.source, channelId: r.channelId };
+        return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to)
+          : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to);
+      });
       if (read.length > 0) {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
@@ -16370,6 +16372,8 @@ export class AgentFramework {
         // take no other cause with it.
         readsDeferredWrite: requests.every((r) => r.readsDeferredWrite === trigger?.readsDeferredWrite)
           ? trigger?.readsDeferredWrite : undefined,
+        readsStoredMessage: requests.every((r) => r.readsStoredMessage === trigger?.readsStoredMessage)
+          ? trigger?.readsStoredMessage : undefined,
         // Every merged wake's handed line, each event's once: the turn's start
         // decides each (beginAgentTurn).
         wakeLines: mergeWakeLines(requests),
@@ -19941,7 +19945,7 @@ export class AgentFramework {
 
     // The turn has passed its gate, so from here it goes on with a copy of
     // its trigger without a batch wake's marks or the mark of a wake for a
-    // deferred write. A retry of it then comes back as an ordinary wake by
+    // write it reads. A retry of it then comes back as an ordinary wake by
     // whatever door it takes (a provider hold's release, the auxiliary park's
     // requeue, the tool-result guard's restart): this gate doesn't withdraw
     // it for finding its batches consumed, no withdrawal of the subject's
@@ -19951,8 +19955,8 @@ export class AgentFramework {
     // once this attempt's compile has moved the watermark past the write.
     // This frame's activeTurnTriggers entry keeps the trigger as it came; a
     // retry's frame records the copy it carries.
-    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined) {
-      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, ...retry } = trigger;
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined || trigger?.readsStoredMessage !== undefined) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, readsStoredMessage: _stored, ...retry } = trigger;
       trigger = retry;
     }
     // The wakes merged into this start are the turn's now: it reads them,
@@ -23603,7 +23607,7 @@ export class AgentFramework {
     const target = this.noticeTargetFor(agentName, `script ${scriptId} wake`);
     if (!target) throw new Error(`agent ${agentName} has no context to wake`);
     try {
-      const placement: { agent?: string; deferredId?: string } = {};
+      const placement: { agent?: string; deferredId?: string; messageId?: string } = {};
       const messageId = this.addMessage('user', [{ type: 'text', text: shown }], {
         source: 'code-execution-script',
         scriptId,
@@ -23614,7 +23618,7 @@ export class AgentFramework {
         reason: 'script:wake',
         source: 'code_execution',
         timestamp: Date.now(),
-        ...this.readsDeferredFor(placement, agentName),
+        ...this.readsWriteFor(placement, agentName),
       });
       this.emitTrace({
         type: 'message:added',
@@ -26665,23 +26669,36 @@ export class AgentFramework {
       // No row yet for a write drained from the queue and still to be stored
       // (un-acked); one stored and awaiting a sync is judged by its row.
       if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
-      const watermark = agent.getAnsweredWatermark();
-      const branch = cm.currentBranch().name;
-      if (!watermark || watermark.branch !== branch || row.sequence > watermark.sequence) return false;
-      return to === undefined || agent.publishedAfterReading(destinationKey(to), branch, row.sequence);
+      return this.writeAnswered(agent, cm, row, to);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
       return false;
     }
   }
 
-  /** The mark a wake for `agentName` takes for the write it was queued with
-   *  (`placement`, addMessage's out-param): set only when that write was
-   *  deferred for that agent, since a stored write's wake starts the turn
-   *  that reads it. The scheduler drops the wake once the write needs
-   *  nothing more of the agent (deferredWriteDone). */
-  private readsDeferredFor(placement: { agent?: string; deferredId?: string } | undefined, agentName: string): { readsDeferredWrite?: string } {
-    return placement?.deferredId && placement.agent === agentName ? { readsDeferredWrite: placement.deferredId } : {};
+  private storedMessageDone(agent: Agent, messageId: string, to: PublishDestination | undefined): boolean {
+    try {
+      const cm = agent.getContextManager();
+      const row = cm.getMessage(messageId);
+      if (!row) return true;
+      return this.writeAnswered(agent, cm, row, to);
+    } catch (error) {
+      console.error(`[wake] ${agent.name}: could not read whether stored message ${messageId} was read, so its wake stays:`, error);
+      return false;
+    }
+  }
+
+  private writeAnswered(agent: Agent, cm: ContextManager, row: StoredMessage, to: PublishDestination | undefined): boolean {
+    const watermark = agent.getAnsweredWatermark();
+    const branch = cm.currentBranch().name;
+    if (!watermark || watermark.branch !== branch || row.sequence > watermark.sequence) return false;
+    return to === undefined || agent.publishedAfterReading(destinationKey(to), branch, row.sequence);
+  }
+
+  private readsWriteFor(placement: { agent?: string; deferredId?: string; messageId?: string } | undefined, agentName: string): Pick<InferenceRequest, 'readsDeferredWrite' | 'readsStoredMessage'> {
+    if (!placement || placement.agent !== agentName) return {};
+    if (placement.deferredId) return { readsDeferredWrite: placement.deferredId };
+    return placement.messageId ? { readsStoredMessage: placement.messageId } : {};
   }
 
   // A module context's reads, edits and removals, and a process answer's,
