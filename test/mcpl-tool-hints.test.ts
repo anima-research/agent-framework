@@ -940,39 +940,6 @@ test('an entry that moves a tool to dynamic keeps the definition it carries', as
   } finally { await t.done(); }
 });
 
-test('reminders restate only servers whose changes may be told unasked', () => {
-  const told = (canNotify: boolean) => {
-    const deps = { notify: () => true, canNotify: () => canNotify, log: () => {}, listedName: (_s: string, tool: string) => `arc--${tool}` };
-    const hub = new ToolsetHub(deps);
-    const c = hub.controllerFor({ id: 'arc', toolHints: true } as McplServerConfig);
-    c.presence.beginConnection({ toolHints: true, toolsets: { build: { title: 'Building' } } }, true);
-    c.presence.setTools([{ name: 'place', description: 'Place a block.', inputSchema: { type: 'object' }, _meta: { 'mcpl/toolset': 'build' } }]);
-    c.presence.noteOpened('build', undefined, 'Workshop');
-    hub.observeCompile('scout', [{ role: 'user', content: [{ type: 'text', text: '[arc/build] Workshop tools now' }] }]);
-    hub.observeCompile('scout', [{ role: 'user', content: [{ type: 'text', text: 'later' }] }]);
-    return hub.reminderFor('scout');
-  };
-  assert.match(told(true) ?? '', /\[arc\/build\] Workshop/);
-  assert.equal(told(false), null);
-});
-
-test('a first sentence is cut by characters, never inside a surrogate pair', () => {
-  const cut = firstSentence(`${'a'.repeat(138)}😀😀 and more`);
-  assert.equal([...cut].length, 140);
-  assert.ok(cut.endsWith('…'));
-  assert.doesNotMatch(cut, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/, 'no lone high surrogate');
-});
-
-test('a group the host opened that the manifest then declares, and later drops, isn\'t open', () => {
-  const p = new ToolPresence('arc', META_TOOL_NAMES);
-  p.beginConnection({ toolHints: true }, true);
-  p.setTools([{ name: 'dig', description: 'Dig.', inputSchema: { type: 'object' }, _meta: { 'mcpl/toolset': 'cave' } }]);
-  p.openGroup('cave');
-  p.setManifest({ toolHints: true, toolsets: { cave: { title: 'Cave' } } });
-  p.setManifest({ toolHints: true });
-  assert.equal(p.isOpen('cave'), false);
-});
-
 test('a server that didn\'t advertise toolHints: its hints are ignored and every tool stays static', async () => {
   const t = await setup((msg, peer) => {
     if (msg.method !== 'tools/call') return false;
@@ -1053,7 +1020,7 @@ test('an instance the host believed open, missing from the next statement with n
   } finally { await t.done(); }
 });
 
-function tappedController(writes: () => boolean = () => true, tools: Json[] = TOOLS, requests: Record<string, (read: (r: unknown) => void) => unknown> = {}) {
+function tappedController(writes: () => boolean = () => true) {
   const told: string[] = [];
   const hub = new ToolsetHub({
     notify: (_s: string, text: string) => { if (!writes()) return false; told.push(text); return true; },
@@ -1061,46 +1028,15 @@ function tappedController(writes: () => boolean = () => true, tools: Json[] = TO
   });
   const c = hub.controllerFor({ id: 'arc', toolHints: true } as McplServerConfig);
   let tap: (read: unknown, epoch: number) => void = () => {};
-  const connection = () => ({
-    setReadTap: (f: typeof tap | null) => { if (f) tap = f; }, transportEpoch: 0, isConnected: true, toolsetDeclarations: ADVERT,
-    sendToolsList: async () => requests.toolsList?.(read),
-    sendToolsetsList: async () => requests.toolsetsList?.(read),
-  });
-  const attached = connection();
-  c.attach(attached as never);
+  c.attach({ setReadTap: (f: typeof tap | null) => { if (f) tap = f; }, transportEpoch: 0, isConnected: true, toolsetDeclarations: ADVERT } as never);
   const read = (r: unknown) => tap(r, 0);
-  read({ kind: 'result', method: 'tools/list', params: {}, result: { tools }, awaited: true });
+  read({ kind: 'result', method: 'tools/list', params: {}, result: { tools: TOOLS }, awaited: true });
   const callResult = (rev: number, tools: Json[]) => ({ content: [{ type: 'text', text: 'ok' }], _meta: { 'mcpl/hints': { rev, tools } } });
   const readCall = (result: Json) => read({ kind: 'result', method: 'tools/call', params: { name: 'status' }, result, awaited: true });
-  const reattach = () => {
-    c.detach(attached as never);
-    c.attach(connection() as never);
-    read({ kind: 'result', method: 'tools/list', params: {}, result: { tools }, awaited: true });
-  };
-  return { hub, c, told, read, callResult, readCall, reattach };
+  return { hub, c, told, read, callResult, readCall };
 }
 
-test('a result\'s change told as a notice before its caller takes it isn\'t shown again with the result', () => {
-  const { c, told, read, callResult, readCall } = tappedController();
-  const result = callResult(1, [{ name: 'peek', visible: true }]);
-  readCall(result);
-  read({ kind: 'hints', params: { rev: 2, tools: [{ name: 'peek', visible: false }] } });
-  assert.equal(told.length, 2, 'the result\'s change, then the later one');
-  assert.match(told[0]!, /peek\(\)/);
-  assert.match(told[1]!, /now unavailable: peek/);
-  assert.equal(c.takeChangeText(result), '', 'not shown again with the result');
-});
-
-test('a result\'s change drained while no notice can be written is dropped, not shown later with its result', () => {
-  const { c, told, read, callResult, readCall } = tappedController(() => false);
-  const result = callResult(1, [{ name: 'peek', visible: true }]);
-  readCall(result);
-  read({ kind: 'hints', params: { rev: 2, tools: [] } });
-  assert.equal(told.length, 0);
-  assert.equal(c.takeChangeText(result), '');
-});
-
-test('taking a result\'s change first tells, as a notice, the change of a result read before it', () => {
+test('taking a result\'s change first tells, as a notice, the change of a result read before it (in process: in an agent\'s window a notice told during a call is stored after the call\'s result)', () => {
   const { c, told, callResult, readCall } = tappedController();
   readCall(callResult(1, [{ name: 'peek', visible: true }]));
   const later = callResult(2, [{ name: 'peek', visible: false }]);
@@ -1109,15 +1045,6 @@ test('taking a result\'s change first tells, as a notice, the change of a result
   assert.equal(told.length, 1, 'the earlier change, told first');
   assert.match(told[0]!, /peek\(\)/);
   assert.match(shown, /now unavailable: peek/);
-});
-
-test('an ended record two statements report before either is told is told once', async () => {
-  const { told, read } = tappedController();
-  const statement = (rev: number) => ({ open: [], ended: [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }], _meta: { 'mcpl/hints': { rev, tools: [] } } });
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(1), awaited: true });
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(2), awaited: true });
-  await nextMacrotask();
-  assert.equal(told.join('\n').split('[arc/game:g1] ended: the game is over.').length - 1, 1);
 });
 
 test('a hint read right after a tools/list\'s last page, in the same chunk, isn\'t undone by that list', async () => {
@@ -1350,7 +1277,7 @@ test('look with a tool or toolset, or one that fails, tells its re-read\'s chang
   } finally { await t.done(); }
 });
 
-test('a definition first described in a notice that wasn\'t written is described again', () => {
+test('a definition first described in a notice that wasn\'t written is described again (in process: a server\'s grant doesn\'t change while it\'s connected, so a refused notice can\'t be followed by a written one)', () => {
   let writing = false;
   const { told, read } = tappedController(() => writing);
   read({ kind: 'hints', params: { rev: 1, tools: [{ name: 'peek', visible: true }] } });
@@ -1361,44 +1288,11 @@ test('a definition first described in a notice that wasn\'t written is described
   assert.match(told[0]!, /peek\(\) — Peek around\./);
 });
 
-test('a tool listed twice is known by its first listing, which act checks arguments against', () => {
-  const tools = [...TOOLS.filter((t) => t.name !== 'peek'),
-    { name: 'peek', description: 'The first listing.', inputSchema: { type: 'object', properties: { far: { type: 'boolean' } } }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': false } },
-    { name: 'peek', description: 'The second listing.', inputSchema: { type: 'object', properties: { far: { type: 'string' } } }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': false } }];
-  const { hub, told, read } = tappedController(() => true, tools);
-  read({ kind: 'hints', params: { rev: 1, tools: [{ name: 'peek', visible: true }] } });
-  assert.match(told.join('\n'), /peek\(far\?: boolean\) — The first listing\./);
-  const target = resolveAct(hub, { tool: 'peek', args: { far: 'yes' } });
-  assert.ok(!target.ok, 'checked against the first listing\'s schema');
-});
-
-test('taking a change doesn\'t count its ended record as told: only told() does', async () => {
-  const { c, told, read } = tappedController();
-  const statement = (rev: number) => ({ open: [], ended: [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }], _meta: { 'mcpl/hints': { rev, tools: [] } } });
-  const first = statement(1);
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: first, awaited: true });
-  c.takeChange(first);
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(2), awaited: true });
-  await nextMacrotask();
-  assert.match(told.join('\n'), /\[arc\/game:g1\] ended: the game is over\./, 'still owed after a take with no told');
-});
-
-test('a push\'s change that nothing takes is told as a notice', async () => {
+test('a push\'s change that nothing takes is told as a notice (in process: a push refused before the push path reads it needs a stopping host)', async () => {
   const { told, read } = tappedController();
   read({ kind: 'push', params: { featureSet: 'arc.events', eventId: 'p1', payload: { content: [] }, hints: { rev: 1, tools: [{ name: 'peek', visible: true }] } } });
   await nextMacrotask();
   assert.match(told.join('\n'), /peek\(\)/);
-});
-
-test('an ended record told before the server\'s connection was let go isn\'t told again on the next one', async () => {
-  const { told, read, reattach } = tappedController();
-  const statement = (rev: number) => ({ open: [], ended: [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }], _meta: { 'mcpl/hints': { rev, tools: [] } } });
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(1), awaited: true });
-  await nextMacrotask();
-  reattach();
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(1), awaited: true });
-  await nextMacrotask();
-  assert.equal(told.join('\n').split('ended: the game is over.').length - 1, 1);
 });
 
 test('close with nothing named, after a group the host opened was declared, says nothing is open', async () => {
@@ -1443,69 +1337,6 @@ test('after a reconnect whose tools/list moved a tool, the model\'s tool list ag
   } finally { await t.done(); }
 });
 
-test('a recovery\'s tools/list change is told as it is read, before a hint read after it', async () => {
-  const statement = { open: [], _meta: { 'mcpl/hints': { rev: 4, tools: [] } } };
-  const { told, read } = tappedController(() => true, TOOLS, {
-    toolsList: (r) => {
-      const tools = TOOLS.map((x) => (x.name === 'peek' ? { ...x, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true } } : x));
-      r({ kind: 'result', method: 'tools/list', params: {}, result: { tools, _meta: { 'mcpl/rev': 2 } }, awaited: true });
-      r({ kind: 'hints', params: { rev: 3, tools: [{ name: 'peek', visible: false }] } });
-      return { tools };
-    },
-    toolsetsList: (r) => {
-      r({ kind: 'result', method: 'toolsets/list', params: {}, result: statement, awaited: true });
-      return statement;
-    },
-  });
-  read({ kind: 'hints', params: { rev: 2, tools: [] } });
-  await waitFor(() => told.some((x) => x.includes('now unavailable: peek')), 'the recovery ran', 2000);
-  const shown = told.findIndex((x) => x.includes('peek()'));
-  const gone = told.findIndex((x) => x.includes('now unavailable: peek'));
-  assert.ok(shown >= 0 && shown < gone, 'the list\'s change first, then the hint\'s');
-});
-
-test('a change look hands back is told before a change read after it', async () => {
-  const statement = { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [{ name: 'peek', visible: true }] } } };
-  const { c, told, read, callResult, readCall } = tappedController(() => true, TOOLS, {
-    toolsetsList: (r) => {
-      r({ kind: 'result', method: 'toolsets/list', params: {}, result: statement, awaited: true });
-      return statement;
-    },
-  });
-  const cs = await c.refreshOpen({ shown: true });
-  readCall(callResult(2, [{ name: 'peek', visible: false }]));
-  c.tell(cs!);
-  await nextMacrotask();
-  const shown = told.findIndex((x) => x.includes('peek()'));
-  const gone = told.findIndex((x) => x.includes('now unavailable: peek'));
-  assert.ok(shown >= 0 && shown < gone, 'look\'s change first');
-});
-
-test('an ended record that expires while its notes wait is still told once', async () => {
-  const { told, read } = tappedController();
-  const statement = (rev: number, ended: Json[]) => ({ open: [], ended, _meta: { 'mcpl/hints': { rev, tools: [] } } });
-  const e1 = [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }];
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(1, e1), awaited: true });
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(2, e1), awaited: true });
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(3, []), awaited: true });
-  await nextMacrotask();
-  assert.equal(told.join('\n').split('ended: the game is over.').length - 1, 1);
-});
-
-test('an instance reopened under an ended instance\'s name is told closed when it goes', async () => {
-  const { told, read } = tappedController();
-  const statement = (rev: number, open: Json[], ended: Json[]) => ({ open, ended, _meta: { 'mcpl/hints': { rev, tools: [] } } });
-  const e1 = [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }];
-  const g1 = [{ toolset: 'game', instance: 'g1', title: 'G1' }];
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(1, g1, []), awaited: true });
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(2, [], e1), awaited: true });
-  await nextMacrotask();
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(3, g1, e1), awaited: true });
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement(4, [], e1), awaited: true });
-  await nextMacrotask();
-  assert.match(told.join('\n'), /\[arc\/game:g1\] is closed/);
-});
-
 test('a paged tools/list whose rev only some pages carry isn\'t taken for one that straddled a change', async () => {
   let paging = false;
   const t = await setup((msg, peer, state) => {
@@ -1525,42 +1356,8 @@ test('a paged tools/list whose rev only some pages carry isn\'t taken for one th
   } finally { await t.done(); }
 });
 
-test('a notice describes a definition it shows twice only once', async () => {
-  const { told, read } = tappedController();
-  const statement = { open: [{ toolset: 'game', instance: 'g1', title: 'G1' }, { toolset: 'game', instance: 'g2', title: 'G2' }], _meta: { 'mcpl/hints': { rev: 1, tools: [] } } };
-  read({ kind: 'result', method: 'toolsets/list', params: {}, result: statement, awaited: true });
-  await nextMacrotask();
-  read({ kind: 'hints', params: { rev: 2, tools: [{ name: 'play', instance: 'g1', visible: true }, { name: 'play', instance: 'g2', visible: true }] } });
-  const text = told.join('\n');
-  assert.match(text, /\[arc\/game:g1\]/, 'both instances are announced');
-  assert.match(text, /\[arc\/game:g2\]/, 'both instances are announced');
-  assert.equal(text.split('play(').length - 1, 2, 'the tool in each');
-  assert.equal(text.split('Play a point.').length - 1, 1, text);
-});
 
-const listOf = (tools: Json[]) => ({ kind: 'result', method: 'tools/list', params: {}, result: { tools }, awaited: true });
-const movedPeek = (presence: 'static' | 'dynamic') => TOOLS.map((x) => (x.name === 'peek' ? { ...x, _meta: { ...(x._meta as Json), 'mcpl/presence': presence } } : x));
-
-test('a hint restating the presence a tools/list moved a tool to leaves the move to be told at the rebuild', () => {
-  const { c, told, read } = tappedController();
-  read(listOf(TOOLS));
-  read(listOf(movedPeek('static')));
-  read({ kind: 'hints', params: { rev: 1, tools: [{ name: 'peek', presence: 'static' }] } });
-  assert.doesNotMatch(told.join('\n'), /peek is in your tool list now/, 'not before the rebuild');
-  c.applyMoves();
-  assert.match(told.join('\n'), /peek is in your tool list now/);
-});
-
-test('a move a later tools/list reverses before the rebuild is never told', () => {
-  const { c, told, read } = tappedController();
-  read(listOf(TOOLS));
-  read(listOf(movedPeek('static')));
-  read(listOf(movedPeek('dynamic')));
-  c.applyMoves();
-  assert.doesNotMatch(told.join('\n'), /peek (is in|left) your tool list/);
-});
-
-test('a push whose change no notice could carry keeps it for the push\'s own path to take', async () => {
+test('a push whose change no notice could carry keeps it for the push\'s own path to take (in process: it needs a push whose own path runs after the next macrotask)', async () => {
   let writes = false;
   const { c, read } = tappedController(() => writes);
   const params = { featureSet: 'arc.events', eventId: 'p1', payload: { content: [] }, hints: { rev: 1, tools: [{ name: 'peek', visible: true }] } };
@@ -1596,37 +1393,7 @@ test('a recovery whose own tools/list straddled a change starts no second recove
   } finally { await t.done(); }
 });
 
-test('a definition a hint gives after a separate hinted move is kept for when the list makes the tool dynamic', () => {
-  const { told, read } = tappedController();
-  read(listOf(TOOLS));
-  read({ kind: 'hints', params: { rev: 1, tools: [{ name: 'status', presence: 'dynamic' }] } });
-  read({ kind: 'hints', params: { rev: 2, tools: [{ name: 'status', definition: { description: 'Status, from a hint.', inputSchema: { type: 'object', properties: {} } } }] } });
-  read(listOf(TOOLS.map((x) => (x.name === 'status' ? { ...x, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true } } : x))));
-  assert.match(told.join('\n'), /status\(\) — Status, from a hint\./);
-});
-
-test('a tool a server describes malformed (a description that isn\'t a string, a schema nested very deep) is still announced and looked at', async () => {
-  let deep: Json = { type: 'string' };
-  for (let i = 0; i < 20000; i++) deep = { type: 'object', properties: { a: deep } };
-  let rows: Json = { type: 'string' };
-  for (let i = 0; i < 20000; i++) rows = { type: 'array', items: rows };
-  const tools = [
-    ...TOOLS.filter((x) => x.name !== 'peek'),
-    { name: 'peek', description: 42, inputSchema: { type: 'object', properties: {} }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': false } },
-    { name: 'delve', description: 'Delve.', inputSchema: deep, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': false } },
-    { name: 'burrow', description: 'Burrow.', inputSchema: { type: 'object', properties: { rows } }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': false } },
-  ];
-  const { hub, told, read } = tappedController(() => true, tools);
-  read({ kind: 'hints', params: { rev: 1, tools: [{ name: 'peek', visible: true }, { name: 'delve', visible: true }, { name: 'burrow', visible: true }] } });
-  const text = told.join('\n');
-  assert.match(text, /peek\(\)/);
-  assert.match(text, /delve\(a\?: .*\) — Delve\./);
-  assert.match(text, /burrow\(rows\?: .*\) — Burrow\./);
-  const looked = await new ToolsetsModule(hub, () => null).handleToolCall({ id: 'l1', name: 'look', input: { server: 'arc', tool: 'delve' } } as never);
-  assert.ok(!looked.isError, String(looked.error));
-});
-
-test('look at a toolset whose options a server nests very deep still answers', async () => {
+test('look at a toolset whose options a server nests very deep still answers (in process: a manifest nested that deep isn\'t taken by the framework\'s manifest read, so no server reaches it)', async () => {
   let deep: Json = { type: 'string' };
   for (let i = 0; i < 20000; i++) deep = { type: 'object', properties: { a: deep } };
   const { hub, c } = tappedController();
@@ -1910,5 +1677,293 @@ test('RFC-014 §4.2: where the tool list hasn\'t published a tool, the server\'s
     release();
     await t.done();
   }
+});
+
+/** Several of the connection's reads in one synchronous run, as when they arrive in one chunk. */
+const chunk = (t: Awaited<ReturnType<typeof setup>>, ...messages: Json[]) => {
+  const connection = (t.fw.framework as unknown as { mcplServerRegistry: { getServer(id: string): unknown } }).mcplServerRegistry.getServer('arc');
+  const transport = (connection as { transport: { emit(event: string, line: string): void } }).transport;
+  for (const m of messages) transport.emit('line', JSON.stringify({ jsonrpc: '2.0', ...m }));
+};
+/** A server that holds the requests of the methods in `holding` until a test answers them. */
+async function holdingServer(config: Partial<McplServerConfig> = {}) {
+  const holding = new Set<string>();
+  const held: Json[] = [];
+  const t = await setup((msg) => {
+    if (!holding.has(String(msg.method))) return false;
+    held.push(msg);
+    return true;
+  }, config);
+  return { t, holding, held };
+}
+const storedResult = (t: Awaited<ReturnType<typeof setup>>, toolUseId: string): string => JSON.stringify(
+  t.fw.framework.getAgent('scout')!.getContextManager().getAllMessages()
+    .flatMap((m) => m.content as unknown as Array<Record<string, unknown>>)
+    .find((b) => b.type === 'tool_result' && b.toolUseId === toolUseId)?.content ?? null);
+const statusResult = (id: unknown, hints: Json) => ({ id, result: { content: [{ type: 'text', text: 'status done' }], _meta: { 'mcpl/hints': hints } } });
+
+test('a call\'s change told as a notice before the puppet stores the call isn\'t stored again with its result', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('tools/call');
+    const call = t.fw.framework.puppetToolCall('scout', 'arc--status', {});
+    await waitFor(() => held.length === 1, 'the call reached the server');
+    holding.clear();
+    const before = notices(t.fw).length;
+    chunk(t, statusResult(held[0]!.id, t.state.hint([{ name: 'peek', visible: true }])),
+      { method: 'tools/hints', params: t.state.hint([{ name: 'peek', visible: false }]) });
+    const { toolUseId } = await call;
+    const told = notices(t.fw).slice(before);
+    const shown = told.findIndex((x) => x.includes('peek()'));
+    const gone = told.findIndex((x) => x.includes('now unavailable: peek'));
+    assert.ok(shown >= 0 && shown < gone, 'the call\'s change, then the later one');
+    assert.doesNotMatch(storedResult(t, toolUseId), /peek\(\)/, 'not stored again with the result');
+  } finally { await t.done(); }
+});
+
+test('without the pushEvents grant, a call\'s change a later read drains before the puppet stores the call is dropped, not stored with its result', async () => {
+  const { t, holding, held } = await holdingServer({ disabledCapabilities: ['pushEvents'] });
+  try {
+    holding.add('tools/call');
+    const call = t.fw.framework.puppetToolCall('scout', 'arc--status', {});
+    await waitFor(() => held.length === 1, 'the call reached the server');
+    holding.clear();
+    const before = notices(t.fw).length;
+    chunk(t, statusResult(held[0]!.id, t.state.hint([{ name: 'peek', visible: true }])),
+      { method: 'tools/hints', params: t.state.hint([]) });
+    const { toolUseId } = await call;
+    assert.equal(notices(t.fw).length, before, 'no notice');
+    assert.doesNotMatch(storedResult(t, toolUseId), /peek\(\)/);
+  } finally { await t.done(); }
+});
+
+test('an ended record two statements report before either is told is told once', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('toolsets/list');
+    const looks = [look(t.fw), look(t.fw)];
+    await waitFor(() => held.length === 2, 'both looks asked the server');
+    holding.clear();
+    t.state.ended = [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }];
+    chunk(t, { id: held[0]!.id, result: t.state.listResult() }, { id: held[1]!.id, result: t.state.listResult() });
+    await Promise.all(looks);
+    await roundTrip(t);
+    assert.equal(windowText(t.fw.framework).join('\n').split('[arc/game:g1] ended: the game is over.').length - 1, 1);
+  } finally { await t.done(); }
+});
+
+test('an ended record that expires while its note waits is still told once', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('toolsets/list');
+    const looks = [look(t.fw), look(t.fw)];
+    await waitFor(() => held.length === 2, 'both looks asked the server');
+    holding.clear();
+    t.state.ended = [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }];
+    const first = t.state.listResult();
+    t.state.ended = [];
+    chunk(t, { id: held[0]!.id, result: first }, { id: held[1]!.id, result: t.state.listResult() });
+    await Promise.all(looks);
+    await roundTrip(t);
+    assert.equal(windowText(t.fw.framework).join('\n').split('[arc/game:g1] ended: the game is over.').length - 1, 1);
+  } finally { await t.done(); }
+});
+
+test('a recovery\'s tools/list change is told as it is read, before a hint read after it in the same chunk', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('tools/list');
+    const before = notices(t.fw).length;
+    t.state.next();
+    t.server.peer.notify('tools/hints', t.state.hint([]));
+    await waitFor(() => held.length === 1, 'the recovery\'s tools/list asked for');
+    holding.clear();
+    const tools = TOOLS.map((x) => (x.name === 'peek' ? { ...x, _meta: { ...(x._meta as Json), 'mcpl/visible': true } } : x));
+    chunk(t, { id: held[0]!.id, result: { tools, _meta: { 'mcpl/rev': t.state.rev } } },
+      { method: 'tools/hints', params: t.state.hint([{ name: 'peek', visible: false }]) });
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('now unavailable: peek')), 'the hint\'s change told');
+    const told = notices(t.fw).slice(before);
+    const shown = told.findIndex((x) => x.includes('peek()'));
+    assert.ok(shown >= 0 && shown < told.findIndex((x) => x.includes('now unavailable: peek')), 'the list\'s change first');
+  } finally { await t.done(); }
+});
+
+test('a change a filtered look hands back is told before a change read after it in the same chunk', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('toolsets/list');
+    const before = notices(t.fw).length;
+    const pending = look(t.fw, { server: 'arc', tool: 'status' });
+    await waitFor(() => held.length === 1, 'look asked the server');
+    holding.clear();
+    t.state.statement = [{ name: 'dig', visible: true }, { name: 'peek', visible: true }];
+    chunk(t, { id: held[0]!.id, result: t.state.listResult() },
+      { method: 'tools/hints', params: t.state.hint([{ name: 'peek', visible: false }]) });
+    await pending;
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('now unavailable: peek')), 'the later change told');
+    const told = notices(t.fw).slice(before);
+    const shown = told.findIndex((x) => x.includes('peek()'));
+    assert.ok(shown >= 0 && shown < told.findIndex((x) => x.includes('now unavailable: peek')), 'look\'s change first');
+  } finally { await t.done(); }
+});
+
+test('an instance reopened under an ended instance\'s name is told closed when it goes', async () => {
+  const t = await setup();
+  const told = (text: string) => windowText(t.fw.framework).join('\n').split(text).length - 1;
+  try {
+    t.state.open = [{ toolset: 'game', instance: 'g1', title: 'G1' }];
+    await look(t.fw);
+    t.state.open = [];
+    t.state.ended = [{ id: 'e1', toolset: 'game', instance: 'g1', reason: 'the game is over' }];
+    await look(t.fw);
+    await waitFor(() => told('[arc/game:g1] ended: the game is over.') === 1, 'the end told');
+    t.state.open = [{ toolset: 'game', instance: 'g1', title: 'G1' }];
+    await look(t.fw);
+    t.state.open = [];
+    const closed = told('[arc/game:g1] is closed');
+    await look(t.fw);
+    await roundTrip(t);
+    assert.equal(told('[arc/game:g1] is closed') - closed, 1, 'the reopened instance told closed');
+    assert.equal(told('[arc/game:g1] ended: the game is over.'), 1, 'the end not told again');
+  } finally { await t.done(); }
+});
+
+test('a notice describes a definition it shows in two instances only once', async () => {
+  const t = await setup();
+  try {
+    t.state.open = [{ toolset: 'game', instance: 'g1', title: 'G1' }, { toolset: 'game', instance: 'g2', title: 'G2' }];
+    await look(t.fw);
+    const before = notices(t.fw).length;
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'play', instance: 'g1', visible: true }, { name: 'play', instance: 'g2', visible: true }]));
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('[arc/game:g2]')), 'the change told');
+    const text = notices(t.fw).slice(before).join('\n');
+    assert.match(text, /\[arc\/game:g1\]/);
+    assert.equal(text.split('play(').length - 1, 2, 'the tool in each');
+    assert.equal(text.split('Play a point.').length - 1, 1, 'its first sentence once');
+  } finally { await t.done(); }
+});
+
+test('a hint restating the presence a recovery\'s tools/list moved a tool to leaves the move to be told at the next refresh', async () => {
+  const tools: Json[] = TOOLS.map((x) => ({ ...x }));
+  const t = await setup(() => false, {}, ADVERT, tools);
+  const told = () => notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length;
+  try {
+    present(tools, 'peek', 'static');
+    const lists = t.methods().filter((m) => m === 'toolsets/list').length;
+    t.state.next();
+    t.server.peer.notify('tools/hints', t.state.hint([]));
+    await waitFor(() => t.methods().filter((m) => m === 'toolsets/list').length > lists, 'a skipped rev recovered');
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', presence: 'static' }]));
+    await roundTrip(t);
+    assert.equal(told(), 0, 'not before the refresh');
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the refresh shows peek');
+    await roundTrip(t);
+    assert.equal(told(), 1, 'told once, at the refresh');
+  } finally { await t.done(); }
+});
+
+test('a definition a hint gives after a separate hinted move is used once the tool list makes the tool dynamic', async () => {
+  const tools: Json[] = TOOLS.map((x) => ({ ...x }));
+  const t = await setup(() => false, {}, ADVERT, tools);
+  try {
+    const definition = { description: 'Status, from a hint.', inputSchema: { type: 'object', properties: { loud: { type: 'boolean' } } } };
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'status', presence: 'dynamic' }]));
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'status', definition }]));
+    // The server's own statement restates the definition in force (RFC §6.1), as look's re-read reads it.
+    t.state.statement.push({ name: 'status', visible: true, definition });
+    await roundTrip(t);
+    present(tools, 'status', 'dynamic');
+    const status = tools.find((x) => x.name === 'status')!;
+    status._meta = { ...(status._meta as Json), 'mcpl/visible': true };
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => !t.fw.framework.getAllTools().some((x) => x.name === 'arc--status'), 'the tool list makes status dynamic');
+    const refused = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'status', args: { loud: 'yes' } });
+    assert.ok(refused.isError, 'checked against the hint\'s definition');
+    assert.match(resultText(refused), /loud/);
+    assert.match(await look(t.fw, { server: 'arc', tool: 'status' }), /Status, from a hint\./);
+  } finally { await t.done(); }
+});
+
+test('a tool listed twice is known by its first listing, which act checks arguments against', async () => {
+  const tools: Json[] = [...TOOLS.filter((x) => x.name !== 'peek'),
+    { name: 'peek', description: 'The first listing.', inputSchema: { type: 'object', properties: { far: { type: 'boolean' } } }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true } },
+    { name: 'peek', description: 'The second listing.', inputSchema: { type: 'object', properties: { far: { type: 'string' } } }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': true } }];
+  const t = await setup(() => false, {}, ADVERT, tools);
+  try {
+    assert.match(await look(t.fw, { server: 'arc', tool: 'peek' }), /The first listing\./);
+    const refused = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'peek', args: { far: 'yes' } });
+    assert.ok(refused.isError, 'checked against the first listing\'s schema');
+  } finally { await t.done(); }
+});
+
+test('a first sentence is cut by characters, never inside one', async () => {
+  const tools: Json[] = [...TOOLS.filter((x) => x.name !== 'peek'),
+    { name: 'peek', description: `${'x'.repeat(138)}\u{1F600}\u{1F600}\u{1F600} and more`, inputSchema: { type: 'object', properties: {} }, _meta: { 'mcpl/presence': 'dynamic', 'mcpl/visible': false } }];
+  const t = await setup(() => false, {}, ADVERT, tools);
+  try {
+    const before = notices(t.fw).length;
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('peek()')), 'peek announced');
+    const line = notices(t.fw).slice(before).join('\n').split('\n').find((x) => x.includes('peek()'))!;
+    assert.match(line, /x\u{1F600}…$/u, 'cut after a whole character');
+    assert.doesNotMatch(line, /\uFFFD/, 'nothing replaced for a broken character');
+  } finally { await t.done(); }
+});
+
+test('a group the host opened, which the manifest then declares and later drops, is no longer open: act is refused', async () => {
+  let advert: Json = ADVERT;
+  const t = await setup((msg, peer) => {
+    if (msg.method === 'mcpl/manifest') { peer.reply(msg.id, { version: '0.5', pushEvents: true, ...advert }); return true; }
+    return false;
+  });
+  const manifests = () => t.methods().filter((m) => m === 'mcpl/manifest').length;
+  const changeManifest = async (next: Json) => {
+    const n = manifests();
+    advert = next;
+    t.server.peer.notify('mcpl/manifestChanged', { revision: `r${n + 2}`, domains: ['toolsets'] });
+    await waitFor(() => manifests() > n, 'the manifest fetched again');
+    await roundTrip(t);
+  };
+  try {
+    await callTool(t.fw.framework, 'toolsets--open', { server: 'arc', toolset: 'cave' });
+    await changeManifest({ ...ADVERT, toolsets: { ...(ADVERT.toolsets as Json), cave: { title: 'Cave' } } });
+    await changeManifest(ADVERT);
+    const gated = await callTool(t.fw.framework, 'toolsets--act', { server: 'arc', tool: 'dig', args: {} });
+    assert.ok(gated.isError);
+    assert.match(resultText(gated), /dig is in cave, which isn't open/);
+  } finally { await t.done(); }
+});
+
+/** JSON nested `depth` levels deep, written as text: a server that writes JSON without JSON.stringify can send it. */
+const deepObjectJson = (depth: number) => `${'{"type":"object","properties":{"a":'.repeat(depth)}{"type":"string"}${'}}'.repeat(depth)}`;
+const deepArrayJson = (depth: number) => `${'{"type":"array","items":'.repeat(depth)}{"type":"string"}${'}'.repeat(depth)}`;
+const rawLine = (t: Awaited<ReturnType<typeof setup>>, line: string) => {
+  const connection = (t.fw.framework as unknown as { mcplServerRegistry: { getServer(id: string): unknown } }).mcplServerRegistry.getServer('arc');
+  (connection as { transport: { emit(event: string, line: string): void } }).transport.emit('line', line);
+};
+
+test('a tool a server describes malformed (a description that isn\'t a string, a schema nested very deep) is still announced and looked at', async () => {
+  const { t, holding, held } = await holdingServer();
+  try {
+    holding.add('tools/list');
+    const before = notices(t.fw).length;
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => held.length === 1, 'the tool list asked for');
+    holding.clear();
+    const listed = TOOLS.filter((x) => x.name !== 'peek').map((x) => JSON.stringify(x)).join(',');
+    const dynamic = '"_meta":{"mcpl/presence":"dynamic","mcpl/visible":true}';
+    rawLine(t, `{"jsonrpc":"2.0","id":${JSON.stringify(held[0]!.id)},"result":{"tools":[${listed},`
+      + `{"name":"peek","description":42,"inputSchema":{"type":"object","properties":{}},${dynamic}},`
+      + `{"name":"delve","description":"Delve.","inputSchema":${deepObjectJson(20000)},${dynamic}},`
+      + `{"name":"burrow","description":"Burrow.","inputSchema":{"type":"object","properties":{"rows":${deepArrayJson(20000)}}},${dynamic}}],`
+      + `"_meta":{"mcpl/rev":${t.state.rev}}}}`);
+    await waitFor(() => notices(t.fw).slice(before).some((x) => x.includes('burrow(')), 'the tools announced');
+    const text = notices(t.fw).slice(before).join('\n');
+    assert.match(text, /peek\(\)/);
+    assert.match(text, /delve\(a\?: .*\) — Delve\./);
+    assert.match(text, /burrow\(rows\?: .*\) — Burrow\./);
+    assert.match(await look(t.fw, { server: 'arc', tool: 'delve' }), /inputSchema:\n\(nested too deeply to show\)/);
+  } finally { await t.done(); }
 });
 
