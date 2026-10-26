@@ -624,6 +624,15 @@ export interface InferenceRequest {
    */
   ambient?: true;
   /**
+   * Host-owned: true when the triggering message's server marked it a
+   * `chat:system` notice (RFC-001 rev 3): an event about the place, such as
+   * a join or the weather changing, not something anyone said. Such a wake
+   * names no channel for its turn's plain speech, though it carries
+   * `channelId`: a turn it starts alone resolves its locus as a heartbeat's
+   * does.
+   */
+  systemNotice?: true;
+  /**
    * Who spoke the message that triggered this inference, as an adapter-
    * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display
    * name. Undefined for wakes without an author (heartbeat, timers, module
