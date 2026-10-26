@@ -11,7 +11,7 @@
     included, as the rewind's order always was.
   - **The marker's count** is the number of turns set aside that the
     refused requests carried. The refused reply is removed without being
-    counted, and a row that carries nothing a request sends is passed over
+    counted, and a row the request's sanitizer leaves empty is passed over
     and left in place.
   - **When the rewind gives up,** because nothing the refused request
     carried is left or because it has reached `maxRewinds`, it removes the
@@ -19,6 +19,8 @@
     the rewind off, the refused reply stays.
   - **A stored row the refused request didn't carry**, such as a tuned-out
     channel's traffic or a message stored while the request streamed, is
-    left in place and isn't counted.
-  - **The shed after inference exhaustion** passes over rows that carry
-    nothing in the same way.
+    left in place and isn't counted, unless it belongs to a tool exchange
+    the shed takes whole: a call's stored result, or a row stored between a
+    call and its result.
+  - **The shed after inference exhaustion** passes over rows the sanitizer
+    leaves empty in the same way.

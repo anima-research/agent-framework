@@ -27796,7 +27796,7 @@ export class AgentFramework {
     if (!rec) {
       console.error(
         `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
-        `history is only system markers. Manual repair needed.`,
+        `history holds only system markers and rows a request leaves empty. Manual repair needed.`,
       );
       return;
     }

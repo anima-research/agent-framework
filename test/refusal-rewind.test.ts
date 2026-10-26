@@ -136,8 +136,15 @@ class Surface implements Module {
   getTools(): ToolDefinition[] { return [{ name: 'look', description: 'Look at something.', inputSchema: { type: 'object', properties: {} } }]; }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     if (this.heardWhileLooking) {
+      const heard = new Promise<void>((resolve) => {
+        const off = this.framework!.onTrace((trace) => {
+          if (trace.type === 'message:added' && (trace as { source?: string }).source === 'external-message') { off(); resolve(); }
+        });
+      });
       this.framework!.pushEvent({ type: 'external-message', source: 'tui', content: this.heardWhileLooking, metadata: {}, triggerInference: false } as never);
-      await new Promise((r) => setTimeout(r, 30));
+      let bound: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([heard, new Promise((r) => { bound = setTimeout(r, 5000); })]);
+      clearTimeout(bound);
     }
     return { success: true, data: 'what the tool saw' };
   }
@@ -358,6 +365,7 @@ test("when the rewind gives up at its cap, no later request carries the refused 
     await rig.say('a new question', 4);
     assert.equal(rig.requests.length, 4, 'the turn, the refused request, its refused retry, and the next turn');
     assert.ok(!rig.texts(rig.requests[3]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+    assert.ok(rig.texts(rig.requests[3]!).some((t) => t.includes('reply 1')), 'and still carries the history before the shed turn');
   } finally { await rig.close(); }
 });
 
