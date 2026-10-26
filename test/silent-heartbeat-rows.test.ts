@@ -795,7 +795,7 @@ describe('replies to a [Continue] turn', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
-  it('a reply resumed after a provider cooldown follows the message that arrived during it, not [Continue]', async () => {
+  it("a reply resumed after a provider cooldown follows the message that arrived during it, not [Continue], and the message's wake then starts a turn of its own", async () => {
     // A reply to [Continue] stores a tool round and restarts at its boundary,
     // and the restart meets a 429 that holds the turn. A message arrives
     // during the cooldown, so the resumed compile ends on it, while the
@@ -814,28 +814,37 @@ describe('replies to a [Continue] turn', () => {
       membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
       await wake(x, ordinaryEvent('hello'));
       membrane.queues.push([nearCapToolRound('sig-c', 'checking', 'c-t1')], accelerationLimit(),
-        [createMockResponse(signed('sig-r', 'resumed reply'))]);
+        [createMockResponse(signed('sig-r', 'resumed reply'))],
+        // The message's wake, which the cooldown held beside the restart,
+        // starts a turn of its own once the resumed turn ends.
+        [createMockResponse(signed('sig-w', 'wake reply'))]);
       (x.framework as any).pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
       await x.framework.runUntilIdle();
       assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is held');
       await wake(x, ordinaryEvent('arrived during the cooldown'));
       await waitFor(() => internal.providerAccelerationCooldowns.size === 0, 'the cooldown\'s release');
       await x.framework.runUntilIdle();
-      assert.equal(membrane.calls.length, 4, 'first, the continued reply, its held restart, the resumed attempt');
+      assert.equal(membrane.calls.length, 5, "first, the continued reply, its held restart, the resumed attempt, the message's wake's own turn");
 
       const resumed = membrane.calls[3]!.messages;
       assert.equal(textOf(resumed.at(-1)!), 'arrived during the cooldown');
       assert.ok(resumed.some((m) => textOf(m) === '[Continue]'), 'the round renders its [Continue]');
       assert.equal(rowWith(x.framework, 'resumed reply').metadata?.promptedBy, undefined);
+      // The message's wake starts its own turn after the resumed one, which
+      // already read the message: it has nothing new to read, so its request
+      // ends on [Continue].
+      assert.equal(textOf(membrane.calls[4]!.messages.at(-1)!), '[Continue]');
 
-      // Later, the window folds the round: no [Continue] is left to render.
+      // Later, the window folds the round, and the round's [Continue] with it.
       strategy.omit = true;
       membrane.queues.push([createMockResponse(signed('sig-later', 'later reply'))]);
       await wake(x, ordinaryEvent('later'));
-      const later = membrane.calls[4]!.messages;
+      const later = membrane.calls[5]!.messages;
       const replyAt = later.findIndex((m) => textOf(m) === 'resumed reply');
       assert.equal(textOf(later[replyAt - 1]!), 'arrived during the cooldown');
-      assert.ok(!later.some((m) => textOf(m) === '[Continue]'));
+      // The round's [Continue] went with the round. The one left is the wake's
+      // own turn's, before its reply.
+      assert.deepEqual(later.flatMap((m, i) => (textOf(m) === '[Continue]' ? [textOf(later[i + 1]!)] : [])), ['wake reply']);
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 

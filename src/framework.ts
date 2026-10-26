@@ -1879,11 +1879,12 @@ export interface HostModeStatus {
    * turn token held with no stream to cancel and no check ahead to stop it
    * at (a puppet tool turn, a store surgery's reservation, a turn finishing
    * its last delivery), or a turn with no stream that hasn't reached its
-   * next check, such as one in a hook that hasn't returned. A turn whose
-   * stream the abandon cancelled isn't listed, even one still running when
-   * the grace runs out, as one whose tool-result guard waits on its speech
-   * may be. Present only after an abandon that left such turns behind, while
-   * the host stays quiesced. */
+   * next check, such as one in a hook that hasn't returned, or a turn whose
+   * stream's cancel threw with no check ahead, so that its stream goes on.
+   * A turn whose stream the abandon cancelled isn't listed, even one still
+   * running when the grace runs out, as one whose tool-result guard waits on
+   * its speech may be. Present only after an abandon that left such turns
+   * behind, while the host stays quiesced. */
   unabandonable?: string[];
 }
 
@@ -4404,10 +4405,10 @@ export class AgentFramework {
     // stop() then fails with it among the others, and an owned store stays
     // open for another stop(), as after a failed module stop. A step added
     // here goes through step(), or catches into shutdownErrors as the waits
-    // below do. step() says whether its step ran without throwing.
+    // below do.
     const shutdownErrors: unknown[] = [];
-    const step = (run: () => void): boolean => {
-      try { run(); return true; } catch (error) { shutdownErrors.push(error); return false; }
+    const step = (run: () => void): void => {
+      try { run(); } catch (error) { shutdownErrors.push(error); }
     };
     // No MCP server is admitted from here on (stopHasBegun): none is launched
     // or dialed while the rest are being closed, so none outlives the
@@ -4446,10 +4447,12 @@ export class AgentFramework {
     // a turn's start a stop reaches does: the continuation would start only
     // after a start(), in a lifecycle where its logical turn is gone
     // (openLogical, below). Before the holds and the parks go, so the
-    // continuation leaves them with its turn.
+    // continuation leaves them with its turn. Each drop is a step of its
+    // own, so one that throws leaves the next agent's turn to end all the
+    // same, as stop()'s other loops do.
     step(() => {
       for (const agentName of this.pendingContinuationAgents()) {
-        this.dropContinuations(agentName, { kind: 'shutdown', why: 'the framework is stopping' });
+        step(() => this.dropContinuations(agentName, { kind: 'shutdown', why: 'the framework is stopping' }));
       }
     });
     // A stopped host must never hang behind its own cooldown.
@@ -4474,8 +4477,14 @@ export class AgentFramework {
     const uncancelled = new Set<string>();
     for (const agent of this.agents.values()) {
       if ('stream' in agent.state && agent.state.stream) {
-        this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'shutdown');
-        if (!step(() => agent.cancelStream())) uncancelled.add(agent.name);
+        try {
+          this.cancelUnderMark(agent, 'shutdown', () => agent.cancelStream());
+        } catch (error) {
+          shutdownErrors.push(error);
+          uncancelled.add(agent.name);
+          console.error(`[turn] ${agent.name}: the stream's cancel threw at stop(), and stop() rejects with that error, ` +
+            `in an AggregateError if other steps failed too: ${describeFailureWithFrames(error)}`);
+        }
       }
     }
 
@@ -7435,11 +7444,21 @@ export class AgentFramework {
       const checkWindow = agent ? this.checkAhead.get(agent) : undefined;
       if (agent && stream) {
         console.error(`[host-mode] abandoning in-flight turn for ${agentName}`);
-        this.frameworkCancelledStreams.set(
-          `${agent.name}:${agent.streamId}`,
-          'quiesce_abandoned',
-        );
-        stream.cancel();
+        try {
+          this.cancelUnderMark(agent, 'quiesce_abandoned', () => stream.cancel());
+        } catch (error) {
+          // The stream goes on, and its turn with it. A frame with a check
+          // ahead is still marked below, and ends at that check; any other
+          // is listed now, and the abandon goes on to the next agent.
+          if (!checkWindow) {
+            console.error(`[host-mode] cannot abandon turn for ${agentName}: its stream's cancel threw, so its stream goes on, ` +
+              `and the turn holds its token until the stream ends or an abort or a stop ends it: ${describeFailureWithFrames(error)}`);
+            unabandonable.push(agentName);
+            continue;
+          }
+          console.error(`[host-mode] abandoning in-flight turn for ${agentName}: its stream's cancel threw, so the turn ends ` +
+            `at its next check instead: ${describeFailureWithFrames(error)}`);
+        }
         // A frame that waits with a window while the agent still holds a
         // stream (the tool-result guard's wait, which holds the round's
         // finished stream) is marked too, so the grace listing names the
@@ -10250,8 +10269,11 @@ export class AgentFramework {
     ok: boolean;
     error?: string;
     agentName?: string;
-    /** Agent state at queue time — 'idle' means the turn starts on the next
-     *  scheduler pass; anything else means it runs after the current turn. */
+    /** Agent state at queue time — 'idle' means no turn holds the agent, so
+     *  the turn starts on the next scheduler pass unless a provider hold (a
+     *  provider's stated wait, or a capacity cooldown) holds it until the hold
+     *  ends, or a start of the agent's that waits for an auxiliary call to
+     *  finish goes first; anything else means it runs after the current turn. */
     agentStatus?: string;
     /** True when the host is quiesced: the wake is PARKED, not running, until resume(). */
     quiesced?: boolean;
@@ -10261,7 +10283,9 @@ export class AgentFramework {
     if (!name || !agent) {
       return { ok: false, error: `Unknown agent: ${String(agentName ?? '(none registered)')}` };
     }
-    const agentStatus = this.activeTurnTokens.has(name) && agent.state.status === 'idle'
+    // A turn is alive while its continuation is on its way, token or not
+    // (hasTurn), as the scheduler, which runs this wake, reads it.
+    const agentStatus = this.hasTurn(name) && agent.state.status === 'idle'
       ? 'idle+turn-alive'
       : agent.state.status;
     this.pendingRequests.push({
@@ -10362,8 +10386,11 @@ export class AgentFramework {
     /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
      *  until resume rather than running. */
     quiesced?: boolean;
-    /** For `nudge`: agent state at queue time ('idle' = runs immediately,
-     *  else it runs once the current turn settles). */
+    /** For `nudge`: agent state at queue time ('idle' = no turn holds the
+     *  agent, so it runs on the next pass unless a provider hold, a stated
+     *  wait or a capacity cooldown, holds it, or a start of the agent's that
+     *  waits for an auxiliary call to finish goes first; else it runs once the
+     *  current turn settles). */
     agentStatus?: string;
     /** For `release-provider-wait`: the waits released. */
     released?: Array<{ model: string; until: string | null }>;
@@ -12985,19 +13012,25 @@ export class AgentFramework {
           }
 
           // A boundary that ends the stream (a result that ends the turn, a restart, a stopping framework) has
-          // stored the stream's last reply above: its final row. Its results go nowhere this stream sends.
+          // stored the stream's last reply above: its final row. Its results go nowhere this stream sends. A stream
+          // whose cancel throws (below) goes on only waiting for those results, so that reply stays its last.
           if (currentState.stream && (shouldEndTurn || overBudget || overPhysical)) {
             this.noteStreamEnd(agent, currentState.stream, { kind: 'reply', id: replyId, sent: replySent ?? [] }, replySent == null);
           }
-          if (shouldEndTurn) {
-            // endTurn: what this boundary stored stays; cancel stream, reset to idle.
-            // The batch is never submitted, so nothing can refuse it: admit
-            // it now instead of leaving it pending across the idle gap.
-            agent.toolResultGuard.settleTurnEnded();
-            if (currentState.stream) {
-              this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'turn_ended');
-              currentState.stream.cancel();
-            }
+          // endTurn: the batch is never submitted, whether or not the stream's
+          // cancel below goes through, so no response can refuse it. Settle it
+          // now (settleTurnEnded admits it, or withholds it when its audit
+          // isn't durable), instead of leaving it pending across the idle
+          // gap, or for a later stop to withhold.
+          if (shouldEndTurn) agent.toolResultGuard.settleTurnEnded();
+          const endingStream = currentState.stream;
+          if (shouldEndTurn && endingStream
+            && !this.cancelLiveStream(agent, 'turn_ended', 'a tool result that ends the turn', () => endingStream.cancel())) {
+            // The stream goes on, so the turn hasn't ended: nothing of the
+            // end below runs.
+          } else if (shouldEndTurn) {
+            // endTurn: what this boundary stored stays; the stream is
+            // cancelled (above), and the agent resets to idle.
             agent.reset();
             // The turn is over — release the gate here, not just in the abort
             // handler: the membrane's aborted event is asynchronous and the
@@ -13014,8 +13047,8 @@ export class AgentFramework {
           } else if ((overBudget || overPhysical) && this.providerAdmissionClosed) {
             // A stopping framework starts no continuation: the turn ends with
             // its stream, as stop() ends a live stream's turn.
-            if (currentState.stream) this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'shutdown');
-            agent.cancelStream();
+            this.cancelLiveStream(agent, currentState.stream ? 'shutdown' : undefined, 'a context-budget restart while the framework stops',
+              () => agent.cancelStream());
           } else if (overBudget || overPhysical) {
             // The continuation is queued, and the stream cancelled, before the
             // boundary's usage report and the restart's trace, so a listener
@@ -13037,20 +13070,18 @@ export class AgentFramework {
             // a terminal failure — rejecting an ephemeral's promise mid-run
             // and emitting a spurious inference:exhausted (same race shape as
             // endTurn above).
-            if (currentState.stream) this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
-            try {
-              agent.cancelStream();
-            } catch (error) {
-              // The cancel failed and the stream is still live, so the turn
-              // has no continuation: take it back out of the queue.
-              this.pendingRequests = this.pendingRequests.filter((r) => r !== continuation);
-              throw error;
-            } finally {
-              // Its rounds were billed, even when the cancel throws; the
-              // restart opens a fresh stream with its own usage.
-              if (currentState.stream) this.streamBoundaryEnds.get(currentState.stream)?.(overBudget ? 'context_budget' : 'physical_window');
-            }
-            this.emitTrace({
+            // A cancel that fails leaves the stream going, so the turn has no
+            // continuation and the boundary is no restart: the continuation
+            // comes back out of the queue before the failure is reported, and
+            // the stream's own end counts and logs the rounds it finished, as
+            // any end does.
+            const restarted = this.cancelLiveStream(agent, currentState.stream ? 'budget_restart' : undefined, 'a context-budget restart',
+              () => agent.cancelStream(),
+              () => { this.pendingRequests = this.pendingRequests.filter((r) => r !== continuation); });
+            // Its rounds were billed; the restart opens a fresh stream with
+            // its own usage.
+            if (restarted && currentState.stream) this.streamBoundaryEnds.get(currentState.stream)?.(overBudget ? 'context_budget' : 'physical_window');
+            if (restarted) this.emitTrace({
               type: 'inference:stream_restarted',
               agentName: agent.name,
               // 'physical_window' only when the budget check alone would
@@ -15522,6 +15553,28 @@ export class AgentFramework {
         requests.push(...passThrough);
       }
 
+      // A batch that carries a continuation which resumes its logical turn
+      // (resumesLogicalTurn: a budget restart, a tool-result guard's retry)
+      // starts with the turn's continuations alone. A resume takes in no new
+      // input: beginAgentTurn writes no clock, flushes nothing and assembles
+      // nothing for it. Merged into it, a wake would get no turn of its own: a
+      // coalesced batch it carries would go unassembled, a guard retry would
+      // record the wake's author as its own, and a silent turn's resume would
+      // take on the wake's prose routing. So the batch's other requests go
+      // back to the queue, wait for the turn as any wake does, and then start
+      // a turn of their own, as the quiesce path above parks them. The turn's
+      // continuations (isTurnContinuation) stay together, as they pass a
+      // quiesce together.
+      if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+        const siblings = requests.filter((r) => !isTurnContinuation(r.reason));
+        if (siblings.length > 0) {
+          this.pendingRequests.push(...siblings);
+          const continuations = requests.filter((r) => isTurnContinuation(r.reason));
+          requests.length = 0;
+          requests.push(...continuations);
+        }
+      }
+
       // Turn-alive includes a continuation of the agent's turn still on its
       // way elsewhere (a park, another pass's hands): a fresh wake waits for
       // it, as for a turn holding its token.
@@ -15618,7 +15671,10 @@ export class AgentFramework {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
         if (requests.some(carriesContinuation)) this.giveBackAutoContinue(agentName, 'the inference policy dropped its wake');
-        this.endPendingPrimary(agentName);
+        // A primary a provider hold left pending stays pending while a wake
+        // this batch sent back to the queue (above) waits to run, as when
+        // dropContinuations drops one.
+        if (!this.pendingRequests.some((r) => r.agentName === agentName)) this.endPendingPrimary(agentName);
         continue;
       }
 
@@ -15627,18 +15683,13 @@ export class AgentFramework {
       // carries its mark, and the turn writes its `[continue]` row as it
       // starts (startAgentStream), past every gate that could still stop it.
       // A batch with a cause of its own is that cause's turn: no row, and the
-      // run starts again below.
+      // run starts again below. A batch that resumes a logical turn holds only
+      // the turn's continuations by now (above), and none of them carries a
+      // mark: an autoContinue wake beside it waits for a turn of its own.
       const continuation = requests.find(carriesContinuation);
-      let continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
+      const continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
         ? { ...continuation.autoContinueRun, sole: requests.every(carriesContinuation) }
         : undefined;
-      // A batch that resumes a logical turn (a budget restart, a guard retry)
-      // takes the continuation's wake into that turn, which writes no start
-      // inputs: its count goes back, and it writes no row.
-      if (continuationMark && requests.some((r) => resumesLogicalTurn(r.reason))) {
-        this.giveBackAutoContinue(agentName, 'a resumed turn took its wake');
-        continuationMark = undefined;
-      }
       // Its row goes into the residents' shared slot, which no write may
       // enter while another reader's turn is alive (as for a clock row): the
       // continuation waits until that turn has ended.
@@ -15652,8 +15703,13 @@ export class AgentFramework {
       // downstream turn semantics. An ordinary wake can already be pending
       // when the tool boundary appends a context-budget restart; selecting
       // requests[0] in that mixed batch bypassed the turn lock because a
-      // restart existed, then treated the continuation as a fresh turn.
-      const trigger = budgetRestart ?? requests[0];
+      // restart existed, then treated the continuation as a fresh turn. A
+      // batch that carries a continuation which resumes the turn holds only
+      // the turn's continuations by now (above), and starts as the one that
+      // resumes it, a budget restart first. Any other batch, one with a
+      // tool_results_ready wake among its wakes included, starts as its first
+      // request.
+      const trigger = budgetRestart ?? requests.find((r) => resumesLogicalTurn(r.reason)) ?? requests[0];
       // The bounce-wake cap (bounceProse) stops a bounce → wake → bounce loop
       // that nothing else feeds. A turn with a cause of its own is not that
       // loop, so the count starts again. Otherwise only a delivered prose
@@ -18885,7 +18941,8 @@ export class AgentFramework {
    * abandon or a stop of a registered agent settles the turn as it settles a
    * turn's start (endStoppedStart: one inference:aborted, the turn settled,
    * the gate released). Any other drop ends it as a start dropped before it
-   * sends anything ends. That frame, if it hasn't let go of its token yet,
+   * sends anything ends, and settles a registered ephemeral run's turn with
+   * the drop's reason. That frame, if it hasn't let go of its token yet,
    * ends on its own and settles nothing. What was deferred for the agent
    * lands now, or at that frame's end.
    */
@@ -18915,6 +18972,10 @@ export class AgentFramework {
       const routing = this.openLogical.get(agentName) ?? this.turnRouting.get(agentName);
       if (routing) this.endDroppedTurn(agentName, routing);
       this.eventGate?.onInferenceEnded(agentName);
+      // A registered ephemeral run's caller waits on the run's settle, which
+      // no frame gives once its continuation is gone: the turn's end is the
+      // run's, with the drop's reason.
+      this.settleAgent(agentName, { stopReason: 'exhausted', speech: '', error: `${agentName}'s turn ended without its continuation: ${drop.why}` }, undefined);
     }
     if (!this.activeTurnTokens.has(agentName) && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agentName)) {
       this.readdDrained(this.drainDeferredFor(agentName), 'continuation-drop flush');
@@ -18987,6 +19048,93 @@ export class AgentFramework {
     const callerStop = agent.takeStopWithoutStream();
     if (checkWindow.abandoned) return { kind: 'quiesce_abandoned' };
     return callerStop ? { kind: 'caller', reason: callerStop.reason } : undefined;
+  }
+
+  /**
+   * Cancel a stream the framework stops, under `kind`, the mark that tells
+   * the stream's end apart from a caller's stop (frameworkCancelledStreams).
+   * A mark records a cancel that happened, so a cancel that throws takes its
+   * mark back, leaving an earlier mark of the same stream as it was, and the
+   * throw goes on to the caller. With no `kind` (the agent holds no stream),
+   * nothing is marked.
+   */
+  private cancelUnderMark(agent: Agent, kind: FrameworkCancelKind | undefined, cancel: () => void): void {
+    if (kind === undefined) {
+      cancel();
+      return;
+    }
+    const key = `${agent.name}:${agent.streamId}`;
+    const earlier = this.frameworkCancelledStreams.get(key);
+    this.frameworkCancelledStreams.set(key, kind);
+    try {
+      cancel();
+    } catch (error) {
+      if (earlier === undefined) this.frameworkCancelledStreams.delete(key);
+      else this.frameworkCancelledStreams.set(key, earlier);
+      throw error;
+    }
+  }
+
+  /**
+   * Cancel a live stream the framework ends at a tool boundary (`site` says
+   * where), under its mark. A cancel that throws leaves the stream going: its
+   * mark is taken back (cancelUnderMark), `onFailed` undoes what the site
+   * did ahead of the cancel, and the failure is logged. The stream waits for
+   * the round's results, which the boundary doesn't send, and the turn holds
+   * its token until the stream ends, as an abort does when its own cancel
+   * goes through. Only an operator's abort or stop, or an ephemeral run's
+   * idle watchdog, comes back to it, so an operator alert says so too.
+   * Returns whether the cancel went through.
+   */
+  private cancelLiveStream(
+    agent: Agent, kind: FrameworkCancelKind | undefined, site: string, cancel: () => void, onFailed?: () => void,
+  ): boolean {
+    try {
+      this.cancelUnderMark(agent, kind, cancel);
+      return true;
+    } catch (error) {
+      onFailed?.();
+      console.error(`[turn] ${agent.name}: the stream's cancel threw at ${site}, so its stream goes on, waiting for ` +
+        `this round's results, and the turn holds its token until the stream ends; an abort tries the cancel again: ` +
+        describeFailureWithFrames(error));
+      this.opsAlert('stream-cancel-failed', agent.name,
+        `${agent.name}'s turn is stuck: its stream's cancel threw at ${site}, and the stream waits for results the ` +
+        `framework won't send. An abort of the agent (abortInference, or the API's inference.abort) tries the cancel ` +
+        `again; if that throws as well, restarting the host process ends the turn: ${describeFailure(error)}`,
+        { data: { site } });
+      return false;
+    }
+  }
+
+  /**
+   * Cancel a stream a start compiled and won't send (`site` says why).
+   * Membrane's yielding stream starts its request when it is first iterated,
+   * and this one never is, so it has sent nothing: a cancel that throws is
+   * logged, and the start's cleanup goes on as if it had worked.
+   */
+  private cancelUnsentStream(agent: Agent, stream: YieldingStream, site: string): void {
+    try {
+      stream.cancel();
+    } catch (error) {
+      console.error(`[turn] ${agent.name}: the cancel of a turn's stream ${site} threw; it was never iterated, so it sent ` +
+        `nothing, and the start ends as if the cancel had worked: ${describeFailureWithFrames(error)}`);
+    }
+  }
+
+  /**
+   * Cancel a stream that no longer owns its agent: the agent was replaced or
+   * removed, or a newer stream took it. Its frame settles nothing and is
+   * leaving, so a cancel that throws is logged and the frame leaves all the
+   * same. Thrown on, it would reject driveStream's promise, which nothing
+   * awaits but stop().
+   */
+  private cancelSupersededStream(agent: Agent, stream: YieldingStream): void {
+    try {
+      stream.cancel();
+    } catch (error) {
+      console.error(`[turn] ${agent.name}: the cancel of a stream that no longer owns its agent (a newer stream took it, or ` +
+        `the agent was replaced or removed) threw; its frame leaves all the same: ${describeFailureWithFrames(error)}`);
+    }
   }
 
   /**
@@ -19545,8 +19693,10 @@ export class AgentFramework {
             : 'the framework was stopped and started again';
         const reason = `a turn compiled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
-        stream.cancel();
-        agent.cancelStream();
+        this.cancelUnsentStream(agent, stream, `compiled while ${why}`);
+        // The agent lets go of the stream, which cancelStream() would cancel
+        // a second time.
+        agent.reset();
         if (this.agents.get(agent.name) === agent) {
           // The compile took the agent's stream id, so a frame that started
           // this one (a guard or budget restart) no longer owns the entries
@@ -19564,7 +19714,7 @@ export class AgentFramework {
       // the compile made hasn't been iterated, so cancelling it sends nothing.
       const stopAfterCompile = this.takeStartStop(agent, checkWindow);
       if (stopAfterCompile) {
-        stream.cancel();
+        this.cancelUnsentStream(agent, stream, 'stopped after its compile');
         // As above: the compile took the agent's stream id from any frame
         // that started this one.
         this.activeStreams.delete(agent.name);
@@ -19585,8 +19735,9 @@ export class AgentFramework {
           // made while inference:failed is delivered finds neither, and the
           // hold's later start drops a cancelStream() made then, as for any
           // parked turn.
-          stream.cancel();
-          agent.cancelStream();
+          this.cancelUnsentStream(agent, stream, 'held by a provider wait recorded while it compiled');
+          // As above, the agent lets go of the stream without a second cancel.
+          agent.reset();
           if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
           // The turn emitted inference:started before its compile; every turn
           // that does gets one terminal event, which listeners (a typing loop)
@@ -20278,7 +20429,7 @@ export class AgentFramework {
         if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
           generationLost = true;
           lifecyclePhase = 'aborted';
-          stream.cancel();
+          this.cancelSupersededStream(agent, stream);
           break;
         }
         this.touchEphemeralRun(agent.name, true);
@@ -20931,7 +21082,7 @@ export class AgentFramework {
             if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
               generationLost = true;
               lifecyclePhase = 'aborted';
-              stream.cancel();
+              this.cancelSupersededStream(agent, stream);
               return;
             }
 
@@ -21750,7 +21901,7 @@ export class AgentFramework {
       if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
         generationLost = true;
         lifecyclePhase = 'aborted';
-        stream.cancel();
+        this.cancelSupersededStream(agent, stream);
         return;
       }
       // A stream cancelled on purpose that then throws has reported its end
@@ -30716,9 +30867,8 @@ export class AgentFramework {
     // turn is still open, even once another start's routing is the agent's
     // live one. A silent turn's open moves no locus: no silent start or
     // resume registers its routing state as the open turn (openLogical), and
-    // a non-silent resume that does, a budget restart batched with an
-    // ordinary wake, starts only once its over-budget boundary has every
-    // result of the round.
+    // a silent turn's resume stays silent, since a batch that carries it
+    // starts it apart from the batch's wakes (runInferencePass).
     // The turn the call was made in, none for one made outside it (a script
     // left running, or one an earlier turn started): only the turn's own call
     // moves its routing (callingTurnOf).
