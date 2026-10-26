@@ -34,8 +34,14 @@ import type { ToolDefinition } from '../types/events.js';
 import type { ToolParameter } from '@animalabs/membrane';
 import { FIRST_REMINDER_TIME, LAST_REMINDER_TIME, canHoldTime, parseReminderTime } from './reminder-time.js';
 
-/** The prefix the heartbeat's tools carry, as heartbeat-mcpl's did under the server id `heartbeat`. */
+/** The prefix the heartbeat's tools carry. */
 export const HEARTBEAT_TOOL_PREFIX = 'heartbeat--';
+/** The prefix heartbeat-mcpl's tools carried under the server id `heartbeat`
+ *  and the default tool prefix: a call by that name, as the agent's context
+ *  may still show them, reaches the same tool. */
+export const LEGACY_HEARTBEAT_TOOL_PREFIX = 'mcpl--heartbeat--';
+/** The tools that change the schedule, as against the two that only show it. */
+export const HEARTBEAT_CHANGING_TOOLS: readonly string[] = ['heartbeat_configure', 'heartbeat_trigger', 'reminder_add', 'reminder_cancel'];
 
 export type HeartbeatDeliveryMode = 'message' | 'silent';
 
@@ -63,6 +69,8 @@ export interface Reminder {
   /** When it's next due (ms). */
   fireAt: number;
   everySeconds: number | null;
+  /** When a delivery that failed is tried again (ms); its `fireAt` stays the time it was due. */
+  retryAt?: number;
 }
 
 /** Host options (`FrameworkConfig.heartbeat`). */
@@ -279,9 +287,9 @@ export class Heartbeat {
     return this.tools;
   }
 
-  /** Whether `name` is one of the heartbeat's tools. */
+  /** Whether `name` is one of the heartbeat's tools, by its name or heartbeat-mcpl's. */
   ownsTool(name: string): boolean {
-    return this.tools.some((t) => t.name === name);
+    return this.tools.some((t) => t.name === canonicalName(name));
   }
 
   /** What the heartbeat will wake the agent with, soonest first, for the reply judge (UpcomingWake). */
@@ -298,7 +306,7 @@ export class Heartbeat {
     for (const r of s.reminders) {
       const message = r.message.length > 80 ? `${r.message.slice(0, 77)}...` : r.message;
       wakes.push({
-        at: Math.max(r.fireAt, this.notBefore),
+        at: Math.max(dueAt(r), this.notBefore),
         certain: true,
         what: `its reminder ${JSON.stringify(message)}${r.everySeconds !== null ? ` (repeats every ${shownLength(r.everySeconds)})` : ''}`,
       });
@@ -312,10 +320,14 @@ export class Heartbeat {
    * outside the parameter it belongs to, refuses the call, naming it; an
    * unknown name is noted in the result.
    */
-  handleToolCall(fullName: string, rawInput: unknown): { success: boolean; data?: string; error?: string; isError?: boolean } {
+  handleToolCall(calledName: string, rawInput: unknown): { success: boolean; data?: string; error?: string; isError?: boolean } {
+    const fullName = canonicalName(calledName);
     const def = this.tools.find((t) => t.name === fullName);
     const name = fullName.slice(HEARTBEAT_TOOL_PREFIX.length);
-    if (!def) return { success: false, error: `There's no heartbeat tool named ${JSON.stringify(fullName)}.`, isError: true };
+    if (!def) return { success: false, error: `There's no heartbeat tool named ${JSON.stringify(calledName)}.`, isError: true };
+    const renamed = calledName !== fullName
+      ? ` (The heartbeat's tools are now ${HEARTBEAT_TOOL_PREFIX}…: this is ${fullName}. ${LEGACY_HEARTBEAT_TOOL_PREFIX}… still reaches them.)`
+      : '';
     const ignored: string[] = [];
     let args: Record<string, unknown>;
     try {
@@ -333,7 +345,7 @@ export class Heartbeat {
       case 'reminder_cancel': result = this.cancelReminder(args, problems); break;
       default: result = { text: this.statusText() };
     }
-    const text = ignored.length > 0 ? `${result.text} ${ignored.join(' ')}` : result.text;
+    const text = `${ignored.length > 0 ? `${result.text} ${ignored.join(' ')}` : result.text}${renamed}`;
     return result.error ? { success: false, error: text, isError: true } : { success: true, data: text };
   }
 
@@ -455,7 +467,9 @@ export class Heartbeat {
   }
 
   private describe(rem: Reminder, now: number): string {
-    const when = rem.fireAt <= now ? 'overdue' : `~${Math.round((rem.fireAt - now) / 1000)}s`;
+    const when = rem.retryAt !== undefined
+      ? `its delivery failed; trying again in ~${Math.max(0, Math.round((rem.retryAt - now) / 1000))}s`
+      : rem.fireAt <= now ? 'overdue' : `~${Math.round((rem.fireAt - now) / 1000)}s`;
     const rec = rem.everySeconds !== null ? `repeats every ${rem.everySeconds}s` : 'one-shot';
     return `due ${formatHeartbeatTime(rem.fireAt, this.timeZone)} (${when}) | ${rec} | "${rem.message}"`;
   }
@@ -493,8 +507,9 @@ export class Heartbeat {
     if (!this.started || this.state.settings.paused || at === null) return;
     this.cancelTick = callAt(Math.max(at, this.notBefore), this.now, () => {
       this.cancelTick = null;
-      this.fireTick('schedule');
-      this.state.nextFireAt = this.now() + this.state.settings.intervalSeconds * 1000;
+      // A tick whose delivery threw is tried again shortly, not a whole interval later.
+      const delivered = this.fireTick('schedule');
+      this.state.nextFireAt = this.now() + (delivered ? this.state.settings.intervalSeconds * 1000 : RETRY_MS);
       this.save();
       this.armTick();
     });
@@ -525,7 +540,7 @@ export class Heartbeat {
     this.cancelReminders?.();
     this.cancelReminders = null;
     if (!this.started || this.state.reminders.length === 0) return;
-    const due = Math.min(...this.state.reminders.map((r) => r.fireAt));
+    const due = Math.min(...this.state.reminders.map(dueAt));
     this.cancelReminders = callAt(Math.max(due, this.notBefore), this.now, () => {
       this.cancelReminders = null;
       this.fireDueReminders();
@@ -534,7 +549,7 @@ export class Heartbeat {
 
   private fireDueReminders(): void {
     const now = this.now();
-    const due = this.state.reminders.filter((r) => r.fireAt <= now).sort((a, b) => a.fireAt - b.fireAt);
+    const due = this.state.reminders.filter((r) => dueAt(r) <= now).sort((a, b) => dueAt(a) - dueAt(b));
     for (const rem of due) {
       const i = this.state.reminders.findIndex((r) => r.id === rem.id);
       if (i === -1) continue;
@@ -547,8 +562,9 @@ export class Heartbeat {
           eventId: `reminder_${now}_${Math.random().toString(36).slice(2, 8)}`,
         });
       } catch (err) {
+        // Its due time stays, for its header's "due" and its repeat's rhythm.
         log(`reminder ${rem.id} couldn't be delivered (${(err as Error).message}); trying again in ${RETRY_MS / 1000}s`);
-        this.state.reminders[i] = { ...rem, fireAt: now + RETRY_MS };
+        this.state.reminders[i] = { ...rem, retryAt: now + RETRY_MS };
         continue;
       }
       if (rem.everySeconds === null) {
@@ -560,7 +576,8 @@ export class Heartbeat {
       let next = rem.fireAt + rem.everySeconds * 1000;
       if (next <= now) next = now + rem.everySeconds * 1000;
       if (canHoldTime(next)) {
-        this.state.reminders[i] = { ...rem, fireAt: next };
+        const { retryAt: _retried, ...kept } = rem;
+        this.state.reminders[i] = { ...kept, fireAt: next };
       } else {
         this.state.reminders.splice(i, 1);
         log(`ended repeating reminder ${rem.id}: its next time is past ${LAST_REMINDER_TIME}`);
@@ -576,6 +593,9 @@ export class Heartbeat {
   // ===========================================================================
 
   private load(now: number): HeartbeatState {
+    // What an earlier start in this process couldn't read doesn't hold this one back.
+    this.unsaveable = null;
+    this.lastSaveError = null;
     if (existsSync(this.statePath)) {
       let text: string;
       try {
@@ -618,19 +638,29 @@ export class Heartbeat {
   private imported(): HeartbeatState | undefined {
     const from = this.importFrom;
     if (!from?.configPath && !from?.remindersPath) return undefined;
+    // A file that's there but can't be read leaves the import unfinished:
+    // nothing is saved, so the next start tries it again, and meanwhile the
+    // agent runs on what could be read, which its tools say isn't saved.
+    const failed: string[] = [];
     const readJson = (path: string | undefined, what: string): unknown => {
       if (!path || !existsSync(path)) return undefined;
       try {
         const text = readFileSync(path, 'utf-8');
         return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
       } catch (err) {
-        log(`couldn't import heartbeat-mcpl's ${what} from ${path} (${(err as Error).message}); left as it is`);
+        failed.push(`heartbeat-mcpl's ${what} at ${path} couldn't be read (${(err as Error).message})`);
         return undefined;
       }
     };
     const config = readJson(from.configPath, 'schedule');
     const reminders = readJson(from.remindersPath, 'reminders');
-    if (config === undefined && reminders === undefined) return undefined;
+    if (failed.length > 0) {
+      this.unsaveable = `${failed.join(', and ')}, so the import isn't finished and nothing is saved until a start can read it`;
+      log(this.unsaveable);
+    }
+    if (config === undefined && reminders === undefined) {
+      return failed.length > 0 ? { v: 1, settings: { ...this.defaults }, nextFireAt: null, reminders: [] } : undefined;
+    }
     const settings = { ...this.defaults };
     if (isObject(config)) {
       const stored = config.intervalSeconds;
@@ -708,9 +738,24 @@ function readReminders(rows: unknown[], note: (text: string) => void): Reminder[
       note(`reminder ${row.id}: interval ${every}s is under the ${MIN_REMINDER_SECONDS}-second floor; using ${MIN_REMINDER_SECONDS}`);
       every = MIN_REMINDER_SECONDS;
     }
-    out.push({ id: row.id, message: row.message, createdAt: row.createdAt, fireAt: row.fireAt, everySeconds: every });
+    out.push({
+      id: row.id, message: row.message, createdAt: row.createdAt, fireAt: row.fireAt, everySeconds: every,
+      ...(typeof row.retryAt === 'number' && canHoldTime(row.retryAt) ? { retryAt: row.retryAt } : {}),
+    });
   }
   return out;
+}
+
+/** A tool's name as the heartbeat lists it, for a call by either prefix. */
+function canonicalName(name: string): string {
+  return name.startsWith(LEGACY_HEARTBEAT_TOOL_PREFIX)
+    ? `${HEARTBEAT_TOOL_PREFIX}${name.slice(LEGACY_HEARTBEAT_TOOL_PREFIX.length)}`
+    : name;
+}
+
+/** When a reminder is next tried: its retry, after a delivery that failed, or its due time. */
+function dueAt(rem: Reminder): number {
+  return rem.retryAt ?? rem.fireAt;
 }
 
 /** A length given in units that add up (seconds, minutes, hours), in seconds; null when none was given. */

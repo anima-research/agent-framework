@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Heartbeat, reminderText, type HeartbeatWake } from '../src/heartbeat/heartbeat.js';
@@ -233,6 +233,85 @@ describe('heartbeat: upcoming wakes', () => {
   });
 });
 
+describe('heartbeat: failures and old names', () => {
+  it("answers a call by heartbeat-mcpl's name, saying the new one", () => {
+    const { hb } = heartbeat();
+    hb.start();
+    assert.equal(hb.ownsTool('mcpl--heartbeat--reminder_list'), true);
+    const r = hb.handleToolCall('mcpl--heartbeat--heartbeat_status', {});
+    assert.equal(r.success, true);
+    assert.match(r.data!, /^Heartbeat ACTIVE .*\(The heartbeat's tools are now heartbeat--…: this is heartbeat--heartbeat_status\. mcpl--heartbeat--… still reaches them\.\)$/);
+    hb.stop();
+  });
+
+  it('a tick whose delivery throws is tried again a minute later, and trigger says it failed', () => {
+    let fail = true;
+    const wakes: HeartbeatWake[] = [];
+    const { hb } = heartbeat({ deliver: (w) => { if (fail) throw new Error('store closed'); wakes.push(w); } });
+    hb.start();
+    const refused = call(hb, 'heartbeat_trigger');
+    assert.equal(refused.success, false);
+    assert.match(refused.error!, /no heartbeat was sent: its delivery failed/);
+    mock.timers.tick(14400_000);
+    assert.equal(wakes.length, 0);
+    assert.equal(saved().nextFireAt, T0 + 14400_000 + 60_000, 'retried in a minute, not an interval');
+    fail = false;
+    mock.timers.tick(60_000);
+    assert.equal(wakes.length, 1);
+    assert.equal(saved().nextFireAt, T0 + 14400_000 + 60_000 + 14400_000);
+    hb.stop();
+  });
+
+  it('a reminder whose delivery throws keeps its due time, for its header and its rhythm', () => {
+    let fail = true;
+    const wakes: HeartbeatWake[] = [];
+    const { hb } = heartbeat({ deliver: (w) => { if (fail) { fail = false; throw new Error('store closed'); } wakes.push(w); } });
+    hb.start();
+    call(hb, 'reminder_add', { message: 'stretch', everyMinutes: 30 });
+    mock.timers.tick(30 * 60_000);
+    assert.equal(wakes.length, 0);
+    assert.match(call(hb, 'reminder_list').data!, /its delivery failed; trying again in ~60s/);
+    mock.timers.tick(60_000);
+    assert.equal(wakes.length, 1);
+    assert.match(wakes[0]!.text, /, due 2026-10-26T12:30:00\+00:00 \[UTC\] · current time: 2026-10-26T12:31:00\+00:00/);
+    assert.equal(saved().reminders[0].fireAt, T0 + 60 * 60_000, 'the next period keeps its rhythm');
+    assert.equal(saved().reminders[0].retryAt, undefined);
+    hb.stop();
+  });
+
+  it('a later start that reads the state file saves again', () => {
+    const path = join(dir, 'heartbeat.json');
+    mkdirSync(path); // can't be read as a file
+    const { hb } = heartbeat();
+    hb.start();
+    assert.match(call(hb, 'heartbeat_status').data!, /Not saved: .* couldn't be read/);
+    hb.stop();
+    rmSync(path, { recursive: true });
+    hb.start();
+    assert.equal(call(hb, 'heartbeat_configure', { intervalHours: 2 }).success, true);
+    assert.equal(saved().settings.intervalSeconds, 7200);
+    hb.stop();
+  });
+
+  it("an import that can't read one of heartbeat-mcpl's files saves nothing, so the next start finishes it", () => {
+    const configPath = join(dir, 'heartbeat-config.json');
+    const remindersPath = join(dir, 'heartbeat-reminders.json');
+    writeFileSync(configPath, '{ torn');
+    writeFileSync(remindersPath, JSON.stringify([{ id: 'rem_a', message: 'm', createdAt: T0, fireAt: T0 + 3600_000, everySeconds: null }]));
+    const first = heartbeat({ importFrom: { configPath, remindersPath } });
+    first.hb.start();
+    assert.equal(existsSync(join(dir, 'heartbeat.json')), false);
+    assert.match(call(first.hb, 'heartbeat_status').data!, /reminders=1 .*Not saved: heartbeat-mcpl's schedule at .* couldn't be read/);
+    first.hb.stop();
+    writeFileSync(configPath, JSON.stringify({ intervalSeconds: 600, paused: false, message: 'hi', deliveryMode: 'message' }));
+    const second = heartbeat({ importFrom: { configPath, remindersPath } });
+    second.hb.start();
+    assert.equal(saved().settings.intervalSeconds, 600);
+    assert.equal(saved().reminders.length, 1);
+    second.hb.stop();
+  });
+});
+
 describe('reminder text and time', () => {
   it('formats a late reminder with when it was due', () => {
     const text = reminderText({ id: 'rem_x', message: 'm', createdAt: T0, fireAt: T0 + 60_000, everySeconds: null }, T0 + 5 * 60_000, 'UTC');
@@ -320,17 +399,62 @@ describe('the framework\'s heartbeat', () => {
     assert.match(req!.silentHeartbeat!.eventId, /^heartbeat_/);
   });
 
-  it('refuses heartbeat-mcpl beside it', async () => {
+  it('refuses heartbeat-mcpl beside it, by its id, a tool prefix like its own, or the command that runs it', async () => {
     mock.timers.reset();
     const { AgentFramework } = await import('../src/index.js');
     const { MockMembrane } = await import('./helpers/mock-membrane.js');
-    await assert.rejects(AgentFramework.create({
-      storePath: join(dir, 'store2'),
+    for (const server of [
+      { id: 'heartbeat', command: 'node', args: ['nothing.js'] },
+      { id: 'hb', command: 'node', args: ['x.js'], toolPrefix: 'mcpl--heartbeat' },
+      { id: 'ticks', command: 'node', args: ['/opt/heartbeat-mcpl/dist/src/index.js', '--stdio'] },
+    ]) {
+      await assert.rejects(AgentFramework.create({
+        storePath: join(dir, `store-${server.id}`),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+        modules: [],
+        heartbeat: true,
+        mcplServers: [server],
+      }), new RegExp(`beside the MCPL server "${server.id}", which is heartbeat-mcpl or names its tools as the heartbeat's`));
+    }
+  });
+
+  it("starts and stops with the framework, and refuses a fork's change while showing it the schedule", async (t) => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const own = mkdtempSync(join(tmpdir(), 'heartbeat-fw-'));
+    const framework = await AgentFramework.create({
+      storePath: join(own, 'store'),
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
       modules: [],
       heartbeat: true,
-      mcplServers: [{ id: 'heartbeat', command: 'node', args: ['nothing.js'] }],
-    }), /an MCPL server with the id "heartbeat"/);
+    });
+    t.after(() => rmSync(own, { recursive: true, force: true }));
+    const internals = framework as unknown as {
+      heartbeat: { started: boolean; cancelTick: unknown };
+      conversationAgentHomes: Map<string, unknown>;
+      pushEvent(event: { type: string; result?: { isError?: boolean; error?: string; data?: unknown } }): void;
+      dispatchHeartbeatToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+    };
+    await framework.start();
+    assert.equal(internals.heartbeat.started, true);
+    assert.ok(internals.heartbeat.cancelTick, 'its tick is armed');
+    assert.ok(existsSync(join(own, 'store', 'config', 'heartbeat.json')));
+    const results: Array<{ isError?: boolean; error?: string; data?: unknown }> = [];
+    const push = internals.pushEvent.bind(framework);
+    internals.pushEvent = (event) => { if (event.type === 'tool-result') results.push(event.result!); else push(event); };
+    internals.conversationAgentHomes.set('scout-conv-1', {});
+    internals.dispatchHeartbeatToolCall('scout-conv-1', { id: 'a', name: 'heartbeat--reminder_add', input: { message: 'x', inMinutes: 1 } });
+    internals.dispatchHeartbeatToolCall('scout-conv-1', { id: 'b', name: 'heartbeat--heartbeat_status', input: {} });
+    internals.conversationAgentHomes.delete('scout-conv-1');
+    assert.equal(results[0]!.isError, true);
+    assert.match(String(results[0]!.error), /Nothing was changed: the heartbeat and its reminders are the agent's, and wake its residents, so this conversation can't change them/);
+    assert.equal(results[1]!.isError, undefined);
+    assert.match(String(results[1]!.data), /^Heartbeat ACTIVE/);
+    await framework.stop();
+    assert.equal(internals.heartbeat.started, false);
+    assert.equal(internals.heartbeat.cancelTick, null, 'its tick is cleared');
   });
 });

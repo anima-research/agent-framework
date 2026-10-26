@@ -751,7 +751,7 @@ import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
-import { Heartbeat, type HeartbeatWake } from './heartbeat/heartbeat.js';
+import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -3958,11 +3958,18 @@ export class AgentFramework {
     // wakes. heartbeat-mcpl beside it would wake the agent twice and offer
     // its tools under the same names, so that's refused.
     if (config.heartbeat !== undefined && config.heartbeat !== false) {
-      if ((config.mcplServers ?? []).some((s) => s.id === 'heartbeat')) {
+      // heartbeat-mcpl by its id, by a tool prefix that names its tools as
+      // the framework's (or as the old names the framework still answers), or
+      // by the command that runs it under any id.
+      const beside = (config.mcplServers ?? []).find((s) => s.id === 'heartbeat'
+        || s.toolPrefix === 'heartbeat' || s.toolPrefix === 'mcpl--heartbeat'
+        || ('command' in s && [s.command, ...(s.args ?? [])].some((part) => /heartbeat-mcpl/.test(String(part)))));
+      if (beside) {
         throw new Error(
-          'FrameworkConfig.heartbeat is on beside an MCPL server with the id "heartbeat" (heartbeat-mcpl): both would wake '
-          + 'the agent, and their tools share the names heartbeat--…. Remove the server to use the framework\'s heartbeat '
-          + '(heartbeat.importFrom can bring its schedule and reminders along), or turn heartbeat off to keep the server.',
+          `FrameworkConfig.heartbeat is on beside the MCPL server ${JSON.stringify(beside.id)}, which is heartbeat-mcpl or `
+          + 'names its tools as the heartbeat\'s: both would wake the agent, and their tools would share names. Remove the '
+          + 'server to use the framework\'s heartbeat (heartbeat.importFrom can bring its schedule and reminders along), or '
+          + 'turn heartbeat off to keep the server.',
         );
       }
       const opts = config.heartbeat === true ? {} : config.heartbeat;
@@ -5120,6 +5127,21 @@ export class AgentFramework {
 
   /** Handle a call to one of the heartbeat's tools. */
   private dispatchHeartbeatToolCall(agentName: string, call: ToolCall): void {
+    // The heartbeat is the agent's, and wakes its residents: a conversation
+    // fork, an ephemeral run or the subconscious may look at it, but not
+    // change it or set a reminder that would wake someone else. Refused
+    // before the tool runs, as a fork's sleep is.
+    const tool = call.name.replace(/^(mcpl--)?heartbeat--/, '');
+    const resident = this.heartbeatTargets().includes(agentName) && !this.ephemeralRuns.has(agentName);
+    if (!resident && HEARTBEAT_CHANGING_TOOLS.includes(tool)) {
+      const one = this.conversationAgentHomes.has(agentName) ? 'conversation'
+        : this.ephemeralRuns.has(agentName) ? 'run' : 'side agent';
+      const error = `Nothing was changed: the heartbeat and its reminders are the agent's, and wake its residents, so this ${one} can't `
+        + `change them. ${call.name.endsWith('status') || call.name.endsWith('list') ? '' : 'heartbeat--heartbeat_status and heartbeat--reminder_list show them.'}`;
+      this.emitTrace({ type: 'tool:failed', module: 'heartbeat', tool: call.name, callId: call.id, error: `${agentName}: ${error}` });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'heartbeat', result: this.refusedResult(agentName, call.id, error.trim()) });
+      return;
+    }
     this.emitTrace({ type: 'tool:started', module: 'heartbeat', tool: call.name, callId: call.id, input: call.input });
     let result: ToolResult;
     try {
