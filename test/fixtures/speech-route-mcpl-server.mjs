@@ -1,6 +1,6 @@
 // MCPL fixture for speech routing, drafts and provenance tests.
 //
-// Registers the channels in CHANNELS (JSON array of {id,label}; two Discord
+// Registers the channels in CHANNELS (JSON array of {id,label,direction?}; two Discord
 // guild channels by default) and, on command, sends inbound traffic over
 // BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH,
 // each acted on once its newline is written (writtenLines):
@@ -185,7 +185,7 @@ rl.on('line', (line) => {
       method: 'channels/register',
       params: {
         channels: CHANNELS.map((c) => ({
-          id: c.id, type: 'discord', label: c.label, direction: 'bidirectional', initiallyOpen: true,
+          id: c.id, type: 'discord', label: c.label, direction: c.direction ?? 'bidirectional', initiallyOpen: true,
         })),
       },
     });
@@ -197,7 +197,7 @@ rl.on('line', (line) => {
     const history = msg.params?.history ? histories.get(channelId) : undefined;
     log('channel-opened', { channelId, history: !!history });
     reply(msg.id, {
-      channel: { id: channel.id, type: 'discord', label: channel.label, direction: 'bidirectional' },
+      channel: { id: channel.id, type: 'discord', label: channel.label, direction: channel.direction ?? 'bidirectional' },
       ...(history ? { history } : {}),
     });
     return;

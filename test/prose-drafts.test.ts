@@ -308,15 +308,25 @@ function completeWhileWaiting(membrane: MockMembrane, response: NormalizedRespon
   };
 }
 
+/** The second stream the membrane opens, such as a guard retry's, answers with this response. */
+function onSecondStream(membrane: MockMembrane, response: NormalizedResponse): void {
+  const streamYielding = membrane.streamYielding.bind(membrane);
+  let opened = 0;
+  (membrane as unknown as { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream }).streamYielding = (request, options) => {
+    if (++opened === 2) membrane.pushResponse(response);
+    return streamYielding(request, options);
+  };
+}
+
 async function harness(opts: {
-  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean }>;
+  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean; toolResultGuard?: boolean }>;
   xml?: boolean;
   /** The fixture server's requestTimeoutMs (the framework's default when unset). */
   requestTimeoutMs?: number;
   sendTool?: boolean;
   codeExecution?: boolean;
   serverConfig?: Record<string, unknown>;
-  channels?: Array<{ id: string; label: string }>;
+  channels?: Array<{ id: string; label: string; direction?: 'inbound' | 'outbound' | 'bidirectional' }>;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -336,6 +346,7 @@ async function harness(opts: {
     ...(a.proseRouting ? { proseRouting: a.proseRouting } : {}),
     ...(a.sameRoundThinkTextPolicy ? { sameRoundThinkTextPolicy: a.sameRoundThinkTextPolicy } : {}),
     ...(a.autoContinue ? { autoContinue: a.autoContinue } : {}),
+    ...(a.toolResultGuard ? { toolResultGuard: a.toolResultGuard } : {}),
   }));
   const create = async () => {
     const framework = await AgentFramework.create({
@@ -3091,6 +3102,40 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.until(() => notices(h).length > 0, 'the notice');
         await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
         assert.match(notices(h)[0]!, /destination: "[^"]*the lounge"\) delivers it unchanged/);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it(`${mode}: after a guard retry, the turn's sends still hold its speech only where they may have posted`, async () => {
+      for (const [place, goes] of [[GENERAL, true], [ROOM, false]] as const) {
+        const h = await harness({ agents: [{ name: 'scout', proseRouting: mode, toolResultGuard: true }], sendTool: true });
+        try {
+          onSecondStream(h.membrane, createMockResponse([text(LINE)]));
+          const refusal = { ...createMockResponse([text('discarded')], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test' } } } } as NormalizedResponse;
+          await h.turn([createMockResponse([send('s1', place)], 'tool_use'), refusal]);
+          assert.equal(h.membrane.calls.length, 2, 'the guard retried the turn');
+          assert.deepEqual(inRoom(h), goes ? [LINE] : []);
+          assert.deepEqual(held(h), goes ? [] : [[LINE, 'explicit-send']]);
+        } finally {
+          await h.close();
+        }
+      }
+    });
+
+    it(`${mode}: the resend example says "#channel" where no name a resend could take reaches the place`, async () => {
+      const INBOUND = 'discord:g1:announcements';
+      const h = await harness({
+        agents: [{ name: 'scout', proseRouting: mode }], sendTool: true,
+        channels: [{ id: ROOM, label: '#room (Guild One)' }, { id: GENERAL, label: '#general (Guild One)' }, { id: INBOUND, label: '#announcements (Guild One)', direction: 'inbound' }],
+      });
+      try {
+        h.membrane.pushResponse(createMockResponse([text(LINE), send('s1', INBOUND)], 'tool_use'));
+        h.membrane.pushResponse(createMockResponse([]));
+        h.command({ op: 'incoming', channelId: INBOUND, messageId: 'in-inbound', mode: 'addressed', text: 'hello' });
+        await h.until(() => notices(h).length > 0, 'the notice');
+        await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
+        assert.match(notices(h)[0]!, /destination: "#channel"\) delivers it unchanged/);
       } finally {
         await h.close();
       }
