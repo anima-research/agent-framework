@@ -465,11 +465,13 @@ framework registers a `toolsets` module with four constant tools:
 as their message is read, in `rev` order, whatever becomes of the message (a
 refused push, a result that came after its timeout). A move between static and
 dynamic takes effect when the server's `tools/list` states it, and the tool
-list follows at its next rebuild, whichever refresh brings it (a move is no
-reason to rebuild the tool list early). Until then the tool is called at either
-place, where the tool list shows it or where the server's
-latest list put it (RFC-014 §4.2: it keeps working where it was), and the agent
-is told where it went once that rebuild has published the list.
+list follows at its next rebuild that lists the server, whichever refresh
+brings it (a move is no reason to rebuild the tool list early). Until then the
+tool is called at either place, where the tool list shows it or where the
+server's latest list put it (RFC-014 §4.2: it keeps working where it was), and
+once that rebuild has published the list, a notice says where it went. A list
+read while a rebuild is under way can undo a move that rebuild then publishes;
+neither is told, and the next rebuild puts the tool back.
 A skipped rev re-reads `tools/list` and then `toolsets/list`, which the host
 also reads after every (re)connect, adopting what the server kept open and
 never re-opening anything.
@@ -483,7 +485,9 @@ already gone as a notice (below). A dynamic tool's change also goes as a notice
 when it wouldn't fit whole within its result's inline cap, or when its call
 fails after the result was read. A call's change also goes as a notice, ahead of its
 result, when a later change goes to the agent before the call's caller has
-taken it, so changes reach the agent in the order they were read. Notices and reminders
+taken it, so changes are told in the order they were read (the agent's window
+can still show a call's result, a push's event, or a change its taker couldn't
+show after a change read later). Notices and reminders
 need the server's `pushEvents` grant, like any delivery; without it, a change
 that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told the first
 time its definition appears. Suggestions are shown, never acted on. Each
