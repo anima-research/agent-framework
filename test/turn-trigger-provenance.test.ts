@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { AgentFramework, readInboundSource } from '../src/index.js';
+import { AgentFramework, ApiModule, readInboundSource } from '../src/index.js';
 import { isNonChannelSurfaceEvent } from '../src/framework.js';
 import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -1204,6 +1204,14 @@ describe('private wins, one way', () => {
       assert.deepEqual(posted, [ROOM], "the outcome is the operator's notice, posted where it was asked");
       return rig.routed.slice(before);
     };
+    const apiInferenceRequest = async (rig: Rig) => {
+      const before = rig.routed.length;
+      const streams = rig.streams.length;
+      rig.framework.pushEvent({ type: 'api:inference-request', agentName: 'scout' } as never);
+      await rig.until(() => rig.streams.length > streams && idle(rig), 'the requested turn to run');
+      await rig.framework.runUntilIdle();
+      return rig.routed.slice(before);
+    };
     const acrossRestart = async (before: (rig: Rig) => Promise<void>, after: (rig: Rig) => Promise<void>) => {
       const storeDir = mkdtempSync(join(tmpdir(), 'surface-restart-test-'));
       try {
@@ -1241,6 +1249,26 @@ describe('private wins, one way', () => {
       try {
         await privateTurn(rig);
         assert.deepEqual(await unstick(rig), []);
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("an inference request through the API after a private turn speaks in no channel", async () => {
+      const rig = await surfaceRig({ modules: [new ApiModule()] });
+      try {
+        await privateTurn(rig);
+        assert.deepEqual(await apiInferenceRequest(rig), []);
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("an inference request through the API after a channel turn speaks as on main, in the fallback channel", async () => {
+      const rig = await surfaceRig({ modules: [new ApiModule()] });
+      try {
+        await roomTurn(rig);
+        assert.deepEqual((await apiInferenceRequest(rig)).map((r) => r.locus), [LOUNGE]);
       } finally {
         await rig.close();
       }

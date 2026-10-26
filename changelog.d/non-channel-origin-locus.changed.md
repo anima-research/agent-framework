@@ -26,17 +26,18 @@
   running reporting its end). Each goes by the turn that caused it as that
   turn stands when its start reads it, so a turn that took in private input
   after causing it counts, even after the wake was queued. An operator's
-  `nudge` or `unstick` speaks as before only when the turn it retakes is known
-  to be public, as it stands when the retake starts: the agent's latest turn
-  in this run other than a silent heartbeat tick, with no silent heartbeat
-  tick since it that took in private input, and no `undo`, `redo`, hide,
-  operator surgery (a branch switch, rollback or suppression) or rewind shed
-  since it. Otherwise, after a restart too, the retake is private, and its
-  delivery receipt says how to publish with a send. A script's wake message is
-  private input, as a private surface's message is, when the script's start
-  turn is private as the message is stored or injected: a turn that reads it
-  is private, and a tool boundary that injects it makes its turn private from
-  there.
+  `nudge` or `unstick`, or an `inference.request` through the API server or
+  its MCP tool (`agent_request_inference`), speaks as before only when the
+  turn it retakes is known to be public, as it stands when the retake starts:
+  the agent's latest turn in this run other than a silent heartbeat tick, with
+  no silent heartbeat tick since it that took in private input, and no `undo`,
+  `redo`, hide, operator surgery (a branch switch, rollback or suppression) or
+  rewind shed since it. Otherwise, after a restart too, the retake is private,
+  and its delivery receipt says how to publish with a send. A script's wake
+  message is private input, as a private surface's message is, when the
+  script's start turn is private as the message is stored or injected: a turn
+  that reads it is private, and a tool boundary that injects it makes its turn
+  private from there.
 
   In locus and hybrid mode, a private turn that holds a channel's message
   tells its resident which channels' messages it holds and that its plain

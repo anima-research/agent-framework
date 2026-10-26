@@ -13451,6 +13451,7 @@ export class AgentFramework {
             source,
             timestamp: Date.now(),
             nonChannelOrigin: isNonChannelSurfaceEvent(event),
+            ...(event.type === 'api:inference-request' ? { [RETAKE]: true as const } : {}),
             ...this.readsDeferredFor(added, agentName),
           });
         }
