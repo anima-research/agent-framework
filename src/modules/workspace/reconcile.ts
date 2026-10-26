@@ -53,6 +53,7 @@ import {
   sameRootIdentity,
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
+import { storedBytes, type StoredBytes } from './sync.js';
 import {
   IGNORED,
   type MountView,
@@ -1386,12 +1387,12 @@ export async function pushPaths(
         continue;
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
-      const blob = store.getBlob(s.hash);
+      const stored = storedBytes(store, s.hash);
       const forcedMode = mount.modesObserved && s.mode !== undefined && s.mode !== (d.kind === 'file' ? d.mode : undefined) ? s.mode : undefined;
       const agreedMode = priorP?.kind === 'content' ? priorP.mode : undefined;
-      if (blob) {
+      if ('bytes' in stored) {
         plans.push({
-          path, kind: 'write', blob, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
+          path, kind: 'write', blob: stored.bytes, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
           ...(forcedMode !== undefined ? { apply: forcedMode } : {}),
           ...(forcedMode !== undefined && d.kind === 'file' && agreedMode !== d.mode ? { overDisk: true as const } : {}),
           ...(s.mode !== undefined ? { storeMode: s.mode } : {}),
@@ -1400,7 +1401,7 @@ export async function pushPaths(
           ...(agreedMode !== undefined ? { priorMode: agreedMode } : {}),
           ...(d.kind === 'file' && d.mode !== undefined ? { seenMode: d.mode } : {}),
         });
-      } else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+      } else result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
     if (v.mode === 'adopt' && s && d.kind === 'file') {
@@ -1551,11 +1552,12 @@ export async function pushPaths(
       plans.push({ path, kind: 'unlink', prior, before: agreement.get(mount.name, path), expect });
       continue;
     }
-    const blob = store.getBlob(s.hash);
-    if (!blob) {
-      result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+    const stored = storedBytes(store, s.hash);
+    if (!('bytes' in stored)) {
+      result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
+    const blob = stored.bytes;
     // The store's mode goes to disk with its bytes where the file is new,
     // the push is forced, or disk still has the mode they last agreed on. A
     // push that completes our own unconfirmed one, whose bytes landed, is a
@@ -1773,4 +1775,8 @@ export async function pushPaths(
   if (recorded || agreement.needsBarrier) agreement.barrier();
   agreement.maybeCheckpoint();
   return result;
+}
+
+function unstoredCopy(stored: Exclude<StoredBytes, { bytes: Buffer }>): string {
+  return 'missing' in stored ? 'the workspace copy is missing from the store' : `the workspace copy is unreadable in the store (${stored.unreadable})`;
 }
