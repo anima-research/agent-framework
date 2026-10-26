@@ -12,9 +12,13 @@
   JSON names the channel (`channelId`), or, for `channel_publish` and a
   `drafts` resend, the framework's own publish outcome, which counts as posted
   when delivered or unconfirmed. A send whose answer is an error, or names no
-  channel (a world's `say`, a server that doesn't report it), holds the
-  round's speech wherever it was going, as before. A send the framework
-  refused, or whose publish is proven not posted, holds nothing. The hold
+  channel the framework reads (as, by our reading of eidoverse-worlds' source,
+  a world's `say` does), holds the round's speech wherever it was going, as
+  before. A send the framework refused, or whose publish is proven not posted,
+  holds nothing. In `hybrid` mode, when every send's place is known, an
+  envelope whose `>>>` target names no channel, or a malformed one, now goes
+  as it would with no send (a bounce, or in a `drafts` round a draft held with
+  no notice); before, the send held it as a draft with a notice. The hold
   lasts for the rest of the turn, for speech to the places a send may have
   posted, until a new message reaches the resident. A script's sends count by
   their answers too, and a send still out when its `code_execution` call
@@ -25,7 +29,8 @@
   goes, so a send that hangs holds its round's speech until the tool's own
   timeout; narration beside a send to another channel, such as "posting it to
   the other channel now", now reaches the conversation; and a world's `say`
-  still holds its round's speech, since its answer names no channel.
+  still holds its round's speech, since, by our reading of eidoverse-worlds'
+  source, its answer names no channel.
 - The held-draft notice now names the send, where it posted or may have
   posted, and where the speech was going, or says the framework can't tell
   where, or whether, the send posted, and why; for a send in an earlier round
