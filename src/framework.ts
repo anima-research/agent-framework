@@ -168,6 +168,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
+import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
@@ -1247,6 +1248,7 @@ interface TurnRouting {
   hybridHold?: 'private' | 'failed';
   /** The turn asked for a ` !` continuation; taken once. */
   continuation: boolean;
+  start?: { branch: string; sequence: number };
   /**
    * Explicit mode: the turn's latest envelope was `>>skip_reply`, so it
    * ended on a deliberate skip and autoContinue leaves it paused. (Hybrid
@@ -2960,6 +2962,7 @@ export class AgentFramework {
    * next turn.
    */
   private turnRouting: Map<string, TurnRouting> = new Map();
+  private readonly reasoningLoss = new ReasoningLossTeller();
   /**
    * The latest link of each agent's chain of queued prose deliveries. Every
    * stream queues its own behind it, a fresh turn's included, so the agent's
@@ -9518,6 +9521,7 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
+        this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
@@ -13977,6 +13981,7 @@ export class AgentFramework {
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
     this.thinkingLossIncidents.forget(agentName);
+    this.reasoningLoss.forget(agentName);
     // Its pending self-wake ends with it, rather than wake a name that's gone.
     this.eventGate?.agentGone(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
@@ -17258,6 +17263,25 @@ export class AgentFramework {
     this.writeChannelNotices(this.channelOpenedNotices(agentName, serverId, channels, cause), `auto-open notice (${cause})`, 'recordChannelAutoOpenNotice');
   }
 
+  private tellReasoningLoss(agent: Agent, make: () => string | undefined): void {
+    if (this.agents.get(agent.name) !== agent) return;
+    let line: string | undefined;
+    try {
+      line = make();
+    } catch (err) {
+      console.error(`[reasoning] ${agent.name}: could not tell what reasoning was lost:`, err);
+      return;
+    }
+    if (!line) return;
+    try {
+      this.addMessage('user', [{ type: 'text', text: line }], { system: true, kind: 'reasoning-loss' } as MessageMetadata, { forAgent: agent.name });
+    } catch (err) {
+      console.error(`[reasoning] ${agent.name}: the line for lost reasoning could not be stored:`, err);
+      return;
+    }
+    console.error(`[reasoning] ${agent.name}: told of reasoning no longer in its context`);
+  }
+
   /**
    * Write a builder's channel notices in order, each on its own: one that
    * can't be written is logged, and the rest are still written. A reader's
@@ -19250,6 +19274,10 @@ export class AgentFramework {
         opensTurn = true;
       }
     }
+    if (opensTurn) {
+      const head = agent.branchHead();
+      if (head) routing.start = head;
+    }
     this.turnRouting.set(agent.name, routing);
     // A turn a start runs on is live again, though an earlier start's settle
     // marked it settled: a resume takes the agent's latest routing, which can
@@ -19401,6 +19429,10 @@ export class AgentFramework {
         const name = agent.name;
         agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
       }
+      if (!agent.onThinkingStrip) {
+        agent.onThinkingStrip = (strip, branch) => this.tellReasoningLoss(agent, () => this.reasoningLoss.forStrip(
+          agent.name, branch, strip, (this.activeTurnTokens.has(agent.name) && this.turnRouting.get(agent.name)) || {}, agent.getContextManager()));
+      }
 
       // Module gatherContext (fail-open, per-module timeout — the module's
       // contextTimeoutMs, else the registry default). Injections are
@@ -19487,6 +19519,7 @@ export class AgentFramework {
         continuePrompt,
         placeDrops,
         thinkingRecordedAfter,
+        thinkingBranch,
         noteRequestSent,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
@@ -19599,7 +19632,13 @@ export class AgentFramework {
         takeKvSubmission,
         drainKvSubmissionIds,
         new Set(tools.map((tool) => tool.name)),
-        placeDrops ? { place: placeDrops, ...(thinkingRecordedAfter !== undefined ? { recordedAfter: thinkingRecordedAfter } : {}) } : undefined,
+        placeDrops
+          ? {
+              place: placeDrops,
+              ...(thinkingRecordedAfter !== undefined ? { recordedAfter: thinkingRecordedAfter } : {}),
+              ...(thinkingBranch !== undefined ? { branch: thinkingBranch } : {}),
+            }
+          : undefined,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -21625,6 +21664,10 @@ export class AgentFramework {
             // for tells the operators (noteThinkingLoss), and a call with no report shows no such drop.
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], thinkingDrops.recordedAfter);
+            }
+            if (thinkingDrops) {
+              this.tellReasoningLoss(agent, () => this.reasoningLoss.forDrops(agent.name, thinkingDrops.branch ?? '',
+                thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], streamRouting, agent.getContextManager()));
             }
             try {
               if (!thinkingDroppedInStream) {
