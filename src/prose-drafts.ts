@@ -4,7 +4,8 @@
  * Plain speech is held back for reasons that are right in themselves: an
  * explicit send suppresses plain speech in its own round and the turn's later
  * rounds, until new conversational input arrives or a budget restart starts a
- * new stream (so a "sent it" postscript is not posted twice), a turn may have
+ * new stream, and in XML tool mode, which routes no round live, in every round
+ * of the turn (so a "sent it" postscript is not posted twice), a turn may have
  * no destination, and a
  * malformed or unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
@@ -55,7 +56,11 @@ export const PROSE_DRAFT_RECORD_TYPE = 'framework/prose-draft';
 
 /** Why words were held instead of sent. */
 export type DraftReason =
-  /** An explicit send, in this round or an earlier one of the turn, suppressed the round's plain speech. */
+  /**
+   * An explicit send suppressed the round's plain speech: one in this round or
+   * an earlier one of the turn, or in XML tool mode, which routes no round
+   * live, one anywhere in the turn.
+   */
   | 'explicit-send'
   /** The speech had no destination (no route this turn, or a failed envelope). */
   | 'no-destination'
