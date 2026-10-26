@@ -1444,7 +1444,7 @@ export class HistoryModule implements Module {
                 ', so this is not a negative result for the range. '
               : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan). `) +
           `Continue by repeating the call with the fields of \`resume\` (${bound}:"${at}" and skipSequences), ` +
-          `or raise limit/maxScan, or narrow with ${[channelId === undefined ? 'channelId' : null, stoppedEarly ? 'author' : null, 'dates'].filter((w) => w !== null).join('/')}.`,
+          `or raise limit/maxScan, or narrow with ${[channelId === undefined ? 'channelId' : null, stoppedEarly && input.author === undefined ? 'author' : null, 'dates'].filter((w) => w !== null).join('/')}.`,
       };
     };
 

@@ -404,7 +404,7 @@ describe('HistoryModule on a real store: a search that stops at maxScan with no 
     const now = Date.now();
     const tieMs = now - 20 * MIN;
     const out: Row[] = [];
-    for (let i = 0; i < 6; i++) out.push({ text: `tie${i}`, channel: 'c', ms: tieMs });
+    for (let i = 0; i < 6; i++) out.push({ text: `tie${i}`, channel: 'c', author: 'antra', ms: tieMs });
     for (let i = 0; i < 5; i++) out.push({ text: `other${i}`, channel: 'd', ms: now - (15 - i) * MIN });
     for (let i = 0; i < 4; i++) out.push({ text: `later${i}`, channel: 'c', ms: now - (10 - i) * MIN });
     return out;
@@ -478,6 +478,15 @@ describe('HistoryModule on a real store: a search that stops at maxScan with no 
     assert.ok(rest(c).includes('; 2 more in this range were not searched'), c.hint);
   });
 
+  it('says nothing of a stop when the range holds exactly maxScan messages', async () => {
+    const { mod } = build(rows());
+    for (const [input, size] of [[{ channelId: 'c' }, 10], [{}, 15]] as const) {
+      const d = await call(mod, 'search', { query: 'needle', maxScan: size, ...input });
+      assert.equal(d.truncated, false, JSON.stringify(input));
+      assert.equal(d.hint, undefined, JSON.stringify(input));
+    }
+  });
+
   it('does not say "no match" when the truncated scan found one', async () => {
     const { mod } = build(rows());
     for (const regex of kinds) {
@@ -488,13 +497,16 @@ describe('HistoryModule on a real store: a search that stops at maxScan with no 
     }
   });
 
-  it('suggests narrowing by author only after a stop at limit, and by channelId only when none was given', async () => {
+  it('suggests narrowing by author only after a stop at limit when the call gave no author, and by channelId only when none was given', async () => {
     const { mod } = build(rows());
     const cases = [
       [{ channelId: 'c', maxScan: 3 }, 'dates'],
       [{ maxScan: 3 }, 'channelId/dates'],
       [{ channelId: 'c', limit: 1 }, 'author/dates'],
       [{ limit: 1 }, 'channelId/author/dates'],
+      [{ author: 'antra', channelId: 'c', limit: 1 }, 'dates'],
+      [{ author: 'antra', limit: 1 }, 'channelId/dates'],
+      [{ excludeAuthor: 'bob', limit: 1 }, 'channelId/author/dates'],
     ] as const;
     for (const regex of kinds) {
       for (const [input, words] of cases) {
