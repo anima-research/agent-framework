@@ -136,9 +136,16 @@ export function changeWriteCheck(): { visit(row: TailRow): boolean; splits(): bo
   };
 }
 
-/** A stored change row of another agent's: in the residents' shared slot,
- *  each agent's view leaves these out, since they declare another's tools. */
+/** A stored change row stamped as another agent's: in the residents' shared
+ *  slot, each resident's view leaves these out, since they declare another's
+ *  tools. A change row stamped as no agent's, as a host may store one, is in
+ *  every resident's view. */
 export function isOthersSystemChange(message: { content: readonly ContentBlock[]; metadata?: unknown }, agentName: string): boolean {
+  const agent = (message.metadata as { agent?: unknown } | undefined)?.agent;
+  return isSystemChangeMessage(message) && agent !== undefined && agent !== agentName;
+}
+
+export function isSystemChangeNotOwn(message: { content: readonly ContentBlock[]; metadata?: unknown }, agentName: string): boolean {
   return isSystemChangeMessage(message) && (message.metadata as { agent?: unknown } | undefined)?.agent !== agentName;
 }
 

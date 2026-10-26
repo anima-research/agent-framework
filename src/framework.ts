@@ -82,6 +82,7 @@ import {
   isHeadDeclaration,
   isOthersSystemChange,
   isSystemChangeMessage,
+  isSystemChangeNotOwn,
   lastConversational,
   memoryHeadDeclarations,
   systemChangeMetadata,
@@ -13106,9 +13107,9 @@ export class AgentFramework {
       // the timeline (KV-prefix-stable delivery). The stored originals
       // remain in the shared slot for the subconscious's merged view,
       // fetch_history, and audit.
-      // Residents share one message slot, so each sees only its own system
-      // changes (another resident's declare another's tools), and none of
-      // another agent's stored context injections (stored-injections.ts),
+      // Residents share one message slot, so each sees no system change
+      // stamped as another resident's (it declares another's tools), and none
+      // of another agent's stored context injections (stored-injections.ts),
       // which are that agent's context, not conversation, so they stay out of
       // this view and so out of its folds.
       viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut
@@ -13190,13 +13191,13 @@ export class AgentFramework {
       isolate: true,
       // The residents' shared un-namespaced slot, merged read-only, with the
       // tune-out's stamped messages included. The filter, which context-
-      // manager applies to the merged view too, leaves out only the
-      // residents' system changes, which declare the residents' tools, not
-      // its own, and their stored context injections (stored-injections.ts):
-      // their context, which this agent never saw while they were placed
-      // unstored.
+      // manager applies to the merged view too, leaves out every system change
+      // not its own, a host's included, since those in the residents' slot
+      // declare the residents' tools, not its own; and the residents' stored
+      // context injections (stored-injections.ts), their context, which this
+      // agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
-      viewFilter: (message) => !isOthersSystemChange(message, name) && !isAnotherAgentsInjection(message.metadata, name),
+      viewFilter: (message) => !isSystemChangeNotOwn(message, name) && !isAnotherAgentsInjection(message.metadata, name),
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,

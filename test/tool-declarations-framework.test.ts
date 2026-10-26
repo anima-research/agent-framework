@@ -717,4 +717,29 @@ describe('toolDeclarations in the framework', () => {
       assert.ok(shown.includes('hello'), `${format}: the conversation reads through`);
     }
   });
+
+  it("sends a host's change row, stored without an agent's metadata in the residents' shared slot, to each 'entries' resident as stored, and not to the subconscious, and a resident's move leaves it", async () => {
+    await withFramework([resident('alpha'), resident('beta')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      const beta = framework.getAgent('beta')!;
+      const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
+      say(alpha, 'user', 'hello, both');
+      await alpha.buildActivationRequest([tool('a')], system('v1'));
+      await beta.buildActivationRequest([tool('x')]);
+      const hostChange = [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[];
+      alpha.getContextManager().addMessage('system', hostChange);
+      assert.deepEqual(changesIn((await alpha.buildActivationRequest([tool('a')], system('v1'))).messages), [hostChange], "alpha's request carries the host's row");
+      assert.deepEqual(changesIn((await beta.buildActivationRequest([tool('x')])).messages), [hostChange], "and so does beta's");
+      const subconscious = await framework.getAgent('Subconscious')!.buildActivationRequest([tool('think')]);
+      assert.deepEqual(changesIn(subconscious.messages), [], "the subconscious's doesn't: the host's row declares the residents' tools");
+      assert.ok(subconscious.messages.some((m) => (m.content[0] as { text?: string }).text === 'hello, both'), 'while the conversation reads through');
+      const owners = () => alpha.getContextManager().getAllMessages().filter(isChange).map((m) => (m.metadata as { agent?: string } | undefined)?.agent ?? 'host');
+      await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
+      assert.deepEqual(owners(), ['host', 'alpha'], 'alpha declared b as a row of its own');
+      await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
+      assert.deepEqual(owners(), ['host'], "alpha's move took its own change and left the host's");
+      assert.deepEqual(changesIn((await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'))).messages), [hostChange], 'which still goes out as stored');
+    }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.' } });
+  });
+
 });
