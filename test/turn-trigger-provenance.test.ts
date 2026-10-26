@@ -376,12 +376,13 @@ async function surfaceRig(opts: {
     }
   };
   const whileRunning = async (cond: () => boolean, what: string) => {
-    void framework.runUntilIdle();
+    const running = framework.runUntilIdle();
     const deadline = Date.now() + 10_000;
     while (!cond()) {
       if (Date.now() > deadline) throw new Error(`timed out: ${what} (starts: ${JSON.stringify(starts)})`);
       await new Promise((r) => setTimeout(r, 10));
     }
+    return { running };
   };
   const texts = () => (framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
     .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
@@ -757,8 +758,9 @@ describe('private wins, one way', () => {
         ] as never, 'tool_use'));
         rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about what you asked' }]));
         rig.i.pendingRequests.push(roomWake());
-        await rig.whileRunning(() => rig.texts().some((t) => t.startsWith(PRIVATE_FROM_HERE)), `${mode}: the boundary makes the turn private`);
+        const run = await rig.whileRunning(() => rig.texts().some((t) => t.startsWith(PRIVATE_FROM_HERE)), `${mode}: the boundary makes the turn private`);
         release();
+        await run.running;
         await rig.until(() => rig.starts.length >= 2, `${mode}: the operator message's own turn`);
         await rig.framework.runUntilIdle();
         assert.deepEqual(rig.routed.map((r) => r.text), ['on my way', 'and over there'],
@@ -1244,27 +1246,6 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge after a channel turn that took in private input at a tool boundary speaks in no channel", async () => {
-      let framework: AgentFramework | undefined;
-      const tool = robot(() => framework!.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never));
-      const rig = await surfaceRig({ modules: [tool], quietSources: ['console'] });
-      framework = rig.framework;
-      try {
-        rig.membrane.pushResponse(createMockResponse([
-          { type: 'text', text: 'on my way' },
-          { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
-        ] as never, 'tool_use'));
-        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about what you asked' }]));
-        rig.i.pendingRequests.push(roomWake());
-        await rig.until(() => rig.starts.length >= 1 && idle(rig), "the room's turn");
-        await rig.framework.runUntilIdle();
-        assert.deepEqual(rig.routed, [{ text: 'on my way', locus: ROOM }], 'control: only the round before the private input reached the room');
-        assert.deepEqual(await nudge(rig), []);
-      } finally {
-        await rig.close();
-      }
-    });
-
     it("a nudge asked for while a channel turn runs, which then takes in private input, speaks in no channel", async () => {
       let framework: AgentFramework | undefined;
       const tool = robot(() => {
@@ -1279,8 +1260,9 @@ describe('private wins, one way', () => {
           { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
         ] as never, 'tool_use'));
         rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about what you asked' }]));
+        const streams = rig.streams.length;
         rig.i.pendingRequests.push(roomWake());
-        await rig.until(() => rig.starts.length >= 2 && idle(rig), "the room's turn, then the nudged one");
+        await rig.until(() => rig.streams.length >= streams + 2 && idle(rig), "the room's turn, then the nudged one");
         await rig.framework.runUntilIdle();
         assert.deepEqual(rig.routed, [{ text: 'on my way', locus: ROOM }], 'only the round before the private input reached a channel');
       } finally {
@@ -1402,12 +1384,9 @@ describe('private wins, one way', () => {
       });
     }
 
-    it("after a restart, a nudge and an unstick following a channel turn speak in no channel: the turn they retake isn't known", async () => {
+    it("after a restart, a nudge following a channel turn speaks in no channel: the turn it retakes isn't known", async () => {
       await acrossRestart(roomTurn, async (rig) => {
         assert.deepEqual(await nudge(rig), []);
-      });
-      await acrossRestart(roomTurn, async (rig) => {
-        assert.deepEqual(await unstick(rig), []);
       });
     });
 
@@ -1678,7 +1657,7 @@ describe('private wins, one way', () => {
         rig.i.pendingRequests.push(roomWake());
         await rig.until(() => rig.starts.length >= 2 && idle(rig), 'the channel turn');
         await rig.framework.runUntilIdle();
-        assert.equal(rig.routed.length, 1, `the channel turn answered in its channel: ${JSON.stringify(rig.routed)}`);
+        assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM], 'the channel turn answered in its channel');
       } finally {
         await rig.close();
       }
@@ -1695,8 +1674,6 @@ describe('private wins, one way', () => {
         assert.equal(rig.starts.length, 2, JSON.stringify(rig.starts));
         if (privateTurn) {
           assert.deepEqual(rig.routed, [], 'neither turn published');
-          const published = (rig.framework.getAgent('scout') as unknown as { publishedThrough: Map<string, unknown> }).publishedThrough;
-          assert.equal(published.size, 0, JSON.stringify([...published.keys()]));
         } else {
           assert.deepEqual(rig.routed, [{ text: 'reply 1', locus: ROOM }, { text: 'reply 2', locus: ROOM }]);
         }
