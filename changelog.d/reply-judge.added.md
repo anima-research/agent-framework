@@ -1,0 +1,21 @@
+- A new wake-rule behavior, `judge`, that asks a small model before waking the agent. A judge rule batches matching events as a debounce does (`debounceMs`, with an optional `maxWaitMs` that judges a batch by then even while messages keep coming). When the batch fires, the reply judge reads three things: the agent's context as one document (the request the agent would send if woken now, `previewActivation`'s dry run, newest part first, cut to fit), the agent's own `instructions` to it, and the batch. It answers `REPLY` or `WAIT`. On reply the batch wakes the agent as a debounce's would. On wait it doesn't, and the events stay in context, as for `defer`.
+- Batches are judged against the context as it stands after any turn. A batch that fires while a turn runs or the host is quiesced is held, then judged once both are clear. A reply reached while a turn ran, or before one that has run since, is judged again after it, so a turn that already answered the messages isn't followed by a second wake for them. A quiesce also stops a judge deciding now, and its batch is judged at resume. What a rule holds for the judge is capped at the inference buffer's 100 events, dropping the oldest, which `inferenceDiagnostics()` counts.
+- The agent writes judge rules with `wake_add_rule`'s new `judge` parameter. gate_status shows each judge rule's verdict counts and its newest verdict, with the judge's reason. It also says when no judge is wired, and when the judge has failed three times in a row. Each verdict is traced as `gate:judge-verdict`.
+- The judge is `ReplyJudge` (`src/gate/reply-judge.ts`), configured by `GateOptions.judge`:
+  - `model`: default `claude-haiku-5-5`.
+  - `maxInputTokens`: default 90,000, under the 100K line past which Haiku 5.5 costs five times as much.
+  - `timeoutMs`: default 20,000.
+  - `onError`: `"wake"` (the default) or `"skip"`.
+  - `effort`: default `"low"`; `"none"` sends none, for a provider without Anthropic's `output_config`.
+  - `cacheTtl`: `"5m"` (the default) or `"1h"`.
+  - `enabled: false` leaves it unwired.
+- How the judge calls its model:
+  - It calls through the primary agent's auxiliary admission, so provider holds, surgeries and stop bind it as they bind compression.
+  - It always uses membrane's native formatter: an XML-formatted request would end in a prefill, which current Claude models refuse.
+  - Input tokens are estimated at a ratio corrected from every response's reported usage.
+  - The document goes in chunks from a fixed first message, with a cache breakpoint after the last full chunk, so successive requests read most of it from the prompt cache.
+  - The batch's listing is capped at a tenth of the budget, newest first.
+  - The verdict is the last line in the asked-for form (`REPLY:` / `WAIT:` in capitals).
+- Failures and fallbacks:
+  - A judge that fails, times out or answers without a verdict wakes the agent (fail open), unless `onError` is `"skip"`.
+  - Without a judge wired, a judge rule wakes the agent as a debounce of the same quiet period would.

@@ -33,10 +33,17 @@ import type {
   GateStatus,
   ShadowWarning,
   GateProbeRow,
+  JudgeConfig,
+  JudgeEventSummary,
+  JudgeFn,
+  JudgeVerdict,
 } from './types.js';
 
 // Re-export types consumers need
-export type { GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './types.js';
+export type {
+  GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo, WakeLine,
+  JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions,
+} from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,6 +70,15 @@ function parseGateJson(text: string): unknown {
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
 const MAX_DEBOUNCE_MS = 300_000;
+/** Maximum `judge.maxWaitMs` (ms): an hour. */
+const MAX_JUDGE_WAIT_MS = 3_600_000;
+/** Longest `judge.instructions` (characters) a rule may hold: they go to the
+ *  judge with every batch, so they're kept short. */
+const MAX_JUDGE_INSTRUCTIONS = 4_000;
+/** How long a judge request may take by default (ms) before onError decides. */
+const DEFAULT_JUDGE_TIMEOUT_MS = 20_000;
+/** Judge failures in a row after which gate_status names the judge as failing. */
+const JUDGE_FAILING_STREAK = 3;
 
 /** Whether a check made at `last` is still fresh at `now`, less than the
  *  reload throttle ago. A clock stepped backwards since makes it stale, so
@@ -182,6 +198,33 @@ export interface WakeProvenance {
 interface DebounceState {
   timer: ReturnType<typeof setTimeout>;
   events: PendingEvent[];
+  /** When the batch's first event arrived (ms), for a judge's maxWaitMs. */
+  firstAt: number;
+  /** The judge the batch goes to when it fires, as its rule held it when the
+   *  batch began: a rule removed or changed meanwhile has its batch judged
+   *  as the rule it was asked. Absent for a debounce. */
+  judge?: JudgeConfig;
+}
+
+/** A batch the reply judge is deciding now. */
+interface JudgingState {
+  events: PendingEvent[];
+  judge: JudgeConfig;
+  started: number;
+  abort: AbortController;
+  /** The judge's time limit, cleared once it's decided or the gate disposed. */
+  timer?: ReturnType<typeof setTimeout>;
+  /** The turn count (turnEpoch) when the judge began reading the context. */
+  epoch: number;
+  /** Batches of the same rule that fired meanwhile, judged once this one is
+   *  decided: delivered with it on reply, judged afresh on wait. */
+  queued: PendingEvent[];
+}
+
+/** A rule's verdict counts and newest verdict (gate_status judgeState). */
+interface JudgeRecord {
+  verdicts: { reply: number; wait: number; error: number };
+  last?: NonNullable<GatePolicyStats['judgeState']>['last'];
 }
 
 /** Token bucket for one (policy, key) pair under a rate_limit behavior. */
@@ -333,7 +376,19 @@ function formatBehavior(b: import('./types.js').GateBehavior): string {
     const k = b.passive_sample.keyBy ? `,keyBy:${b.passive_sample.keyBy}` : '';
     return `passive_sample:${b.passive_sample.every}${k}`;
   }
+  if ('judge' in b) {
+    const w = b.judge.maxWaitMs !== undefined ? `,maxWait:${b.judge.maxWaitMs}` : '';
+    return `judge:${b.judge.debounceMs}${w}`;
+  }
   return 'unknown';
+}
+
+/** The quiet period (ms) of a batching behavior: a debounce's, or a judge's. */
+function batchQuietMs(b: GateBehavior): number | undefined {
+  if (typeof b !== 'object') return undefined;
+  if ('debounce' in b) return b.debounce;
+  if ('judge' in b) return b.judge.debounceMs;
+  return undefined;
 }
 
 /**
@@ -393,9 +448,10 @@ const MATCH_FIELDS = [
   'scope', 'source', 'channel', 'mount', 'pathGlob', 'tagsAny', 'tagsAll', 'tagsNone', 'metadataTrue', 'filter',
 ];
 const FILTER_FIELDS = ['type', 'pattern'];
-const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample'] as const;
+const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample', 'judge'] as const;
 const RATE_LIMIT_FIELDS = ['tokens', 'refillIntervalMs', 'keyBy'];
 const PASSIVE_SAMPLE_FIELDS = ['every', 'keyBy'];
+const JUDGE_FIELDS = ['debounceMs', 'maxWaitMs', 'instructions'];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -600,6 +656,7 @@ function fieldLevels(file: string): ReadonlyArray<{ name: string; fields: readon
     { name: '"behavior"', fields: BEHAVIOR_KINDS },
     { name: '"behavior.rate_limit"', fields: RATE_LIMIT_FIELDS },
     { name: '"behavior.passive_sample"', fields: PASSIVE_SAMPLE_FIELDS },
+    { name: '"behavior.judge"', fields: JUDGE_FIELDS },
   ];
 }
 
@@ -840,7 +897,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReadin
   }, (m) => {
     const of = (fields: readonly string[]) => m.keys.some((key) => fields.includes(key));
     if (obj.match === undefined && (of(MATCH_FIELDS) || of(FILTER_FIELDS))) return 'so the rule matches every event';
-    if (obj.behavior === undefined && (of(BEHAVIOR_KINDS) || of(RATE_LIMIT_FIELDS) || of(PASSIVE_SAMPLE_FIELDS))) {
+    if (obj.behavior === undefined && (of(BEHAVIOR_KINDS) || of(RATE_LIMIT_FIELDS) || of(PASSIVE_SAMPLE_FIELDS) || of(JUDGE_FIELDS))) {
       return 'so the rule\'s behavior is "always"';
     }
     return undefined;
@@ -869,7 +926,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReadin
 
 type BehaviorKind = 'always' | 'defer' | 'skip' | (typeof BEHAVIOR_KINDS)[number];
 
-const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit" and "passive_sample"';
+const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit", "passive_sample" and "judge"';
 
 /**
  * A rule's behavior: "always" when left out; one of the three names; or an
@@ -878,7 +935,8 @@ const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one 
  * and is read so; a list, or an object holding none of the kinds, was
  * refused, and the rule is left out. Of
  * two kinds or more, "debounce", then "rate_limit", then "passive_sample" was
- * the one read, whatever their order, and is read so. Each other kind is read
+ * the one read, whatever their order, and is read so; "judge", newer than
+ * those, is read only where none of them is given. Each other kind is read
  * on its own as well, so that a refusal names its problems too, and a load
  * reads past them, since it isn't read either way. `kind` is the behavior's
  * kind even where it can't be read, for passthrough's check.
@@ -899,7 +957,7 @@ function readBehavior(r: Reader, value: unknown): { behavior?: GateBehavior | un
   const kinds = BEHAVIOR_KINDS.filter((k) => b[k] !== undefined);
   const kind = kinds[0];
   if (kind === undefined) {
-    r.problems.push({ text: 'behavior holds none of "debounce", "rate_limit" and "passive_sample"' });
+    r.problems.push({ text: 'behavior holds none of "debounce", "rate_limit", "passive_sample" and "judge"' });
     return {};
   }
   if (kinds.length > 1) {
@@ -1022,11 +1080,99 @@ function readPassiveSample(r: Reader, value: unknown): GateBehavior | undefined 
   return { passive_sample: out };
 }
 
+/**
+ * A judge: a debounce's quiet period, read as `debounce` is, with at its
+ * nearest bound one out of range; an optional longest wait, from that
+ * quiet period to an hour, likewise; and the agent's optional instructions to
+ * the judge, text of at most MAX_JUDGE_INSTRUCTIONS characters. Earlier
+ * releases knew no judge, so nothing deployed has one: a rule whose judge
+ * can't be read is left out, and its instructions, which go to a model with
+ * every batch, are never cut to fit.
+ */
+function readJudge(r: Reader, value: unknown): GateBehavior | undefined {
+  if (!isPlainObject(value)) {
+    r.problems.push({
+      text: `behavior.judge is ${shownValue(value)}, where an object is needed, such as {"debounceMs": 30000, "instructions": "..."}`,
+    });
+    return undefined;
+  }
+  const conf = withoutEmpty(`${r.where}: behavior.judge`, value, r.notes, {
+    maxWaitMs: 'a batch is judged only after its quiet period',
+    instructions: 'the judge decides without the agent\'s word',
+  });
+  readFieldNames(r, 'behavior.judge', conf, JUDGE_FIELDS);
+  let ok = true;
+  const ms = conf.debounceMs;
+  let debounceMs: number | undefined;
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) {
+    r.problems.push({ text: `behavior.judge.debounceMs is ${shownValue(ms)}, where a number of milliseconds is needed, such as 30000` });
+    ok = false;
+  } else if (ms < MIN_DEBOUNCE_MS) {
+    r.problems.push({
+      text: `behavior.judge.debounceMs is ${ms} ms, under the ${MIN_DEBOUNCE_MS} ms minimum`, read: `so it's read as ${MIN_DEBOUNCE_MS} ms`,
+    });
+    debounceMs = MIN_DEBOUNCE_MS;
+  } else if (ms > MAX_DEBOUNCE_MS) {
+    r.problems.push({
+      text: `behavior.judge.debounceMs is ${ms} ms, over the ${MAX_DEBOUNCE_MS} ms maximum`, read: `so it's read as ${MAX_DEBOUNCE_MS} ms`,
+    });
+    debounceMs = MAX_DEBOUNCE_MS;
+  } else {
+    debounceMs = ms;
+  }
+  let maxWaitMs: number | undefined;
+  const wait = conf.maxWaitMs;
+  if (wait !== undefined) {
+    if (typeof wait !== 'number' || !Number.isFinite(wait)) {
+      r.problems.push({ text: `behavior.judge.maxWaitMs is ${shownValue(wait)}, where a number of milliseconds is needed, such as 120000` });
+      ok = false;
+    } else {
+      const floor = debounceMs ?? MIN_DEBOUNCE_MS;
+      if (wait < floor) {
+        r.problems.push({
+          text: `behavior.judge.maxWaitMs is ${wait} ms, under the rule's ${floor} ms quiet period`,
+          read: `so it's read as ${floor} ms`,
+        });
+        maxWaitMs = floor;
+      } else if (wait > MAX_JUDGE_WAIT_MS) {
+        r.problems.push({
+          text: `behavior.judge.maxWaitMs is ${wait} ms, over the ${MAX_JUDGE_WAIT_MS} ms maximum`,
+          read: `so it's read as ${MAX_JUDGE_WAIT_MS} ms`,
+        });
+        maxWaitMs = MAX_JUDGE_WAIT_MS;
+      } else {
+        maxWaitMs = wait;
+      }
+    }
+  }
+  const said = conf.instructions;
+  let instructions: string | undefined;
+  if (said !== undefined) {
+    if (typeof said !== 'string') {
+      r.problems.push({ text: `behavior.judge.instructions is ${shownValue(said)}, where text is needed` });
+      ok = false;
+    } else if (said.length > MAX_JUDGE_INSTRUCTIONS) {
+      r.problems.push({
+        text: `behavior.judge.instructions is ${said.length} characters long, over the ${MAX_JUDGE_INSTRUCTIONS}-character maximum`,
+      });
+      ok = false;
+    } else {
+      instructions = said;
+    }
+  }
+  if (!ok || debounceMs === undefined) return undefined;
+  const out: JudgeConfig = { debounceMs };
+  if (maxWaitMs !== undefined) out.maxWaitMs = maxWaitMs;
+  if (instructions !== undefined) out.instructions = instructions;
+  return { judge: out };
+}
+
 /** How each kind of behavior object is read. */
 const READ_KIND: Readonly<Record<(typeof BEHAVIOR_KINDS)[number], (r: Reader, value: unknown) => GateBehavior | undefined>> = {
   debounce: readDebounce,
   rate_limit: readRateLimit,
   passive_sample: readPassiveSample,
+  judge: readJudge,
 };
 
 /** A timing kind's keyBy: a field name. One of another type was read as none. */
@@ -1846,6 +1992,31 @@ export class EventGate {
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
 
+  // Reply judge state (`judge` rules). The judge itself, when the host wires
+  // one; without it a judge rule's batch is delivered as a debounce's.
+  private judgeFn: JudgeFn | undefined;
+  private judgeTimeoutMs: number;
+  private judgeOnError: 'wake' | 'skip';
+  /** Per rule, the batch the judge is deciding now. */
+  private judging = new Map<string, JudgingState>();
+  /** Per rule, a batch that fired while an agent's turn ran or the host was
+   *  quiesced, held to be judged once both are clear: the judge reads the
+   *  context the turn leaves, which may already answer it. */
+  private judgeHeld = new Map<string, { events: PendingEvent[]; judge: JudgeConfig }>();
+  private judgeRecords = new Map<string, JudgeRecord>();
+  /** Turns started or resumed so far: a verdict reached while one ran (the
+   *  count moved) was reached on a context that turn has changed, so its
+   *  batch is judged again once it ends. */
+  private turnEpoch = 0;
+  /** Lifetime count of events dropped from batches waiting on the judge, at
+   *  the inference buffer's cap (MAX_INFERENCE_BUFFER per rule). */
+  private droppedJudgeEvents = 0;
+  /** Judge requests failed in a row, and the newest failure's reason: a host
+   *  whose provider can't serve the judge's model fails every time, which
+   *  gate_status says once it's a streak (judgeFailingNotice). */
+  private judgeFailStreak = 0;
+  private judgeLastFailure = '';
+
   // Rate-limit state — policy name → key → bucket.
   private rateLimitBuckets = new Map<string, Map<string, RateBucket>>();
   // Passive-sample state — policy name → key → counter (count since last fire).
@@ -1947,6 +2118,13 @@ export class EventGate {
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** The reply judge `judge` rules ask (JudgeConfig). Absent: a judge
+     *  rule's batch is delivered as a debounce's, and gate_status says so. */
+    judge?: JudgeFn;
+    /** How long a judge request may take (ms). Default 20,000. */
+    judgeTimeoutMs?: number;
+    /** What a judge failure does: wake (default) or skip. */
+    judgeOnError?: 'wake' | 'skip';
     /** Map an event to the registered channel it arrived on (the host knows
      *  how push-event origins compose into channel ids). The gate routes a
      *  batched wake by it, tests a policy's `match.channel` against it when
@@ -1978,6 +2156,11 @@ export class EventGate {
     this.channelShownFn = opts.channelShown;
     this.isNewestEntryFn = opts.isNewestEntry;
     this.now = opts.now ?? (() => Date.now());
+    this.judgeFn = opts.judge;
+    this.judgeTimeoutMs = opts.judgeTimeoutMs !== undefined && Number.isFinite(opts.judgeTimeoutMs) && opts.judgeTimeoutMs > 0
+      ? Math.min(opts.judgeTimeoutMs, MAX_TIMER_MS)
+      : DEFAULT_JUDGE_TIMEOUT_MS;
+    this.judgeOnError = opts.judgeOnError === 'skip' ? 'skip' : 'wake';
     this.loadPrivileged();
 
     // Seed or reconcile the on-disk config from the host's starting rules
@@ -2488,6 +2671,7 @@ export class EventGate {
     for (const name of removed) {
       this.clearPolicyState(name);
       this.stats.delete(name);
+      this.judgeRecords.delete(name);
     }
     const cleared = [...after.keys()].filter((name) => before.has(name) && before.get(name) !== after.get(name));
     for (const name of cleared) this.clearPolicyState(name);
@@ -2963,7 +3147,7 @@ export class EventGate {
     }
 
     if (typeof policy.behavior === 'object') {
-      if ('debounce' in policy.behavior) {
+      if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
         this.handleDebounce(policy, info);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
       }
@@ -3115,7 +3299,7 @@ export class EventGate {
     if (b === 'always') return true;
     if (b === 'defer' || b === 'skip') return false;
     if (typeof b === 'object') {
-      if ('debounce' in b) return false; // batches; never triggers inline
+      if ('debounce' in b || 'judge' in b) return false; // batches; never triggers inline
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
         const key = this.resolveKey(info, cfg.keyBy);
@@ -3316,7 +3500,8 @@ export class EventGate {
   }
 
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
-    const debounceMs = (policy.behavior as { debounce: number }).debounce;
+    const debounceMs = batchQuietMs(policy.behavior) ?? MIN_DEBOUNCE_MS;
+    const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
 
     const event: PendingEvent = {
       policyName: policy.name,
@@ -3340,13 +3525,20 @@ export class EventGate {
     };
 
     const existing = this.debounceTimers.get(policy.name);
+    // A judge's maxWaitMs caps how far new events push the batch back: it's
+    // judged by then, from its first event, quiet or not.
+    const delay = (firstAt: number, batchJudge: JudgeConfig | undefined): number => {
+      const cap = batchJudge?.maxWaitMs;
+      return cap === undefined ? debounceMs : Math.max(0, Math.min(debounceMs, firstAt + cap - Date.now()));
+    };
     if (existing) {
       clearTimeout(existing.timer);
       existing.events.push(event);
-      existing.timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
+      existing.timer = setTimeout(() => this.fireDebounce(policy.name), delay(existing.firstAt, existing.judge));
     } else {
-      const timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
-      this.debounceTimers.set(policy.name, { timer, events: [event] });
+      const firstAt = Date.now();
+      const timer = setTimeout(() => this.fireDebounce(policy.name), delay(firstAt, judge));
+      this.debounceTimers.set(policy.name, { timer, events: [event], firstAt, ...(judge ? { judge } : {}) });
     }
   }
 
@@ -3359,6 +3551,14 @@ export class EventGate {
 
     const events = state.events;
     this.debounceTimers.delete(policyName);
+
+    // A judge rule's batch goes to the reply judge, which delivers it, or
+    // doesn't, once it has decided (judgeBatch). Without a judge wired it's
+    // delivered below, as a debounce's batch is.
+    if (state.judge && this.judgeFn) {
+      this.judgeBatch(policyName, events, state.judge);
+      return;
+    }
 
     // If any agent is currently inferring — or the host is quiesced — buffer
     // for later (with cap). While quiesced, delivering would write a
@@ -3500,11 +3700,255 @@ export class EventGate {
   }
 
   // =========================================================================
+  // Reply judge (`judge` rules)
+  // =========================================================================
+
+  /**
+   * Send one of a judge rule's batches to the reply judge. While an agent's
+   * turn runs or the host is quiesced the batch is held instead, merged with
+   * any the rule already holds, and judged once both are clear
+   * (flushJudgeHeldIfClear): the judge then reads the context the turn left,
+   * which may already have answered it. While the judge decides one of the
+   * rule's batches, a later one waits for that verdict (finishJudging), so the
+   * judge never decides two of a rule's batches at once.
+   */
+  private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
+    if (this.disposed) return;
+    const deciding = this.judging.get(policyName);
+    if (deciding) {
+      deciding.queued.push(...events);
+      this.capJudgeEvents(deciding.queued, deciding.events.length);
+      return;
+    }
+    if (this.inferring.size > 0 || this.quiesced) {
+      this.holdForJudge(policyName, events, judge);
+      return;
+    }
+    const fn = this.judgeFn;
+    if (!fn) {
+      this.deliverOrBuffer(events);
+      return;
+    }
+    const abort = new AbortController();
+    const state: JudgingState = { events, judge, started: Date.now(), abort, epoch: this.turnEpoch, queued: [] };
+    this.judging.set(policyName, state);
+    const timedOut = new Promise<never>((_, reject) => {
+      state.timer = setTimeout(() => {
+        abort.abort();
+        reject(new Error(`the judge took more than ${this.judgeTimeoutMs} ms`));
+      }, this.judgeTimeoutMs);
+      // Never keep the process alive on the judge's account.
+      state.timer.unref?.();
+    });
+    let asked: Promise<JudgeVerdict>;
+    try {
+      asked = fn({
+        policyName,
+        ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
+        events: events.map((e) => this.judgeEventSummary(e)),
+        agentNames: this.getAgentNamesFn(),
+        signal: abort.signal,
+      });
+    } catch (err) {
+      asked = Promise.reject(err);
+    }
+    Promise.race([asked, timedOut]).then(
+      (verdict) => this.finishJudging(policyName, state, verdict),
+      (err: unknown) => this.finishJudging(policyName, state, undefined, err),
+    ).finally(() => {
+      if (state.timer) clearTimeout(state.timer);
+    }).catch((err: unknown) => {
+      console.error(`[gate] Policy "${policyName}": the judge's verdict couldn't be applied (${errorText(err)})`);
+    });
+  }
+
+  /** Hold a batch for the judge until no turn runs and the host isn't
+   *  quiesced, merged with what the rule already holds. */
+  private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
+    const held = this.judgeHeld.get(policyName);
+    if (held) {
+      held.events.push(...events);
+      held.judge = judge;
+      this.capJudgeEvents(held.events);
+    } else {
+      const fresh = [...events];
+      this.capJudgeEvents(fresh);
+      this.judgeHeld.set(policyName, { events: fresh, judge });
+    }
+  }
+
+  /**
+   * Keep a rule's events waiting on the judge to the inference buffer's cap,
+   * dropping the oldest, counted and logged as bufferForInference counts its
+   * drops: a turn that never ends (the wake-wedge) or a long quiesce on a busy
+   * channel would otherwise grow them without bound. `alongside` is the
+   * events already counted against the cap elsewhere (the batch being
+   * judged, beside its queue).
+   */
+  private capJudgeEvents(events: PendingEvent[], alongside = 0): void {
+    const over = events.length + alongside - MAX_INFERENCE_BUFFER;
+    if (over <= 0) return;
+    const drop = Math.min(over, events.length);
+    events.splice(0, drop);
+    const before = this.droppedJudgeEvents;
+    this.droppedJudgeEvents += drop;
+    if (Math.floor(before / 50) !== Math.floor(this.droppedJudgeEvents / 50) || before === 0) {
+      console.error(
+        `[gate] events waiting on the reply judge reached the cap (${MAX_INFERENCE_BUFFER} per rule): dropped `
+        + `${this.droppedJudgeEvents} oldest so far${this.quiesced ? ' during quiesce' : ''}`,
+      );
+    }
+  }
+
+  /** The rule's judge as it is now, when the rule is still a judge rule; else the one the batch was asked with. */
+  private currentJudge(policyName: string, asked: JudgeConfig): JudgeConfig {
+    const now = this.config.policies.find((p) => p.name === policyName)?.behavior;
+    return typeof now === 'object' && 'judge' in now ? now.judge : asked;
+  }
+
+  /** A batch's event as the judge is shown it. */
+  private judgeEventSummary(e: PendingEvent): JudgeEventSummary {
+    const id = e.routeChannelId ?? e.channelId;
+    let channel: string | undefined;
+    if (id !== undefined) {
+      let name = id;
+      if (e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn) {
+        try {
+          name = this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId });
+        } catch {
+          name = id;
+        }
+      }
+      channel = e.channelLabel ? `${e.channelLabel.startsWith('#') ? e.channelLabel : `#${e.channelLabel}`} (${name})` : name;
+    }
+    return {
+      eventType: e.eventType,
+      ...(channel !== undefined ? { channel } : {}),
+      ...(e.authorId !== undefined ? { authorId: e.authorId } : {}),
+      addressed: e.addressed,
+      content: e.content,
+      at: e.timestamp,
+    };
+  }
+
+  /**
+   * Apply the judge's verdict on a batch. Reply: the batch, with any of the
+   * rule's batches that fired meanwhile, is delivered as a debounce's is
+   * (held for a turn that started meanwhile, as fireDebounce holds one). Wait:
+   * nothing is delivered, and batches that fired meanwhile go to the judge
+   * afresh. A judge that failed, timed out or answered nothing usable decides
+   * by onError: "wake" delivers, "skip" doesn't. Each verdict is traced and
+   * counted for gate_status, and a failure is logged.
+   */
+  private finishJudging(policyName: string, state: JudgingState, verdict: JudgeVerdict | undefined, err?: unknown): void {
+    // A verdict for a batch the gate let go of (dispose() clears what the
+    // judge was deciding) applies to nothing, even after a start() since.
+    if (this.judging.get(policyName) !== state) return;
+    this.judging.delete(policyName);
+    if (state.timer) clearTimeout(state.timer);
+    const durationMs = Date.now() - state.started;
+    const failed = verdict == null || typeof verdict !== 'object' || typeof verdict.reply !== 'boolean';
+    const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
+    const reason = failed
+      ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
+      : typeof verdict.reason === 'string' ? verdict.reason : '';
+    const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0 } };
+    record.verdicts[outcome]++;
+    record.last = {
+      at: Date.now(),
+      verdict: outcome,
+      reason: safeSlice(reason, 0, 300),
+      eventCount: state.events.length,
+      durationMs,
+      ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
+    };
+    this.judgeRecords.set(policyName, record);
+    if (failed) {
+      this.judgeFailStreak++;
+      this.judgeLastFailure = safeSlice(reason, 0, 200);
+    } else {
+      this.judgeFailStreak = 0;
+    }
+    const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
+    if (failed) {
+      console.error(
+        `[gate] Policy "${policyName}": the reply judge failed (${reason}), so its batch of ${state.events.length} `
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+      );
+    }
+    this.emitTrace({
+      type: 'gate:judge-verdict',
+      policyName,
+      verdict: outcome,
+      woke: wake,
+      reason: safeSlice(reason, 0, 300),
+      eventCount: state.events.length,
+      durationMs,
+      ...(!failed && verdict.model ? { model: verdict.model } : {}),
+      ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
+      ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
+      ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
+      timestamp: Date.now(),
+    });
+    if (this.disposed) return;
+    const judge = this.currentJudge(policyName, state.judge);
+    // A verdict to wake that was reached while a turn ran, or started before
+    // one that has run since, was reached on a context that turn changed (it
+    // may have answered these very messages): the batch is judged again once
+    // the turn ends, against what it left, rather than waking the agent after
+    // it unjudged. A failure isn't a verdict on the context, and wakes as
+    // onError says.
+    if (outcome === 'reply' && (this.turnEpoch !== state.epoch || this.inferring.size > 0 || this.quiesced)) {
+      this.holdForJudge(policyName, [...state.events, ...state.queued], judge);
+      this.flushJudgeHeldIfClear();
+      return;
+    }
+    if (wake) {
+      this.deliverOrBuffer([...state.events, ...state.queued]);
+      return;
+    }
+    if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, judge);
+  }
+
+  /** Deliver a batch now, or hold it for the agents' turns and the host's
+   *  quiesce to end, as fireDebounce does; a delivery that throws drops it,
+   *  named in the log. */
+  private deliverOrBuffer(events: PendingEvent[]): void {
+    if (events.length === 0) return;
+    if (this.inferring.size > 0 || this.quiesced) {
+      this.bufferForInference(events);
+      return;
+    }
+    try {
+      this.deliverEvents(events);
+    } catch (err) {
+      const one = events.length === 1;
+      console.error(
+        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
+        + `(${errorText(err)}), so the batch is dropped`,
+      );
+    }
+  }
+
+  /** Send the batches held for the judge once no turn runs and the host isn't quiesced. */
+  private flushJudgeHeldIfClear(): void {
+    if (this.quiesced || this.inferring.size > 0 || this.judgeHeld.size === 0) return;
+    const held = [...this.judgeHeld];
+    this.judgeHeld.clear();
+    // Deferred, as the inference buffer's flush is, to stay out of the
+    // turn-end callback that called this.
+    queueMicrotask(() => {
+      for (const [policyName, { events, judge }] of held) this.judgeBatch(policyName, events, judge);
+    });
+  }
+
+  // =========================================================================
   // Inference lifecycle
   // =========================================================================
 
   onInferenceStarted(agentName: string): void {
     this.inferring.add(agentName);
+    this.turnEpoch++;
     // A turn is starting — whatever caused it supersedes any pending
     // self-wake. (Arming happens MID-turn via skip_reply, i.e. after this
     // ran for the arming turn, so a fresh arm always survives its own turn.)
@@ -3524,11 +3968,13 @@ export class EventGate {
    *  still running. */
   onInferenceResumed(agentName: string): void {
     this.inferring.add(agentName);
+    this.turnEpoch++;
   }
 
   onInferenceEnded(agentName: string): void {
     this.inferring.delete(agentName);
     this.flushInferenceBufferIfClear();
+    this.flushJudgeHeldIfClear();
   }
 
   /**
@@ -3543,7 +3989,20 @@ export class EventGate {
   setQuiesced(quiesced: boolean): void {
     if (this.quiesced === quiesced) return;
     this.quiesced = quiesced;
-    if (!quiesced) this.flushInferenceBufferIfClear();
+    if (quiesced) {
+      // A judge reading the context now would read it mid-surgery, and call
+      // its provider while the host holds still: it's stopped, and its batch
+      // held to be judged at resume.
+      for (const [policyName, state] of [...this.judging]) {
+        this.judging.delete(policyName);
+        if (state.timer) clearTimeout(state.timer);
+        state.abort.abort();
+        this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge);
+      }
+    } else {
+      this.flushInferenceBufferIfClear();
+      this.flushJudgeHeldIfClear();
+    }
   }
 
   private flushInferenceBufferIfClear(): void {
@@ -3576,12 +4035,19 @@ export class EventGate {
     bufferedEvents: number;
     droppedBufferedEvents: number;
     sleepUntil: number;
+    /** Events held for the reply judge until the turn or quiesce ends, and the judge's own drops at the cap. */
+    judgeHeldEvents: number;
+    droppedJudgeEvents: number;
   } {
+    let judgeHeldEvents = 0;
+    for (const held of this.judgeHeld.values()) judgeHeldEvents += held.events.length;
     return {
       inferring: [...this.inferring],
       bufferedEvents: this.inferenceBuffer.length,
       droppedBufferedEvents: this.droppedBufferedEvents,
       sleepUntil: this.sleepUntil,
+      judgeHeldEvents,
+      droppedJudgeEvents: this.droppedJudgeEvents,
     };
   }
 
@@ -3935,6 +4401,16 @@ export class EventGate {
           fireCount: this.passiveSampleFires.get(p.name) ?? 0,
         };
       }
+      if (typeof p.behavior === 'object' && 'judge' in p.behavior) {
+        const record = this.judgeRecords.get(p.name);
+        result.judgeState = {
+          pendingCount: debounce?.events.length ?? 0,
+          judging: this.judging.has(p.name),
+          heldCount: this.judgeHeld.get(p.name)?.events.length ?? 0,
+          verdicts: { ...(record?.verdicts ?? { reply: 0, wait: 0, error: 0 }) },
+          ...(record?.last ? { last: { ...record.last } } : {}),
+        };
+      }
       return result;
     });
 
@@ -3961,7 +4437,10 @@ export class EventGate {
       default: this.config.default ?? 'always',
       script: this.gateScript.status(),
       policies,
-      errors: [this.configErrorShown(), this.startNotice, this.startUnsaved, this.privilegedError]
+      errors: [
+        this.configErrorShown(), this.startNotice, this.startUnsaved, this.privilegedError,
+        this.judgeUnwiredNotice(), this.judgeFailingNotice(),
+      ]
         .filter((e): e is string => e !== null),
       shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
       totalEvaluations: this.totalEvaluations,
@@ -3971,6 +4450,27 @@ export class EventGate {
         byEventType,
       },
     };
+  }
+
+  /** gate_status's word on judge rules in force with no judge wired. */
+  private judgeUnwiredNotice(): string | null {
+    if (this.judgeFn) return null;
+    const names = this.config.policies
+      .filter((p) => typeof p.behavior === 'object' && 'judge' in p.behavior)
+      .map((p) => p.name);
+    if (names.length === 0) return null;
+    return `${quotedList(names)} ${names.length === 1 ? 'is a judge rule' : 'are judge rules'}, and this host wires no reply `
+      + `judge, so ${names.length === 1 ? 'its batches wake' : 'their batches wake'} the agent as a debounce of the same quiet period would`;
+  }
+
+  /** gate_status's word on a judge that keeps failing (JUDGE_FAILING_STREAK in a row). */
+  private judgeFailingNotice(): string | null {
+    if (this.judgeFailStreak < JUDGE_FAILING_STREAK) return null;
+    return `the reply judge has failed its last ${this.judgeFailStreak} requests (the newest: ${this.judgeLastFailure}), `
+      + (this.judgeOnError === 'wake'
+        ? 'so judge rules wake the agent as debounces of the same quiet period would'
+        : "so judge rules' batches don't wake the agent")
+      + "; the host's judge model or provider may not serve it (GateOptions.judge)";
   }
 
   // =========================================================================
@@ -3983,6 +4483,14 @@ export class EventGate {
       clearTimeout(state.timer);
     }
     this.debounceTimers.clear();
+    // A judge deciding now is told to stop, and its verdict, when it comes,
+    // delivers nothing (finishJudging); held batches go with the buffer.
+    for (const state of this.judging.values()) {
+      if (state.timer) clearTimeout(state.timer);
+      state.abort.abort();
+    }
+    this.judging.clear();
+    this.judgeHeld.clear();
     for (const timer of this.selfWakeTimers.values()) {
       clearTimeout(timer);
     }
