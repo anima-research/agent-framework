@@ -11,13 +11,13 @@
  * rewinds with the tree.
  *
  * P is evidence about one directory, so each mount also records the identity
- * (device and inode) of the root that evidence was gathered under. A root
- * that isn't that directory any more (an unmounted drive whose mountpoint is
- * now empty, a replaced directory) is an unavailable mount, never a disk on
- * which every file was deleted; only an explicit acceptance takes it, and
- * that starts its evidence afresh. A place, where a walk stopped (`walks`),
- * binds no root: it only says where the next walk starts, in whatever
- * directory the root is by then.
+ * (device, inode and birth time: sameRootIdentity) of the root that evidence
+ * was gathered under. A root that isn't that directory any more (an unmounted
+ * drive whose mountpoint is now empty, a replaced directory) is an unavailable
+ * mount, never a disk on which every file was deleted; only an explicit
+ * acceptance takes it, and that starts its evidence afresh. A place, where a
+ * walk stopped (`walks`), binds no root: it only says where the next walk
+ * starts, in whatever directory the root is by then.
  *
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
@@ -94,10 +94,14 @@ export interface Interrupted {
 
 export type Physical = Agreed | Pending | Interrupted;
 
-/** Which directory a mount root is: its device and inode, as decimal strings. */
+/**
+ * Which directory a mount root is: its device and inode, and its birth time
+ * in nanoseconds where the filesystem reports one, as decimal strings.
+ */
 export interface RootIdentity {
   dev: string;
   ino: string;
+  born?: string;
 }
 
 /** Whether two configured roots name the same path, whatever their spelling
@@ -106,8 +110,14 @@ function sameRootPath(a: string, b: string): boolean {
   return resolve(a) === resolve(b);
 }
 
+/**
+ * Whether two identities name the same directory: the same device and inode,
+ * or the same inode and birth time on another device, since macOS can give a
+ * volume another device number after a reboot.
+ */
 export function sameRootIdentity(a: RootIdentity, b: RootIdentity): boolean {
-  return a.dev === b.dev && a.ino === b.ino;
+  if (a.ino !== b.ino) return false;
+  return a.dev === b.dev || (a.born !== undefined && a.born === b.born);
 }
 
 type JournalEntry =
@@ -314,11 +324,19 @@ export class DiskAgreement {
 
   /**
    * Record the root's identity just before the first evidence a mount gains:
-   * the caller saw it as the root while gathering that evidence. A no-op once
-   * one is recorded; changing it is acceptRoot's alone.
+   * the caller saw it as the root while gathering that evidence. Once one is
+   * recorded, the same directory seen on another device, or with a birth
+   * time the record lacks, replaces it and keeps the evidence; another
+   * directory is acceptRoot's alone.
    */
   recordRootIdentity(mount: string, identity: RootIdentity): void {
-    if (this.rootIdentity(mount) !== undefined) return;
+    const recorded = this.rootIdentity(mount);
+    if (recorded !== undefined) {
+      if (!sameRootIdentity(recorded, identity)) return;
+      const renumbered = recorded.dev !== identity.dev;
+      const bornLearned = recorded.born === undefined && identity.born !== undefined;
+      if (!renumbered && !bornLearned) return;
+    }
     this.write({ t: 'root', mount, identity }, {});
   }
 

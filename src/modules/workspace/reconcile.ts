@@ -1029,9 +1029,10 @@ export async function reconcilePass(
   }
 
   // The evidence about to be recorded describes the root it was gathered
-  // under, which is recorded first (once per mount), so no crash can leave
+  // under, which is recorded first (once per mount, and again when the same
+  // root shows a new device or its first birth time), so no crash can leave
   // evidence without its root.
-  if (gathered.rootIdentity && planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined)) {
+  if (gathered.rootIdentity && (agreement.rootIdentity(mount.name) !== undefined || planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined))) {
     agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
   }
 

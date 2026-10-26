@@ -8002,8 +8002,16 @@ describe('the mount root', () => {
   }
   const identityOf = (path: string) => {
     const s = statSync(path, { bigint: true });
-    return { dev: String(s.dev), ino: String(s.ino) };
+    return { dev: String(s.dev), ino: String(s.ino), ...(s.birthtimeNs > 0n ? { born: String(s.birthtimeNs) } : {}) };
   };
+  const bumped = (n: string) => String(BigInt(n) + 1n);
+  /** Record `identity` as the mount's root, as an earlier process might have, and start a new one. */
+  async function recordedAs(env: Env, m: WorkspaceModule, identity: { dev: string; ino: string; born?: string }): Promise<WorkspaceModule> {
+    (m as any).agreement.write({ t: 'root', mount: 'work', identity }, {});
+    (m as any).agreement.barrier();
+    return env.restart(m);
+  }
+  const rootEntries = (m: WorkspaceModule) => (m as any).agreement.journal.load().entries.filter((e: any) => e.entry.t === 'root');
 
   test('the root disk agreed under is recorded with the first evidence', async (t) => {
     const env = new Env(t);
@@ -8149,6 +8157,81 @@ describe('the mount root', () => {
 
     const again = await call(m, 'sync', { mount: 'work', acceptRoot: true });
     assert.equal(again.rootsAccepted, undefined, 'the recorded root is not accepted twice');
+  });
+
+  test('a root on another device with the same inode and birth time is the same directory: its evidence stays, and drafts go out', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await seedSynced(env, m, 'b.txt', 'B');
+    await call(m, 'write', { path: 'work/a.txt', content: 'A2, a draft over a synced file' });
+    await call(m, 'write', { path: 'work/c.txt', content: 'C, a new draft' });
+    const now = identityOf(env.dir);
+    assert.ok(now.born, 'this filesystem reports a birth time');
+    // What a reboot that renumbered the volume leaves: the recorded root on another device.
+    m = await recordedAs(env, m, { ...now, dev: bumped(now.dev) });
+
+    const materialized = await call(m, 'materialize', {});
+    assert.equal(materialized.skipped, undefined, 'nothing skipped');
+    assert.equal(env.readDisk('a.txt'), 'A2, a draft over a synced file', 'the draft over a synced file went out');
+    assert.equal(env.readDisk('c.txt'), 'C, a new draft');
+    assert.deepEqual((m as any).agreement.rootIdentity('work'), now, 'the root is recorded on the device it is on now');
+    assert.equal(rootEntries(m).at(-1).entry.reset, undefined, 'recorded again, not accepted: the evidence stays');
+
+    const synced = await call(m, 'sync', {});
+    assert.equal(synced.incomplete, undefined, 'nothing was left unobserved');
+    assert.equal(await stateOf(m, 'a.txt'), 'synced');
+    assert.equal(await stateOf(m, 'b.txt'), 'synced');
+    assert.equal(await stateOf(m, 'c.txt'), 'synced');
+    assert.equal(env.eventsOf('workspace:deleted').length, 0, 'nothing was taken as deleted');
+    const accepted = await call(m, 'sync', { mount: 'work', acceptRoot: true });
+    assert.equal(accepted.rootsAccepted, undefined, 'acceptRoot finds nothing to accept');
+  });
+
+  for (const [what, recorded] of [
+    ['another inode', (now: { dev: string; ino: string; born?: string }) => ({ ...now, dev: bumped(now.dev), ino: bumped(now.ino) })],
+    ['another birth time', (now: { dev: string; ino: string; born?: string }) => ({ ...now, dev: bumped(now.dev), born: bumped(now.born!) })],
+    ['no birth time recorded', (now: { dev: string; ino: string; born?: string }) => ({ dev: bumped(now.dev), ino: now.ino })],
+  ] as const) {
+    test(`a root on another device with ${what} is refused as before, and acceptRoot names the way on`, async (t) => {
+      const env = new Env(t);
+      let m = await env.open();
+      await seedSynced(env, m, 'a.txt', 'A');
+      await call(m, 'write', { path: 'work/a.txt', content: 'A2, a draft' });
+      const now = identityOf(env.dir);
+      assert.ok(now.born, 'this filesystem reports a birth time');
+      m = await recordedAs(env, m, recorded(now));
+
+      const materialized = await call(m, 'materialize', {});
+      assert.equal(env.readDisk('a.txt'), 'A', 'the draft was not written');
+      assert.match(JSON.stringify(materialized.skipped), /not the directory disk last agreed with/);
+      const synced = await call(m, 'sync', {});
+      assert.match(synced.incomplete?.[0]?.reason ?? '', /not the directory disk last agreed with/);
+      assert.match(synced.incomplete[0].reason, /acceptRoot/, 'the reason names the remedy');
+      assert.deepEqual((m as any).agreement.rootIdentity('work'), recorded(now), 'the recorded root is left as it was');
+      assert.equal(env.eventsOf('workspace:deleted').length, 0, 'nothing was taken as deleted');
+    });
+  }
+
+  test('a root recorded without its birth time gains it at the next pass that finds it on its device and inode', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const now = identityOf(env.dir);
+    assert.ok(now.born, 'this filesystem reports a birth time');
+    m = await recordedAs(env, m, { dev: now.dev, ino: now.ino });
+
+    const synced = await call(m, 'sync', {});
+    assert.equal(synced.totalSynced, 0, 'a pass with nothing to take in');
+    assert.deepEqual((m as any).agreement.rootIdentity('work'), now, 'the birth time is recorded');
+    assert.equal(rootEntries(m).at(-1).entry.reset, undefined, 'and the evidence stays');
+    assert.equal(await stateOf(m, 'a.txt'), 'synced');
+
+    // So a later renumbering finds the same directory.
+    m = await recordedAs(env, m, { ...now, dev: bumped(now.dev) });
+    await call(m, 'write', { path: 'work/a.txt', content: 'A2, a draft' });
+    await call(m, 'materialize', {});
+    assert.equal(env.readDisk('a.txt'), 'A2, a draft');
   });
 
   test('acceptRoot takes a whole mount, not a path', async (t) => {
