@@ -1737,12 +1737,22 @@ function logSeedOmissions(
   );
 }
 
+interface ManagerRelease {
+  released: boolean;
+  calls: Set<AbortController>;
+  manager?: ContextManager;
+}
+
 /**
- * A maintenance provider call withdrawn because a surgery holds the store, or
- * because stop() has closed provider admission: either is the framework's own
- * doing, and no failure. It sent nothing: it was refused at the provider
- * gate, or woken there from its wait. It extends context-manager's
- * CompressionWithdrawn, whose constructor sets the brand context-manager reads
+ * A maintenance provider call withdrawn because a surgery holds the store,
+ * because stop() has closed provider admission, or because the framework is
+ * done with the agent's context manager: each is the framework's own doing,
+ * and no failure. It sent nothing, as it was refused at the provider gate or
+ * by the manager's own membrane, or woken at the gate from its wait; or it
+ * was out when the framework was done with the manager, and was aborted, so
+ * it sends nothing more, its retries included, though what it had sent may
+ * have reached the provider. It
+ * extends context-manager's CompressionWithdrawn, whose constructor sets the brand context-manager reads
  * a withdrawal by, so the call is no outcome of the compression: every rung
  * of the fallback ladder and the merge path rethrow it unchanged, recording
  * no outcome, attempt, streak or quarantine event. Its tick puts the chunk
@@ -2835,6 +2845,7 @@ export class AgentFramework {
   private stopPromise: Promise<void> | null = null;
   private stopCompleted = false;
   private ownedStoreClosed = false;
+  private ownedStoreManagersClosed = false;
   /** Whether the latest stop() got through its teardown with nothing failed:
    * every step and every wait up to and including the one on awareness
    * drains, whatever failed after that, in the storage work that finishes
@@ -3308,6 +3319,18 @@ export class AgentFramework {
    *  queued, and clears them. While a name is here, no other flush drains
    *  its queue (drainDeferredFor). */
   private readonly releasesAfterResume = new Map<string, Agent>();
+  private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
+  private readonly releasedByCleanup = new WeakSet<Agent>();
+  // context-manager 0.22.1: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2694),
+  // keeps its manager reachable while its work is pending, since the
+  // context's tools and systemPrompt getters close over the manager
+  // (context-manager.ts:2321-2337). So such a released manager is collected
+  // only once nothing of its work can still read the store, and stop()
+  // closes, before an owned store, each one alive.
+  private readonly openManagers = new Set<WeakRef<ContextManager>>();
+  private readonly openManagerRefs = new WeakMap<ContextManager, WeakRef<ContextManager>>();
+  private readonly collectedManagers = new FinalizationRegistry<WeakRef<ContextManager>>((ref) => this.openManagers.delete(ref));
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -3593,8 +3616,9 @@ export class AgentFramework {
   /**
    * The error a failed create() rejects with, once what it acquired is
    * released: the framework it had begun is stopped, with
-   * FAILED_CREATE_TEARDOWN_TIMEOUT_MS as stop()'s teardownTimeoutMs, and a
-   * store create() opened is closed even when that stop failed or timed out.
+   * FAILED_CREATE_TEARDOWN_TIMEOUT_MS as stop()'s teardownTimeoutMs, the
+   * context managers it opened are closed, and a store create() opened is
+   * closed even when that stop failed or timed out.
    * stop() keeps an owned store open when any of its waits fails or times
    * out, so that it can be called again, but no one can call it on a
    * framework that create() never returned. When the release doesn't finish
@@ -3625,6 +3649,7 @@ export class AgentFramework {
             shutdownErrorMessage(stopError));
       }
     }
+    if (framework) framework.closeOpenManagers();
     if (ownsStore && !store.isClosed()) {
       try {
         store.close();
@@ -4287,11 +4312,15 @@ export class AgentFramework {
   /** What start() and addModule() pass before either begins work of a
    * lifecycle. A stop() still running refuses both, from the moment it
    * claims its attempt until that attempt settles. A failed stop() has
-   * cleared its attempt, unless it closed an owned store, which is refused
-   * first. A completed stop() is cleared, and the call goes on as before;
+   * cleared its attempt, unless it closed an owned store, or the context
+   * managers it closes before that store, which are refused first. A
+   * completed stop() is cleared, and the call goes on as before;
    * whether a lifecycle should begin after a stop() is #315's question. */
   private resetCompletedStop(verb: 'start()' | 'addModule()'): void {
     if (this.ownedStoreClosed) throw new Error('Cannot start a new lifecycle: owned store is closed');
+    if (this.ownedStoreManagersClosed) {
+      throw new Error('Cannot start a new lifecycle: stop() closed its context managers, and then failed to close its owned store');
+    }
     if (this.stopPromise && !this.stopCompleted) throw new Error(`${verb} refused: the framework is stopping`);
     if (this.stopCompleted) {
       this.stopPromise = null;
@@ -4845,6 +4874,7 @@ export class AgentFramework {
     }
 
     if (this.ownsStore && teardownSucceeded) {
+      if (this.closeOpenManagers()) this.ownedStoreManagersClosed = true;
       try {
         this.store.close();
         this.ownedStoreClosed = true;
@@ -4992,7 +5022,8 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) Its
+   * single-use, so its context manager's calls are only withdrawn, as below,
+   * through ephemeralAuxiliaryMembraneFor.) Its
    * compression is the background work a resident's is, whether a
    * maintenance tick or a drain after a message starts it, so it is withdrawn
    * as a resident's is: a call made while a surgery holds the store, or once
@@ -5009,6 +5040,63 @@ export class AgentFramework {
         throw error;
       }
     });
+  }
+  private ephemeralAuxiliaryMembraneFor(agentName: string, release: ManagerRelease): Membrane {
+    return this.withdrawnOnceReleased(this.membraneAdmitting(async (run) => {
+      this.withdrawMaintenanceUnderSurgery();
+      this.withdrawMaintenanceWhenStopping(agentName);
+      return run();
+    }), agentName, release);
+  }
+  private withdrawnOnceReleased(membrane: Membrane, agentName: string, release: ManagerRelease): Membrane {
+    const target = membrane as unknown as Record<PropertyKey, unknown>;
+    return new Proxy(target, { get: (obj, prop, receiver) => {
+      const value = Reflect.get(obj, prop, receiver);
+      if (prop === 'complete' && typeof value === 'function') {
+        return async (request: unknown, options?: { signal?: AbortSignal }, ...rest: unknown[]) => {
+          if (release.released) throw new MaintenanceWithdrawnError(`the framework is done with ${agentName}'s context manager`);
+          const call = new AbortController();
+          const signal = options?.signal ? AbortSignal.any([options.signal, call.signal]) : call.signal;
+          release.calls.add(call);
+          try {
+            return await Reflect.apply(value, membrane, [request, { ...options, signal }, ...rest]);
+          } catch (error) {
+            if (call.signal.reason instanceof MaintenanceWithdrawnError) throw call.signal.reason;
+            throw error;
+          } finally {
+            release.calls.delete(call);
+          }
+        };
+      }
+      return typeof value === 'function' ? value.bind(membrane) : value;
+    }}) as unknown as Membrane;
+  }
+  private releaseManager(agent: Agent): void {
+    const release = this.managerReleases.get(agent);
+    if (!release) return;
+    release.released = true;
+    const withdrawn = new MaintenanceWithdrawnError(`the framework is done with ${agent.name}'s context manager`);
+    for (const call of release.calls) call.abort(withdrawn);
+  }
+  private trackManager(contextManager: ContextManager): void {
+    const ref = new WeakRef(contextManager);
+    this.openManagers.add(ref);
+    this.openManagerRefs.set(contextManager, ref);
+    this.collectedManagers.register(contextManager, ref, ref);
+  }
+  private closeManager(contextManager: ContextManager): void {
+    const ref = this.openManagerRefs.get(contextManager);
+    if (ref) {
+      this.openManagers.delete(ref);
+      this.openManagerRefs.delete(contextManager);
+      this.collectedManagers.unregister(ref);
+    }
+    contextManager.close();
+  }
+  private closeOpenManagers(): boolean {
+    const alive = [...this.openManagers].flatMap((ref) => ref.deref() ?? []);
+    for (const contextManager of alive) this.closeManager(contextManager);
+    return alive.length > 0;
   }
   /** The framework's membrane, with each complete() call passed through
    *  `admit` along with the model it names. */
@@ -5593,6 +5681,7 @@ export class AgentFramework {
       } catch (error) {
         console.error(`[tool-result-guard] agent=${agent.name} storage retry failed during maintenance:`, error);
       }
+      if (this.managerReleases.get(agent)?.released) return [];
       // Whatever throws while one agent's maintenance is prepared is that
       // agent's failure, reported for it alone, while the others run.
       const failedAgent = (error: unknown): Queued[] => {
@@ -9188,7 +9277,13 @@ export class AgentFramework {
    * `{namespace}/messages`, context log to `{namespace}/context`.
    *
    * Data persists after cleanup for investigation and cross-revert.
-   * Call cleanup() when done to release the ContextManager.
+   * Call cleanup() when done with the agent: the agent can't run again. From
+   * the run's end, or from cleanup(), its ContextManager makes no provider
+   * call, and the calls it has out are aborted. It starts no new call while a
+   * surgery holds the store or once stop() has begun, either; one already out
+   * then runs on until stop(), with a store the framework owns, closes the
+   * ContextManager, before the store. Until then the ContextManager stays
+   * open.
    */
   async createEphemeralAgent(config: AgentConfig): Promise<{
     agent: Agent;
@@ -9206,6 +9301,7 @@ export class AgentFramework {
       throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
     }
     this.usedEphemeralAgentNames.set(config.name, 'run');
+    const release: ManagerRelease = { released: false, calls: new Set() };
     try {
       const namespace = `subagent/${config.name}`;
 
@@ -9214,23 +9310,27 @@ export class AgentFramework {
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
+      this.trackManager(contextManager);
+      release.manager = contextManager;
 
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
       this.ephemeralAgents.add(agent);
+      this.managerReleases.set(agent, release);
 
       const cleanup = () => {
-        // Don't close the store — it's shared. Just release the CM.
-        // Data persists in the store under the namespace for investigation.
+        this.releasedByCleanup.add(agent);
+        this.releaseManager(agent);
       };
 
       return { agent, contextManager, cleanup };
     } catch (error) {
+      if (release.manager) this.closeManager(release.manager);
       this.usedEphemeralAgentNames.delete(config.name);
       throw error;
     }
@@ -9371,6 +9471,9 @@ export class AgentFramework {
     contextManager: ContextManager,
     watchdogs?: { startupTimeoutMs?: number; idleTimeoutMs?: number; idlePollMs?: number },
   ): Promise<{ speech: string; toolCallsCount: number }> {
+    if (this.releasedByCleanup.has(agent)) {
+      throw new Error(`Ephemeral agent "${agent.name}" was released by cleanup() and can't run; create a new one`);
+    }
     // Refused at admission while quiesced rather than requeued: the caller
     // awaits the settle promise under an idle-stall watchdog, so a gate-parked
     // ephemeral would ride out its timeout and reject with a misleading
@@ -9521,6 +9624,7 @@ export class AgentFramework {
         console.error(`[ephemeral] agent=${agent.name} its stream's cancel failed at the run's end; the run leaves all the same:`, error);
       }
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
+      this.releaseManager(agent);
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its
         // turn's end, is left to its window's release below
@@ -12373,6 +12477,7 @@ export class AgentFramework {
       viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut
         && !isAnotherAgentsInjection(message.metadata, config.name),
     });
+    this.trackManager(contextManager);
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
@@ -12455,6 +12560,7 @@ export class AgentFramework {
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
+    this.trackManager(contextManager);
 
     // Inherit the principal's inference settings wholesale (fork-template
     // idiom): reasoning effort (thinking), provider params, token ceilings,
@@ -13754,6 +13860,7 @@ export class AgentFramework {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
     this.usedEphemeralAgentNames.set(name, 'conversation');
+    const release: ManagerRelease = { released: false, calls: new Set() };
     try {
 
       const contextManager = await ContextManager.open({
@@ -13765,9 +13872,11 @@ export class AgentFramework {
         // Provider cooldown ownership belongs to the persistent resident only;
         // generation-unique forks must not leak gates. A fork's own recorded
         // provider waits still bind its compression calls.
-        membrane: this.conversationAuxiliaryMembraneFor(name),
+        membrane: this.withdrawnOnceReleased(this.conversationAuxiliaryMembraneFor(name), name, release),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
+      release.manager = contextManager;
+      this.trackManager(contextManager);
 
       // Seed with the template's compiled context, renaming the template
       // participant so the fork reads its inheritance as its own history.
@@ -13854,11 +13963,13 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      this.managerReleases.set(agent, release);
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       this.conversationAgentHomes.set(name, home);
       return agent;
     } catch (error) {
+      if (release.manager) this.closeManager(release.manager);
       this.usedEphemeralAgentNames.delete(name);
       throw error;
     }
@@ -14023,7 +14134,10 @@ export class AgentFramework {
     this.thinkingLossIncidents.forget(agentName);
     // Its pending self-wake ends with it, rather than wake a name that's gone.
     this.eventGate?.agentGone(agentName);
-    if (agent) this.releaseWindowNowOrAfterResume(agent);
+    if (agent) {
+      this.releaseManager(agent);
+      this.releaseWindowNowOrAfterResume(agent);
+    }
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
     this.openLogical.delete(agentName);
