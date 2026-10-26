@@ -1,13 +1,3 @@
-/**
- * After the store's branch moves, every agent sharing the store compiles
- * again without a restart (#326). context-manager re-initializes only the
- * manager that makes a move; the framework re-initializes every other one
- * before the move releases the store.
- *
- * Two agents with autobiographical strategies, whose loaded branch
- * generation is what goes stale, on one store. No provider is called except
- * where a test takes a turn.
- */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
@@ -43,9 +33,6 @@ function autobiographical(): AutobiographicalStrategy {
   });
 }
 
-/** A promise the test settles, which records whether anything has waited on
- *  it through `then` (Promise.allSettled does), so a test can check that a
- *  wait was reached instead of sleeping and hoping it was. */
 const watchedPromise = () => {
   let settle!: () => void;
   const promise = new Promise<void>((resolve) => { settle = resolve; });
@@ -56,9 +43,7 @@ const watchedPromise = () => {
   });
   return { promise, settle, waited: () => waitedOn };
 };
-/** Let every queued microtask run (setImmediate's callback runs after them). */
 const settled = () => new Promise<void>((resolve) => { setImmediate(resolve); });
-/** What the ops webhook is posted, through a stubbed fetch, until restore(). */
 const captureWebhook = () => {
   const hook = process.env.CONNECTOME_OPS_WEBHOOK;
   const realFetch = globalThis.fetch;
@@ -76,8 +61,6 @@ const captureWebhook = () => {
     },
   };
 };
-/** The one webhook post of an agent's alert of a kind, as far as the start the
- *  webhook keeps of a cut message: up to its omission marker. */
 const keptHead = (posted: string[], agentName: string, kind: string): string => {
   const prefix = `\u{1F6A8} **${agentName}** ${kind}: `;
   const posts = posted.filter((post) => post.startsWith(prefix));
@@ -86,8 +69,6 @@ const keptHead = (posted: string[], agentName: string, kind: string): string => 
   assert.ok(marker > 0, `the post was cut: ${posts[0]}`);
   return posts[0]!.slice(prefix.length, marker);
 };
-/** Wait until `check()` holds, for at most `ms`, so a test waiting for
- *  something that never comes fails rather than hangs. */
 const until = async (check: () => boolean, what: string, ms: number): Promise<void> => {
   const deadline = Date.now() + ms;
   while (!check()) {
@@ -115,21 +96,16 @@ describe('after a branch move, every agent on the store compiles without a resta
   const cmOf = (name: string): ContextManager => framework.getAgent(name)!.getContextManager();
   const internals = () => framework as unknown as Internals;
   const text = (t: string) => [{ type: 'text' as const, text: t }];
-  /** A dry compile and a readiness read: both refuse on a manager left on an
-   *  earlier branch generation. */
   const budget = { maxTokens: 100_000, reserveForResponse: 1_000 };
   const works = async (name: string): Promise<void> => {
     await cmOf(name).compile(budget, undefined, { dryRun: true });
     assert.equal(typeof cmOf(name).isReady(), 'boolean');
   };
-  /** One turn's checkpoint for `a`, taken before its last message. */
   const checkpointTurn = (): void => {
     const sequenceBefore = framework.getStore().currentSequence();
     cmOf('a').addMessage('user', text('a turn to undo'));
     internals().saveTurnCheckpoints('a', [{ agentName: 'a', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
   };
-  /** Wait for the re-initialization an undo or redo started, by the
-   *  `settled` its result carries once the store has moved. */
   const reinitDone = async (moved: { settled?: Promise<void> }): Promise<void> => {
     assert.ok(moved.settled, 'a move answers with the promise of its re-initialization');
     await moved.settled;
@@ -183,9 +159,6 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it('suppressMessages on one agent: the other compiles', async () => {
-    // The first message: after a middle one is removed, context-manager
-    // 0.14.0's autobiographical strategy refuses every compile that follows
-    // a dry run, the suppression's own preview included, whatever the move.
     const r = await framework.suppressMessages('a', { messageIds: [firstId] });
     assert.equal(r.messagesRemoved, 1);
     await works('a');
@@ -238,8 +211,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(undone.undone, true);
     assert.equal(redone.redone, true);
     assert.equal(framework.getStore().currentBranch().name, 'main');
-    // An operation that awaits its steps is refused while the managers
-    // re-initialize, as during any surgery. The hold is the undo's.
     await assert.rejects(
       framework.rollbackToMessage('a', { messageId: firstId }),
       (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /live undo for a/.test(e.message),
@@ -261,8 +232,6 @@ describe('after a branch move, every agent on the store compiles without a resta
       cmdAgentContext(params: { agentName: string }): Promise<{ context: unknown[] }>;
       broadcast(event: string, data: unknown): void;
     };
-    // A client that answers each move by reading the other agent's context,
-    // which compiles on that agent's own manager.
     const held: boolean[] = [];
     const reads: Array<Promise<{ context: unknown[] }>> = [];
     api.broadcast = (event) => {
@@ -343,8 +312,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(reinitAlerts().length, 1);
   });
 
-  // R1-2: the release can't store a write for an agent whose manager refuses
-  // its work, so the write stays in that agent's queue rather than being lost.
   it('a message deferred during the hold for an agent whose re-initialization fails stays queued at the release, and is stored once the agent recovers', async () => {
     checkpointTurn();
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
@@ -373,7 +340,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.deepEqual(queue.deferredMessages.map((m) => m.forAgent), ['b'], 'still queued for b after the release');
     assert.ok(!textsOfB().includes(held));
 
-    // The documented recovery: a switch to the branch the store is on.
     await framework.switchBranch(framework.getStore().currentBranch().name);
     await works('b');
     assert.deepEqual(queue.deferredMessages, [], 'nothing is left queued');
@@ -401,10 +367,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     await works('b');
   });
 
-  // A run is registered for its run, so a move's pass re-initializes its
-  // manager too, but a restart ends the run rather than creating it again.
-  // What a restart does is taken when the manager fails: here the run leaves
-  // before the failure is reported.
   it("a run whose manager fails to re-initialize is told that a restart ends the run, as it was when it failed", async () => {
     checkpointTurn();
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
@@ -415,12 +377,9 @@ describe('after a branch move, every agent on the store compiles without a resta
       reportReinitFailures: (...args: unknown[]) => void;
     };
     const b = internals.agents.get('b');
-    // b stands in for a run registered while the undo held the store.
     internals.ephemeralRuns.set('b', {
       settle: { promise: new Promise(() => {}), resolve() {}, reject() {} }, inferenceStarted: false, lastActivity: Date.now(), toolCallsCount: 0,
     });
-    // It ends, leaving both maps as a run's end does, after its failure was
-    // recorded and before it's reported.
     const report = internals.reportReinitFailures.bind(framework);
     internals.reportReinitFailures = (...args: unknown[]) => {
       internals.ephemeralRuns.delete('b');
@@ -438,8 +397,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.match(alerts[0]!.message, /; a restart ends the run\. The work it refuses includes compiles and message writes\. Its re-initialization failed: .*injected initialization failure/);
   });
 
-  // A run whose watchdog ends it while its manager re-initializes has left
-  // by the time that fails, and refuses no one's work.
   it("a run that ends during its own re-initialization, which then fails, isn't reported", async () => {
     checkpointTurn();
     const internals = framework as unknown as { agents: Map<string, unknown>; ephemeralRuns: Map<string, unknown> };
@@ -465,14 +422,10 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.deepEqual(reinitAlerts(), []);
   });
 
-  // A rollback can name a run, and the run can end while the rollback runs,
-  // during its own switch or its restore: what a restart does to it is taken
-  // when the rollback reserves the store, before either.
   for (const during of ['switch', 'restore'] as const) {
     it(`a run named by a rollback whose restore fails, and which ends during the rollback's ${during}, is told a restart ends the run`, async () => {
       const internals = framework as unknown as { agents: Map<string, unknown>; ephemeralRuns: Map<string, unknown> };
       const agentA = internals.agents.get('a');
-      // As a run's end does: it leaves both maps.
       let ended: 'switch' | 'restore' | undefined;
       const end = (where: 'switch' | 'restore') => {
         ended = where;
@@ -517,8 +470,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     });
   }
 
-  // R3-5: a restart loses the write R1-2's release keeps queued, so the
-  // remedy says so, and stop() says how many it leaves queued.
   it("the alert's remedy says a restart loses the writes kept queued, and stop() says how many it leaves for an agent whose manager refuses them", async () => {
     checkpointTurn();
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
@@ -548,8 +499,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.ok(!logged.some((line) => /write\(s\) for a stay queued/.test(line)), `nothing is said for a, whose write the release stored: ${logged.join('\n')}`);
   });
 
-  // The same line, for a persisted queue: one whose record is current keeps
-  // the writes for boot, and one whose last write failed is behind.
   for (const record of ['current', 'behind'] as const) {
     it(`stop() says a persisted queue whose record is ${record} ${record === 'current' ? 'keeps' : 'can lose'} the writes it leaves for an agent whose manager refuses them`, async () => {
       checkpointTurn();
@@ -644,8 +593,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     let calls = 0;
     strategy.initialize = async (...args: unknown[]) => {
       calls++;
-      // The first pass's re-initialization of b fails; the pass the redo
-      // starts succeeds.
       if (calls === 1) throw new Error('injected first-pass failure');
       return initialize(...args);
     };
@@ -655,7 +602,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.deepEqual(reinitAlerts(), [], 'the overtaken pass is not reported');
     await works('b');
 
-    // Now the last pass fails: one alert, labelled with the last move.
     let failAll = true;
     strategy.initialize = async (...args: unknown[]) => {
       if (failAll) throw new Error('injected last-pass failure');
@@ -669,9 +615,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.match(alerts[0]!.message, /The redo moved the store's branch/);
   });
 
-  // R3-4: no turn starts while a move holds the store, and nothing bounds
-  // what the hold waits on, so a hold still up past its threshold is said,
-  // once.
   it("a hold's reporter, called during the pass, names the move, its agent, the manager the pass is on and the writes waiting", async () => {
     checkpointTurn();
     const fw = framework as unknown as { reportLongHold(hold: unknown): void };
@@ -681,8 +624,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     let atGate = false;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    // b's re-initialization in the undo's pass runs at once; in the pass the
-    // redo's join starts, it waits at the gate.
     strategy.initialize = async (...args: unknown[]) => {
       if (++calls === 2) {
         atGate = true;
@@ -699,8 +640,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     try {
       await until(() => atGate, "b's second re-initialization to reach its gate", 10_000);
       assert.equal(queue.addMessage('user', text('for a, during the hold'), undefined, { forAgent: 'a' }), '', 'deferred, not stored');
-      // What its timer does when the threshold passes, called here so the
-      // test needn't time the pass against it; the next test runs the timer.
       const hold = internals().surgeryHold;
       assert.ok(hold, 'the store is held');
       fw.reportLongHold(hold);
@@ -725,7 +664,6 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("a rollback still waiting for maintenance that was running when it took the store raises the alert, saying that's what it waits on", async () => {
     shortenHoldAlert(1_000);
-    // A maintenance pass in flight: one the test settles.
     const { promise: pass, settle, waited } = watchedPromise();
     const fw = framework as unknown as { maintenancePass: Promise<void> | null };
     fw.maintenancePass = pass;
@@ -735,7 +673,6 @@ describe('after a branch move, every agent on the store compiles without a resta
       await settled();
       assert.ok(waited(), 'the rollback waits on the running maintenance pass');
       await until(() => longHoldAlerts().length > 0, 'the store-held-long alert', 10_000);
-      // A hold has one timer, so nothing more comes while it's still up.
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       assert.equal(longHoldAlerts().length, 1, JSON.stringify(longHoldAlerts()));
       const [alert] = longHoldAlerts();
@@ -770,8 +707,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     const mount = new Promise<void>((resolve) => { mounted = resolve; });
     fw.moduleRegistry.getModule = (name: string) =>
       name === 'workspace' ? { materializeMount: async () => { await mount; } } : getModule(name);
-    // The pass has ended once both managers are re-initialized: this fixture
-    // has no conversation agent to seed again.
     let reinitialized = 0;
     for (const name of ['a', 'b']) {
       const cm = cmOf(name) as unknown as { setStrategy: (s: unknown) => Promise<void> };
@@ -787,8 +722,6 @@ describe('after a branch move, every agent on the store compiles without a resta
       const hold = (internals() as unknown as { surgeryHold: { reinitializing?: string } | null }).surgeryHold;
       assert.ok(hold, 'the store is still held, for the config mount');
       assert.equal(hold.reinitializing, undefined);
-      // What its timer does when the threshold passes, called here so the
-      // test needn't time the pass against it.
       fw.reportLongHold(hold);
       const [alert] = longHoldAlerts();
       assert.equal(alert!.agentName, 'every agent');
@@ -834,8 +767,6 @@ describe('after a branch move, every agent on the store compiles without a resta
       try {
         return await setStrategy(strategy);
       } finally {
-        // Runs at the pass's turn of the event loop before b's, where an
-        // overdue timer would.
         setImmediate(() => {
           named.push((internals() as unknown as { surgeryHold: { reinitializing?: string } | null }).surgeryHold?.reinitializing);
         });
@@ -857,7 +788,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     const readdDrained = fw.readdDrained;
     try {
       const undone = framework.undoLastTurn('a');
-      // The release's flush, which runs once the hold is cleared, throws.
       assert.equal(fw.addMessage('user', text('for b, during the hold'), undefined, { forAgent: 'b' }), '', 'deferred, not stored');
       fw.readdDrained = () => { throw new Error('injected release flush failure'); };
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -880,9 +810,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     shortenHoldAlert(1_000);
     await reinitDone(framework.undoLastTurn('a'));
     assert.equal(internals().surgeryHold, null);
-    // An undo of two short histories lets the store go well within 1 s. One
-    // that took longer on a slow host was said while the store was held, and
-    // still nothing may come after it.
     const atRelease = longHoldAlerts().length;
     await new Promise((resolve) => setTimeout(resolve, 1_500));
     assert.equal(longHoldAlerts().length, atRelease, 'its timer went with the hold');
@@ -893,7 +820,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     const fork = a.fork;
     const store = framework.getStore();
     a.fork = async (...args: unknown[]) => {
-      // As a fork whose initialization fails after the store has moved.
       const name = String(args[1] ?? args[0]);
       if (!store.listBranches().some((b) => b.name === name)) store.createBranchAt(name, 'main', store.currentSequence());
       store.switchBranch(name);
@@ -962,7 +888,6 @@ describe('after a branch move, every agent on the store compiles without a resta
       const name = String(args[1] ?? args[0]);
       if (!store.listBranches().some((b) => b.name === name)) store.createBranchAt(name, 'main', store.currentSequence());
       store.switchBranch(name);
-      // The run ends, leaving both maps, as the fork fails.
       ended = true;
       internals.ephemeralRuns.delete('a');
       internals.agents.delete('a');
@@ -1016,8 +941,6 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it('a host/command undo of two turns undoes both, then answers', async () => {
-    // As turns record them: each turn's checkpoint is saved at its start,
-    // so the branch an undo goes back to holds the earlier ones.
     const first = { agentName: 'a', turnIndex: 1, sequenceBefore: framework.getStore().currentSequence(), branchName: 'main', timestamp: Date.now() };
     internals().saveTurnCheckpoints('a', [first]);
     cmOf('a').addMessage('user', text('turn one'));
@@ -1034,7 +957,6 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("undo refuses as busy when the named agent is busy, and a joined redo when another agent is", async () => {
     checkpointTurn();
-    // An agent reads as busy while its state says so.
     const busy = (name: string) => {
       const agent = framework.getAgent(name)!;
       const state = agent.state;
@@ -1065,7 +987,6 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("an undo's re-initialization waits for maintenance already running before any manager re-initializes", async () => {
     checkpointTurn();
-    // A maintenance pass in flight: one the test settles.
     const { promise: pass, settle, waited } = watchedPromise();
     const fw = framework as unknown as { maintenancePass: Promise<void> | null };
     fw.maintenancePass = pass;
@@ -1102,8 +1023,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     }
     const undone = framework.undoLastTurn('a');
     assert.deepEqual(calls, [], 'no manager re-initializes inside undoLastTurn()');
-    // An immediate queued now runs on the event loop's next turn: before the
-    // last manager re-initializes, since each waits for a turn of its own.
     const before = await new Promise<number>((resolve) => { setImmediate(() => resolve(calls.length)); });
     assert.ok(before < 2, `the event loop ran while the managers re-initialized (${before} of 2 had when it did)`);
     await reinitDone(undone);
@@ -1153,8 +1072,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     } finally {
       a.initializeStrategy = initializeStrategy;
     }
-    // The restore's switch selects main before its initialization fails, so
-    // the store is back on main, and the message says so.
     assert.equal(framework.getStore().currentBranch().name, 'main');
     assert.match(message, /RESTORE TO main selected it, but re-initializing the agent's context manager for it FAILED/);
     assert.match(message, /the agent refuses its work until switchBranch\(\) to the current branch, or a restart, re-initializes it/);
@@ -1221,13 +1138,10 @@ describe('after a branch move, every agent on the store compiles without a resta
     const alerts = reinitAlerts().filter((alert) => alert.agentName === 'a');
     assert.equal(alerts.length, 1, JSON.stringify(reinitAlerts()));
     assert.match(alerts[0]!.message, /^The suppression failed and the store couldn't be put back, so this agent's context manager is current on the branch the suppression made: it serves from there, which may be partly suppressed, until switchBranch\(\) to the branch it should run on moves it\. The store is on partly-suppressed, and the restore to main failed: injected restore refusal\.$/);
-    // It does serve: its manager compiles there.
     await works('a');
   });
 
   it("a suppression whose removals fail after its fork, and whose restore selects the source but fails to re-initialize, says the agent refuses its work", async () => {
-    // The fork initialized a's manager, but once the restore has selected the
-    // source, its initialization there is what decides: selected wins.
     const a = cmOf('a') as unknown as {
       removeMessage: (...args: unknown[]) => void;
       removeMessages: (...args: unknown[]) => void;
@@ -1283,8 +1197,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.match(keptHead(webhook.posted, 'a', 'context-reinit-failed'), /^The rollback failed and the store couldn't be put back, so this agent's context manager refuses its work until switchBranch\(\) to the branch it should run on re-initializes it and stores its queued writes, at resume on a quiesced host; a restart re-initializes it on the branch the store is on instead\. /);
   });
 
-  // A taken branch name is refused before anything is prepared (the
-  // known-collision check), so the fork's own refusal is injected here.
   it('a suppression whose fork is refused before the store moved re-initializes no other manager and raises no alert', async () => {
     const store = framework.getStore();
     const cmA = cmOf('a') as unknown as { fork: (name: string) => Promise<string> };
@@ -1334,8 +1246,6 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it("a redo whose branch was deleted drops that step and says so, with the switch's error as its cause, and the redo beneath it still works", async () => {
-    // Two turns of a's, each checkpointed at its start as a turn is, then
-    // undone one after the other.
     const store = framework.getStore();
     const before1 = store.currentSequence();
     const turn1 = { agentName: 'a', turnIndex: 1, sequenceBefore: before1, branchName: 'main', timestamp: Date.now() };
@@ -1349,10 +1259,8 @@ describe('after a branch move, every agent on the store compiles without a resta
     await reinitDone(framework.undoLastTurn('a'));
     const afterSecondUndo = store.currentBranch().name;
     assert.equal(framework.getUndoRedoState('a').redoDepth, 2);
-    // The top entry returns to the branch the first undo left; delete it.
     store.deleteBranch(afterFirstUndo);
 
-    // The error the switch itself throws for the deleted branch.
     const mover = store as unknown as { switchBranch: (name: string) => void };
     const switchBranch = mover.switchBranch.bind(store);
     let switchError: unknown;
@@ -1440,7 +1348,6 @@ describe('after a branch move, every agent on the store compiles without a resta
     );
     await reinitDone(undone);
     assert.equal(framework.getAgentRuntimeSettings('b').sameRoundThinkTextPolicy, before.sameRoundThinkTextPolicy);
-    // Once the store is let go, the same change applies.
     assert.equal(framework.updateAgentRuntimeSettings('b', { sameRoundThinkTextPolicy: next }).sameRoundThinkTextPolicy, next);
   });
 
@@ -1465,8 +1372,6 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it("after a rollback, the other agent compiles what the landed branch holds", async () => {
-    // a and b share the store's slot here, so the rollback to a's first
-    // message takes b's later message with it.
     await framework.rollbackToMessage('a', { messageId: firstId });
     const { messages } = await cmOf('b').compile(budget, undefined, { dryRun: true });
     const texts = JSON.stringify(messages);
@@ -1477,7 +1382,6 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("a redo made from a listener of the last pass's alert is refused as busy, the store stays where the undo left it, and the agent that moved compiles", async () => {
     checkpointTurn();
-    // b's next initialization fails, so the undo's pass reports an alert.
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
     const initialize = strategy.initialize.bind(strategy);
     let failNext = true;
@@ -1485,7 +1389,6 @@ describe('after a branch move, every agent on the store compiles without a resta
       if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
       return initialize(...args);
     };
-    // A trace listener that redoes, synchronously, when it hears that alert.
     let redo: unknown = 'not called';
     framework.onTrace((event) => {
       if (event.type === 'ops:alert' && event.kind === 'context-reinit-failed' && redo === 'not called') {
@@ -1528,9 +1431,6 @@ describe('conversation forks and an undo', () => {
       const sequenceBefore = framework.getStore().currentSequence();
       cmA.addMessage('user', [{ type: 'text', text: 'a turn to undo' }]);
       internals.saveTurnCheckpoints('a', [{ agentName: 'a', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
-      // The template's re-initialization waits at a gate the test opens once
-      // the spawn is waiting, so a fork that didn't wait would be seeded from
-      // it mid-initialization.
       const order: string[] = [];
       const strategy = cmA.getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
       const initialize = strategy.initialize.bind(strategy);
@@ -1601,8 +1501,6 @@ describe('conversation forks and an undo', () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   };
-  /** Template `a` says hello; a fork is spawned before a turn's checkpoint and
-   *  one after it; each fork then writes a message of its own. */
   const forksAroundACheckpoint = async (framework: AgentFramework, internals: ForkInternals): Promise<number> => {
     const router = framework.getConversationRouter()!;
     const cmA = framework.getAgent('a')!.getContextManager();
@@ -1636,7 +1534,6 @@ describe('conversation forks and an undo', () => {
       const early = await textsOf(framework, 'a-early-g1');
       assert.ok(count(early, 'hello a') === 1 && count(early, 'early own') === 1, `the fork spawned before the point keeps its own, seeded once: ${JSON.stringify(early)}`);
       assert.equal(logged.filter((line) => /a-late-g1 had no messages on the branch the store moved to: seeded again from a/.test(line)).length, 1, logged.join('\n'));
-      // RFC-006: the seeded copies count as consumed, as a seed at creation does.
       const lastSeeded = framework.getAgent('a-late-g1')!.getContextManager().getAllMessages().at(-1)!.sequence;
       const mark = framework.getAgent('a-late-g1')!.getConsumedWatermark();
       assert.equal(mark?.branch, framework.getStore().currentBranch().name, `the consumed mark is on the branch the undo landed on: ${JSON.stringify(mark)}`);
@@ -1671,8 +1568,6 @@ describe('conversation forks and an undo', () => {
       assert.equal(count(late, 'late own'), 0, JSON.stringify(late));
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-bad-g1'], JSON.stringify(alerts));
-      // A restart doesn't create a conversation agent again, so its remedy
-      // says what a restart does to it instead.
       assert.match(reinit[0]!.message, /^The branch switch moved the store's branch, and this agent's context manager failed to re-initialize\. It refuses its work until switchBranch\(\) to the current branch re-initializes it and stores its queued writes, at resume on a quiesced host; a restart ends it, and its channel's next qualifying message spawns a new fork\. The work it refuses includes compiles and message writes, and a fork its channel spawns after a restart gets none of the writes queued for this one\. Its re-initialization failed: .*injected fork init failure/);
       assert.equal(framework.getAgent('a-bad-g1')!.getContextManager().getMessageCount(), 0, 'not seeded');
       assert.ok(!logged.some((line) => /a-bad-g1 had no messages/.test(line)), logged.join('\n'));
@@ -1707,9 +1602,6 @@ describe('conversation forks and an undo', () => {
     });
   });
 
-  // A fork can leave while it's seeded again, as stop() ends it: its
-  // seeding's failure is then neither reported nor its disposal made again
-  // (af-353-r8's I15).
   it("a fork that leaves while it's seeded again, whose seeding then fails, isn't reported", { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-seed-leaves-', async (framework, internals) => {
       await forksAroundACheckpoint(framework, internals);
@@ -1750,8 +1642,6 @@ describe('conversation forks and an undo', () => {
       framework.onTrace((event) => {
         if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string });
       });
-      // The template's compile, which a seeding reads, fails once the managers
-      // are re-initialized.
       const cmA = framework.getAgent('a')!.getContextManager();
       const compile = cmA.compile.bind(cmA);
       (cmA as unknown as { compile: () => Promise<never> }).compile = async () => { throw new Error('injected template compile failure'); };
@@ -1780,7 +1670,6 @@ describe('conversation forks and an undo', () => {
     await withForks('reinit-fork-disposefail-', async (framework, internals) => {
       await forksAroundACheckpoint(framework, internals);
       const router = framework.getConversationRouter()!;
-      // A second fork spawned after the checkpoint, after a-late-g1 in the pass.
       await internals.createConversationAgent('a-later-g1', { serverId: 'world', channelId: 'world:later' });
       router.bind({ serverId: 'world', channelId: 'world:later' }, 'a-later-g1', 1);
       framework.getAgent('a-later-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'later own' }]);
@@ -1788,9 +1677,6 @@ describe('conversation forks and an undo', () => {
       framework.onTrace((event) => {
         if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string });
       });
-      // a-late-g1's seeding fails, and then releasing its window throws when
-      // it's disposed. (A store that refuses to drop its turn checkpoints no
-      // longer fails a disposal: evictTurnCheckpoints logs it and goes on.)
       const cmLate = framework.getAgent('a-late-g1')!.getContextManager();
       (cmLate as unknown as { addMessage: () => never }).addMessage = () => { throw new Error('injected seed failure'); };
       const released = framework as unknown as { releaseWindow: (agent: { name: string }) => void };
@@ -1829,8 +1715,6 @@ describe('conversation forks and an undo', () => {
       const sequenceBefore = framework.getStore().currentSequence();
       cmA.addMessage('user', [{ type: 'text', text: 'a turn to undo' }]);
       internals.saveTurnCheckpoints('a', [{ agentName: 'a', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
-      // Hold the spawn at the template's compile, which it makes before it
-      // registers the fork.
       const compile = cmA.compile.bind(cmA);
       let entered!: () => void;
       const reached = new Promise<void>((resolve) => { entered = resolve; });
@@ -1884,10 +1768,6 @@ describe('conversation forks and an undo', () => {
     });
   });
 
-  /** Takes the template's next compiles in order: 'throw' fails one; 'hold'
-   *  waits at a gate until `release`, which says whether it then fails, and
-   *  compiles after it; 'answer' compiles first and then waits at the gate
-   *  with its answer. */
   const holdTemplateCompile = (framework: AgentFramework, calls: Array<'throw' | 'hold' | 'answer'>) => {
     const cmA = framework.getAgent('a')!.getContextManager();
     const compile = cmA.compile.bind(cmA);
@@ -1919,9 +1799,6 @@ describe('conversation forks and an undo', () => {
     };
   };
 
-  // The redo lands while the pass waits on the template's compile: after the
-  // compile answered on the branch the pass judged, before a compile that
-  // then runs on the branch the redo landed on, and before one that fails.
   const joinedSeeds = [
     { compile: 'answered before the move', call: 'answer', throws: false },
     { compile: 'runs after the move', call: 'hold', throws: false },
@@ -1969,7 +1846,6 @@ describe('conversation forks and an undo', () => {
       framework.onTrace((event) => {
         if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string; data?: { after?: string } });
       });
-      // a-late-g1's seed fails; a-late2-g1's is held while a redo joins.
       const held = holdTemplateCompile(framework, ['throw', 'hold']);
       try {
         const undo = framework.undoLastTurn('a');
@@ -1985,7 +1861,6 @@ describe('conversation forks and an undo', () => {
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
       assert.match(reinit[0]!.message, /because its seeding from the template failed: .*injected template compile failure/);
-      // Reported under the move whose branch its pass judged, not the redo that joined later.
       assert.match(reinit[0]!.message, /^The undo left this conversation agent/);
       assert.equal(reinit[0]!.data?.after, 'undo');
       assert.ok(!framework.getAgent('a-late-g1'), 'disposed in the first pass');
@@ -2015,7 +1890,6 @@ describe('conversation forks and an undo', () => {
       assert.deepEqual([...byAgent.keys()].sort(), ['a', 'a-late-g1'], JSON.stringify(alerts));
       assert.match(byAgent.get('a')!, /injected template init failure/);
       assert.match(byAgent.get('a-late-g1')!, /couldn't be seeded again, so it was disposed and its channel unbound\. Once a switchBranch\(\) to the current branch or a restart re-initializes the template, its channel's next qualifying message spawns a new fork\. That fork is seeded from the template, under a new name\. .*It couldn't be seeded because the template a's own context manager failed to re-initialize \([^)]*injected template init failure[^)]*\)\.$/);
-      // A spawn seeds from the template too, so the channel spawns again only once it's re-initialized.
       assert.match(byAgent.get('a-late-g1')!, /no agent reads them again/);
       assert.ok(!framework.getAgent('a-late-g1'), 'the empty fork is disposed');
       assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId: 'world:late' }), undefined);
@@ -2037,8 +1911,6 @@ describe('conversation forks and an undo', () => {
         webhook.restore();
         strategy.initialize = initialize;
       }
-      // The template's own manager refuses its work, and the fork the undo
-      // emptied is disposed, both for a cause past what the webhook keeps.
       assert.match(keptHead(webhook.posted, 'a', 'context-reinit-failed'), /^The undo moved the store's branch, and this agent's context manager failed to re-initialize\. It refuses its work until switchBranch\(\) to the current branch re-initializes it and stores its queued writes, at resume on a quiesced host; a restart re-initializes it too, but loses them unless the deferral queue is persisted\. /);
       assert.match(keptHead(webhook.posted, 'a-late-g1', 'context-reinit-failed'), /^The undo left this conversation agent with no messages of its own, and it couldn't be seeded again, so it was disposed and its channel unbound\. Once a switchBranch\(\) to the current branch or a restart re-initializes the template, its channel's next qualifying message spawns a new fork\. /);
     });
@@ -2046,8 +1918,6 @@ describe('conversation forks and an undo', () => {
 
   it("a template refusal in a pass an undo joins disposes nothing, and the next pass seeds the fork the joined undo emptied", { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-template-joined-', async (framework, internals) => {
-      // Two of a's turns: a-late-g1 is spawned between them, so the first
-      // undo leaves it its history and the second, which joins, empties it.
       const store = framework.getStore();
       const cmA = framework.getAgent('a')!.getContextManager();
       cmA.addMessage('user', [{ type: 'text', text: 'hello a' }]);
@@ -2065,8 +1935,6 @@ describe('conversation forks and an undo', () => {
       framework.onTrace((event) => {
         if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string });
       });
-      // The template's first re-initialization waits, and then refuses, as one
-      // can when the store moves under it; later ones run as usual.
       const strategy = cmA.getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
       const initialize = strategy.initialize.bind(strategy);
       let entered!: () => void;
@@ -2080,13 +1948,10 @@ describe('conversation forks and an undo', () => {
         await gate;
         throw new Error('injected refusal after the store moved');
       };
-      // The managers re-initialize one at a time, the template first, so
-      // a-late-g1's comes after the second undo has joined, and the pass
-      // judges it, rather than skipping it as failed.
       try {
         const first = framework.undoLastTurn('a');
         assert.equal(first.undone, true, 'the first undo keeps a-late-g1 its history');
-        await reached; // the first pass is re-initializing the template
+        await reached;
         const second = framework.undoLastTurn('a');
         assert.equal(second.undone, true, 'the second undo joins, to before a-late-g1 was spawned');
         release();
@@ -2128,13 +1993,9 @@ describe('conversation forks and an undo', () => {
       await internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
       const stored = framework.getAgent('a-chan-g1')!.getContextManager().getMessageCount();
       assert.ok(stored > 0, 'seeded once');
-      // The name comes round again over the same namespace, as when the
-      // router's counter wasn't stored (agent-framework's F50 case).
       const forget = framework as unknown as { disposeConversationAgent(name: string): void; usedEphemeralAgentNames: Set<string> };
       forget.disposeConversationAgent('a-chan-g1');
       forget.usedEphemeralAgentNames.delete('a-chan-g1');
-      // Every compile but the template's reads as empty, as a history that is
-      // hidden or past its window does.
       const proto = Object.getPrototypeOf(cmA) as { compile: (...args: unknown[]) => Promise<{ messages: unknown[] }> };
       const compile = proto.compile;
       proto.compile = async function (this: unknown, ...args: unknown[]) {
@@ -2206,9 +2067,6 @@ describe('conversation forks and an undo', () => {
   const storedTexts = (cm: ContextManager): string[] => cm.getAllMessages().flatMap((m) => m.content)
     .filter((b): b is { type: 'text'; text: string } => (b as { type: string }).type === 'text')
     .map((b) => b.text);
-  /** Hold a maintenance pass across `move()`, run `during()` while the move
-   *  waits for it, then let it go and wait for the move to finish, its
-   *  managers' re-initialization included. */
   const duringMaintenanceWait = async (internals: HoldInternals, move: () => Promise<unknown>, during: () => Promise<void>): Promise<void> => {
     const { promise: pass, settle, waited } = watchedPromise();
     internals.maintenancePass = pass;
@@ -2252,9 +2110,6 @@ describe('conversation forks and an undo', () => {
         internals.resolvePlacement(placement!);
         assert.ok(placement!.messageId && !placement!.deferredId, `the placement resolves to the stored message: ${JSON.stringify(placement)}`);
       }
-      // Each write is traced at its deferral with no id yet, as addMessage
-      // answers for any write it defers, and again as it lands at the
-      // release, with the stored message's id.
       assert.deepEqual(added.filter((t) => t.source === 'mcpl:channel-incoming').map((t) => t.messageId), ['', ''],
         `traced at the deferral, with no id yet: ${JSON.stringify(added)}`);
       assert.deepEqual(added.filter((t) => t.source === 'deferred-flush:surgery-release').map((t) => t.messageId),
@@ -2262,8 +2117,6 @@ describe('conversation forks and an undo', () => {
     });
   });
 
-  // R3-3: what reached a fork while the store was held lands in its window
-  // when its seeding fails and it's disposed, and its alert says how many.
   it("a fork disposed after a move takes the writes held for it into its window, and its alert says how many", { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-seedfail-held-', async (framework, forkInternals) => {
       await forksAroundACheckpoint(framework, forkInternals);
@@ -2285,8 +2138,6 @@ describe('conversation forks and an undo', () => {
             const placement = await internals.handleMcplChannelIncoming(channelMessage('world:late', words));
             assert.ok(placement?.deferredId && !placement.messageId, `deferred, not stored: ${JSON.stringify(placement)}`);
           }
-          // The re-seed, once the maintenance pass ends, reads the template's
-          // compile, which now fails.
           (cmA as unknown as { compile: () => Promise<never> }).compile = async () => { throw new Error('injected template compile failure'); };
         });
       } finally {
@@ -2331,16 +2182,6 @@ describe('conversation forks and an undo', () => {
     });
   });
 
-  // Adapted from Naomi-2422's probe (J26262, room-203 #169193): where the
-  // writes held for a fork go when a move disposes it on a quiesced host, at
-  // the host's resume, and at a stop before that resume, whose pass for
-  // postponed releases (#616) drains them: a failed reply goes on to the
-  // primary, and the rest is dropped.
-  // A disposal whose cleanup fails after its release was postponed still has
-  // its release waiting, and the alert says so (af-353-r7's I6). A crash
-  // leaves the store and its recovery files as they are on disk: the copy of
-  // the host's directory right after the disposal stands in for it, and a
-  // second host boots from the copy (Naomi-2422, room-203 #178882).
   for (const after of ['resume', 'stop', 'crash', 'cleanup', 'released before the report'] as const) {
     it(after === 'resume'
       ? "a fork disposed on a quiesced host: its window takes the writes held for it at the host's resume, and the primary is told of a failed reply"
@@ -2388,8 +2229,6 @@ describe('conversation forks and an undo', () => {
         const owner = framework as unknown as { evictTurnCheckpoints(name: string): void };
         const evict = owner.evictTurnCheckpoints.bind(framework);
         if (after === 'released before the report') {
-          // As a resume between the disposal and the report would: the
-          // postponed release runs first, and empties the map.
           const internalsForReport = framework as unknown as {
             reportReinitFailures: (...args: unknown[]) => void; runReleasesAfterResume(): void;
           };
@@ -2400,9 +2239,6 @@ describe('conversation forks and an undo', () => {
           };
         }
         if (after === 'cleanup') {
-          // A step of the disposal after its window's release was postponed.
-          // By reading none of them throws today (evictTurnCheckpoints catches
-          // its own failures): this stands in for any that comes to.
           owner.evictTurnCheckpoints = (name: string) => {
             if (name === 'a-late-g1') throw new Error('injected checkpoint eviction failure');
             evict(name);
@@ -2417,8 +2253,6 @@ describe('conversation forks and an undo', () => {
             }
             const failed = { kind: 'discord-send-failed', channelId: 'world:late', reason: 'injected send failure', textLen: 19, outcome: 'failed' };
             assert.equal((framework as unknown as Queue).addMessage('a-late-g1', [{ type: 'text', text: 'A REPLY THAT FAILED' }], failed, { forAgent: 'a-late-g1' }), '', 'deferred');
-            // The seeding reads the template's compile, which fails once the
-            // managers are re-initialized, so the fork the undo empties is disposed.
             (cmA as unknown as { compile: () => Promise<never> }).compile = async () => { throw new Error('injected template compile failure'); };
           });
         } finally {
@@ -2443,8 +2277,6 @@ describe('conversation forks and an undo', () => {
           assert.match(reinit[0]!.message, / Its cleanup failed: .*injected checkpoint eviction failure\.$/);
         }
         if (after === 'crash') {
-          // What a crash leaves: the store and its recovery files as they are
-          // on disk now, with the release's postponement gone with the process.
           const crashed = join(tempDir, 'crashed');
           cpSync(join(tempDir, 'store'), join(crashed, 'store'), { recursive: true });
           await framework.stop();
@@ -2492,8 +2324,6 @@ describe('conversation forks and an undo', () => {
             assert.equal(kept[0]!.forAgent, undefined, "the primary's");
             await booted.resume();
             assert.equal(notices(booted).length, 1, 'the primary is told of the failed reply');
-            // The two channel writes are stored nowhere: not in the primary's
-            // window, and not in the fork's, which no agent reads.
             const window = await StoreWindow.open({
               store: booted.getStore(), namespace: 'conversations/a-late-g1', isolate: true, strategy: new PassthroughStrategy(),
             });
@@ -2512,7 +2342,6 @@ describe('conversation forks and an undo', () => {
   }
 
   it("a spawn after a failed stop() is refused, and so is one after a completed stop() and an addModule(): neither begins a lifecycle", { timeout: 30_000 }, async () => {
-    // A store the framework doesn't own, so a failed stop() leaves it open.
     const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-stopped-'));
     const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
     let failStop = true;
@@ -2553,10 +2382,6 @@ describe('conversation forks and an undo', () => {
   });
 
   it("a spawn that reaches its check in stop()'s first steps, while the framework still runs, is refused", { timeout: 30_000 }, async () => {
-    // stop() claims its attempt before its first steps, which can emit traces
-    // whose listeners run before it clears running and closes the queue. Its
-    // first step starts the spawn here, as such a listener could, so a claim
-    // that came after any of those steps would let it through.
     const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-early-'));
     const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
     const framework = await AgentFramework.create({
@@ -2591,7 +2416,6 @@ describe('conversation forks and an undo', () => {
   });
 
   it('a spawn after a stop() and a start() is made: the check is for a stop() of this lifecycle', { timeout: 30_000 }, async () => {
-    // A store the framework doesn't own, so stop() leaves it open and start() is admitted.
     const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-restart-'));
     const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
     const framework = await AgentFramework.create({
@@ -2684,8 +2508,6 @@ describe('conversation forks and an undo', () => {
       const cmA = framework.getAgent('a')!.getContextManager();
       const late = framework.getAgent('a-late-g1')!.getContextManager();
       const compile = cmA.compile.bind(cmA);
-      // The template's own manager moves the store between the seed's compile
-      // and its write, as a host moving through an agent's context manager can.
       (cmA as unknown as { compile: typeof compile }).compile = async (...args: Parameters<typeof compile>) => {
         const compiled = await compile(...args);
         (cmA as unknown as { compile: typeof compile }).compile = compile;
@@ -2709,7 +2531,6 @@ describe('conversation forks and an undo', () => {
   });
 });
 
-/** A strategy whose next tick, once armed, closes its agent's provider gate and parks a maintenance call there. */
 class ArmedParkedCallStrategy implements ContextStrategy {
   readonly name = 'armed-parked-call-test';
   armed = false;
@@ -2771,16 +2592,12 @@ describe('an undo or redo while a maintenance call waits at the provider gate', 
       const sequenceBefore = framework.getStore().currentSequence();
       cm.addMessage('user', [{ type: 'text', text: 'a turn to undo' }]);
       internals.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
-      // Park a maintenance call at the gate, then make the move: its
-      // re-initialization waits for the running pass, which the withdrawal ends.
       const parkThen = async (label: string, move: () => { settled?: Promise<void> }): Promise<void> => {
         gate().primaryPending = false;
         strategy.armed = true;
         await waitParked();
         const moved = move();
         assert.ok(moved.settled, `${label}: a re-initialization is running`);
-        // No clock bounds a correct re-initialization here: a hang fails at
-        // the test's own timeout, which names the test.
         await moved.settled;
         assert.equal(internals.surgeryHold, null, `${label}: the store is released`);
       };
@@ -2808,18 +2625,11 @@ describe('an undo or redo while a maintenance call waits at the provider gate', 
   }
 });
 
-/**
- * A strategy whose next tick, once armed, waits for the test; once `stale`
- * is set (as a move leaves a manager), its tick and readiness refuse as a
- * manager loaded for an earlier branch generation does, until it is
- * initialized again.
- */
 class GatedTickStrategy implements ContextStrategy {
   readonly name = 'gated-tick-test';
   armed = false;
   stale = false;
   throwOnStale = true;
-  /** Thrown by the tick once released, whatever the generation: a failure of the tick's own. */
   failure?: Error;
   entered = false;
   release?: () => void;
@@ -2853,8 +2663,6 @@ describe('an undo while a maintenance tick runs', () => {
       const dir = mkdtempSync(join(tmpdir(), 'reinit-tick-'));
       const gated = new GatedTickStrategy();
       gated.throwOnStale = where === 'the tick';
-      // A failure of the tick's own, in a tick the move landed under: its work
-      // was for the branch the store left, so it is withdrawn too.
       if (where === 'a provider failure in the tick') gated.failure = new Error('provider exploded');
       const framework = await AgentFramework.create({
         storePath: join(dir, 'store'),
@@ -2893,7 +2701,6 @@ describe('an undo while a maintenance tick runs', () => {
         const undo = framework.undoLastTurn('a');
         assert.equal(undo.undone, true);
         assert.ok(undo.settled, 'a re-initialization is running');
-        // The move leaves b's manager on the old generation until its pass.
         gated.stale = true;
         gated.release!();
         await undo.settled;
@@ -2914,18 +2721,8 @@ describe('an undo while a maintenance tick runs', () => {
 });
 
 describe("a re-initialization alert's opening", () => {
-  // Every shape the text builders make, with a cause and branch names long
-  // enough that the ops webhook cuts the message: its opening, what happened
-  // and what to do or what happens next, is in the start the webhook keeps,
-  // however the shape's other parts grow.
   it('is in what the ops webhook keeps of the message, in every shape the builders make', () => {
     const branch = (kind: string) => `${kind}/a/${'9'.repeat(200)}`;
-    // What a restart does, and what the refusal covers, by the agent's kind,
-    // in every shape that names a refusing manager (restartClause,
-    // refusalDetail).
-    // A configured agent's restart is said one way where the store is on the
-    // branch it should run on, and another where a failed restore left the
-    // store on the failed branch (elsewhere).
     const restartSays = (kind: AgentKind, elsewhere: boolean): RegExp => kind === 'conversation'
       ? /; a restart ends it, and its channel's next qualifying message spawns a new fork\.$/
       : kind === 'run'
@@ -2938,9 +2735,6 @@ describe("a re-initialization alert's opening", () => {
       conversation: ' The work it refuses includes compiles and message writes, and a fork its channel spawns after a restart gets none of the writes queued for this one.',
       run: ' The work it refuses includes compiles and message writes.',
     };
-    // 3,000 characters and more cut the message, and a million leaves 343
-    // characters of its start. The test checks that each opening is in that
-    // start; what follows the opening isn't checked against it.
     for (const [queued, says] of [[0, '0 writes'], [1, '1 write'], [2, '2 writes']] as const) {
       const { opening } = longHoldAlert({ move: 'undo', agentName: 'a', heldSeconds: 61, queued, waitingForMaintenance: false });
       assert.ok(opening.includes(` wait in the deferral queue (${says} now). `), opening);
@@ -2953,8 +2747,6 @@ describe("a re-initialization alert's opening", () => {
         for (const kind of ['configured', 'conversation', 'run'] as const) {
           shapes.push([`refused work after the ${move}, ${kind} agent`, refusedWorkAlert(move, kind, cause), { kind, elsewhere: false }]);
         }
-        // store-held-long, whose names are unbounded and come after its
-        // opening, with a cause's length standing in for theirs.
         for (const on of ['reinitializing', 'maintenance', 'neither'] as const) {
           const hold = longHoldAlert({
             move, agentName: `${name('agent')}${'x'.repeat(causeLength)}`, heldSeconds: 999_999_999, queued: 999_999_999,

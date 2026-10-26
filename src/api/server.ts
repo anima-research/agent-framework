@@ -598,10 +598,8 @@ export class ApiServer {
     // already running. It moves the store once any maintenance already
     // running has finished, so the move can come after this call returns.
     // The event names this switch's own move, from the branch read here to
-    // the one it was asked for: the framework refuses another move until
-    // this one's awaited steps end, but a host that switches through an
-    // agent's own context manager can still move the store before this one
-    // continues.
+    // the one it was asked for: another switch can move the store again
+    // before this one continues.
     let switched = false;
     try {
       await this.framework.switchBranch(params.name);
@@ -652,10 +650,6 @@ export class ApiServer {
     }
 
     const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
-    // The store stays reserved until every agent's context manager is
-    // re-initialized for the branch it moved to. A client that answers the
-    // event by reading an agent's context compiles on that manager, which
-    // refuses until then, so the event, and this answer, wait for it.
     await settled;
 
     if (result.undone) {
@@ -675,7 +669,6 @@ export class ApiServer {
     }
 
     const { settled, ...result } = this.framework.redo(params.agentName);
-    // As for an undo (cmdUndo).
     await settled;
 
     if (result.redone) {

@@ -1823,9 +1823,7 @@ test("a wake to read a render starts its turn until the render's row is at or be
   // An operator's undo switches the store to a new branch; the watermark of
   // the agent's answered requests stays on the old one until a request on
   // the new one is answered. The render lands at or below that watermark's
-  // sequence, so only the branch tells it unread. The undo holds the store
-  // until the managers are re-initialized, which defers a write, so the
-  // render lands once that settles.
+  // sequence, so only the branch tells it unread.
   await f.framework.undoLastTurn('agent').settled;
   const afterUndo = land('render_1');
   const mark = agent.getAnsweredWatermark();

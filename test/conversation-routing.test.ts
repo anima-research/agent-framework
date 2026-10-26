@@ -348,8 +348,7 @@ describe('Conversation routing', () => {
     ] as never);
     trunk.addMessage('trunk', [{ type: 'redacted_thinking', data: 'opaque' }] as never);
 
-    // Every compile on any context manager during the spawn and the fork's
-    // first turn, by instance, with whether its namespace held a message.
+    // Every compile on any context manager during the spawn, by instance.
     const proto = (trunk.constructor as { prototype: { compile: (...args: unknown[]) => unknown } }).prototype;
     const original = proto.compile;
     const compiles: Array<{ cm: unknown; dry: boolean; empty: boolean }> = [];

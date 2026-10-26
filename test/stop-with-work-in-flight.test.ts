@@ -583,8 +583,6 @@ describe('stop() with work still in flight', () => {
       return { framework, release, residentStreaming, entered, letGo, order, push, internals, storedTexts };
     }
 
-    // The same line, for a persisted queue: one whose record is current keeps
-    // the writes for boot, and one whose last write failed is behind.
     for (const record of ['current', 'behind'] as const) {
       it(`a stream that outlasts the budget says a persisted queue whose record is ${record} ${record === 'current' ? 'keeps' : 'can lose'} its agent's queued writes`, { timeout: 30_000 }, async () => {
         const { framework, release, residentStreaming, push, internals } = await frameworkWithHeldWork();

@@ -720,9 +720,6 @@ describe('stop() with an operator operation in flight', () => {
   });
 
   it('two API switches handled together: the second is refused while the first holds the store, and only the first is announced', async () => {
-    // A switch holds the store until every agent's context manager is
-    // re-initialized for its branch, with or without a workspace module, so
-    // a second switch made meanwhile finds the store held.
     const framework = await create();
     try {
       const api = new ApiServer(framework) as unknown as {
