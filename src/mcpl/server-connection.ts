@@ -240,10 +240,12 @@ export function toolsetDeclarationsOf(advertised: unknown): Record<string, unkno
 /** What the RFC-014 read tap is handed as the connection reads a message
  *  that can carry hint changes (see McplServerConnection.setReadTap). */
 export type HintRead =
-  /** A response to a request that can carry hints (RFC-014 §6.1 carrier 1).
-   *  `awaited`: whoever sent it still waits for it; false for a result that
-   *  arrives after its timeout. A JSON-RPC error carries no state and isn't
-   *  tapped. */
+  /** A response to a request that can carry hints (RFC-014 §6.1 carrier 1),
+   *  or a `tools/list`'s whole inventory (§4.1), its pages joined by
+   *  sendToolsList, with `params.straddled` when its pages carry different
+   *  revs. `awaited`: whoever sent it still waits for it; false for a
+   *  result that arrives after its timeout. A JSON-RPC error carries no state
+   *  and isn't tapped. */
   | { kind: 'result'; method: string; params: Record<string, unknown>; result: unknown; awaited: boolean }
   /** A push/event (carrier 2), as read, before the plane gate or the grant
    *  admit or refuse it. */
@@ -251,8 +253,8 @@ export type HintRead =
   /** A standalone tools/hints (carrier 3). */
   | { kind: 'hints'; params: unknown };
 
-/** Requests whose results can carry hint state (RFC-014 §6.1, §4.1). */
-const HINTED_METHODS: ReadonlySet<string> = new Set(['tools/call', 'toolsets/open', 'toolsets/close', 'toolsets/list', 'tools/list']);
+/** Requests whose results can carry hint state, remembered for a late answer (RFC-014 §6.1). */
+const HINTED_METHODS: ReadonlySet<string> = new Set(['tools/call', 'toolsets/open', 'toolsets/close', 'toolsets/list']);
 
 /**
  * A handshake that failed, and whose cleanup couldn't confirm that the child
@@ -330,6 +332,7 @@ interface PendingRequest {
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
   method: string;
+  onRead?: (result: unknown) => void;
   /** Per-request timeout timer; cleared on response/close/timeout. */
   timer?: ReturnType<typeof setTimeout>;
 }
@@ -339,6 +342,9 @@ interface RequestOptions {
   timeoutMs?: number;
   /** Surface a late response even when it carries no checkpoint state. */
   surfaceOrphanedResponse?: boolean;
+  /** Called with a successful result as its response is read, before
+   *  anything read after it and before the request's promise settles. */
+  onRead?: (result: unknown) => void;
 }
 
 /** A server→host message held while its plane is closed. `kept`: it came on
@@ -452,8 +458,9 @@ export class McplServerConnection extends EventEmitter {
    * the message: a push the plane holds or the grant refuses, a result its
    * caller stopped waiting for. The tap sees every such message of the
    * current transport, synchronously, before anything routes it; a late
-   * answer's request is remembered past its timeout (hintedRequests) so its
-   * hints still apply. Null (the default) taps nothing, and the connection
+   * answer's request is remembered past its timeout (hintedRequests, while
+   * no more than 1,000 hinted requests await an answer) so its hints still
+   * apply. Null (the default) taps nothing, and the connection
    * behaves as it always has.
    */
   private readTap: ((read: HintRead, epoch: number) => void) | null = null;
@@ -1708,15 +1715,33 @@ export class McplServerConnection extends EventEmitter {
    * read it as a complete page). A page that isn't well formed (no `tools` array, a cursor
    * that isn't a string), or cursors that don't terminate (a repeat, or more
    * than {@link MAX_TOOL_LIST_PAGES} pages), are errors, never a partial or
-   * empty inventory published as complete.
+   * empty inventory published as complete. The read tap (RFC-014) is handed
+   * the complete inventory once, with the last page's `_meta`, as the last
+   * page's response is read, before anything read after it; a list that
+   * fails or times out hands it nothing. Its params say `straddled` when its
+   * pages carry different `mcpl/rev`s.
    */
   async sendToolsList(): Promise<{ tools: McpToolDefinition[] }> {
     const tools: McpToolDefinition[] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
     let first: Record<string, unknown> | undefined;
+    const read: McpToolDefinition[] = [];
+    const revs = new Set<unknown>();
+    const onRead = (result: unknown) => {
+      if (!result || typeof result !== 'object' || !Array.isArray((result as { tools?: unknown }).tools)) return;
+      const r = result as { tools: McpToolDefinition[]; nextCursor?: unknown; _meta?: unknown };
+      read.push(...r.tools);
+      const rev = (r._meta as Record<string, unknown> | undefined)?.['mcpl/rev'];
+      if (typeof rev === 'number') revs.add(rev);
+      if (r.nextCursor !== undefined && r.nextCursor !== null) return;
+      this.tap({
+        kind: 'result', method: 'tools/list', params: revs.size > 1 ? { straddled: true } : {},
+        result: { tools: read, ...(r._meta !== undefined ? { _meta: r._meta } : {}) }, awaited: true,
+      });
+    };
     for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
-      const result = await this.sendRequest('tools/list', cursor === undefined ? {} : { cursor }) as Record<string, unknown> | null;
+      const result = await this.sendRequest('tools/list', cursor === undefined ? {} : { cursor }, { onRead }) as Record<string, unknown> | null;
       const malformed = (why: string) =>
         new Error(`MCPL server "${this.id}" sent a malformed tools/list page ${page + 1}: ${why}`);
       if (!result || typeof result !== 'object' || !Array.isArray(result.tools)) {
@@ -2176,7 +2201,7 @@ export class McplServerConnection extends EventEmitter {
     }
 
     return new Promise((resolve, reject) => {
-      const pending: PendingRequest = { resolve, reject, method };
+      const pending: PendingRequest = { resolve, reject, method, ...(options.onRead ? { onRead: options.onRead } : {}) };
       const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
       if (timeoutMs > 0) {
         pending.timer = setTimeout(() => {
@@ -2654,6 +2679,11 @@ export class McplServerConnection extends EventEmitter {
         logValueRedacted(response.error.message, redact),
       );
     } else {
+      try {
+        pending.onRead?.(response.result);
+      } catch (error) {
+        console.error(`MCPL server "${this.id}": reading ${pending.method}'s result failed: ${logDetail(describeCause(error))}`);
+      }
       pending.resolve(response.result);
     }
   }

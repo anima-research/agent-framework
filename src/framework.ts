@@ -22357,7 +22357,7 @@ export class AgentFramework {
    * itself when there's none, as for every server without toolHints.
    */
   private withToolsetChange<R extends { content?: unknown }>(serverId: string, result: R): R {
-    const change = this.toolsetHub?.get(serverId)?.changeText(result) ?? '';
+    const change = this.toolsetHub?.get(serverId)?.takeChangeText(result) ?? '';
     if (!change) return result;
     return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: change }] };
   }
@@ -27594,6 +27594,8 @@ export class AgentFramework {
   private toolsets(): ToolsetHub {
     return (this.toolsetHub ??= new ToolsetHub({
       notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
+      canNotify: (serverId) => CapabilityGrant.of(this.mcplServerRegistry?.getServer(serverId)).has('pushEvents'),
+      refreshTools: (serverId) => this.handleToolsListChanged(serverId),
       log: (line) => console.error(`[mcpl] ${line}`),
       listedName: (serverId, tool) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`,
     }));
@@ -27632,21 +27634,23 @@ export class AgentFramework {
    * it. The text is the server's (its tool definitions, titles, reasons), so
    * the notice names the server.
    */
-  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): void {
+  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): boolean {
     const connection = this.mcplServerRegistry?.getServer(serverId);
     if (!CapabilityGrant.of(connection).has('pushEvents')) {
       console.error(`[mcpl] ${serverId}: a tool change was not told (pushEvents is not granted); ${META_TOOL_NAMES.look} shows it`);
-      return;
+      return false;
     }
-    if (this.agents.size === 0) return;
+    if (this.agents.size === 0) return false;
     try {
       this.addMessage(
         'user',
         [{ type: 'text', text: `MCPL server "${serverId}", tool changes:\n${text}` }],
         { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
       );
+      return true;
     } catch (error) {
       console.error(`[mcpl] ${serverId}: a tool change notice could not be written:`, error);
+      return false;
     }
   }
 
@@ -29190,30 +29194,38 @@ export class AgentFramework {
       // RFC-014 §6.1 carrier 2: the tool change this push explains was
       // applied as it was read; it's told after the event's own content. A
       // push the host then refuses still tells its change, on its own.
-      const change = this.toolsetHub?.get(connection.id)?.changeText(params) ?? '';
+      const toolsets = this.toolsetHub?.get(connection.id);
+      const cs = toolsets?.takeChange(params);
+      const change = toolsets && cs ? toolsets.presence.render(cs, { mark: false }) : '';
+      const tellAlone = () => {
+        if (this.recordToolsetNotice(connection.id, change, { invite: false })) toolsets!.told(cs!);
+      };
       const content = (params as { payload?: { content?: unknown } } | null)?.payload?.content;
       if (!change || !Array.isArray(content)) {
-        if (change) this.recordToolsetNotice(connection.id, change, { invite: false });
+        if (change) tellAlone();
         await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
         return;
       }
-      let refused = false;
+      let accepted = false;
       const told = {
         respond: (result: unknown) => {
-          if ((result as { accepted?: unknown } | null)?.accepted === false) refused = true;
+          accepted = (result as { accepted?: unknown } | null)?.accepted !== false;
           responder?.respond(result);
         },
         respondError: (code: number, message: string, data?: unknown) => {
-          refused = true;
           (responder?.respondError as ((code: number, message: string, data?: unknown) => void) | undefined)?.(code, message, data);
         },
       };
-      await this.pushHandler?.handlePushEvent(
-        connection.id,
-        { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
-        told as never,
-      );
-      if (refused) this.recordToolsetNotice(connection.id, change, { invite: false });
+      try {
+        await this.pushHandler?.handlePushEvent(
+          connection.id,
+          { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
+          told as never,
+        );
+      } finally {
+        if (accepted) toolsets!.told(cs!);
+        else tellAlone();
+      }
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -29713,11 +29725,11 @@ export class AgentFramework {
         // so a call act makes is attributed, classed and state-exchanged as
         // a direct call of the tool would be. The list was read through the
         // server's tap, so its presence is current.
-        // A static↔dynamic move the server hinted applies here, at a list
-        // boundary (§4.2), and the agent is told where the tool went.
+        // The static↔dynamic moves the lists made since the last rebuild
+        // reach the tool list here (§4.2), and the agent is told where each
+        // tool went, when a notice can be written.
         const presence = this.toolsetHub?.get(server.id);
-        const moves = presence?.presence.active ? presence.applyMoves() : [];
-        if (moves.length > 0) this.recordToolsetNotice(server.id, moves.join('\n'), { invite: false });
+        if (presence?.presence.active) presence.applyMoves();
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;

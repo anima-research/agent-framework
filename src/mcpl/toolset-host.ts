@@ -5,10 +5,13 @@
  * what changed; and the hub that holds every server's controller for the
  * meta-tools (toolsets-module.ts) and for reminders.
  *
- * Hint changes apply as their message is read (RFC §6.1): the connection's
- * read tap hands the controller every result of a hinted request (awaited or
- * not), every push/event and every tools/hints, of the current transport,
- * synchronously and in arrival order, before anything routes the message.
+ * Hint changes apply as their message is read (RFC §6.1); a static↔dynamic
+ * move takes effect when a tools/list states it (§4.1), and the model's tool
+ * list shows it at its next rebuild (§4.2). The connection's read tap hands
+ * the controller every result of a hinted request (awaited or not, while no
+ * more than 1,000 hinted requests await an answer), each tools/list whole, every push/event and every tools/hints, of the
+ * current transport, synchronously and in arrival order, before anything
+ * routes the message or anything read after it is handled.
  * What a message's changes did to the model's view is kept by the object
  * that carried them (`readChanges`), so whoever later handles that object
  * (the tool result, the push, the meta-tool) renders it next to the content.
@@ -24,7 +27,7 @@ import type { McplServerConnection, HintRead } from './server-connection.js';
 import type { McplServerConfig } from './types.js';
 import { isToolAllowed } from './tool-policy.js';
 import {
-  ToolPresence, emptyChange, isEmptyChange, joinChanges, keyOf,
+  ToolPresence, emptyChange, isEmptyChange, keyOf,
   type ChangeSet, type MetaToolNames,
 } from './tool-presence.js';
 import type { HintedTool } from './tool-signature.js';
@@ -38,7 +41,7 @@ export const META_TOOL_NAMES: MetaToolNames = {
   close: `${TOOLSETS_MODULE}--close`,
 };
 
-/** How long an open, close or call is waited for. A late result still applies when it's read. */
+/** How long an open or close is waited for. A late result still applies when it's read. */
 export const TOOLSET_REQUEST_TIMEOUT_MS = 60_000;
 /** A toolsets/list after a (re)connect or in a recovery. */
 const LIST_TIMEOUT_MS = 15_000;
@@ -54,7 +57,12 @@ export interface ToolsetHostDeps {
   /** A standalone notice into the conversation: a tools/hints change, a late
    *  result's, a reconnect's adoption, a recovery's. `invite`: it suggests an
    *  open. The host applies its usual rules for events. */
-  notify(serverId: string, text: string, opts: { invite: boolean }): void;
+  notify(serverId: string, text: string, opts: { invite: boolean }): boolean;
+  /** Whether the server's changes may be put into the conversation unasked
+   *  (its `pushEvents` grant): notices and reminders. */
+  canNotify(serverId: string): boolean;
+  /** Rebuild the model's tool list from the server's (its tools/list_changed path). */
+  refreshTools(serverId: string): void;
   /** The operator's log. */
   log(line: string): void;
   /** How a static tool is named in the tool list (`prefix--tool`). */
@@ -62,8 +70,8 @@ export interface ToolsetHostDeps {
 }
 
 /** One server's RFC-014 state and traffic. Lives as long as the server's
- *  configuration, across reconnects and restarts (its `ended` ids and what
- *  the model was shown carry over). */
+ *  configuration, across reconnects and the server's restarts (its `ended`
+ *  ids and what the model was shown carry over), in memory only. */
 export class ToolsetController {
   readonly presence: ToolPresence;
   private connection: McplServerConnection | null = null;
@@ -71,16 +79,10 @@ export class ToolsetController {
   private epoch = -1;
   /** What applying a message's hints changed, by the object that carried them. */
   private readonly readChanges = new WeakMap<object, ChangeSet>();
-  /** Results whose change no one has rendered yet (tellUnlessClaimed). */
-  private readonly unclaimed = new Set<object>();
+  /** Results whose change no one has taken yet, in the order they were read, with their method (tellUnlessClaimed). */
+  private readonly unclaimed = new Map<object, string>();
   /** eventIds of pushes read on this transport (bounded): a repeat's hints are ignored (RFC §6.1). */
   private seenEvents = new Set<string>();
-  /** A paged tools/list being read. */
-  private listPages: HintedTool[] | null = null;
-  /** Lists this controller asked for itself, whose change it delivers. */
-  private ownLists = 0;
-  /** What lists read while one of its own was out changed, for it to tell. */
-  private ownListChange: ChangeSet | null = null;
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private recovering = false;
   private recoverAgain = false;
@@ -153,7 +155,6 @@ export class ToolsetController {
     if (epoch === this.epoch) return;
     this.epoch = epoch;
     this.seenEvents = new Set();
-    this.listPages = null;
     this.presence.beginConnection(connection.toolsetDeclarations, true);
   }
 
@@ -193,25 +194,22 @@ export class ToolsetController {
       if (this.seenEvents.size > 1000) this.seenEvents.delete(this.seenEvents.values().next().value!);
     }
     // Applied now, before (and whatever) the host decides about the push.
-    this.readChanges.set(p, this.applyHints(p.hints, 'push'));
+    const cs = this.applyHints(p.hints, 'push');
+    this.readChanges.set(p, cs);
+    this.tellUnlessClaimed(p, cs, 'push/event');
   }
 
   private readResult(method: string, params: Record<string, unknown>, res: Record<string, unknown>, awaited: boolean): void {
     let cs: ChangeSet;
     switch (method) {
       case 'tools/list': {
-        const page = Array.isArray(res.tools) ? (res.tools as HintedTool[]) : [];
-        // A first page (no cursor) starts the list; a page with no next cursor ends it.
-        if (params.cursor === undefined || this.listPages === null) this.listPages = [];
-        this.listPages.push(...page);
-        if (res.nextCursor !== undefined && res.nextCursor !== null) return;
-        const tools = this.listPages;
-        this.listPages = null;
-        cs = this.readToolList(tools, res);
-        // The framework's own refresh (a list change, a reconnect) told here;
-        // a list this controller asked for is told by whoever asked.
-        if (this.ownLists === 0) this.deliver(cs);
-        else this.ownListChange = joinChanges(this.ownListChange ?? emptyChange(), cs);
+        if (!Array.isArray(res.tools)) return;
+        cs = this.readToolList(res.tools as HintedTool[], res);
+        if (params.straddled === true && !this.recovering) {
+          this.log('tools/list pages carried different revs, so its earlier pages are older than changes read between them: recovering');
+          this.scheduleRecovery();
+        }
+        this.deliver(cs);
         return;
       }
       case 'toolsets/list':
@@ -271,6 +269,10 @@ export class ToolsetController {
     } else if (!r.applied) {
       this.log(`a malformed hint change (${source}) was ignored`);
     }
+    if (r.unlisted) {
+      this.log(`hint change rev ${rev} (${source}) names a tool tools/list hasn't listed: recovering from tools/list and toolsets/list`);
+      this.scheduleRecovery();
+    }
     const cs = this.presence.diff(before, this.presence.view());
     cs.suggest.push(...r.suggest);
     return cs;
@@ -290,27 +292,63 @@ export class ToolsetController {
   /** toolsets/list, as read: a full statement of dynamic-tool state under its own rev (RFC §5.3, §6.1). */
   private readToolsetList(res: Record<string, unknown>): ChangeSet {
     if (!this.presence.active) return emptyChange();
+    if (!Array.isArray(res.open)) {
+      this.log('a toolsets/list result with no open list was ignored');
+      return emptyChange();
+    }
     const before = this.presence.view();
-    const { lost, ended, suggest, skipped } = this.presence.adopt(res);
+    const { lost, ended, suggest, skipped, unlisted } = this.presence.adopt(res);
     if (skipped && !this.recovering) {
       // Per-instance state is restated in full; what else was lost (presence) comes from tools/list.
       this.log('toolsets/list skipped a rev: re-reading tools/list');
+      this.scheduleRecovery();
+    }
+    if (unlisted && !this.recovering) {
+      this.log('toolsets/list names a tool tools/list hasn\'t listed: re-reading tools/list');
       this.scheduleRecovery();
     }
     const cs = this.presence.diff(before, this.presence.view());
     cs.suggest.push(...suggest);
     // A lost toolset gets its note, not also a "closed" line.
     cs.changes = cs.changes.filter((c) => !lost.some((o) => keyOf(o.toolset, o.instance) === c.key));
-    cs.notes.push(...this.presence.adoptionNotes(lost, ended));
+    const told = this.presence.adoptionNotes(lost, ended);
+    cs.notes.push(...told.notes);
+    if (told.ended.length) cs.ended = [...(cs.ended ?? []), ...told.ended];
     return cs;
   }
 
-  /** A change with nothing else to ride on, told as a notice. */
+  /** A change with nothing else to ride on, told as a notice, after every result's change still unclaimed. */
   private deliver(cs: ChangeSet): void {
-    if (isEmptyChange(cs)) return;
-    const text = this.presence.render(cs);
-    if (!text) return;
-    this.deps.notify(this.serverId, text, { invite: cs.suggest.some((s) => s.action === 'open') });
+    this.tellUnclaimed();
+    this.notice(cs);
+  }
+
+  /**
+   * Unclaimed carriers' changes, told as notices in the order they were read,
+   * through `upTo` when given. When no notice can be written, a push keeps its
+   * change for the framework's push path, which takes it when the push gets
+   * there; a result's is dropped, whether or not its caller is still to
+   * resume.
+   */
+  private tellUnclaimed(upTo?: object): void {
+    for (const [res, method] of [...this.unclaimed]) {
+      this.unclaimed.delete(res);
+      const cs = this.readChanges.get(res) ?? emptyChange();
+      const sent = this.notice(cs);
+      if (sent !== 'refused' || method !== 'push/event') this.readChanges.delete(res);
+      if (sent === 'told') this.log(`${method}'s tool change wasn't shown with it: told as a notice`);
+      if (res === upTo) return;
+    }
+  }
+
+  /** Whether a notice was written, there was nothing left to tell (`empty`), or one couldn't be written (`refused`). */
+  private notice(cs: ChangeSet): 'told' | 'empty' | 'refused' {
+    if (isEmptyChange(cs)) return 'empty';
+    const text = this.presence.render(cs, { mark: false });
+    if (!text) return 'empty';
+    if (!this.deps.notify(this.serverId, text, { invite: cs.suggest.some((s) => s.action === 'open') })) return 'refused';
+    this.told(cs);
+    return 'told';
   }
 
   /**
@@ -332,31 +370,67 @@ export class ToolsetController {
    * run (the next macrotask), such as the result of a call the framework makes
    * itself (a reaction, a send, an accounted side effect), is told as a notice
    * instead, as a standalone tools/hints is (RFC §6.1: every change reaches the
-   * agent once).
+   * agent once), or dropped as tellUnclaimed says when none can be written.
    */
   private tellUnlessClaimed(res: object, cs: ChangeSet, method: string): void {
     if (isEmptyChange(cs)) return;
-    this.unclaimed.add(res);
+    this.unclaimed.set(res, method);
     setImmediate(() => {
-      if (!this.unclaimed.delete(res)) return;
-      this.log(`${method} result's tool change wasn't shown with it: told as a notice`);
-      this.deliver(cs);
+      if (this.unclaimed.has(res)) this.tellUnclaimed(res);
     });
   }
 
-  /** What applying `carrier`'s hints changed (a tool result, a push's params),
-   *  rendered, for its handler to show with it; '' for nothing. Taking it
-   *  means it's told there, not as a notice. */
-  changeText(carrier: unknown): string {
-    if (!isObj(carrier)) return '';
-    this.unclaimed.delete(carrier);
-    const cs = this.readChanges.get(carrier);
-    return cs ? this.presence.render(cs) : '';
+
+  /**
+   * The change a carrier's hints made (a tool result, a push's params), taken
+   * by a caller that shows it to an agent with the carrier: it isn't told as a
+   * notice, and the caller says when it has reached an agent (told). Call it
+   * synchronously as the carrier is read, before the next macrotask, when an
+   * unclaimed carrier's change goes out as a notice instead (tellUnclaimed
+   * says what happens when none can be written). A change already gone that
+   * way is empty here. Unclaimed carriers read before this one
+   * are told first, as notices, so no later change is shown before them.
+   */
+  takeChange(carrier: unknown): ChangeSet {
+    return this.take(carrier);
   }
 
-  /** The change a carrier's hints made, or an empty one; taken as changeText's is. */
-  changeOf(carrier: unknown): ChangeSet {
+  /** takeChange's change rendered, for a caller that shows it with the carrier
+   *  at once, so it counts as told; '' for nothing. */
+  takeChangeText(carrier: unknown): string {
+    const cs = this.take(carrier);
+    if (isEmptyChange(cs)) return '';
+    const text = this.presence.render(cs);
+    this.told(cs);
+    return text;
+  }
+
+  /** A change its taker showed to an agent: its ended records count as told, and the definitions it describes as shown. */
+  told(cs: ChangeSet): void {
+    this.presence.markTold(cs.ended);
+    this.presence.markShown(cs);
+  }
+
+  /** A change its taker couldn't show, told as a notice instead, or dropped when none can be written. */
+  tell(cs: ChangeSet): void {
+    this.notice(cs);
+  }
+
+  /** A carrier's change, taken to be told some other way (a notice this controller sends). */
+  private claim(carrier: unknown): ChangeSet {
+    return this.take(carrier);
+  }
+
+  private take(carrier: unknown): ChangeSet {
     if (!isObj(carrier)) return emptyChange();
+    if (this.unclaimed.has(carrier)) {
+      let before: object | undefined;
+      for (const res of this.unclaimed.keys()) {
+        if (res === carrier) break;
+        before = res;
+      }
+      if (before) this.tellUnclaimed(before);
+    }
     this.unclaimed.delete(carrier);
     return this.readChanges.get(carrier) ?? emptyChange();
   }
@@ -388,11 +462,12 @@ export class ToolsetController {
     if (!connection || !connection.isConnected) return;
     this.recovering = true;
     try {
-      const tools = await this.ownToolList(connection);
-      if (connection !== this.connection) return;
+      const read = await this.ownToolList(connection);
+      // RFC §6.1: toolsets/list after tools/list, so every tool it names is known.
+      if (connection !== this.connection || !read) return;
       const lists = await this.ownToolsetList(connection, LIST_TIMEOUT_MS, 'recovery');
       if (connection !== this.connection) return;
-      this.deliver(joinChanges(tools, lists));
+      this.deliver(lists);
     } finally {
       this.recovering = false;
       if (this.recoverAgain) {
@@ -402,27 +477,26 @@ export class ToolsetController {
     }
   }
 
-  private async ownToolList(connection: McplServerConnection): Promise<ChangeSet> {
-    if (this.ownLists++ === 0) this.ownListChange = null;
+  /**
+   * Whether the list was read; the tap applied it and told its change as it
+   * was read. When it moved a tool, the model's tool list is rebuilt now
+   * rather than at the next unrelated refresh.
+   */
+  private async ownToolList(connection: McplServerConnection): Promise<boolean> {
     try {
-      // The tap applied each page as it was read, and kept what the whole
-      // list changed (ownListChange).
       await connection.sendToolsList();
+      if (this.presence.movesOwed) this.deps.refreshTools(this.serverId);
+      return true;
     } catch (error) {
       this.log(`tools/list failed: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      this.ownLists--;
+      return false;
     }
-    const collected = this.ownListChange ?? emptyChange();
-    if (this.ownLists === 0) this.ownListChange = null;
-    else this.ownListChange = emptyChange();
-    return collected;
   }
 
   private async ownToolsetList(connection: McplServerConnection, timeoutMs: number, why: string): Promise<ChangeSet> {
     try {
       const r = await connection.sendToolsetsList(timeoutMs);
-      return this.changeOf(r);
+      return this.claim(r);
     } catch (error) {
       this.log(`toolsets/list (${why}) failed: ${error instanceof Error ? error.message : String(error)}`);
       return emptyChange();
@@ -441,28 +515,29 @@ export class ToolsetController {
     this.sync(connection.transportEpoch, connection);
     if (!this.presence.active) return;
     const epoch = connection.transportEpoch;
-    const tools = await this.ownToolList(connection);
+    await this.ownToolList(connection);
     if (connection !== this.connection || connection.transportEpoch !== epoch) return;
     const lists = await this.ownToolsetList(connection, LIST_TIMEOUT_MS, 'after connecting');
     if (connection !== this.connection || connection.transportEpoch !== epoch) return;
-    this.deliver(joinChanges(tools, lists));
+    this.deliver(lists);
   }
 
   /**
    * Re-read what the server holds open (titles, visibility) without telling
-   * it: for look, which restates everything anyway. Returns notes for what
-   * the server no longer holds.
+   * it, for look. Returns what the re-read changed, taken from the notice it
+   * would otherwise get: look then either shows it (told) or hands it back
+   * (tell). Null when nothing was read.
    */
-  async refreshOpen(): Promise<string[]> {
-    if (!this.presence.active) return [];
+  async refreshOpen(): Promise<ChangeSet | null> {
+    if (!this.presence.active) return null;
     const connection = this.connection;
-    if (!connection || !connection.isConnected) return [];
+    if (!connection || !connection.isConnected) return null;
     try {
       const r = await connection.sendToolsetsList(REFRESH_TIMEOUT_MS);
-      return this.changeOf(r).notes;
+      return isObj(r) ? this.claim(r) : null;
     } catch (error) {
       this.log(`toolsets/list (look) failed: ${error instanceof Error ? error.message : String(error)}`);
-      return [];
+      return null;
     }
   }
 
@@ -484,7 +559,7 @@ export class ToolsetController {
       key,
       ...(title ? { title } : {}),
       content: Array.isArray(res.content) ? res.content : [],
-      change: this.changeOf(res),
+      change: this.takeChange(res),
       adopted: res.adopted === true,
     };
   }
@@ -494,7 +569,7 @@ export class ToolsetController {
     const connection = this.live();
     const r = await connection.sendToolsetsClose({ toolset, ...(instance ? { instance } : {}) }, TOOLSET_REQUEST_TIMEOUT_MS);
     const res = isObj(r) ? r : {};
-    return { content: Array.isArray(res.content) ? res.content : [], change: this.changeOf(res) };
+    return { content: Array.isArray(res.content) ? res.content : [], change: this.takeChange(res) };
   }
 
   /** Open or close an undeclared group (RFC §5.4): the host's own act; the server isn't told. */
@@ -532,11 +607,15 @@ export class ToolsetController {
     this.deliver(this.presence.diff(before, this.presence.view()));
   }
 
-  /** Apply pending static↔dynamic moves (RFC §4.2) at a tool-list boundary, and say where they went. */
-  applyMoves(): string[] {
-    return this.presence.applyMoves().map(({ name, to }) => to === 'dynamic'
-      ? `${name} left your tool list: it's announced when available now, and called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${name}", args}.`
-      : `${name} is in your tool list now, as ${this.deps.listedName(this.serverId, name)}.`);
+  /** At a rebuild of the model's tool list (RFC §4.2), tell where the tools the list moved went. */
+  applyMoves(): void {
+    const moved = this.presence.applyMoves();
+    if (!moved.length) return;
+    const cs = emptyChange();
+    cs.notes.push(...moved.map(({ name, to }) => to === 'dynamic'
+      ? `${name} left your tool list: it's announced when available, and called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${name}", args}.`
+      : `${name} is in your tool list now, as ${this.deps.listedName(this.serverId, name)}.`));
+    this.deliver(cs);
   }
 }
 
@@ -615,7 +694,7 @@ export class ToolsetHub {
   /** The reminder due for `agentName`, or null when none is. */
   reminderFor(agentName: string): string | null {
     if (!this.due.has(agentName)) return null;
-    const parts = this.presenting().map((c) => c.presence.reminder()).filter((r): r is string => !!r);
+    const parts = this.presenting().filter((c) => this.deps.canNotify(c.serverId)).map((c) => c.presence.reminder()).filter((r): r is string => !!r);
     if (parts.length === 0) return null;
     return `Open toolsets (a reminder: their earlier announcements have left your context):\n${parts.join('\n')}`;
   }

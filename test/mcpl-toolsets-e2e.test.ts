@@ -6,8 +6,7 @@
  *  - the four meta-tools (toolsets--open/act/look/close) are there, constant;
  *  - an open announces the toolset's tools; act calls carry the instance and
  *    report what the call changed; close reports what closing meant;
- *  - an instance the server kept is adopted after a reconnect (vector 9);
- *  - toolsets/list with nothing visible clears what the host believed (38).
+ *  - an instance the server kept is adopted after a reconnect (vector 9).
  */
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -166,6 +165,7 @@ describe('RFC-014 host, end to end against the reference ToolsetServer', () => {
     await callTool(fw.framework, 'toolsets--open', { server: 'arcade', toolset: 'build' });
     const closed = await callTool(fw.framework, 'toolsets--close', { server: 'arcade', toolset: 'build' });
     assert.match(resultText(closed), /\[arcade\/build\] closed/);
+    await new Promise((r) => setImmediate(r));
     // Nothing of it reached the window as a notice: the results carried it.
     assert.ok(!windowText(fw.framework).some((t) => t.includes('tool changes') && t.includes('[arcade/build]')));
   });

@@ -1,10 +1,10 @@
 /**
  * How a dynamic tool reads to a model when it reaches the conversation
  * instead of the tool list (MCPL RFC-014 §8.3): a compact signature, its
- * first sentence the first time a definition is shown, the whole definition
- * on request. Also the host's own argument check against a tool's current
- * definition (RFC-014 §6.1: "the host checks arguments for that instance
- * against it").
+ * first sentence the first time a definition is shown, and on request its
+ * description, input schema and class. Also the host's own argument check
+ * against a tool's current definition (RFC-014 §6.1: "the host checks
+ * arguments for that instance against it").
  *
  * Ported from mcpl-cc-bridge's tool-render.ts and schema-check.ts, the
  * reference host of RFC-014. Dependency-free.
@@ -26,6 +26,7 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object
 
 function typeSig(schema: JsonSchema | undefined, depth = 0): string {
   if (!schema || typeof schema !== 'object') return 'any';
+  if (depth > 8) return '…';
   if (Array.isArray(schema.enum)) {
     // The enum is often the menu (a decision's options): all of it unless it is long.
     const vals = (schema.enum as unknown[]).map((v) => JSON.stringify(v));
@@ -94,22 +95,23 @@ export function objectSignature(schema: unknown): string {
 }
 
 /** First sentence of a description, bounded. */
-export function firstSentence(text: string | undefined, max = 140): string {
-  const t = (text ?? '').trim().replace(/\s+/g, ' ');
+export function firstSentence(text: unknown, max = 140): string {
+  const t = (typeof text === 'string' ? text : '').trim().replace(/\s+/g, ' ');
   // A sentence ends at . ! ? followed by a capital, a bracket, or the end, so "e.g. \"D4\"" does not end it.
   const m = t.match(/^(.+?[.!?])(?=\s+[A-Z([]|$)/);
-  const s = m ? m[1]! : t;
-  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+  const s = [...(m ? m[1]! : t)];
+  return s.length > max ? s.slice(0, max - 1).join('') + '…' : s.join('');
 }
 
-function canonicalJson(value: unknown): string {
+function canonicalJson(value: unknown, depth = 0): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (depth > 64) return '"…"';
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v, depth + 1)).join(',')}]`;
   const obj = value as Record<string, unknown>;
   return `{${Object.keys(obj)
     .sort()
     .filter((k) => obj[k] !== undefined)
-    .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`)
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k], depth + 1)}`)
     .join(',')}}`;
 }
 
@@ -121,12 +123,15 @@ export function toolDigest(tool: HintedTool): string {
     .slice(0, 22);
 }
 
+/** The definitions a model has been shown, by digest: has and add are all rendering needs. */
+export type Shown = { has(digest: string): boolean; add(digest: string): void };
+
 /**
  * Tool lines as the model reads them. A definition the model has been shown
  * gets its signature only; a new or changed one also gets its first
  * sentence. `shown` is updated.
  */
-export function renderToolLines(tools: HintedTool[], shown: Set<string>, opts: { describeAll?: boolean; indent?: string } = {}): string[] {
+export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { describeAll?: boolean; indent?: string } = {}): string[] {
   const indent = opts.indent ?? '  ';
   return tools.map((t) => {
     const d = toolDigest(t);
@@ -137,7 +142,16 @@ export function renderToolLines(tools: HintedTool[], shown: Set<string>, opts: {
   });
 }
 
-/** The whole definition, for `look` naming a tool. */
+/** A server's value as JSON, or a note where it's nested too deeply to show. */
+export function jsonText(value: unknown, space?: number): string {
+  try {
+    return JSON.stringify(value, null, space) ?? '';
+  } catch {
+    return '(nested too deeply to show)';
+  }
+}
+
+/** A tool's signature, description, class and input schema, for `look` naming a tool. */
 export function renderToolDefinition(tool: HintedTool): string {
   const cls = tool._meta?.['mcpl/class'];
   return [
@@ -145,7 +159,7 @@ export function renderToolDefinition(tool: HintedTool): string {
     tool.description ?? '',
     ...(Array.isArray(cls) ? [`class: ${cls.join(', ')}`] : []),
     'inputSchema:',
-    JSON.stringify(tool.inputSchema ?? {}, null, 2),
+    jsonText(tool.inputSchema ?? {}, 2),
   ]
     .filter((l) => l !== '')
     .join('\n');

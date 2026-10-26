@@ -1,0 +1,6 @@
+- MCPL RFC-014 tool presence (`toolHints: true`), fixes to how hint changes are applied and told:
+  - A `tools/list` is applied whole as its last page is read, so a hint read just after it isn't undone, and a malformed or timed-out list changes nothing. A paged list whose pages straddle a change, or a hint or `toolsets/list` entry naming a tool `tools/list` hasn't listed, is recovered from.
+  - Changes reach the agent in the order they were read, each once: a result's change nobody shows with it is told as a notice before any later change, and a new tool's first sentence counts as shown only once text describing it reached the model.
+  - A change that would go as a notice to a server without the `pushEvents` grant is dropped, and `toolsets--look` shows the state.
+  - A tool the operator's tool policy refuses never starts a recovery, and a tool listed twice is known by its first listing.
+  - Rendering a server's definitions never throws: a description that isn't a string is left out, and a schema or a toolset's `options` nested very deep is cut short, rather than failing a notice or `toolsets--look`.

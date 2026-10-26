@@ -27,7 +27,7 @@ import type { ProcessEvent, ToolCall, ToolDefinition, ToolResult } from '../type
 import { unknownToolMessage } from '../modules/unknown-tool.js';
 import { META_TOOL_NAMES, TOOLSETS_MODULE, type ToolsetController, type ToolsetHub } from './toolset-host.js';
 import { keyOf, type ChangeSet } from './tool-presence.js';
-import { checkArgs, renderToolDefinition, type HintedTool } from './tool-signature.js';
+import { checkArgs, jsonText, renderToolDefinition, type HintedTool } from './tool-signature.js';
 
 /** The namespace a reminder's stored injection carries. */
 export const TOOLSETS_REMINDER_NAMESPACE = 'mcpl-toolsets';
@@ -55,7 +55,7 @@ const META_TOOLS: ToolDefinition[] = [
     description:
       'Call a tool that was announced in the conversation (a tool of an open toolset, or another dynamic tool); they are not in your tool list. ' +
       'args are the arguments its signature shows; instance picks the open copy when several are open; server is needed only when two servers have the tool. ' +
-      'Returns the server\'s result, then any change in which tools are available.',
+      'Returns the server\'s result, then any change it made in which tools are available, unless that change already went out as a notice (or was due as one and none could be written). toolsets--look shows what is available now.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -303,6 +303,7 @@ export class ToolsetsModule implements Module {
       const close = p.closeHint(opened.key);
       if (close) tail.push(`${close} closes it.`);
       blocks.push({ type: 'text', text: tail.join('\n') });
+      c.told(opened.change);
       return blocksResult(blocks);
     }
     if (p.undeclaredGroups.includes(toolset)) {
@@ -336,9 +337,26 @@ export class ToolsetsModule implements Module {
   private async look(args: Record<string, unknown>): Promise<ToolResult> {
     const server = str(args.server);
     const targets = server ? [this.hub.get(server)].filter((c): c is ToolsetController => !!c && c.presents) : this.hub.presenting();
-    const notes = (await Promise.all(targets.map((c) => c.refreshOpen().catch(() => [] as string[])))).flat();
-    const result = this.lookNow(args, server, str(args.tool));
-    return notes.length && !result.isError && typeof result.data === 'string' ? textResult(`${result.data}\n${notes.join('\n')}`) : result;
+    const read = (await Promise.all(targets.map(async (c) => ({ c, cs: await c.refreshOpen().catch(() => null) }))))
+      .filter((r): r is { c: ToolsetController; cs: ChangeSet } => r.cs !== null);
+    let result: ToolResult;
+    try {
+      result = this.lookNow(args, server, str(args.tool));
+    } catch (error) {
+      for (const { c, cs } of read) c.tell(cs);
+      throw error;
+    }
+    const restates = !str(args.tool) && !str(args.toolset) && !str(args.instance);
+    if (result.isError || typeof result.data !== 'string' || !restates) {
+      for (const { c, cs } of read) c.tell(cs);
+      return result;
+    }
+    const lines = read.flatMap(({ c, cs }) => {
+      const shown = [...cs.suggest.map((s) => c.presence.renderSuggestion(s)), ...c.presence.untoldNotes(cs), ...cs.notes];
+      c.told(cs);
+      return shown;
+    });
+    return lines.length ? textResult(`${result.data}\n${lines.join('\n')}`) : result;
   }
 
   private lookNow(args: Record<string, unknown>, server: string | undefined, tool: string | undefined): ToolResult {
@@ -380,7 +398,7 @@ export class ToolsetsModule implements Module {
         `${c.serverId}/${toolset}${d.title ? ` — ${d.title}` : ''}${d.summary ? `: ${d.summary}` : ''}`,
         open.length ? `open: ${open.map((o) => o.instance ?? toolset).join(', ')}` : 'not open',
         ...(d.instances ? ['several can be open at once; name each with instance'] : []),
-        ...(d.options ? [`options: ${JSON.stringify(d.options)}`] : []),
+        ...(d.options ? [`options: ${jsonText(d.options)}`] : []),
         `${p.openHint(toolset)} opens it.`,
       ].join('\n'));
     }
@@ -438,6 +456,7 @@ export class ToolsetsModule implements Module {
       }
       const key = keyOf(toolset!, instance);
       const change = p.render(closed.change) || `${p.label(key)} closed.`;
+      c.told(closed.change);
       return blocksResult([...asBlocks(closed.content), { type: 'text', text: change }]);
     }
     if (p.undeclaredGroups.includes(toolset!)) {

@@ -448,27 +448,41 @@ framework registers a `toolsets` module with four constant tools:
 - `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool down
   the same path as a direct call of it (the agent's `allowedTools`, the
   server's tool policy, the state exchange, the reading of its result, RFC-007
-  observers, who see the server's tool), with only the instance added, in
+  observers and RFC-008 class rules, which see the server's tool and its class),
+  with only the instance added, in
   `_meta["mcpl/instance"]`. It first checks `args` against the definition in
   force for that instance; that check is bounded, and leaves `pattern` and
   anything nested or branching too far to the server, which checks every
   call itself;
 - `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
-  and what can be opened, or one tool's whole definition;
+  and what can be opened, or one tool's description and input schema. It
+  re-reads the server first; what that changed is in the answer when look
+  restates everything, and otherwise told as a notice;
 - `toolsets--close {server?, toolset?, instance?}` closes it.
 
 `server` can be left out when only one server has the name. Hint changes apply
 as their message is read, in `rev` order, whatever becomes of the message (a
-refused push, a result that came after its timeout). A skipped rev re-reads
-`tools/list` and then `toolsets/list`, which the host also reads after every
-(re)connect, adopting what the server kept open and never re-opening anything.
+refused push, a result that came after its timeout). A move between static and
+dynamic takes effect when the server's `tools/list` states it: `toolsets--act`
+follows it then, and the tool list at its next rebuild, which the host asks for
+at once when its own re-read (after a reconnect or a lost `rev`) made the move.
+A skipped rev re-reads `tools/list` and then `toolsets/list`, which the host
+also reads after every (re)connect, adopting what the server kept open and
+never re-opening anything.
 What changed is told where it happened: after a call's own result, after the
 push that explains it, or as a notice (`kind: 'mcpl-toolsets'`, which wakes
 nothing) for a standalone `tools/hints`, a late result, an adoption, a
 recovery, or a call whose result doesn't go to the agent (one the framework or
-a module makes itself). Notices need the server's `pushEvents` grant, like any delivery. A
-new tool's first sentence is told the first time its definition appears.
-Suggestions are shown, never acted on. Each `ended` id is told once. When an
+a module makes itself). A call's change also goes as a notice, ahead of its
+result, when a later change goes to the agent before the call's caller has
+taken it, so changes reach the agent in the order they were read. Notices and reminders
+need the server's `pushEvents` grant, like any delivery; without it, a change
+that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told the first
+time its definition appears. Suggestions are shown, never acted on. Each
+`ended` id is told once while the
+host runs (told ids are kept in memory), short of rare interleavings, such as a
+`toolsets--look` overlapping other reads of the same server, that can tell one
+twice. When an
 open toolset's announcements have left an agent's context (compressed or out
 of the window), the module's `gatherContext` restates what is open, as a
 stored `afterUser` injection (namespace `mcpl-toolsets`), at that agent's next

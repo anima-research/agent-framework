@@ -76,6 +76,8 @@ export async function startScriptedServer(opts: {
   tools: Json[];
   /** tools/list's `_meta["mcpl/rev"]`, read at each list. */
   listRev?: () => number | undefined;
+  /** Answers a tools/list itself when it returns true. */
+  onList?: (msg: Json, peer: ScriptedPeer) => boolean;
   on?: (msg: Json, peer: ScriptedPeer) => void;
 }) {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
@@ -105,6 +107,7 @@ export async function startScriptedServer(opts: {
           if (msg.id !== undefined) peer.reply(msg.id, { accepted: true });
           return;
         case 'tools/list': {
+          if (opts.onList?.(msg, peer)) return;
           const rev = opts.listRev?.();
           peer.reply(msg.id, { tools: opts.tools, ...(rev !== undefined ? { _meta: { 'mcpl/rev': rev } } : {}) });
           return;
