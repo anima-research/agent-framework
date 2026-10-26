@@ -830,11 +830,12 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
   inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
   reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
   allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
+  toolHints: 'true advertises MCPL tool hints (RFC-014), so the server\'s dynamic tools are announced in the conversation and called through toolsets--act, and false or leaving it out lists every tool as before',
 };
 
 /**
- * Refuse a server config whose `inheritEnv`, `reconnect` or `allowHostCommands`
- * holds anything but true or false. A config read from JSON can carry a quoted
+ * Refuse a server config whose `inheritEnv`, `reconnect`, `allowHostCommands`
+ * or `toolHints` holds anything but true or false. A config read from JSON can carry a quoted
  * "false" where the type says boolean, and every reader of these settings takes
  * only `true` as on, so the quotes would hide what the value does. null counts
  * as not set, so a generated config that writes an unset setting as null

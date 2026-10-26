@@ -151,7 +151,7 @@ export const ROOT_UNAVAILABLE = 'the mount root is unavailable';
 export const ROOT_REPLACED =
   'the mount root is not the directory disk last agreed with (an unmounted drive, or a replaced directory): ' +
   'reconnect it; if it was replaced on purpose, sync the mount with acceptRoot to take it as it is now';
-const CHANGED = 'it changed while it was observed';
+export const CHANGED = 'it changed while it was observed';
 const CHANGED_WALK = 'the directory changed while the walk ran';
 const BENEATH_SYMLINK = 'beneath a symlink that does not lead to a directory inside the mount';
 
