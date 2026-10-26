@@ -72,22 +72,23 @@ or hold for lack of a destination is held as a draft with no notice instead of
 bouncing: a later `drafts` listing shows it, and the turn's receipt or, in
 `explicit` mode, which writes none, a later turn's catch-up notice names it,
 but nothing offers it for resend while the turn runs. In a `locus` or `hybrid`
-turn a send has silenced, the round's plain speech stays in the agent's
-context instead, counted in the receipt as kept private, and what a `>>>`
-envelope addressed is held with no notice. A round that also makes a send of
-its own, other than a `drafts` resend, holds its prose and offers it as any
-send's round does. Without this, an agent that writes a line beside each call
-would resend its own narration round after round, inside one turn, where the
-bounce-wake cap doesn't reach (#701). Outside a silenced turn, what the round
-would deliver is delivered, an unprefixed line to the turn's sticky target
-included, and a refused target, a malformed envelope or a failed delivery
-still bounces. Only the framework's own `drafts` tool makes such a round, not
-a module's or server's tool of that bare name. An envelope beside a script
-whose code mentions `drafts` waits for the script. In XML tool mode, where a
-turn's prose is routed once at its end with no notice mid-turn, a drafts round
-is routed as any other: its unprefixed line still bounces, and the bounce-wake
-cap ends a cycle of `drafts` resends after two wakes, counted from the last
-turn with a cause of its own or the last delivered envelope.
+turn a send has silenced, the round's plain speech aimed where a send may have
+posted stays in the agent's context instead, counted in the receipt as kept
+private, and what a `>>>` envelope addressed there is held with no notice. A
+round that also makes a send of its own, other than a `drafts` resend, holds
+its prose where that send may have posted, and offers it as any send's round
+does. Without this, an agent that writes a line beside each call would resend
+its own narration round after round, inside one turn, where the bounce-wake
+cap doesn't reach (#701). Outside a silenced turn, what the round would
+deliver is delivered, an unprefixed line to the turn's sticky target included,
+and a refused target, a malformed envelope or a failed delivery still bounces.
+Only the framework's own `drafts` tool makes such a round, not a module's or
+server's tool of that bare name. An envelope beside a script whose code
+mentions `drafts` waits for the script. In XML tool mode, where a turn's prose
+is routed once at its end with no notice mid-turn, a drafts round is routed as
+any other: its unprefixed line still bounces, and the bounce-wake cap ends a
+cycle of `drafts` resends after two wakes, counted from the last turn with a
+cause of its own or the last delivered envelope.
 
 `{{unsent}}` means the latest bounce while that draft is open (latest-wins, as
 the clipboard it replaced was), and `>>skip_reply {{unsent}}` dismisses it.
@@ -117,7 +118,7 @@ depends on the route:
 
 - The turn-frozen locus, announce-on-change notices, and all locus-capture
   policy (addressed-preference, ambient tiers) — no locus exists.
-- Explicit-send prose suppression (`turnSilenced`): redundant, since
+- Explicit-send prose suppression (`silence`): redundant, since
   unprefixed prose bounces and prefixed prose is deliberate.
 - The entire "which event may move the agent's voice" question.
 
