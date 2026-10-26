@@ -10452,7 +10452,7 @@ export class AgentFramework {
     }
   }
 
-  private shedNewestTurn(agent: Agent, refusedReply?: MessageId, carried?: ReadonlySet<MessageId>): RewindRecord | null {
+  private shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): RewindRecord | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
     const typeOf = (b: unknown) => (b as { type?: string }).type;
@@ -10474,26 +10474,19 @@ export class AgentFramework {
       const turn = bodyRangeIn(all, start - 1);
       return all.slice(turn.from, turn.to + 1).some((m) => hasBlock(m, 'tool_use')) && wasCarried(turn.from, turn.to);
     };
-    const uncounted: Array<{ from: number; to: number }> = [];
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
       if (meta.system) continue;
       const { from: start } = bodyRangeIn(all, i);
       const body = all.slice(start, i + 1);
-      if ((refusedReply !== undefined && body.some((m) => m.id === refusedReply))
-        || body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)) {
-        uncounted.push({ from: start, to: i });
-      } else if (wasCarried(start, i) || (body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start))) {
+      if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
+        && (wasCarried(start, i) || (body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start)))) {
         idx = i; break;
       }
       i = start;
     }
-    if (idx < 0) {
-      const reply = uncounted.find(({ from: start, to }) => all.slice(start, to + 1).some((m) => m.id === refusedReply));
-      if (reply) removeStoredMessages(cm, all[reply.from], all[reply.to]);
-      return null;
-    }
+    if (idx < 0) return null;
     // The newest message can be the last shard of a body (a document stored
     // in shards). context-manager removes a shard only with the rest of its
     // body, so the rewind takes the whole body.
@@ -10512,10 +10505,7 @@ export class AgentFramework {
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
     // Determine the complete exchange to remove, newest first.
-    const removedIds: MessageId[] = [
-      ...uncounted.flatMap(({ from: start, to }) => all.slice(start, to + 1).map((m) => m.id).reverse()),
-      ...members.map((m) => m.id).reverse(),
-    ];
+    const removedIds: MessageId[] = members.map((m) => m.id).reverse();
     // Where the exchange starts: this body, or the tool_use turn paired with it.
     let from = first;
     let descriptor: string;
@@ -10542,7 +10532,6 @@ export class AgentFramework {
       descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
-    for (const { from: start, to } of uncounted) removeStoredMessages(cm, all[start], all[to]);
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
     return { descriptor, removedIds };
@@ -21991,8 +21980,10 @@ export class AgentFramework {
                 onStep: (count: number) => void,
                 onGiveUp: () => void,
               ): void => {
+                const cm = agent.getContextManager();
+                if (refusedReplyId !== undefined && cm.getMessage(refusedReplyId)) removeStoredMessage(cm, refusedReplyId);
                 if (!budgetLeft) { onGiveUp(); return; }
-                const rec = this.shedNewestTurn(agent, refusedReplyId, this.streamCarried.get(stream));
+                const rec = this.shedNewestTurn(agent, this.streamCarried.get(stream));
                 if (!rec) { onGiveUp(); return; }
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);

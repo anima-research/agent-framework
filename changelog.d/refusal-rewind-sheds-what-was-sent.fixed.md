@@ -10,12 +10,15 @@
     refusals now shed older messages, newest first, the agent's own turns
     included, as the rewind's order always was.
   - **The marker's count** is the number of turns set aside that the
-    refused requests carried. A shed removes the refused reply that its
-    refusal just stored, and any row that carries nothing a request sends,
-    without counting them. When nothing the refused request carried is
-    left, it removes the refused reply alone before giving up.
+    refused requests carried. The refused reply is removed without being
+    counted, and a row that carries nothing a request sends is passed over
+    and left in place.
+  - **When the rewind gives up,** because nothing the refused request
+    carried is left or because it has reached `maxRewinds`, it removes the
+    refused reply first, so the next request doesn't carry its text. With
+    the rewind off, the refused reply stays.
   - **A stored row the refused request didn't carry**, such as a tuned-out
     channel's traffic or a message stored while the request streamed, is
     left in place and isn't counted.
-  - **The shed after inference exhaustion** removes rows that carry
-    nothing without counting them, in the same way.
+  - **The shed after inference exhaustion** passes over rows that carry
+    nothing in the same way.

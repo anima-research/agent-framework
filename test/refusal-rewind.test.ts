@@ -348,6 +348,31 @@ test('when no turn the refused request carried is left, the rewind removes only 
   } finally { await rig.close(); }
 });
 
+test("when the rewind gives up at its cap, no later request carries the refused reply's text", async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[], [refused()], [refused(partial)]], { autoRewind: true, maxRewinds: 1 });
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 3);
+    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes('[refusal-rewind]')), 'the premise: one rewind ran, and its retry was refused');
+    await rig.say('a new question', 4);
+    assert.equal(rig.requests.length, 4, 'the turn, the refused request, its refused retry, and the next turn');
+    assert.ok(!rig.texts(rig.requests[3]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+  } finally { await rig.close(); }
+});
+
+test("with the rewind off, the next request still carries the refused reply's text", async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[], [refused(partial)]], {});
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 2);
+    await rig.say('a new question', 3);
+    assert.equal(rig.requests.length, 3, 'the turn, the refused request, and the next turn, with no retry');
+    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes(partial)), 'the next request carries the refused reply, as on main');
+  } finally { await rig.close(); }
+});
+
 test('a refused reply stored in shards is removed whole, and the marker says 1', async () => {
   const long = (tag: string) => Array.from({ length: 400 }, (_, i) => `${tag}${i}`).join(' ');
   const rig = await rewindRig([[createMockResponse([text(long('answer'))])], [refused(long('partial'))]], { autoRewind: true, maxRewinds: 3 }, {
