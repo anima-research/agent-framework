@@ -281,7 +281,7 @@ const isSilencingTool = (name: string): boolean => {
  *  send, though inspecting drafts is not). */
 const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
   if (isSilencingTool(call.name)) return true;
-  return bareToolName(call.name) === 'drafts'
+  return call.name === 'drafts'
     && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
 };
 
@@ -312,9 +312,9 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
  * Whether a call of one of these tools can change a round's routing
  * (routeRound): in locus and hybrid mode a silencing or world-publication
  * tool, or `drafts`, whose resend is an explicit send (isSilencingCall); in
- * explicit mode, where sends don't silence, only `skip_reply`, which keeps
- * the round private; in either, `think` under the private same-round policy,
- * which holds the round back. Disabled mode routes nothing.
+ * explicit mode, where sends don't silence, `skip_reply`, which keeps the
+ * round private, and `drafts`; in either, `think` under the private same-round
+ * policy, which holds the round back. Disabled mode routes nothing.
  */
 const changesRouting = (
   named: ReadonlySet<string>,
@@ -323,7 +323,7 @@ const changesRouting = (
 ): boolean => {
   if (mode === 'disabled') return false;
   for (const name of named) {
-    if (name === 'think' ? privateThink : mode !== 'explicit' || name === 'skip_reply') return true;
+    if (name === 'think' ? privateThink : mode !== 'explicit' || name === 'skip_reply' || name === 'drafts') return true;
   }
   return false;
 };
@@ -344,9 +344,9 @@ const ROUTING_TOOL_NAMED = new RegExp(
  * all name `say`, and `say_hello` doesn't. A coarse reading of what a script
  * may call (AgentFramework.scriptMayRoute): a comment or a string that
  * mentions a tool names it too, and `drafts` holds whatever the action its
- * call asks, though only a resend changes routing. A tool the code doesn't
- * spell out goes unseen: a name it builds at runtime or spells with escapes,
- * or one it picks by enumerating ALL_TOOLS or `tools`.
+ * call asks. A tool the code doesn't spell out goes unseen: a name it builds
+ * at runtime or spells with escapes, or one it picks by enumerating ALL_TOOLS
+ * or `tools`.
  */
 const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUTING_TOOL_NAMED) ?? []);
 
@@ -706,6 +706,10 @@ const PROSE_ROUTING_HELP =
   'Text without a destination is not delivered: it is held as a draft, and a notice\n' +
   'names it — reply e.g. ">>#channel {{unsent}}" to deliver your latest bounce draft\n' +
   'unchanged, or use the drafts tool to list, resend or dismiss any draft by id.\n' +
+  'With native tool calls, an unprefixed line written in a round that calls the\n' +
+  'drafts tool while the turn has no destination is held as a draft, with no\n' +
+  'notice that turn: a later turn\'s catch-up notice and the drafts listing show\n' +
+  'it. Only if it cannot be held does it bounce.\n' +
   '">>skip_reply {{unsent}}" sets the latest bounce aside. Send tools (send_message,\n' +
   'send_dm, …) are unaffected.';
 
@@ -1271,7 +1275,7 @@ interface TurnRouting {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send): counted, never drafted. */
+  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts`, and sends nothing else, after a send: counted, never drafted. */
   keptPrivate: number;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
@@ -1352,6 +1356,7 @@ interface ProseRound {
   routing: TurnRouting;
   notice: 'now' | 'later';
   keepPrivate?: boolean;
+  draftsRound?: boolean;
   /** The outgoing stream of the stream that queued the round. */
   onPublished?: SpeechPublished;
 }
@@ -1367,6 +1372,7 @@ interface RoundCall {
   name: string;
   cause: 'send' | 'private' | null;
   refused: boolean;
+  permitted: boolean;
 }
 
 /** Why a round's calls silence its prose, as silenceCauseOf reads them: a
@@ -15823,7 +15829,9 @@ export class AgentFramework {
   }
 
   /**
-   * Silenced plain speech: an explicit send holds it as resendable drafts; a
+   * Silenced plain speech: an explicit send holds it as resendable drafts (in
+   * a round that calls `drafts` and sends nothing else, 'drafts', its plain
+   * speech is kept and counted instead); a
    * deliberate silence (skip_reply, a silent turn, or a private think in
    * the same native round, where that policy applies: an XML-mode round has
    * no verbatim content to route live, so its prose is routed at the turn's
@@ -15836,13 +15844,13 @@ export class AgentFramework {
   private holdSilencedProse(
     agent: Agent,
     segments: string[],
-    cause: 'send' | 'private' | null,
+    cause: 'send' | 'private' | 'drafts' | null,
     privateThink: boolean,
     round: ProseRound,
   ): void {
     if (segments.length === 0) return;
     const routing = round.routing;
-    if (cause === 'private' || privateThink) {
+    if (cause === 'private' || privateThink || (cause === 'drafts' && agent.proseRouting !== 'hybrid')) {
       // Match explicit mode: skip_reply keeps publication private but can
       // still set a bounce aside. A private-think round interprets no text.
       if (cause === 'private' && !privateThink && agent.proseRouting === 'hybrid') {
@@ -15871,7 +15879,7 @@ export class AgentFramework {
     // re-bounce rule, unsentWords), not its routing syntax, and the
     // destination the resident wrote stays with it as a note.
     let privateCount = 0;
-    const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk }> = [];
+    const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean }> = [];
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
     for (const segment of segments) {
@@ -15902,13 +15910,14 @@ export class AgentFramework {
               text: words.text,
               note: `written for >>>${parsed.target}`,
               ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
+              deliberate: true,
             });
           }
         } else if (envelope.startsWith('>>>')) {
           // Malformed: an attempted destination that names none.
           delete routing.pin;
           routing.hybridHold = 'failed';
-          parts.push({ text: envelope });
+          parts.push({ text: envelope, deliberate: true });
         } else if (routing.hybridHold === 'private') {
           privateCount++;
         } else {
@@ -15917,7 +15926,12 @@ export class AgentFramework {
       }
     }
     routing.keptPrivate += privateCount;
-    this.holdProseDrafts(agent, parts, 'explicit-send', round);
+    if (cause === 'drafts') {
+      routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
+      this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later' });
+    } else {
+      this.holdProseDrafts(agent, parts, 'explicit-send', round);
+    }
     // The turn's receipt names them by their state at turn end; each was
     // named when it bounced.
     const drafts = routing.drafts;
@@ -15988,7 +16002,7 @@ export class AgentFramework {
 
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
     'explicit-send': 'an explicit send in the same round holds plain speech back',
-    'no-destination': 'it had no destination — after a routing envelope failed, plain speech waits for a new valid target',
+    'no-destination': 'it had no destination: plain speech with no target waits for one',
     bounced: 'its routing prefix bounced',
   };
 
@@ -16722,7 +16736,7 @@ export class AgentFramework {
         'the words remain only in your history',
       );
     }
-    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply or a private think)`);
+    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`);
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
@@ -17893,7 +17907,7 @@ export class AgentFramework {
   private async deliverProse(
     agent: Agent,
     rawText: string,
-    round: { notice?: 'now' | 'later'; keepPrivate?: boolean } = {},
+    round: { notice?: 'now' | 'later'; keepPrivate?: boolean; draftsRound?: boolean } = {},
   ): Promise<void> {
     // The direct entry delivers as a live round does: under the live turn's
     // routing.
@@ -17902,6 +17916,7 @@ export class AgentFramework {
       routing,
       notice: round.notice ?? 'later',
       keepPrivate: round.keepPrivate,
+      draftsRound: round.draftsRound,
     });
   }
 
@@ -18186,13 +18201,9 @@ export class AgentFramework {
         routing.keptPrivate++;
         continue;
       }
-      if (routing.hybridHold === 'failed') {
-        this.holdProseDrafts(agent, [envelope], 'no-destination', round);
-        continue;
-      }
       const sticky = routing.pin;
-      if (!allowLocus && !sticky) {
-        this.holdProseDrafts(agent, [envelope], 'no-destination', round);
+      if (routing.hybridHold === 'failed' || (!allowLocus && !sticky)) {
+        this.holdProseDrafts(agent, [envelope], 'no-destination', round.draftsRound ? { ...round, notice: 'later' } : round);
         continue;
       }
       const target = sticky ?? locus;
@@ -18306,6 +18317,22 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky) {
+        if (round.draftsRound) {
+          console.error(`[prose] ${name}: unprefixed — ${rawText.length} chars held with no notice (a drafts round, no destination)`);
+          const words = this.unsentWords(agent, rawText);
+          if (!('draft' in words)) {
+            const held = this.holdProseDrafts(
+              agent,
+              [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
+              'no-destination',
+              { ...round, notice: 'later' },
+            );
+            if (held.length === 0 && words.text.trim().length > 0) {
+              this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round);
+            }
+          }
+          return;
+        }
         this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round);
         return;
       }
@@ -19954,8 +19981,9 @@ export class AgentFramework {
     // model writes it, so it carries only what delivery published, where it
     // published it. A round's text reaches it once the round's routing is
     // decided and its publish succeeds. Text that delivery withholds never
-    // does: a round a silencing tool, `skip_reply` or a private `think` keeps
-    // back, a hold, a bounce, a draft, or a round its stream never finished.
+    // does: a round a silencing tool, `skip_reply`, a `drafts` call or a
+    // private `think` keeps back, a hold, a bounce, a draft, or a round its
+    // stream never finished.
     // Nor does a publish the server doesn't confirm (SpeechPublished).
     // Emission to a server is gated in the registry (`channels.streaming`),
     // and `channels/publish` stays the authoritative send.
@@ -20037,8 +20065,10 @@ export class AgentFramework {
     // to prevent a redundant "sent it" postscript. Fresh injected input
     // clears it, because the following prose is a reply to a new message.
     // Why it is silenced decides what happens to the held words: an explicit
-    // send ('send') holds them as resendable drafts; a deliberate silence
-    // ('private': skip_reply, a silent control-plane turn) keeps them private.
+    // send ('send') holds them as resendable drafts, except in a round that
+    // calls `drafts` and sends nothing else, which keeps its plain speech; a
+    // deliberate silence ('private': skip_reply, a silent control-plane turn)
+    // keeps them private.
     let silenceCause: 'send' | 'private' | null = trigger?.suppressProse === true
       ? 'private'
       : (trigger?.reason === 'tool_result_guard_retry' ? this.guardRetryTurnSilenced.get(agent.name) : undefined) ?? null;
@@ -20496,6 +20526,10 @@ export class AgentFramework {
                 turnSilenced = true;
                 silenceCause = roundCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
               }
+              const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
+              const draftsCause = draftsRound
+                && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
+              const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
                 console.error(
@@ -20506,14 +20540,14 @@ export class AgentFramework {
                 if (turnSilenced) {
                   // In order behind earlier rounds' envelopes: the router
                   // state they leave is where this round's starts.
-                  const cause = silenceCause;
+                  const cause = draftsCause && silenceCause !== 'private' ? 'drafts' : silenceCause;
                   chainSpeech(
                     async () => this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts),
                     'mid-turn hybrid prose hold failed:',
                   );
                 } else if (!hasSameRoundPrivateThink) {
                   for (const seg of roundSegments) {
-                    chainSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, holdOpts), 'mid-turn hybrid prose delivery failed:');
+                    chainSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, roundOpts), 'mid-turn hybrid prose delivery failed:');
                   }
                 }
               } else if (turnProseRouting === 'explicit') {
@@ -20531,16 +20565,17 @@ export class AgentFramework {
                     `[prose] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                   );
                   for (const envelopes of roundAdmitted) {
-                    chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...holdOpts, keepPrivate }), 'mid-turn prose delivery failed:');
+                    chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...roundOpts, keepPrivate }), 'mid-turn prose delivery failed:');
                   }
                 }
               } else if (turnSilenced) {
                 console.error(
-                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause})`,
+                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause}${draftsCause ? ', a drafts round: kept' : ''})`,
                 );
                 // Never a silent black hole (n=8: the flying-scene reply):
-                // held as drafts the resident can resend, and named.
-                this.holdSilencedProse(agent, roundRuns, silenceCause, hasSameRoundPrivateThink, holdOpts);
+                // held as drafts the resident can resend, and named. A drafts
+                // round's is kept and counted instead.
+                this.holdSilencedProse(agent, roundRuns, draftsCause && silenceCause !== 'private' ? 'drafts' : silenceCause, hasSameRoundPrivateThink, holdOpts);
               } else if (hasSameRoundPrivateThink) {
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -23183,13 +23218,14 @@ export class AgentFramework {
     // however it turns out, as a direct call does: one refused here as one
     // the allowedTools refuses (a skip_reply as refused, another call for
     // nothing), and one the dispatcher refuses as roundCallOf reads it. The
-    // round reads its calls as a set, so each kind of call is kept once: the
-    // list stays as long as the agent's tool list, however many calls the
-    // script makes.
+    // round reads its calls as a set, so each kind of call (its name, cause,
+    // refusal and whether it was permitted) is kept once: the list stays as
+    // long as the agent's tool list, however many calls the script makes.
     const roundCalls = context.watch ? this.scriptRoundCalls.get(context.watch) : undefined;
     if (roundCalls) {
       const counted = this.roundCallOf(agentName, { name: toolName, input }, refusal !== undefined);
-      if (!roundCalls.some((c) => c.name === counted.name && c.cause === counted.cause && c.refused === counted.refused)) roundCalls.push(counted);
+      if (!roundCalls.some((c) => c.name === counted.name && c.cause === counted.cause
+        && c.refused === counted.refused && c.permitted === counted.permitted)) roundCalls.push(counted);
     }
     if (refusal !== undefined) return refused(refusal);
     const route = { toServer: false };
@@ -23988,7 +24024,7 @@ export class AgentFramework {
   private roundCallOf(agentName: string, call: { name: string; input?: unknown; unparseableInput?: string }, refusedHere = false): RoundCall {
     const permitted = !refusedHere && markedInputRefusal(call) === undefined && this.canAgentUseTool(agentName, call.name);
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
-    return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused };
+    return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused, permitted };
   }
 
   /**
