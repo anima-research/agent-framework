@@ -14384,20 +14384,20 @@ export class AgentFramework {
   }
 
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
-    'explicit-send': 'an explicit send in the same round holds plain speech back',
+    'explicit-send': 'an explicit send in its turn held it back',
     'no-destination': 'it had no destination — after a routing envelope failed, plain speech waits for a new valid target',
     bounced: 'its routing prefix bounced',
   };
 
   private static readonly DRAFT_REASON_SHORT: Record<DraftReason, string> = {
-    'explicit-send': 'explicit send in the same round',
+    'explicit-send': 'explicit send in its turn',
     'no-destination': 'no destination',
     bounced: 'routing prefix bounced',
   };
 
   /** Why the held-draft notice's drafts were held, as the clause after "because". */
   private static readonly DRAFT_REASON_BECAUSE: Record<DraftReason, (many: boolean) => string> = {
-    'explicit-send': () => 'there was an explicit send in the same round as the plain speech',
+    'explicit-send': () => 'you made an explicit send in this round or an earlier one this turn',
     'no-destination': (many) => `${many ? 'they' : 'it'} had no destination — after a routing envelope failed, ` +
       'plain speech waits for a new valid target',
     bounced: (many) => `${many ? 'their' : 'its'} routing prefix bounced`,
@@ -14418,19 +14418,16 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
     ];
-    // Each draft is named with its opening words, so the resident can tell
-    // which of its messages this is.
-    const opening = (d: Draft): string => AgentFramework.draftPreview(d.text, 50);
-    const named = held.map((d) => `${d.id} (starting ${opening(d)})`);
+    const named = held.map((d) => `${d.id} (${d.text.length} chars)`);
     const which = many
       ? `your ${held.length} plain-speech messages`
-      : `your plain-speech message starting ${opening(held[0]!)}`;
+      : `your plain-speech message (${held[0]!.text.length} chars)`;
     // "Not sent" only when no copied words may already have been posted.
     const status = risky.length > 0
       ? `${many ? 'are' : 'is'} held as`
       : `${many ? 'were not sent and are' : 'was not sent and is'} instead held as`;
     const heldAs = many
-      ? `drafts ${named.slice(0, -1).join(', ')} and ${named.at(-1)}`
+      ? `drafts ${named.slice(0, -1).join(', ')} and ${named.at(-1)}, in the order you wrote them,`
       : `draft ${held[0]!.id}`;
     // Named: residents that share one message slot (#197) share this window.
     return (
@@ -14444,7 +14441,7 @@ export class AgentFramework {
     return formatZonedDateTime(t, this.timeZone).replace(/:\d\d\.\d{3}/, '');
   }
 
-  /** A draft's opening words, for the drafts tool's listing and the held-draft notice. */
+  /** A draft's opening words, for the drafts tool's listing only. */
   private static draftPreview(text: string, max = 80): string {
     const flat = text.replace(/\s+/g, ' ').trim();
     return JSON.stringify(flat.length > max ? `${flat.slice(0, max)}…` : flat);
@@ -14525,9 +14522,9 @@ export class AgentFramework {
    * reached the history (a crash, an aborted turn), or a rollback or branch
    * move took the notices away. Every draft it marks is named by id, newest
    * first: the newest eight with their state and why each was held, the rest
-   * by id. Like every notice, it quotes none of their words; the drafts tool
-   * shows them. A draft a recent message already names is recorded as
-   * noticed rather than named again: its notice landed after its turn ended,
+   * by id. It quotes none of their words; the drafts tool shows them. A
+   * draft a recent message already names is recorded as noticed rather
+   * than named again: its notice landed after its turn ended,
    * as a bounce does when a delivery runs after a tool ends an explicit turn.
    * It reads only the recent history (draftsNamedInHistory), so its notice
    * claims no more than that. Left out are the open logical turn's own
