@@ -81,12 +81,18 @@ export interface AgentConfig {
   /** Temperature for inference */
   temperature?: number;
 
-  /** Max input tokens before framework breaks a yielding stream and
-   *  restarts with recompiled (compressed) context. Default: 150000. Not
-   *  checked mid-turn for an agent whose model binds its thinking
+  /** The `inputTokens` total above which framework breaks a yielding
+   *  stream and restarts with recompiled (compressed) context. Default:
+   *  150000. The total runs over the stream's calls, as membrane's usage
+   *  events report it, and doesn't add the cache reads and writes they
+   *  report beside it. Where membrane knows the provider's cache convention
+   *  (one other than `'unknown'`), `inputTokens` leaves those out, so there,
+   *  where a prompt is mostly cached, this setting doesn't bound the
+   *  request's size: `physicalWindowTokens`, when set, does. Not checked
+   *  mid-turn for an agent whose model binds its thinking
    *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
-   *  there would take the turn's own earlier reasoning out of the request, and
-   *  the window projection still guards the provider's hard cap. */
+   *  there would take the turn's own earlier reasoning out of the request,
+   *  and the window projection still guards the provider's hard cap. */
   maxStreamTokens?: number;
 
   /**
@@ -99,7 +105,10 @@ export interface AgentConfig {
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
    * stream has reported its prompt. Unset → no projection; only the
-   * maxStreamTokens restart applies. A value is converted to a number as a
+   * maxStreamTokens restart applies. Where membrane knows the provider's
+   * cache convention, the count that restart compares leaves out cache reads
+   * and writes, so a turn's requests can then grow past the window while
+   * most of their prompt is cached. A value is converted to a number as a
    * comparison converts it, so a string such as "200000" reads as its number;
    * one whose number isn't finite, such as null, reads as unset.
    */
