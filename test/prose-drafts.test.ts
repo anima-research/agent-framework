@@ -3135,6 +3135,8 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         h.command({ op: 'incoming', channelId: INBOUND, messageId: 'in-inbound', mode: 'addressed', text: 'hello' });
         await h.until(() => notices(h).length > 0, 'the notice');
         await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
+        assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
+        assert.match(notices(h)[0]!, /your send_message in this round delivered to #announcements/);
         assert.match(notices(h)[0]!, /destination: "#channel"\) delivers it unchanged/);
       } finally {
         await h.close();
