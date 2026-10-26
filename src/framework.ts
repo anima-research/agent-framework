@@ -22420,13 +22420,13 @@ export class AgentFramework {
       const toolsets = taker ? this.toolsetHub?.get(serverId) : undefined;
       const cs = toolsets?.takeChange(result);
       if (toolsets && cs && !isEmptyChange(cs)) taken = { toolsets, cs };
-      const withChange = (answer: ToolResult): ToolResult => {
+      const withChange = (answer: ToolResult, alone: ToolResult = answer): ToolResult => {
         if (!taken) return answer;
         const joined = this.withWholeChange(agentName!, call, answer, taken.toolsets.presence.render(taken.cs, { mark: false }), call.resultMaxChars);
         if (joined) taker!(taken);
         else taken.toolsets.tell(taken.cs);
         taken = undefined;
-        return joined ?? answer;
+        return joined ?? alone;
       };
       // A server's error is a failure here too, as the model's dispatch
       // reads it: its text (mcplToolFailure), without its other blocks, and
@@ -22451,10 +22451,11 @@ export class AgentFramework {
         await this.autoFetchReferences(result.content, serverId, 'register')
           .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
         const blocks = Array.isArray(direct.data) ? direct.data : [];
-        const read: ToolResult = taken && blocks.length === 0 && Object.prototype.hasOwnProperty.call(direct, 'structured')
+        const read: ToolResult = Array.isArray(direct.data) ? { ...direct, dataIsContent: true } : direct;
+        const shown: ToolResult = taken && blocks.length === 0 && Object.prototype.hasOwnProperty.call(direct, 'structured')
           ? { ...direct, data: JSON.stringify(direct.structured) ?? 'null' }
-          : Array.isArray(direct.data) ? { ...direct, dataIsContent: true } : direct;
-        return withChange(read);
+          : read;
+        return withChange(shown, read);
       }
       return withChange(direct);
     } catch (err) {

@@ -205,6 +205,19 @@ test('the puppet stores a result that is structured content alone as that conten
   }
 });
 
+test('the puppet stores a structured-only result as 0.27.0 did when its tool change won\'t fit under the cap, and the change goes as a notice', async () => {
+  const { server } = await hintingServer({ content: [], structuredContent: { s: 'x'.repeat(980) } });
+  const fw = await connectedTo(server, { toolResultInlineMaxChars: 1000 });
+  try {
+    const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
+    assert.equal(storedResult(fw, toolUseId), '""', 'stored as 0.27.0 stored it');
+    await waitFor(() => notices(fw).some((x) => x.includes('peek()')), 'the change told as a notice');
+  } finally {
+    await fw.stop();
+    await server.close();
+  }
+});
+
 test('the puppet\'s toolsets--act stores the dynamic tool\'s result with the tool change its call made, and the change isn\'t told again', async () => {
   const { server } = await hintingServer({ content: [{ type: 'text', text: 'peeked' }] });
   const fw = await connectedTo(server);
