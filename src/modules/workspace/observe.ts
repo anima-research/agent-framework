@@ -1718,10 +1718,10 @@ function parsePattern(pattern: string): Pattern | string {
   const directory = beneath || body.endsWith('/');
   body = body.slice(0, beneath ? -3 : directory ? -1 : undefined);
   const anchored = (beneath && !anyDepth) || body.includes('/');
-  if (body.startsWith('/')) body = body.slice(1);
-  if (body.includes('**') || (anyDepth && anchored)) return '"**" is read only as a leading "**/" before one name, or a trailing "/**"';
+  if (body.startsWith('/') && !anyDepth) body = body.slice(1);
   const segments = body.split('/');
   if (segments.some((s) => s === '' || s === '.' || s === '..')) return 'it has an empty, "." or ".." segment, which names no entry';
+  if (body.includes('**') || (anyDepth && anchored)) return '"**" is read only as a leading "**/" before one name, or a trailing "/**"';
   const glob = (s: string): string | RegExp => /[*?]/.test(s)
     ? new RegExp(`^${s.replace(/[.+^${}()|[\]*?]/g, (c) => (c === '*' ? '.*' : c === '?' ? '.' : `\\${c}`))}$`, 'su')
     : s;
@@ -2084,8 +2084,12 @@ export async function walkScope(
       // Another mount's directory is passed over by its real path too, so a
       // walk that reaches one through a link to a directory above it lists
       // none of that mount's names (nestedAtReal).
-      const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others, entry.isDirectory())
+      let passedOver = passedOverBecause(childRel, entry.name, ignore, view.others, entry.isDirectory())
         ?? (entry.isDirectory() && nestedAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
+      if (passedOver === undefined && view.followSymlinks && entry.isSymbolicLink()) {
+        const asDirectory = passedOverBecause(childRel, entry.name, ignore, view.others, true);
+        if (asDirectory !== undefined && (await directoryAt(dir.at(entry.name), true)) === true) passedOver = asDirectory;
+      }
       if (passedOver !== undefined) {
         others.push([childRel, passedOver]);
         regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });

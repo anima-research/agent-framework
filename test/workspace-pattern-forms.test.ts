@@ -141,6 +141,18 @@ describe('ignore reads gitignore\'s forms', () => {
     assert.deepEqual((await call(m, 'sync', { path: 'work/build' })).ignored, [{ mount: 'work', path: 'build', note: IGNORED_NOTE }]);
     assert.doesNotMatch(await listingSays('work/bin'), /ignored by the mount/);
     assert.equal((await call(m, 'sync', { path: 'work/bin' })).ignored, undefined);
+    const all = await call(m, 'sync', { mount: 'work' });
+    assert.deepEqual(all.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 1 }], JSON.stringify(all));
+  });
+
+  test('a listing naming a directory a directory-only pattern names, which disk no longer holds, says the list covers it, as history beneath it implies a directory', async (t) => {
+    const env = new Env(t, ['build/a.js', 'keep.txt']);
+    const m = await env.open({ ignore: ['build/'] });
+    await call(m, 'sync', { path: 'work/build' });
+    assert.deepEqual(env.tree(), ['build/a.js']);
+    rmSync(join(env.dir, 'build'), { recursive: true });
+    const res = await call(m, 'ls', { path: 'work/build' });
+    assert.deepEqual(res.incomplete, [{ path: 'build', reason: "ignored by the mount: a sync that names this path takes in what's there, editors' files aside" }], JSON.stringify(res));
   });
 
   test('"*" and "?" match within a name, and "*.ext" matches as before', async (t) => {
@@ -170,6 +182,10 @@ describe('include reads gitignore\'s forms, for files', () => {
     assert.deepEqual(await synced(t, files, { include: ['/docs/', '**/cache/'] }), ['cache/c', 'docs/a.md', 'y/cache/d']);
   });
 
+  test('a "?" matches any one character, where 0.27.0 read it as itself', async (t) => {
+    assert.deepEqual(await synced(t, ['test.txt', 'tent.txt', 'teest.txt', 'te?t.txt', 'other.txt'], { include: ['te?t.txt'] }), ['te?t.txt', 'tent.txt', 'test.txt']);
+  });
+
   test('a "[" is read as itself, as 0.27.0 promised, with "*" and "?" beside it too', async (t) => {
     const files = ['[id].tsx', 'x/[id].tsx', '[id]-x.tsx', 'i.tsx', 'd.tsx'];
     assert.deepEqual(await synced(t, files, { include: ['[id].tsx'] }), ['[id].tsx', 'x/[id].tsx']);
@@ -194,6 +210,7 @@ describe('a pattern of another form is refused when the module is built', () => 
       ['/', 'it has an empty, "." or ".." segment, which names no entry'],
       ['/**', 'it has an empty, "." or ".." segment, which names no entry'],
       ['a//b', 'it has an empty, "." or ".." segment, which names no entry'],
+      ['**//x', 'it has an empty, "." or ".." segment, which names no entry'],
       ['a/../b', 'it has an empty, "." or ".." segment, which names no entry'],
       [1n, "it isn't a string"],
       [undefined, "it isn't a string"],
