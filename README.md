@@ -118,7 +118,7 @@ interface Module {
 
   // Optional
   onAgentSpeech?(agentName: string, content: ContentBlock[], context: SpeechContext): Promise<void>;
-  gatherContext?(agentName: string): Promise<ContextInjection[]>;
+  gatherContext?(agentName: string): Promise<ModuleContextInjection[]>;
 }
 ```
 
@@ -150,7 +150,7 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
-Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`.
+Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
 ### Persistence
 
@@ -347,8 +347,9 @@ three ways:
   configuration error: `allowHostCommands: true`, an `enabledCapabilities`
   pattern that matches a capability denied by default, `channelSubscription:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
-  `toolLifecycle` `observe` or `inputs` block, and a
-  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default.
+  `toolLifecycle` `observe` or `inputs` block, a
+  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default,
+  and `toolHints: true`.
   A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
@@ -428,6 +429,55 @@ appends, as it does today. There is no per-subject cap: a busy channel's unread
 backlog is simply its unread backlog. Receipts and subject history are kept in
 the `mcpl/coalescing` state (retry window 1 h); audit lines are
 `mcpl:coalescing` trace events.
+
+#### Tool presence and toolsets (RFC-014)
+
+A server configured with `toolHints: true` (default false) is offered
+`experimental.mcpl.toolHints`, and its hints count only if it advertised
+`toolHints` too. Without it nothing changes: every tool is listed as before,
+and the host advertises and reads nothing new.
+
+With it, the server's static tools stay in the tool list as before, and its
+dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
+enter it, since every change to the list rebuilds the prompt cache. The
+framework registers a `toolsets` module with four constant tools:
+
+- `toolsets--open {server?, toolset?, instance?, options?}` opens a toolset (or
+  a named instance of one), and answers with what the server shows on opening
+  and the tools usable now;
+- `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool down
+  the same path as a direct call of it (the agent's `allowedTools`, the
+  server's tool policy, the state exchange, the reading of its result, RFC-007
+  observers, who see the server's tool), with only the instance added, in
+  `_meta["mcpl/instance"]`. It first checks `args` against the definition in
+  force for that instance; that check is bounded, and leaves `pattern` and
+  anything nested or branching too far to the server, which checks every
+  call itself;
+- `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
+  and what can be opened, or one tool's whole definition;
+- `toolsets--close {server?, toolset?, instance?}` closes it.
+
+`server` can be left out when only one server has the name. Hint changes apply
+as their message is read, in `rev` order, whatever becomes of the message (a
+refused push, a result that came after its timeout). A skipped rev re-reads
+`tools/list` and then `toolsets/list`, which the host also reads after every
+(re)connect, adopting what the server kept open and never re-opening anything.
+What changed is told where it happened: after a call's own result, after the
+push that explains it, or as a notice (`kind: 'mcpl-toolsets'`, which wakes
+nothing) for a standalone `tools/hints`, a late result, an adoption, a
+recovery, or a call whose result doesn't go to the agent (one the framework or
+a module makes itself). Notices need the server's `pushEvents` grant, like any delivery. A
+new tool's first sentence is told the first time its definition appears.
+Suggestions are shown, never acted on. Each `ended` id is told once. When an
+open toolset's announcements have left an agent's context (compressed or out
+of the window), the module's `gatherContext` restates what is open, as a
+stored `afterUser` injection (namespace `mcpl-toolsets`), at that agent's next
+start.
+
+A dynamic tool called by its prefixed name is refused, pointing at
+`toolsets--act`. Calls to an undeclared toolset's tools are refused while the
+host has that group closed (RFC-014 §5.4). Projection and surface mode are not
+implemented: a `surface` server's static tools are listed like any server's.
 
 #### Per-channel conversation routing (deprecated)
 

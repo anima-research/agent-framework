@@ -169,6 +169,7 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
+import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -354,6 +355,12 @@ const ROUTING_TOOL_NAMED = new RegExp(
  */
 const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUTING_TOOL_NAMED) ?? []);
 
+/** The metadata key on a module's write for an ephemeral run or a
+ *  conversation fork (ModuleContext addMessage's forAgent), whose window
+ *  nothing reads after its release: true, the write goes to the primary, as
+ *  the module wrote it, if its target never read it (passesToPrimary). */
+const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
+
 /**
  * The keys of a stored message's metadata that only the host writes and that
  * some reader takes on its own as what the message is: `system` and `kind`
@@ -363,8 +370,13 @@ const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUT
  * delivery of a coalesced occurrence, `firstView` the coalescer's mark that
  * no version of the message was shown, `deferredWriteId` the landed copy of
  * a deferred write, `external` a module's own row for an outside message,
- * and `openaiResponsesItems` membrane's mark of an imported Responses
- * history. A server's metadata, a channel message's `metadata` or a
+ * `openaiResponsesItems` membrane's mark of an imported Responses
+ * history, `contextInjection` an agent's stored context injection
+ * (stored-injections.ts), which every other agent's view leaves out, and
+ * `primaryIfUnread` a module's write for an ephemeral run or a
+ * conversation fork, which goes to the primary if its target never read it
+ * (passesToPrimary). A
+ * server's metadata, a channel message's `metadata` or a
  * push event's `origin`, is stored without them, and the host writes its own
  * after it: MCPL SPEC §16.6 makes metadata the producer's untrusted claims,
  * which a host may disbelieve. Keys a server writes by protocol, such as
@@ -374,7 +386,7 @@ const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUT
  */
 const HOST_METADATA_KEYS = [
   'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView',
-  'deferredWriteId', 'external', 'openaiResponsesItems',
+  'deferredWriteId', 'external', 'openaiResponsesItems', STORED_INJECTION_KEY, PRIMARY_IF_UNREAD_KEY,
 ] as const;
 
 /**
@@ -750,7 +762,9 @@ import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineTex
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/toolset-host.js';
+import { ToolsetsModule, resolveAct } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -965,7 +979,9 @@ type SpillWrite = { path: string; error?: string; branchLeft?: true } | null;
 /** A released agent's window as its pass to the primary reads it
  *  (AgentFramework.releasedWindow). */
 type ReleasedWindow = {
-  unread: MessageMetadata[];
+  /** Each unread message the primary takes in its place, in store order,
+   *  with what it says: a sharded body's shards' content joined. */
+  unread: Array<{ participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
   held: Map<string, { copies: StoredCopy[]; unread: boolean }>;
 };
 
@@ -1703,13 +1719,16 @@ function withoutPrimaryNotices<M extends { content: ContentBlock[] }>(messages: 
  *  sees a fork answer differently from its template has something to check:
  *  the template's thinking blocks, its channel and by-name notices
  *  (primaryNoticeTexts, counting any text block that repeats one word for
- *  word), and the tool blocks the pairing pass dropped (calls
- *  with no result in the seed, results whose call isn't in it).
+ *  word), its stored context injections (stored-injections.ts: compiled
+ *  messages whose stored rows all carry the mark), and the tool blocks the
+ *  pairing pass dropped (calls with no result in the seed, results whose
+ *  call isn't in it).
  *  `withoutReasoning` is the seed without thinking, `withoutNotices` without
  *  those notices too, and `seed` after the pairing pass. */
 function logSeedOmissions(
   fork: string,
   template: string,
+  injections: number,
   compiled: readonly { content: ContentBlock[] }[],
   withoutReasoning: readonly { content: ContentBlock[] }[],
   withoutNotices: readonly { content: ContentBlock[] }[],
@@ -1721,9 +1740,10 @@ function logSeedOmissions(
   const notices = count(withoutReasoning, (b) => b.type === 'text') - count(withoutNotices, (b) => b.type === 'text');
   const calls = count(withoutNotices, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
   const results = count(withoutNotices, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
-  if (thinking + notices + calls + results === 0) return;
+  if (injections + thinking + notices + calls + results === 0) return;
   console.log(
-    `[conversation] ${fork}: seeded from ${template} without ${thinking} thinking block(s), ` +
+    `[conversation] ${fork}: seeded from ${template} without ${injections} stored context injection(s), ` +
+    `${thinking} thinking block(s), ` +
     `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
   );
 }
@@ -2745,10 +2765,18 @@ function channelNoticePassOn(metadata: unknown): ChannelNoticePassOn | null {
 
 /** Whether a notice an agent never read goes to the primary in its place
  *  when the agent ends: a failed reply's, or a channel notice that carries
- *  its inputs, since its reader was told it could act (ChannelNoticePassOn). */
+ *  its inputs, since its reader was told it could act (ChannelNoticePassOn);
+ *  or a module's write for a run or a fork (PRIMARY_IF_UNREAD_KEY), which
+ *  goes as the write itself (noticeForPrimary). */
 function passesToPrimary(metadata: unknown): boolean {
   return (metadata as { kind?: unknown } | null | undefined)?.kind === 'discord-send-failed' ||
-    channelNoticePassOn(metadata) !== null;
+    channelNoticePassOn(metadata) !== null || isPrimaryIfUnread(metadata);
+}
+
+/** Whether a stored message or queued write is a module's write for an
+ *  ephemeral run or a conversation fork (PRIMARY_IF_UNREAD_KEY). */
+function isPrimaryIfUnread(metadata: unknown): boolean {
+  return (metadata as Record<string, unknown> | null | undefined)?.[PRIMARY_IF_UNREAD_KEY] === true;
 }
 
 /** The batched-wake lines a merge of wakes carries (InferenceRequest
@@ -2796,9 +2824,10 @@ export class AgentFramework {
    * compile does after the select. The agent then changes the messages
    * itself, and the stats come from before that: they count a message it
    * drops, such as one left holding only blank text, and leave out the turns
-   * it adds, such as `[Continue]`, a silent heartbeat's separator and
-   * request-only turns. A later preview or live compile leaves them as they
-   * were.
+   * it adds, such as `[Continue]`, a silent heartbeat's separator,
+   * request-only turns, and the stand-ins `previewActivation` shows for the
+   * `afterUser` injections a start would store (stored-injections.ts). A
+   * later preview or live compile leaves them as they were.
    * They're the object the compile returned, not a copy, so treat them as
    * read-only: a change to them shows in every later read. Null for a request
    * no dry run built, a request that is sent included, and when the agent's
@@ -3424,6 +3453,10 @@ export class AgentFramework {
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
+  /** MCPL RFC-014: every toolHints server's tool presence, for the
+   *  `toolsets` module's meta-tools and reminders. Made when the first
+   *  server configured with `toolHints: true` is set up; null until then. */
+  private toolsetHub: ToolsetHub | null = null;
   /** Inference routing policy from FrameworkConfig — stored so the MCPL
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
@@ -3510,11 +3543,11 @@ export class AgentFramework {
     // go through pushModuleEvent(), which names the module.
     this.moduleRegistry = new ModuleRegistry(store, { push: (event, moduleName) => this.pushModuleEvent(event, moduleName, false) }, {
       getAgents: () => Array.from(this.agents.values()),
-      addMessage: (p, c, m) => this.addModuleMessage(p, c, m),
+      addMessage: (p, c, m, opts) => this.addModuleMessage(p, c, m, opts),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
-      queryMessages: (filter) => this.queryMessages(filter),
+      queryMessages: (filter, opts) => this.queryMessages(filter, opts),
       pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
@@ -3982,6 +4015,9 @@ export class AgentFramework {
       // settings, and its tool prefix, which mustn't collide with a module
       // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
+      // RFC-014: a server configured with toolHints brings the toolsets
+      // module, whose name no prefix may take either.
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) moduleNames.add(TOOLSETS_MODULE);
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
         assertServerConfigBooleans(serverConfig);
@@ -4004,6 +4040,7 @@ export class AgentFramework {
         prefixesSeen.set(prefix, serverConfig.id);
       }
 
+      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) await framework.ensureToolsetsModule();
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -4601,8 +4638,9 @@ export class AgentFramework {
     // once the host stops, so its pass to the primary runs here, deferred
     // while quiesced like any write, so it waits in the queue with the rest:
     // each notice stored unread in that window that the primary takes in its
-    // place (a failed reply, or a channel notice its reader could act on),
-    // and each such notice still queued for that agent, under its own id,
+    // place (a failed reply, a channel notice its reader could act on, or a
+    // module's write for a run or a fork: passesToPrimary), and each such
+    // notice still queued for that agent, under its own id,
     // unless the agent read a copy of it that landed in its window
     // (passOnFromReleasedWindow). What else was queued for it goes as boot
     // would send it (readdDrained): dropped, logged, since nothing lands
@@ -7571,8 +7609,8 @@ export class AgentFramework {
     try {
       // The windows of forks and runs deregistered during the window are
       // released first, each landing its queued writes and passing on its
-      // unread failed replies, and the channel notices it could act on, as at
-      // any release. Then flush context writes
+      // unread failed replies, the channel notices it could act on, and a
+      // run's unread module writes, as at any release. Then flush context writes
       // deferred by the quiesce window (module events, api message.send) —
       // with no turn alive there is no other flush point. The batch is
       // stored in queue order and acknowledged once, after the chronicle
@@ -7646,8 +7684,9 @@ export class AgentFramework {
     this.handOffDeferredWrites(flush);
     // A write for a target no longer registered, such as a fork or a run gone
     // before a crash that left it to boot recovery, goes as readdDrained
-    // sends it: a failed reply, or a channel notice its reader could act on,
-    // to the primary, anything else dropped, logged.
+    // sends it: a failed reply, a channel notice its reader could act on, or
+    // a module's write for a run or a fork, to the primary (passesToPrimary),
+    // anything else dropped, logged.
     const stored = this.readdDrained(flush, `host-mode ${label}`).length;
     // Ack = sync the chronicle FIRST, then rewrite the durable queue without
     // the batch. Never the other way round.
@@ -8358,9 +8397,16 @@ export class AgentFramework {
    *
    * Pass `{ injections: true }` to opt into full-fidelity gathering and accept
    * those side effects (byte-faithful to a real activation's injected context).
+   * An `afterUser` injection a start would store (stored-injections.ts) is
+   * shown where that start's compile would render it, and one it would skip
+   * isn't shown again; nothing is stored. The stand-in isn't weighed against
+   * the budget or shaped as the stored row would be, so where the strategy
+   * would cap, shard or leave out rows to fit it, the start's request
+   * differs from the preview.
    *
    * What the dry compile selected, by kind, is `getRequestCompileStats` of the
-   * request this returns.
+   * request this returns. It doesn't count the stand-in, which is added after
+   * the compile.
    */
   async previewActivation(
     agentName: string,
@@ -8422,8 +8468,21 @@ export class AgentFramework {
       }
     }
 
+    // What a start would store (storeInjections) is appended after the
+    // compile, as the start would have stored it before its compile, and
+    // what it would skip, being in view already, isn't placed. While the
+    // window is held, the start would have compile() place what it would
+    // store, and so does the preview. Nothing is stored: a preview writes no
+    // row. Its stand-in rows aren't weighed against the budget, as stored
+    // rows are at the next compile.
+    const plan = this.planInjectionStores(agent, injections);
+    const held = plan !== undefined && this.slotHeldFrom(agent);
+    const placed = new Set(plan ? (held ? [...plan.leftAt, ...plan.rows.map((row) => row.at)] : plan.leftAt) : []);
     return capture(await agent.buildActivationRequest(
-      tools, injections, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+      tools, plan ? (injections ?? []).filter((_, at) => placed.has(at)) : injections, opts?.budget, presentation?.available ?? tools, {
+        dryRun: true,
+        ...(plan && !held ? { appendedMessages: plan.rows.map(({ participant, content }) => ({ participant, content })) } : {}),
+      },
     ));
   }
 
@@ -12290,7 +12349,11 @@ export class AgentFramework {
       // the timeline (KV-prefix-stable delivery). The stored originals
       // remain in the shared slot for the subconscious's merged view,
       // fetch_history, and audit.
-      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut,
+      // Another agent's stored context injections (stored-injections.ts) are
+      // that agent's context, not conversation: they stay out of this view,
+      // and so out of its folds, as the residents share this slot.
+      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut
+        && !isAnotherAgentsInjection(message.metadata, config.name),
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -12363,9 +12426,13 @@ export class AgentFramework {
       store: this.store,
       namespace: `subconscious/${primaryName}`,
       isolate: true,
-      // The residents' shared un-namespaced slot, merged read-only and
-      // UNfiltered (no viewFilter here — stamped messages included).
+      // The residents' shared un-namespaced slot, merged read-only, with the
+      // tune-out's stamped messages included. The filter, which context-
+      // manager applies to the merged view too, leaves out only the
+      // residents' stored context injections (stored-injections.ts): their
+      // context, which this agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
+      viewFilter: (message) => !isAnotherAgentsInjection(message.metadata, name),
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -13732,13 +13799,24 @@ export class AgentFramework {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
-        const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
+        const { messages: compiledWhole, provenance } = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const templateRows = template.getContextManager().getAllMessages();
+        // The template's stored context injections (stored-injections.ts) are
+        // its context, not the conversation, so the seed leaves them out, as
+        // it had none before they were stored: a compiled message whose
+        // stored rows are all marked as injections, by the compile's own
+        // account of where each message came from.
+        const injectionRows = new Set(templateRows.filter((m) => storedInjectionMarkOf(m.metadata)).map((m) => m.id));
+        const compiled = compiledWhole.filter((_, i) => {
+          const source = provenance?.messages[i];
+          return !(source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId)));
+        });
         const withoutReasoning = withoutThinking(compiled);
         const withoutNotices = withoutPrimaryNotices(
-          withoutReasoning, primaryNoticeTexts(template.getContextManager().getAllMessages()));
+          withoutReasoning, primaryNoticeTexts(templateRows));
         const seed = stripUnpairedToolBlocks(withoutNotices);
-        logSeedOmissions(name, template.name, compiled, withoutReasoning, withoutNotices, seed);
+        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -13883,8 +13961,9 @@ export class AgentFramework {
    * and keeping the agent registered would just grow every agent scan and
    * broadcast filter forever. Its window is released now, or, while the host
    * is quiesced, at resume (releaseWindowNowOrAfterResume); when stop() ends
-   * it then, stop()'s pass for postponed releases passes on the failed
-   * replies it left unread instead. No binding names it
+   * it then, stop()'s pass for postponed releases passes on what it left
+   * unread that the primary takes in its place instead (passesToPrimary:
+   * failed replies, channel notices, module writes). No binding names it
    * by then: the idle sweep unbinds its channel as the closure begins,
    * stop() unbinds it just before it ends the fork, and a spawn whose fork
    * stop() has ended binds nothing (spawnConversationAgent). The fork's
@@ -16894,6 +16973,135 @@ export class AgentFramework {
   }
 
   /**
+   * Store `agent`'s `afterUser` injections in its own window, as the
+   * messages `compile()` would have placed after the last user message, and
+   * return the injections left for `compile()` to place: the rest, and any
+   * that couldn't be stored (stored-injections.ts, #155 part 5). Which are
+   * stored, and which skipped, is planInjectionStores'.
+   *
+   * Nothing is stored while the window is held (slotHeldFrom: the host is
+   * quiesced, or another reader of the residents' shared slot has a turn
+   * alive, as for a clock row): `compile()` places what the plan would have
+   * stored, and what it skips, being in view already, isn't placed again.
+   * Rows are written in the order gathered. A row whose write throws is
+   * placed by `compile()` instead, with every row after it, unless the
+   * read-back shows it landed; where the read-back fails, a row whose write
+   * returned counts as landed and the rest are placed, so the request may
+   * carry a landed one twice, which is logged as unknown.
+   */
+  private storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined {
+    const plan = this.planInjectionStores(agent, injections);
+    if (!plan) return injections;
+    // By position, as the plan is: what compile() places, in the order given.
+    const placed = new Set<number>(plan.leftAt);
+    if (this.slotHeldFrom(agent)) {
+      for (const row of plan.rows) placed.add(row.at);
+    } else {
+      const cm = agent.getContextManager();
+      const before = this.storedCountOf(agent);
+      const key = (mark: { namespace: string; contentHash: string; part: number }) => `${mark.namespace}\0${mark.contentHash}\0${mark.part}`;
+      const traced = new Set<string>();
+      try {
+        for (const row of plan.rows) {
+          const id = cm.addMessage(row.participant, row.content, {
+            system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: row.mark,
+          } as MessageMetadata);
+          traced.add(key(row.mark));
+          this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.mark.namespace}` });
+        }
+      } catch (err) {
+        // A write can throw after its row landed, as storeDueClock's can: the
+        // rows that landed stay where they are, and compile() places the rest.
+        const wanted = new Set(plan.rows.map((row) => key(row.mark)));
+        const markOf = new Map<MessageId, StoredInjectionMark>();
+        const landed = before === undefined ? undefined : this.storedSince(agent, before, (m) => {
+          const mark = storedInjectionMarkOf(m.metadata);
+          if (!mark || mark.agent !== agent.name || !wanted.has(key(mark))) return false;
+          markOf.set(m.id, mark);
+          return true;
+        }, 'injection', 'the injection writes');
+        const kept = new Set(traced);
+        for (const copy of landed ?? []) {
+          const mark = markOf.get(copy.id)!;
+          kept.add(key(mark));
+          if (!traced.has(key(mark))) {
+            traced.add(key(mark));
+            this.emitTrace({ type: 'message:added', messageId: copy.id, source: `context-injection:${mark.namespace}` });
+          }
+        }
+        const rest = plan.rows.filter((row) => !kept.has(key(row.mark)));
+        for (const row of rest) placed.add(row.at);
+        console.error(`[injection] ${agent.name}: a write threw with ${plan.rows.length - rest.length} of ${plan.rows.length} injection row(s) stored${landed ? '' : ' (whether the one that threw landed is unknown)'}, and compile() places the rest:`, err);
+      }
+    }
+    const left = (injections ?? []).filter((_, at) => placed.has(at));
+    return left.length > 0 ? left : undefined;
+  }
+
+  /**
+   * Which of `injections` a start stores in `agent`'s window, and which it
+   * leaves for `compile()`. Each source's stored kind (isStoredKind), by
+   * namespace, is one unit. A unit is skipped, neither stored nor placed,
+   * when the copy the agent will read as that namespace's current one has
+   * every part of it with the same content: the newest copy this agent
+   * stored since its last request compiled to send, where a start stored one
+   * and its compile then didn't record, as when it threw
+   * (Agent.unsentInjection), and otherwise the
+   * newest stored unit of that namespace the last request held
+   * (Agent.renderedInjection). It's where the agent saw it, or will see it
+   * at this compile, and placing it again would move it; a fold or scroll-out
+   * since costs one request, as below. A part the strategy cut at its
+   * per-message cap, or stripped an image from, counts as held, since a new
+   * copy would meet the same. One a fold has summarized, a strategy's window
+   * has scrolled past, a throwing write left part-stored, or that no request
+   * since this agent started has held (and no failed start since has
+   * stored), is stored again at the next start,
+   * so the agent has the current copy at the cost of one more row: a fold
+   * between two starts leaves the request after it with the summary's word,
+   * and the start after that stores it again. The rows to store come in the order gathered,
+   * as `compile()` would have placed them. A stored row is appended, so
+   * where the window ends on a user message (a turn's start, a restart
+   * after tool results) it lands where `compile()` would have placed it;
+   * where it ends on the agent's latest reply (a wake with nothing new), it
+   * lands after that reply, where `compile()` placed it after the last user
+   * message, before the reply, or at the end when there was none.
+   * Undefined when there's nothing of the stored kind.
+   */
+  private planInjectionStores(
+    agent: Agent,
+    injections: ContextInjection[] | undefined,
+  ): {
+    rows: Array<{ at: number; participant: string; content: ContextInjection['content']; mark: StoredInjectionMark }>;
+    leftAt: number[];
+  } | undefined {
+    // By position, not identity: a source can give the same object twice.
+    const given = injections ?? [];
+    const stored = given.map((injection) => isStoredKind(injection) && hasRenderedContent(injection.content));
+    if (!stored.includes(true)) return undefined;
+    const asRows = given.flatMap((injection, at) => (stored[at] ? [{ at, ...asStoredRow(injection) }] : []));
+    const units = new Map<string, typeof asRows>();
+    for (const row of asRows) units.set(row.namespace, [...(units.get(row.namespace) ?? []), row]);
+    const marks = new Map<number, StoredInjectionMark>();
+    for (const [namespace, unit] of units) {
+      const contentHash = unitHash(unit);
+      // A copy a start stored whose compile then didn't record (it threw, or
+      // the start failed before it) is newer than what the last request
+      // held, and no request has sent it yet, so it decides: a retry of that
+      // start (an error policy's) doesn't store it again, one more copy at
+      // each attempt, and content that changed back while a compile failed
+      // is stored again rather than left older than it.
+      const newest = agent.unsentInjection(namespace) ?? agent.renderedInjection(namespace);
+      if (newest?.whole && newest.contentHash === contentHash) continue;
+      unit.forEach((row, part) => marks.set(row.at, { agent: agent.name, namespace, contentHash, part, parts: unit.length }));
+    }
+    return {
+      rows: asRows.filter((row) => marks.has(row.at))
+        .map(({ participant, content, at }) => ({ at, participant, content, mark: marks.get(at)! })),
+      leftAt: given.flatMap((_, at) => (stored[at] ? [] : [at])),
+    };
+  }
+
+  /**
    * Whether a write the framework makes into `agent`'s window of its own
    * accord (a clock row, a batched wake's line) waits: while the host is
    * quiesced, or, for a reader of the residents' shared slot (the
@@ -16904,6 +17112,9 @@ export class AgentFramework {
   private slotHeldFrom(agent: Agent): boolean {
     return this.quiesced || this.sharedSlotBusy(agent);
   }
+
+  /** Rows isNewestIn reads back past clock rows and stored injections. */
+  private static readonly NEWEST_SCAN_ROWS = 32;
 
   /** Rows a window's last-clock scan reads at a time. */
   private static readonly CLOCK_SCAN_ROWS = 256;
@@ -19246,6 +19457,15 @@ export class AgentFramework {
       // Both produce ContextInjection[] that get merged before inference.
       let injections: ContextInjection[] | undefined;
 
+      // RFC-014 §8.3: each compile this agent sends says which open
+      // toolsets' announcements it still carries; the toolsets module's
+      // gatherContext reminds it of those that left.
+      if (this.toolsetHub && !agent.onCompiledToSend) {
+        const hub = this.toolsetHub;
+        const name = agent.name;
+        agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
+      }
+
       // Module gatherContext (fail-open, per-module timeout — the module's
       // contextTimeoutMs, else the registry default). Injections are
       // channel-scoped via scopeInjectionsForAgent, matching the MCPL hook
@@ -19314,6 +19534,14 @@ export class AgentFramework {
           injections = injections ? [...injections, dispositionInjection] : [dispositionInjection];
         }
       }
+
+      // Each afterUser injection is appended to the agent's window, so it
+      // stays where it's first seen (stored-injections.ts), unless the copy
+      // the agent will read as current already has its content whole (what its
+      // last request held, or a newer copy a start stored whose compile then
+      // didn't record), when it's left out; the rest go to compile(), as do those
+      // it would store while the window is held.
+      injections = this.storeInjections(agent, injections);
 
       const {
         stream,
@@ -22102,6 +22330,18 @@ export class AgentFramework {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
 
+    // RFC-014: toolsets--act, resolved to the dynamic tool it calls, goes
+    // where a programmatic call of that tool goes, with its instance.
+    if (call.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const target = this.resolveToolsetAct(call);
+      if (!target.ok) return { success: false, error: target.error, isError: true };
+      if (origin.kind === 'agent') {
+        const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
+        if (failure) return failure;
+      }
+      return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
+    }
+
     // MCPL tools go where the model's own call of the name goes, by the same
     // resolver and with the prefix it matched: to the server whose listing
     // offers the name, else the longest matching prefix.
@@ -22149,7 +22389,74 @@ export class AgentFramework {
     return this.moduleRegistry.handleToolCall(call);
   }
 
-  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
+  /**
+   * RFC-014: the calls toolsets--act resolved to a server's dynamic tool,
+   * with the instance each is for (`_meta["mcpl/instance"]`, §5.5). The MCPL
+   * dispatch paths read it: such a call isn't refused as a dynamic tool
+   * called by name, and carries its instance. Nothing else about it differs
+   * from a direct call of the tool. Created on first use, so a framework
+   * assembled field by field (as unit tests do) needs no setup for it.
+   */
+  private toolsetActCalls?: WeakMap<ToolCall, { instance?: string }>;
+
+  /** A toolsets--act call resolved (resolveAct) to the call of the server's
+   *  tool it makes, under that tool's model-facing name and with its
+   *  arguments, its id kept; or the reason it can't be sent. */
+  private resolveToolsetAct(call: ToolCall): { ok: true; call: ToolCall; serverId: string; prefix: string; instance?: string } | { ok: false; error: string } {
+    const target = resolveAct(this.toolsetHub!, call.input);
+    if (!target.ok) return target;
+    const prefix = this.mcplServerConfigs.get(target.serverId)?.toolPrefix ?? `mcpl--${target.serverId}`;
+    const inner: ToolCall = { ...call, name: `${prefix}--${target.tool}`, input: target.args };
+    (this.toolsetActCalls ??= new WeakMap()).set(inner, target.instance !== undefined ? { instance: target.instance } : {});
+    return { ok: true, call: inner, serverId: target.serverId, prefix, ...(target.instance !== undefined ? { instance: target.instance } : {}) };
+  }
+
+  /**
+   * RFC-014 §8.2: a toolsets--act call from the agent (the model's, or a
+   * script's) goes down the path a direct call of the server's tool takes
+   * (dispatchMcplToolCall): its agent's allowedTools, the server's tool
+   * policy, the state exchange, RFC-005's reading of the result, the tool
+   * change shown after it, and RFC-007's lifecycle, which describes the call
+   * as that tool, with its arguments, before it opens. Only
+   * `_meta["mcpl/instance"]` is added. A call act can't resolve is refused
+   * before anything is sent.
+   */
+  private dispatchToolsetAct(agentName: string, call: ToolCall): void {
+    const target = this.resolveToolsetAct(call);
+    if (!target.ok) {
+      this.emitTrace({ type: 'tool:failed', module: TOOLSETS_MODULE, tool: call.name, callId: call.id, error: target.error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: TOOLSETS_MODULE,
+        result: this.refusedResult(agentName, call.id, target.error),
+      });
+      return;
+    }
+    const refusal = this.agentToolPermissionFailure(agentName, target.call);
+    if (refusal) {
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal });
+      return;
+    }
+    this.toolLifecycleEmitter?.retarget(agentName, call.id, target.call);
+    this.dispatchMcplToolCall(agentName, target.call, target.serverId, target.prefix);
+  }
+
+  /**
+   * RFC-014 §6.2: a tool result that goes to the agent, with the tool change
+   * its hints made (applied as the result was read) told after the server's
+   * content; taking it means it isn't told again as a notice. The result
+   * itself when there's none, as for every server without toolHints.
+   */
+  private withToolsetChange<R extends { content?: unknown }>(serverId: string, result: R): R {
+    const change = this.toolsetHub?.get(serverId)?.changeText(result) ?? '';
+    if (!change) return result;
+    return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: change }] };
+  }
+
+  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as
+   *  resolveMcplTool matched them, or as toolsets--act resolved them
+   *  (toolsetActCalls). Its RFC-014 tool change isn't shown with its result,
+   *  which goes to its caller, not necessarily to the agent: it's told as a
+   *  notice (ToolsetController.tellUnlessClaimed). */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized, so the call didn\'t run', isError: true };
@@ -22164,9 +22471,16 @@ export class AgentFramework {
     if (!isToolAllowed(toolName, config)) {
       return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
+    // RFC-014: a dynamic tool is called through toolsets--act, which marks
+    // the call it resolved (toolsetActCalls) with the instance it's for.
+    const act = this.toolsetActCalls?.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) return { success: false, error: dynamicRefusal, isError: true };
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     try {
-      const result = modern ? await modern.callTool(toolName, args) : await server!.sendToolsCall(toolName, args);
+      const result = modern
+        ? await modern.callTool(toolName, args)
+        : await server!.sendToolsCall(toolName, args, undefined, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined);
       // A server's error is a failure here too, as the model's dispatch
       // reads it: its text (mcplToolFailure), without its other blocks, and
       // its structured content, kept by presence. A success is the server's
@@ -23780,6 +24094,15 @@ export class AgentFramework {
     }
 
 
+    // RFC-014: toolsets--act calls a server's dynamic tool, down the same
+    // path as a direct call of it (dispatchToolsetAct).
+    if (enrichedCall.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
+      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+      if (scriptWaiter) scriptWaiter.route.toServer = true;
+      this.dispatchToolsetAct(agentName, enrichedCall);
+      return;
+    }
+
     // Route MCPL tool calls to the appropriate server via prefix map
     const mcplMatch = this.resolveMcplTool(enrichedCall.name);
     if (mcplMatch && this.mcplServerRegistry) {
@@ -24052,6 +24375,9 @@ export class AgentFramework {
        * it was first held.
        */
       fromQueue?: { id: string; seq: number; heldAt: number };
+      /** Set by addModuleMessage for a write it marked for a run or a fork
+       *  (PRIMARY_IF_UNREAD_KEY): any other write has the mark taken off. */
+      markedForRun?: true;
       /** Out-param: where the message landed (RFC-006 needs to find it again). */
       placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
       /**
@@ -24077,6 +24403,14 @@ export class AgentFramework {
     // reads a fork's store, which is isolated.
     if (!opts?.fromQueue && metadata && 'deferredWriteId' in metadata) {
       const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
+      metadata = rest as MessageMetadata;
+    }
+    // So is the mark of a module's write for a run or a fork
+    // (PRIMARY_IF_UNREAD_KEY), which only addModuleMessage sets: a module's
+    // process response, or an event an API module passes on, can't send a
+    // write to the primary by carrying it.
+    if (!opts?.fromQueue && !opts?.markedForRun && metadata && PRIMARY_IF_UNREAD_KEY in metadata) {
+      const { [PRIMARY_IF_UNREAD_KEY]: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
       metadata = rest as MessageMetadata;
     }
     // Content context-manager won't store is refused here, as the store's own
@@ -24300,14 +24634,16 @@ export class AgentFramework {
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
-   *  a clock row after it aside: a channel message by its server, channel and
-   *  message id, a push event by its server and event id, and never one a
-   *  tune-out holds. */
+   *  clock rows and stored context injections after it aside: a channel
+   *  message by its server, channel and message id, a push event by its
+   *  server and event id, and never one a tune-out holds. Past
+   *  NEWEST_SCAN_ROWS such rows, it answers no. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
-    // A clock row the framework wrote after it (a turn start's, an event's)
-    // isn't a message a reply could be meant for, so it doesn't count.
-    const newest = agent.getContextManager().queryMessages({ limit: 2, reverse: true }).messages
-      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND);
+    // A clock row the framework wrote after it (a turn start's, an event's),
+    // or a stored context injection (any agent's, a start's), isn't a
+    // message a reply could be meant for, so it doesn't count.
+    const newest = agent.getContextManager().queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages
+      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata));
     const md = newest?.metadata as Record<string, unknown> | undefined;
     if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
     if (entry.eventType === 'mcpl:channel-incoming') {
@@ -24354,8 +24690,8 @@ export class AgentFramework {
     // to its window's release at resume (runReleasesAfterResume, which clears
     // the name first), which stores its writes in that window, or to stop()'s
     // pass for postponed releases, which clears the name, passes its notices
-    // on as that release would (as boot would, where its pass throws), and
-    // drops the rest, logged. Drained by any
+    // and marked module writes on as that release would (as boot would,
+    // where its pass throws), and drops the rest, logged. Drained by any
     // other flush meanwhile, they would meet no registered agent and be
     // dropped, or written into a window no one reads.
     if (this.releasesAfterResume.has(agentName)) return [];
@@ -24814,23 +25150,29 @@ export class AgentFramework {
    *  A target no longer registered (a fork or a run that has ended, here or
    *  before a crash) has no window to land in: a failed reply queued for it,
    *  or a channel notice it could have acted on, becomes the primary's
-   *  by-name notice, under the entry's own id and place in the queue
-   *  (queuedNoticeForPrimary), and is written with the rest; any other write
-   *  is dropped, logged, by addMessage. Nothing here reads the gone agent's
+   *  by-name notice, and a module's write for a run or a fork goes to it as
+   *  written, each under the entry's own id and place in the queue
+   *  (passesToPrimary, queuedNoticeForPrimary), written with the rest; any
+   *  other write is dropped, logged, by addMessage. Nothing here reads the gone agent's
    *  window, so such a notice an earlier write of which landed there, and
    *  which the agent read, goes on too. */
   private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
     let passed = 0;
+    let writes = 0;
     const entries = drained.flatMap((msg) => {
       if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
       if (!passesToPrimary(msg.metadata)) return [msg];
       const forPrimary = this.queuedNoticeForPrimary(msg.forAgent, msg);
       if (!forPrimary) return [];
-      passed++;
+      if (isPrimaryIfUnread(msg.metadata)) writes++;
+      else passed++;
       return [forPrimary];
     });
     if (passed > 0) {
       console.error(`[deferred-flush] ${where}: ${passed} notice${passed === 1 ? '' : 's'} of an agent that has ended passed to the primary`);
+    }
+    if (writes > 0) {
+      console.error(`[deferred-flush] ${where}: ${writes} module write${writes === 1 ? '' : 's'} queued for a run or fork that has ended passed to the primary`);
     }
     const bypassFor = (msg: DeferredWrite): string | undefined =>
       opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
@@ -24878,7 +25220,8 @@ export class AgentFramework {
    *
    * The agent never reads its window again, so every failed-reply notice it
    * never read, and every channel notice it could act on and never read, is
-   * passed to the primary, by name, once (passesToPrimary,
+   * passed to the primary, by name, once, and so is every module write for
+   * it that it never read, as the write itself (passesToPrimary,
    * passOnFromReleasedWindow): each one stored in its window above its
    * consumed watermark (flushed there at its turn's end, or stored while it
    * was idle) and not heard at a tool boundary, and each one still queued
@@ -24956,8 +25299,9 @@ export class AgentFramework {
    * The part of a released agent's pass to the primary that its release and
    * stop() share (stop() runs it for a release the quiesce postponed). Each
    * notice stored in its window that it never read and the primary takes in
-   * its place (passesToPrimary: a failed reply, or a channel notice its
-   * reader could act on) goes on as stored, by name (passNoticeToPrimary),
+   * its place (passesToPrimary: a failed reply, a channel notice its reader
+   * could act on, or a module's write for a run or a fork, which goes as
+   * the write itself) goes on as stored, by name (passNoticeToPrimary),
    * except a copy of an entry for it still in the durable queue, pending or
    * un-acked: that entry is the notice's one identity until its ack, the one
    * boot's check for landed writes knows, so it's the entry that goes on, as
@@ -24982,7 +25326,7 @@ export class AgentFramework {
     const mine = (msg: DeferredWrite): boolean => (msg.forAgent ?? this.primaryAgentName) === agent.name;
     const unacked = this.unackedDeferredWrites.filter(mine);
     const window = this.releasedWindow(agent, new Set([...this.deferredMessages.filter(mine), ...unacked].map((m) => m.id)));
-    for (const metadata of window?.unread ?? []) this.passNoticeToPrimary(agent.name, metadata);
+    for (const { metadata, ...written } of window?.unread ?? []) this.passNoticeToPrimary(agent.name, metadata, written);
     const forPrimary: DeferredWrite[] = [];
     const passOn = (msg: DeferredWrite): void => {
       if (!passesToPrimary(msg.metadata)) return;
@@ -24998,8 +25342,11 @@ export class AgentFramework {
    * What a released agent's window holds that its pass to the primary reads
    * (passOnFromReleasedWindow): `unread`, the notices stored there that it
    * never read and the primary takes in its place (passesToPrimary: its
-   * failed replies, and the channel notices it was told it could act on),
-   * other than copies of the entries `held` names; and `held`, for each of
+   * failed replies, the channel notices it was told it could act on, and a
+   * run's or a fork's module writes), each with its participant and
+   * content, a sharded body's shards joined into one text, as the
+   * autobiographical strategy joins them (asCompiled), other than
+   * copies of the entries `held` names; and `held`, for each of
    * those entries with a copy there, its copies and whether any of them is
    * unread. A notice is read below the lower of its consumed watermark and
    * the point where the watermark's branch and the current one part
@@ -25023,13 +25370,16 @@ export class AgentFramework {
         : Number.NEGATIVE_INFINITY;
       // A body the store took as more than one message (a sharded body)
       // carries the same metadata on each of its shards, and is one notice,
-      // so a shard that continues the body before it isn't taken again. Which
+      // so a shard that continues the body before it isn't taken again: its
+      // content joins the body's, which a module's write passes on. Which
       // messages make up a body is context-manager's rule (continuesBody,
       // pairwise in store order): a group id names the text, so the same text
       // stored twice is two bodies under one id. A held entry's copies are
       // kept whole, each shard among them, as its lookup by id finds them.
       const read: ReleasedWindow = { unread: [], held: new Map() };
       const messages = cm.getAllMessages();
+      const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
+      let lastUnread = -1;
       messages.forEach((m, i) => {
         const id = (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
         if (typeof id === 'string' && held.has(id)) {
@@ -25037,10 +25387,19 @@ export class AgentFramework {
           copies.copies.push(storedCopy(m));
           copies.unread ||= m.sequence > floor;
           read.held.set(id, copies);
-        } else if (m.sequence > floor && passesToPrimary(m.metadata) && !continuesBody(messages[i - 1], m)) {
-          read.unread.push(m.metadata as MessageMetadata);
+        } else if (m.sequence > floor && passesToPrimary(m.metadata)) {
+          if (!continuesBody(messages[i - 1], m)) {
+            bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
+            lastUnread = i;
+          } else if (lastUnread === i - 1) {
+            bodies.at(-1)!.shards.push(m);
+            lastUnread = i;
+          }
         }
       });
+      // A body's shards joined into one text, as the strategy joins them
+      // (asCompiled), whole: a compile may also cut each shard to its cap.
+      read.unread = bodies.map(({ shards, ...body }) => ({ ...body, content: asCompiled(shards) }));
       return read;
     } catch (err) {
       // A release must complete whatever its window's read meets.
@@ -25089,8 +25448,8 @@ export class AgentFramework {
    * deregistered, so its stream can't dispatch anything more and resume
    * doesn't weigh its context, and a write addressed to it meanwhile is
    * treated as for any agent no longer registered (dropped, or passed to the
-   * primary if it's a failed reply, or a channel notice its reader could act
-   * on).
+   * primary if it's a failed reply, a channel notice its reader could act
+   * on, or a module's write for a run or a fork: passesToPrimary).
    */
   private releaseWindowNowOrAfterResume(agent: Agent): void {
     if (this.quiesced) this.releasesAfterResume.set(agent.name, agent);
@@ -25120,11 +25479,15 @@ export class AgentFramework {
    * learns of it (noticeForPrimary). Never throws: it runs inside a release,
    * which must complete whatever this write meets.
    */
-  private passNoticeToPrimary(speaker: string, metadata: MessageMetadata | undefined): void {
-    const notice = this.noticeForPrimary(speaker, metadata);
+  private passNoticeToPrimary(
+    speaker: string,
+    metadata: MessageMetadata | undefined,
+    written?: { participant: string; content: ContentBlock[] },
+  ): void {
+    const notice = this.noticeForPrimary(speaker, metadata, written);
     if (!notice) return;
     try {
-      this.addMessage('user', notice.content, notice.metadata);
+      this.addMessage(notice.participant, notice.content, notice.metadata);
     } catch (err) {
       console.error(`[route-failure] failed to tell the primary ${notice.about}:`, err);
     }
@@ -25145,10 +25508,10 @@ export class AgentFramework {
    * decided).
    */
   private queuedNoticeForPrimary(speaker: string, msg: DeferredWrite): DeferredWrite | null {
-    const notice = this.noticeForPrimary(speaker, msg.metadata);
+    const notice = this.noticeForPrimary(speaker, msg.metadata, msg);
     if (!notice) return null;
     return {
-      id: msg.id, seq: msg.seq, participant: 'user', content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt,
+      id: msg.id, seq: msg.seq, participant: notice.participant, content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt,
       ...(msg.landing ? { landing: msg.landing } : {}),
     };
   }
@@ -25157,22 +25520,30 @@ export class AgentFramework {
    * The primary's by-name notice in place of one `speaker` never read, and
    * what it's about, as a log line says it: a failed reply's
    * (failedReplyNoticeForPrimary) or a channel notice's
-   * (channelNoticeForPrimary). null when no one is told, which is logged
+   * (channelNoticeForPrimary). A module's write for a run or a fork that
+   * it never read (PRIMARY_IF_UNREAD_KEY), given with what was `written`,
+   * goes as the write itself: its participant, its content, and its
+   * metadata without the mark. null when no one is told, which is logged
    * where it's decided.
    */
   private noticeForPrimary(
     speaker: string,
     metadata: MessageMetadata | undefined,
-  ): { content: ContentBlock[]; metadata: MessageMetadata; about: string } | null {
+    written?: { participant: string; content: ContentBlock[] },
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; about: string } | null {
+    if (written && isPrimaryIfUnread(metadata)) {
+      const { [PRIMARY_IF_UNREAD_KEY]: _mark, ...rest } = metadata as Record<string, unknown>;
+      return { participant: written.participant, content: written.content, metadata: rest as MessageMetadata, about: `of a module's write for ${speaker}` };
+    }
     const kind = (metadata as { kind?: unknown } | undefined)?.kind;
     if (kind === 'discord-send-failed') {
       const notice = this.failedReplyNoticeForPrimary(speaker, metadata);
-      return notice && { ...notice, about: `that ${speaker}'s reply to ${String(notice.metadata.channelId)} failed` };
+      return notice && { ...notice, participant: 'user', about: `that ${speaker}'s reply to ${String(notice.metadata.channelId)} failed` };
     }
     const passOn = channelNoticePassOn(metadata);
     if (!passOn) return null;
     const notice = this.channelNoticeForPrimary(speaker, passOn);
-    return notice && { ...notice, about: `of ${speaker}'s channel notice` };
+    return notice && { ...notice, participant: 'user', about: `of ${speaker}'s channel notice` };
   }
 
   /**
@@ -25310,15 +25681,39 @@ export class AgentFramework {
 
 
   /**
-   * A module's write through its context: addMessage's, except that a write
-   * the framework holds is answered by its handle (heldHandle) rather than
-   * '', so the module can find, read, edit and remove what it wrote before
-   * the write lands. The framework's own callers keep the '' they've always
-   * had, which their traces and checks take as a write not stored yet.
+   * A module's write through its context (ModuleContext.addMessage):
+   * addMessage's, except that a write the framework holds is answered by its
+   * handle (heldHandle) rather than '', so the module can find, read, edit
+   * and remove what it wrote before the write lands, through getMessage,
+   * editMessage and removeMessage, which read the delivery agent's window: a
+   * handle for a write held for a fork or a sub-agent isn't found there. The
+   * framework's own callers keep the '' they've always had, which their
+   * traces and checks take as a write not stored yet.
+   *
+   * With `forAgent`, the write is for the named agent's window, which must
+   * be registered when the write is made: a name that isn't, or the empty
+   * one, which addMessage would read as none (deliveryAgent), throws, naming
+   * the registered ones, as queryMessages does. The framework's own writes
+   * log and drop instead, as a held write does whose agent is gone by its
+   * flush. A write for an ephemeral run or a conversation fork, whose
+   * window nothing reads after its release, is marked (PRIMARY_IF_UNREAD_KEY),
+   * so the release passes it to the primary if its target never read it,
+   * as it passes a notice (passOnFromReleasedWindow).
    */
-  private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata): MessageId {
+  private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId {
+    if (opts?.forAgent !== undefined && (opts.forAgent === '' || !this.agents.has(opts.forAgent))) {
+      throw this.unknownAgentError(opts.forAgent, 'A write');
+    }
+    // A write for an ephemeral run or a conversation fork carries the
+    // framework's mark, so the release passes it to the primary if its
+    // target never read it (passesToPrimary); addMessage takes it off any
+    // other write.
+    const forRun = opts?.forAgent !== undefined
+      && (this.ephemeralRuns.has(opts.forAgent) || this.conversationAgentHomes.has(opts.forAgent));
     const placement: { deferredId?: string } = {};
-    const id = this.addMessage(participant, content, metadata, { placement });
+    const id = this.addMessage(participant, content, forRun ? { ...metadata, [PRIMARY_IF_UNREAD_KEY]: true } as MessageMetadata : metadata, {
+      placement, ...(opts?.forAgent !== undefined ? { forAgent: opts.forAgent } : {}), ...(forRun ? { markedForRun: true as const } : {}),
+    });
     return placement.deferredId === undefined ? id : heldHandle(placement.deferredId);
   }
 
@@ -25330,7 +25725,8 @@ export class AgentFramework {
    * no module reads that agent's store, and the write waits for its window's
    * release (drainDeferredFor) or, at its flush, is dropped (addMessage), a
    * failed reply, or a channel notice its reader could act on, passing to the
-   * primary as its notice (queuedNoticeForPrimary).
+   * primary as its notice, and a module's write for a run as written
+   * (passesToPrimary, queuedNoticeForPrimary).
    */
   private heldWritesFor(reader: Agent): DeferredWrite[] {
     const heldFor = (m: DeferredWrite): boolean => {
@@ -25588,9 +25984,34 @@ export class AgentFramework {
     return row ? asModuleRow(row) : null;
   }
 
-  private queryMessages(filter: MessageQuery): { messages: ModuleMessage[]; totalCount: number } {
-    const agent = this.deliveryAgent();
+  /** The refusal of a module's `forAgent` that names no registered agent:
+   *  the name, cut at 120 characters; the registered ones, a list over 400
+   *  characters cut with how many there are; and what leaving forAgent out
+   *  does. With none registered, there's no window either way, and it says
+   *  so. */
+  private unknownAgentError(named: string, what: 'A query' | 'A write'): Error {
+    const unknown = `Unknown agent: ${safeSlice(JSON.stringify(named), 0, 120)}.`;
+    // The empty name is refused even when an agent is registered under it.
+    const names = [...this.agents.keys()].filter((name) => name !== '');
+    if (names.length === 0) return new Error(`${unknown} No agent is registered yet, so there's no window to ${what === 'A query' ? 'read' : 'write to'}.`);
+    const listed = names.map((n) => JSON.stringify(n)).join(', ');
+    const shown = listed.length > 400 ? `${safeSlice(listed, 0, 400)}… (${names.length} in all)` : listed;
+    return new Error(`${unknown} ${what} names a registered agent: ${shown} (ModuleContext.getAgents() lists them), or leaves forAgent `
+      + `out to ${what === 'A query' ? 'read' : 'write to'} the delivery agent's window: the primary's, or the first agent's when none is primary.`);
+  }
+
+  /** A module's query (ModuleContext.queryMessages): the delivery agent's
+   *  window (the primary's, or the first agent's when none is primary), or
+   *  the named agent's, which must be registered: an unknown name, or the
+   *  empty one, throws, naming the registered ones, as a write's does. */
+  private queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): { messages: ModuleMessage[]; totalCount: number } {
+    // A name given is a name: it doesn't fall back to the primary, as
+    // deliveryAgent's would for the empty one, which is refused, as a
+    // write's is, since a write can't be routed to it.
+    const named = opts?.forAgent;
+    const agent = named === undefined ? this.deliveryAgent() : named === '' ? undefined : this.agents.get(named);
     if (!agent) {
+      if (named !== undefined) throw this.unknownAgentError(named, 'A query');
       return { messages: [], totalCount: 0 };
     }
     const cm = agent.getContextManager();
@@ -26617,6 +27038,10 @@ export class AgentFramework {
     // never gate this: queued marks are delivered in the background.
     this.readyMcplPlanes();
     this.deliverDiscordAwarenessInBackground('startup', 'host');
+    // RFC-014 §5.3: each toolHints server's open toolsets, read once its policy settled.
+    for (const server of this.mcplServerRegistry?.getAllServers() ?? []) {
+      if (server.isConnected) this.reattachToolsets(server);
+    }
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
@@ -27247,6 +27672,76 @@ export class AgentFramework {
   }
 
   /**
+   * The host capabilities offered to one server: the host's own, plus
+   * RFC-014's `toolHints` where its configuration asks for them. Without it,
+   * the very object every server is offered.
+   */
+  private mcplHostCapabilitiesFor(config: McplServerConfig): McplHostCapabilities {
+    const base = this.mcplHostCapabilities!;
+    return config.toolHints === true ? { ...base, toolHints: true } : base;
+  }
+
+  /** RFC-014: every toolHints server's presence, made on first use. */
+  private toolsets(): ToolsetHub {
+    return (this.toolsetHub ??= new ToolsetHub({
+      notify: (serverId, text, opts) => this.recordToolsetNotice(serverId, text, opts),
+      log: (line) => console.error(`[mcpl] ${line}`),
+      listedName: (serverId, tool) => `${this.mcplServerConfigs.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`}--${tool}`,
+    }));
+  }
+
+  /** RFC-014: the `toolsets` module (toolsets--open, --act, --look,
+   *  --close), registered once, by the first server configured with
+   *  toolHints. Its tools don't change after that. */
+  private async ensureToolsetsModule(): Promise<void> {
+    const hub = this.toolsets();
+    const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
+    if (existing instanceof ToolsetsModule) return;
+    if (existing) {
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints needs that name for its meta-tools`);
+    }
+    await this.addModule(new ToolsetsModule(hub));
+  }
+
+  /** RFC-014 §5.3: after a (re)connect whose policy has settled, read what
+   *  the server holds open and adopt it. In the background: its notices are
+   *  written as they come. */
+  private reattachToolsets(connection: McplServerConnection): void {
+    const controller = this.toolsetHub?.get(connection.id);
+    if (!controller) return;
+    void controller.connected(connection).catch((error: unknown) => {
+      console.error(`[mcpl] ${connection.id}: reading its open toolsets failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  /**
+   * RFC-014 §8.3: a tool change with no result or event to ride on (a
+   * standalone tools/hints, a late result, a reconnect's adoption, a
+   * recovery) is told as a notice, which doesn't wake the agent. Like any
+   * delivery from a server into the conversation, it needs `pushEvents`
+   * (§6.1); without it the change is still tracked, and toolsets--look shows
+   * it. The text is the server's (its tool definitions, titles, reasons), so
+   * the notice names the server.
+   */
+  private recordToolsetNotice(serverId: string, text: string, opts: { invite: boolean }): void {
+    const connection = this.mcplServerRegistry?.getServer(serverId);
+    if (!CapabilityGrant.of(connection).has('pushEvents')) {
+      console.error(`[mcpl] ${serverId}: a tool change was not told (pushEvents is not granted); ${META_TOOL_NAMES.look} shows it`);
+      return;
+    }
+    if (this.agents.size === 0) return;
+    try {
+      this.addMessage(
+        'user',
+        [{ type: 'text', text: `MCPL server "${serverId}", tool changes:\n${text}` }],
+        { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
+      );
+    } catch (error) {
+      console.error(`[mcpl] ${serverId}: a tool change notice could not be written:`, error);
+    }
+  }
+
+  /**
    * Connect a single MCPL server: register routing entries, open the
    * connection, wire events, and initialize feature sets / scopes /
    * checkpoints. Shared by startup (initializeMcpl) and the runtime
@@ -27402,6 +27897,8 @@ export class AgentFramework {
     let connection: McplServerConnection;
     // The transport the connect registered, which its own exchange is for.
     let registeredEpoch = 0;
+    // RFC-014: a toolHints server's meta-tools exist before it connects.
+    if (config.toolHints === true) await this.ensureToolsetsModule();
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
@@ -27411,11 +27908,14 @@ export class AgentFramework {
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
         connectionConfig,
-        this.mcplHostCapabilities,
+        this.mcplHostCapabilitiesFor(config),
         abort.signal,
         (registering) => {
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
+          // RFC-014 §6.1: hints apply as the connection reads them, from its
+          // first message, so the tap is on before any I/O can deliver one.
+          if (config.toolHints === true) this.toolsets().controllerFor(config).attach(registering);
         },
       );
     } catch (error) {
@@ -27494,6 +27994,8 @@ export class AgentFramework {
     // connected once its attempt settles, granted or not.
     if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      // RFC-014 §5.3: what the server holds open is the truth after a connect.
+      this.reattachToolsets(connection);
     }
     // A connection can make queued awareness work deliverable; it never
     // waits on it.
@@ -27733,6 +28235,15 @@ export class AgentFramework {
           ? (fetched as { revision: string }).revision : null;
       connection.manifestState.lastFetchedAt = Date.now();
       connection.droppedCapabilities = new Set(dropped);
+      // RFC-014 §5.1: the `toolsets` domain (toolHints, toolsets, surface),
+      // read from the manifest as fetched. A toolset removed ends its open
+      // instances; toolHints withdrawn makes every tool static. Its impact is
+      // surface-changed, applied, with no grant consequence (§17.6).
+      const declarations = toolsetDeclarationsOf(fetched);
+      const toolsetsChanged = config.toolHints === true
+        && JSON.stringify(declarations) !== JSON.stringify(connection.toolsetDeclarations);
+      connection.toolsetDeclarations = declarations;
+      if (toolsetsChanged) this.toolsetHub?.get(connection.id)?.manifestChanged(declarations);
 
       const newDeclared = Object.keys(this.featureSetManager?.getDeclaredFeatureSets(connection.id) ?? {});
       const newEnabled = newDeclared.filter((n) => this.featureSetManager?.isEnabled(connection.id, n));
@@ -27746,6 +28257,7 @@ export class AgentFramework {
         ...added.map((p) => ({ impact: 'capability-expansion-pending', subject: p, disposition: negotiated ? 'applied' : 'decision-needed' })),
         ...degraded.map((n) => ({ impact: 'feature-degraded', subject: n, disposition: 'applied' })),
         ...restored.map((n) => ({ impact: 'feature-restored', subject: n, disposition: negotiated ? 'applied' : 'decision-needed' })),
+        ...(toolsetsChanged ? [{ impact: 'surface-changed', subject: 'toolsets', disposition: 'applied' }] : []),
       ];
       this.emitTrace({
         type: 'mcpl:manifest-change-receipt',
@@ -28766,7 +29278,33 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      // RFC-014 §6.1 carrier 2: the tool change this push explains was
+      // applied as it was read; it's told after the event's own content. A
+      // push the host then refuses still tells its change, on its own.
+      const change = this.toolsetHub?.get(connection.id)?.changeText(params) ?? '';
+      const content = (params as { payload?: { content?: unknown } } | null)?.payload?.content;
+      if (!change || !Array.isArray(content)) {
+        if (change) this.recordToolsetNotice(connection.id, change, { invite: false });
+        await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+        return;
+      }
+      let refused = false;
+      const told = {
+        respond: (result: unknown) => {
+          if ((result as { accepted?: unknown } | null)?.accepted === false) refused = true;
+          responder?.respond(result);
+        },
+        respondError: (code: number, message: string, data?: unknown) => {
+          refused = true;
+          (responder?.respondError as ((code: number, message: string, data?: unknown) => void) | undefined)?.(code, message, data);
+        },
+      };
+      await this.pushHandler?.handlePushEvent(
+        connection.id,
+        { ...params, payload: { ...params.payload, content: [...content, { type: 'text', text: change }] } } as PushEventParams,
+        told as never,
+      );
+      if (refused) this.recordToolsetNotice(connection.id, change, { invite: false });
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -28966,6 +29504,9 @@ export class AgentFramework {
         // listeners can close it.
         if (connection.transportEpoch !== epoch || !connection.isConnected) return;
         this.handleToolsListChanged(connection.id);
+        // RFC-014 §5.2–5.3: what the server still holds open is adopted, and
+        // what it doesn't is closed; nothing is re-opened.
+        this.reattachToolsets(connection);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,
@@ -29128,6 +29669,8 @@ export class AgentFramework {
       // Lost for good (no reconnect, and the registry has dropped it): its
       // tools leave the agents' list, as a disconnect's do.
       if (!connection.willReconnect && this.mcplServerRegistry?.getServer(connection.id) !== connection) {
+        // RFC-014: its toolsets go with it; a next connection reads them again.
+        this.toolsetHub?.get(connection.id)?.detach(connection);
         this.handleToolsListChanged(connection.id);
       }
     });
@@ -29254,8 +29797,22 @@ export class AgentFramework {
         listedServers.add(server.id);
         const listed = new Set<string>();
         const repeated: string[] = [];
+        // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
+        // the conversation and called through toolsets--act, never offered
+        // here: every change to this list rebuilds the prompt cache. Their
+        // server, RFC-008 class and feature set are kept as any tool's are,
+        // so a call act makes is attributed, classed and state-exchanged as
+        // a direct call of the tool would be. The list was read through the
+        // server's tap, so its presence is current.
+        // A static↔dynamic move the server hinted applies here, at a list
+        // boundary (§4.2), and the agent is told where the tool went.
+        const presence = this.toolsetHub?.get(server.id);
+        const moves = presence?.presence.active ? presence.applyMoves() : [];
+        if (moves.length > 0) this.recordToolsetNotice(server.id, moves.join('\n'), { invite: false });
+        const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
+          const offered = !dynamic(tool.name);
           const namespacedName = `${prefix}--${tool.name}`;
           if (listed.has(namespacedName)) {
             if (!repeated.includes(tool.name)) repeated.push(tool.name);
@@ -29278,11 +29835,13 @@ export class AgentFramework {
               : undefined;
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
-          tools.push({
-            name: namespacedName,
-            description: tool.description ?? '',
-            inputSchema: schema,
-          });
+          if (offered) {
+            tools.push({
+              name: namespacedName,
+              description: tool.description ?? '',
+              inputSchema: schema,
+            });
+          }
           if (featureSet !== undefined) {
             toolFeatureSets.set(namespacedName, featureSet);
           }
@@ -29596,6 +30155,22 @@ export class AgentFramework {
       });
       return;
     }
+    // RFC-014: a dynamic tool isn't in the list; it's called through act,
+    // which marks the call it resolved (toolsetActCalls) with its instance.
+    const act = this.toolsetActCalls?.get(call);
+    const dynamicRefusal = modern || act ? null : this.toolsetHub?.get(serverId)?.dynamicCallRefusal(toolName, call.name) ?? null;
+    if (dynamicRefusal) {
+      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'a dynamic tool, called through toolsets--act' });
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        toolName: call.name,
+        agentName,
+        moduleName: `mcpl:${serverId}`,
+        result: this.refusedResult(agentName, call.id, dynamicRefusal),
+      });
+      return;
+    }
 
     this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
@@ -29788,7 +30363,10 @@ export class AgentFramework {
       }
     }
 
-    legacy.sendToolsCall(toolName, args, stateParams)
+    legacy.sendToolsCall(toolName, args, stateParams, act?.instance !== undefined ? { 'mcpl/instance': act.instance } : undefined)
+      // RFC-014 §6.2: a call reports its own consequences; the tool change
+      // its result carried is told after the server's content.
+      .then((result) => this.withToolsetChange(serverId, result))
       .then(async (result) => {
         // RFC-005: register references and fetch the small ones, and every
         // one a script will read, before serialization, so their stubs carry
@@ -31215,6 +31793,9 @@ export class AgentFramework {
           for (let i = messages.length - 1; i >= 0 && collecting(); i--) {
             const content = messages[i]?.content;
             if (!Array.isArray(content)) continue;
+            // Another agent's stored context injection isn't in this agent's
+            // view (stored-injections.ts), so its images aren't either.
+            if (isAnotherAgentsInjection(messages[i]?.metadata, agentName)) continue;
             const messagesBack = total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {
