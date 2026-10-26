@@ -1,8 +1,3 @@
-/**
- * The subconscious inherits the resident's inference settings, but on another
- * model not the fields that describe the resident's model
- * (SUBCONSCIOUS_MODEL_FIELDS): its window and whether its thinking binds.
- */
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -30,15 +25,11 @@ async function withSubconscious(resident: Partial<AgentConfig>, subconscious: Pa
   return { framework, residentConfig };
 }
 
-/** What an agent was built with, for the two fields: the window is public, and
- *  the binding is read by the agent into its drop-control flag. */
 function fieldsOf(framework: AgentFramework, name: string) {
   const agent = framework.getAgent(name)! as unknown as { physicalWindowTokens?: number; thinkingDropBlock: boolean; model: string };
   return { model: agent.model, physicalWindowTokens: agent.physicalWindowTokens, thinkingDropBlock: agent.thinkingDropBlock };
 }
 
-/** The resident's config as the framework keeps it, which the subconscious's
- *  copy and conversation forks are made from. */
 function storedConfig(framework: AgentFramework, name: string): AgentConfig | undefined {
   return (framework as unknown as { agentConfigs: Map<string, AgentConfig> }).agentConfigs.get(name);
 }
@@ -51,8 +42,6 @@ describe('the subconscious and the resident\'s model fields', () => {
     try {
       assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingDropBlock: true });
       assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: undefined, thinkingDropBlock: false });
-      // The copy is the subconscious's own: the config the framework keeps
-      // for the resident, and the one its host passed, still hold both.
       for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
         assert.equal(config?.physicalWindowTokens, 1_000_000);
         assert.deepEqual(config?.thinkingBinding, { dropBlock: true });
@@ -100,8 +89,6 @@ describe('the subconscious and the resident\'s model fields', () => {
           promptCaching: settings.promptCaching,
         },
       );
-      // Every field, as the configs are kept: the subconscious's is the
-      // resident's less the two model fields and what the copy sets itself.
       const own = ['physicalWindowTokens', 'thinkingBinding', 'name', 'model', 'systemPrompt', 'strategy', 'proseRouting', 'allowedTools', 'clock'];
       const rest = (config: AgentConfig | undefined) =>
         Object.fromEntries(Object.entries(config ?? {}).filter(([key]) => !own.includes(key)));

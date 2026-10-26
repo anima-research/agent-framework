@@ -2789,32 +2789,6 @@ interface StreamRequestNotes {
   stopped: boolean;
 }
 
-/**
- * The fields of an agent's config that describe its model, which a
- * subconscious on another model id (compared exactly, so another spelling of
- * the same model counts as another) doesn't carry over from the resident
- * (createSubconsciousAgent): `physicalWindowTokens`, the model's window, and
- * `thinkingBinding`, whether its thinking binds and takes the drop control.
- * Those are true of another model only by coincidence: a resident window
- * above the other model's lets a stream walk past that model's window (#92).
- * Without them the subconscious runs as an agent that sets neither, so only
- * its `maxStreamTokens` restart bounds its streams.
- *
- * What it inherits is how the resident asks to run, as the copy's same-model
- * premise has it: every field the copy doesn't set itself, among them the
- * thinking config, output ceiling (`maxTokens`), `temperature`, budgets
- * (`contextBudgetTokens`, `maxStreamTokens`), caching (`promptCaching`,
- * `cacheTtl`) and `providerParams`. A thinking config in `providerParams`
- * passes through as the resident set it, binding control included, so it's
- * the one way such a control reaches another model here. Another model takes
- * those or refuses the call, with two exceptions:
- * - Its window must hold the budgets. A budget past the window isn't refused
- *   up front: calls go out until the context passes the window, and the
- *   provider then answers 400, the refusal #92 describes.
- * - Membrane leaves some settings unsent rather than refused. On an
- *   always-thinking model (Fable, Mythos) it sends no `temperature`, and,
- *   with no binding control, none of the thinking config.
- */
 const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
 
 export class AgentFramework {
@@ -12454,8 +12428,7 @@ export class AgentFramework {
     // caching, refusal handling, timezone — a same-model side-process must
     // not silently run under different inference conditions than the
     // resident it serves. Only identity- and surface-defining fields are
-    // overridden below. On another model id, what describes the principal's
-    // model isn't the subconscious's to carry (SUBCONSCIOUS_MODEL_FIELDS).
+    // overridden below.
     const model = cfg.model ?? primaryConfig.model;
     const inherited: AgentConfig = { ...primaryConfig };
     if (model !== primaryConfig.model) {
