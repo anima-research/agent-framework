@@ -1271,9 +1271,9 @@ describe('judge rules: what waiting leaves the agent with', () => {
     await until(() => judge.requests.length === 1, 'the judge rule\'s batch to go to the judge during the fork\'s turn');
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1, 'premise: the debounced batch is buffered behind the fork\'s turn');
     assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
-      ['1 event buffered behind a running turn, delivered when it ends', false],
+      ['1 event buffered behind a running turn or the host\'s quiesce, delivered when that ends', true],
     ]);
-    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient').map((w) => w.what), ['1 event buffered behind a running turn, delivered when it ends']);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient').map((w) => w.what), ['1 event buffered behind a running turn or the host\'s quiesce, delivered when that ends']);
     assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'files').map((w) => w.what), ['rule "ambient"\'s batch of 1 event, which the judge is deciding'], "rule files' buffered events are left out with it");
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
@@ -1322,6 +1322,25 @@ describe('judge rules: what waiting leaves the agent with', () => {
     assert.deepStrictEqual(listed('second'), ['rule "first"\'s batch of 1 event, held for the judge']);
     assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
     assert.strictEqual(listed().length, 2);
+    gate.dispose();
+  });
+
+  it("tells the judge its own rule's events buffered behind a turn, as certain", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-own-buffered.json', {
+      policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 50 } } }],
+    }), { judge: judge.fn, residents: ['agent'] });
+    gate.onInferenceStarted('fork');
+    gate.evaluate(chat('hello'));
+    await until(() => judge.requests.length === 1, "the batch's call during the fork's turn");
+    judge.answer({ reply: true, reason: 'addressed' });
+    await until(() => gate.inferenceDiagnostics().bufferedEvents === 1, "the replied batch buffered behind the fork's turn");
+    gate.evaluate(chat('again'));
+    await until(() => judge.requests.length === 2, 'the next batch asked');
+    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
+      ['1 event buffered behind a running turn or the host\'s quiesce, delivered when that ends', true],
+    ]);
+    judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
 
