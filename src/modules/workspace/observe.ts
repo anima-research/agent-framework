@@ -978,11 +978,16 @@ export class CheckedDir {
     private readonly lexical: string,
     private readonly dev: bigint,
     private readonly ino: bigint,
+    private readonly born: bigint,
   ) {}
 
   /** Which directory it is. */
   identity(): RootIdentity {
-    return { dev: String(this.dev), ino: String(this.ino) };
+    return {
+      dev: String(this.dev),
+      ino: String(this.ino),
+      ...(this.born > 0n ? { born: String(this.born) } : {}),
+    };
   }
 
   /** A path that reaches `name` in this directory. */
@@ -1028,7 +1033,7 @@ export class CheckedDir {
 async function checkedAt(view: MountView, rel: string, real: string): Promise<CheckedDir | null> {
   const info = await lstat(real, { bigint: true }).catch(() => null);
   if (!info?.isDirectory()) return null;
-  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino);
+  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs);
 }
 
 /**
@@ -1196,7 +1201,7 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     }
     if (info.isDirectory()) {
       if (last) return CHANGED; // present after all
-      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino);
+      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino, info.birthtimeNs);
       walked.push(cur);
       continue;
     }
@@ -2034,7 +2039,7 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
     return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent', by: proof.by };
   }
   if (!info.isDirectory()) return { kind: 'unobserved', reason: CHANGED_WALK };
-  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino) };
+  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs) };
 }
 
 /**

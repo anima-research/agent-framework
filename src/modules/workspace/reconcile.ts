@@ -1029,9 +1029,13 @@ export async function reconcilePass(
   }
 
   // The evidence about to be recorded describes the root it was gathered
-  // under, which is recorded first (once per mount), so no crash can leave
-  // evidence without its root.
-  if (gathered.rootIdentity && planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined)) {
+  // under, which is recorded first, so no crash can leave evidence without
+  // its root. Once a root is recorded, every pass that found it offers it,
+  // evidence or none: the same root on a new device, or with its first
+  // birth time, is recorded again (recordRootIdentity writes nothing
+  // otherwise), and a quiet mount's passes are where an old record learns
+  // its birth time.
+  if (gathered.rootIdentity && (agreement.rootIdentity(mount.name) !== undefined || planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined))) {
     agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
   }
 
@@ -1427,7 +1431,7 @@ export async function pushPaths(
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
     // intent) is recorded before anything is pushed over it, and the root it
-    // was learned under before that (once per mount), as a pass does.
+    // was learned under before that, as a pass does.
     if (v.p !== undefined) agreement.recordRootIdentity(mount.name, root.identity);
     if (v.p === 'forget') agreement.forget(mount.name, path);
     else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
