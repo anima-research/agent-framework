@@ -49,6 +49,10 @@ type Internals = {
   bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: unknown): void;
   readsRowFor(placement: { agent?: string; messageId?: string; presented?: false } | undefined, agentName: string): { readsRow?: string };
   dispatchChannelToolCall(agentName: string, call: ToolCall): void;
+  reserveStoreForSurgery(verb: string, agentName: string): () => void;
+  surgeryHeldWrites: unknown[];
+  processNextEvent(): Promise<void>;
+  routingOf(agentName: string): unknown;
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
 
@@ -677,7 +681,7 @@ describe('a wake for a write heard mid-turn', () => {
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'assistant'), { readsRow: 'm-1' });
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'helper'), {}, "another agent's wake stays plain");
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'assistant'), { readsRow: 'm-1' },
-      'a wake can wait while a request reads a stored write, as behind a held continuation');
+      'a row presented to the agent at its write marks its wake too (#814): only a request that carried it drops the wake');
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'helper'), {}, "another agent's wake stays plain");
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant' }, 'assistant'), {}, 'nor does a write a surgery holds, with no id yet');
     assert.deepEqual(fw.readsRowFor(undefined, 'assistant'), {}, 'nor does a wake with no write');
@@ -1020,6 +1024,45 @@ describe('a wake for a write heard mid-turn', () => {
         'the turn heard it at its tool boundary');
       assert.equal(membrane.calls.length, 2, 'its wake started the turn');
       assert.deepEqual(drops, []);
+      await framework.stop();
+    });
+  }
+
+  // A write a surgery's hold keeps in memory has no id until the release
+  // stores it. It is traced once, then, with that id, as 'surgery-release',
+  // never at its arrival with an empty id (291-deferral-queue), on every
+  // path a write arrives by.
+  const arrivals: Array<[string, string, (framework: AgentFramework) => unknown]> = [
+    ...storedAsItArrives.filter(([what]) => !what.includes('self-wake')),
+    ['a prose bounce notice', 'no channel named #nowhere', (framework) => {
+      const fw = internals(framework);
+      fw.bounceProse(fw.agents.get('assistant'), 'hello there', 'no channel named #nowhere', undefined, '>>',
+        { routing: fw.routingOf('assistant'), notice: 'later' });
+    }],
+  ];
+  for (const [what, shown, write] of arrivals) {
+    it(`${what}, made while a surgery holds the store, is traced once, as the release stores it, with its stored id`, async () => {
+      const framework = await createFramework();
+      stubChannelRegistry(framework, ROOM);
+      (framework as unknown as { startAgentStream: () => Promise<unknown> }).startAgentStream = async () => undefined;
+      const added: Array<[string, string]> = [];
+      framework.onTrace((event) => {
+        if (event.type === 'message:added') added.push([event.source, event.messageId]);
+      });
+      const fw = internals(framework);
+      const release = fw.reserveStoreForSurgery('test', 'assistant');
+      try {
+        await write(framework);
+        for (let i = 0; i < 50 && fw.surgeryHeldWrites.length === 0; i++) await fw.processNextEvent();
+        assert.equal(fw.surgeryHeldWrites.length, 1, 'the hold kept it in memory');
+        assert.deepEqual(added, [], 'its arrival is not traced');
+      } finally {
+        release();
+      }
+      const rows = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes(shown));
+      assert.equal(rows.length, 1, 'the release stored it once');
+      assert.deepEqual(added, [['surgery-release', rows[0]!.id]], 'traced once, with its stored id');
       await framework.stop();
     });
   }

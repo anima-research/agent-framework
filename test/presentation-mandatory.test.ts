@@ -178,7 +178,15 @@ describe('presentation is mandatory (#291)', () => {
         membrane: new MockMembrane().asMembrane(),
         agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
         modules: [],
-      }), /agent-framework needs @animalabs\/context-manager with ContextManager\.presentRows/);
+      }), (error: Error) => {
+        assert.match(error.message, /agent-framework needs @animalabs\/context-manager with ContextManager\.presentRows/);
+        // The release it names is the one package.json declares.
+        const declared = (JSON.parse(readFileSync(join(import.meta.dirname, '../../package.json'), 'utf8')) as {
+          dependencies: Record<string, string>;
+        }).dependencies['@animalabs/context-manager']!;
+        assert.ok(error.message.includes(`Install @animalabs/context-manager ${declared}, which this package declares`), error.message);
+        return true;
+      });
     } finally {
       proto.presentRows = presentRows;
     }

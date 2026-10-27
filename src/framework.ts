@@ -4420,9 +4420,13 @@ export class AgentFramework {
     );
     framework.providerHoldHook = config.providerHold;
     // The presentation index (#291), before any agent exists. It needs a
-    // context-manager that keeps a window index per agent (presentRows).
+    // context-manager that keeps a window index per agent (presentRows):
+    // 0.24.0 on, since 0.23.0 was published without one.
     if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
-      throw new Error('agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent');
+      throw new Error(
+        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
+          'Install @animalabs/context-manager ^0.24.0, which this package declares (0.23.0 has no window index)',
+      );
     }
     // A store handle without the batched identity append (a chronicle
     // before 0.5.0, or a host's handle from one) still works, one record per
@@ -29657,14 +29661,20 @@ export class AgentFramework {
    * The mark a wake for `agentName` takes for the row it was queued with
    * (`placement`, addMessage's out-param), so the scheduler can drop the
    * wake once the row needs nothing more of the agent (rowDone): the row's
-   * stored id, whether the row was presented to that agent at its write or
-   * not (`presented: false`, set where the agent's turn was alive). A row
-   * stored for an agent with no turn alive is read by the turn its wake
-   * starts, unless a request reads and answers it while that wake waits, as
-   * behind a context-budget restart or a tool-result guard's retry held by a
-   * provider: then the wake has nothing left to do. Another agent's wake
-   * stays plain, and so does one for a write a surgery's hold keeps, which
-   * has no id yet.
+   * stored id, for every row stored for that agent, whether it was
+   * presented to the agent at its write or not (`presented: false`, set
+   * where the agent's turn was alive). #291 first marked only a row kept
+   * out of a live turn's window; #814 marks a message stored as it arrived
+   * too, and this carries that. The wider mark drops no wake wrongly:
+   * rowDone drops one only once an answered request's mark covers the row,
+   * by its place in the agent's window (covers), so a request that never
+   * carried the row keeps its wake. A resumed turn (a context-budget
+   * restart, or a tool-result guard's retry a provider held) presents
+   * nothing that arrived meanwhile (the presentation's afterStore counts
+   * its turn alive), so its request doesn't carry such a row, and the row's
+   * wake still starts a turn after it. Another agent's wake stays plain, and
+   * so does one for a write kept in memory (a surgery's hold, or
+   * heldForRecovery), which has no id yet.
    */
   private readsRowFor(placement: WritePlacement | undefined, agentName: string): { readsRow?: string } {
     if (!placement || placement.agent !== agentName) return {};

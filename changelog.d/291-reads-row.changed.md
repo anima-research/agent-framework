@@ -16,3 +16,14 @@
   the drafts catch-up read the window's order: a co-resident's rows in the
   shared slot aren't in it, and a drafts notice taken out as an undone
   turn's doesn't count.
+- A wake for a row stored for its agent carries `InferenceRequest.readsRow`
+  (the row's stored id) whether or not the row was presented to that agent
+  at its write, not only for a row kept out of its window while its turn
+  was alive: #814's mark for a message stored as it arrived (the
+  stored-message-wake entry), read onto the presentation index. The wake is
+  dropped only once an answered request carried the row, which that
+  request's mark says by the row's place in the agent's window, so a
+  request that never carried the row keeps its wake. A resumed turn (a
+  context-budget restart, or a tool-result guard's retry a provider held)
+  presents nothing that arrived meanwhile, so such a row's wake still starts
+  its turn.
