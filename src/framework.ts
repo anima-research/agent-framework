@@ -670,6 +670,17 @@ const ambientMark = (tags?: string[]): { ambient?: true } =>
 const systemNoticeMark = (tags?: string[]): { systemNotice?: true } =>
   isSystemNotice(tags) ? { systemNotice: true } : {};
 
+/**
+ * A wake from the heartbeat: a tick or a reminder, from the framework's own
+ * heartbeat or from an MCPL server whose id is `heartbeat` (heartbeat-mcpl),
+ * which carries no channel. A silent tick isn't one here: its turn keeps
+ * every plain word private already (suppressProse). Its turn's plain speech
+ * has no destination (TurnRouting.heartbeat).
+ */
+function isHeartbeatWake(trigger: Pick<InferenceRequest, 'source' | 'channelId' | 'suppressProse'> | undefined): boolean {
+  return trigger !== undefined && trigger.source === 'heartbeat' && !trigger.channelId && trigger.suppressProse !== true;
+}
+
 // parseProsePrefix lives in ./mcpl/prose-grammar.ts. The outgoing stream
 // (Spec 14.3) needs no grammar of its own: it carries what delivery
 // published.
@@ -1275,6 +1286,17 @@ interface TurnRouting {
    * A fork's home still applies.
    */
   noChannel?: true;
+  /**
+   * The turn was opened by a heartbeat tick or reminder (isHeartbeatWake): a
+   * wake that came from no channel, so nobody is waiting for its words. It
+   * takes no locus and no global fallback, in its locus or in what servers
+   * are told. Its plain speech with no destination of its own (a `>>` or
+   * `>>>` target, a re-pin, the agent's channel_open) is held as a draft the
+   * agent can resend, in every routing mode, rather than posted where the
+   * latest inbound message came from; and a bounce of its speech requests no
+   * wake, so a heartbeat can't start a loop of turns.
+   */
+  heartbeat?: true;
   /**
    * Locus and hybrid mode: where the turn's unpinned plain prose lands.
    * Frozen when the turn opens (home channel for a fork, else the trigger
@@ -17994,6 +18016,40 @@ export class AgentFramework {
     return undefined;
   }
 
+  /** Why a heartbeat's turn holds its plain speech, in a held-draft notice ("because …"). */
+  private static readonly HEARTBEAT_HOLD_BECAUSE =
+    'this turn came from your heartbeat, not from a channel, so its plain speech has no destination ' +
+    'and is kept for you to send where you choose';
+
+  /**
+   * Locus mode's delivery of plain speech to the turn's frozen locus. A
+   * heartbeat's turn with no locus of its own (TurnRouting.heartbeat) holds
+   * the words as a draft instead of failing the delivery: nobody was waiting
+   * for them, and the agent may send them where it chooses.
+   */
+  private async routeLocusSpeech(
+    agent: Agent,
+    round: ProseRound,
+    text: string,
+    locus: ChannelRef | null,
+  ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
+    if (locus === null && round.routing.heartbeat) {
+      this.holdHeartbeatProse(agent, [text], round);
+      return null;
+    }
+    return this.channelRegistry!.routeSpeech(agent.name, text, locus);
+  }
+
+  /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
+  private holdHeartbeatProse(agent: Agent, texts: string[], round: ProseRound): Draft[] {
+    console.error(`[prose] ${agent.name}: heartbeat turn — ${texts.length} plain-speech segment(s) held as drafts (no destination)`);
+    return this.holdProseDrafts(agent, texts, 'no-destination', {
+      routing: round.routing,
+      notice: round.draftsRound ? 'later' : round.notice,
+      because: AgentFramework.HEARTBEAT_HOLD_BECAUSE,
+    });
+  }
+
   /** Record a successful plain-prose delivery for this turn's receipt. */
   private recordProseDelivery(
     routing: TurnRouting,
@@ -19641,6 +19697,10 @@ export class AgentFramework {
       this.holdProseDrafts(agent, [envelope], 'no-destination', round.draftsRound ? { ...round, notice: 'later' } : round);
       return;
     }
+    if (!sticky && locus === null && routing.heartbeat) {
+      this.holdHeartbeatProse(agent, [envelope], round);
+      return;
+    }
     const target = sticky ?? locus;
     try {
       const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
@@ -19935,8 +19995,12 @@ export class AgentFramework {
         { routing: round.routing, note: reason, notice: 'later' },
       )[0];
     }
-    const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
-    this.proseBounceStreaks.set(name, streak);
+    // A heartbeat's turn came from no channel: its bounce is noticed, and
+    // waits for the agent's next turn, rather than starting one of its own,
+    // so it neither wakes the agent nor counts toward the bounce-wake cap.
+    const quiet = round.routing.heartbeat === true;
+    const streak = (this.proseBounceStreaks.get(name) ?? 0) + (quiet ? 0 : 1);
+    if (!quiet) this.proseBounceStreaks.set(name, streak);
     const cand = candidates?.length ? ` Known channels it could mean: ${candidates.join(', ')}.` : '';
     // The examples name the first candidate that is one token, as a target
     // takes it, so they show the form to write, such as a server-qualified
@@ -19999,9 +20063,9 @@ export class AgentFramework {
     const capped = streak > AgentFramework.PROSE_BOUNCE_WAKE_CAP;
     console.error(
       `[prose] ${name}: BOUNCED ${text.length} chars — ${reason}` +
-      (capped ? ' (bounce-wake cap reached; notice appended without wake)' : ''),
+      (quiet ? ' (a heartbeat turn: notice appended without wake)' : capped ? ' (bounce-wake cap reached; notice appended without wake)' : ''),
     );
-    if (!capped && target) {
+    if (!capped && !quiet && target) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
       this.pendingRequests.push({
@@ -20876,6 +20940,10 @@ export class AgentFramework {
       const unresolvedTrigger = !!trigger?.channelId && routing.triggerChannel === undefined;
       if (unresolvedTrigger) routing.noChannel = true;
       else delete routing.noChannel;
+      // A heartbeat's turn has no channel, and takes no fallback: its plain
+      // speech is held as a draft (TurnRouting.heartbeat).
+      if (isHeartbeatWake(trigger)) routing.heartbeat = true;
+      else delete routing.heartbeat;
       // Resolve the turn's outbound locus now: the home channel for forks,
       // else the trigger channel, else the global default, which an
       // ephemeral run never takes (takesGlobalFallback). Ambient mid-turn
@@ -20898,7 +20966,10 @@ export class AgentFramework {
           routing.locus = locus;
           noteTurnChannel(routing, locus);
         }
-        if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
+        // A heartbeat's turn speaks nowhere by design; announcing that would
+        // move the baseline, and the next channel turn would announce its
+        // channel again. Its held drafts say why they were held.
+        if (attempt === 0 && !routing.heartbeat) this.announceLocusIfChanged(agent.name, locus);
       }
     } else {
       // Every other start of the turn keeps its locus: a resume, or a start
@@ -21632,9 +21703,9 @@ export class AgentFramework {
         }
       };
     };
-    const enqueueSpeech = (text: string, locus: ChannelRef | null, onPublished: SpeechPublished): void => {
+    const enqueueSpeech = (text: string, locus: ChannelRef | null, onPublished: SpeechPublished, round?: ProseRound): void => {
       chainSpeech(routingSpeech(async () => {
-        const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+        const outcome = await this.routeLocusSpeech(agent, round ?? { routing: streamRouting, notice: 'later' }, text, locus);
         this.recordProseDelivery(streamRouting, outcome);
         if (outcome?.delivered) {
           streamRouting.liveSpeech = true;
@@ -22181,7 +22252,7 @@ export class AgentFramework {
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${roundLocus ?? '(default)'}`,
                 );
                 for (const seg of roundSegments) {
-                  enqueueSpeech(seg, roundLocus, roundPublished);
+                  enqueueSpeech(seg, roundLocus, roundPublished, roundOpts);
                 }
               }
             };
@@ -22831,7 +22902,7 @@ export class AgentFramework {
                   );
                   for (const segment of speechSegments) {
                     try {
-                      const outcome = await this.channelRegistry.routeSpeech(agent.name, segment, locus);
+                      const outcome = await this.routeLocusSpeech(agent, textOnlyHold, segment, locus);
                       this.recordProseDelivery(streamRouting, outcome);
                       if (outcome?.delivered) endPublished(outcome, segment, outcome.messageId);
                     } catch (err) {
@@ -22950,7 +23021,7 @@ export class AgentFramework {
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
                   try {
-                    const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
+                    const outcome = await this.routeLocusSpeech(agent, trailingHold, seg, locus);
                     this.recordProseDelivery(streamRouting, outcome);
                     if (outcome?.delivered) endPublished(outcome, seg, outcome.messageId);
                   } catch (err) {
@@ -28709,7 +28780,7 @@ export class AgentFramework {
         // keeps that channel.
         activeChannelResolver: (agentName) => {
           const routing = this.turnRouting.get(agentName);
-          return routing?.locus ?? routing?.triggerChannel ?? (routing?.noChannel ? null : undefined);
+          return routing?.locus ?? routing?.triggerChannel ?? (routing?.noChannel || routing?.heartbeat ? null : undefined);
         },
         // An ephemeral run (a subagent) never takes the process-global
         // fallback: its prose is its caller's result, and the latest inbound
