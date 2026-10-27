@@ -15,7 +15,8 @@
   from a hold that then keeps a later wake. Such a host's idle check now
   waits for the hold to end, however long the provider's stated wait, or
   until an operator releases a wait with no end. `drained` is unchanged: it
-  counts turns alive, and a hold that releases during a quiesce hands its
-  wakes to the quiesce gate, as any queued wake meets it, so no turn starts
-  until `resume()`. The quiesce's log line says "wake(s) waiting" where it
+  is true when no turn is alive and nothing is parked on provider
+  admission, and a hold that releases during a quiesce hands its wakes to
+  the quiesce gate, as any queued wake meets it, so no turn starts until
+  `resume()`. The quiesce's log line says "wake(s) waiting" where it
   said "wake(s) parked".
