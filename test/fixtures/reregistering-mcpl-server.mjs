@@ -1,4 +1,6 @@
-// MCPL server for test/mcpl-reconnect-registration.test.ts.
+// MCPL server for test/mcpl-reconnect-registration.test.ts,
+// test/mcpl-runtime-connect-failure.test.ts and
+// test/failed-create-releases.test.ts.
 //
 // Like a chat bridge, it registers its channel as soon as the host sends
 // notifications/initialized, before the host's §5.3 policy Request is

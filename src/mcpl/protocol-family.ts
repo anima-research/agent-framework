@@ -26,6 +26,7 @@ import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
 import { DEFAULT_MAX_INPUT_BYTES } from './tool-lifecycle.js';
 import type { McplServerConfig, ScopeConfig } from './types.js';
+import { kindOf } from '../config-checks.js';
 
 /** The one revision the legacy engine offers and accepts. */
 export const LEGACY_MCP_PROTOCOL_VERSION = '2024-11-05';
@@ -126,8 +127,21 @@ export function redactUrl(url: string | undefined): string {
  * strings (serverCredentialPatterns), so strings of different servers that
  * overlap are both replaced whole. A credential neither the configuration
  * holds nor a dial of it sent, such as another origin's, is outside it, and
- * so are other encodings of the ones it holds. JSON-RPC answers, and the
- * error a host's own connect raises, pass as they are.
+ * so are other encodings of the ones it holds. A JSON-RPC answer's result
+ * passes as it is. No error a host's own call gets, whether thrown, rejected
+ * with or in an error answer's data, carries one of the strings above,
+ * whoever wrote the words: a server's words are redacted, then bounded,
+ * where an error is built from them, the strings in an error answer's data
+ * are redacted ({@link redactedData}), and an error a library raised is
+ * handed on as its name and its redacted words alone ({@link maskedError}),
+ * with a stdio launch failure's code. A failed handshake's stderr tail
+ * is redacted from a longer window of the stream, so a credential of up to
+ * 14,336 characters that reaches into it is replaced whole
+ * (McplTransport.stderrTailRedacted). A close's or a
+ * cleanup's failure carries the transports' own words, a child's pid, its
+ * server's id and the wait it was given, and passes as built. A
+ * connection's events are the framework's records' inputs, and the records
+ * redact them.
  *
  * A configuration that can't be read, such as one whose `env` is a getter
  * that throws, says nothing of which strings to replace, so the whole text
@@ -135,9 +149,25 @@ export function redactUrl(url: string | undefined): string {
  * runs where a throw has nowhere to go, such as inside a transport's 'error'
  * listener.
  */
-export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
+export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): string {
   return serverTextRedactor(config)(text);
 }
+
+/** A {@link serverTextRedactor}: a redaction of one configuration's
+ *  credentials, which reads the configuration until a build succeeds. */
+export interface ServerTextRedactor {
+  (text: unknown, from?: number): string;
+  /**
+   * This redaction for one piece of work, such as building one error from a
+   * server's words and data: its pattern built now if it isn't, so the
+   * configuration is read at most once for all the work's texts, and every
+   * text withheld if it can't be read.
+   */
+  now(): Redaction;
+}
+
+/** The redaction of a configuration that can't be read. */
+const withheld: Redaction = () => WITHHELD_TEXT;
 
 /**
  * {@link redactServerText} for one configuration, its strings found and its
@@ -146,28 +176,107 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  * line. A build that can't read the configuration withholds that call's
  * text, and the next call builds again.
  */
-export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
+export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): ServerTextRedactor {
   let built = -1;
-  let redact!: (text: unknown) => string;
-  return (text) => {
+  let redact!: Redaction;
+  const now = (): Redaction => {
     const version = dialsSent.get(config)?.version ?? 0;
     if (version !== built) {
       let patterns: CredentialPattern[];
       try {
         patterns = serverCredentialPatterns(config);
       } catch {
-        return WITHHELD_TEXT;
+        return withheld;
       }
       redact = credentialRedactor(patterns);
       built = version;
     }
-    return redact(text);
+    return redact;
   };
+  return Object.assign((text: unknown, from?: number) => now()(text, from), { now });
 }
 
 /** What a redaction gives in place of text when the configuration it
  *  redacts with can't be read ({@link redactServerText}). */
 export const WITHHELD_TEXT = "[withheld: the server's configuration couldn't be read to redact this]";
+
+/** What {@link redactedData} gives in place of data nested deeper than it
+ *  walks. */
+export const TOO_DEEP_TEXT = '[withheld: nested too deep to redact]';
+
+/** How deep {@link redactedData} walks. A server's JSON can nest deeper than
+ *  a recursive walk's stack holds (10,000 levels overflow it), and the walk
+ *  runs where a throw would leave the request it answers unsettled. */
+const REDACTED_DATA_DEPTH = 64;
+
+/**
+ * The data a server's error answer carries beside its words, with every
+ * string in it, an object's keys included, redacted (`redact`, a server's
+ * {@link serverTextRedactor}, built once for the walk), so an error handed
+ * to a host carries no credential its configuration holds. Arrays and plain
+ * objects are walked, to a depth of 64; deeper data is
+ * {@link TOO_DEEP_TEXT}. A number goes as its redacted text if its digits,
+ * as JavaScript reads the number, hold a credential: a number with more
+ * significant digits than a double holds (about 15) has lost its last ones
+ * before anything sees it, so a credential sent as such a number isn't
+ * matched. A redacted key that comes out the same as another key is
+ * numbered, so every entry is kept under a name of its own, and a key the
+ * redaction leaves alone keeps its name. Any other value, null or a
+ * boolean, is kept as it is. With a configuration that can't be read, the
+ * data as a whole is {@link WITHHELD_TEXT}.
+ */
+export function redactedData(value: unknown, redactor: ServerTextRedactor | Redaction): unknown {
+  const redact = 'now' in redactor ? redactor.now() : redactor;
+  if (redact === withheld) return value === undefined ? undefined : WITHHELD_TEXT;
+  const walk = (item: unknown, depth: number): unknown => {
+    if (typeof item === 'string') return redact(item);
+    if (typeof item === 'number') {
+      const digits = String(item);
+      const redacted = redact(digits);
+      return redacted === digits ? item : redacted;
+    }
+    if (item === null || typeof item !== 'object') return item;
+    const walked = Array.isArray(item) || [Object.prototype, null].includes(Object.getPrototypeOf(item));
+    if (!walked) return item;
+    if (depth >= REDACTED_DATA_DEPTH) return TOO_DEEP_TEXT;
+    if (Array.isArray(item)) return item.map((entry) => walk(entry, depth + 1));
+    // A key the redaction leaves as it is keeps its name; a redacted one
+    // takes the first name no other key has, so no entry is lost or moved.
+    const entries = Object.entries(item);
+    const names = entries.map(([key]) => redact(key));
+    const taken = new Set(names.filter((name, n) => name === entries[n][0]));
+    // Each name's next number to try, so keys that redact alike don't search
+    // from 2 again: every number below it was taken, and stays taken.
+    const next = new Map<string, number>();
+    return Object.fromEntries(entries.map(([key, entry], n) => {
+      let name = names[n];
+      if (name !== key) {
+        const base = name;
+        let k = next.get(base) ?? 2;
+        while (taken.has(name)) name = `${base} (${k++})`;
+        next.set(base, k);
+        taken.add(name);
+      }
+      return [name, walk(entry, depth + 1)];
+    }));
+  };
+  return walk(value, 0);
+}
+
+/**
+ * An error a library raised, as the framework hands it to a host: its name,
+ * which is its class's, as it is, and its words redacted (`redact`, a
+ * server's {@link serverTextRedactor}), and nothing else. A library's error
+ * can carry the url it dialed elsewhere than in its message (Bun's fetch
+ * errors keep it in `path`, its path and query included), or keep the raw
+ * error it wraps as its `cause`, so none of that is carried over.
+ */
+export function maskedError(error: unknown, redact: (text: unknown) => string): Error {
+  const masked = new Error(redact(error instanceof Error ? error.message : error));
+  // Not enumerable, as an error's own name is not.
+  if (error instanceof Error) Object.defineProperty(masked, 'name', { value: error.name, writable: true, configurable: true });
+  return masked;
+}
 
 /**
  * What a configuration's dials sent that the configuration doesn't hold: the
@@ -208,10 +317,12 @@ export function noteDialSent(config: object, sent: { readonly url?: string; read
 }
 
 /**
- * The url a dial sends. A WebSocket dial sets the token as the `token`
- * parameter, and setting it makes URLSearchParams write the whole query
- * again, form-encoded (a space as `+`), so the url as sent can differ from
- * the url as configured. An http(s) dial sends the url as configured.
+ * The url a dial sends. A WebSocket dial that sends its token in the query
+ * sets it as the `token` parameter, and setting it makes URLSearchParams
+ * write the whole query again, form-encoded (a space as `+`), so the url as
+ * sent can differ from the url as configured. A header-mode WebSocket dial,
+ * which is given no token here, and an http(s) dial send the url as
+ * configured.
  */
 export function urlAsDialed(url: URL, token: string | null | undefined): URL {
   const dialed = new URL(url);
@@ -232,7 +343,7 @@ export interface CredentialPattern {
  * that begins inside another configuration's, or shares its start, can't
  * leave any of that one in place.
  */
-export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): CredentialPattern[] {
+export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): CredentialPattern[] {
   // Strings replaced wherever they occur (after an escape or inside a longer
   // token too), and name=value pairs, replaced only where no letter or digit
   // adjoins them, so a pair such as v=2 leaves dev=2 alone. A pair's value is
@@ -329,7 +440,7 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
   const configuredUrl = config.url ?? '';
   let url: URL | undefined;
   try { url = new URL(configuredUrl); } catch { /* Still remove the static token. */ }
-  if (url) addUrl(urlAsDialed(url, config.token));
+  if (url) addUrl(urlAsDialed(url, config.tokenTransport === 'header' ? null : config.token));
   // What the dials sent beyond that: urls dialed with an access provider's
   // token, and its tokens sent in a header.
   const sent = dialsSent.get(config);
@@ -368,19 +479,28 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
 }
 
 /**
+ * A redaction: `text` with the credentials it holds replaced, and only what
+ * lies from its `from`th code unit on (0 when left out). A credential that
+ * begins before `from` and reaches past it is matched whole and replaced
+ * whole, so a part of the text can be given redacted as the whole text has
+ * it.
+ */
+export type Redaction = (text: unknown, from?: number) => string;
+
+/**
  * Every place one of the given patterns matches becomes `redacted`,
  * overlapping places included: the matches are found in the text as given,
  * a match may begin inside another, and each run of overlapping matches is
  * replaced as one. So two strings that overlap, one's end being the other's
  * start, are both replaced whole, and the replacement is never scanned.
  */
-export function credentialRedactor(patterns: readonly CredentialPattern[]): (text: unknown) => string {
-  if (patterns.length === 0) return asText;
+export function credentialRedactor(patterns: readonly CredentialPattern[]): Redaction {
+  if (patterns.length === 0) return (text, from = 0) => asText(text).slice(from);
   // Longest first, so at each place the longest string that matches there is
   // the match.
   const sources = [...patterns].sort((a, b) => b.value.length - a.value.length).map(({ source }) => source);
   const pattern = new RegExp([...new Set(sources)].join('|'), 'g');
-  return (text) => {
+  return (text, from = 0) => {
     const input = asText(text);
     const spans: Array<[start: number, end: number]> = [];
     pattern.lastIndex = 0;
@@ -395,12 +515,13 @@ export function credentialRedactor(patterns: readonly CredentialPattern[]): (tex
       pattern.lastIndex = start + 1;
     }
     let redacted = '';
-    let from = 0;
+    let at = from;
     for (const [start, end] of spans) {
-      redacted += `${input.slice(from, start)}redacted`;
-      from = end;
+      if (end <= from) continue;
+      redacted += `${input.slice(at, start)}redacted`;
+      at = end;
     }
-    return redacted + input.slice(from);
+    return redacted + input.slice(at);
   };
 }
 
@@ -520,6 +641,8 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 export function mcplPolicyGrants(config: McplServerConfig): string[] {
   const grants: string[] = [];
   if (isEffective(config.allowHostCommands)) grants.push('allowHostCommands');
+  // RFC-014 tool hints are an MCPL advertisement.
+  if (config.toolHints === true) grants.push('toolHints');
   // An allow-list, except that a pattern matching a path denied by default
   // grants it (computeGrant's explicitlyEnabled), named by the path.
   const enabled = config.enabledCapabilities as unknown;
@@ -583,6 +706,22 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
       );
     }
   }
+  if (config.tokenTransport !== undefined && config.tokenTransport !== null) {
+    if (binding.transport !== 'websocket') {
+      problems.push(
+        `MCP server "${config.id}": "tokenTransport" applies only to a ws(s):// server; an http(s):// server always sends its credential as a header, and a stdio server sends none`,
+      );
+    } else {
+      const problem = tokenTransportProblem(config, new URL(config.url!));
+      if (problem) problems.push(problem);
+      // A static token known now that no dial could send as configured.
+      else if (config.tokenTransport === 'header' && config.token && !headerCarries(config.token)) {
+        problems.push(
+          `MCP server "${config.id}": with tokenTransport 'header', "token" must be printable ASCII (U+0020 to U+007E) with no space at either end, which is all a header carries as configured`,
+        );
+      }
+    }
+  }
   if (config.protocol !== undefined) {
     if (config.protocol !== 'legacy' && config.protocol !== 'modern') {
       problems.push(`MCP server "${config.id}": protocol must be 'legacy' or 'modern', got ${JSON.stringify(config.protocol)}`);
@@ -596,7 +735,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   if (binding.family === 'modern') {
     if (timeout !== undefined && !(Number.isInteger(timeout) && timeout >= 1 && timeout <= MAX_TIMER_MS)) {
       problems.push(
-        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${String(timeout)}); every modern call has a deadline`,
+        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${asText(timeout)}); every modern call has a deadline`,
       );
     }
     for (const path of mcplPolicyGrants(config)) {
@@ -618,6 +757,47 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     );
   }
   return problems;
+}
+
+/**
+ * What's wrong with a WebSocket server's `tokenTransport`, as a message, or
+ * undefined: a value that is neither mode, or `'header'` with a url that
+ * carries a `token` query parameter of its own, which would still put a
+ * credential in the url, or userinfo, whose Basic credential the Bearer
+ * header replaces whenever it carries a credential, since a request has one
+ * Authorization header. null counts as not set, as config-checks.ts has it.
+ * The refusal names the value's kind, never the value, which could be a
+ * credential pasted into the wrong field, and quotes nothing of the url.
+ */
+export function tokenTransportProblem(config: Pick<McplServerConfig, 'id' | 'tokenTransport'>, url: URL): string | undefined {
+  // A configuration read from JSON can hold anything here.
+  const mode: unknown = config.tokenTransport;
+  if (mode === undefined || mode === null || mode === 'query') return undefined;
+  if (mode !== 'header') {
+    return `MCP server "${config.id}": tokenTransport must be 'query' or 'header', not ${typeof mode === 'string' ? 'another string' : kindOf(mode)}`;
+  }
+  if (url.searchParams.has('token')) {
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as "token" or "accessProvider"`;
+  }
+  if (url.username || url.password) {
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry userinfo (user:password@), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; leave out "tokenTransport" to send the userinfo as before, or give the credential as "token" or "accessProvider"`;
+  }
+  return undefined;
+}
+
+/**
+ * Whether a header-mode credential can go in an `Authorization: Bearer`
+ * header as it is: printable ASCII (U+0020 to U+007E), with no space at
+ * either end. Node and Bun send exactly those bytes, so the server checks the
+ * credential that was configured, and the redactor's patterns match whatever
+ * it echoes. Outside that set a header can't carry it as configured: a space
+ * at either end is dropped (by Bun before sending, by an HTTP parser on
+ * arrival), a control character can't go in a header, and a character past
+ * U+007E goes out as different bytes from Node and from Bun, or is refused
+ * when the socket is built.
+ */
+export function headerCarries(credential: string): boolean {
+  return /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(credential);
 }
 
 /** A host a connection to which never leaves this machine, as the WHATWG URL

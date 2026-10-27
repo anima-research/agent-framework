@@ -21,13 +21,14 @@ import type {
   ProcessEvent,
   TraceEventListener,
   ModuleMessage,
+  ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
 import { heldWriteId } from './held-writes.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
-import { toolArgsProblems } from './tool-args.js';
+import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -110,11 +111,11 @@ export class ModuleRegistry {
   private store: JsStore;
   private queue: ModuleQueue;
   private getAgents: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
@@ -134,11 +135,11 @@ export class ModuleRegistry {
     queue: ModuleQueue,
     options: {
       getAgents: () => Agent[];
-      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
       getMessage: (id: MessageId) => ModuleMessage | null;
-      queryMessages: (filter: MessageQuery) => MessageQueryResult;
+      queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
@@ -230,7 +231,8 @@ export class ModuleRegistry {
 
   /**
    * Set state for a module by name.
-   * Used by the framework to apply stateUpdate from EventResponse atomically.
+   * Used by the framework to apply stateUpdate from EventResponse after its
+   * message changes.
    */
   setModuleState(moduleName: string, state: unknown): void {
     const ctx = this.moduleContexts.get(moduleName);
@@ -310,21 +312,28 @@ export class ModuleRegistry {
    * Handle a tool call by routing to the appropriate module: the module's own
    * result, unchecked, as it returned it, for a caller that uses the result
    * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
-   * calling the registry). A module's throw is answered as an error result.
+   * calling the registry), less a refusal it claims (withoutRefusal). A
+   * module's throw is answered as an error result.
    * A call whose input isn't an object, or lacks a key the tool's schema
    * requires, is answered before the module runs, with an error result that
    * opens "Nothing was done:" and names what to send (toolArgsProblems).
+   * So is a call membrane marked `unparseableInput`, unless its text is JSON
+   * `null`, which reaches the module as a call with no arguments
+   * (markedInputRefusal).
    * A caller that has already resolved the tool's definition, as the `utils`
    * tool has a utility's, passes it as `definition`, and it's checked against
    * that one.
    */
-  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+  async handleToolCall(given: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    const marked = markedInputRefusal(given);
+    if (marked !== undefined) return { success: false, error: marked, isError: true };
+    const call = asCalled(given);
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
       return {
         success: false,
-        error: `Invalid tool name format: ${call.name}`,
+        error: `Invalid tool name format: ${call.name}, so nothing was done`,
         isError: true,
       };
     }
@@ -336,19 +345,14 @@ export class ModuleRegistry {
     if (!module) {
       return {
         success: false,
-        error: `Module not found: ${moduleName}`,
+        error: `Module not found: ${moduleName}, so nothing was done`,
         isError: true,
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity and turn)
-    const moduleCall: ToolCall = {
-      id: call.id,
-      name: toolName,
-      input: call.input,
-      callerAgentName: call.callerAgentName,
-      ...(call.callerTurnId !== undefined ? { callerTurnId: call.callerTurnId } : {}),
-    };
+    // The call as it came, with the un-prefixed name: the caller's identity
+    // and everything else the dispatch set on it reach the module.
+    const moduleCall: ToolCall = { ...call, name: toolName };
 
     try {
       // The call against the tool's declared schema, before the module runs:
@@ -372,7 +376,9 @@ export class ModuleRegistry {
           isError: true,
         };
       }
-      return await module.handleToolCall(moduleCall);
+      // A refusal is the dispatcher's to say (RFC-007), so a module's result
+      // can't claim one on this route either.
+      return withoutRefusal(call, await module.handleToolCall(moduleCall));
     } catch (error) {
       return thrownResult(error);
     }
@@ -441,8 +447,18 @@ export class ModuleRegistry {
 
   /**
    * Gather context injections from all modules before inference.
-   * Calls each module's gatherContext() in parallel with a per-module timeout.
-   * Fail-open: timed-out or erroring modules are skipped (with a stderr line).
+   * Calls each module's gatherContext() in parallel with a per-module timeout,
+   * and returns their injections in the modules' registration order, whatever
+   * order they finish in. Fail-open: timed-out or erroring modules are skipped
+   * (with a stderr line), whether the call throws, rejects, or answers with
+   * something that isn't an array of objects, or with a `system` entry whose
+   * content isn't an array of objects, every block of which the agent's
+   * buildSystemPrompt reads, and one that answers after its timeout adds
+   * nothing. An array returned without a promise is taken as the module's
+   * answer. An entry's other fields are the module's to get right. Each
+   * module's budget starts once its call returns, after its own synchronous
+   * work and every earlier module's; a later module's synchronous work still
+   * counts against it.
    *
    * The per-module budget is `module.contextTimeoutMs` when declared, else the
    * `timeoutMs` default (15s). Modules whose gatherContext does real work —
@@ -452,12 +468,16 @@ export class ModuleRegistry {
    * to MAX_CONTEXT_TIMEOUT_MS so no single module can hold every turn hostage.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ContextInjection[]> {
-    const injections: ContextInjection[] = [];
+  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ModuleContextInjection[]> {
+    // Each module's result in registration order, whatever order they finish
+    // in: a stored injection's content hash follows that order, and a module
+    // that answers after its timeout adds nothing (it's skipped, fail-open).
+    const results: ModuleContextInjection[][] = [];
     const promises: Promise<void>[] = [];
 
     for (const module of this.modules.values()) {
-      if (!module.gatherContext) continue;
+      const gather = module.gatherContext;
+      if (!gather) continue;
 
       // Clamp the per-module budget. A module declaring `contextTimeoutMs`
       // legitimately needs more than the shared default (e.g. a retrieval
@@ -469,14 +489,43 @@ export class ModuleRegistry {
         MAX_CONTEXT_TIMEOUT_MS,
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      const slot = results.length;
+      results.push([]);
+      // Called here, before its timer is set, so its budget starts after its
+      // synchronous work; a call that throws is skipped as a rejection is.
+      let call: Promise<ModuleContextInjection[]>;
+      try {
+        call = Promise.resolve(gather.call(module, agentName));
+      } catch (err) {
+        call = Promise.reject(err);
+      }
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => {
-          injections.push(...r);
+        call.then(r => {
+          if (timedOut) return;
+          // Checked before it's kept, so an answer that isn't an array of
+          // objects skips the module, as does a system entry whose content
+          // isn't an array of objects: buildSystemPrompt reads every block
+          // of it, and one it can't read would fail the turn. Each array is
+          // read through Array.from, which reads a hole as `undefined`, as
+          // context-manager's compile does when it spreads the content.
+          if (!Array.isArray(r) || Array.from(r).some((entry) => entry === null || typeof entry !== 'object')) {
+            throw new TypeError(`gatherContext answered with ${Array.isArray(r) ? 'an array holding an entry that is not an object' : r === null ? 'null' : typeof r}, not an array of objects`);
+          }
+          const unreadable = r.find((entry) => entry.position === 'system'
+            && !(Array.isArray(entry.content) && Array.from(entry.content).every((block) => block !== null && typeof block === 'object')));
+          if (unreadable) {
+            throw new TypeError(`gatherContext answered with a system injection in namespace ${logValue(unreadable.namespace)} whose content isn't an array of objects`);
+          }
           this.noteBlocksNotShown(module.name, r);
+          results[slot] = [...r];
         }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
-            () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
+            () => {
+              timedOut = true;
+              rej(new Error(`gatherContext timed out after ${budgetMs}ms`));
+            },
             budgetMs,
           );
         }),
@@ -488,7 +537,7 @@ export class ModuleRegistry {
     }
 
     await Promise.all(promises);
-    return injections;
+    return results.flat();
   }
 
   /**
@@ -609,11 +658,11 @@ class ModuleContextImpl implements ModuleContext {
   private registry: ModuleRegistry;
   readonly isRestart: boolean;
   private getAgentsFn: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
@@ -629,11 +678,11 @@ class ModuleContextImpl implements ModuleContext {
     registry: ModuleRegistry,
     isRestart: boolean,
     getAgents: () => Agent[],
-    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
+    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => ModuleMessage | null,
-    queryMessages: (filter: MessageQuery) => MessageQueryResult,
+    queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult,
     pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
     callTool: (call: ToolCall) => Promise<ToolResult>
@@ -755,9 +804,17 @@ class ModuleContextImpl implements ModuleContext {
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    opts?: { forAgent?: string },
   ): MessageId {
-    const id = this.addMessageFn(participant, content, metadata);
+    // The external id map is read in the primary's store
+    // (findMessageByExternalId), so a mapping into another window would
+    // answer wrong.
+    if (metadata?.external && opts?.forAgent !== undefined) {
+      throw new Error(`A message for agent ${JSON.stringify(opts.forAgent)} can't carry metadata.external: `
+        + "its external id would be looked up in the primary's window. Leave forAgent out, or the external id.");
+    }
+    const id = this.addMessageFn(participant, content, metadata, opts);
 
     // Track external ID if provided. A write the framework holds keeps '',
     // as it did before held writes had handles: the map is module state an
@@ -821,8 +878,8 @@ class ModuleContextImpl implements ModuleContext {
     return this.getMessageFn(id);
   }
 
-  queryMessages(filter: MessageQuery): MessageQueryResult {
-    return this.queryMessagesFn(filter);
+  queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult {
+    return this.queryMessagesFn(filter, opts);
   }
 
   getAgents(): AgentInfo[] {
@@ -900,8 +957,85 @@ class ProcessStateImpl implements ProcessState {
   }
 }
 
+/** The fields ToolResult declares, read by name, so a result class's getters count: endTurn first and the error next, so a failure keeps them. */
+const TOOL_RESULT_FIELDS = ['endTurn', 'error', 'success', 'isError', 'data', 'structured', 'keepWhenWithheld'] as const;
+
+/**
+ * A module's result for an in-process caller: the module's own object, unless
+ * it claims a refusal, which is the dispatcher's to say (RFC-007). Then it's a
+ * copy, less the claim: a plain object of every field ToolResult declares,
+ * read by name, so a result class's getters count, each read once, and every
+ * other own enumerable field, string or symbol, as a spread takes them, so
+ * non-enumerable own fields and inherited undeclared ones are left out. A
+ * result that can't be read, its claim included, is a failure saying so, as
+ * on the stored route (checkedToolResult),
+ * keeping the turn's end and the module's error if those could be read: the
+ * module's call completed, and the claim never reaches the caller.
+ */
+function withoutRefusal(call: ToolCall, result: ToolResult): ToolResult {
+  // Not an object: nothing to claim, and the caller gets it as it came.
+  if (!result || (typeof result !== 'object' && typeof result !== 'function')) return result;
+  const source = result as unknown as Record<PropertyKey, unknown>;
+  const copy: Record<PropertyKey, unknown> = {};
+  // Each field is read once: one whose getter threw isn't asked again.
+  const read = new Set<PropertyKey>();
+  // Defined, not assigned, so a field named __proto__ is a field.
+  const keep = (key: PropertyKey): void => {
+    read.add(key);
+    Object.defineProperty(copy, key, { value: source[key], enumerable: true, writable: true, configurable: true });
+  };
+  const once = (key: string): unknown => {
+    if (key in copy) return copy[key];
+    if (read.has(key)) return undefined;
+    return source[key];
+  };
+  // A failure keeps what could be read of the turn's end and the module's
+  // error, each read on its own, whatever else couldn't be.
+  const unreadable = (error: unknown): ToolResult => {
+    let endTurn: unknown;
+    let own: string | undefined;
+    try {
+      endTurn = once('endTurn');
+    } catch {
+      // Not readable: the failure doesn't end the turn.
+    }
+    try {
+      own = errorText(once('error'));
+    } catch {
+      // An error whose own text can't be read: the failure says only why.
+    }
+    return {
+      success: false,
+      isError: true,
+      error: `Tool '${call.name}' returned a result that couldn't be read (${thrownText(error).split('\n')[0] || 'no reason given'}). ` +
+        `The call itself completed${own ? `, with this error: ${own}` : '.'}`,
+      ...(endTurn ? { endTurn: true } : {}),
+    };
+  };
+  let claim: unknown;
+  try {
+    claim = source.refused;
+  } catch (error) {
+    return unreadable(error);
+  }
+  if (!claim) return result;
+  try {
+    const copied = new Set<PropertyKey>(['refused']);
+    for (const key of TOOL_RESULT_FIELDS) {
+      copied.add(key);
+      if (key in source) keep(key);
+    }
+    for (const key of Reflect.ownKeys(source)) {
+      if (!copied.has(key) && Object.prototype.propertyIsEnumerable.call(source, key)) keep(key);
+    }
+    return copy as unknown as ToolResult;
+  } catch (error) {
+    return unreadable(error);
+  }
+}
+
 /** A result's flags, which consumers read for their truth: booleans here. */
-const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
+const RESULT_FLAGS = ['success', 'isError', 'endTurn', 'dataIsContent'] as const;
 
 /**
  * A module's tool result as the framework can store, send and trace it. A
@@ -921,7 +1055,8 @@ const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
  * runs again. It's taken where the framework stores or sends a result
  * ({@link ModuleRegistry.storableToolCall}). A caller that uses the result
  * in process (`ModuleContext.callTool`, `executeToolCall`) gets the module's
- * own result, as the module returned it ({@link ModuleRegistry.handleToolCall}).
+ * own result, as the module returned it, less a refusal it claims
+ * ({@link ModuleRegistry.handleToolCall}).
  * The flags are booleans, read for their truth as consumers read them.
  * `error` is its text form, which is all a consumer reads of it, so an error
  * value JSON can't hold costs nothing. An error that says nothing (null,
@@ -971,12 +1106,15 @@ export function checkedToolResult(call: ToolCall, result: unknown): { result: To
     endTurn = Boolean(fields.endTurn);
     read('error');
     ownText = errorText(fields.error);
-    for (const key of ['success', 'isError', 'data']) read(key);
+    for (const key of ['success', 'isError', 'data', 'dataIsContent']) read(key);
     for (const key of Object.keys(candidate)) {
       if (key !== 'toJSON' && !(key in fields)) fields[key] = candidate[key];
     }
     // The error is kept as its text, which consumers read; its value isn't.
     delete fields.error;
+    // A refusal is the dispatcher's to say, before the call opens (RFC-007):
+    // a module answers after that, so its result can't claim one.
+    delete fields.refused;
     // The flags are kept as their truth, which is all consumers read of them,
     // before anything is serialized, so a flag's own value (a BigInt, a
     // function, an object with a toJSON) neither breaks nor runs anything.

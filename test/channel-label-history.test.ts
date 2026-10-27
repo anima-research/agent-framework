@@ -163,7 +163,7 @@ test('resolveProseTargetDurable prefers the live path and only falls back to his
   // Live path resolves uniquely against the live channel — must win over
   // the (stale) history entry for the ghost channel.
   const live = registry.resolveProseTarget('shared-label');
-  assert.deepEqual(live, { channelId: 'discord:g1:live', label: 'shared-label' });
+  assert.deepEqual(live, { channelId: 'discord:g1:live', serverId: 'discord', label: 'shared-label' });
   assert.deepEqual(registry.resolveProseTargetDurable('shared-label'), live);
 });
 
@@ -286,6 +286,7 @@ test('a label-less descriptor from handleRegister does not crash and does not po
   await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c2', '#general')] });
   assert.deepEqual(registry.resolveProseTargetDurable('#general'), {
     channelId: 'discord:g1:c2',
+    serverId: 'discord',
     label: '#general',
   });
   assert.doesNotThrow(() => registry.resolveProseTargetDurable('#anything-else'));
@@ -300,7 +301,7 @@ test('a channel renamed A -> B -> A is still resolvable by a name from BEFORE th
   await registry.handleChanged('discord', { updated: [descriptor('discord:g1:c1', '#alpha')] });
 
   // Live-path check: '#alpha' is current again, so it resolves live.
-  assert.deepEqual(registry.resolveProseTarget('#alpha'), { channelId: 'discord:g1:c1', label: '#alpha' });
+  assert.deepEqual(registry.resolveProseTarget('#alpha'), { channelId: 'discord:g1:c1', serverId: 'discord', label: '#alpha' });
 
   // The interesting case: '#beta' is a name from BEFORE the most recent
   // rename (A -> B -> A), not the current OR immediately-previous label —
@@ -378,6 +379,7 @@ test('a DM registered live resolves after a restart via @name, not just the lite
   // establishes this is real DM-shaped addressing, not a coincidence.
   assert.deepEqual(first.resolveProseTarget('@antra'), {
     channelId: 'discord:dm:antra',
+    serverId: 'discord',
     label: 'DM: antra',
   });
 
@@ -445,6 +447,7 @@ test('a DM whose live username differs from its display label resolves by USERNA
   // not an invented requirement.
   assert.deepEqual(first.resolveProseTarget('@antra_tessera'), {
     channelId: 'discord:dm:42',
+    serverId: 'discord',
     label: 'DM: Tess',
   });
 
@@ -481,6 +484,7 @@ test('a DM classified only via metadata.channelType (non-conventional id/label) 
   // Live check: classified as a DM live via metadata alone.
   assert.deepEqual(first.resolveProseTarget('<@42>'), {
     channelId: 'private-room-42',
+    serverId: 'discord',
     label: 'Tess',
   });
 

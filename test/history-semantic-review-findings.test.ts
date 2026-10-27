@@ -106,7 +106,10 @@ class StubCm {
   }
   getSummariesInRange() { return this.summaries; }
   getMessage(id: string) { return this.messages.find((m) => m.id === id) ?? null; }
-  getSummary(id: string) { return this.summaries.find((s) => s.id === id) ?? null; }
+  getSummary(id: string) {
+    const s = this.summaries.find((x) => x.id === id);
+    return s ? { ...s, created: s.createdMs } : null;
+  }
   onMessage(l: Listener) { this.listeners.add(l); return () => this.listeners.delete(l); }
   edit(id: string, text: string) {
     const m = this.getMessage(id)!;
@@ -160,7 +163,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     const m = mod(new StubCm(store, summaries));
     const r = await m.syncSemanticIndex(300)!;
     assert.equal(r.more, true);
-    assert.ok(svc.items.has('sum:s1'), 'summary indexed while the message backlog is still draining');
+    assert.ok(svc.items.has(`sum:s1@${T0 + 5}`), 'summary indexed while the message backlog is still draining');
     await m.stop();
   });
 
@@ -402,7 +405,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     const sums = [1, 2, 3].map((i) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T0, endMs: T0 + 1, firstSequence: 0, lastSequence: 1, createdMs: T0 + 5 }));
     const m = mod(new StubCm([], sums));
     for (let i = 0; i < 5; i++) await m.syncSemanticIndex(1);
-    assert.deepEqual([...svc.items.keys()].sort(), ['sum:s1', 'sum:s2', 'sum:s3']);
+    assert.deepEqual([...svc.items.keys()].sort(), [1, 2, 3].map((i) => `sum:s${i}@${T0 + 5}`));
     await m.stop();
   });
 
@@ -505,7 +508,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     m.bind(new StubCm([msg('e', T0, `x${grin.repeat(250)}`)], [summary]) as unknown as ContextManager);
     await m.syncSemanticIndex();
     assert.equal(svc.items.get('msg:e')?.text, `x${grin.repeat(199)}`);
-    assert.equal(svc.items.get('sum:s1')?.text, `x${grin.repeat(199)}`);
+    assert.equal(svc.items.get(`sum:s1@${T0 + 5}`)?.text, `x${grin.repeat(199)}`);
     await m.stop();
   });
 

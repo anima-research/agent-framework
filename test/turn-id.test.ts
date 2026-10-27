@@ -17,11 +17,13 @@ import type {
 import type { AgentConfig, SpeechContext } from '../src/types/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { fireNextYieldAsSet } from './helpers/capture-timers.js';
 
 // A module can tell one turn's work from another's: the tool calls made in an
 // agent's turn carry the turn's id (`ToolCall.callerTurnId`), its speech
 // carries the same id (`SpeechContext.turnId`), the agent's next turn has a
-// new one, and a background script's call carries none.
+// new one, and a call of a script left running, which no call watches,
+// carries none.
 
 class TurnRecorder implements Module {
   readonly name = 'test';
@@ -219,7 +221,7 @@ test('a script\'s inner calls carry the turn of the code_execution call that run
     queueToolTurn(membrane, {
       id: 'call-ce',
       name: 'code_execution',
-      input: { code: 'await test__echo({"message": "first"})\nawait test__echo({"message": "second"})' },
+      input: { code: 'await tools["test--echo"]({ message: "first" });\nawait tools["test--echo"]({ message: "second" });' },
     });
     await runTurn(framework, 'go');
     const inner = recorder.calls.filter((c) => String(c.id).startsWith('pytc-'));
@@ -229,6 +231,43 @@ test('a script\'s inner calls carry the turn of the code_execution call that run
     const turn = recorder.speeches[0]!.turnId;
     assert.equal(typeof turn, 'number');
     assert.deepEqual(inner.map((c) => c.callerTurnId), [turn, turn], 'both calls carry the code_execution call\'s turn');
+  });
+});
+
+test("a script's inner calls carry what its agent had read when the run call started the script, after the agent has read more", async () => {
+  await withFramework({ codeExecution: true }, async ({ framework, membrane, recorder }) => {
+    type Start = { turnId?: number; readThrough: { branch: string; sequence: number } | null };
+    const fw = framework as unknown as { dispatchScriptToolCall: (...args: unknown[]) => Promise<unknown> };
+    const agent = framework.getAgent('assistant') as unknown as {
+      getConsumedWatermark(): { branch: string; sequence: number } | null;
+      getContextManager(): { addMessage(participant: string, content: unknown[]): unknown };
+      markContextConsumed(): void;
+    };
+    // What the bridge hands the dispatch with each of the script's calls.
+    const seen: Array<{ start: Start; read: unknown }> = [];
+    const dispatch = fw.dispatchScriptToolCall.bind(framework);
+    fw.dispatchScriptToolCall = (...args: unknown[]) => {
+      seen.push({ start: args[5] as Start, read: agent.getConsumedWatermark() });
+      return dispatch(...args);
+    };
+    // The agent reads more between the script's two calls, as a later
+    // round's boundary would have it.
+    recorder.onCall = async (call) => {
+      if (messageOf(call) !== 'first') return;
+      agent.getContextManager().addMessage('Antra', [{ type: 'text', text: 'read since the script started' }]);
+      agent.markContextConsumed();
+    };
+    queueToolTurn(membrane, {
+      id: 'call-ce',
+      name: 'code_execution',
+      input: { code: 'await tools["test--echo"]({ message: "first" });\nawait tools["test--echo"]({ message: "second" });' },
+    });
+    await runTurn(framework, 'go');
+    assert.equal(seen.length, 2, 'the script made both calls');
+    assert.ok(seen[0]!.start.readThrough, "the call carries its script's start reading");
+    assert.deepEqual(seen[0]!.start.readThrough, seen[0]!.read, 'what the agent had read as the run call started it');
+    assert.notDeepEqual(seen[1]!.read, seen[0]!.read, 'the agent read more before the second call');
+    assert.deepEqual(seen[1]!.start.readThrough, seen[0]!.read, 'and the second call carries the start reading still');
   });
 });
 
@@ -298,33 +337,41 @@ test('a dispatched call carries the turn it is dispatched with, or none, whateve
   });
 });
 
-test('a background script\'s call carries no turn, even while a foreground script of a turn runs', async () => {
+test('a left script\'s call carries no turn, even while a script a turn waits on runs', async () => {
   await withFramework({ codeExecution: true }, async ({ framework, membrane, recorder }) => {
-    // One round starts a background script and a foreground script. The
-    // background script's first call waits in the module until the foreground
-    // script's call is there; its second call is dispatched while the
-    // foreground script waits for that call's result, which waits for it.
+    // One round starts a script that yields at once, left running, and one
+    // the turn waits on. The left script's first call waits in the module
+    // until the other script's call is there; its second call is dispatched
+    // while the other script waits for that call's result, which waits for it.
+    const yields = fireNextYieldAsSet((framework as unknown as { codeExecution: { scripts: object } }).codeExecution.scripts, 60_000);
     const foregroundCalled = signal();
     const backgroundCalledDuring = signal();
+    const timedOut: string[] = [];
+    const held = (done: Promise<void>, what: string) => within(done, what).catch((err: Error) => {
+      timedOut.push(err.message);
+      throw err;
+    });
     recorder.onCall = async (call) => {
       const message = messageOf(call);
-      if (message === 'background, first') await within(foregroundCalled.done, 'the foreground script didn\'t call');
+      if (message === 'background, first') await held(foregroundCalled.done, 'the foreground script didn\'t call');
       else if (message === 'background, during') backgroundCalledDuring.resolve();
       else if (message === 'foreground') {
         foregroundCalled.resolve();
-        await within(backgroundCalledDuring.done, 'the background script didn\'t call again');
+        await held(backgroundCalledDuring.done, 'the background script didn\'t call again');
       }
     };
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'starting both' },
       { type: 'tool_use', id: 'call-bg', name: 'code_execution', input: {
-        background: true,
-        code: 'await test__echo({"message": "background, first"})\nawait test__echo({"message": "background, during"})',
+        yield_time_ms: 60_000,
+        code: 'await tools["test--echo"]({ message: "background, first" });\nawait tools["test--echo"]({ message: "background, during" });',
       } } as ContentBlock,
-      { type: 'tool_use', id: 'call-fg', name: 'code_execution', input: { code: 'await test__echo({"message": "foreground"})' } } as ContentBlock,
+      { type: 'tool_use', id: 'call-fg', name: 'code_execution', input: { code: 'await tools["test--echo"]({ message: "foreground" });' } } as ContentBlock,
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
     await runTurn(framework, 'go');
+    assert.deepEqual(yields, { fired: true }, 'the left script\'s run call yielded as its timer was set');
+    assert.deepEqual(timedOut, [], 'each call waited for its counterpart, not for the bound');
     const byMessage = (message: string) => recorder.calls.find((c) => messageOf(c) === message);
     const foreground = byMessage('foreground');
     const during = byMessage('background, during');
@@ -333,7 +380,9 @@ test('a background script\'s call carries no turn, even while a foreground scrip
     assert.equal(recorder.speeches.length, 1);
     assert.equal(typeof foreground.callerTurnId, 'number', 'the foreground script\'s call carries a turn');
     assert.equal(foreground.callerTurnId, recorder.speeches[0]!.turnId, 'the foreground script\'s call carries the turn');
-    assert.equal(byMessage('background, first')?.callerTurnId, undefined);
+    const first = byMessage('background, first');
+    assert.ok(first, 'the left script made its first call');
+    assert.equal(first.callerTurnId, undefined);
     assert.equal(during.callerTurnId, undefined);
   });
 });

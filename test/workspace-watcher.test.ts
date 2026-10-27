@@ -610,7 +610,11 @@ describe('MountWatcher lifecycle', () => {
 
   // The identity is read from the descriptor held, so it's the held
   // directory's even when the root is replaced between the open and the read.
-  // Here the replacement happens inside the open, and a poll finds it.
+  // Here the replacement happens inside the open, and a poll finds it. The
+  // poll is driven at once, before chokidar's first instance is ready, as a
+  // loaded host's timer can run it first: the re-attach then closes that
+  // instance, whose ready never comes. So the test waits for a ready after
+  // the re-attach, which is what the watcher promises, not for two readies.
   it('reads the held root identity from what it holds, so a root replaced as it was opened is found', {
     skip: process.platform !== 'linux',
   }, async () => {
@@ -626,14 +630,16 @@ describe('MountWatcher lifecycle', () => {
       }
       return fd;
     }, async () => {
-      let readyCount = 0;
       let reattachCount = 0;
+      let readyAfterReattach = false;
       const { watcher } = collectWithNative(
-        { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
-        { ...makeConfig(), path: root },
+        { onReady: () => { if (reattachCount > 0) readyAfterReattach = true; }, onReattach: () => { reattachCount++; } },
+        { ...makeConfig(), path: root, watchRootPollMs: EVENT_MS * 6 },
       );
       try {
-        await waitFor(() => reattachCount > 0 && readyCount > 1, 'expected a poll to find the root replaced as it was opened');
+        await (watcher as unknown as { checkRootLiveness(): Promise<void> }).checkRootLiveness();
+        assert.strictEqual(reattachCount, 1, 'a poll finds the root replaced as it was opened, and re-attaches');
+        await waitFor(() => readyAfterReattach, 'expected the watcher ready after the re-attach');
         assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds the root at its path');
         assert.deepStrictEqual(descriptorsOf(`${root}.away`), [], 'the watcher still holds the directory moved away');
       } finally {
@@ -1120,6 +1126,7 @@ describe('MountWatcher ignores what a walk passes over by design (connectome-hos
     mkdirSync(join(root, 'cache'), { recursive: true });
     mkdirSync(join(root, 'drafts~'), { recursive: true });
     for (const other of others) mkdirSync(join(root, other), { recursive: true });
+    for (const f of files) mkdirSync(join(root, dirname(f)), { recursive: true });
     let ready = false;
     const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore }, others);
     try {
@@ -1151,6 +1158,35 @@ describe('MountWatcher ignores what a walk passes over by design (connectome-hos
     it(`passes over another mount's directory nested in this one, and reports what lies beside it (${backend})`, async () => {
       const files = ['inner/mount/x.txt', 'inner/kept.txt', 'kept.txt'];
       assert.deepEqual(await reported(collectOn, [], files, ['inner/kept.txt', 'kept.txt'], ['inner/mount']), ['inner/kept.txt', 'kept.txt']);
+    });
+
+    it(`passes over a directory a trailing "/" names, and reports a file of that name (${backend})`, async () => {
+      assert.deepEqual(await reported(collectOn, ['out/'], ['out/x.txt', 'deep/out/y.txt', 'sub/out', 'kept.txt'], ['sub/out', 'kept.txt']), ['kept.txt', 'sub/out']);
+    });
+
+    it(`reports nothing when a directory a trailing "/" names is removed, and reports a file of that name removed (${backend})`, async () => {
+      const root = join(tmp, 'work');
+      for (const f of ['out/x.txt', 'sub/out', 'kept.txt']) {
+        mkdirSync(join(root, dirname(f)), { recursive: true });
+        writeFileSync(join(root, f), 'x');
+      }
+      let ready = false;
+      const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore: ['out/'] });
+      try {
+        await waitFor(() => ready, 'expected the watcher to be ready', 10_000);
+        await changesFlow(root, batches, ['', 'sub']);
+        rmSync(join(root, 'out'), { recursive: true });
+        unlinkSync(join(root, 'sub/out'));
+        writeFileSync(join(root, 'after.txt'), 'x');
+        const seen = (p: string) => batches.flat().some((c) => c.path === p);
+        await waitFor(() => seen('sub/out') && seen('after.txt'), 'expected sub/out and after.txt to be reported', 10_000);
+        await wait(SETTLE_MS);
+      } finally {
+        await watcher.stop();
+      }
+      const changes = batches.flat().filter((c) => !isProbe(c.path));
+      assert.deepEqual(changes.filter((c) => c.path === 'out' || c.path.startsWith('out/')), []);
+      assert.ok(changes.some((c) => c.path === 'sub/out' && c.op === 'deleted'), JSON.stringify(changes));
     });
   }
 

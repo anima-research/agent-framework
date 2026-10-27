@@ -96,6 +96,9 @@ export interface McplAudioContent {
   disposition?: 'never' | 'ref';
 }
 
+/** MCPL's reference block (RFC-005 §3). A `resource` block with no `uri` of
+ *  its own may be MCP's embedded resource instead, its contents under
+ *  `resource`, which classifyBlock tells apart and shows as its contents. */
 export interface McplResourceContent {
   type: 'resource';
   /** Resource URI (e.g., "memory://facts/12345") */
@@ -190,6 +193,9 @@ export interface McplHostCapabilities {
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
+  /** RFC-014 §6.3: this host presents tool hints. Sent only to a server
+   *  whose config sets `toolHints: true`. */
+  toolHints?: boolean;
 }
 
 /** Channel capability leaves (§14.1). `observe` was the pre-0.5 name for
@@ -285,11 +291,27 @@ export interface McplServerConfig {
   /**
    * Bearer token for a network server. Where it travels depends on the
    * transport: on a ws(s):// url it is appended as a `token` query parameter
-   * (`?token=…`) on connect; to an http(s):// server it is sent as an
-   * `Authorization: Bearer` header and never put in the url. A legacy stdio
-   * server ignores it, and a modern stdio server refuses it.
+   * (`?token=…`) on connect, unless `tokenTransport` is `'header'`; to an
+   * http(s):// server it is sent as an `Authorization: Bearer` header and
+   * never put in the url. A legacy stdio server ignores it, and a modern
+   * stdio server refuses it.
    */
   token?: string;
+
+  /**
+   * How a ws(s):// server's credential, `token` or what `accessProvider`
+   * returns for the dial, is sent on the WebSocket upgrade. `'query'`, the
+   * default: as a `token` query parameter (`?token=…`). `'header'`: as an
+   * `Authorization: Bearer …` header, with no query parameter, so the
+   * credential stays out of the url and of the access logs that record it.
+   * A header carries a credential as configured only if it is printable
+   * ASCII (U+0020 to U+007E) with no space at either end, so header mode
+   * refuses any other: a static `token` when the server is added, an access
+   * provider's at the dial. Set only on a WebSocket server; an http(s)://
+   * server always sends the header, and a stdio server sends no credential.
+   * `null` counts as not set.
+   */
+  tokenTransport?: 'query' | 'header';
 
   /**
    * Lazily resolves the connection credential at EVERY dial — first connect
@@ -362,7 +384,9 @@ export interface McplServerConfig {
    *
    * `disabledCapabilities` takes precedence on conflict. `version` and
    * `featureSets` are not maskable here — feature sets have their own
-   * enable/disable knobs above.
+   * enable/disable knobs above — and neither are RFC-014's `toolHints`,
+   * `toolsets` and `surface`, which a server's own `toolHints` config turns
+   * off.
    */
   enabledCapabilities?: string[];
 
@@ -414,9 +438,10 @@ export interface McplServerConfig {
    * are also the only bound for one that closes its stdin, since Bun emits no
    * 'error' event for the writes to it. requestTimeoutMs is the timeout of
    * every request that names none; the handshake's initialize has its own.
-   * Set 0 to disable, except for channels/publish and the channels/open a
-   * delivery may send first, which keep the 60 s default: a publish's outcome
-   * is reported to the resident and recorded for its draft, so it must end.
+   * Set 0 to disable, except for channels/publish, channels/open and
+   * channels/close, which keep the 60 s default: a publish's outcome is
+   * reported to the resident and recorded for its draft, so it must end, and
+   * a delivery waits for a channel's queued opens and closes.
    * Default: 60000 (60 seconds). A value above 2^31−1 is refused: Node runs a
    * longer timer after about 1 ms, so every request would time out at once.
    *
@@ -481,6 +506,20 @@ export interface McplServerConfig {
    * See src/mcpl/tool-lifecycle.ts.
    */
   toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
+
+  /**
+   * MCPL RFC-014 (tool presence, toolsets and surfaces). Default false: the
+   * host advertises nothing and treats every tool as static, byte for byte as
+   * before. When true, the host advertises `experimental.mcpl.toolHints`, and
+   * honours hints only from a server that advertised `toolHints` too. Then
+   * the server's static tools stay in the tool list as before, and its
+   * dynamic tools (toolset tools, `mcpl/presence: "dynamic"`) leave it: they
+   * are announced in the conversation as they become visible and invisible,
+   * and called through the `toolsets` module's `toolsets--act`, opened with
+   * `toolsets--open`, inspected with `toolsets--look` and closed with
+   * `toolsets--close`. Only `true` turns it on, and null counts as not set.
+   */
+  toolHints?: boolean;
 }
 
 // ============================================================================
@@ -1282,7 +1321,8 @@ export interface ChannelIncomingMessageResult {
  * Non-normative; host-defined. See Spec Section 11.5.
  */
 export interface InferenceRoutingPolicy {
-  /** Default model for all inference requests */
+  /** Model for a request no override, byFeature or wildcards entry names a
+   *  model for. Left empty, such a request is refused with -32603. */
   default: string;
 
   /** Model override per feature set name */

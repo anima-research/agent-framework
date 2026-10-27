@@ -1,3 +1,4 @@
+import type { ThinkingBindingEntry } from '@animalabs/membrane';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
@@ -33,8 +34,22 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'process:completed';
       processEvent: ProcessEvent;
+      /** The modules' responses that applied: one refused for malformed
+       *  content is left out, and named by process:response-refused. */
       responses: ModuleProcessResponse[];
       durationMs: number;
+    })
+  /** A module's process response held content context-manager won't store,
+   *  in a message it adds or an edit it makes, and was refused whole before
+   *  any response to the event applied. `where` names the first such message
+   *  or edit in the response, such as `addMessages[1]`, and `places` is
+   *  malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'process:response-refused';
+      moduleName: string;
+      eventType: string;
+      where: string;
+      places: string[];
     })
 
   // Inference lifecycle
@@ -52,6 +67,14 @@ export type TraceEvent =
        * without re-deriving routing.
        */
       channelId?: string;
+      /**
+       * The server that registers `channelId`, given with it. Two MCPL
+       * servers may register one channel id, so a tap that posts back to the
+       * turn's channel, such as a host telling it the turn failed, passes this
+       * server with the id. The streaming traces, `inference:tokens` and
+       * `inference:content_block`, carry the id alone.
+       */
+      serverId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
       silent?: boolean;
     })
@@ -90,6 +113,23 @@ export type TraceEvent =
       error: string;
       /** Bounded like `error`. */
       stack?: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A turn waiting out its error policy's delay before a retry says so:
+       * as the wait begins, with when it is due to end, and again every 60
+       * seconds while it lasts, while its agent is the one registered under
+       * its name, and never after the wait ends (its time coming, a stop, or
+       * an abort). The failure being retried is the `inference:failed` just
+       * before it. A host watching for agents gone quiet can tell a waiting
+       * one from a stuck one by it.
+       */
+      type: 'inference:waiting';
+      agentName: string;
+      /** When the wait is due to end (epoch ms): it counts down by its
+       *  timers, so a stalled event loop can end it later. Absent for a wait
+       *  too long for a date. */
+      until?: number;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
@@ -148,8 +188,10 @@ export type TraceEvent =
        * minutes passed. 'nothing_pending': compression has nothing pending
        * and the context still doesn't fit. After those two the requests are
        * queued too, and the turn fails as a refused compile did before the
-       * hold. 'stopped': the framework stopped or the agent left, and the
-       * requests went with it.
+       * hold. 'stopped': the turn ended while it was held (an abandon, a
+       * stop of the turn or of the framework, or the agent's leaving), with
+       * its `inference:aborted`; the wakes that joined it go back to the queue
+       * after an abandon or a stop of the turn, and go with it otherwise.
        */
       outcome: 'fit' | 'check_failed' | 'deadline' | 'nothing_pending' | 'stopped';
       /** Since the hold started (`inference:held`'s `since`). */
@@ -170,9 +212,17 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel its typing shows, where the start's wake
+       *  came from, or, at a start whose wake names none, such as a budget
+       *  restart, the one the turn already shows. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -187,9 +237,17 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel its typing shows, where the start's wake
+       *  came from, or, at a start whose wake names none, such as a budget
+       *  restart, the one the turn already shows. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -201,6 +259,20 @@ export type TraceEvent =
       type: 'inference:usage';
       agentName: string;
       tokenUsage: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
+      /**
+       * The provider's report on the signed thinking of the call this event
+       * closes (membrane's `RoundReport.thinking`): blocks it dropped before
+       * the model saw them, and blocks it showed the model anyway because the
+       * check isn't enforced. `tokenUsage` beside it is the stream's running
+       * total, not this call's. The provider reports them for a request that
+       * carried the binding control, whoever asked for it:
+       * `thinkingBinding.dropBlock`, or a thinking config the host sends
+       * itself. Present only when the report names any block.
+       */
+      thinking?: {
+        dropped: ThinkingBindingEntry[];
+        mismatchAllowed: ThinkingBindingEntry[];
+      };
     })
   | (TraceEventBase & {
       type: 'inference:stream_resumed';
@@ -218,6 +290,66 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:turn_ended';
       agentName: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * Prose that delivery published, sent once the publish succeeds: the
+       * outgoing stream's chunk (MCPL Spec 14.3 `channels/outgoing/chunk`),
+       * emitted whether or not the channel's server takes the stream. It
+       * carries only what was published, so a consumer that speaks or shows
+       * it, such as a voice relay, never gets text that delivery withholds (a
+       * `skip_reply`, a silencing send, a private `think`, a hold, a bounce,
+       * a draft) or a publish the server didn't confirm (`delivered: true`):
+       * one refused before sending, one that threw, timed out or got an
+       * error answer, one the server reported undelivered
+       * (`delivered: false`), and one whose reply leaves `delivered` out.
+       * `inference:tokens` stays the model's text as it is written (held, as
+       * before, while a tool-result guard's batch is pending). A later
+       * publish to the same destination, a server and its channel, by the
+       * same stream opens with a paragraph break (`\n\n`), so a
+       * destination's chunks joined in `index` order are its text, its
+       * messages kept apart.
+       * `mcpl:speech-routed` also reports speech publishes, with no stream
+       * id, index or end, each once delivered: deliverSpeech's, the `sleep`
+       * tool's announcement among them, and a subconscious's
+       * `speak_in_channel`'s. A relay that voices the agent's prose takes
+       * this trace, with `inference:published_complete`, and not
+       * `mcpl:speech-routed` as well, and takes each message's id from its
+       * `messageId` to edit what it voiced.
+       */
+      type: 'inference:published';
+      agentName: string;
+      /** The server the prose is published to, and its channel there: two
+       *  servers' channels with the same id are two destinations. */
+      serverId: string;
+      channelId: string;
+      /** The stream's id, shared with its `channels/outgoing/*` notifications. */
+      inferenceId: string;
+      /** Increases by one per chunk of the stream, across its channels. */
+      index: number;
+      text: string;
+      /** The id the channel's server returned for this chunk's publish
+       *  (`ChannelsPublishResult.messageId`); absent when it returned none.
+       *  Each chunk is one publish, so each carries its own. */
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A stream's end for one destination it published to, a server and
+       * its channel, emitted on every exit path once the stream has ended
+       * and its deliveries have run, or, when the host stops, before its
+       * connections close: `text` is everything its `inference:published`
+       * chunks carried there by then, and none follows it. Like those
+       * chunks, it's emitted whether or not that server takes the stream,
+       * or registers the channel still; the MCPL
+       * `channels/outgoing/complete` goes to the server only when it does.
+       */
+      type: 'inference:published_complete';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      inferenceId: string;
+      text: string;
     })
 
   // Tool lifecycle
@@ -262,10 +394,11 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * A writable workspace existed but the oversized-result spill write
-       * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
+       * The workspace had a writable mount without an include, where spills
+       * go, but the oversized-result spill write failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
        * retained. Distinct from the no-workspace fallback, which is silent
-       * by design (nothing unexpected happened).
+       * by design (nothing unexpected happened), whether the setup has no
+       * writable mount or every writable mount has an include, as configured.
        */
       type: 'tool:spill_failed';
       label: string;
@@ -348,6 +481,18 @@ export type TraceEvent =
       field?: string;
       detail?: string;
     })
+  /** MCPL content that context-manager won't store, because it doesn't
+   *  match ContentBlock, reached the store/wake site and was refused there:
+   *  no row, no wake. `places` is malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'mcpl:malformed-content-refused';
+      lane: 'push' | 'channel';
+      serverId: string;
+      places: string[];
+      eventId?: string;
+      channelId?: string;
+      messageId?: string;
+    })
   /** MCPL content with nothing model-visible reached the store/wake site
    *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */
   | (TraceEventBase & {
@@ -391,6 +536,38 @@ export type TraceEvent =
       type: 'gate:debounce-delivered';
       policyName: string;
       eventCount: number;
+    })
+  | (TraceEventBase & {
+      /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
+       *  `reply` or `wait` as the judge answered, `error` when it failed,
+       *  timed out or answered nothing usable; `woke` is whether the batch
+       *  then woke the agent (an error does by the host's onError).
+       *  The judge's reason is in the agent's gate_status, not here: it's
+       *  written from the agent's context. */
+      type: 'gate:judge-verdict';
+      policyName: string;
+      verdict: 'reply' | 'wait' | 'error';
+      woke: boolean;
+      eventCount: number;
+      durationMs: number;
+      model?: string;
+      inputTokens?: number;
+      cacheReadTokens?: number;
+      outputTokens?: number;
+    })
+  | (TraceEventBase & {
+      /** A batched wake's turn started without its `[Gate: …]` line (the
+       *  gate hands the line to the wake when its message is the newest at
+       *  the fire, EventGate isNewestEntry, and the turn's start decides).
+       *  `reason`: `newest`, on the delivery agent's start the message was
+       *  still the newest entry in the window; `held`, the host was quiesced
+       *  or another reader of the residents' shared slot had a turn alive,
+       *  so no line could be written then. */
+      type: 'gate:wake-line-omitted';
+      reason: 'newest' | 'held';
+      policyNames: string[];
+      eventType: string;
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'gate:config-reloaded';
@@ -455,6 +632,8 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:conversation-spawned';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       generation: number;
       template: string;
@@ -462,22 +641,30 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:conversation-spawn-failed';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       error: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-unrouted';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       messageId: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-binding-orphaned';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-closed';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       reason: 'idle-ttl';
     })
@@ -485,16 +672,21 @@ export type TraceEvent =
       type: 'mcpl:conversation-disposed';
       agentName: string;
       channelId?: string;
+      /** The home channel's server, beside its channelId. */
+      serverId?: string;
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
-  // for the posted message (when the MCPL server reports one). Together they
-  // give external taps the (channelId, messageId, text) tuple needed to edit
-  // a just-posted message, e.g. a TTS interruption truncating a reply to the
-  // words actually voiced.
+  // for the posted message (on routeSpeech's traces, when the MCPL server
+  // reports one). Together they give external taps the (channelId,
+  // messageId, text) tuple needed to edit a just-posted message, e.g. a TTS
+  // interruption truncating a reply to the words actually voiced.
   | (TraceEventBase & {
       type: 'mcpl:speech-routed';
       /** Agent / conversation whose speech was routed. */
@@ -505,13 +697,17 @@ export type TraceEvent =
       textLen: number;
       /** The routed prose segment, verbatim. */
       text: string;
-      /** Surface message id (e.g. Discord message id), when reported. */
+      /** Surface message id (e.g. Discord message id), when reported, on
+       *  routeSpeech's traces. speak_in_channel's carry none. */
       messageId?: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:speech-route-failed';
       /** Agent / conversation whose speech failed to route. */
       conversationId: string;
+      /** The channel's server, where the destination, or the caller, named
+       *  one: a channel id is unique only within one server. */
+      serverId?: string;
       /** Empty string when the failure was "no locus at all". */
       channelId: string;
       reason: string;
@@ -519,6 +715,9 @@ export type TraceEvent =
       /** `failed`: nothing was posted; `unknown`: the request was dispatched
        *  and no valid receipt came back, so it may have been. */
       outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -720,7 +919,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included, or a turn whose stream's cancel threw with no check ahead, so that its stream goes on. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {

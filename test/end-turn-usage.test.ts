@@ -7,6 +7,7 @@ import { MembraneError } from '@animalabs/membrane';
 import type { DetailedUsage, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import { HealthModule } from '../src/modules/health/index.js';
+import { EPHEMERAL_USAGE_NAME } from '../src/usage/usage-tracker.js';
 import type { EventResponse, Module, ProcessEvent, ToolCall, TraceEvent } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
@@ -151,8 +152,9 @@ describe('tool-ended turn usage accounting', () => {
         const snapshot = f.framework.getSessionUsage();
         assert.equal(snapshot.inferenceCount, 1);
         assert.deepEqual(snapshot.totals, expectedTotals(totalUsage));
+        // An ephemeral run counts in the one shared entry; the traces name it.
         assert.deepEqual(snapshot.byAgent, [{
-          agentName: 'worker', usage: expectedTotals(totalUsage), inferenceCount: 1,
+          agentName: EPHEMERAL_USAGE_NAME, usage: expectedTotals(totalUsage), inferenceCount: 1, ephemeral: true,
         }]);
       } finally {
         await f.framework.stop();
@@ -209,7 +211,7 @@ describe('tool-ended turn usage accounting', () => {
     }
   });
 
-  it('attributes successive streams separately and persists their totals through store reopen', async () => {
+  it('attributes successive streams separately in the traces and the log, and persists their totals through store reopen', async () => {
     const f = await fixture();
     let stopped = false;
     try {
@@ -219,10 +221,18 @@ describe('tool-ended turn usage accounting', () => {
       await run(f.framework, 'bob');
       const snapshot = f.framework.getSessionUsage();
       assert.equal(snapshot.inferenceCount, 2);
-      assert.deepEqual(snapshot.byAgent, [
-        { agentName: 'alice', usage: expectedTotals(firstUsage), inferenceCount: 1 },
-        { agentName: 'bob', usage: expectedTotals(totalUsage), inferenceCount: 1 },
-      ]);
+      // Both ephemeral runs count in the one shared entry; the traces and the
+      // inference log attribute each stream to its own agent.
+      const shared = snapshot.byAgent.map(({ usage: { estimatedCost, ...tokens }, ...entry }) => ({ ...entry, tokens, currency: estimatedCost?.currency }));
+      assert.deepEqual(shared, [{
+        agentName: EPHEMERAL_USAGE_NAME,
+        tokens: { inputTokens: 350, outputTokens: 75, cacheCreationTokens: 75, cacheReadTokens: 130 },
+        currency: 'USD',
+        inferenceCount: 2,
+        ephemeral: true,
+      }]);
+      // The two streams' costs, 0.03 and 0.08.
+      assert.ok(Math.abs(snapshot.byAgent[0].usage.estimatedCost!.total - 0.11) < 1e-10);
       assert.deepEqual(f.traces.filter((e) => e.type === 'usage:updated').map((e) => e.agentName), ['alice', 'bob']);
       const logs = f.framework.queryInferenceLogs();
       assert.equal(logs.total, 2);
@@ -499,6 +509,67 @@ describe('a stream counts its usage once, however it ends', () => {
   }
 });
 
+/** Its first stream holds a tool round over the budget and the turn's end; a later stream, a restart's, the end alone. */
+class ToolRoundThenFinal extends MockMembrane {
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    const stream = new MockYieldingStream(this.calls.length === 1
+      ? [toolResponse('echo', 'echo-1', firstUsage), finalResponse('Recovered.', secondUsage)]
+      : [finalResponse('Recovered.', secondUsage)]);
+    this.lastStream = stream;
+    return stream;
+  }
+}
+
+describe('an agent whose model binds its thinking, with its window size set, takes no new stream mid-turn for budget alone', () => {
+  // A budget restart compiles afresh mid-turn, and what that compile changes ahead of the turn's own earlier rounds
+  // takes their reasoning out of the request. The window projection still guards.
+  const huge = 1_000_000;
+  for (const [label, limits, restarts] of [
+    ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, []],
+    ['binds, with no window size: the budget restart, as before', { thinkingBinding: { binds: true } }, ['context_budget']],
+    ['a window size, without binds: the budget restart, as before', { physicalWindowTokens: huge }, ['context_budget']],
+    // A window size that isn't a finite number reads as none: a config read from JSON can hold null.
+    ['binds, with a null window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: null as unknown as number }, ['context_budget']],
+    ['binds, with an infinite window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: Infinity }, ['context_budget']],
+    // One a config holds as a string reads as its number, as the projection's comparison always read it.
+    ['binds, with a window size given as a string: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: String(huge) as unknown as number }, []],
+    // The first call's projection passes the window: its prompt (170, cache included), its output (20) and the
+    // reserve for the next response (100) make 290, past 250, where without the prompt they'd make 120.
+    ['binds, with a window the stream outgrows: the window restart', { thinkingBinding: { binds: true }, maxTokens: 100, physicalWindowTokens: 250 }, ['physical_window']],
+  ] as const) {
+    it(label, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-binds-budget-'));
+      const membrane = new ToolRoundThenFinal();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [],
+        modules: [new TurnTools()], syncIntervalMs: 0,
+      });
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => traces.push(event));
+      framework.start();
+      const tornDown = streamsDriven(framework);
+      try {
+        const { agent, contextManager } = await framework.createEphemeralAgent({
+          name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+          proseRouting: 'disabled', maxStreamTokens: 50, ...limits,
+        });
+        contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+        await framework.runEphemeralToCompletion(agent, contextManager);
+        await tornDown();
+        const restarted = traces.filter((e) => e.type === 'inference:stream_restarted');
+        assert.ok(firstUsage.inputTokens! > 50, 'the first call is over the budget');
+        assert.deepEqual(restarted.map((e) => (e as { reason?: string }).reason), restarts);
+        assert.equal(membrane.calls.length, restarts.length > 0 ? 2 : 1, restarts.length > 0 ? 'the restart opened a second stream' : 'one stream, its tool round included');
+        assert.equal(traces.filter((e) => e.type === 'inference:completed').length, 1, 'the turn completed');
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 class InputModule implements Module {
   readonly name = 'input';
   async start() {}
@@ -625,7 +696,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
       assert.ok(await pollUntil(() => r.traces.some((e) => e.type === 'usage:updated')), 'the finished round was counted');
       const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
       assert.equal(logs.length, 1);
-      assert.match(String(logs[0].error), /^Provider acceleration cooldown: /);
+      assert.match(String(logs[0].error), /^This request would exceed your organization's maximum usage increase rate/);
       assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage));
       assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
       assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);
@@ -646,12 +717,12 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
     // cooldown. Its turns aren't an external message's default target, so
     // the turn is started directly.
     const internal = r.framework as unknown as {
-      conversationAgentHomes: Map<string, string>;
+      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
       startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
     };
     r.framework.start();
     try {
-      internal.conversationAgentHomes.set('resident', 'world:zz');
+      internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
       r.framework.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'first' }]);
       await internal.startAgentStream(r.framework.getAgent('resident'),
         { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
@@ -659,7 +730,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         && r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'the finished round was counted and logged');
       const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
       assert.equal(logs.length, 1, 'the wait writes the stream\'s one entry');
-      assert.match(String(logs[0].error), /^Provider wait: /);
+      assert.equal(String(logs[0].error), 'zz rate limit reached for requests');
       assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'and it carries the finished round');
       assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
       assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);

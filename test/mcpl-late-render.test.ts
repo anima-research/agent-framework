@@ -129,7 +129,7 @@ test('a late answer carrying both a result and an error, which JSON-RPC forbids,
 
 test('while the data plane is paused, a late push/render answer is recorded at once and takes no slot', async (t) => {
   const { connection, answerLate, recorded } = await timedOutRender(t);
-  // A quiesce or an awareness drain: control traffic flows, data is held.
+  // A quiesce: control traffic flows, data is held.
   connection.pauseDataPlane();
   answerLate();
   assert.equal((connection as any).bufferedEvents.length, 0);

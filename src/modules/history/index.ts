@@ -49,7 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { safeSlice } from '../../safe-slice.js';
 
@@ -535,7 +535,7 @@ export class HistoryModule implements Module {
     channelId?: string;
     n: number;
     side: 'newest' | 'oldest';
-  }): { messages: StoredMessage[]; more: boolean } {
+  }): { messages: StoredMessage[]; more: boolean; total?: number } {
     const cm = this.cm as ContextManager;
     const { fromMs, toMs, channelId, n, side } = opts;
     const newest = side === 'newest';
@@ -553,8 +553,8 @@ export class HistoryModule implements Module {
     const fetch = (f: number | undefined, t: number | undefined, limit: number, offset = 0) =>
       limit <= 0 ? [] : cm.queryMessagesByTimeAndChannel({ fromMs: f, toMs: t, channelId, limit, offset }).messages;
     const total = count(fromMs, toMs);
-    if (n === 0) return { messages: [], more: total > 0 };
-    if (total <= n) return { messages: dirSort(fetch(fromMs, toMs, total)), more: false };
+    if (n === 0) return { messages: [], more: total > 0, total };
+    if (total <= n) return { messages: dirSort(fetch(fromMs, toMs, total)), more: false, total };
 
     // The window is parameterised by its FAR bound `e`: [e, toMs] for the
     // newest side, [fromMs, e] for the oldest; its count is monotone in e.
@@ -580,7 +580,7 @@ export class HistoryModule implements Module {
     }
     const fetchCap = Math.max(4 * n, n + 1000);
     if (inCount <= fetchCap) {
-      return { messages: dirSort(fetch(...win(inside), inCount)).slice(0, n), more: true };
+      return { messages: dirSort(fetch(...win(inside), inCount)).slice(0, n), more: true, total };
     }
     // Overshoot: bisect the far bound. The empty side starts one past the
     // range's near end (newest: past toMs / any date; oldest: before lo).
@@ -595,7 +595,7 @@ export class HistoryModule implements Module {
         inside = mid;
         inCount = c;
         if (c <= fetchCap) {
-          return { messages: dirSort(fetch(...win(mid), c)).slice(0, n), more: true };
+          return { messages: dirSort(fetch(...win(mid), c)).slice(0, n), more: true, total };
         }
       }
     }
@@ -607,7 +607,7 @@ export class HistoryModule implements Module {
     const need = n - near.length;
     const ties = count(inside, inside);
     const edgeMs = fetch(inside, inside, need, newest ? Math.max(0, ties - need) : 0);
-    return { messages: dirSort([...near, ...edgeMs]).slice(0, n), more: true };
+    return { messages: dirSort([...near, ...edgeMs]).slice(0, n), more: true, total };
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -624,6 +624,16 @@ export class HistoryModule implements Module {
       const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
       this.ctx?.setState({ ...prev, semanticPending: p });
     };
+    // Module state follows the store's branches, so each branch keeps its
+    // own sync cursors, and a branch made at an earlier point inherits them
+    // as they were there.
+    this.indexer.cursorStore = {
+      read: () => this.ctx?.getState<{ semanticCursors?: SyncCursors }>()?.semanticCursors ?? null,
+      write: (cursors) => {
+        const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
+        this.ctx?.setState({ ...prev, semanticCursors: cursors });
+      },
+    };
     this.indexer.attach();
   }
 
@@ -631,13 +641,16 @@ export class HistoryModule implements Module {
     this.ctx = null;
     if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
     if (this.firstSyncTimer) { clearTimeout(this.firstSyncTimer); this.firstSyncTimer = null; }
-    if (this.indexer) this.indexer.onPendingChange = null;
+    // Unwired from the state it can no longer reach, the indexer goes on
+    // from the cursors it last wrote for each branch, kept in memory.
+    if (this.indexer) { this.indexer.onPendingChange = null; this.indexer.cursorStore = null; }
     this.indexer?.dispose();
   }
 
   /**
    * Background sync into the semantic index: every `syncIntervalMs` (default
-   * 60 s) push up to `maxSyncPerTick` new items. Idempotent to call — starts
+   * 60 s) write at most `maxSyncPerTick` items to the index, counted as its
+   * doc says. Idempotent to call — starts
    * once we have both a context-manager (bind) and a config; `unref`'d so it
    * never keeps a shutting-down process alive. A first tick runs after 5 s so
    * a fresh store starts backfilling immediately rather than a minute later.
@@ -1137,7 +1150,8 @@ export class HistoryModule implements Module {
                   hint:
                     (pageFull
                       ? 'More matching messages exist. '
-                      : `Stopped after scanning ${scanned} messages of the window without reaching its end. `) +
+                      : `Stopped after scanning ${scanned} messages of the window without reaching its end` +
+                        (page.length === 0 ? ', so returning none is not a negative result for the window. ' : '. ')) +
                     `Continue by repeating this call with the same from/to/channelId/author plus ` +
                     `the fields of \`resume\` (windowOffset:${resume.windowOffset}, offset:${resume.offset}, afterId).`,
                 };
@@ -1360,6 +1374,7 @@ export class HistoryModule implements Module {
       !!skipRange && m.timestamp.getTime() === edgeMs && m.sequence >= skipRange[0] && m.sequence <= skipRange[1];
     let windowMessages: StoredMessage[];
     let truncated: boolean;
+    let unscanned: number | undefined;
     {
       // Over-fetch by the number of messages at the edge millisecond (the
       // only ones that can be skipped), then drop the skipped ones.
@@ -1368,6 +1383,7 @@ export class HistoryModule implements Module {
       const pool = skipRange ? w.messages.filter((m) => !isSkipped(m)) : w.messages;
       truncated = w.more || pool.length > maxScan;
       windowMessages = pool.slice(0, maxScan);
+      if (w.total !== undefined) unscanned = w.total - (w.messages.length - pool.length) - windowMessages.length;
     }
     const candidatePoolSize = windowMessages.length;
     const candidates = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
@@ -1381,7 +1397,7 @@ export class HistoryModule implements Module {
     // the pool was never looked at) or the pool itself was truncated. The
     // timestamp is the continuation point — from: (oldest) / to: (newest).
     // Boundary is inclusive, so a message at exactly that instant may repeat.
-    const resumeInfo = (scanned: number): Record<string, unknown> => {
+    const resumeInfo = (scanned: number, matched: number): Record<string, unknown> => {
       const stoppedEarly = scanned < candidates.length;
       if (!stoppedEarly && !truncated) return {};
       // Stopped at limit: the last candidate actually looked at. Scanned the
@@ -1419,9 +1435,16 @@ export class HistoryModule implements Module {
         hint:
           (stoppedEarly
             ? 'Stopped at limit; more candidates remain. '
-            : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan). `) +
+            : matched === 0
+              ? `No match among the ${order} ${candidatePoolSize} ${candidatePoolSize === 1 ? 'message' : 'messages'} ` +
+                'scanned (maxScan); ' +
+                (unscanned === undefined
+                  ? 'the rest of this range was not searched'
+                  : `${unscanned} more in this range ${unscanned === 1 ? 'was' : 'were'} not searched`) +
+                ', so this is not a negative result for the range. '
+              : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan). `) +
           `Continue by repeating the call with the fields of \`resume\` (${bound}:"${at}" and skipSequences), ` +
-          'or raise limit/maxScan, or narrow with channelId/author/dates.',
+          `or raise limit/maxScan, or narrow with ${[channelId === undefined ? 'channelId' : null, stoppedEarly && input.author === undefined ? 'author' : null, 'dates'].filter((w) => w !== null).join('/')}.`,
       };
     };
 
@@ -1436,7 +1459,7 @@ export class HistoryModule implements Module {
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
       const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit);
-      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned), matches } };
+      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches } };
     }
 
     // Plain substring search (String.prototype.indexOf) is inherently
@@ -1468,7 +1491,7 @@ export class HistoryModule implements Module {
 
     return {
       success: true,
-      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned), matches },
+      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches },
     };
   }
 
@@ -1608,12 +1631,18 @@ export class HistoryModule implements Module {
       );
     }
 
-    // Bounded catch-up so the newest messages are searchable; never block on a backlog.
+    // A catch-up bounded in what it writes, so the newest messages are
+    // searchable without waiting on a backlog. It can re-send many items the
+    // index holds unchanged, as on a branch's first pass (maxSyncPerTick's
+    // doc), which costs a request per batch and no embedding.
     let sync: SyncReport | null = null;
     if (this.indexer) {
       try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
     }
 
+    // A message's or summary's snippet is built here, from the local text.
+    // `snippet` still bounds what a service that keeps text sends with each
+    // hit, since what it sends without one isn't specified here.
     const runSearch = (k: number) => this.semanticClient!.search({
       query: input.query, k,
       ts_from: fromMs === undefined ? undefined : fromMs / 1000,
@@ -1667,8 +1696,12 @@ export class HistoryModule implements Module {
     // /newtopic keeps its id (a new message gets a fresh one) and stays
     // indexed. Check every hit against the CURRENT branch before it goes back
     // to the model — getMessage/getSummary rebuild on branch switch, so an
-    // undone message or a summary minted on another branch answers null.
-    // k is small, so this is at most `limit` local lookups.
+    // undone message, or a summary this branch doesn't hold, answers null.
+    // A branch made from an earlier point, as an undo makes one, can mint a
+    // summary id another branch already used, so a summary's key carries its
+    // creation time too, and a hit whose time isn't this branch's summary's
+    // is another branch's. k is small, so this is at most `limit` local
+    // lookups.
     // A message hit whose current text has nothing left to index (edited
     // blank, delete not yet applied) is dropped too, so its stale snippet is
     // never served. Dropped hits are replaced by over-fetching: when the
@@ -1679,10 +1712,12 @@ export class HistoryModule implements Module {
     // A message hit's snippet is rebuilt from the CURRENT local text, never
     // the remote copy: an edit not yet synced (or one the index never got)
     // must not leak a passage the edit removed. Only the ranking can be stale.
+    // A summary hit's snippet is rebuilt from the local summary too, so a
+    // service that keeps only vectors and ids (no text) still yields one.
     const currentText = new Map<string, string>();
-    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
+    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
-      const sumId = /^sum:(.+)$/.exec(h.id)?.[1];
+      const sum = parseSummaryKey(h.id);
       if (msgId !== undefined) {
         const m = cm.getMessage(msgId);
         if (!m) return 'offBranch';
@@ -1691,7 +1726,28 @@ export class HistoryModule implements Module {
         currentText.set(h.id, text);
         return 'ok';
       }
-      if (sumId !== undefined) return cm.getSummary(sumId) !== null ? 'ok' : 'offBranch';
+      if (sum !== null) {
+        // An item from before keys carried the creation time is never a hit.
+        // One whose id names no summary on this branch is another branch's,
+        // and is counted as such. One whose id this branch has can hold this
+        // branch's summary or another's under the same id, and isn't counted.
+        // Until this branch's passes send the summary under its own key, as
+        // the search's catch-up does within its budget after any queued
+        // edits, a search can miss it.
+        const s = cm.getSummary(sum.id);
+        if (!s) return 'offBranch';
+        if (sum.createdMs === null) return 'superseded';
+        if (s.created !== sum.createdMs) return 'offBranch';
+        const text = summaryIndexText(s, this.semanticCfg!);
+        // An empty text here is mostly defensive: context-manager drops a
+        // summary that's empty after trimming when it loads, and refuses to
+        // store one. Short of that, only a maxChars that cuts the text to
+        // nothing gives one. The hit is dropped rather than show the index's
+        // text.
+        if (!text) return 'stale';
+        currentText.set(h.id, text);
+        return 'ok';
+      }
       return 'ok';
     };
     let k = limit;
@@ -1749,10 +1805,13 @@ export class HistoryModule implements Module {
       const meta = typeof h.meta === 'object' && h.meta !== null && !Array.isArray(h.meta)
         ? h.meta as { participant?: unknown; author?: unknown }
         : null;
+      // A summary is shown as `sum:<id>`, as it was before its key carried its creation time.
+      const sum = parseSummaryKey(h.id);
+      const id = sum ? `sum:${sum.id}` : h.id;
       const missing = [...(h.ts !== null && timestamp === null ? ['ts'] : []), ...(meta === null ? ['meta'] : [])];
-      if (missing.length > 0) unread.push(`${shown(h.id)} (${missing.join(' and ')})`);
+      if (missing.length > 0) unread.push(`${shown(id)} (${missing.join(' and ')})`);
       return {
-        id: h.id,
+        id,
         /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
         messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
         kind: h.kind,
@@ -1775,7 +1834,10 @@ export class HistoryModule implements Module {
         hits,
         index: {
           indexed: res.count_indexed,
-          behind: sync ? sync.more : this.indexer === null ? null : true,
+          // The pass may have read another branch: one the search joined
+          // that started before a switch, or one the search left while it
+          // waited.
+          behind: this.indexer === null ? null : sync && this.indexer.passedOn(sync) === this.indexer.branchId() ? sync.more : true,
           syncedThisCall: sync ? sync.pushed : 0,
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */

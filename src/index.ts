@@ -2,14 +2,17 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
+export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
+export { CLOCK_ROW_KIND, resolveClockConfig } from './clock-rows.js';
+export type { ClockConfig, ClockStamp, ResolvedClockConfig } from './clock-rows.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 
 // Built-in modules
@@ -59,34 +62,27 @@ export type {
 // Usage tracking
 export { UsageTracker } from './usage/index.js';
 
-// Client-side programmatic tool calling (code_execution): exposed so external
-// tooling can drive the python runtime the way the framework does (protocol
-// harnesses, runtime smoke tests).
-export {
-  PyRunner,
-  buildInjectedTools,
-  buildCodeExecutionToolDefinition,
-  CODE_EXECUTION_TOOL_NAME,
-  PYTHON_RUNTIME_SOURCE,
-} from './code-execution/index.js';
-export type {
-  InjectedTool,
-  ExecResult,
-  PyRunnerOptions,
-  ScriptToolCallHandler,
-  ScriptToolResult,
-} from './code-execution/index.js';
+// Client-side programmatic tool calling (code_execution): the tool's name,
+// and its definition as an agent reads it.
+export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './code-execution/index.js';
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
 // EventGate
-export { EventGate, type WakeProvenance } from './gate/index.js';
-export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior } from './gate/index.js';
+export { EventGate, wakeLineText, type WakeProvenance, type WritePlacement } from './gate/index.js';
+export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine } from './gate/index.js';
+export { ReplyJudge, DEFAULT_JUDGE_MODEL, DEFAULT_JUDGE_MAX_INPUT_TOKENS, MIN_JUDGE_INPUT_TOKENS } from './gate/index.js';
+export type { JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, ReplyJudgeDeps, UpcomingWake } from './gate/index.js';
+export { Heartbeat, DEFAULT_HEARTBEAT, HEARTBEAT_TOOL_PREFIX } from './heartbeat/heartbeat.js';
+export type { HeartbeatOptions, HeartbeatSettings, HeartbeatWake, HeartbeatDeliveryMode, Reminder } from './heartbeat/heartbeat.js';
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
+export type { ChannelRef, PublishRefusalReason } from './mcpl/index.js';
 
-// Where each accepted inbound item came from (`metadata.inboundSource`)
-export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+// Where each accepted inbound item came from (`metadata.inboundSource`), and
+// the digest its delivered and stored bodies are stamped with
+// (`metadata.sourceBodyDigest`, `metadata.storedBodyDigest`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey, sourceBodyDigest } from './mcpl/index.js';
 export type {
   InboundSource,
   InboundChannelSource,
@@ -104,6 +100,8 @@ export type { McplServerConfig } from './mcpl/index.js';
 // exactly the way the framework host does: MCPL over stdio or WebSocket, and
 // modern MCP over stdio or Streamable HTTP)
 export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
+// RFC-014: the meta-tools' module and its names.
+export { ToolsetsModule, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/index.js';
 export { ModernMcpConnection } from './mcpl/index.js';
 export type { ModernToolCallResult } from './mcpl/index.js';
 export {
@@ -150,18 +148,35 @@ export { PassthroughStrategy, AutobiographicalStrategy, KnowledgeStrategy } from
 export type { KnowledgeConfig, PhaseType } from '@animalabs/context-manager';
 export type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } from '@animalabs/membrane';
 
-// Offline outage recovery and branch-independent Discord awareness markers
+// Offline outage recovery and the Discord awareness-mark ledger
 export {
   DiscordAwarenessOutbox,
+  DiscordAwarenessRefusal,
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  isPermanentDiscordReactionFailure,
+  selectDiscordAwarenessRefs,
 } from './recovery/discord-awareness-outbox.js';
 export type {
+  DiscordAwarenessAction,
   DiscordAwarenessBatch,
-  DiscordAwarenessEntry,
-  DiscordAwarenessOperation,
+  DiscordAwarenessBatchStatus,
+  DiscordAwarenessBatchView,
+  DiscordAwarenessRetractView,
+  DiscordAwarenessView,
+  DiscordAwarenessCancelReceipt,
+  DiscordAwarenessMarks,
+  DiscordAwarenessOutcome,
+  DiscordAwarenessPrepareInput,
+  DiscordAwarenessReactionState,
+  DiscordAwarenessImportedUnsent,
   DiscordAwarenessRef,
+  DiscordAwarenessRequest,
+  DiscordAwarenessRetractReceipt,
+  DiscordAwarenessRetirement,
+  DiscordAwarenessScope,
+  DiscordAwarenessSettlement,
   DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
@@ -170,7 +185,9 @@ export type {
   OperatorLogEntry,
   OperatorLogInput,
   OperatorRequester,
+  SurgeryMarkerFacts,
   SurgeryMarkerReceipt,
+  SurgeryMarksPreview,
 } from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {

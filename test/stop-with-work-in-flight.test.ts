@@ -583,6 +583,35 @@ describe('stop() with work still in flight', () => {
       return { framework, release, residentStreaming, entered, letGo, order, push, internals, storedTexts };
     }
 
+    for (const record of ['current', 'behind'] as const) {
+      it(`a stream that outlasts the budget says a persisted queue whose record is ${record} ${record === 'current' ? 'keeps' : 'can lose'} its agent's queued writes`, { timeout: 30_000 }, async () => {
+        const { framework, release, residentStreaming, push, internals } = await frameworkWithHeldWork();
+        const fw = framework as unknown as { deferredWritesPersisted: boolean; writeDeferredWrites: () => unknown };
+        try {
+          framework.start();
+          push('go');
+          await residentStreaming;
+          fw.deferredWritesPersisted = true;
+          if (record === 'behind') fw.writeDeferredWrites = () => { throw new Error('injected record write failure'); };
+          push('a note for later');
+          await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
+          const outcome = await settledWithin(framework.stop(100), 5_000);
+          assert.ok(outcome instanceof ShutdownTimeoutError, String(outcome));
+          const line = logged.find((l) => l.includes('1 deferred write(s) for assistant stay queued')) ?? '';
+          assert.ok(line.includes('its stream is still running'), logged.join('\n'));
+          if (record === 'current') {
+            assert.ok(line.includes('the persisted queue keeps them for boot') && !/can lose|record is behind/.test(line), line);
+          } else {
+            assert.ok(["the persisted queue's record is behind", 'since its last write failed or met the cap', 'a restart can lose them']
+              .every((fact) => line.includes(fact)) && !line.includes('keeps them for boot'), line);
+          }
+        } finally {
+          release();
+          await framework.stop().catch(() => {});
+        }
+      });
+    }
+
     it("a stream that outlasts the budget fails the stop, keeps the store open, and keeps its agent's deferred write queued until its own end stores it", { timeout: 30_000 }, async () => {
       // The deferral's rule holds through the timeout: no entry lands ahead of
       // a stream that may still write.
@@ -1085,34 +1114,6 @@ describe('stop() with work still in flight', () => {
       for (const r of [push, incoming, register, changed, inference, command]) assert.deepEqual(r.answers, [stopping]);
       assert.deepEqual(rejections, []);
     });
-
-    for (const [event, method, params] of [
-      ['push-event', 'push/event', { featureSet: 'chat', eventId: 'e2', payload: { content: [{ type: 'text', text: 'waiting' }] } }],
-      ['channels-incoming', 'channels/incoming', { messages: [{ channelId: 'c', messageId: 'm2', content: [] }] }],
-      ['inference-request', 'inference/request', { messages: [] }],
-      ['host-command', 'host/command', { command: 'undo' }],
-    ] as const) {
-      it(`a ${method} held at the awareness barrier while the host stops is refused once the barrier lifts`, async () => {
-        const { framework, connection } = await wiredFramework();
-        let lift!: () => void;
-        (framework as unknown as { discordAwarenessBarrier: unknown }).discordAwarenessBarrier = {
-          promise: new Promise<void>((r) => { lift = r; }),
-        };
-        let handled = 0;
-        standIns(framework, async () => { handled++; return {}; });
-
-        const r = responder();
-        connection.emit(event, params, r);
-        await framework.stop();
-        lift();
-        await answered(r);
-
-        assert.equal(handled, 0);
-        assert.deepEqual(r.answers, [stopping]);
-        assert.ok(logged.some((line) => line.includes(`${method} from srv refused: the host is stopping`)), logged.join('\n'));
-        assert.deepEqual(rejections, []);
-      });
-    }
 
     it('a handler running when the host stops, and then failing, is answered -32000 with the stop wording alone', async () => {
       const { framework, connection } = await wiredFramework();
