@@ -2822,11 +2822,11 @@ function messageFromLine(serverId: string, line: string): object | undefined {
   try {
     value = JSON.parse(line);
   } catch {
-    logDroppedLine(serverId, line);
+    logDroppedLine(serverId, line, 'unparsed');
     return undefined;
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    logDroppedLine(serverId, line);
+    logDroppedLine(serverId, line, 'not-object');
     return undefined;
   }
   return value;

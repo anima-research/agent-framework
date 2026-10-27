@@ -435,7 +435,7 @@ for (const value of [null, 42, 'hi', true]) {
     connection.on('error', (error: unknown) => { reported.push(error); });
     const line = JSON.stringify(value);
     transport.emit('line', line);
-    assert.deepEqual(errors, [[`MCP server "srv" sent a line of length ${line.length} that isn't a JSON object, so it was dropped`]]);
+    assert.deepEqual(errors, [[`MCP server "srv" sent a line of length ${line.length} that is JSON but not an object, so it was dropped`]]);
     assert.deepEqual(reported, []);
   });
 }

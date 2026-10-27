@@ -896,7 +896,7 @@ test('a line that is not JSON is dropped and logged by its length, never its con
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   assert.deepEqual((await connection.callTool('nullframe', {})).content, [{ type: 'text', text: 'after the noise' }]);
   t.mock.restoreAll();
-  assert.deepEqual(logged, ['MCP server "raw" sent a line of length 21 that isn\'t a JSON object, so it was dropped']);
+  assert.deepEqual(logged, ['MCP server "raw" sent a line of length 21 that isn\'t JSON, so it was dropped']);
 });
 
 test('a result holding U+2028 and U+2029 inside a string arrives whole', async () => {

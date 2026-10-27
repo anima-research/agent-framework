@@ -56,10 +56,12 @@ process.stdin.on('data', (chunk) => {
     if (request.method === 'initialize') {
       process.stdout.write('handshake chatter\n');
       process.stdout.write('[]\n');
+      process.stdout.write(' \t{"jsonrpc":"2.0"\n');
       send({jsonrpc:'2.0', id:request.id, result:{protocolVersion:'2024-11-05', capabilities:{tools:{}}}});
     } else if (request.method === 'tools/list') {
       process.stdout.write('not json at all\n');
       process.stdout.write('42\n');
+      process.stdout.write('[info] listening on 3000\n');
       process.stdout.write('\u{1F600} not json\n');
       process.stdout.write('\u2028\n');
       process.stdout.write(' \t \n');
@@ -70,7 +72,7 @@ process.stdin.on('data', (chunk) => {
 });
 `;
 
-test('a line a connection drops because it is not a JSON object is logged by its length in characters, never its content, in the handshake and once connected; a blank one is not', async () => {
+test('a line a connection drops because it is not a JSON object is logged by its length in characters and why, never its content, in the handshake and once connected; a blank one is not', async () => {
   const logged: string[] = [];
   const realError = console.error;
   console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -88,8 +90,14 @@ test('a line a connection drops because it is not a JSON object is logged by its
   } finally {
     console.error = realError;
   }
-  const dropped = (length: number) => `MCP server "dropping" sent a line of length ${length} that isn't a JSON object, so it was dropped`;
-  assert.deepEqual(logged, [dropped(17), dropped(2), dropped(15), dropped(2), dropped(10), dropped(1)]);
+  const dropped = (length: number, why: string) => `MCP server "dropping" sent a line of length ${length} that ${why}, so it was dropped`;
+  const notJson = "isn't JSON";
+  const brokenJson = "starts like a JSON object but doesn't parse";
+  const notObject = 'is JSON but not an object';
+  assert.deepEqual(logged, [
+    dropped(17, notJson), dropped(2, notObject), dropped(18, brokenJson),
+    dropped(15, notJson), dropped(2, notObject), dropped(24, notJson), dropped(10, notJson), dropped(1, notJson),
+  ]);
 });
 
 test('once the host closes a stdio transport, a line its child writes after the close is not delivered', async () => {

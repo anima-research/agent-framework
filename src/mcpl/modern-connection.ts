@@ -341,7 +341,7 @@ class SpawnerStdioTransport implements Transport {
       try {
         parsed = JSON.parse(text);
       } catch {
-        logDroppedLine(this.config.id, text);
+        logDroppedLine(this.config.id, text, 'unparsed');
         return;
       }
       let message: JSONRPCMessage;

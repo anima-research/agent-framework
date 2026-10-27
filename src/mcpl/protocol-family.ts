@@ -870,9 +870,12 @@ export function checkServerConfig(config: McplServerConfig): ServerBinding {
   return resolveServerBinding(config);
 }
 
-export function logDroppedLine(serverId: string, line: string): void {
+export function logDroppedLine(serverId: string, line: string, reason: 'unparsed' | 'not-object'): void {
   if (/^[ \t]*$/.test(line)) return;
   let length = 0;
   for (const _ of line) length++;
-  console.error(`MCP server "${serverId}" sent a line of length ${length} that isn't a JSON object, so it was dropped`);
+  const why = reason === 'not-object' ? 'is JSON but not an object'
+    : /^[ \t]*\{/.test(line) ? "starts like a JSON object but doesn't parse"
+    : "isn't JSON";
+  console.error(`MCP server "${serverId}" sent a line of length ${length} that ${why}, so it was dropped`);
 }

@@ -10,8 +10,9 @@
   request holding either character gets its answer, not two parse errors.
 - **A line an MCP server sends that isn't JSON is logged when it's
   dropped,** as is a JSON value that isn't an object from a legacy MCPL
-  server: one stderr line naming the server and the line's length, never its
-  content. A blank line is still dropped without one, and the WebSocket
-  transport still trims each line first and drops one that trims to nothing.
-  A server that writes plain-text log lines to its stdout gets one such
-  stderr line for each.
+  server: one stderr line naming the server, the line's length, and whether
+  it isn't JSON, starts like a JSON object but doesn't parse, or is JSON but
+  not an object, never its content. A blank line is still dropped without
+  one, and the WebSocket transport still trims each line first and drops one
+  that trims to nothing. A server that writes plain-text log lines to its
+  stdout gets one such stderr line for each.
