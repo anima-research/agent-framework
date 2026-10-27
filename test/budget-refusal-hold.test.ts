@@ -9,12 +9,24 @@ import { AgentFramework } from '../src/index.js';
 import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
-/** Each stream answers with its own script of rounds. */
+/** A stream whose round after its tool results fails, as a provider's
+ *  stream can mid-turn. */
+class FailsAfterToolsStream extends MockYieldingStream {
+  override provideToolResults(results: unknown[], options?: Parameters<MockYieldingStream['provideToolResults']>[1]): void {
+    super.provideToolResults(results, options);
+    (this as unknown as { events: unknown[] }).events.push({ type: 'error', error: new Error('stream broke') });
+  }
+}
+
+/** Each stream answers with its own script of rounds; a script that ends in
+ *  'fails' fails after its last tool round. */
 class ScriptedStreamMembrane extends MockMembrane {
-  constructor(private readonly scripts: NormalizedResponse[][]) { super(); }
+  constructor(private readonly scripts: Array<Array<NormalizedResponse | 'fails'>>) { super(); }
   override streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
     this.calls.push(request);
-    const stream = new MockYieldingStream(this.scripts.shift() ?? []);
+    const script = this.scripts.shift() ?? [];
+    const rounds = script.filter((r): r is NormalizedResponse => r !== 'fails');
+    const stream = script.includes('fails') ? new FailsAfterToolsStream(rounds) : new MockYieldingStream(rounds);
     this.lastStream = stream;
     return stream;
   }
@@ -51,6 +63,14 @@ function stored(framework: AgentFramework): Array<{ text: string; metadata: Reco
   }));
 }
 const storedText = (framework: AgentFramework): string => stored(framework).map((m) => m.text).join('\n');
+/** The tool calls and results the agent's history holds. */
+const toolBlocks = (framework: AgentFramework): number => {
+  const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content?: Array<{ type: string }> }>;
+  return msgs.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
+};
+/** The turn is over: it completed and holds no turn token, so a store move is admitted. */
+const turnOver = (t: { of: (type: string) => unknown[]; internal: { activeTurnTokens: Map<string, number> } }, completed = 1): Promise<boolean> =>
+  pollUntil(() => t.of('inference:completed').length >= completed && !t.internal.activeTurnTokens.has('prime'), 5_000);
 
 async function errorLines<T>(run: (lines: string[]) => Promise<T>): Promise<T> {
   const lines: string[] = [];
@@ -81,6 +101,8 @@ interface Backlog {
   previewError?: Error; dryRunGate?: Promise<void>; dryRunMs?: number; slowCompile?: { nth: number; ms: number };
   compileGate?: { nth: number; until: Promise<void> };
   bindings: { compile: unknown[]; dryRun: unknown[]; preview: unknown[] };
+  /** Each refusal a committing compile threw, and the budget each preview was asked at. */
+  thrown: Error[]; previewBudgets: unknown[];
 }
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
 const pending = (b: Backlog): boolean => b.alwaysPending || (!fits(b) && b.ticks < b.readyAt);
@@ -98,6 +120,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     alwaysPending: false, stalled: false, previewless: false, refuseCompiles: 0,
     previews: 0, dryRuns: 0, dryRunsRunning: 0, mostDryRunsRunning: 0, compiles: 0,
     dryRunsAcrossFit: 0, noProgress: false, bindings: { compile: [], dryRun: [], preview: [] },
+    thrown: [], previewBudgets: [],
     ...backlog,
   };
   refusalName = b.refusalName ?? 'OverBudgetError';
@@ -126,17 +149,20 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     if (b.compileGate?.nth === b.compiles) await b.compileGate.until;
     if (!fits(b)) {
       b.refused = true;
-      throw overBudget();
+      b.thrown.push(overBudget());
+      throw b.thrown.at(-1);
     }
     if (b.refuseCompiles > 0) {
       b.refuseCompiles--;
       b.refused = true;
-      throw overBudget(49_000);
+      b.thrown.push(overBudget(49_000));
+      throw b.thrown.at(-1);
     }
     return original.compile.apply(this, args);
   };
   proto.previewContext = function (...args: unknown[]) {
     b.previews++;
+    b.previewBudgets.push(args[0]);
     b.bindings.preview.push((args[2] as { thinkingBinding?: unknown } | undefined)?.thinkingBinding);
     if (b.previewError) {
       const error = b.previewError;
@@ -221,6 +247,9 @@ async function heldRestart(texts: string[], options: {
   /** The tool round's continuation is a refusal, which the tool-result guard
    *  retries in the turn, instead of a near-cap round that restarts it. */
   guardRetry?: boolean;
+  /** The stream fails after its tool round, and the error policy retries the
+   *  turn. */
+  failsAfterTools?: boolean;
 } = {}) {
   const proto = ContextManager.prototype as unknown as Patchable;
   const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
@@ -235,16 +264,19 @@ async function heldRestart(texts: string[], options: {
   proto.tick = async function () {};
   proto.isReady = function () { return fit; };
   const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-restart-'));
-  const membrane = options.guardRetry
+  const scripted = options.guardRetry || options.failsAfterTools;
+  const membrane = scripted
     ? new ScriptedStreamMembrane([
       [
         createMockResponse([{ type: 'tool_use', id: 'call_1', name: 'canned--fetch', input: {} }], 'tool_use'),
-        { ...createMockResponse([{ type: 'text', text: 'refused partial' }], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test-category' } } } } as NormalizedResponse,
+        options.guardRetry
+          ? { ...createMockResponse([{ type: 'text', text: 'refused partial' }], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test-category' } } } } as NormalizedResponse
+          : 'fails',
       ],
       ...texts.map((text) => [createMockResponse([{ type: 'text', text }])]),
     ])
     : new SequentialStreamMembrane();
-  if (!options.guardRetry) {
+  if (!scripted) {
     membrane.pushResponse(nearCapToolResponse());
     for (const text of texts) membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
   }
@@ -581,7 +613,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
 
   it('ends the hold at its deadline, and the turn fails as a refused compile did', async () => {
-    await withBacklog({}, async () => {
+    await withBacklog({}, async (backlog) => {
       const policyErrors: Error[] = [];
       const t = await residentTurn({ maintenanceIntervalMs: 50, holdMs: 400, policyErrors });
       try {
@@ -591,7 +623,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.match(String(t.of('inference:exhausted')[0]!.error), /the turn was first held \d+ s ago; the hold's 1 s bound passed and it still didn't fit/);
         assert.equal(t.membrane.calls.length, 0);
         const last = policyErrors.at(-1) as Error & { budget?: number; actual?: number };
-        assert.equal(last.name, 'OverBudgetError', 'the error policy gets the refusal itself');
+        assert.equal(last, backlog.thrown.at(-1), 'the error policy gets the refusal itself');
         assert.equal(last.budget, 48_568, 'with its figures');
         assert.match(last.message, /the turn was first held/);
       } finally {
@@ -1037,7 +1069,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         t.send('Second message, while held');
         assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
         backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        assert.ok(await turnOver(t));
         assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the refused start left no undo step of its own');
         assert.equal(t.framework.undoLastTurn('prime').undone, true);
         const text = storedText(t.framework);
@@ -1056,12 +1088,31 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         t.send('First message');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the retry\'s compile is refused and held');
         backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        assert.ok(await turnOver(t));
         assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
+        assert.equal(t.framework.undoLastTurn('prime').undone, true);
+        assert.ok(storedText(t.framework).includes('First message') && !storedText(t.framework).includes('Answered once it fit'),
+          'which takes the reply and leaves the input');
       } finally {
         await t.close();
       }
     });
+  });
+
+  it('keeps the checkpoint of a turn held on its error policy\'s retry after its rounds ran, so its undo takes them', async () => {
+    const t = await heldRestart(['Answered once it fit'], { failsAfterTools: true });
+    try {
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the retry after the failed stream is refused and held');
+      assert.ok(toolBlocks(t.framework) >= 2, 'the turn\'s tool round is in its history');
+      t.fit();
+      assert.ok(await turnOver(t));
+      assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
+      assert.equal(t.framework.undoLastTurn('prime').undone, true);
+      assert.equal(toolBlocks(t.framework), 0, 'the undo takes the rounds the turn ran before its hold');
+      assert.ok(storedText(t.framework).includes('fetch it') && !storedText(t.framework).includes('Answered once it fit'));
+    } finally {
+      await t.close();
+    }
   });
 
   it('keeps the turn\'s one undo step when its tool-result guard\'s retry is held', async () => {
@@ -1069,8 +1120,10 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     try {
       assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the guard\'s retry is refused and held');
       t.fit();
-      assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 5_000));
+      assert.ok(await turnOver(t));
       assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the turn\'s first start recorded its one undo step, and the hold gave none of it back');
+      assert.equal(t.framework.undoLastTurn('prime').undone, true);
+      assert.equal(toolBlocks(t.framework), 0, 'the undo takes the tool round the guard\'s retry followed');
     } finally {
       await t.close();
     }
@@ -1216,8 +1269,11 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
         await new Promise((r) => setTimeout(r, 200));
         const previews = backlog.previews;
+        const before = backlog.previewBudgets.at(-1) as { reserveForResponse: number };
         reserve = 0;
         assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'a smaller reserve, which can make the context fit, brings a look');
+        assert.equal((backlog.previewBudgets.at(-1) as { reserveForResponse: number }).reserveForResponse, before.reserveForResponse - 5_000,
+          'at the budget the next compile plans at, with the reserve settled');
       } finally {
         await t.close();
       }
@@ -1852,6 +1908,28 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('reports a stopped hold\'s end once its turn has ended and the wakes that joined it are back in the queue', async () => {
+    await withBacklog({}, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
+        t.send('Joined while held');
+        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
+        let atEnd: { aborted: number; queued: number } | undefined;
+        t.framework.onTrace((e) => {
+          if (e.type === 'inference:hold_ended') {
+            atEnd = { aborted: t.of('inference:aborted').length, queued: t.internal.pendingRequests.filter((r) => r.agentName === 'prime').length };
+          }
+        });
+        assert.equal(t.framework.abortInference('prime'), true);
+        assert.deepEqual(atEnd, { aborted: 1, queued: 1 }, 'the turn had ended and its joined wake was queued when the end was reported');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('gives a deferred batch\'s wake that joins a held continuation a fresh turn of its own', async () => {
     const t = await heldRestart(['Answered after the restart', 'Answered the batch']);
     try {
@@ -1943,7 +2021,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       try {
         t.send('A turn that fits');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        assert.ok(await turnOver(t));
         assert.equal(t.framework.undoLastTurn('prime').undone, true);
         const before = t.framework.getUndoRedoState('prime');
         assert.equal(before.redoDepth, 1, 'the undone turn can be redone');
