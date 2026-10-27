@@ -106,6 +106,22 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
 });
 
+test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
+  const { fw, messages, added, restore } = makeHarness({ messages: [
+    { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },
+    { id: 'a0', participant: 'agent', content: [{ type: 'text', text: 'an answer' }] },
+    { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+    { id: 'a1', participant: 'agent', content: [] },
+  ] });
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
+    'the newest message is gone, and the empty row after it stays with what came before');
+  const marker = added.find((m) => m.meta.kind === 'refusal-rewind');
+  assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
+});
+
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {

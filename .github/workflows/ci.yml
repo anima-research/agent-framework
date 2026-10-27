@@ -139,6 +139,17 @@ jobs:
       - name: Test unforced (work in flight at stop)
         run: node --test --test-timeout=600000 dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js
 
+      # A Node diagnostic report lists the whole environment, values included.
+      # The .gitignore line that keeps one out of `git add -A` also hides it
+      # from plain `git status`, so without this step a regression would write
+      # dumps nobody sees (#697 R1-3). Covers both test steps above, the
+      # unforced one included.
+      - name: No Node diagnostic reports written
+        if: always()
+        run: |
+          found=$(find . -name 'report.*.json' -not -path './node_modules/*')
+          if [ -n "$found" ]; then echo "Node diagnostic reports were written (they list the environment):"; echo "$found"; exit 1; fi
+
   # The release as npm would pack it, installed on its own and loaded, as
   # the publish workflow checks before it publishes (see
   # scripts/pack-installs-alone.mjs): here a change that leaves a file out

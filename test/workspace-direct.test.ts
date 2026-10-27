@@ -205,13 +205,14 @@ test("read on a direct mount refuses what a 'chronicle' mount never stores: a bi
   env.file('big.txt', 'x'.repeat(9));
   env.file('fits.txt', 'x'.repeat(8));
   const m = await env.open({ maxFileSize: 8 });
-  assert.equal(await failure(m, 'read', { path: 'ref/bin.dat' }), "ref/bin.dat is binary, so read doesn't show it as text.");
-  assert.equal(await failure(m, 'read', { path: 'ref/dot.png' }), "ref/dot.png is over the size limit (8 bytes), so read doesn't show it.");
-  assert.equal(await failure(m, 'read', { path: 'ref/big.txt' }), "ref/big.txt is over the size limit (8 bytes), so read doesn't show it.");
+  assert.equal(await failure(m, 'read', { path: 'ref/bin.dat' }), `The read did nothing: "ref/bin.dat" is binary, so read doesn't show it as text. No tool shows it as text, so calling again won't change that.`);
+  const limit = "The limit is the mount's maxFileSize setting, which only whoever runs the host can change.";
+  assert.equal(await failure(m, 'read', { path: 'ref/dot.png' }), `The read did nothing: "ref/dot.png" is ${PNG.length} bytes, past the 8-byte limit this mount sets on a file, so read doesn't show it. ${limit}`);
+  assert.equal(await failure(m, 'read', { path: 'ref/big.txt' }), `The read did nothing: "ref/big.txt" is 9 bytes, past the 8-byte limit this mount sets on a file, so read doesn't show it. ${limit}`);
   assert.equal((await data<{ content: string }>(m, 'read', { path: 'ref/fits.txt' })).content, '     1\txxxxxxxx');
 
   const roomy = await env.open({ maxFileSize: 1024 });
-  assert.equal(await failure(roomy, 'read', { path: 'ref/dot.png' }), "ref/dot.png is binary, so read doesn't show it as text; read it with read_image.");
+  assert.equal(await failure(roomy, 'read', { path: 'ref/dot.png' }), `The read did nothing: "ref/dot.png" is binary, so read doesn't show it as text. read_image shows it, if its data holds together as an image.`);
 });
 
 test("read on a direct mount answers with the disk reader's refusals", async (t) => {
@@ -220,14 +221,15 @@ test("read on a direct mount answers with the disk reader's refusals", async (t)
   symlinkSync(join(env.ref, 'src/a.ts'), join(env.ref, 'link.ts'));
   symlinkSync(join(env.ref, 'src'), join(env.ref, 'srclink'));
   const m = await env.open();
-  assert.equal(await failure(m, 'read', { path: 'ref/missing.ts' }), 'File not found: ref/missing.ts');
-  assert.equal(await failure(m, 'read', { path: 'ref/src' }), 'Path is a directory: ref/src');
-  assert.equal(await failure(m, 'read', { path: 'ref/link.ts' }), 'Symlinks are not allowed: ref/link.ts');
+  assert.equal(await failure(m, 'read', { path: 'ref/missing.ts' }), `The read did nothing: there's no file at "ref/missing.ts". ls or glob lists the files that exist.`);
+  assert.equal(await failure(m, 'read', { path: 'ref/src' }), `The read did nothing: "ref/src" is a directory, not a file; ls "ref/src" lists what's in it.`);
+  assert.equal(await failure(m, 'read', { path: 'ref/link.ts' }),
+    `The read did nothing: "ref/link.ts" is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. Calling again won't change that; if you know the file it leads to, name that file by its own path.`);
   assert.equal(
     await failure(m, 'read', { path: 'ref/srclink/a.ts' }),
-    'ref/srclink/a.ts: "ref/srclink" is a symlink to "ref/src", which this mount does not follow; the mount\'s host can set followSymlinks: true',
+    'The read did nothing: ref/srclink/a.ts: "ref/srclink" is a symlink to "ref/src", which this mount does not follow; the mount\'s host can set followSymlinks: true.',
   );
-  assert.match(await failure(m, 'read', { path: 'ref/../escape.txt' }), /^Path traversal detected/);
+  assert.match(await failure(m, 'read', { path: 'ref/../escape.txt' }), /^The read did nothing: "ref\/\.\.\/escape\.txt" climbs above the root of mount "ref"/);
 });
 
 test("read_image on a direct mount never shows the copy a 'chronicle' run stored", async (t) => {
@@ -393,10 +395,11 @@ test("a direct mount's read loads none of a file over the size limit and grep on
   env.file('grows.txt', 'x'.repeat(8));
   env.file('huge.txt', 'y'.repeat(100_000));
   const m = await env.open({ maxFileSize: 10 });
-  const over = (path: string) => `${path} is over the size limit (10 bytes), so read doesn't show it.`;
+  const over = (path: string, size: string) => `The read did nothing: "${path}" is ${size} bytes, past the 10-byte limit this mount sets on a file, so read doesn't show it. `
+    + "The limit is the mount's maxFileSize setting, which only whoever runs the host can change.";
   // Over the limit at its open: read loads none of it, and grep its head.
   const read = await countingLoads(() => call(m, 'read', { path: 'ref/huge.txt' }));
-  assert.deepEqual([read.result.error, read.loaded], [over('ref/huge.txt'), 0]);
+  assert.deepEqual([read.result.error, read.loaded], [over('ref/huge.txt', '100,000'), 0]);
   const grep = await countingLoads(() => call(m, 'grep', { pattern: 'y', path: 'ref/huge.txt' }));
   assert.deepEqual((grep.result.structured as { skipped: unknown[] }).skipped, [{ file: 'ref/huge.txt', reason: 'over the size limit (10 bytes)', size: 100_000 }]);
   assert.equal(grep.loaded, 8192);
@@ -404,7 +407,7 @@ test("a direct mount's read loads none of a file over the size limit and grep on
   const grows = join(env.ref, 'grows.txt');
   const grown = await changedAfterFstat(grows, () => appendFileSync(grows, 'x'.repeat(1000)),
     () => countingLoads(() => call(m, 'read', { path: 'ref/grows.txt' })));
-  assert.equal(grown.result.error, over('ref/grows.txt'));
+  assert.equal(grown.result.error, over('ref/grows.txt', 'at least 11'));
   assert.ok(grown.loaded <= 11, `loaded ${grown.loaded}`);
   writeFileSync(grows, 'x'.repeat(8));
   const grownGrep = await changedAfterFstat(grows, () => appendFileSync(grows, 'x'.repeat(1000)),
@@ -418,12 +421,12 @@ test("a direct mount's read and grep say so where reading a file fails", async (
   env.file('a.txt', 'needle\n');
   const m = await env.open();
   const failing = { read: () => async function () { throw Object.assign(new Error('EIO: i/o error, read'), { code: 'EIO' }); } };
-  assert.equal((await withFileHandle(failing, () => call(m, 'read', { path: 'ref/a.txt' }))).error, 'Unable to read file: ref/a.txt (EIO)');
+  assert.equal((await withFileHandle(failing, () => call(m, 'read', { path: 'ref/a.txt' }))).error, `The read did nothing: "ref/a.txt" can't be read from disk: an input/output error on the disk. Calling again may work; if it fails the same way, whoever runs this host can check the disk.`);
   assert.deepEqual((await withFileHandle(failing, () => call(m, 'grep', { pattern: 'needle' }))).structured, {
     pattern: 'needle',
     results: [],
     totalMatches: 0,
-    skipped: [{ file: 'ref/a.txt', reason: 'cannot read (EIO)' }],
+    skipped: [{ file: 'ref/a.txt', reason: 'cannot read (an input/output error on the disk)' }],
   });
 });
 
@@ -435,8 +438,8 @@ test("read on a direct mount says why it couldn't open a file", { skip: IS_ROOT 
   chmodSync(join(env.ref, 'noperm.txt'), 0o000);
   chmodSync(join(env.ref, 'shut'), 0o000);
   try {
-    assert.equal(await failure(m, 'read', { path: 'ref/noperm.txt' }), 'Unable to read file: ref/noperm.txt (EACCES)');
-    assert.equal(await failure(m, 'read', { path: 'ref/shut/b.ts' }), 'Unable to read file: ref/shut/b.ts (EACCES)');
+    assert.equal(await failure(m, 'read', { path: 'ref/noperm.txt' }), `The read did nothing: "ref/noperm.txt" can't be read from disk: permission denied. Calling again won't change that; whoever runs this host can change the permissions.`);
+    assert.equal(await failure(m, 'read', { path: 'ref/shut/b.ts' }), `The read did nothing: "ref/shut/b.ts" can't be read from disk: permission denied. Calling again won't change that; whoever runs this host can change the permissions.`);
   } finally {
     chmodSync(join(env.ref, 'noperm.txt'), 0o644);
     chmodSync(join(env.ref, 'shut'), 0o755);
@@ -514,7 +517,7 @@ test("grep on a direct mount names a link to a directory it can't open as its li
     assert.deepEqual(listed.entries.find((e) => e.path === 'linkshut'), { path: 'linkshut', note: 'a symlink to a directory, not walked' });
     assert.deepEqual((await data<{ skipped?: unknown[] }>(m, 'grep', { pattern: 'needle' })).skipped, [
       { file: 'ref/linkshut', reason: 'a symlink to a directory, not walked' },
-      { file: 'ref/noperm.txt', reason: 'cannot open (EACCES)' },
+      { file: 'ref/noperm.txt', reason: 'cannot open (permission denied)' },
     ]);
   } finally {
     chmodSync(join(env.ref, 'shut'), 0o755);
@@ -629,8 +632,8 @@ test('a direct read that finds its root replaced as it opens the file says to re
     renameSync(env.ref, `${env.ref}-before`);
     mkdirSync(env.ref);
   }, () => failure(m, 'read', { path: 'ref/a.txt' }));
-  assert.equal(error, 'Mount unavailable: ref: the mount root was replaced as the file was opened: reading it again reads the directory there now');
-  assert.equal(await failure(m, 'read', { path: 'ref/a.txt' }), 'File not found: ref/a.txt');
+  assert.equal(error, `The read did nothing: "ref/a.txt" can't be read: the mount root was replaced as the file was opened: reading it again reads the directory there now.`);
+  assert.equal(await failure(m, 'read', { path: 'ref/a.txt' }), `The read did nothing: there's no file at "ref/a.txt". ls or glob lists the files that exist.`);
 });
 
 test("a direct mount takes each spelling of a path as a 'chronicle' mount does", async (t) => {
@@ -722,11 +725,11 @@ test("a direct mount's include holds as a 'chronicle' mount's does", async (t) =
   const fromDisk = await answersOf(direct, calls, hostPaths);
   // The include's refusal is the shared parse's, in the same words, and `ls`
   // without a path lists it beside the kind.
-  const said = /^"ref\/other\.txt" is outside the mount's include: mount "ref" holds only gate\.json, \*\.md, docs\/\*\*\./;
+  const said = /^The read did nothing: "ref\/other\.txt" is outside the mount's include: mount "ref" holds only gate\.json, \*\.md, docs\/\*\*\./;
   assert.match(await failure(direct, 'read', { path: 'ref/other.txt' }), said);
   // An image the include leaves out is refused in the include's words too,
   // and one it covers is read.
-  assert.match(await failure(direct, 'read_image', { path: 'ref/pic.png' }), /^"ref\/pic\.png" is outside the mount's include: mount "ref" holds only /);
+  assert.match(await failure(direct, 'read_image', { path: 'ref/pic.png' }), /^The read_image did nothing: "ref\/pic\.png" is outside the mount's include: mount "ref" holds only /);
   assert.ok((await call(direct, 'read_image', { path: 'ref/docs/pic.png' })).success);
   assert.deepEqual((await data<{ mounts: Array<Record<string, unknown>> }>(direct, 'ls')).mounts[0]!.include, include);
   assert.deepEqual((fromDisk[0] as [string, unknown, { entries: string[] }])[2].entries, ['docs/a/b.txt', 'docs/pic.png', 'gate.json', 'notes.md', 'sub/gate.json', 'sub/x.md']);
@@ -749,7 +752,7 @@ test("on a direct mount that follows links, a covered link that lands on a file 
   ];
   const direct = await env.open({ include, followSymlinks: true });
   const fromDisk = await answersOf(direct, calls, ['ref/link.md']);
-  assert.match(await failure(direct, 'read', { path: 'ref/link.md' }), /Symlink escape detected: ref\/link\.md/);
+  assert.match(await failure(direct, 'read', { path: 'ref/link.md' }), /^The read did nothing: "ref\/link\.md" leads through a symlink to a place outside its mount/);
   assert.deepEqual((fromDisk[3] as [string, unknown, { results: string[] }])[2].results, ['ref/also.md', 'ref/notes.md']);
   await env.close(direct);
   assert.deepEqual(fromDisk, await answersOf(await env.open({ backend: 'chronicle', mode: 'read-write', watch: 'never', include, followSymlinks: true }), calls, ['ref/link.md']));
@@ -1477,7 +1480,7 @@ test("a direct mount whose root moves between a read's parse and its open names 
   assert.match(err.message, /lies in mount "work", nested in mount "ref"/);
 });
 
-test("a direct mount whose root has moved resolves no other mount's root but those configured beneath its path", async (t) => {
+test("a direct mount whose root has moved resolves no other mount's root but those configured on or beneath its path", async (t) => {
   const env = new Env(t);
   // `ref` reaches `a` through `link`, and `x` is configured through a link
   // of its own, elsewhere.
@@ -1535,6 +1538,49 @@ const FOLDS_CASE = (() => {
     rmSync(dir, { recursive: true, force: true });
   }
 })();
+
+const KEEPS_FORMS_APART = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'workspace-direct-forms-'));
+  try {
+    writeFileSync(join(dir, 'caf\u00e9'), '');
+    return !existsSync(join(dir, 'cafe\u0301'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
+test("a direct root moved beside directories spelled in another case or form places each mount there as a start there does, and says where it only may lie", {
+  skip: FOLDS_CASE || !KEEPS_FORMS_APART ? 'the temp directory folds case or joins the normalization forms, so these spellings name one directory' : false,
+}, async (t) => {
+  const env = new Env(t);
+  const a = join(env.root, 'a');
+  mkdirSync(a);
+  for (const top of ['cafe', 'CAFE', 'caf\u00e9', 'cafe\u0301']) {
+    mkdirSync(join(env.root, top, 'inner'), { recursive: true });
+    writeFileSync(join(env.root, top, 'inner', 'file.txt'), `${top}\n`);
+  }
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link }, [
+    { name: 'upper', path: join(env.root, 'CAFE', 'inner'), mode: 'read-write', watch: 'never' },
+    { name: 'nfd', path: join(env.root, 'cafe\u0301', 'inner'), mode: 'read-write', watch: 'never' },
+  ]];
+  const moved = await env.open(...mounts);
+  const answer = (m: WorkspaceModule) => call(m, 'read', { path: 'ref/inner/file.txt' });
+
+  rmSync(link);
+  symlinkSync(join(env.root, 'cafe'), link);
+  const own = await answer(moved);
+  assert.equal(own.success, false, String(own.error));
+  assert.match(String(own.error), /may lie in mount "upper", nested in mount "ref".*can't tell whether "ref\/inner" is mount "upper"'s directory/);
+  assert.deepEqual(own, await answer(await new Env(t).open(...mounts)));
+
+  rmSync(link);
+  symlinkSync(join(env.root, 'caf\u00e9'), link);
+  const guessed = await answer(moved);
+  assert.match(String(guessed.error), /may lie in mount "nfd", nested in mount "ref".*can't tell whether "ref\/inner" is mount "nfd"'s directory/);
+  assert.deepEqual(guessed, await answer(await new Env(t).open(...mounts)));
+});
 
 test("on a disk that folds case, a mount configured beneath a moved direct root, spelled otherwise than disk spells it, is nested as a start there nests it", {
   skip: FOLDS_CASE ? false : "the temp directory tells case apart, so a path spelled in another case reaches nothing: this runs on a disk that folds case, such as macOS's default",
@@ -1695,7 +1741,7 @@ test("a mount nested in a moved direct root is judged by its own include there, 
   const fromStart = await answers(started);
   // A place `work`'s include leaves out is no mount's, so the link leaves
   // `ref`; one it covers is `work`'s.
-  assert.equal(fromStart.outside, 'Symlink escape detected: ref/l.md');
+  assert.equal(fromStart.outside, `The read did nothing: "ref/l.md" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; if a mount holds that file, name it by its path there.`);
   assert.match(fromStart.covered, /"ref\/k\.json" leads into mount "work", nested in mount "ref"/);
   assert.equal(fromStart.disk, 'escape');
   assert.deepEqual(await answers(moved), fromStart);
@@ -1732,7 +1778,7 @@ test("a direct mount moved away from a mount nested in it judges a path its incl
   const fromStart = await answers(started);
   // Nothing is nested in `ref` at `a`, so `work` is a file of `ref`'s that
   // its include leaves out, and no scope.
-  for (const result of fromStart) assert.match(result.error ?? '', /^"ref\/work" is outside the mount's include/);
+  for (const result of fromStart) assert.match(result.error ?? '', /^The (ls|glob|grep|read|sync|materialize) did nothing: "ref\/work" is outside the mount's include/);
   assert.deepEqual(await answers(moved), fromStart);
 });
 
@@ -1767,7 +1813,7 @@ test('a direct mount refuses every tool that writes, edit_many and materialize i
     ['edit_many', { edits: [{ path: 'ref/a.ts', oldString: 'alpha', newString: 'beta' }] }],
     ['delete', { path: 'ref/a.ts' }],
   ];
-  for (const [name, input] of calls) assert.match(await failure(m, name, input), /Mount "ref" is read-only/, name);
+  for (const [name, input] of calls) assert.match(await failure(m, name, input), /mount "ref" is read-only\. Calling again won't change that; whoever runs this host can make it read-write\./, name);
   // materialize names a read-only mount among what it skipped, as on any.
   const materialized = await data<{ count: number; skipped: unknown[] }>(m, 'materialize', { mount: 'ref' });
   assert.deepEqual([materialized.count, materialized.skipped], [0, [{ mount: 'ref', reason: 'a read-only mount: materialize writes nothing to it' }]]);
@@ -2311,17 +2357,17 @@ test("a writable mount configured direct that runs as 'chronicle' takes no write
   await env.close(chronicle);
   const m = await env.open({ mode: undefined });
   assert.equal(env.alerts.length, 1, "it runs as 'chronicle'");
-  const why = 'Mount "ref" is configured direct, and runs as \'chronicle\' this session because its start found the store holding changes there that disk lacks, '
+  const why = 'mount "ref" is configured direct, and runs as \'chronicle\' this session because its start found the store holding changes there that disk lacks, '
     + 'so it takes no writes this session, and calling again is refused the same way. To run it direct again, settle what\'s held '
-    + '(sync each held path to take disk\'s copy, or materialize mount "ref" by name to write the store\'s copies to disk), and the host\'s next start runs it direct';
+    + '(sync each held path to take disk\'s copy, or materialize mount "ref" by name to write the store\'s copies to disk), and the host\'s next start runs it direct.';
   // And getMounts gives it as read-only this session, so a caller choosing where to save passes over it.
   assert.deepEqual(m.getMounts().map(({ name, mode, backend }) => ({ name, mode, backend })), [{ name: 'ref', mode: 'read-only', backend: 'direct' }]);
   const pending = async () => (await data<Record<string, { pendingChanges: number }>>(m, 'status')).ref!.pendingChanges;
   assert.equal(await pending(), 1);
-  assert.equal(await failure(m, 'write', { path: 'ref/new.ts', content: 'x\n' }), why);
+  assert.equal(await failure(m, 'write', { path: 'ref/new.ts', content: 'x\n' }), `The write did nothing: ${why}`);
   assert.match(await failure(m, 'edit', { path: 'ref/kept.ts', oldString: 'disk', newString: 'edited' }), new RegExp(`${why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   assert.match(await failure(m, 'edit_many', { edits: [{ path: 'ref/kept.ts', oldString: 'disk', newString: 'edited' }] }), new RegExp(`${why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
-  assert.equal(await failure(m, 'delete', { path: 'ref/kept.ts' }), why);
+  assert.equal(await failure(m, 'delete', { path: 'ref/kept.ts' }), `The delete did nothing: ${why}`);
   assert.deepEqual(await m.writeBinary('ref/dot.img', Buffer.from('img'), 'image/png'), { success: false, isError: true, error: why });
   // Nothing reached disk or the store, so what's held is as it was.
   assert.equal(readFileSync(join(env.ref, 'kept.ts'), 'utf8'), 'disk\n');

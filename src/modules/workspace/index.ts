@@ -38,16 +38,16 @@ import type {
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, storedBytes, DEFAULT_MAX_FILE_SIZE, type StoredBytes } from './sync.js';
-import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
+import { DiskAgreement, EvidenceUnavailable, callGate, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { CHANGED, IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, checkDir, checkRoot, confirmAbsent, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, includePatternReadable, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, shownLeads, sniffImageMime, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { CHANGED, DIRECTORY, IGNORED, LEAVES_MOUNT, NONBLOCK, NOT_FOLLOWED, NOT_REGULAR, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, directoryAt, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, patternRefusal, readBytes, readPrefix, realSegments, restBeneath, rootAbsence, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
 import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
 import { type FileText, fileText } from './text.js';
 import { DEFAULT_READ_LINE_LIMIT, characterPage, linePage } from './read-page.js';
-import { type GrepAnswer, grepText, textAnswer } from './result-text.js';
+import { type DiskState, type GrepAnswer, grepText, textAnswer } from './result-text.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -65,6 +65,9 @@ import {
   settleAdoptionBeforeMutation,
 } from './reconcile.js';
 import { EffectFailed, unlinkContained } from './effects.js';
+import { AWAITS_REOPEN, ROOT_RECHECK, ROOT_UNCHECKED, Refusal, changesFiles, didNothing, errnoCode, errnoWayOn, errnoWords, hostFix, onlyTheHost, systemWords, unexpectedAnswer } from './answers.js';
+import { unknownToolMessage } from '../unknown-tool.js';
+import { closestNames } from '../../closest-names.js';
 import { RecordJournal } from '../../record-journal.js';
 import {
   type FileIdentity,
@@ -100,6 +103,9 @@ const BRANCH_LEFT = 'the workspace had left the branch this file is for';
 const AGENT_ACTION_SCAN_DEADLINE_MAX_MS = TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000;
 /** A direct mount's ignore list when its config names none (MountConfig.ignore). */
 const DIRECT_MOUNT_IGNORE: readonly string[] = ['node_modules', 'dist', '.git', 'build', 'coverage', 'target', '__pycache__', '.venv'];
+const PATTERN_FORMS = 'The list reads these of gitignore\'s forms: a name, matched at any depth, with "*" and "?" within it; '
+  + 'a trailing "/" to match only directories; a leading or inner "/" for a path from the mount\'s root; '
+  + 'a leading "**/" before one name; and a trailing "/**" for what lies beneath a directory.';
 /**
  * How many files a direct mount's grep reads, and its listings look at, at
  * once. Over a layout of seven checkouts, 5,929 files, a direct grep reading
@@ -134,27 +140,21 @@ export type {
 
 type SupportedImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
 
-class WorkspaceImageReadError extends Error {
-  constructor(
-    readonly code:
-      | 'mount_unavailable'
-      | 'not_found'
-      | 'directory'
-      | 'symlink'
-      | 'parent_symlink'
-      | 'other_mount'
-      | 'escape'
-      | 'changed'
-      | 'empty'
-      | 'too_large'
-      | 'truncated'
-      | 'invalid'
-      | 'unsupported',
-    message: string,
-  ) {
-    super(message);
+class WorkspaceImageReadError extends Refusal {
+  constructor(readonly reason: string, wayOn: string | null) {
+    super(wayOn === null ? sentence(reason) : `${reason}. ${wayOn}`);
     this.name = 'WorkspaceImageReadError';
   }
+}
+
+const IMAGE_STAYS = "Calling again won't change that; only a whole image in its place would.";
+
+function truncatedImage(mountPrefixedPath: string): WorkspaceImageReadError {
+  return new WorkspaceImageReadError(`${JSON.stringify(mountPrefixedPath)} is too short to be an image: it ends inside an image format's signature`, IMAGE_STAYS);
+}
+
+function emptyImage(mountPrefixedPath: string): WorkspaceImageReadError {
+  return new WorkspaceImageReadError(`${JSON.stringify(mountPrefixedPath)} is empty, so there's no image in it`, IMAGE_STAYS);
 }
 
 /**
@@ -174,10 +174,12 @@ class WorkspaceImageReadError extends Error {
  * directories leading out of it (`escape`), a file swapped underneath the read
  * (`changed`), a path the mount's `include` doesn't cover (`outside_include`),
  * and a path in another mount's directory nested in the one named
- * (`other_mount`), whose message names the mount that holds it and the path
- * to use there. A symlink leading into such a directory is `other_mount`
- * only where its refusal names that mount: a directory, or a file that
- * mount's include covers. Anywhere else, on a mount that doesn't follow
+ * (`other_mount`), whose message names the mount that holds it, or may hold
+ * it, and the path to use there. A symlink leading into such a directory is
+ * `other_mount` only where its refusal names that mount: a directory, or a
+ * file that mount's include covers, and so does the include of each other
+ * nested mount whose directory may hold it, out to the first that surely
+ * does. Anywhere else, on a mount that doesn't follow
  * symlinks, it gets the code of a link where it stands, `symlink` at the
  * path itself and `parent_symlink` on its way, and on one that does,
  * `escape`, as a path that leaves the mount. On a mount with an include, a
@@ -219,7 +221,7 @@ export type WorkspaceReadStage =
   | 'read';
 
 /** A path the mount's `include` doesn't cover: outside the mount. */
-class OutsideIncludeError extends Error {
+class OutsideIncludeError extends Refusal {
   constructor(shownPath: string, mount: MountConfig) {
     super(`"${shownPath}" is outside the mount's include: mount "${mount.name}" holds only ${(mount.include ?? []).join(', ')}. `
       + 'The host\'s operator sets the include in the mount\'s configuration, so calling again with this path changes nothing.');
@@ -231,9 +233,16 @@ class OutsideIncludeError extends Error {
  * mount it names. The message names the mount that holds it and the path to
  * use there.
  */
-class NestedMountError extends Error {
-  constructor(path: string, mount: string, holder: string, use: string, how: 'lies in' | 'leads into' = 'lies in') {
-    super(`"${path}" ${how} mount "${holder}", nested in mount "${mount}", which neither reads nor writes it: use "${use}".`);
+class NestedMountError extends Refusal {
+  constructor(path: string, mount: string, holder: { name: string; use: string; guess?: NestedGuess }, how: 'lies in' | 'leads into' = 'lies in') {
+    const verb = holder.guess === undefined ? how : how === 'lies in' ? 'may lie in' : 'may lead into';
+    super(`"${path}" ${verb} mount "${holder.name}", nested in mount "${mount}", which neither reads nor writes it: ${nestedStep(holder, { named: how === 'lies in' })}.`);
+  }
+}
+
+class PathRefusal extends Refusal {
+  constructor(readonly code: 'unknown_mount' | 'traversal', message: string) {
+    super(message);
   }
 }
 
@@ -252,6 +261,18 @@ export class WorkspaceReadError extends Error {
   ) {
     super(message);
     this.name = 'WorkspaceReadError';
+  }
+}
+
+class NotRegularFile extends WorkspaceReadError {
+  constructor(path: string, stage: WorkspaceReadStage) {
+    super('not_found', `Not a regular file: ${path}`, stage);
+  }
+}
+
+class RootUnavailable extends WorkspaceReadError {
+  constructor(readonly mount: string, readonly reason: string | null, stage: WorkspaceReadStage, errno?: string, readonly refusal?: Refusal) {
+    super('mount_unavailable', reason === null ? `Mount unavailable: ${mount}` : `Mount unavailable: ${mount}: ${reason}`, stage, errno);
   }
 }
 
@@ -307,23 +328,10 @@ function errnoOf(err: unknown): string | undefined {
     : undefined;
 }
 
-/**
- * What is at a mount root's path now, followed as the root is: for a
- * directory, undefined; for anything else, ENOTDIR; and where the path
- * can't be followed to anything, the errno its stat failed with, ENOENT
- * when nothing is there.
- */
-async function rootAbsence(root: string): Promise<string | undefined> {
-  try {
-    return (await stat(root)).isDirectory() ? undefined : 'ENOTDIR';
-  } catch (err) {
-    return errnoOf(err);
-  }
-}
 
 /** read_image's refusal of a file over the mount's size limit, wherever it's found to be. */
-function imageTooLarge(maxSize: number, mountPrefixedPath: string): WorkspaceImageReadError {
-  return new WorkspaceImageReadError('too_large', `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`);
+function imageTooLarge(maxSize: number, mountPrefixedPath: string, size: string): WorkspaceImageReadError {
+  return new WorkspaceImageReadError(pastSizeLimit(`${JSON.stringify(mountPrefixedPath)} is ${size} bytes`, maxSize, "read_image doesn't show it", null), null);
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -340,10 +348,6 @@ const JPEG_SOI = 0xd8;
 const JPEG_EOI = 0xd9;
 const JPEG_SOS = 0xda;
 const JPEG_TEM = 0x01;
-
-function isErrnoCode(err: unknown, code: string): boolean {
-  return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: unknown }).code === code;
-}
 
 function startsWithBytes(buffer: Buffer, prefix: Buffer): boolean {
   return buffer.length >= prefix.length && buffer.subarray(0, prefix.length).equals(prefix);
@@ -387,7 +391,7 @@ async function linkReadError(
   const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested, mount.config.include)}`;
   const holder = leads?.kind === 'inside' ? nestedHolder(leads.target, nested) : undefined;
   const code = leads?.kind === 'outside' ? 'escape'
-    : leads?.kind === 'inside' && holder && namesHolder(leads, holder) ? 'other_mount'
+    : leads?.kind === 'inside' && holder && namesHolder(leads, nested) ? 'other_mount'
     : relativePath === found.link ? 'symlink' : 'parent_symlink';
   return new WorkspaceReadError(code, reason, 'readlink');
 }
@@ -419,32 +423,30 @@ function ancestorsOf(path: string): string[] {
  * directory as configured beneath the outer mount's configured path
  * (`outerPath`), beneath each directory above its configured path that is
  * the outer root on disk (`above`, each with where it lies on disk), and
- * where its real root (`real`) lies beneath the outer root (`outerReal`),
- * each also as disk spells it beneath `spellAt`. Its real root is claimed
- * where it doesn't hold the outer root, which it would otherwise claim
- * whole. Undefined where it's nested nowhere.
+ * where its real root (`real`) lies beneath the outer root (`outerReal`).
+ * Its real root is claimed where it doesn't hold the outer root, which it
+ * would otherwise claim whole. Undefined where it's nested nowhere.
  */
-async function placementOf(
+function placementOf(
   outerPath: string,
   outerReal: string,
   innerPath: string,
   real: string,
   above: ReadonlyArray<{ dir: string; real: string }>,
-  spellAt: string,
-): Promise<{ configured: string | undefined; fromRoots: Array<{ dir: string; root: string }>; spellings: Array<{ dir: string; root: string }>; claims: boolean } | undefined> {
+): { configured: string | undefined; fromRoots: NestedMountEntry['fromRoots']; claims: boolean } | undefined {
   const configured = nestedDir(outerPath, innerPath);
-  const throughRoot = above.filter((a) => a.real === outerReal).map((a) => nestedDir(a.dir, innerPath));
-  const fromRoots: Array<{ dir: string; root: string }> = [];
-  for (const dir of [configured, ...throughRoot, nestedDir(outerReal, real)]) {
-    if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });
+  const dirs = new Map<string, boolean>();
+  const place = (dir: string | undefined, sure: boolean) => { if (dir !== undefined) dirs.set(dir, (dirs.get(dir) ?? false) || sure); };
+  place(configured, true);
+  for (const a of above) {
+    if (sameRoot(a.real, outerReal)) place(nestedDir(a.dir, innerPath), surelyAtRoot(a.real, outerReal));
   }
-  if (fromRoots.length === 0) return undefined;
-  const spellings = [...fromRoots];
-  for (const found of fromRoots) {
-    const dir = await diskSpelling(spellAt, found.dir);
-    if (!spellings.some((s) => s.dir === dir)) spellings.push({ dir, root: join(outerPath, ...dir.split('/')) });
-  }
-  return { configured, fromRoots, spellings, claims: !isContainedPath(real, outerReal) };
+  const below = beneathRoot(real, outerReal);
+  place(below, below !== undefined && surelyAtRoot(real, outerReal));
+  if (dirs.size === 0) return undefined;
+  const fromRoots: NestedMountEntry['fromRoots'] = [...dirs].map(([dir, sure]) => ({ dir, ...(sure ? {} : { guessed: true as const }) }));
+  const claims = !sameRoot(outerReal, real) && beneathRoot(outerReal, real) === undefined;
+  return { configured, fromRoots, claims };
 }
 
 /** A mount nested in another, as the outer mount's otherMounts holds it. */
@@ -457,9 +459,7 @@ interface NestedMountEntry {
    */
   real?: string;
   /** Its directory as configured and as the real roots place it. */
-  fromRoots: Array<{ dir: string; root: string }>;
-  /** Those, and each as disk spells it where that differs. */
-  spellings: Array<{ dir: string; root: string }>;
+  fromRoots: Array<{ dir: string; guessed?: true }>;
 }
 
 /**
@@ -538,7 +538,7 @@ function isContainedPath(root: string, candidate: string): boolean {
 }
 
 function invalidImage(format: string, mountPrefixedPath: string): never {
-  throw new WorkspaceImageReadError('invalid', `Invalid ${format} image: ${mountPrefixedPath}`);
+  throw new WorkspaceImageReadError(`${JSON.stringify(mountPrefixedPath)} starts as a ${format} image, but its data doesn't hold together as one`, IMAGE_STAYS);
 }
 
 function requireBufferRange(bytes: Buffer, start: number, length: number, format: string, mountPrefixedPath: string): void {
@@ -914,7 +914,7 @@ function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): Supporte
     return 'image/png';
   }
   if (matchesPartialPrefix(bytes, PNG_SIGNATURE)) {
-    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+    throw truncatedImage(mountPrefixedPath);
   }
 
   if (startsWithBytes(bytes, JPEG_SIGNATURE)) {
@@ -922,7 +922,7 @@ function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): Supporte
     return 'image/jpeg';
   }
   if (matchesPartialPrefix(bytes, JPEG_SIGNATURE)) {
-    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+    throw truncatedImage(mountPrefixedPath);
   }
 
   if (startsWithBytes(bytes, GIF87A_SIGNATURE) || startsWithBytes(bytes, GIF89A_SIGNATURE)) {
@@ -930,7 +930,7 @@ function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): Supporte
     return 'image/gif';
   }
   if (matchesPartialPrefix(bytes, GIF87A_SIGNATURE) || matchesPartialPrefix(bytes, GIF89A_SIGNATURE)) {
-    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+    throw truncatedImage(mountPrefixedPath);
   }
 
   if (bytes.length >= 12 && startsWithBytes(bytes, RIFF_SIGNATURE) && bytes.subarray(8, 12).equals(WEBP_SIGNATURE)) {
@@ -941,10 +941,10 @@ function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): Supporte
     (bytes.length < RIFF_SIGNATURE.length && matchesPartialPrefix(bytes, RIFF_SIGNATURE))
     || (bytes.length >= RIFF_SIGNATURE.length && startsWithBytes(bytes, RIFF_SIGNATURE) && bytes.length < 12)
   ) {
-    throw new WorkspaceImageReadError('truncated', `Truncated image signature: ${mountPrefixedPath}`);
+    throw truncatedImage(mountPrefixedPath);
   }
 
-  throw new WorkspaceImageReadError('unsupported', `Unsupported image format: ${mountPrefixedPath}`);
+  throw new WorkspaceImageReadError(`${JSON.stringify(mountPrefixedPath)} isn't a PNG, JPEG, GIF or WebP image, the formats read_image shows`, "read shows it, if it's text.");
 }
 
 export class WorkspaceModule implements Module {
@@ -972,14 +972,11 @@ export class WorkspaceModule implements Module {
   private ctimeTrust = new Map<string, string | null>();
   /**
    * Each mount's directories that are other mounts nested inside it, with
-   * each mount's name and real root, in each spelling that names the
-   * directory: as configured; as the real roots place it, where that differs
-   * (`fromRoots`); and as disk spells each of those where that differs.
-   * Each spelling is mount-relative and `/`-separated, with its root beneath
-   * the mount's resolved root. The constructor nests by configured path,
-   * with each root as resolved standing for its real one, and each start
-   * reads it all again with the roots placed where disk has them
-   * (readNesting).
+   * each mount's name and real root: as configured, and as the real roots
+   * place it, where that differs (`fromRoots`). Each is mount-relative and
+   * `/`-separated. The constructor nests by configured path, with each root
+   * as resolved standing for its real one, and each start reads it all again
+   * with the roots placed where disk has them (readNesting).
    */
   private otherMounts = new Map<string, NestedMountEntry[]>();
   /** Whether each mount's root folds case (foldsCase), where disk has it, as the last start read it. */
@@ -1044,24 +1041,18 @@ export class WorkspaceModule implements Module {
       if (refused.length > 0) {
         throw new Error(`[workspace] Mount "${mount.name}" is direct, which reads disk as it is with no store, watcher or push: ${refused.join('; ')}`);
       }
-      const include: unknown = mount.include;
-      if (include !== undefined) {
-        // A pattern the matcher can't read would match nothing, and take every
-        // file out of the mount unsaid (includePatternReadable).
-        if (!Array.isArray(include) || include.length === 0) {
-          throw new Error(
-            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, not ${shownValue(include)}`,
-          );
+      for (const list of ['ignore', 'include'] as const) {
+        const patterns: unknown = mount[list];
+        if (patterns === undefined) continue;
+        if (!Array.isArray(patterns) || (list === 'include' && patterns.length === 0)) {
+          throw new Error(`[workspace] Mount "${mount.name}": ${list} must be a ${list === 'include' ? 'non-empty ' : ''}list of patterns, not ${shownValue(patterns)}`);
         }
-        // By index: an entry that is itself undefined, or a hole, is unreadable too.
-        const at = include.findIndex((p) => !includePatternReadable(p));
-        if (at >= 0) {
-          const unreadable: unknown = include[at];
-          throw new Error(
-            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, `
-            + `with no "." or ".." segment${sep === '\\' ? ' and no "\\", which this platform reads as a separator' : ''}; `
-            + `${shownValue(unreadable)} is none of these`,
-          );
+        for (let i = 0; i < patterns.length; i++) {
+          const pattern: unknown = patterns[i];
+          const why = patternRefusal(pattern, list);
+          if (why !== undefined) {
+            throw new Error(`[workspace] Mount "${mount.name}": ${list} pattern ${shownValue(pattern)} isn't read: ${why}. ${PATTERN_FORMS}`);
+          }
         }
       }
     }
@@ -1080,8 +1071,8 @@ export class WorkspaceModule implements Module {
         const innerPath = resolve(inner.path);
         const dir = nestedDir(outerPath, innerPath);
         if (dir === undefined) continue;
-        const configured = [{ dir, root: innerPath }];
-        this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, real: innerPath, fromRoots: configured, spellings: [...configured] }]);
+        const configured = [{ dir }];
+        this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, real: innerPath, fromRoots: configured }]);
         console.warn(
           `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
           `at ${dir}/ — passing over it as another mount's directory`,
@@ -1371,7 +1362,7 @@ export class WorkspaceModule implements Module {
     const { view, rootReal } = mount.direct ? await this.diskView(mount) : await this.runtime(mount);
     let start = base;
     for (const segment of beneath.split('/')) {
-      if (start !== '' && (mount.direct ? inOtherMount(start, view.others) : passedOverAt(start, view.ignore, view.others) !== undefined)) break;
+      if (start !== '' && (mount.direct ? inOtherMount(start, view.others) : passedOverAt(start, view.ignore, view.others, true) !== undefined)) break;
       const here = await checkDir(view, rootReal, start);
       if (here.kind !== 'checked') break;
       const entry = (await readdir(here.dir.real, { withFileTypes: true }).catch(() => [])).find((e) => e.name === segment);
@@ -1424,11 +1415,10 @@ export class WorkspaceModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     // Which mounts are nested where, with the roots placed where disk has
-    // them and each nested mount's directory as disk spells it, and whether
-    // each mount's root folds case, read where disk has it, before this start
-    // sets anything, so a restart takes no call and walks or watches nothing
-    // before they're known. A stop begun meanwhile stands, and this start then
-    // sets nothing.
+    // them, and whether each mount's root folds case, read where disk has
+    // it, before this start sets anything, so a restart takes no call
+    // and walks or watches nothing before they're known. A stop begun
+    // meanwhile stands, and this start then sets nothing.
     const stops = this.stopsBegun;
     const { nesting, reals, above } = await this.readNesting();
     const rootFoldsCase = new Map<string, boolean>();
@@ -1544,7 +1534,8 @@ export class WorkspaceModule implements Module {
     return (
       `current branch "${current.name}" has diverged from the branch last materialized to disk ` +
       `(${pinnedName} at seq ${mount.lastMaterializedSeq}) — disk may hold state the current branch ` +
-      `never had. Pass force: true to overwrite disk from the current branch if it is canonical.`
+      `never had. ls with path ${JSON.stringify(mount.config.name)} and recursive: true shows how each file of the current branch stands against disk; ` +
+      'if the current branch is what disk should hold, pass force: true to overwrite disk from it.'
     );
   }
 
@@ -2183,7 +2174,13 @@ export class WorkspaceModule implements Module {
     return work;
   }
 
-  private async runToolCall(call: ToolCall): Promise<ToolResult> {
+  private runToolCall(call: ToolCall): Promise<ToolResult> {
+    const gate = { passed: false };
+    return callGate.run(gate, () => this.answerToolCall(call, gate));
+  }
+
+  private async answerToolCall(call: ToolCall, gate: { passed: boolean }): Promise<ToolResult> {
+    const reopenAtStart = this.agreement?.awaitsReopen === true;
     try {
       // Every handler reads its input as its schema describes it; a call
       // that sends something else is refused here, before anything is read.
@@ -2198,12 +2195,12 @@ export class WorkspaceModule implements Module {
       // ResultTooLarge in its place. A call made in process carries none and
       // takes the data itself, so its read pages by its line limit alone.
       const resultMaxChars = call.resultMaxChars;
-      const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
+      const generated = schema !== undefined && typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
         if (call.name === 'read' && call.callerAgentName === generated.agentName) {
           return await this.handleRead(input as unknown as ReadInput, resultMaxChars, generated.read());
         }
-        return { success: false, isError: true, error: this.generatedFileRefusal(generated, call.callerAgentName) };
+        return { success: false, isError: true, error: didNothing(call.name, this.generatedFileRefusal(input.path as string, generated, call.callerAgentName)) };
       }
 
       switch (call.name) {
@@ -2220,12 +2217,40 @@ export class WorkspaceModule implements Module {
         case 'materialize': return await this.handleMaterialize(input as unknown as MaterializeInput);
         case 'sync': return await this.handleSync(input as unknown as SyncInput);
         default:
-          return { success: false, error: `Unknown tool: ${call.name}, so nothing was done`, isError: true };
+          return { success: false, error: unknownToolMessage(this.name, call.name, this.getTools()), isError: true };
       }
     } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err), isError: true };
+      return { success: false, error: this.failureAnswer(call, err, reopenAtStart, gate.passed), isError: true };
     }
   }
+
+  private failureAnswer(call: ToolCall, err: unknown, reopenAtStart: boolean, passedGate: boolean): string {
+    const input = (typeof call.input === 'object' && call.input !== null ? call.input : {}) as { path?: unknown; mount?: unknown };
+    const path = typeof input.path === 'string' ? input.path : undefined;
+    const mountName = path !== undefined ? path.split('/')[0]! : typeof input.mount === 'string' ? input.mount : undefined;
+    const subject = path !== undefined ? JSON.stringify(path) : typeof input.mount === 'string' ? `mount ${JSON.stringify(input.mount)}` : undefined;
+    const reopened = !reopenAtStart && this.agreement?.awaitsReopen === true;
+    if (err instanceof EvidenceUnavailable && passedGate && changesFiles(call.name)) {
+      return `The ${call.name}${subject !== undefined ? ` of ${subject}` : ''} stopped partway: ${err.message} Whether it changed anything before it stopped isn't known until then.`;
+    }
+    if (err instanceof Refusal) return didNothing(call.name, err.message);
+    if (err instanceof WorkspaceReadError) return didNothing(call.name, path !== undefined ? readRefusal(err, path) : sentence(err.message));
+    const look = call.name !== 'materialize' && call.name !== 'sync' ? undefined
+      : mountName !== undefined ? `ls with path ${JSON.stringify(mountName)} and recursive: true shows how each file there stands against disk now`
+        : 'ls of each mount, with recursive: true, shows how each file stands against disk now';
+    if (err instanceof NotStored || err instanceof AlreadyHeld) {
+      console.error(`[workspace] ${call.name} failed before it changed anything:`, err.thrown);
+      return unexpectedAnswer(call.name, subject, err.thrown, { stored: err instanceof NotStored ? 'not' : 'held', reopen: reopened });
+    }
+    console.error(`[workspace] ${call.name} failed:`, err);
+    if (err instanceof CommitUnknownError) {
+      return unexpectedAnswer(call.name, subject, err.setCause, {
+        said: `the store failed as it set the change (${storeWords(err.setCause)}), and reading it back failed too (${storeWords(err.readCause)})`, reopen: reopened, look,
+      });
+    }
+    return unexpectedAnswer(call.name, subject, err, { reopen: reopened, look });
+  }
+
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     // Wake agents on filesystem events when the originating mount opted in.
@@ -2271,7 +2296,7 @@ export class WorkspaceModule implements Module {
       text = `[workspace event · ${op} · ${paths.length} files in ${mountName}/]\n${list}`;
     }
     if (conflicts && conflicts.length > 0) {
-      text += `\n[conflicts: ${conflicts.join(', ')}]`;
+      text += `\n[conflicts with disk: ${conflicts.join(', ')}; reading each shows how to settle it]`;
     }
 
     return {
@@ -2322,16 +2347,15 @@ export class WorkspaceModule implements Module {
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
       // Synchronous, so the path as given. The nested-mount check takes it
-      // in each spelling readNesting knows for the nested mount's directory,
-      // or in any spelling a disk that folds names may fold to one of them,
-      // erring toward that mount (holderOf's asGiven, beginsWithDir). The
-      // include judges it as given, so on a disk that
+      // in any spelling a disk that folds names may fold to the nested
+      // mount's directory, erring toward that mount (holderOf). The include
+      // judges it as given, so on a disk that
       // folds names a covered name whose file disk spells otherwise returns
       // that file's path, which the tools refuse, and a covered file named in
       // another case is null, which the tools read. A path the mount doesn't
       // hold, outside its include or in another mount's directory nested in
       // it, is null, as for a path that leaves the mount's directory.
-      const { mount, relativePath } = this.refuseNotHeld({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath }, mountPrefixedPath, true);
+      const { mount, relativePath } = this.refuseNotHeld({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath }, mountPrefixedPath);
       return resolve(mount.config.path, relativePath);
     } catch {
       return null;
@@ -2358,6 +2382,9 @@ export class WorkspaceModule implements Module {
    * checked before the write starts and again just before its rename, and
    * `agentName` names the agent whose write it is for the head-move notice
    * (a write naming none tells no agent).
+   *
+   * A success's `disk` says where the file stands on disk as the workspace
+   * last saw it, as the write tool's answer does.
    *
    * A write whose tree entry is set but that then fails returns success
    * false with `data: { inChronicle: true }`: its copy on disk was refused,
@@ -2395,11 +2422,12 @@ export class WorkspaceModule implements Module {
         isError: true,
       };
     }
-    const refusal = writeRefusal(mount);
+    if (relativePath === '') return { success: false, error: namesRoot(mountPrefixedPath, mount.config.name), isError: true };
+    const refusal = writeRefusal(mount, this.writableNames());
     if (refusal) return { success: false, error: refusal, isError: true };
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     if (data.byteLength > maxSize) {
-      return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
+      return { success: false, error: tooLargeToWrite(mountPrefixedPath, data.byteLength, maxSize), isError: true };
     }
     const store = this.getStore();
     // A direct mount's bytes go to disk, whole, or nowhere (writeDirect),
@@ -2413,7 +2441,7 @@ export class WorkspaceModule implements Module {
       }
       const written = await this.writeDirect(mount, relativePath, mountPrefixedPath, data, options.agentName, options.branch);
       if ('error' in written) return { success: false, isError: true, error: written.error, ...(written.branchLeft ? { data: { branchLeft: true } } : {}) };
-      return { success: true, data: { path: mountPrefixedPath, size: data.byteLength, mimeType, ...(written.note ? { note: written.note } : {}) } };
+      return { success: true, data: { path: mountPrefixedPath, size: data.byteLength, mimeType, disk: 'done', ...(written.note ? { note: written.note } : {}) } };
     }
     return this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
@@ -2428,20 +2456,24 @@ export class WorkspaceModule implements Module {
       let committed = false;
       let failure: string | null;
       let modeKept: string | null = null;
+      let disk: DiskState | null = null;
       try {
         const answer = await this.commitToolChange(mount, relativePath,
           { kind: 'set', blobHash, size: data.byteLength, ...(existing ? { mode: existing.mode } : {}) }, () => { committed = true; });
         modeKept = answer.modeKept;
+        disk = answer.disk;
         failure = answer.refused === null ? null
           : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${answer.refused}.`;
       } catch (error) {
         if (!committed) throw error;
         // As write words it: a store that failed after recording the file
         // skipped its push, so on a mount that pushes, disk lacks it.
+        const reopen = this.agreement?.awaitsReopen === true;
         failure = error instanceof StoredThenFailed
           ? `Stored "${mountPrefixedPath}" in Chronicle, but the store failed after recording it: ${error.message}.`
-            + (error.pushes ? " Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it." : '')
+            + (error.pushes ? ` Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it${reopen ? ONCE_REOPENED : ''}.` : '')
           : `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
+        if (reopen) failure += ` ${AWAITS_REOPEN}`;
       }
       if (failure !== null) {
         // The file is in the Chronicle tree, where the workspace's tools read
@@ -2451,7 +2483,7 @@ export class WorkspaceModule implements Module {
       }
       return {
         success: true,
-        data: { path: mountPrefixedPath, size: data.byteLength, mimeType, ...(modeKept ? { modeKept } : {}) },
+        data: { path: mountPrefixedPath, size: data.byteLength, mimeType, disk, ...(modeKept ? { modeKept } : {}) },
       };
     });
   }
@@ -2490,7 +2522,9 @@ export class WorkspaceModule implements Module {
     return this.withMount(mount, async () => {
       const { report, undecided } = await this.ensureSynced(mount, relativePath);
       const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) return { error: undecided !== null ? this.notCheckedYet(mountPrefixedPath, undecided) : this.notInWorkspace(mountPrefixedPath, report) };
+      if (!entry) {
+        return { error: undecided !== null ? this.notCheckedYet(mountPrefixedPath, undecided) : this.notInWorkspace(mountPrefixedPath, report, mount, `File not found: ${mountPrefixedPath}`) };
+      }
       const contents = await this.contentsOf(mount, relativePath, mountPrefixedPath, entry);
       if ('lost' in contents) return { error: nothingToRead(contents.lost) };
       return { data: contents.bytes };
@@ -2576,9 +2610,9 @@ export class WorkspaceModule implements Module {
     }
   }
 
-  /** The directories of the mounts nested inside a mount, mount-relative, in each spelling. */
+  /** The directories of the mounts nested inside a mount, mount-relative. */
   private othersOf(mountName: string): string[] {
-    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => s.dir));
+    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.fromRoots.map((s) => s.dir));
   }
 
   /**
@@ -2594,13 +2628,8 @@ export class WorkspaceModule implements Module {
    * alone, with no real root, since through it it would claim the other's
    * every path.
    *
-   * Each way it lies there is a spelling of its directory (`fromRoots`), and
-   * so is the spelling disk lists each of those by, where that differs. On a
-   * disk that folds names, the outer mount's walks name the directory as
-   * disk does, and so does a path parsePath has respelled, while a path given
-   * as configured still names it as configured (resolveAbsolutePath). A
-   * directory not on disk keeps the spellings the roots give alone. Each
-   * mount's real root comes back beside the nesting (`reals`), for what
+   * Each way it lies there is a spelling of its directory (`fromRoots`).
+   * Each mount's real root comes back beside the nesting (`reals`), for what
    * start reads there, and each directory above each configured path with
    * where it lies on disk (`above`), for a direct mount whose root moves
    * (movedNesting).
@@ -2625,16 +2654,15 @@ export class WorkspaceModule implements Module {
       for (const inner of this.config.mounts) {
         if (outer === inner) continue;
         const real = reals.get(inner.name)!;
-        const at = await placementOf(outerPath, outerReal, resolve(inner.path), real, above.get(inner.name)!, outerPath);
+        const at = placementOf(outerPath, outerReal, resolve(inner.path), real, above.get(inner.name)!);
         if (at === undefined) continue;
-        const { configured, fromRoots, spellings, claims } = at;
-        nesting.set(outer.name, [...(nesting.get(outer.name) ?? []), { name: inner.name, ...(claims ? { real } : {}), fromRoots, spellings }]);
+        const { configured, fromRoots, claims } = at;
+        nesting.set(outer.name, [...(nesting.get(outer.name) ?? []), { name: inner.name, ...(claims ? { real } : {}), fromRoots }]);
         const placed = fromRoots.filter((s) => s.dir !== configured);
         if (placed.length > 0) {
-          console.warn(
-            `[workspace] Mount "${outer.name}" contains mount "${inner.name}" where it lies on disk, ` +
-            `at ${placed.map((s) => `${s.dir}/`).join(' and ')} — passing over it as another mount's directory`,
-          );
+          const at = (sure: boolean) => placed.filter((s) => !s.guessed === sure).map((s) => `${s.dir}/`).join(' and ');
+          const where = [at(true) && `where it lies on disk, at ${at(true)}`, at(false) && `where it may lie on disk, at ${at(false)}`].filter(Boolean).join(', and ');
+          console.warn(`[workspace] Mount "${outer.name}" contains mount "${inner.name}" ${where} — passing over it as another mount's directory`);
         }
       }
     }
@@ -2643,11 +2671,11 @@ export class WorkspaceModule implements Module {
 
   /**
    * The mounts nested in `mountName`, by directory, name, real root where it
-   * has one, and include (MountView's `nested`), in each spelling known.
+   * has one, and include (MountView's `nested`).
    */
   private nestedOf(mountName: string): NestedMount[] {
     return (this.otherMounts.get(mountName) ?? []).flatMap((o) =>
-      o.spellings.map((s) => ({ dir: s.dir, name: o.name, real: o.real, include: this.mounts.get(o.name)?.config.include })));
+      o.fromRoots.map((s) => ({ dir: s.dir, ...(s.guessed ? { guessed: s.guessed } : {}), name: o.name, real: o.real, include: this.mounts.get(o.name)?.config.include })));
   }
 
   /**
@@ -2746,10 +2774,12 @@ export class WorkspaceModule implements Module {
         if (real === undefined) continue;
         above = placedAbove.get(inner.name) ?? [];
       }
-      const at = await placementOf(outerPath, rootReal, innerPath, real, above, rootReal);
+      const at = placementOf(outerPath, rootReal, innerPath, real, above);
       if (at === undefined) continue;
       const include = this.mounts.get(inner.name)?.config.include;
-      for (const s of at.spellings) nested.push({ dir: s.dir, name: inner.name, ...(at.claims ? { real } : {}), include });
+      for (const s of at.fromRoots) {
+        nested.push({ dir: s.dir, ...(s.guessed ? { guessed: s.guessed } : {}), name: inner.name, ...(at.claims ? { real } : {}), include });
+      }
     }
     return nested;
   }
@@ -2759,33 +2789,22 @@ export class WorkspaceModule implements Module {
    * of that mount, judged lexically where the path lands (`.`, `..` and
    * repeated separators resolved, as for the traversal guard; a link of the
    * outer mount isn't followed), with the path to use there; undefined when
-   * no nested mount's directory holds it. A path parsePath has respelled is
-   * compared with the directory's spellings exactly. One judged as given
-   * (`asGiven`, resolveAbsolutePath's) is compared loosely, as a disk that
-   * folds names may compare it (beginsWithDir), so it can't reach that
-   * mount's directory by spelling a segment otherwise. On a disk that tells
-   * names apart, that takes a directory of this mount's own spelled like the
-   * nested one in another way as that mount's too.
+   * no nested mount's directory holds it.
    */
-  private holderOf(mountName: string, relativePath: string, asGiven = false, moved: NestedMount[] | null = null): { name: string; use: string } | undefined {
+  private holderOf(mountName: string, relativePath: string, moved: NestedMount[] | null = null): { name: string; use: string; guess?: NestedGuess } | undefined {
     const mount = this.mounts.get(mountName);
     if (!mount) return undefined;
     const root = resolve(mount.config.path);
     const resolved = resolve(root, relativePath);
     if (!isContainedPath(root, resolved)) return undefined;
-    const segments = resolved === root ? [] : relative(root, resolved).split(sep);
+    const path = resolved === root ? '' : relative(root, resolved).split(sep).join('/');
     // A direct mount whose root a call found moved is judged by that call's
     // nesting (movedNesting), each directory beneath its configured path.
-    const dirs = moved !== null
-      ? moved.map((n) => ({ name: n.name, dir: n.dir }))
-      : (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => ({ name: o.name, dir: s.dir })));
-    const holder = dirs
-      .filter((s) => beginsWithDir(segments, s.dir.split('/'), asGiven))
-      .map((s) => ({ name: s.name, depth: s.dir.split('/').length }))
-      .sort((a, b) => b.depth - a.depth)[0];
+    const holder = nestedHolder(path, moved ?? this.nestedOf(mountName));
     if (!holder) return undefined;
-    const rest = segments.slice(holder.depth).join('/');
-    return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name };
+    const rest = restBeneath(path, holder);
+    const guess = nestedGuess(mountName, path.split('/'), holder);
+    return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name, ...(guess === undefined ? {} : { guess }) };
   }
 
   /**
@@ -2794,10 +2813,10 @@ export class WorkspaceModule implements Module {
    * it; for a listing, whose the path is.
    */
   private otherMountNote(mountName: string, relativePath: string, by: 'sync' | 'push' | 'list', moved: NestedMount[] | null = null): string {
-    const holder = this.holderOf(mountName, relativePath, false, moved);
+    const holder = this.holderOf(mountName, relativePath, moved);
     const what = by === 'sync' ? ', which no sync of this mount takes in' : by === 'push' ? ', which no push of this mount writes' : '';
     return holder
-      ? `it lies in mount "${holder.name}", nested in this one${what}: use "${holder.use}"`
+      ? `it ${holder.guess === undefined ? 'lies' : 'may lie'} in mount "${holder.name}", nested in this one${what}: ${nestedStep(holder)}`
       : `it lies in another mount's directory${what}`;
   }
 
@@ -2817,7 +2836,7 @@ export class WorkspaceModule implements Module {
     // Both checks judge by the nesting the parse found, and the second reads
     // disk beneath the root the parse resolved.
     const { mount, root, moved } = spelled;
-    const parsed = this.refuseNotHeld(spelled, path, false, moved);
+    const parsed = this.refuseNotHeld(spelled, path, moved);
     // A path can also reach a nested mount's directory, or a file this
     // mount's own include leaves out, through a symlink on its way. No push
     // of this mount writes it there and no read reads it, so it's refused
@@ -2857,7 +2876,8 @@ export class WorkspaceModule implements Module {
     // operation, in the words a disk read gives a path it can't resolve,
     // whatever the place realpath stopped short of would say.
     if (judged && unresolved.code !== undefined) return new WorkspaceReadError('not_found', `Unable to resolve file: ${path}`, 'realpath', unresolved.code);
-    const holder = nestedAtReal(real, nested);
+    let holder = await nestedAtReal(real, nested);
+    if (holder?.guess === null) holder = await nestedAtReal(real, nested, { name: mount.config.name, rootReal: await realBeneath(resolve(mount.config.path)) });
     if (!holder) {
       if (!judged) return null;
       const rootReal = await realBeneath(root);
@@ -2873,11 +2893,11 @@ export class WorkspaceModule implements Module {
     // on the place's way as that mount's, so a place beneath anything else
     // there, such as a file the include leaves out, isn't named; one beneath
     // a directory not there yet is.
-    const onItsWay = holder.include === undefined
+    const onItsWay = !holder.judgedByInclude
       || await stat(dirname(real)).then((info) => info.isDirectory(), (err: unknown) => errnoOf(err) === 'ENOENT');
-    const directory = holder.include !== undefined && await stat(real).then((info) => info.isDirectory(), () => false);
-    if (!onItsWay || !namesNestedPlace(holder.rest, holder.include, directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
-    return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
+    const directory = holder.judgedByInclude && await stat(real).then((info) => info.isDirectory(), () => false);
+    if (!onItsWay || !holder.names(directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+    return new NestedMountError(path, mount.config.name, holder, 'leads into');
   }
 
   /**
@@ -2885,13 +2905,12 @@ export class WorkspaceModule implements Module {
    * mount's directory first, naming the mount that holds it, then outside
    * the mount's include. Each is judged on the path as the caller parsed it:
    * as disk spells it for parseFilePath, as given for resolveAbsolutePath,
-   * which is synchronous and says so (`asGiven`, so the nested-mount check
-   * folds where disk does). The include's refusal shows the path as given
+   * which is synchronous. The include's refusal shows the path as given
    * (`given`), since it answers the path the caller asked about.
    */
-  private refuseNotHeld<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, given: string, asGiven = false, moved: NestedMount[] | null = null): P {
-    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath, asGiven, moved);
-    if (holder) throw new NestedMountError(parsed.path, parsed.mount.config.name, holder.name, holder.use);
+  private refuseNotHeld<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, given: string, moved: NestedMount[] | null = null): P {
+    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath, moved);
+    if (holder) throw new NestedMountError(parsed.path, parsed.mount.config.name, holder);
     if (!insideMount(parsed.relativePath, parsed.mount.config.include)) {
       throw new OutsideIncludeError(given, parsed.mount.config);
     }
@@ -2941,7 +2960,7 @@ export class WorkspaceModule implements Module {
    * parse resolved (`root`), by the nesting there (`moved`, movedNesting).
    */
   private async refusesAsOutside(mount: MountState, relativePath: string, moved: NestedMount[] | null, root: string): Promise<boolean> {
-    if (this.holderOf(mount.config.name, relativePath, false, moved)) return false;
+    if (this.holderOf(mount.config.name, relativePath, moved)) return false;
     if (insideMount(relativePath, mount.config.include)) return false;
     const own = { include: mount.config.include, nested: this.nestedOf(mount.config.name) };
     if (!mount.direct && this.getStore().treeList(mount.treeStateId, relativePath + '/')
@@ -3014,18 +3033,12 @@ export class WorkspaceModule implements Module {
 
   /**
    * How many segments the innermost nested mount's directory that holds
-   * `relativePath` has, in a spelling it's known by (othersOf), or, for a
-   * direct mount whose root has moved, in the nesting there (`moved`);
+   * `relativePath` has, or, for a direct mount whose root has moved, in the
+   * nesting there (`moved`);
    * undefined when no nested mount's directory holds it.
    */
   private nestedDepth(mountName: string, relativePath: string, moved: NestedMount[] | null = null): number | undefined {
-    let depth: number | undefined;
-    for (const dir of moved?.map((n) => n.dir) ?? this.othersOf(mountName)) {
-      if (relativePath !== dir && !relativePath.startsWith(`${dir}/`)) continue;
-      const segments = dir.split('/').length;
-      if (depth === undefined || segments > depth) depth = segments;
-    }
-    return depth;
+    return nestedHolder(relativePath, moved ?? this.nestedOf(mountName))?.dir.split('/').length;
   }
 
   /**
@@ -3048,11 +3061,7 @@ export class WorkspaceModule implements Module {
       // Only an entry this mount's include covers spells a draft's path
       // (insideMount): not a key no spelling names, such as `c/` or `a//b.txt`
       // from an earlier version, nor one the include leaves out, which would
-      // respell a covered draft into a name the include leaves out. An entry
-      // in a nested mount's directory that this mount's include covers
-      // spells one whatever that mount's include says, so on a disk that
-      // folds names, a draft naming the directory in another spelling takes
-      // the entry's spelling and is judged as in it.
+      // respell a covered draft into a name the include leaves out.
       under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => insideMount(path, mount.config.include)),
       holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
@@ -3078,25 +3087,24 @@ export class WorkspaceModule implements Module {
     // A file's name on disk is UTF-8, which can't hold a lone surrogate: the
     // store would keep one name and disk another.
     if (LONE_SURROGATE.test(path)) {
-      throw new Error(`The path ${JSON.stringify(path)} holds a lone UTF-16 surrogate, which UTF-8 can't store, so no file on disk can have that name. Nothing was done.`);
+      throw new PathRefusal('traversal', `${JSON.stringify(path)} holds a lone UTF-16 surrogate, which UTF-8 can't store, so no file on disk can have that name. Give the name without it.`);
     }
     const slashIdx = path.indexOf('/');
     const mountName = slashIdx >= 0 ? path.slice(0, slashIdx) : path;
     const given = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
 
     const mount = this.mounts.get(mountName);
-    if (!mount) {
-      throw new Error(`Unknown mount: "${mountName}". Available: ${[...this.mounts.keys()].join(', ')}`);
-    }
+    if (!mount) throw new PathRefusal('unknown_mount', this.noSuchMount(path, mountName));
     const segments = pathSegments(given);
     if (given.startsWith('/') || (sep === '\\' && given.startsWith('\\'))) {
-      throw new Error(`Path traversal detected: "${path}" has a separator right after mount "${mountName}", which makes it an absolute path: give it from the mount's root.`);
+      throw new PathRefusal('traversal', `${JSON.stringify(path)} has a separator right after mount "${mountName}", which makes it an absolute path: give it from the mount's root, as "${mountName}/<path>".`);
     }
     const kept: string[] = [];
     for (const segment of segments) {
       if (segment !== '..') kept.push(segment);
       else if (kept.pop() === undefined) {
-        throw new Error(`Path traversal detected: "${path}" climbs above the root of mount "${mountName}".`);
+        throw new PathRefusal('traversal', `${JSON.stringify(path)} climbs above the root of mount "${mountName}" with "..", and a path can't leave its mount. `
+          + `Name a file from its own mount's name; ${this.mountList()}.`);
       }
     }
     const relativePath = kept.join('/');
@@ -3111,9 +3119,39 @@ export class WorkspaceModule implements Module {
     const root = resolve(mount.config.path);
     const resolved = resolve(root, relativePath);
     if (!isContainedPath(root, resolved)) {
-      throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
+      throw new PathRefusal('traversal', `${JSON.stringify(path)} resolves outside mount "${mountName}", as a drive or root named in it does: give the path from the mount's root, as "${mountName}/<path>".`);
     }
     return { mount, relativePath };
+  }
+
+  private writableNames(): string[] {
+    return [...this.mounts.values()].filter((m) => writeRefusal(m) === null).map((m) => m.config.name);
+  }
+
+  private mountList(): string {
+    const names = [...this.mounts.keys()];
+    return names.length === 0 ? 'this workspace has no mounts' : `the mounts are ${listed(names.map((name) => JSON.stringify(name)))}`;
+  }
+
+  private noSuchMountField(given: string, bare: string): string {
+    const [close] = closestNames(given, [...this.mounts.keys()], 1);
+    return `"mount" is ${JSON.stringify(given)}, which is no mount's name; ${this.mountList()}.`
+      + (close !== undefined ? ` Did you mean ${JSON.stringify(close)}?` : '')
+      + ` Leaving "mount" out ${bare}.`;
+  }
+
+  private noSuchMount(path: string, mountName: string): string {
+    const names = [...this.mounts.keys()];
+    const rest = path.slice(mountName.length);
+    const unslashed = path.replace(/^[/\\]+/, '');
+    if (unslashed !== path && names.some((name) => unslashed === name || unslashed.startsWith(`${name}/`))) {
+      return `${JSON.stringify(path)} starts with "/", and a path starts with its mount's name: give ${JSON.stringify(unslashed)}.`;
+    }
+    if (mountName === '') return `${JSON.stringify(path)} doesn't start with a mount's name, and a path starts with its mount's name; ${this.mountList()}.`;
+    const [close] = closestNames(mountName, names, 1);
+    const said = rest === '' ? `${JSON.stringify(path)} is no mount's name; ${this.mountList()}.`
+      : `${JSON.stringify(path)} starts with ${JSON.stringify(mountName)}, which is no mount's name, and a path starts with its mount's name; ${this.mountList()}.`;
+    return said + (close !== undefined ? ` Did you mean ${JSON.stringify(close + rest)}?` : '');
   }
 
   /**
@@ -3139,9 +3177,9 @@ export class WorkspaceModule implements Module {
     maxSize: number,
   ): { bytes: Buffer; mimeType: SupportedImageMimeType } {
     if (bytes.byteLength === 0) {
-      throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+      throw emptyImage(mountPrefixedPath);
     }
-    if (bytes.byteLength > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath);
+    if (bytes.byteLength > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath, bytes.byteLength.toLocaleString('en-US'));
     return {
       bytes,
       mimeType: detectImageMimeType(bytes, mountPrefixedPath),
@@ -3175,19 +3213,14 @@ export class WorkspaceModule implements Module {
    * another directory carries none. The identity is rootIdentityForRead's,
    * which answers while the evidence awaits reopening; where even it can't
    * be read, as when the evidence was never read back whole, the read is
-   * refused too, with an errno only where no directory is at the root's path.
+   * refused before its root is resolved, with an errno only where no
+   * directory is at the root's path.
    * A direct mount's root is checked against no identity, and its read reads
    * no evidence: it promises what's at its root now (diskView).
    */
   private async readRoot(mount: MountState): Promise<{ real: string; dir: CheckedDir }> {
     const name = mount.config.name;
     const root = resolve(mount.config.path);
-    let real: string;
-    try {
-      real = await realpath(root);
-    } catch (err) {
-      throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${name}`, 'realpath_root', errnoOf(err));
-    }
     let rootIdentity: MountView['rootIdentity'];
     if (!mount.direct) {
       try {
@@ -3195,9 +3228,14 @@ export class WorkspaceModule implements Module {
       } catch (err) {
         // The evidence can't be read back, so neither can the check be made.
         // Where no directory is at the root's path, its errno still says so.
-        throw new WorkspaceReadError('mount_unavailable',
-          `Mount unavailable: ${name}: ${err instanceof Error ? err.message : String(err)}`, 'root', await rootAbsence(root));
+        throw new RootUnavailable(name, err instanceof Error ? err.message : String(err), 'root', await rootAbsence(root), err instanceof Refusal ? err : undefined);
       }
+    }
+    let real: string;
+    try {
+      real = await realpath(root);
+    } catch (err) {
+      throw new RootUnavailable(name, null, 'realpath_root', errnoOf(err));
     }
     const checked = await checkRoot(this.viewOf(mount, rootIdentity), real);
     if ('dir' in checked) return { real, dir: checked.dir };
@@ -3205,7 +3243,7 @@ export class WorkspaceModule implements Module {
     // root's path now decides: nothing, something that isn't a directory, or
     // a directory the path has come to name since it was resolved (no errno).
     const errno = checked.reason === ROOT_REPLACED ? undefined : await rootAbsence(root);
-    throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${name}: ${checked.reason}`, 'root', errno);
+    throw new RootUnavailable(name, checked.reason, 'root', errno);
   }
 
   /**
@@ -3220,7 +3258,7 @@ export class WorkspaceModule implements Module {
   private async rootMoved(mount: MountState): Promise<WorkspaceReadError> {
     const errno = await rootAbsence(resolve(mount.config.path));
     const reason = errno !== undefined ? ROOT_UNAVAILABLE : mount.direct ? DIRECT_ROOT_REPLACED : ROOT_REPLACED;
-    return new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}: ${reason}`, 'root', errno);
+    return new RootUnavailable(mount.config.name, reason, 'root', errno);
   }
 
   /**
@@ -3322,7 +3360,7 @@ export class WorkspaceModule implements Module {
     }
     if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) {
       // A FIFO, socket or device is never opened.
-      throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'lstat');
+      throw new NotRegularFile(mountPrefixedPath, 'lstat');
     }
 
     let handle: Awaited<ReturnType<typeof open>>;
@@ -3358,7 +3396,7 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
       }
       if (!fileStat.isFile()) {
-        throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'fstat');
+        throw new NotRegularFile(mountPrefixedPath, 'fstat');
       }
 
       if (!follow && !useNoFollow) {
@@ -3397,13 +3435,13 @@ export class WorkspaceModule implements Module {
       if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, relativePath, nested, realMountRoot);
 
       const inside = isContainedPath(realMountRoot, realFilePath);
-      const holder = inside ? nestedAtReal(realFilePath, nested) : undefined;
+      const holder = inside ? await nestedAtReal(realFilePath, nested, { name: mount.config.name, rootReal: realMountRoot }) : undefined;
       // A place in a nested mount's directory that its include leaves out is
       // no mount's, so the path leaves this one (namesNestedPlace), and so
       // does one reaching a file this mount's own include leaves out
       // (coversLanding).
       const own = holder === undefined && inside && !(await coversLanding({ include: mount.config.include }, realMountRoot, realFilePath, relativePath));
-      if (!inside || own || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
+      if (!inside || own || (holder !== undefined && !holder.names(false))) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');
@@ -3471,7 +3509,9 @@ export class WorkspaceModule implements Module {
    * (`outside_include`), a path in another mount's directory nested in the one named
    * (`other_mount`), unavailable mount, missing or non-regular file,
    * directory, policy-denied symlink, outside-mount target, and
-   * file-changed-during-read.
+   * file-changed-during-read. An error met while parsing the path that is
+   * none of these refusals, such as the store's, is thrown as it is, and a
+   * `maxBytes` that isn't a non-negative integer throws a `RangeError`.
    */
   async readFileFromDisk(
     mountPrefixedPath: string,
@@ -3487,11 +3527,11 @@ export class WorkspaceModule implements Module {
     } catch (err) {
       // A link's refusal (parseFilePath) carries its own code.
       if (err instanceof WorkspaceReadError) throw err;
-      const message = err instanceof Error ? err.message : String(err);
-      const code: WorkspaceReadErrorCode = err instanceof OutsideIncludeError ? 'outside_include'
+      const code: WorkspaceReadErrorCode | null = err instanceof OutsideIncludeError ? 'outside_include'
         : err instanceof NestedMountError ? 'other_mount'
-        : message.startsWith('Unknown mount') ? 'unknown_mount' : 'traversal';
-      throw new WorkspaceReadError(code, message, 'parse');
+        : err instanceof PathRefusal ? err.code : null;
+      if (code === null) throw err;
+      throw new WorkspaceReadError(code, (err as Error).message, 'parse');
     }
     if (!relativePath) {
       throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'parse');
@@ -3519,92 +3559,25 @@ export class WorkspaceModule implements Module {
     }
   }
 
-  /** Map a core read refusal onto the image reader's historical error vocabulary and wording. */
-  private imageErrorFromRead(err: WorkspaceReadError, mount: MountState, mountPrefixedPath: string): WorkspaceImageReadError {
-    const p = mountPrefixedPath;
-    switch (err.code) {
-      case 'mount_unavailable':
-        // With why, where the root's check says, such as a directory that
-        // isn't the mount's.
-        return new WorkspaceImageReadError('mount_unavailable', err.message);
-      case 'directory':
-        return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
-      case 'symlink':
-        // The core reader's own words for a link at the path: "Symlinks are not
-        // allowed: <path>".
-        return new WorkspaceImageReadError('symlink', err.message);
-      case 'parent_symlink':
-        // The core reader's own words for a link on its way: which link and
-        // where it leads, with the setting for a link to a directory.
-        return new WorkspaceImageReadError('parent_symlink', err.message);
-      case 'other_mount':
-        // The core reader's own words for a path a link takes into a nested
-        // mount's directory: that mount and the path to use there. (#460's
-        // own other_mount, a path in that directory, is refused at parse,
-        // and so is a link found there before the read.)
-        return new WorkspaceImageReadError('other_mount', err.message);
-      case 'escape':
-        // The core reader's own words: "Symlink escape detected: <path>" for a
-        // followed link that resolves outside the mount, and for a link on the
-        // way that leads outside a mount that doesn't follow links, which link.
-        return new WorkspaceImageReadError('escape', err.message);
-      case 'changed':
-        return new WorkspaceImageReadError('changed', `Image file changed during read: ${p}`);
-      case 'not_found':
-      default:
-        // The core reader's own words for a file that isn't regular, and for
-        // a directory on the way it couldn't ask about.
-        if (err.message.startsWith('Not a regular file') || err.stage === 'readlink') {
-          return new WorkspaceImageReadError('not_found', err.message);
-        }
-        if (err.message.startsWith('File not found')) {
-          return new WorkspaceImageReadError('not_found', `File not found: ${p}`);
-        }
-        if (err.stage === 'realpath') {
-          return new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${p}`);
-        }
-        if (err.stage === 'stat') {
-          return new WorkspaceImageReadError('not_found', `Unable to stat image file: ${p}`);
-        }
-        return new WorkspaceImageReadError('not_found', `Unable to read image file: ${p}`);
-    }
-  }
-
   private async readImageFromFilesystem(
     mount: MountState,
     relativePath: string,
     mountPrefixedPath: string,
     maxSize: number,
   ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
-    let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
-    try {
-      opened = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
-        if (fileStat.size === 0) {
-          throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
-        }
-        if (fileStat.size > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath);
-      });
-    } catch (err) {
-      if (err instanceof WorkspaceImageReadError) throw err;
-      if (err instanceof WorkspaceReadError) throw this.imageErrorFromRead(err, mount, mountPrefixedPath);
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
-      }
-      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
-    }
-    const { handle, fileStat } = opened;
+    const { handle, fileStat } = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
+      if (fileStat.size === 0) throw emptyImage(mountPrefixedPath);
+      if (fileStat.size > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath, fileStat.size.toLocaleString('en-US'));
+    });
     try {
       // No more than maxSize is loaded: a file grown past it since the fstat
       // above is refused here, as one already over it was there.
       const { bytes, more } = await readPrefix(handle, maxSize, fileStat.size);
-      if (more) throw imageTooLarge(maxSize, mountPrefixedPath);
+      if (more) throw imageTooLarge(maxSize, mountPrefixedPath, `at least ${(maxSize + 1).toLocaleString('en-US')}`);
       return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
     } catch (err) {
       if (err instanceof WorkspaceImageReadError) throw err;
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
-      }
-      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'read', errnoOf(err));
     } finally {
       await handle.close();
     }
@@ -3637,18 +3610,19 @@ export class WorkspaceModule implements Module {
    * downstream agents. And, apart from it, why a write whose bytes reached
    * disk left the file's mode as disk had it (`modeKept`), and, for a
    * deletion that cleared a conflict naming a disk file the workspace never
-   * took in, that nothing was unlinked (`note`). The caller holds the mount's
-   * turn and has settled the path first (settleBeforeMutation, or a pass over
-   * the path, as an edit makes).
+   * took in, that nothing was unlinked (`note`). And the answer's `disk` for
+   * the path, unless it was refused. The caller holds the mount's turn and has
+   * settled the path first (settleBeforeMutation, or a pass over the path, as
+   * an edit makes).
    */
   private async commitToolChange(
     mount: MountState,
     relativePath: string,
     change: ToolChange,
     onCommitted?: () => void,
-  ): Promise<{ refused: string | null; modeKept: string | null; note: string | null }> {
-    const { refused, modeKept, notes } = await this.commitToolChanges(mount, [{ path: relativePath, change }], onCommitted && (() => onCommitted()));
-    return { refused: refused.get(relativePath) ?? null, modeKept: modeKept.get(relativePath) ?? null, note: notes.get(relativePath) ?? null };
+  ): Promise<{ refused: string | null; modeKept: string | null; note: string | null; disk: DiskState | null }> {
+    const { refused, modeKept, notes, disk } = await this.commitToolChanges(mount, [{ path: relativePath, change }], onCommitted && (() => onCommitted()));
+    return { refused: refused.get(relativePath) ?? null, modeKept: modeKept.get(relativePath) ?? null, note: notes.get(relativePath) ?? null, disk: disk.get(relativePath) ?? null };
   }
 
   /**
@@ -3664,15 +3638,16 @@ export class WorkspaceModule implements Module {
    * (changesLanded).
    * Answers, by path, the reason for each that reached the workspace but not
    * disk (`refused`), and, apart from it, why one whose bytes reached disk
-   * left the file's mode as disk had it (`modeKept`), and that a deletion
-   * clearing a conflict that named a disk file unlinked nothing (`notes`), as
-   * commitToolChange answers them for one path.
+   * left the file's mode as disk had it (`modeKept`), that a deletion
+   * clearing a conflict that named a disk file unlinked nothing (`notes`),
+   * and the answer's `disk` for each path not refused, as commitToolChange
+   * answers them for one path.
    */
   private async commitToolChanges(
     mount: MountState,
     changes: Array<{ path: string; change: ToolChange }>,
     onCommitted?: (path: string) => void,
-  ): Promise<{ refused: Map<string, string>; modeKept: Map<string, string>; notes: Map<string, string> }> {
+  ): Promise<{ refused: Map<string, string>; modeKept: Map<string, string>; notes: Map<string, string>; disk: Map<string, DiskState> }> {
     const store = this.getStore();
     const agreement = this.agreementOrThrow();
     const intents = this.intents.get(mount.config.name)!;
@@ -3811,7 +3786,7 @@ export class WorkspaceModule implements Module {
       // nothing.
       if (changing.length === 0 || !changesLanded(store, mount.treeStateId, changing, error)) {
         putBack();
-        throw error;
+        throw changing.length === 0 ? new AlreadyHeld(error) : error;
       }
       landedThenThrew = { error };
     }
@@ -3825,7 +3800,9 @@ export class WorkspaceModule implements Module {
     if (landedThenThrew) throw new StoredThenFailed(landedThenThrew.error, this.pushesOnCommit(mount) && pushing.length > 0, notes);
     const refused = new Map<string, string>();
     const modeKept = new Map<string, string>();
-    if (!this.pushesOnCommit(mount) || pushing.length === 0) return { refused, modeKept, notes };
+    if (!this.pushesOnCommit(mount) || pushing.length === 0) {
+      return { refused, modeKept, notes, disk: new Map(changes.map(({ path }): [string, DiskState] => [path, this.diskOf(mount, path)])) };
+    }
 
     const pushed = await this.pushUnlocked(mount, pushing.map(({ path }) => path), {
       applyDeletions: pushing.some(({ change }) => change.kind === 'remove'),
@@ -3847,7 +3824,7 @@ export class WorkspaceModule implements Module {
         error: skipped.reason,
       } as ProcessEvent);
     }
-    return { refused, modeKept, notes };
+    return { refused, modeKept, notes, disk: new Map(changes.filter(({ path }) => !refused.has(path)).map(({ path }): [string, DiskState] => [path, 'done'])) };
   }
 
   // ==========================================================================
@@ -3898,26 +3875,30 @@ export class WorkspaceModule implements Module {
    * call made again checks it.
    */
   private notCheckedYet(path: string, reason: string): string {
-    return `${this.notInWorkspace(path, { path, state: 'unverified', note: reason })} Make the same call again, which checks disk first.`;
+    return `${JSON.stringify(path)} isn't in the workspace, and disk couldn't be checked: ${reason}. Make the same call again, which checks disk first.`;
   }
 
   /** Why the workspace holds no entry at a path, when disk explains it. */
-  private notInWorkspace(path: string, report: PathReport | undefined): string {
+  private notInWorkspace(path: string, report: PathReport | undefined, mount: MountState, missing?: string): string {
+    const shown = JSON.stringify(path);
     switch (report?.state) {
       case 'workspace-deleted':
-        return `${path} was deleted in the workspace; disk still has a copy. Sync this path to restore it.`;
+        return `${shown} was deleted in the workspace; disk still has a copy. Sync this path to restore it.`;
       case 'not-in-branch':
-        return `${path} is not in this branch's workspace; disk has a copy. Sync this path to add it.`;
-      case 'disk-only':
-        return `${path} is on disk but not stored in the workspace (binary or over the size limit)` +
-          (report.mimeType?.startsWith('image/') ? '; read it with read_image.' : '.');
+        return `${shown} is not in this branch's workspace; disk has a copy. Sync this path to add it.`;
+      case 'disk-only': {
+        const shows = report.mimeType?.startsWith('image/') === true && report.size !== undefined && report.size <= (mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE);
+        return `${shown} is on disk, but the workspace doesn't store it: it's binary, or over this mount's size limit. `
+          + 'read, edit and delete act only on the files it stores, so calling again won\'t change that'
+          + (shows ? '; read_image shows it, if its data holds together as an image.' : '.');
+      }
       case 'conflict':
-        return `${path} is in conflict: the workspace deleted it and disk changed it since. ` +
+        return `${shown} is in conflict: the workspace deleted it and disk changed it since. ` +
           'Sync this path to take the disk version.';
       case 'unverified':
-        return `${path} is not in the workspace, and disk could not be checked (${report.note ?? 'not observed'}).`;
+        return uncheckedFile(shown, report.note);
       default:
-        return `File not found: ${path}`;
+        return missing ?? `there's no file at ${shown}. ls or glob lists the files that exist.`;
     }
   }
 
@@ -3960,9 +3941,9 @@ export class WorkspaceModule implements Module {
         // A pass also drops a copy disk made binary or too large, which
         // the disk-only answer describes; any other drop is disk's deletion.
         return {
-          error: took('deleted') && report?.state !== 'disk-only'
-            ? `File not found: ${path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
-            : [this.notInWorkspace(path, report), ...again].join(' '),
+          error: took('deleted') && report?.state !== 'disk-only' ? deletedOnDisk(path)
+            : undecided !== null ? this.notCheckedYet(path, undecided)
+              : this.notInWorkspace(path, report, mount),
         };
       }
       const contents = await this.contentsOf(mount, relativePath, path, entry);
@@ -3981,28 +3962,27 @@ export class WorkspaceModule implements Module {
    */
   private async bytesOnDisk(mount: MountState, relativePath: string, path: string): Promise<{ bytes: Buffer } | { error: string }> {
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-    const over = `${path} is over the size limit (${maxSize} bytes), so read doesn't show it.`;
+    const over = (size: string) => pastSizeLimit(`${JSON.stringify(path)} is ${size} bytes`, maxSize, "read doesn't show it", null);
     let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
     try {
       opened = await this.openContainedFile(mount, relativePath, path, (fileStat) => {
-        if (fileStat.size > maxSize) throw new Error(over);
+        if (fileStat.size > maxSize) throw new Refusal(over(fileStat.size.toLocaleString('en-US')));
       });
     } catch (err) {
-      // A refusal that names only the path says why with its errno, as a
-      // failed read below does.
-      return { error: containedRefusal(err, path) };
+      if (err instanceof Refusal) return { error: err.message };
+      if (err instanceof WorkspaceReadError) return { error: readRefusal(err, path) };
+      throw err;
     }
     try {
       // No more than the limit is loaded, as for a file over it at its fstat.
       const { bytes, more } = await readPrefix(opened.handle, maxSize, opened.fileStat.size);
-      if (more) return { error: over };
+      if (more) return { error: over(`at least ${(maxSize + 1).toLocaleString('en-US')}`) };
       if (looksBinary(bytes)) {
-        return { error: `${path} is binary, so read doesn't show it as text${sniffImageMime(bytes) ? '; read it with read_image.' : '.'}` };
+        return { error: `${JSON.stringify(path)} is binary, so read doesn't show it as text. ${sniffImageMime(bytes) ? 'read_image shows it, if its data holds together as an image.' : 'No tool shows it as text, so calling again won\'t change that.'}` };
       }
       return { bytes };
     } catch (err) {
-      const errno = errnoOf(err);
-      return { error: `Unable to read file: ${path}${errno ? ` (${errno})` : ''}` };
+      return { error: unreadable(JSON.stringify(path), errnoOf(err)) };
     } finally {
       await opened.handle.close();
     }
@@ -4039,7 +4019,7 @@ export class WorkspaceModule implements Module {
     if ('disk' in found) {
       const now = storedBytes(store, version.blobHash);
       if ('bytes' in now) return now;
-      const lost: LostContents = { path, store: now, disk: found.disk, writable: writeRefusal(mount) === null };
+      const lost: LostContents = { path, store: now, disk: found.disk, writable: writeRefusal(mount) === null, reopen: this.agreementOrThrow().awaitsReopen };
       if (tell === 'now') this.tellLost(mount.config.name, what, version.blobHash, lost);
       return { lost };
     }
@@ -4135,15 +4115,16 @@ export class WorkspaceModule implements Module {
     // Each number is a whole number of at least its schema's minimum by now
     // (inputProblem).
     if (characterPaging && (input.offset !== undefined || input.limit !== undefined)) {
-      return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
+      return { success: false, isError: true, error: didNothing('read', 'it was given both "offset"/"limit", which page by lines, and "offsetChars"/"limitChars", which page by characters. Give one pair.') };
     }
     let file: FileText;
     let notes: string[] = [];
     if (generatedContent === undefined) {
       const { mount, relativePath, path } = await this.parseFilePath(input.path);
+      if (relativePath === '') return { success: false, error: didNothing('read', namesRoot(input.path, mount.config.name)), isError: true };
       input = { ...input, path };
       const found = await this.bytesOf(mount, relativePath, path);
-      if ('error' in found) return { success: false, error: found.error, isError: true };
+      if ('error' in found) return { success: false, error: didNothing('read', found.error), isError: true };
       file = fileText(found.bytes);
       notes = found.notes;
     } else {
@@ -4159,22 +4140,11 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
-    let mount: MountState;
-    let relativePath: string;
-    try {
-      let path: string;
-      ({ mount, relativePath, path } = await this.parseFilePath(input.path));
-      input = { ...input, path };
-    } catch (err) {
-      return {
-        success: false,
-        error: err instanceof Error ? err.message : String(err),
-        isError: true,
-      };
-    }
-    if (!relativePath) {
-      return { success: false, error: `Path is a directory: ${input.path}`, isError: true };
-    }
+    const given = input.path;
+    const refused = (body: string): ToolResult => ({ success: false, isError: true, error: didNothing('read_image', body) });
+    const { mount, relativePath, path } = await this.parseFilePath(given);
+    if (!relativePath) return refused(namesRoot(given, mount.config.name));
+    input = { ...input, path };
 
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     let treeError: WorkspaceImageReadError | null = null;
@@ -4201,37 +4171,33 @@ export class WorkspaceModule implements Module {
         : `The workspace's copy of ${input.path} is ${lostInStore(lost)}, so this is disk's copy${lost.disk === 'other' ? ', which holds other contents' : ''}.`;
       return imageResult(input.path, await this.readImageFromFilesystem(mount, relativePath, input.path, maxSize), note);
     } catch (err) {
-      if (err instanceof WorkspaceImageReadError) {
-        if (lost) {
-          return {
-            success: false,
-            isError: true,
-            error: err.code === 'not_found' || lost.disk !== 'other' ? nothingToRead(lost)
-              : `${lostText(lost)}, so it can't be restored, and disk's copy can't be shown (${err.message}). ${lostRemedy(lost)}`,
-          };
-        }
-        if (err.code === 'not_found' && treeError) {
-          return { success: false, error: treeError.message, isError: true };
-        }
-        return { success: false, error: err.message, isError: true };
+      if (!(err instanceof WorkspaceImageReadError) && !(err instanceof WorkspaceReadError)) throw err;
+      const noFile = err instanceof WorkspaceReadError && err.code === 'not_found';
+      if (lost) {
+        const why = err instanceof WorkspaceImageReadError ? err.reason : containedRefusal(err, input.path);
+        return refused(noFile || lost.disk !== 'other' ? nothingToRead(lost)
+          : `${lostText(lost, 'the')}, so it can't be restored, and disk's copy can't be shown (${why}). ${lostRemedy(lost)}`);
       }
-      throw err;
+      if (noFile && treeError) return refused(treeError.message);
+      return refused(err instanceof WorkspaceImageReadError ? err.message : readRefusal(err, given));
     }
   }
 
   private async handleWrite(input: WriteInput, callerAgentName?: string): Promise<ToolResult> {
     if (LONE_SURROGATE.test(input.content)) {
-      return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store.' };
+      return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store. Give it without the surrogate, or with the other half of its pair.' };
     }
-    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path).catch((error: unknown) => { throw notStored(error); });
+    if (relativePath === '') return { success: false, error: didNothing('write', namesRoot(input.path, mount.config.name)), isError: true };
     input = { ...input, path };
-    const refusal = writeRefusal(mount);
-    if (refusal) return { success: false, error: refusal, isError: true };
+    const refusal = writeRefusal(mount, this.writableNames());
+    if (refusal) return { success: false, error: didNothing('write', refusal), isError: true };
 
     const store = this.getStore();
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-    if (Buffer.byteLength(input.content) > maxSize) {
-      return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
+    const bytes = Buffer.byteLength(input.content);
+    if (bytes > maxSize) {
+      return { success: false, error: didNothing('write', tooLargeToWrite(input.path, bytes, maxSize)), isError: true };
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
@@ -4240,13 +4206,14 @@ export class WorkspaceModule implements Module {
     if (mount.direct) {
       const written = await this.writeDirect(mount, relativePath, input.path, buffer, callerAgentName);
       if ('error' in written) return { success: false, isError: true, error: written.error };
-      return { success: true, data: { ...receipt, ...(written.note ? { note: written.note } : {}) } };
+      return { success: true, data: { ...receipt, disk: 'done', ...(written.note ? { note: written.note } : {}) } };
     }
     let committed = false;
     let refused: string | null;
     let modeKept: string | null;
+    let disk: DiskState | null;
     try {
-      ({ refused, modeKept } = await this.withMount(mount, async () => {
+      ({ refused, modeKept, disk } = await this.withMount(mount, async () => {
         await this.settleBeforeMutation(mount, relativePath);
         const blobHash = store.storeBlob(buffer, 'text/plain');
         // An overwrite keeps the file's mode, as an edit does.
@@ -4255,14 +4222,14 @@ export class WorkspaceModule implements Module {
           () => { committed = true; });
       }));
     } catch (error) {
-      if (!committed) throw error;
+      if (!committed) throw notStored(error);
       return storedButUnfinished('write', input.path, error instanceof StoredThenFailed
         ? { storeFailed: error.message, pushes: error.pushes }
-        : { threw: error instanceof Error ? error.message : String(error) });
+        : { threw: error instanceof Error ? error.message : String(error) }, null, this.agreement?.awaitsReopen === true);
     }
     if (refused !== null) return storedButUnfinished('write', input.path, { refused });
 
-    return { success: true, data: { ...receipt, ...(modeKept ? { modeKept } : {}) } };
+    return { success: true, data: { ...receipt, disk, ...(modeKept ? { modeKept } : {}) } };
   }
 
   private async handleEdit(input: EditInput, maxChars = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS, callerAgentName?: string): Promise<ToolResult> {
@@ -4357,7 +4324,7 @@ export class WorkspaceModule implements Module {
       }
       for (const field of ['oldString', 'newString'] as const) {
         if (LONE_SURROGATE.test(edit[field])) {
-          problems.push({ kind: 'input', edit: index, text: `"${field}" holds a lone UTF-16 surrogate, which UTF-8 can't store.` });
+          problems.push({ kind: 'input', edit: index, text: `"${field}" holds a lone UTF-16 surrogate, which UTF-8 can't store. Give it without the surrogate, or with the other half of its pair.` });
         }
       }
       if (problems.length === found) specs.set(index, spec);
@@ -4514,9 +4481,9 @@ export class WorkspaceModule implements Module {
             // A pass also drops a copy disk made binary or too large, which
             // the disk-only answer describes; any other drop is disk's deletion.
             const text = took('deleted') && report?.state !== 'disk-only'
-              ? `File not found: ${target.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
-              : this.notInWorkspace(target.path, report);
-            problems.push({ kind: 'file', edits: target.edits, path: target.path, text, whole: true });
+              ? deletedOnDisk(target.path)
+              : this.notInWorkspace(target.path, report, mount);
+            problems.push({ kind: 'file', edits: target.edits, path: target.path, text, whole: false });
             continue;
           }
           const known = contents.get(entry.blobHash);
@@ -4549,7 +4516,7 @@ export class WorkspaceModule implements Module {
         }
         if (problems.length) return refuse(problems, notes);
 
-        const { refused, modeKept } = await this.commitToolChanges(mount, plans.map(({ target, plan, mode }) => ({
+        const { refused, modeKept, disk } = await this.commitToolChanges(mount, plans.map(({ target, plan, mode }) => ({
           path: target.relativePath,
           change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
         })), () => { committed = true; });
@@ -4559,19 +4526,19 @@ export class WorkspaceModule implements Module {
           plan,
           notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
           modeKept: modeKept.get(target.relativePath) ?? null,
-        })), given.length, maxChars);
+        })), given.length, maxChars, furthestFromDisk(plans.map(({ target }) => disk.get(target.relativePath)!)));
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (committed) {
         return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, error instanceof StoredThenFailed
           ? { storeFailed: message, pushes: error.pushes }
-          : { threw: message }, maxChars);
+          : { threw: message }, maxChars, this.agreement?.awaitsReopen === true);
       }
       // A set that threw and couldn't be read back may have stored the edits,
       // and a second call could then apply them twice.
       if (error instanceof CommitUnknownError) {
-        const [set, read] = [cutLine(error.setError), cutLine(error.readError)];
+        const [set, read] = [storeWords(error.setCause), storeWords(error.readCause)];
         return {
           success: false,
           isError: true,
@@ -4584,9 +4551,8 @@ export class WorkspaceModule implements Module {
       }
       // The commit sets every entry in one record or none, and a set that
       // threw was read back, so nothing is stored; or every change was one
-      // the tree already held, which leaves the tree as it was either way.
-      if (tool === 'edit_many') return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
-      throw error;
+      // the tree already held (AlreadyHeld).
+      throw notStored(error);
     }
   }
 
@@ -4604,7 +4570,7 @@ export class WorkspaceModule implements Module {
     path: string,
     callerAgentName: string | undefined,
   ): Promise<{ mount: MountState; relativePath: string; path: string } | Extract<EditProblem, { kind: 'file' }>> {
-    const unusable = (text: string) => ({ kind: 'file' as const, edits: [], path, text, whole: true });
+    const unusable = (text: string) => ({ kind: 'file' as const, edits: [], path, text, whole: false });
     try {
       // In the one spelling every file tool reads, as disk spells it, so two
       // spellings of a file are one entry and, in one call, one plan
@@ -4613,14 +4579,16 @@ export class WorkspaceModule implements Module {
       const where = await this.parseFilePath(path);
       // One that names the mount's root, its bare name included, names no
       // file.
-      if (where.relativePath === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file; ls ${where.mount.config.name} lists the files in it.`);
-      const refusal = writeRefusal(where.mount);
+      if (where.relativePath === '') return unusable(namesRoot(path, where.mount.config.name));
+      const refusal = writeRefusal(where.mount, this.writableNames());
       if (refusal) return unusable(refusal);
       const generated = tool === 'edit_many' ? this.findGeneratedTextFile(path) : undefined;
-      if (generated) return unusable(`${path}: ${this.generatedFileRefusal(generated, callerAgentName)}.`);
+      if (generated) return unusable(this.generatedFileRefusal(path, generated, callerAgentName));
       return where;
     } catch (error) {
-      return unusable(error instanceof Error ? error.message : String(error));
+      if (error instanceof Refusal) return unusable(error.message);
+      if (error instanceof WorkspaceReadError) return unusable(readRefusal(error, path));
+      throw notStored(error);
     }
   }
 
@@ -4629,10 +4597,10 @@ export class WorkspaceModule implements Module {
    * and the agent's own is read-only, since it shows the agent's tool
    * presentation, which set_tool_visibility and set_tool_description change.
    */
-  private generatedFileRefusal(generated: { agentName: string }, callerAgentName: string | undefined): string {
+  private generatedFileRefusal(path: string, generated: { agentName: string }, callerAgentName: string | undefined): string {
     return callerAgentName !== generated.agentName
-      ? 'Generated file belongs to another agent'
-      : 'Generated file is read-only; change the tool presentation it shows with set_tool_visibility or set_tool_description instead';
+      ? `${JSON.stringify(path)} is generated from another agent's tool presentation, and only that agent reads it. Calling again won't change that.`
+      : `${JSON.stringify(path)} is generated from your tool presentation, so it's read-only; set_tool_visibility and set_tool_description change what it shows.`;
   }
 
   /**
@@ -4656,12 +4624,13 @@ export class WorkspaceModule implements Module {
     conflicts: Map<EditTarget, string>,
     outcome: { refused: Map<string, string>; modeKept: Map<string, string> } | { threw: string } | { storeFailed: string; pushes: boolean },
     maxChars: number,
+    reopen = false,
   ): ToolResult {
     const conflictOf = (target: EditTarget) => ('storeFailed' in outcome ? conflicts.get(target) ?? null : null);
     if (tool === 'edit') {
       const [target] = targets;
       const note = [applied.get(target!) ?? null, conflictOf(target!)].filter((text): text is string => text !== null).join(' ');
-      return storedButUnfinished('edit', target!.path, 'refused' in outcome ? { refused: outcome.refused.get(target!.relativePath)! } : outcome, note || null);
+      return storedButUnfinished('edit', target!.path, 'refused' in outcome ? { refused: outcome.refused.get(target!.relativePath)! } : outcome, note || null, reopen);
     }
     const stored = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.";
     // The head is never cut, so what stands for the whole call goes in it,
@@ -4682,9 +4651,10 @@ export class WorkspaceModule implements Module {
       }
     } else if ('storeFailed' in outcome) {
       head = `${stored}\n\nThe store failed after recording them: ${cutLine(outcome.storeFailed)}.`
-        + (outcome.pushes ? " Their push to disk didn't run, so disk lacks them until a materialize of their files writes them." : '');
+        + (outcome.pushes ? ` Their push to disk didn't run, so disk lacks them until a materialize of their files writes them${reopen ? ONCE_REOPENED : ''}.` : '')
+        + (reopen ? ` ${AWAITS_REOPEN}` : '');
     } else {
-      head = `${stored}\n\nThe rest of the call failed: ${cutLine(outcome.threw)}. ls shows each path's state.`;
+      head = `${stored}\n\nThe rest of the call failed: ${cutLine(outcome.threw)}.${reopen ? ` ${AWAITS_REOPEN}` : " ls shows each path's state."}`;
     }
     const kept = 'modeKept' in outcome
       ? targets.flatMap((target) => {
@@ -4726,7 +4696,7 @@ export class WorkspaceModule implements Module {
       try {
         staged = await stageContained(view, rootReal, relativePath, bytes, { makeDirectory: true });
       } catch (error) {
-        return { error: `The write did nothing to ${path}: ${directReason(error)}.` };
+        return { error: directDidNothing('write', path, error) };
       }
       try {
         await directWriteTestSeam.afterStage?.([staged.path]);
@@ -4740,7 +4710,7 @@ export class WorkspaceModule implements Module {
         renameInto(staged);
       } catch (error) {
         await discard(staged);
-        return { error: `The write did nothing to ${path}: ${directReason(error)}.` };
+        return { error: directDidNothing('write', path, error) };
       }
       this.recordDirectWrite(mount, agentName);
       return { note: linksNote(path, staged, 'write') };
@@ -4817,7 +4787,7 @@ export class WorkspaceModule implements Module {
         changedMeanwhile.add(target);
         return 'changed';
       }
-      if ('error' in got) problems.push({ kind: 'file', edits: target.edits, path: target.path, text: got.error, whole: true });
+      if ('error' in got) problems.push({ kind: 'file', edits: target.edits, path: target.path, text: got.error, whole: false });
       else read.set(target, got);
     }
     // Two paths that reach one file, through a link this mount follows, or
@@ -4882,7 +4852,8 @@ export class WorkspaceModule implements Module {
       edits: target.edits,
       path: target.path,
       text: `${target.path}: ${directReason(error)}, so ${tool === 'edit' ? 'the edit' : editList(target.edits)} changed nothing.`
-        + (tool === 'edit_many' && plans.length > 1 ? ' No file was written.' : ''),
+        + (tool === 'edit_many' && plans.length > 1 ? ' No file was written.' : '')
+        + (directWayOn(error) !== null ? ` ${directWayOn(error)}` : ''),
       whole: true,
     }]);
     for (const { target, plan } of plans) {
@@ -4947,7 +4918,7 @@ export class WorkspaceModule implements Module {
       plan: plans.find((p) => p.target === target)!.plan,
       notes: [reread(target, 'applied to'), linksNote(target.path, file, tool)].filter((note): note is string => note !== null),
       modeKept: null,
-    })), editCount, maxChars);
+    })), editCount, maxChars, 'done');
   }
 
   /**
@@ -4960,7 +4931,8 @@ export class WorkspaceModule implements Module {
   private directEditsPartway(staged: Array<{ target: EditTarget; staged: Staged }>, failed: number, error: unknown, maxChars: number): string {
     // The failed file is named among the outcomes, so the head stays as
     // long as its reason, whatever the paths' lengths.
-    const head = `The edit_many call wrote ${failed} of its ${staged.length} files before the next one's write failed: ${directReason(error)}. `
+    const can = error instanceof WriteRefused && error.errno !== undefined ? hostFix(error.errno) : undefined;
+    const head = `The edit_many call wrote ${failed} of its ${staged.length} files before the next one's write failed: ${directReason(error)}.${can !== undefined ? ` Whoever runs this host can ${can}.` : ''} `
       + "Nothing puts the written files back, so finish or revert them: in each written file, each of its edits replaced its oldString with its newString. Each file's outcome:";
     const parts = staged.map(({ target }, i) => `${target.path}: ${i < failed ? 'written' : i === failed ? 'not written, as it was (its write failed)' : 'not written, as it was'}`);
     const notes = staged.slice(0, failed).map(({ target, staged: file }) => linksNote(target.path, file, 'edit_many')).filter((note): note is string => note !== null);
@@ -4982,26 +4954,29 @@ export class WorkspaceModule implements Module {
     path: string,
   ): Promise<{ bytes: Buffer; identity: FileIdentity } | { error: string } | { changed: true }> {
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-    const over = `${path} is over the size limit (${maxSize} bytes), so the workspace doesn't edit it.`;
+    const over = (size: string) => pastSizeLimit(`${JSON.stringify(path)} is ${size} bytes`, maxSize, "the workspace doesn't edit it", null);
     let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
     try {
       opened = await this.openContainedFile(mount, relativePath, path, (fileStat) => {
-        if (fileStat.size > maxSize) throw new Error(over);
+        if (fileStat.size > maxSize) throw new Refusal(over(fileStat.size.toLocaleString('en-US')));
       });
     } catch (err) {
       if (err instanceof WorkspaceReadError && err.code === 'changed') return { changed: true };
-      return { error: containedRefusal(err, path) };
+      if (err instanceof Refusal) return { error: err.message };
+      if (err instanceof WorkspaceReadError) return { error: readRefusal(err, path) };
+      throw err;
     }
     try {
       const before = identityOf(await opened.handle.stat({ bigint: true }));
       const { bytes, more } = await readPrefix(opened.handle, maxSize, opened.fileStat.size);
-      if (more) return { error: over };
-      if (looksBinary(bytes)) return { error: `${path} is binary, so the workspace doesn't edit it as text.` };
+      if (more) return { error: over(`at least ${(maxSize + 1).toLocaleString('en-US')}`) };
+      if (looksBinary(bytes)) {
+        return { error: `${JSON.stringify(path)} is binary, so the workspace doesn't edit it as text. A write replaces the whole file, if that's what you mean to do.` };
+      }
       if (!sameIdentity(before, identityOf(await opened.handle.stat({ bigint: true })))) return { changed: true };
       return { bytes, identity: before };
     } catch (err) {
-      const errno = errnoOf(err);
-      return { error: `Unable to read file: ${path}${errno ? ` (${errno})` : ''}` };
+      return { error: unreadable(JSON.stringify(path), errnoOf(err)) };
     } finally {
       await opened.handle.close();
     }
@@ -5029,11 +5004,9 @@ export class WorkspaceModule implements Module {
       } catch (err) {
         const code = errnoOf(err);
         const why = code === 'ENOENT' || code === 'ENOTDIR'
-          ? `the mount root is gone (${code}), and calling again is refused the same way until whoever runs the host puts a directory back at the mount's path`
-          : code === 'EACCES' || code === 'EPERM'
-            ? `the mount root can't be read (${code}), and calling again is refused the same way until whoever runs the host makes it readable`
-            : `the mount root can't be read (${code ?? String(err)})`;
-        return { success: false, isError: true, error: `The delete did nothing to ${path}: ${why}.` };
+          ? `the mount root isn't on disk. ${onlyTheHost("put the mount's directory back at its path")}`
+          : `the mount root can't be read: ${systemWords(code, err)}. ${errnoWayOn(code, ROOT_RECHECK, true)}`;
+        return { success: false, isError: true, error: didNothing('delete', why, path) };
       }
       const view = { ...disk.view, rootIdentity: { dev: String(rootStat.dev), ino: String(rootStat.ino) } };
       const { rootReal } = disk;
@@ -5042,10 +5015,11 @@ export class WorkspaceModule implements Module {
         await opened.handle.close();
       } catch (err) {
         // The open's own words for a replaced root speak of reading.
-        if (err instanceof WorkspaceReadError && err.message.endsWith(DIRECT_ROOT_REPLACED)) {
-          return { success: false, isError: true, error: `The delete did nothing to ${path}: ${ROOT_MOVED}.` };
+        if (err instanceof RootUnavailable && err.reason === DIRECT_ROOT_REPLACED) {
+          return { success: false, isError: true, error: didNothing('delete', `${ROOT_MOVED}.`, path) };
         }
-        return { success: false, isError: true, error: containedRefusal(err, path) };
+        if (err instanceof WorkspaceReadError) return { success: false, isError: true, error: didNothing('delete', readRefusal(err, path)) };
+        throw err;
       }
       // The unlink is awaited, unlike a write's rename, so where the head
       // was just before it says whether the head moved while it ran.
@@ -5059,10 +5033,10 @@ export class WorkspaceModule implements Module {
           this.recordDirectWrite(mount, agentName, since);
           return { success: false, isError: true, error: `The delete of ${path} failed after it reached the file, so the file may be gone: ${directReason(error)}. ls shows whether it is.` };
         }
-        return { success: false, isError: true, error: `The delete did nothing to ${path}: ${directReason(error)}.` };
+        return { success: false, isError: true, error: directDidNothing('delete', path, error) };
       }
       this.recordDirectWrite(mount, agentName, since);
-      return { success: true, data: { path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
+      return { success: true, data: { path, deleted: true, disk: 'done' }, keepWhenWithheld: ['path', 'deleted', 'disk'] };
     });
   }
 
@@ -5201,10 +5175,11 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleDelete(input: DeleteInput, callerAgentName?: string): Promise<ToolResult> {
-    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path).catch((error: unknown) => { throw notStored(error); });
+    if (relativePath === '') return { success: false, error: didNothing('delete', namesRoot(input.path, mount.config.name)), isError: true };
     input = { ...input, path };
-    const refusal = writeRefusal(mount);
-    if (refusal) return { success: false, error: refusal, isError: true };
+    const refusal = writeRefusal(mount, this.writableNames());
+    if (refusal) return { success: false, error: didNothing('delete', refusal), isError: true };
     if (mount.direct) return this.deleteDirect(mount, relativePath, input.path, callerAgentName);
 
     const store = this.getStore();
@@ -5215,11 +5190,11 @@ export class WorkspaceModule implements Module {
         await this.settleBeforeMutation(mount, relativePath);
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
-          const error = undecided !== null ? this.notCheckedYet(input.path, undecided) : this.notInWorkspace(input.path, report);
-          return { success: false, error, isError: true };
+          const error = undecided !== null ? this.notCheckedYet(input.path, undecided) : this.notInWorkspace(input.path, report, mount);
+          return { success: false, error: didNothing('delete', error), isError: true };
         }
 
-        const { refused, note } = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash },
+        const { refused, note, disk } = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash },
           () => { committed = true; });
         if (refused !== null) return storedButUnfinished('delete', input.path, { refused });
 
@@ -5227,20 +5202,20 @@ export class WorkspaceModule implements Module {
         // withholds the result (agent-framework #277).
         return {
           success: true,
-          data: { path: input.path, deleted: true, ...(note ? { note } : {}) },
-          keepWhenWithheld: ['path', 'deleted', 'note'],
+          data: { path: input.path, deleted: true, disk, ...(note ? { note } : {}) },
+          keepWhenWithheld: ['path', 'deleted', 'disk', 'note'],
         };
       });
     } catch (error) {
-      if (!committed) throw error;
+      if (!committed) throw notStored(error);
       if (error instanceof StoredThenFailed) {
         // Its note, as the success answer's: a deletion that cleared a
         // conflict naming a disk file unlinked nothing.
         const note = error.notes.get(relativePath);
         return storedButUnfinished('delete', input.path, { storeFailed: error.message, pushes: error.pushes },
-          note === undefined ? null : `${note.charAt(0).toUpperCase()}${note.slice(1)}.`);
+          note === undefined ? null : `${note.charAt(0).toUpperCase()}${note.slice(1)}.`, this.agreement?.awaitsReopen === true);
       }
-      return storedButUnfinished('delete', input.path, { threw: error instanceof Error ? error.message : String(error) });
+      return storedButUnfinished('delete', input.path, { threw: error instanceof Error ? error.message : String(error) }, null, this.agreement?.awaitsReopen === true);
     }
   }
 
@@ -5266,7 +5241,7 @@ export class WorkspaceModule implements Module {
     // A path outside the mount's include that's no scope (refusesAsOutside)
     // is refused, as glob refuses it, and shown as given.
     if (await this.refusesAsOutside(mount, relativePath, moved, root)) {
-      return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+      return { success: false, error: didNothing('ls', new OutsideIncludeError(input.path, mount.config).message), isError: true };
     }
     input = { ...input, path };
     const recursive = input.recursive === true;
@@ -5276,6 +5251,9 @@ export class WorkspaceModule implements Module {
     // shows disk's.
     const listing = await this.listingOf(mount, relativePath, recursive);
     const incomplete = listing.incomplete.length > 0 ? { incomplete: listing.incomplete } : {};
+    const empty = relativePath !== '' && listing.files.length === 0 && listing.dirs.length === 0 && listing.incomplete.length === 0;
+    const note = empty ? await this.emptyScopeNote(mount, relativePath, path) : null;
+    const noted = note !== null ? { note } : {};
     if (recursive) {
       return {
         success: true,
@@ -5284,6 +5262,7 @@ export class WorkspaceModule implements Module {
           entries: listing.files,
           count: listing.files.length,
           ...incomplete,
+          ...noted,
         },
       };
     }
@@ -5301,8 +5280,32 @@ export class WorkspaceModule implements Module {
         entries: children,
         count: children.length,
         ...incomplete,
+        ...noted,
       },
     };
+  }
+
+  private async emptyScopeNote(mount: MountState, relativePath: string, path: string): Promise<string | null> {
+    const shown = JSON.stringify(path);
+    const isFile = `${shown} is a file, not a directory, so there's nothing in it to list.`;
+    const { view, rootReal } = await this.diskView(mount);
+    const seen = await observePath(view, rootReal, relativePath);
+    if (seen.kind === 'file') return isFile;
+    if (seen.kind !== 'absent') return null;
+    if (!mount.direct && this.getStore().treeGet(mount.treeStateId, relativePath) !== null) return isFile;
+    return this.holdsAnythingAt(mount, relativePath) ? null : `${shown} isn't a directory in the workspace or on disk, so there's nothing to list.`;
+  }
+
+  private async absentOnDisk(mount: MountState, relativePath: string): Promise<boolean> {
+    const { view, rootReal } = await this.diskView(mount);
+    return (await observePath(view, rootReal, relativePath)).kind === 'absent';
+  }
+
+  private holdsAnythingAt(mount: MountState, relativePath: string): boolean {
+    if (mount.direct) return false;
+    const store = this.getStore();
+    const trees = [mount.treeStateId, this.intents.get(mount.config.name)?.treeStateId].filter((tree): tree is string => tree !== undefined);
+    return trees.some((tree) => store.treeGet(tree, relativePath) !== null || store.treeList(tree, `${relativePath}/`).length > 0);
   }
 
   /**
@@ -5408,7 +5411,7 @@ export class WorkspaceModule implements Module {
     if (input.path) {
       const { mount, relativePath, moved, root } = mountsToSearch[0]!;
       if (await this.refusesAsOutside(mount, relativePath, moved, root)) {
-        return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+        return { success: false, error: didNothing('glob', new OutsideIncludeError(input.path, mount.config).message), isError: true };
       }
     }
 
@@ -5430,7 +5433,7 @@ export class WorkspaceModule implements Module {
       if (prefixed) {
         const dir = deeperOf(relativePath, prefixed.dir);
         if (dir === null) {
-          if (this.holderOf(mount.config.name, relativePath, false, moved)) {
+          if (this.holderOf(mount.config.name, relativePath, moved)) {
             incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
             continue;
           }
@@ -5465,8 +5468,16 @@ export class WorkspaceModule implements Module {
     try {
       regex = new RegExp(input.pattern);
     } catch (e) {
-      // The parser's reason says where the pattern goes wrong.
-      return { success: false, error: `The grep did nothing: ${e instanceof Error ? e.message : String(e)}.`, isError: true };
+      // V8's message ends with the parser's reason, after the pattern: "Invalid
+      // regular expression: /foo(/: Unterminated group".
+      const message = e instanceof Error ? e.message : String(e);
+      const why = /: ([^:/]+)$/.exec(message)?.[1] ?? message;
+      return {
+        success: false,
+        isError: true,
+        error: didNothing('grep', `"pattern" ${JSON.stringify(input.pattern)} isn't a valid regular expression (${why}). `
+          + 'To match a character such as "(", "[" or "*" as itself, put "\\" before it.'),
+      };
     }
 
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
@@ -5494,7 +5505,7 @@ export class WorkspaceModule implements Module {
     if (input.path) {
       const { mount, relativePath, moved, root } = mountsToSearch[0]!;
       if (await this.refusesAsOutside(mount, relativePath, moved, root)) {
-        return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+        return { success: false, error: didNothing('grep', new OutsideIncludeError(input.path, mount.config).message), isError: true };
       }
     }
 
@@ -5541,7 +5552,7 @@ export class WorkspaceModule implements Module {
       // is that mount's: grep searches nothing of this mount's there, and
       // says whose it is. A direct mount's is judged by the nesting its parse
       // found where its root lies now (movedNesting).
-      if (this.holderOf(mount.config.name, relativePath, false, moved)) {
+      if (this.holderOf(mount.config.name, relativePath, moved)) {
         incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
         continue;
       }
@@ -5738,7 +5749,7 @@ export class WorkspaceModule implements Module {
             found.push({ skip: { file, reason: 'conflict: disk changed since the conflict was recorded; grep searches stored text, so the file disk holds now was not searched' } });
           }
         } else if (disk && !disk.stored) {
-          found.push({ skip: { file, reason: 'conflict: the disk version is binary or over the size limit, never stored', size: disk.size } });
+          found.push({ skip: { file, reason: `conflict: the disk version is binary or over the size limit, so the workspace never stored it, and grep searches only what it stores; ${settleConflict('file', mount.config.mode === 'read-only').replace(/\.$/, '')}`, size: disk.size } });
         }
       }
       const answers = new Map<Lost, { searched: () => void } | { skip: GrepSkip }>();
@@ -5806,7 +5817,7 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     const status: Record<string, unknown> = {};
     if (input.mount !== undefined && !this.mounts.has(input.mount)) {
-      return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
+      return { success: false, error: didNothing('status', this.noSuchMountField(input.mount, 'covers every mount')), isError: true };
     }
 
     for (const [name, mount] of this.mounts) {
@@ -5949,9 +5960,6 @@ export class WorkspaceModule implements Module {
    */
   private entriesByEvidence(mount: MountState): { owed: string[]; unchecked: string[]; agreed: number } {
     const store = this.getStore();
-    const agreement = this.agreementOrThrow();
-    const name = mount.config.name;
-    const intents = this.intents.get(name)!;
     const owed: string[] = [];
     const unchecked: string[] = [];
     let agreed = 0;
@@ -5960,15 +5968,30 @@ export class WorkspaceModule implements Module {
       // Outside the mount's include, or in another mount's directory nested
       // in it: neither owed to disk nor counted as on it.
       if (!insideMount(e.path, mount.config.include) || !own(e.path)) continue;
-      const p = agreement.get(name, e.path);
-      if (p === undefined) (intents.get(e.path)?.origin === 'store' ? owed : unchecked).push(e.path);
-      else if (p.kind !== 'content' || p.hash !== e.blobHash) owed.push(e.path);
-      // A mode the store records, other than the one disk last agreed with,
-      // where modes are observed: elsewhere no push applies one.
-      else if (this.modesObserved && p.mode !== undefined && (entryMode(e.mode) ?? p.mode) !== p.mode) owed.push(e.path);
+      const kind = this.evidenceOf(mount, e);
+      if (kind === 'owed') owed.push(e.path);
+      else if (kind === 'unchecked') unchecked.push(e.path);
       else agreed++;
     }
     return { owed, unchecked, agreed };
+  }
+
+  private evidenceOf(mount: MountState, e: { path: string; blobHash: string; mode: number }): 'owed' | 'unchecked' | 'agreed' {
+    const p = this.agreementOrThrow().get(mount.config.name, e.path);
+    if (p === undefined) return this.intents.get(mount.config.name)!.get(e.path)?.origin === 'store' ? 'owed' : 'unchecked';
+    if (p.kind !== 'content' || p.hash !== e.blobHash) return 'owed';
+    // A mode the store records, other than the one disk last agreed with,
+    // where modes are observed: elsewhere no push applies one.
+    if (this.modesObserved && p.mode !== undefined && (entryMode(e.mode) ?? p.mode) !== p.mode) return 'owed';
+    return 'agreed';
+  }
+
+  private diskOf(mount: MountState, relativePath: string): DiskState {
+    const intent = this.intents.get(mount.config.name)!.get(relativePath);
+    if (intent?.conflict) return 'in conflict with disk';
+    const entry = this.getStore().treeGet(mount.treeStateId, relativePath);
+    if (!entry) return intent?.tombstone ? 'waits for materialize with applyDeletions' : 'done';
+    return this.evidenceOf(mount, { ...entry, path: relativePath }) === 'agreed' ? 'done' : 'waits for materialize';
   }
 
   private async handleMaterialize(input: MaterializeInput): Promise<ToolResult> {
@@ -5987,7 +6010,7 @@ export class WorkspaceModule implements Module {
       // is refused; beneath a directory, the push leaves out what the include
       // doesn't cover.
       if (await this.refusesAsOutside(parsed.mount, parsed.relativePath, parsed.moved, parsed.root)) {
-        return { success: false, error: new OutsideIncludeError(input.path, explicit.mount.config).message, isError: true };
+        return { success: false, error: didNothing('materialize', new OutsideIncludeError(input.path, explicit.mount.config).message), isError: true };
       }
     }
 
@@ -5997,7 +6020,7 @@ export class WorkspaceModule implements Module {
     } else if (input.mount) {
       const m = this.mounts.get(input.mount);
       if (!m) {
-        return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
+        return { success: false, error: didNothing('materialize', this.noSuchMountField(input.mount, "covers every mount that takes writes and doesn't already write them straight to disk")), isError: true };
       }
       mountsToMaterialize = [{ name: input.mount, mount: m }];
     } else {
@@ -6105,16 +6128,21 @@ export class WorkspaceModule implements Module {
     if (proceeded === 0 && guarded.length > 0 && guarded.length === mountsToMaterialize.length) {
       return {
         success: false,
-        error: `Cannot materialize: ${blocked.map((b) => `[${b.mount}] ${b.reason}`).join('; ')}`,
+        error: didNothing('materialize', blocked.map((b) => `mount ${JSON.stringify(b.mount)}: ${b.reason}`).join('; ')),
         isError: true,
       };
     }
 
+    const held = explicit;
+    const heldNothing = held !== null && held.relativePath !== '' && !held.mount.direct
+      && allWritten.length === 0 && allDeleted.length === 0 && pendingDeletions.length === 0 && blocked.length === 0 && passedOver.length === 0
+      && !this.holdsAnythingAt(held.mount, held.relativePath);
     return {
       success: true,
       data: {
         materialized: allWritten,
         count: allWritten.length,
+        ...(heldNothing ? { note: `The workspace holds nothing at ${JSON.stringify(`${held.mount.config.name}/${held.relativePath}`)}, so there was nothing to write there.` } : {}),
         ...(allDeleted.length > 0 ? { deleted: allDeleted } : {}),
         ...(pendingDeletions.length > 0
           ? {
@@ -6185,7 +6213,13 @@ export class WorkspaceModule implements Module {
     const allIgnored: Array<{ mount: string; path: string; note: string }> = [];
     const rootsAccepted: string[] = [];
     if (input.acceptRoot && input.path) {
-      return { success: false, error: 'acceptRoot takes a whole mount\'s root: give mount, or nothing, not path', isError: true };
+      const named = input.path.split('/')[0]!;
+      return {
+        success: false,
+        isError: true,
+        error: didNothing('sync', `acceptRoot takes a whole mount's root, so it isn't given with "path" (${JSON.stringify(input.path)}). `
+          + `${this.mounts.has(named) ? `Give "mount" (${JSON.stringify(named)}) with acceptRoot to take that mount's root` : 'Give "mount", naming the mount whose root to take, with acceptRoot'}, or leave acceptRoot out to sync the path.`),
+      };
     }
 
     // A path names its own mount; otherwise the given mount, or every mount.
@@ -6196,13 +6230,13 @@ export class WorkspaceModule implements Module {
       // is refused; beneath a directory, the walk passes over what the include
       // doesn't cover.
       if (await this.refusesAsOutside(mount, relativePath, moved, root)) {
-        return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+        return { success: false, error: didNothing('sync', new OutsideIncludeError(input.path, mount.config).message), isError: true };
       }
       targets = [{ name: mount.config.name, mount, relativePath }];
     } else if (input.mount) {
       const m = this.mounts.get(input.mount);
       if (!m) {
-        return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
+        return { success: false, error: didNothing('sync', this.noSuchMountField(input.mount, 'covers every mount')), isError: true };
       }
       targets = [{ name: input.mount, mount: m, relativePath: '' }];
     } else {
@@ -6216,6 +6250,7 @@ export class WorkspaceModule implements Module {
         allSkipped.push({ mount: name, path: relativePath, reason: DIRECT_SYNC_SKIPPED });
         continue;
       }
+      let namedDirectory = false;
       const pass = await this.withMount(mount, async () => {
         if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
         if (!relativePath) {
@@ -6230,6 +6265,7 @@ export class WorkspaceModule implements Module {
           store.treeList(mount.treeStateId, prefix).length > 0 ||
           this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
           this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
+        namedDirectory = (await directoryAt(join(mount.config.path, relativePath), mount.config.followSymlinks === true)) ?? isDir;
         // named: ignore patterns covering the path asked for don't apply
         // beneath it (a directory scope's walk; a path scope doesn't walk).
         const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn, named: true };
@@ -6288,7 +6324,7 @@ export class WorkspaceModule implements Module {
       // without a path passes over it, so nothing else keeps it current
       // (agent-framework #276). A path in another mount's directory isn't
       // synced at all, and the note says so.
-      const passedOver = passedOverAt(relativePath, this.ignoreOf(mount), this.othersOf(name));
+      const passedOver = passedOverAt(relativePath, this.ignoreOf(mount), this.othersOf(name), namedDirectory);
       if (passedOver !== undefined) {
         allIgnored.push({
           mount: name,
@@ -6302,10 +6338,17 @@ export class WorkspaceModule implements Module {
       }
     }
 
+    const named = input.path !== undefined && input.path !== '' ? targets[0]! : null;
+    const nothingThere = named !== null && named.relativePath !== '' && !named.mount.direct
+      && allResults.every((r) => r.synced.length === 0 && r.conflicts.length === 0 && (r.discarded?.length ?? 0) === 0)
+      && allSkipped.length === 0 && allIncomplete.length === 0 && allIgnored.length === 0
+      && !this.holdsAnythingAt(named.mount, named.relativePath)
+      && await this.absentOnDisk(named.mount, named.relativePath);
     return {
       success: true,
       data: {
         results: allResults,
+        ...(nothingThere ? { note: `Neither the workspace nor disk has anything at ${JSON.stringify(`${named.name}/${named.relativePath}`)}, so there was nothing to sync.` } : {}),
         totalSynced: allResults.reduce((sum, r) => sum + r.synced.length, 0),
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
         ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
@@ -6646,13 +6689,16 @@ function watchOf(config: MountConfig): 'always' | 'on-agent-action' | 'never' {
  * add to what keeps it off direct; refused, what's held only shrinks, and
  * the next start once none is held runs it direct.
  */
-function writeRefusal(mount: MountState): string | null {
+function writeRefusal(mount: MountState, writable: readonly string[] = []): string | null {
   const name = mount.config.name;
-  if (mount.config.mode === 'read-only') return `Mount "${name}" is read-only`;
+  if (mount.config.mode === 'read-only') {
+    return `mount "${name}" is read-only. ${onlyTheHost('make it read-write')}`
+      + (writable.length > 0 ? ` The mounts that take writes are ${listed(writable.map((other) => JSON.stringify(other)))}.` : '');
+  }
   if (mount.config.backend === 'direct' && !mount.direct) {
-    return `Mount "${name}" is configured direct, and runs as 'chronicle' this session because its start found the store holding changes there that disk lacks, `
+    return `mount "${name}" is configured direct, and runs as 'chronicle' this session because its start found the store holding changes there that disk lacks, `
       + `so it takes no writes this session, and calling again is refused the same way. To run it direct again, settle what's held `
-      + `(sync each held path to take disk's copy, or materialize mount "${name}" by name to write the store's copies to disk), and the host's next start runs it direct`;
+      + `(sync each held path to take disk's copy, or materialize mount "${name}" by name to write the store's copies to disk), and the host's next start runs it direct.`;
   }
   return null;
 }
@@ -6752,6 +6798,15 @@ function directReason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function directWayOn(error: unknown): string | null {
+  return error instanceof FileChanged ? 'Calling again reads it afresh.' : error instanceof WriteRefused ? error.wayOn : null;
+}
+
+function directDidNothing(tool: string, path: string, error: unknown): string {
+  const on = directWayOn(error);
+  return didNothing(tool, `${directReason(error)}.${on !== null ? ` ${on}` : ''}`, path);
+}
+
 /** "a", "a and b", or "a, b and c". */
 function listed(items: readonly string[]): string {
   return items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
@@ -6775,7 +6830,85 @@ function linksNote(path: string, staged: Staged, tool: 'write' | EditTool): stri
  */
 function containedRefusal(err: unknown, path: string): string {
   const bare = err instanceof WorkspaceReadError && err.errno !== undefined && err.message === `Unable to read file: ${path}`;
-  return bare ? `${err.message} (${err.errno})` : err instanceof Error ? err.message : String(err);
+  return bare ? `${err.message} (${errnoWords(err.errno)})` : err instanceof Error ? err.message : String(err);
+}
+
+function deletedOnDisk(path: string): string {
+  return `there's no file at ${JSON.stringify(path)} any more: disk's copy was deleted since the workspace last agreed with it, and the workspace took that in first. ls or glob lists the files that exist.`;
+}
+
+function uncheckedFile(shown: string, note: string | undefined): string {
+  if (note === DIRECTORY) return `${shown} is a directory, not a file; ls ${shown} lists what's in it.`;
+  const on = note === ROOT_UNAVAILABLE ? ROOT_UNCHECKED
+    : note === ROOT_REPLACED ? null
+      : note === NOT_FOLLOWED ? "Calling again won't change that; if you know the file it leads to, name that file by its own path."
+        : note === LEAVES_MOUNT ? "Calling again won't change that; if a mount holds the file it leads to, name it by its path there."
+          : note === NOT_REGULAR ? onlyTheHost('put a regular file there')
+            : note === CHANGED ? 'Calling again checks it afresh.'
+              : 'Calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk.';
+  return `${shown} isn't in the workspace, and disk couldn't be checked: ${sentence(note ?? 'not observed')}${on !== null ? ` ${on}` : ''}`;
+}
+
+function namesRoot(path: string, mount: string): string {
+  return `${JSON.stringify(path)} names the root of mount "${mount}", which isn't a file; ls "${mount}" lists the files in it.`;
+}
+
+function tooLargeToWrite(path: string, bytes: number, maxSize: number): string {
+  return pastSizeLimit(`${JSON.stringify(path)} would be ${bytes.toLocaleString('en-US')} bytes`, maxSize, "the workspace couldn't keep it", 'Content within the limit is written.');
+}
+
+function pastSizeLimit(what: string, maxSize: number, outcome: string, within: string | null): string {
+  return `${what}, past the ${maxSize.toLocaleString('en-US')}-byte limit this mount sets on a file, so ${outcome}.${within !== null ? ` ${within}` : ''} `
+    + "The limit is the mount's maxFileSize setting, which only whoever runs the host can change.";
+}
+
+function sentence(text: string): string {
+  return /[.!?]$/.test(text) ? text : `${text}.`;
+}
+
+function unreadable(shown: string, errno: string | undefined): string {
+  return `${shown} can't be read from disk: ${errnoWords(errno)}. ${errnoWayOn(errno)}`;
+}
+
+function readRefusal(err: WorkspaceReadError, path: string): string {
+  const shown = JSON.stringify(path);
+  if (err instanceof RootUnavailable) {
+    if (err.refusal) return err.refusal.message;
+    const mount = JSON.stringify(err.mount);
+    if (err.reason === ROOT_UNAVAILABLE || err.reason === null) {
+      if (err.errno === 'ENOENT' || err.errno === 'ENOTDIR') {
+        return `the directory of mount ${mount} isn't on disk, so nothing in it can be read. ${onlyTheHost("put the mount's directory back at its path")}`;
+      }
+      if (err.errno !== undefined) {
+        return `the directory of mount ${mount} can't be read: ${errnoWords(err.errno)}. `
+          + errnoWayOn(err.errno, ROOT_RECHECK, true);
+      }
+      return `the directory of mount ${mount} can't be checked at its path, so nothing in it can be read. ${ROOT_RECHECK}`;
+    }
+    return `${shown} can't be read: ${sentence(err.reason)}`;
+  }
+  if (err.stage === 'readlink') return sentence(err.message);
+  switch (err.code) {
+    case 'directory':
+      return `${shown} is a directory, not a file; ls ${shown} lists what's in it.`;
+    case 'symlink':
+      return `${shown} is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. `
+        + 'Calling again won\'t change that; if you know the file it leads to, name that file by its own path.';
+    case 'escape':
+      return `${shown} leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. `
+        + 'Calling again won\'t change that; if a mount holds that file, name it by its path there.';
+    case 'changed':
+      return `${shown} changed on disk while it was being read. Calling again reads it afresh.`;
+    case 'not_found':
+      if (err.errno === 'ENOENT' || err.errno === 'ENOTDIR') return `there's no file at ${shown}. ls or glob lists the files that exist.`;
+      if (err instanceof NotRegularFile) {
+        return `${shown} isn't a regular file (it's a pipe, a socket or a device), so the workspace doesn't read it. ${onlyTheHost('put a regular file there')}`;
+      }
+      if (err.stage === 'realpath') return `where ${shown} leads on disk can't be resolved: ${errnoWords(err.errno)}. ${errnoWayOn(err.errno)}`;
+      return unreadable(shown, err.errno);
+    default:
+      return sentence(err.message);
+  }
 }
 
 type LostContents = {
@@ -6783,6 +6916,7 @@ type LostContents = {
   store: Exclude<StoredBytes, { bytes: Buffer }>;
   disk: 'other' | 'none' | { unreadable: string };
   writable: boolean;
+  reopen: boolean;
 };
 
 function contentsSubject(what: 'saved' | 'conflict-disk', path: string): string {
@@ -6803,15 +6937,22 @@ function lostOnDisk(lost: LostContents): string {
       : `disk's copy can't be read (${lost.disk.unreadable})`;
 }
 
-function lostText(lost: LostContents): string {
-  return `The workspace's copy of ${lost.path} is ${lostInStore(lost)}, and ${lostOnDisk(lost)}`;
+function lostText(lost: LostContents, the: 'The' | 'the' = 'The'): string {
+  return `${the} workspace's copy of ${lost.path} is ${lostInStore(lost)}, and ${lostOnDisk(lost)}`;
 }
 
 function nothingToRead(lost: LostContents): string {
-  return `${lostText(lost)}, so it can't be restored or read. ${lostRemedy(lost)}`;
+  return `${lostText(lost, 'the')}, so it can't be restored or read. ${lostRemedy(lost)}`;
 }
 
 function lostRemedy(lost: LostContents): string {
+  const after = remedyOfLost(lost);
+  if (!lost.reopen) return after;
+  return "Nothing you do clears this until the workspace's store is reopened, and calling again won't change that; whoever runs this host can reopen it with a restart. "
+    + `After that, ${after.charAt(0).toLowerCase()}${after.slice(1)}`;
+}
+
+function remedyOfLost(lost: LostContents): string {
   const rewrite = lost.writable && 'missing' in lost.store;
   if (lost.disk === 'other') return `Sync the path to keep disk's copy and give up the workspace's${rewrite ? ', or write the file again' : ''}.`;
   if (lost.writable) return rewrite ? 'Write the file again, or delete it.' : 'Delete the file to clear it.';
@@ -6896,9 +7037,8 @@ function planTargetEdits(
       kind: 'file',
       edits: target.edits,
       path: target.path,
-      text: `${target.path} would be ${size} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}, `
-        + `past the ${maxSize.toLocaleString('en-US')}-byte limit this mount sets on a file, so the workspace couldn't keep it. `
-        + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.",
+      text: pastSizeLimit(`${target.path} would be ${size} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}`, maxSize,
+        "the workspace couldn't keep it", 'An edit that leaves the file within the limit applies.'),
       whole: false,
     });
     return null;
@@ -6941,16 +7081,35 @@ function changesLanded(
  * change is stored isn't known. Its message says so after both errors.
  */
 class CommitUnknownError extends Error {
-  readonly setError: string;
-  readonly readError: string;
-  constructor(setError: unknown, readError: unknown) {
+  constructor(readonly setCause: unknown, readonly readCause: unknown) {
     const text = (error: unknown) => (error instanceof Error ? error.message : String(error));
-    super(`${text(setError)}; reading its entries back failed too (${text(readError)}), so whether the change is stored isn't known`);
+    super(`${text(setCause)}; reading its entries back failed too (${text(readCause)}), so whether the change is stored isn't known`);
     this.name = 'CommitUnknownError';
-    this.setError = text(setError);
-    this.readError = text(readError);
   }
 }
+
+function storeWords(error: unknown): string {
+  const code = errnoCode(error);
+  return code !== undefined ? errnoWords(code) : cutLine(error instanceof Error ? error.message : String(error));
+}
+
+class NotStored extends Error {
+  constructor(readonly thrown: unknown) {
+    super('stopped before the change was stored');
+  }
+}
+
+class AlreadyHeld extends Error {
+  constructor(readonly thrown: unknown) {
+    super(thrown instanceof Error ? thrown.message : String(thrown));
+  }
+}
+
+function notStored(error: unknown): unknown {
+  return error instanceof Refusal || error instanceof WorkspaceReadError || error instanceof CommitUnknownError || error instanceof AlreadyHeld || error instanceof NotStored
+    ? error : new NotStored(error);
+}
+
 
 /**
  * A store's set that threw after recording the change (changesLanded): the
@@ -6963,6 +7122,14 @@ class StoredThenFailed extends Error {
     super(storeError instanceof Error ? storeError.message : String(storeError));
     this.name = 'StoredThenFailed';
   }
+}
+
+const ONCE_REOPENED = ', once the store is reopened';
+
+const DISK_ORDER: DiskState[] = ['in conflict with disk', 'waits for materialize with applyDeletions', 'waits for materialize', 'done'];
+
+function furthestFromDisk(values: DiskState[]): DiskState {
+  return DISK_ORDER.find((state) => values.includes(state)) ?? 'done';
 }
 
 /**
@@ -6981,6 +7148,7 @@ function storedButUnfinished(
   path: string,
   outcome: { refused: string } | { threw: string } | { storeFailed: string; pushes: boolean },
   note: string | null = null,
+  reopen = false,
 ): ToolResult {
   const change = tool === 'delete' ? 'deletion' : tool;
   const stored = `The ${change} of "${path}" is stored in the workspace, so don't send it again`
@@ -6990,10 +7158,10 @@ function storedButUnfinished(
     : 'storeFailed' in outcome
       ? ` The store failed after recording it: ${outcome.storeFailed}.` + (!outcome.pushes ? ''
         : tool === 'delete'
-          ? ' Its push to disk didn\'t run, so disk keeps the file until a materialize of the path with applyDeletions deletes it.'
-          : ' Its push to disk didn\'t run, so disk lacks the change until a materialize of the path writes it.')
-      : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
-  return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : '') };
+          ? ` Its push to disk didn't run, so disk keeps the file until a materialize of the path with applyDeletions deletes it${reopen ? ONCE_REOPENED : ''}.`
+          : ` Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it${reopen ? ONCE_REOPENED : ''}.`)
+      : ` The rest of the call failed: ${outcome.threw}.${reopen ? '' : " ls shows the path's state."}`;
+  return { success: false, isError: true, error: stored + rest + (reopen ? ` ${AWAITS_REOPEN}` : '') + (note !== null ? ` ${note}` : '') };
 }
 
 /**
@@ -7023,17 +7191,22 @@ function whichCopyRead(report: PathReport | undefined, tookChange: boolean, read
     // can hold it (not binary or too large). A read-only mount can hold a
     // copy disk doesn't, such as one a branch switch selected, but a
     // materialize, forced or not, writes nothing to it.
-    const sync = report.diskNow === 'absent'
-      ? 'Sync the path to take disk\'s deletion, which removes the workspace\'s copy'
-      : 'Sync the path to keep disk\'s copy and give up the workspace\'s';
-    const force = readOnly
-      ? '. The mount is read-only, so nothing writes the workspace\'s copy to disk.'
-      : report.diskNow === 'absent'
-        ? ', or materialize it with force to write the workspace\'s copy back to disk.'
-        : ', or materialize it with force to write the workspace\'s over disk\'s.';
-    return [`The path is in conflict with disk (${kind}): this read shows the workspace's copy. ${sync}${force}`];
+    const settle = settleConflict(report.diskNow, readOnly);
+    return [`The path is in conflict with disk (${kind}): this read shows the workspace's copy. ${settle[0]!.toUpperCase()}${settle.slice(1)}`];
   }
   return [];
+}
+
+function settleConflict(diskNow: PathReport['diskNow'], readOnly: boolean): string {
+  const sync = diskNow === 'absent'
+    ? 'sync the path to take disk\'s deletion, which removes the workspace\'s copy'
+    : 'sync the path to keep disk\'s copy and give up the workspace\'s';
+  const force = readOnly
+    ? '. The mount is read-only, so nothing writes the workspace\'s copy to disk.'
+    : diskNow === 'absent'
+      ? ', or materialize it with force to write the workspace\'s copy back to disk.'
+      : ', or materialize it with force to write the workspace\'s over disk\'s.';
+  return `${sync}${force}`;
 }
 
 /**
@@ -7233,13 +7406,13 @@ function globToRegex(pattern: string): RegExp {
         if (pattern[j] === '{') depth++;
         else if (pattern[j] === '}' && --depth === 0) closeIdx = j;
       }
-      if (closeIdx < 0) throw new Error(braceRefusal(pattern, 'has a "{" with no closing "}"'));
+      if (closeIdx < 0) throw new Refusal(braceRefusal(pattern, 'has a "{" with no closing "}"'));
       const group = pattern.slice(i + 1, closeIdx);
       if (group.includes('{')) {
-        throw new Error(braceRefusal(pattern, 'has a "{" group inside another; put all its alternatives in one group'));
+        throw new Refusal(braceRefusal(pattern, 'has a "{" group inside another; put all its alternatives in one group'));
       }
       if (!group.includes(',')) {
-        throw new Error(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
+        throw new Refusal(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
       }
       // A `/` right after the group goes into each alternative, as `{a,b}/x`
       // and `{a/,b/}x` name the same paths, so an alternative's own `**`

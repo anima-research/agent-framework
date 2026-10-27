@@ -14,8 +14,9 @@ export type SameRoundThinkTextPolicySource =
 export interface AutoContinueRun {
   /** How the agent stops, as the row puts it ("call skip_reply"). */
   stop: string;
-  /** The turn before ended in words that were held, not sent, because it
-   *  had already sent with a send tool. */
+  /** The turn before ended in words some or all of which were held, not
+   *  sent, because a send in it may already have posted where they were
+   *  going. */
   heldAfterSend?: boolean;
   /** Set by the scheduler: the continuation is the turn's only cause. */
   sole?: boolean;
@@ -254,7 +255,18 @@ export interface AgentConfig {
      *   that the record doesn't account for raises the
      *   `thinking-binding-loss` ops alert, once per incident and again if a
      *   call drops more. The provider reports drops only on a request that
-     *   carries the drop control; without it, such a block is refused.
+     *   carries the drop control; without it, such a block is refused;
+     * - the agent is told, in a `[reasoning] <agent>:` system notice of kind
+     *   `reasoning-loss` stored for it as the framework's other notices are,
+     *   when a committing compile leaves out a stored reply's reasoning at a
+     *   change of the request's head, at a branch's first compile, or in a
+     *   fold or other change to an earlier message that takes a reply of the
+     *   current turn, and, with `dropBlock` set too, when the provider drops
+     *   blocks it can place as the agent's stored replies or the stream's
+     *   rounds, once per incident and again when a call drops more. The
+     *   framework hears compiles through `Agent.onThinkingStrip` from the
+     *   agent's first stream on, unless a host has set its own, so an agent
+     *   driven only through the direct API is never told.
      * The record and the notes
      * vouch for requests as agent-framework hands them to membrane, so a
      * membrane `beforeRequest` hook that changes a request must change every
@@ -548,10 +560,18 @@ export interface InferenceRequest {
    *  agent while a turn was alive: a coalesced render placed in its queue
    *  (wakeToRead), or a message, notice or event whose wake was queued with
    *  it. Once a request that carried the write was answered and, for a wake
-   *  that carries a channel, the agent has since published into that
-   *  channel having read it, or once the write is in neither the agent's
-   *  queue nor its store's current branch, the wake starts no turn. */
+   *  that carries a channel and isn't marked `ambient`, the agent has since
+   *  published into that channel having read it, or once the write is in
+   *  neither the agent's queue nor its store's current branch, the wake
+   *  starts no turn. */
   readsDeferredWrite?: string;
+  /** Host-owned: this wake's sole cause is this message, stored in its
+   *  agent's store as it arrived, not deferred (its row's id). Once a
+   *  request that carried the message was answered and, for a wake that
+   *  carries a channel and isn't marked `ambient`, the agent has since
+   *  published into that channel having read it, or once the message isn't
+   *  on its store's current branch, the wake starts no turn. */
+  readsStoredMessage?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -600,11 +620,22 @@ export interface InferenceRequest {
    * (`chat:ambient`). A coalesced push's wake carries it only to read a
    * render, and only when every notice the render stands for was. Such a
    * message asked nothing of the agent, so a wake for it that carries
-   * `readsDeferredWrite` is dropped once a request that carried the message
-   * was answered, with no publish asked of the agent. A message with neither
-   * tag is in doubt, and is judged as an addressed one.
+   * `readsDeferredWrite` or `readsStoredMessage` is dropped once a request
+   * that carried the message was answered, with no publish asked of the
+   * agent. A message with neither tag is in doubt, and is judged as an
+   * addressed one.
    */
   ambient?: true;
+  /**
+   * Host-owned: true when the triggering message's server marked it a
+   * `chat:system` notice (RFC-001 rev 3): an event about the place, such as
+   * a join or the weather changing, not something anyone said. Such a wake
+   * names no channel for its turn's plain speech, though it carries
+   * `channelId`: a turn it starts alone resolves its locus as a heartbeat's
+   * does. Like an ambient one, a wake to read it is done once read. Never
+   * set on a coalesced render's wake, which may fold messages too.
+   */
+  systemNotice?: true;
   /**
    * Who spoke the message that triggered this inference, as an adapter-
    * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display

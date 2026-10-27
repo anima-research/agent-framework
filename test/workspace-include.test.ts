@@ -13,12 +13,12 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
-import { coversLanding, includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
+import { coversLanding, insideMount, patternRefusal, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
@@ -201,10 +201,8 @@ describe('mount include', () => {
       for (const [tool, input] of [
         ['sync', { path }], ['materialize', { path }], ['grep', { path, pattern: 'x' }], ['glob', { path, pattern: '*' }], ['ls', { path }], ['read', { path }],
       ] as const) {
-        // read throws its refusal, so it arrives as an Error's text; the five
-        // that take a scope return it.
         const text = await refused(m, tool, input as Record<string, unknown>);
-        assert.equal(tool === 'read' ? text.replace(/^Error: /, '') : text, said, `${tool} ${name}`);
+        assert.equal(text, `The ${tool} did nothing: ${said}`, `${tool} ${name}`);
       }
     }
     // A directory gone from disk is still a scope while history holds an
@@ -422,7 +420,9 @@ describe('mount include', () => {
       for (const [tool, input] of [
         ['ls', { path }], ['sync', { path }], ['materialize', { path }], ['grep', { path, pattern: 'a' }], ['glob', { path, pattern: '*' }],
       ] as const) {
-        texts.add((await refused(m, tool, input as Record<string, unknown>)).replace(path, 'PATH'));
+        const text = await refused(m, tool, input as Record<string, unknown>);
+        assert.ok(text.startsWith(`The ${tool} did nothing: `), text);
+        texts.add(text.slice(`The ${tool} did nothing: `.length).replace(path, 'PATH'));
       }
     }
     assert.equal(texts.size, 1, [...texts].join(' | '));
@@ -625,7 +625,7 @@ describe('mount include', () => {
         const left = await diskRefusal(m, path);
         assert.equal(left, `escape: Symlink escape detected: ${path}`);
         const read = await refused(m, 'read', { path });
-        assert.ok(read.includes(`Symlink escape detected: ${path}`) && !read.includes('inner'), read);
+        assert.ok(read.startsWith(`The read did nothing: ${JSON.stringify(path)} leads through a symlink to a place outside its mount`) && !read.includes('inner'), read);
         // Nothing of the inner mount's file is searched, and nothing names it as that mount's: a sync or a
         // listing may name the directory `d` leads into, which that mount shows.
         const unnamed = (answer: string): boolean => !answer.includes("inner mount's") && !answer.includes('hidden')
@@ -969,12 +969,12 @@ describe('mount include', () => {
     for (const path of ['work/notes.json', 'work/via/x.txt']) {
       for (const [tool, input] of [['read', { path }], ['write', { path, content: 'x' }], ['edit', { path, oldString: 'not', newString: 'now' }], ['delete', { path }]] as const) {
         const said = await refused(m, tool, input);
-        assert.ok(said.endsWith(`Symlink escape detected: ${path}`), `${tool} ${path}: ${said}`);
+        assert.ok(said.startsWith(`The ${tool} did nothing: ${JSON.stringify(path)} leads through a symlink to a place outside its mount`), `${tool} ${path}: ${said}`);
       }
       assert.equal(await diskRefusal(m, path), `escape: Symlink escape detected: ${path}`, path);
     }
     const created = await refused(m, 'write', { path: 'work/via/new.txt', content: 'x' });
-    assert.ok(created.endsWith('Symlink escape detected: work/via/new.txt'), `a file it would create where the link leads: ${created}`);
+    assert.ok(created.startsWith('The write did nothing: "work/via/new.txt" leads through a symlink to a place outside its mount'), `a file it would create where the link leads: ${created}`);
     // A covered directory where the link leads is a directory to the file tools, not a place that leaves the
     // mount: the include judges files.
     const directory = await refused(m, 'read', { path: 'work/via/sub' });
@@ -1050,12 +1050,13 @@ describe('mount include', () => {
     symlinkSync('c.json', join(env.dir, 'loop.json'));
     m = await env.open({ followSymlinks: true, include: ['*.json'] });
     const read = await refused(m, 'read', { path: 'work/c.json' });
-    assert.ok(read.includes('Unable to resolve file: work/c.json') && !read.includes('needle'), read);
+    const loop = 'where "work/c.json" leads on disk can\'t be resolved: too many symlinks, or a loop of them.';
+    assert.ok(read.includes(loop) && !read.includes('needle'), read);
     await assert.rejects(m.readFileFromDisk('work/c.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'not_found');
     const written = await refused(m, 'write', { path: 'work/c.json', content: 'written through a loop\n' });
-    assert.ok(written.includes('Unable to resolve file: work/c.json'), written);
+    assert.ok(written.includes(loop), written);
     const deleted = await refused(m, 'delete', { path: 'work/c.json' });
-    assert.ok(deleted.includes('Unable to resolve file: work/c.json'), deleted);
+    assert.ok(deleted.includes(loop), deleted);
     assert.ok(lstatSync(join(env.dir, 'c.json')).isSymbolicLink() && lstatSync(join(env.dir, 'loop.json')).isSymbolicLink(), 'both links stay');
     assert.equal(readFileSync(join(env.dir, 'secret.dat'), 'utf8'), "needle: not the mount's\n");
   });
@@ -1068,7 +1069,7 @@ describe('mount include', () => {
     try {
       for (const [name, input] of [['read', { path: 'work/locked/x.json' }], ['write', { path: 'work/locked/x.json', content: '[]\n' }], ['delete', { path: 'work/locked/x.json' }]] as const) {
         const why = await refused(m, name, input);
-        assert.ok(why.includes('Unable to resolve file: work/locked/x.json'), `${name}: ${why}`);
+        assert.ok(why.includes('where "work/locked/x.json" leads on disk can\'t be resolved: permission denied.'), `${name}: ${why}`);
       }
       await assert.rejects(m.readFileFromDisk('work/locked/x.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'not_found');
     } finally {
@@ -1095,7 +1096,7 @@ describe('mount include', () => {
       } else {
         for (const [name, input] of [['read', { path: 'work/c0.json' }], ['write', { path: 'work/c0.json', content: '{}\n' }], ['delete', { path: 'work/c0.json' }]] as const) {
           const why = await refused(m, name, input);
-          assert.ok(why.includes('Unable to resolve file: work/c0.json'), `${name}: ${why}`);
+          assert.ok(why.includes('where "work/c0.json" leads on disk can\'t be resolved: too many symlinks, or a loop of them.'), `${name}: ${why}`);
         }
         await assert.rejects(m.readFileFromDisk('work/c0.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'not_found');
       }
@@ -1446,7 +1447,7 @@ describe('mount include', () => {
       assert.equal(read.success, true, `${path}: ${read.error}`);
       assert.match(JSON.stringify(read.structured), /generated/, path);
       const write = await m.handleToolCall({ id: 't', name: 'write', input: { path, content: 'x' }, callerAgentName: 'resident' });
-      assert.match(String(write.error), /Generated file is read-only/, path);
+      assert.match(String(write.error), /is generated from your tool presentation, so it's read-only/, path);
     }
     assert.equal(existsSync(join(env.dir, 'notes.md')), false);
     assert.deepEqual(env.tree(), [], 'and history holds none of it');
@@ -1642,33 +1643,28 @@ describe('mount include', () => {
     assert.equal(firstWritable(only), null, 'as a setup with no writable mount');
   });
 
-  test('a pattern holding "\\" is unreadable where "\\" is the separator, and part of a name where it isn\'t', () => {
-    // Windows reads every path with `\` as a separator, so no file there is named `sub\gate.json`.
-    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.equal(includePatternReadable(pattern, '\\'), false, pattern);
-    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(includePatternReadable(pattern, '\\'), true, pattern);
-    assert.equal(includePatternReadable('sub\\gate.json', '/'), true, 'where "/" is the separator, "\\" is a character of the name');
+  test('a pattern holding "\\" is refused on every platform, where "/" is the separator too', () => {
+    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.notEqual(patternRefusal(pattern, 'include'), undefined, pattern);
+    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(patternRefusal(pattern, 'include'), undefined, pattern);
   });
 
   test('include is checked when the module is built, and the refusal names the mount and what it refused', () => {
     const mount = (include: unknown): MountConfig => ({ name: 'work', path: '/tmp/x', mode: 'read-write', include } as MountConfig);
-    const refusal = (include: unknown, ending: string): void => {
+    const refusal = (include: unknown, said: string): void => {
       assert.throws(() => new WorkspaceModule({ mounts: [mount(include)] }), (err: unknown) => err instanceof Error
-        && err.message.startsWith('[workspace] Mount "work": include must be a non-empty list of names') && err.message.endsWith(ending),
-      ending);
+        && err.message.startsWith(`[workspace] Mount "work": ${said}`),
+      said);
     };
-    for (const bad of [[], 42, 'gate.json']) refusal(bad, `, not ${JSON.stringify(bad)}`);
-    for (const entry of ['sub/file.txt', 'foo*', '*', '*.', '*.js*', 'a/*/**', '/**', '', '.', '..', './**', '../**', 'a/../**', undefined]) {
-      refusal([entry], `; ${JSON.stringify(entry) ?? String(entry)} is none of these`);
+    for (const bad of [[], 42, 'gate.json']) refusal(bad, `include must be a non-empty list of patterns, not ${JSON.stringify(bad)}`);
+    for (const entry of ['/**', '', '.', '..', './**', '../**', 'a/../**', 'a\\b.json', undefined]) {
+      refusal([entry], `include pattern ${JSON.stringify(entry) ?? String(entry)} isn't read: `);
     }
-    // A value JSON can't write is shown as JavaScript writes it, not thrown on, inside a value too.
-    refusal([1n], '; 1n is none of these');
-    refusal({ pattern: 1n }, ', not [object Object]');
-    refusal(['gate.json', 'foo*'], '; "foo*" is none of these');
-    for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**']]) {
+    refusal([1n], 'include pattern 1n isn\'t read: ');
+    refusal({ pattern: 1n }, 'include must be a non-empty list of patterns, not [object Object]');
+    refusal(['gate.json', '!gate.json'], 'include pattern "!gate.json" isn\'t read: ');
+    for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**'], ['sub/file.txt'], ['foo*'], ['*'], ['*.'], ['*.js*'], ['a/*/**'], ['fixtures/'], ['/gate.json'], ['[id].tsx']]) {
       assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(good)] }), JSON.stringify(good));
     }
-    // Where "/" is the separator, "\" is part of a name, so a pattern may hold one.
-    if (sep === '/') assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(['a\\b.json'])] }), 'a pattern holding "\\"');
   });
 });
 
