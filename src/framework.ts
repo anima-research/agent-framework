@@ -29503,9 +29503,9 @@ export class AgentFramework {
    * (`toolHints: false`). With them off, the very object every server is
    * offered.
    */
-  private mcplHostCapabilitiesFor(config: McplServerConfig): McplHostCapabilities {
+  private mcplHostCapabilitiesFor(config: McplServerConfig, hints = this.hintsFor(config)): McplHostCapabilities {
     const base = this.mcplHostCapabilities!;
-    return this.hintsFor(config) ? { ...base, toolHints: true } : base;
+    return hints ? { ...base, toolHints: true } : base;
   }
 
   /** RFC-014: every toolHints server's presence, made on first use. */
@@ -29739,23 +29739,27 @@ export class AgentFramework {
     let registeredEpoch = 0;
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
+    // RFC-014: decided once for this connect, so the meta-tools, the offer
+    // and the read tap agree though the state hintsFor reads can change
+    // across the awaits below.
+    const hints = this.hintsFor(config);
     try {
       // RFC-014: a hinted server's meta-tools exist before it connects.
-      if (this.hintsFor(config)) await this.ensureToolsetsModule();
+      if (hints) await this.ensureToolsetsModule();
       // Its policy exchange is in flight from its registration until the
       // exchange settles: an opener that runs meanwhile (a resume, startup's
       // staged open) passes the connection by, so nothing opens its planes
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
         connectionConfig,
-        this.mcplHostCapabilitiesFor(config),
+        this.mcplHostCapabilitiesFor(config, hints),
         abort.signal,
         (registering) => {
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
           // RFC-014 §6.1: hints apply as the connection reads them, from its
           // first message, so the tap is on before any I/O can deliver one.
-          if (this.hintsFor(config)) this.toolsets().controllerFor(config).attach(registering);
+          if (hints) this.toolsets().controllerFor(config).attach(registering);
         },
       );
     } catch (error) {

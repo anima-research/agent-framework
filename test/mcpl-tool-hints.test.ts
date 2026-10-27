@@ -593,6 +593,11 @@ test('at runtime, a name held by a host\'s module, by another server\'s prefix, 
     ['a module added at runtime', async (fw) => { await fw.framework.addModule(new HostToolsets() as never); }, { toolPrefix: 'arc' }],
     ['another server\'s prefix', async (fw, url) => { await fw.framework.connectMcplServer({ id: 'ts', toolPrefix: 'toolsets', toolHints: false, url }); }, { toolPrefix: 'arc' }],
     ['its own prefix', async () => {}, { toolPrefix: 'toolsets' }],
+    // A restart moving a server to the prefix holds the name as a claim, in
+    // the window between its disconnect and its connect.
+    ['a restart\'s claim', async (fw) => {
+      (fw.framework as unknown as { restartClaims(): { prefixes: Map<string, unknown> } }).restartClaims().prefixes.set('toolsets', { restarting: 'mover' });
+    }, { toolPrefix: 'arc' }],
   ];
   for (const [label, hold, config] of cases) {
     const holder = await arcServer();

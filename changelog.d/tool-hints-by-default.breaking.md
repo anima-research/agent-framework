@@ -23,5 +23,7 @@
     module or by a server's `toolPrefix`, MCPL servers that leave the setting
     out have no hints, and a line names them; `toolHints: true` reserves the
     name as before. At runtime, while the meta-tools are registered, a server
-    whose `toolPrefix` is `toolsets` is refused, as it was in 0.28.0 while any
-    server had `toolHints: true`.
+    whose `toolPrefix` is `toolsets` is refused, and so is a host's own
+    `addModule()` of a module named `toolsets`, as both were in 0.28.0 while
+    any server had `toolHints: true`; a host that adds such a module at runtime
+    sets `toolHints: false` on its MCPL servers.
