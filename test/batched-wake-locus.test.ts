@@ -161,6 +161,31 @@ describe('batched wake routing', () => {
     assert.deepEqual(publishes(), [ROOM]);
   });
 
+  it('two closed channels addressed in one batch: the turn speaks in the later one, and no [routing] notice names the earlier', async () => {
+    const registry = (framework as unknown as {
+      channelRegistry: { handleChannelToolCall(name: string, args: Record<string, unknown>, caller: { kind: 'agent'; agentName: string }): Promise<{ success: boolean }> };
+    }).channelRegistry;
+    for (const channelId of [ROOM, GENERAL]) {
+      assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, { kind: 'agent', agentName: 'scout' })).success, true);
+    }
+    const held = holdBatches();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering' }]));
+    incoming(ROOM, 'addressed', '@scout first');
+    await waitFor(() => held() >= 1, "the first message's batch held past its window");
+    incoming(GENERAL, 'addressed', '@scout second');
+    await waitFor(() => publishes().length >= 1, 'reply published');
+    assert.deepEqual(publishes(), [GENERAL]);
+    const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text));
+    const invitation = texts.find((t) => t.includes('[Channel invitation]') && t.includes('first')) ??
+      texts.find((t, i) => t.includes('[Channel invitation]') && texts[i - 1]?.includes('first'));
+    assert.ok(invitation?.includes('If it names this channel, write your reply with no prefix'), String(invitation));
+    assert.ok(invitation?.includes('Otherwise, or if you see none, to reply here'), String(invitation));
+    const routing = texts.filter((t) => t.startsWith('[routing]'));
+    assert.ok(routing.length >= 1 && routing.at(-1)!.includes('general'), JSON.stringify(routing));
+    assert.ok(!routing.some((t) => t.includes('room')), JSON.stringify(routing));
+  });
+
   it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
     const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));

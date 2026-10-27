@@ -1331,7 +1331,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
       assert.equal(h.publishes().length, before, 'neither draft goes out without confirmation');
       assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}, and ${fresh.id} includes the words of ${risky!.id}`) &&
-        t.includes(`Nothing was sent; sending that draft again could post it twice. To send it anyway, use drafts(action: "resend", draftIds: ["${fresh.id}"], destination: "#channel", confirmDuplicate: true).`)));
+        t.includes(`Nothing was sent; sending that draft again could post it twice. To send it anyway, use drafts(action: "resend", draftIds: ["${fresh.id}"], destination: "#<channel>", confirmDuplicate: true).`)));
       await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [fresh.id], destination: ROOM, confirmDuplicate: true })], 'tool_use'), createMockResponse([])]);
       assert.deepEqual(h.publishes().slice(before).map((p) => p.text), ['risky words and a postscript']);
       assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed', 'the original still needs its own confirmation');
@@ -3230,7 +3230,7 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       }
     });
 
-    it(`${mode}: the resend example says "#channel" where no name a resend could take reaches the place`, async () => {
+    it(`${mode}: the resend example says "#<channel>", which reaches no channel, where no name a resend could take reaches the place`, async () => {
       const INBOUND = 'discord:g1:announcements';
       const h = await harness({
         agents: [{ name: 'scout', proseRouting: mode }], sendTool: true,
@@ -3244,7 +3244,7 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
         assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
         assert.match(notices(h)[0]!, /your send_message in this round delivered to #announcements/);
-        assert.match(notices(h)[0]!, /destination: "#channel"\) delivers it unchanged/);
+        assert.match(notices(h)[0]!, /destination: "#<channel>"\) delivers it unchanged/);
       } finally {
         await h.close();
       }
@@ -4237,4 +4237,54 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
   });
+});
+
+describe('a closed channel\'s invitation offers the reply its agent\'s mode reads', () => {
+  const opens = 'it will be delivered there, which opens the channel. To reply without opening it, decline it first (option 3): ' +
+    'a channel you\'ve declined stays closed when you speak there.';
+  const sendTool = 'check whether discord exposes a send tool that can address it';
+  const offered = {
+    explicit: { line: `1. Reply — write your reply this turn prefixed with ">>#side"; ${opens}\n`, reply: '>>#side hello there' },
+    hybrid: { line: `1. Reply — write your reply this turn prefixed with ">>>#side"; ${opens}\n`, reply: '>>>#side hello there' },
+    locus: {
+      line: `1. Reply — your plain text goes to the channel the latest [routing] notice names. If it names this channel, ` +
+        `write your reply with no prefix; ${opens} Otherwise, or if you see none, to reply here, ${sendTool}.\n`,
+      reply: 'hello there',
+    },
+    disabled: { line: `1. Replying in plain text isn't available: your plain text is never published. To speak there, ${sendTool}.\n`, reply: 'hello there' },
+  } as const;
+  for (const mode of ['explicit', 'hybrid', 'locus', 'disabled'] as const) {
+    it(`${mode}: the reply it offers ${mode === 'disabled' ? 'is none, and plain text posts nothing' : 'lands in the channel, as written after its prefix'}`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        (h.framework as unknown as { channelRegistry: { ensureChannelRegistered(s: string, id: string, label: string): void } })
+          .channelRegistry.ensureChannelRegistered('discord', 'discord:g1:side', '#side (Guild One)');
+        h.membrane.pushResponse(createMockResponse([text(offered[mode].reply)]));
+        h.command({ op: 'incoming', channelId: 'discord:g1:side', messageId: 'in-side', mode: 'addressed', text: 'over here' });
+        await h.until(() => h.membrane.calls.length >= 1, 'the turn');
+        await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
+        const invitation = h.texts().find((t) => t.includes('[Channel invitation]'))!;
+        assert.ok(invitation.includes(offered[mode].line), invitation);
+        const published = h.publishes().filter((p) => p.event === 'publish').map((p) => [p.channelId, p.text]);
+        assert.deepEqual(published, mode === 'disabled' ? [] : [['discord:g1:side', 'hello there']]);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+  for (const [first, second] of [['explicit', 'locus'], ['locus', 'explicit']] as const) {
+    it(`reads the mode of the agent whose window it goes into, the first agent's: ${first} beside ${second}`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: first }, { name: 'quill', proseRouting: second }] });
+      try {
+        (h.framework as unknown as { channelRegistry: { ensureChannelRegistered(s: string, id: string, label: string): void } })
+          .channelRegistry.ensureChannelRegistered('discord', 'discord:g1:side', '#side (Guild One)');
+        h.command({ op: 'incoming', channelId: 'discord:g1:side', messageId: 'in-side', mode: 'addressed', text: 'over here' });
+        await h.until(() => h.texts().some((t) => t.includes('[Channel invitation]')), 'the invitation');
+        const invitation = h.texts().find((t) => t.includes('[Channel invitation]'))!;
+        assert.ok(invitation.includes(offered[first].line), invitation);
+      } finally {
+        await h.close();
+      }
+    });
+  }
 });

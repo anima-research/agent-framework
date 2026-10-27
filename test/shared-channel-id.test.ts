@@ -19,7 +19,7 @@ import { AgentFramework } from '../src/index.js';
 import type { ChannelRef, InferenceRequest, ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { isProseTargetToken } from '../src/mcpl/prose-grammar.js';
-import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
+import { CHANNEL_ON_SERVER_ROUTE, ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
 import { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
@@ -658,12 +658,14 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
   const ownOdd: ChannelRef[] = [{ serverId: 'a', channelId: 'b:room' }, { serverId: 'c', channelId: 'b:room' }];
   const oddRefusal = await odd.registry.handleChannelToolCall('channel_publish', { channelId: 'b:room', content: 'x' }, inTurn(ownOdd));
   assert.equal(oddRefusal.error, '"b:room" is the id of this turn\'s channels on more than one server ("b:room" on server "a" (no channelId '
-    + 'reaches it alone), "c:b:room"), so nothing was posted. Call again with channelId "c:b:room".');
+    + 'reaches it alone), "c:b:room"), so nothing was posted. Call again with channelId "c:b:room". For a channel shown by its id and '
+    + 'server, call again with that channelId and that serverId.');
   // None reachable by a name: no "Call again".
   await odd.registry.handleChanged('c', { removed: ['b:room'] });
   const none = await odd.registry.handleChannelToolCall('channel_publish', { channelId: 'b:room', content: 'x' }, inTurn(ownOdd));
   assert.equal(none.error, '"b:room" is the id of this turn\'s channels on more than one server ("b:room" on server "a" (no channelId '
-    + 'reaches it alone), "b:room" on server "c" (its server no longer registers it)), so nothing was posted.');
+    + 'reaches it alone), "b:room" on server "c" (its server no longer registers it)), so nothing was posted. For a channel shown by '
+    + 'its id and server, call again with that channelId and that serverId.');
   // Two named among three: "one of X, Y".
   const three = fixture([['a', 'general'], ['b', 'general'], ['d', 'general']]);
   await three.registry.handleChanged('d', { removed: ['general'] });
@@ -944,7 +946,7 @@ test("a publish's failed or unconfirmed answer names its channel apart, as it's 
 });
 
 test("a closed-channel invitation offers no >> reply a line reads as private speech, with the real registry or without its proseTargetFor", async (t) => {
-  const f = await frameworkWith(t, ['a', 'b']);
+  const f = await frameworkWith(t, ['a', 'b'], 'explicit');
   // A stand-in registry that can't name targets: the framework guesses one.
   (f.i.channelRegistry as unknown as { proseTargetFor?: unknown }).proseTargetFor = undefined;
   const invite = (f.framework as unknown as { buildClosedChannelInvitation(o: unknown): unknown }).buildClosedChannelInvitation({
@@ -1254,7 +1256,34 @@ for (const order of orders) {
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce')
       .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text))[0] ?? '';
     assert.ok(bounce.includes('DM: antra (work)'), bounce);
-    assert.ok(bounce.includes('">>#channel {{unsent}}"'), 'no candidate is one token, so the example is generic');
+    assert.ok(bounce.includes('">>#<channel> {{unsent}}"'), 'no candidate is one token, so the example is generic');
+    assert.ok(bounce.includes('">>@<person> {{unsent}}"'), 'and the DM example a placeholder too');
+    assert.ok(!bounce.includes(CHANNEL_ON_SERVER_ROUTE), 'no candidate is shown by its id and server');
+  });
+
+  test(`a bounce that shows a candidate by its id and server says which tool reaches it (${registered})`, async (t) => {
+    const f = await frameworkWith(t, order, 'explicit');
+    // Two servers' channels labelled alike, whose ids don't show as themselves.
+    const map = (f.i.channelRegistry as unknown as { channels: Map<string, unknown> }).channels;
+    for (const serverId of ['a', 'b'] as const) {
+      map.set(destinationKey({ serverId, channelId: `gen"${serverId}` }), {
+        serverId, descriptor: { id: `gen"${serverId}`, type: 'chat', label: '#lounge' }, open: true,
+      });
+    }
+    f.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#lounge hello' }]));
+    let starts = 0;
+    f.framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started' && ++starts >= 2) {
+        f.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }]));
+      }
+    });
+    f.framework.pushEvent(incomingOn('b', 'hello from b'));
+    await f.framework.runUntilIdle();
+    const bounce = f.framework.getAgent('scout')!.getContextManager().queryMessages({}).messages
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce')
+      .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text))[0] ?? '';
+    assert.ok(bounce.includes('"gen\\"a" on server "a"'), bounce);
+    assert.ok(bounce.includes(CHANNEL_ON_SERVER_ROUTE), bounce);
   });
 
   test(`a >> delivery that fails names the channel it was for apart, in its bounce (${registered})`, async (t) => {

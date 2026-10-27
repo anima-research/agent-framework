@@ -28,6 +28,7 @@
  * missed.
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { checkToolInput, shownValue } from '../gate/event-gate.js';
@@ -81,7 +82,7 @@ export const DEFAULT_HEARTBEAT: Readonly<HeartbeatSettings> = {
   intervalSeconds: 4 * 60 * 60,
   paused: false,
   deliveryMode: 'message',
-  message: '[heartbeat] Periodic self-check-in. Review anything pending — reminders, schedules, follow-ups — and act if needed; otherwise a brief note to yourself is fine.',
+  message: `[${NOTICE_TAG.heartbeat}] Periodic self-check-in. Review anything pending — reminders, schedules, follow-ups — and act if needed; otherwise a brief note to yourself is fine.`,
 };
 
 /** A scheduled reminder. `everySeconds` null: one-off, dropped once it fires. */
@@ -227,7 +228,7 @@ function callAt(dueAt: number, now: () => number, onDue: () => void): () => void
 export function reminderText(rem: Reminder, now: number, timeZone: string): string {
   let schedule = rem.everySeconds !== null ? `, repeats every ${rem.everySeconds}s` : `, set ${formatHeartbeatTime(rem.createdAt, timeZone)}`;
   if (now - rem.fireAt >= LATE_MS) schedule += `, due ${formatHeartbeatTime(rem.fireAt, timeZone)}`;
-  return `[reminder ${rem.id}${schedule} · current time: ${formatHeartbeatTime(now, timeZone)}] ${rem.message}`;
+  return `[${NOTICE_TAG.reminder} ${rem.id}${schedule} · current time: ${formatHeartbeatTime(now, timeZone)}] ${rem.message}`;
 }
 
 /** A length of time as the agent is shown it. */
@@ -549,7 +550,7 @@ export class Heartbeat {
         kind: 'heartbeat',
         reason,
         silent,
-        text: `[current time: ${formatHeartbeatTime(now, this.timeZone)}] ${s.message}`,
+        text: `[${NOTICE_TAG.currentTime}: ${formatHeartbeatTime(now, this.timeZone)}] ${s.message}`,
         eventId: `heartbeat_${now}_${Math.random().toString(36).slice(2, 8)}`,
       });
       log(`fired heartbeat (${reason}${silent ? ', silent' : ''})`);
