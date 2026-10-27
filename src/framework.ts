@@ -1294,6 +1294,13 @@ interface TurnRouting {
   /** The turn asked for a ` !` continuation; taken once. */
   continuation: boolean;
   start?: { branch: string; sequence: number };
+  roundsRan?: true;
+  callsCutOff?: true;
+  unpostedSpeech?: true;
+  privateEnd?: true;
+  silent?: true;
+  liveSpeech?: true;
+  speechRouting?: number;
   /**
    * Explicit mode: the turn's latest envelope was `>>skip_reply`, so it
    * ended on a deliberate skip and autoContinue leaves it paused. (Hybrid
@@ -1560,6 +1567,9 @@ interface ScriptRound {
 function ephemeralRunStopped(name: string, observed?: string): Error {
   return new Error(`Ephemeral agent "${name}" refused: the framework is stopping${observed ? ` (${observed})` : ''}`);
 }
+
+const SPEECH_STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
+const LIVE_SPEECH_UNRECEIPTED = 'Plain speech its rounds routed live was handed on for delivery as written, and no [delivered] line was written for it.';
 
 /** The reason on the inference:aborted that ends a turn whose retry stop()
  *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
@@ -3164,6 +3174,8 @@ export class AgentFramework {
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
+  private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
+  private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
   /** Quiesce/maintenance mode (issue #122). DELIBERATELY separate from
@@ -6762,16 +6774,19 @@ export class AgentFramework {
     });
     // Agent-facing marker in the same system envelope as the failure marker
     // so surfaces render it the same way. The text names the act and not an
-    // actor (the wire reason names the call, not who made it) and says
-    // nothing about delivery: earlier rounds of this turn may have been
-    // live-routed already, so "your output was not delivered" would be a
-    // false claim. addMessage alone requests no inference: no loop.
+    // actor (the wire reason names the call, not who made it). Of delivery
+    // it says only that speech earlier rounds routed live was handed on:
+    // "your output was not delivered" would be a false claim, and with no
+    // receipt for it the agent could take those words as unsent.
+    // addMessage alone requests no inference: no loop.
+    const handedOn = before === 'sending' ? ''
+      : `${stream?.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
     try {
       agent.getContextManager().addMessage(
         'user',
         [{
           type: 'text',
-          text: before === 'sending'
+          text: (before === 'sending'
             ? `[turn-interrupted] Your previous turn was stopped before it sent anything — ` +
               `a deliberate stop, not a failure.`
             : before === 'finishing'
@@ -6779,7 +6794,7 @@ export class AgentFramework {
                 `a deliberate stop, not a failure.`
               : `[turn-interrupted] Your previous turn was cancelled mid-stream — ` +
                 `a deliberate stop, not a failure. Whatever you were still ` +
-                `producing when it stopped was cut off there.`,
+                `producing when it stopped was cut off there.`) + handedOn,
         }],
         { system: true, kind: 'turn-interrupted', reason },
       );
@@ -9968,6 +9983,8 @@ export class AgentFramework {
    */
   private endDroppedTurn(agentName: string, routing: TurnRouting): void {
     if (this.openLogical.get(agentName) === routing) this.openLogical.delete(agentName);
+    const dropping = this.agents?.get(agentName);
+    if (dropping) this.nameUnpostedSpeech(dropping, routing);
     // Its scripts take it as a settle's end of the turn: the start sent
     // nothing, so none of its own calls is waiting on a script.
     this.settledTurns.add(routing);
@@ -10001,6 +10018,8 @@ export class AgentFramework {
     // object from closing a newer turn; keep it when editing call sites.
     const open = this.openLogical.get(agentName);
     if (closes && open === closes) this.openLogical.delete(agentName);
+    const settling = this.agents?.get(agentName);
+    if (closes && settling) this.nameUnpostedSpeech(settling, closes);
     // The settling stream's turn ends here, however it ended, whether or not
     // the stream still owns the agent: a non-primary agent's scripts whose
     // turn isn't live end with it, and a turn that failed stops a script its
@@ -13672,6 +13691,15 @@ export class AgentFramework {
             this.pendingAssistantBlocks.delete(agent.name);
           }
           const replySent = pendingBlocks ? this.pendingRoundSent.get(pendingBlocks) : undefined;
+          const flushedTurn = pendingBlocks ? this.roundTurns?.get(pendingBlocks) : undefined;
+          if (flushedTurn) {
+            flushedTurn.roundsRan = true;
+            delete flushedTurn.callsCutOff;
+          }
+          if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent
+            && pendingBlocks!.some((b) => b.type === 'text' && (b as { text?: string }).text?.trim())) {
+            flushedTurn.unpostedSpeech = true;
+          }
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id), tc.name)
           );
@@ -17929,6 +17957,33 @@ export class AgentFramework {
     }
   }
 
+  private nameUnpostedSpeech(agent: Agent, routing: TurnRouting): void {
+    if (!routing.unpostedSpeech) return;
+    try {
+      agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text: `[speech-not-posted] Nothing you wrote before your tool calls in the rounds just above was posted. ` +
+            `If any of it should go out, send it again.`,
+        }],
+        { system: true, kind: 'speech-not-posted' },
+      );
+      delete routing.unpostedSpeech;
+    } catch (err) {
+      console.error(`[speech-not-posted] could not record the notice for ${agent.name}:`, err);
+    }
+  }
+
+  private noteFailedTurnEnd(agent: Agent, routing: TurnRouting): void {
+    if (routing.roundsRan || routing.callsCutOff) {
+      this.exhaustedTurns?.set(agent.name, {
+        roundsRan: routing.roundsRan === true, callsCutOff: routing.callsCutOff === true, liveSpeech: routing.liveSpeech === true,
+        speechRouting: (routing.speechRouting ?? 0) > 0,
+      });
+    }
+  }
+
   /**
    * The closed-channel note alone, in a send's words, at explicit mode's turn
    * end, which has no `[delivered]` receipt since the agent named every
@@ -19344,6 +19399,7 @@ export class AgentFramework {
         console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
         return;
       }
+      routing.liveSpeech = true;
       try {
         const outcome = await this.deliverWithUnsent(agent, body, pinned, unsent.draft);
         this.recordProseDelivery(routing, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
@@ -19383,6 +19439,7 @@ export class AgentFramework {
       return;
     }
     const target = sticky ?? locus;
+    routing.liveSpeech = true;
     try {
       const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
       this.recordProseDelivery(routing, outcome);
@@ -20107,11 +20164,14 @@ export class AgentFramework {
    * admission, the hold installs nothing (holdForProviderWait,
    * holdProviderAcceleration), so no retry follows the turn's
    * inference:failed, and the turn ends as a retry a stop cancelled ends, with
-   * an inference:aborted saying so. Nothing is written. True when it ended
-   * the turn.
+   * an inference:aborted saying so. Nothing is written but the
+   * [speech-not-posted] notice, for speech the turn's rounds left unposted.
+   * True when it ended the turn.
    */
-  private endFailureAtStop(agentName: string, turnToken: number, startedAt: number): boolean {
+  private endFailureAtStop(agentName: string, turnToken: number, startedAt: number, routing: TurnRouting): boolean {
     if (!this.providerAdmissionClosed) return false;
+    const ending = this.agents?.get(agentName);
+    if (ending) this.nameUnpostedSpeech(ending, routing);
     this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt);
     return true;
   }
@@ -20124,9 +20184,9 @@ export class AgentFramework {
    * find the held retry (abortInference's drop), not a window nothing will
    * collect.
    */
-  private endHeldStart(agent: Agent, checkWindow: CheckWindow, turnToken: number, startedAt: number): void {
+  private endHeldStart(agent: Agent, checkWindow: CheckWindow, turnToken: number, startedAt: number, routing: TurnRouting): void {
     if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-    this.endFailureAtStop(agent.name, turnToken, startedAt);
+    this.endFailureAtStop(agent.name, turnToken, startedAt, routing);
     this.eventGate?.onInferenceEnded(agent.name);
   }
 
@@ -20539,7 +20599,11 @@ export class AgentFramework {
       // open turn since: it opens again, so its later starts continue it.
       if (!trigger?.suppressProse && !this.openLogical.has(agent.name)) this.openLogical.set(agent.name, routing);
     } else if (trigger?.suppressProse) {
+      const continued = continuesTurn(trigger) ? this.turnRouting.get(agent.name) : undefined;
       routing = freshTurnRouting();
+      routing.silent = true;
+      if (continued?.roundsRan) routing.roundsRan = true;
+      if (continued?.callsCutOff) routing.callsCutOff = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -20768,6 +20832,7 @@ export class AgentFramework {
         this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn);
         return false;
       }
+      this.nameUnpostedSpeech(agent, routing);
 
       // The subconscious's standing dispositions ride a fixed system-position
       // injection (antra, #tuneout-talk): never repeated in its timeline, and
@@ -20879,7 +20944,7 @@ export class AgentFramework {
             `(recorded while the turn compiled); ${this.providerAdmissionClosed ? 'the framework is stopping, so nothing is held'
               : this.providerAccelerationCooldowns.get(agent.name)?.heldRequests.some(isTurnRetry) ? 'turn held'
                 : 'the wait was released as the failure was reported, so the retry is queued'}, nothing sent`);
-          this.endFailureAtStop(agent.name, turnToken, turnStartedAt);
+          this.endFailureAtStop(agent.name, turnToken, turnStartedAt, routing);
           this.activeStreams.delete(agent.name);
           this.pendingAssistantBlocks.delete(agent.name);
           this.channelRegistry?.stopTyping();
@@ -20973,14 +21038,14 @@ export class AgentFramework {
         // one later fresh compile; no immediate retry or exhaustion marker.
         // (Once stop() has closed admission, nothing is held, and the turn
         // ends here: endFailureAtStop.)
-        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt);
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing);
         return false;
       }
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
         // A conversation agent held by the provider's stated wait, as a
         // resident is: the hold's release owns the later compile.
-        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt);
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing);
         return false;
       }
 
@@ -20995,8 +21060,10 @@ export class AgentFramework {
           // lifecycle's turn in the next one, and a stop kept for the turn
           // goes with it. The turn ends as one dropped before it sends
           // anything does: a terminal event saying why, after the
-          // inference:failed above, and its record's end. Nothing is written;
-          // this frame still owns its token, since no retry frame replaced it.
+          // inference:failed above, and its record's end. Nothing is written
+          // but the [speech-not-posted] notice; this frame still owns its
+          // token, since no retry frame replaced it.
+          this.nameUnpostedSpeech(agent, routing);
           this.abortDroppedTurn(agent.name, turnToken,
             this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_ACROSS_RESTART, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
@@ -21025,6 +21092,7 @@ export class AgentFramework {
         if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
         await this.startAgentStream(agent, trigger && asTurnRetry(trigger), attempt + 1);
       } else {
+        this.noteFailedTurnEnd(agent, routing);
         // Terminal failure with no driveStream: this frame owns teardown.
         // Token-matched (like the finally in driveStream) so a stale frame
         // can never clear a successor turn's marker. A leaked token would
@@ -21340,7 +21408,18 @@ export class AgentFramework {
         agent.notePublished(destinationKey(to), readThrough);
         streamSpeech(to, text, messageId);
       };
+    const routingSpeech = (link: () => Promise<void>): (() => Promise<void>) => {
+      streamRouting.speechRouting = (streamRouting.speechRouting ?? 0) + 1;
+      return async () => {
+        try {
+          await link();
+        } finally {
+          streamRouting.speechRouting = (streamRouting.speechRouting ?? 1) - 1;
+        }
+      };
+    };
     const enqueueSpeech = (text: string, locus: ChannelRef | null, onPublished: SpeechPublished): void => {
+      streamRouting.liveSpeech = true;
       chainSpeech(async () => {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
         this.recordProseDelivery(streamRouting, outcome);
@@ -21498,10 +21577,12 @@ export class AgentFramework {
         // deliberately NO inference:exhausted: that trace centrally
         // drives the consecutive-failure streak, hard-down ops
         // alerts, and the poison-history breaker, none of which a
-        // stop represents. No chronicle marker of any kind either:
-        // nobody stopped the agent, and a resident must not read
-        // after restart that someone did. inference:aborted and the
-        // inference-log row carry the observability instead.
+        // stop represents. No chronicle marker either: nobody stopped
+        // the agent, and a resident must not read after restart that
+        // someone did. Only the [speech-not-posted] notice, which names
+        // no actor, is written, when its rounds left speech unposted.
+        // inference:aborted and the inference-log row carry the
+        // observability instead.
         this.settleFrameworkCancel({
           agent, myStreamId, startTime, compiledRequest,
           kind: cancelKind,
@@ -21648,6 +21729,7 @@ export class AgentFramework {
             adoptInjectedRound();
             hadToolCalls = true;
             const toolRound = toolRounds++;
+            streamRouting.callsCutOff = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, calls.length);
             this.recordEphemeralToolCalls(agent.name, calls.length);
             this.emitTrace({
@@ -21710,6 +21792,7 @@ export class AgentFramework {
             this.pendingRoundSent.set(assistantBlocks, roundContent && roundContent.length > 0
               ? roundContent.filter((b) => b.type !== 'tool_result')
               : null);
+            this.roundTurns?.set(assistantBlocks, streamRouting);
 
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
@@ -21831,12 +21914,12 @@ export class AgentFramework {
                   // In order behind earlier rounds' envelopes: the router
                   // state they leave is where this round's starts.
                   chainSpeech(
-                    async () => { await this.routeSilencedHybrid(agent, roundRuns, roundSilence, draftsCause, roundOpts, roundLocus, toolRound); },
+                    routingSpeech(async () => { await this.routeSilencedHybrid(agent, roundRuns, roundSilence, draftsCause, roundOpts, roundLocus, toolRound); }),
                     'mid-turn hybrid prose hold failed:',
                   );
                 } else if (!hasSameRoundPrivateThink) {
                   for (const seg of roundSegments) {
-                    chainSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, roundOpts), 'mid-turn hybrid prose delivery failed:');
+                    chainSpeech(routingSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, roundOpts)), 'mid-turn hybrid prose delivery failed:');
                   }
                 }
               } else if (turnProseRouting === 'explicit') {
@@ -22312,6 +22395,7 @@ export class AgentFramework {
             // still see the terminal state at the terminal trace boundary.
             // Speech dispatch happens after but doesn't depend on the status
             // field.
+            delete streamRouting.unpostedSpeech;
             agent.reset();
             if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, {
@@ -22787,13 +22871,13 @@ export class AgentFramework {
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
-              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
             const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
             if (statedWait === 'held') {
-              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
@@ -22841,6 +22925,7 @@ export class AgentFramework {
                 // holds the token, whose bracket the event would end.
                 const owner = this.activeTurnTokens.get(agent.name);
                 if (owner === undefined || owner === myTurnToken) {
+                  if (this.agents.get(agent.name) === agent) this.nameUnpostedSpeech(agent, streamRouting);
                   this.emitTrace({
                     type: 'inference:aborted', agentName: agent.name,
                     durationMs: Date.now() - startTime, reason: RETRY_CANCELLED_BY_STOP,
@@ -22848,6 +22933,7 @@ export class AgentFramework {
                 }
               }
             } else {
+              this.noteFailedTurnEnd(agent, streamRouting);
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
@@ -22908,8 +22994,8 @@ export class AgentFramework {
             // above; a caller of Agent.cancelStream(reason) /
             // framework.abortInference(reason) hands its reason over here.
             // The marker text therefore names the act and not an actor, and
-            // says nothing about delivery: earlier rounds of this turn may
-            // have been live-routed already, so "your output was not
+            // of delivery says only that speech earlier rounds routed live
+            // was handed on (settleDeliberateCancel): "your output was not
             // delivered" would be a false claim.
             const deliberate = reason === 'user';
             // Only reset if this is still the active stream (a budget restart
@@ -22933,6 +23019,7 @@ export class AgentFramework {
                 const terminal = `Stream aborted: ${reason}`;
                 this.abandonAgentScripts(agent.name, `stream aborted (${reason})`, streamRouting);
                 agent.reset();
+                this.noteFailedTurnEnd(agent, streamRouting);
                 this.settleAgent(agent.name, {
                   stopReason: 'exhausted',
                   speech: '',
@@ -23204,7 +23291,7 @@ export class AgentFramework {
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
-        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
         logStream({ success: false,
           error: `Provider acceleration cooldown: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
@@ -23218,7 +23305,7 @@ export class AgentFramework {
       // says why it ends.
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
-        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
         logStream({ success: false,
           error: `Provider wait: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
@@ -23226,6 +23313,7 @@ export class AgentFramework {
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
+      this.noteFailedTurnEnd(agent, streamRouting);
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
@@ -25707,6 +25795,11 @@ export class AgentFramework {
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
           return;
         }
+        const skipping = this.callingTurnOf(agentName, enrichedCall);
+        if (skipping) {
+          skipping.privateEnd = true;
+          delete skipping.unpostedSpeech;
+        }
         const wake = readSkipReplyWake(enrichedCall.input);
         if (wake.kind === 'wake' && this.eventGate) {
           const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
@@ -27993,6 +28086,8 @@ export class AgentFramework {
     rawErrorType?: string,
     detail?: { httpStatus?: number; providerErrorCode?: string },
   ): void {
+    const ended = this.exhaustedTurns?.get(agentName);
+    this.exhaustedTurns?.delete(agentName);
     // The reason is the failure's own message, and a provider can echo the
     // whole rejected request in it: one household's [inference-failed]
     // marker carried ~1.7 MB of its own request back into its context. Every
@@ -28058,8 +28153,15 @@ export class AgentFramework {
           [{
             type: 'text',
             text:
-              `[inference-failed] Your previous turn did not complete: the model ` +
-              `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: ` +
+              (ended
+                ? `[inference-failed] Your previous turn did not complete: it ` +
+                  `failed${cause ? ` (${cause})` : ''}.` +
+                  `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
+                  `${ended.callsCutOff ? " Its last round's tool calls were started, but the stream ended before their results came back, so that round isn't in your context; those calls may have taken effect." : ''}` +
+                  `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
+                  `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''} Reason: `
+                : `[inference-failed] Your previous turn did not complete: the model ` +
+                  `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: `) +
               `${markerReason}. If this recurs with the same cause, change approach ` +
               `rather than retrying identically (e.g. drop an oversized attachment ` +
               `or an unsupported setting).`,
