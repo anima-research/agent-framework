@@ -113,6 +113,7 @@ import { SEND_TOOLS, bareToolName } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
+import { Refusal, errnoCode, errnoWayOn, systemWords } from './modules/workspace/answers.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   goesNative,
@@ -33094,7 +33095,8 @@ export class AgentFramework {
             // error says that whether the entry changed isn't known
             // (writeBinary); the images before it are saved, and the
             // failure says so, as a returned one does.
-            failed(error);
+            console.error(`[save_recent_image] writing "${destination}" failed:`, error);
+            failed(thrownWords(error));
             return;
           }
           const inChronicle = (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
@@ -33575,4 +33577,11 @@ export class AgentFramework {
       // orchestrator gives each server the channel context of its channels.
     };
   }
+}
+
+function thrownWords(error: unknown): string {
+  if (error instanceof Refusal) return error.message;
+  const code = errnoCode(error);
+  const on = errnoWayOn(code, "Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.");
+  return `${systemWords(code, error).replace(/\.$/, '')}. ${on}`;
 }

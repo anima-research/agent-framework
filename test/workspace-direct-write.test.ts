@@ -396,10 +396,12 @@ test("a deletion whose unlink fails after reaching the file says the file may be
   const position = () => (m as unknown as { directHeads: Map<string, Map<string, unknown>> }).directHeads.get('ref')?.has('scout') ?? false;
   try {
     failWith('EACCES');
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), 'The delete did nothing to "ref/f.txt": could not unlink the file: EACCES: failed.');
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }),
+      'The delete did nothing to "ref/f.txt": could not unlink the file: permission denied. Calling again won\'t change that; whoever runs this host can change the permissions.');
     assert.equal(position(), false, 'a deletion disk refused outright is no write of the agent\'s');
     failWith('EIO');
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), 'The delete of ref/f.txt failed after it reached the file, so the file may be gone: could not unlink the file: EIO: failed. ls shows whether it is.');
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }),
+      'The delete of "ref/f.txt" failed after it reached the file, so the file may be gone: could not unlink the file: an input/output error on the disk. ls shows whether it is.');
     assert.equal(position(), true, 'one that may have landed is taken as the agent\'s write');
   } finally {
     fsp.unlink = original;
@@ -1315,8 +1317,8 @@ test("a direct mount that doesn't follow links refuses a write, an edit or a del
   writeFileSync(outside, 'outside\n');
   symlinkSync(outside, join(env.ref, 'out.txt'));
   const strict = await env.open();
-  assert.equal(await failure(strict, 'write', { path: 'ref/link.txt', content: 'new\n' }), `The write did nothing to "ref/link.txt": a symlink, which this mount does not follow. Calling again won't change that; if you know the file it leads to, name that file by its own path.`);
-  const notFollowed = `"ref/link.txt" is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. Calling again won't change that; if you know the file it leads to, name that file by its own path.`;
+  assert.equal(await failure(strict, 'write', { path: 'ref/link.txt', content: 'new\n' }), `The write did nothing to "ref/link.txt": a symlink, which this mount does not follow. Calling again won't change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere.`);
+  const notFollowed = `"ref/link.txt" is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. Calling again won't change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere.`;
   assert.equal(await failure(strict, 'edit', { path: 'ref/link.txt', oldString: 'real', newString: 'new' }), `The edit did nothing: ${notFollowed}`);
   assert.equal(await failure(strict, 'delete', { path: 'ref/link.txt' }), `The delete did nothing: ${notFollowed}`);
 
@@ -1327,8 +1329,13 @@ test("a direct mount that doesn't follow links refuses a write, an edit or a del
   await data(following, 'write', { path: 'ref/link.txt', content: 'written\n' });
   assert.equal(readlinkSync(join(env.ref, 'link.txt')), 'real.txt');
   assert.equal(env.text('real.txt'), 'written\n');
-  assert.equal(await failure(following, 'write', { path: 'ref/out.txt', content: 'new\n' }), `The write did nothing to "ref/out.txt": a symlink that leaves the mount. Calling again won't change that; the workspace writes only inside its mounts.`);
+  assert.equal(await failure(following, 'write', { path: 'ref/out.txt', content: 'new\n' }), `The write did nothing to "ref/out.txt": a symlink that leaves the mount. Calling again won't change that; nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it.`);
   assert.equal(readFileSync(outside, 'utf8'), 'outside\n');
+  const outsideDir = join(env.root, 'outside-dir');
+  mkdirSync(outsideDir);
+  symlinkSync(outsideDir, join(env.ref, 'outdir'));
+  assert.equal(await failure(following, 'write', { path: 'ref/outdir/new.txt', content: 'new\n' }), `The write did nothing to "ref/outdir/new.txt": a parent directory resolves outside the mount. Calling again won't change that; nothing done through this mount reaches where it resolves, and whoever runs this host can mount that place.`);
+  assert.equal(existsSync(join(outsideDir, 'new.txt')), false);
   // Two paths to one file in one edit_many would rename over each other, so
   // they're refused, with nothing written.
   const aliased = await failure(following, 'edit_many', {
