@@ -451,7 +451,7 @@ test('lexical traversal and symlink escape fail without leaking absolute paths',
   const escape = await callReadImage(workspace, 'work/escape.png');
   assert.equal(escape.success, false);
   assert.equal(escape.isError, true);
-  assert.equal(escape.error, `The read_image did nothing: "work/escape.png" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; if a mount holds that file, name it by its path there.`);
+  assert.equal(escape.error, `The read_image did nothing: "work/escape.png" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; whoever runs this host can mount it, or a directory that holds it.`);
   assert.ok(!escape.error?.includes(root));
   assert.ok(!escape.error?.includes(outsideFile));
 });

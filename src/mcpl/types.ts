@@ -518,9 +518,10 @@ export interface McplServerConfig {
    * with `toolsets--open`, inspected with `toolsets--look` and closed with
    * `toolsets--close`. A server that doesn't advertise `toolHints` lists every
    * tool as before. `false` advertises nothing and treats every tool as
-   * static, byte for byte as before 0.28.1. Omitted and null are on wherever
-   * the name `toolsets` is free (no module holds it and no server's
-   * `toolPrefix` is it); `true` reserves that name.
+   * static, byte for byte as 0.28.0 did. Omitted and null are on wherever
+   * the name `toolsets` is free (no module holds it, no server's
+   * `toolPrefix` is it, no restart is moving a server to it); a name held at
+   * startup stays held for the framework's life. `true` reserves that name.
    */
   toolHints?: boolean;
 

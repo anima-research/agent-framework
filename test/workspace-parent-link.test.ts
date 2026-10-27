@@ -10,8 +10,10 @@
  * mount was refused before as well, and now gets the link's own answer. The
  * refusal names the link, and where it leads only where a tool could name
  * that: on a mount with an include, nothing of where a link the include
- * leaves out leads, and no target the include leaves out. Only for a link to
- * a directory inside the mount does it offer a way out. A mount that follows
+ * leaves out leads, and no target the include leaves out. Each kind of link
+ * gets its own way on: for a link to a directory inside the mount, the path
+ * to use in its place; for one leading out of the mount, nowhere, or to
+ * something that isn't a directory, what gets past it. A mount that follows
  * links keeps following an inside one, and a root that is itself a link is
  * still the root.
  */
@@ -35,14 +37,15 @@ const LINKED = /"work\/l" is a symlink(?: to "work\/elsewhere"| leading outside 
 
 /**
  * The refusal of a path through the link at "work/l", exactly: for a link to
- * `elsewhere/`, naming it and the setting the mount's host can change; for
- * one leading out of the mount, saying so. Paths are spelled as the tools
- * take them.
+ * `elsewhere/`, naming it as the path to use, and the setting whoever runs
+ * the host can change; for one leading out of the mount, saying so, and
+ * where what it leads to can be named. Paths are spelled as the tools take
+ * them.
  */
 function linkedReason(target: 'inside' | 'outside'): string {
   return target === 'inside'
-    ? '"work/l" is a symlink to "work/elsewhere", which this mount does not follow; the mount\'s host can set followSymlinks: true'
-    : '"work/l" is a symlink leading outside the mount, which this mount does not follow';
+    ? '"work/l" is a symlink to "work/elsewhere", which this mount does not follow; use "work/elsewhere" in place of "work/l", or whoever runs this host can set followSymlinks: true on mount "work"'
+    : '"work/l" is a symlink leading outside the mount, which this mount does not follow; followed or not, nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it';
 }
 
 /**
@@ -56,12 +59,11 @@ function linkedCode(target: 'inside' | 'outside'): 'parent_symlink' | 'escape' {
 }
 
 /**
- * A materialize's refusal before it pushes: the note, and the advice to fix
- * it and materialize again (with applyDeletions, for a deletion), with no
- * force.
+ * A materialize's refusal before it pushes, for a note that names its own way
+ * on: the note alone, with no force.
  */
-function unverified(path: string, note: string, again = 'materialize again'): string {
-  return `${path}: cannot verify disk copy (${note}) — fix it and ${again}`;
+function unverified(path: string, note: string): string {
+  return `${path}: cannot verify disk copy (${note})`;
 }
 
 class Env {
@@ -160,7 +162,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
         assert.deepEqual(data.deleted ?? [], [], `force ${force}: nothing was deleted`);
         const reason = skippedReason(data, 'l/x.txt');
         if (force) assert.match(reason, LINKED, 'forced');
-        else assert.equal(reason, unverified('l/x.txt', linkedReason(target), 'materialize again with applyDeletions'));
+        else assert.equal(reason, unverified('l/x.txt', linkedReason(target)));
         assert.equal(readFileSync(join(away, 'x.txt'), 'utf8'), 'behind the link\n', `force ${force}: the file behind the link stays`);
       }
     });
@@ -239,7 +241,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       writeFileSync(join(away, 'img.png'), 'not read');
       const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
       assert.equal(image.success, false);
-      assert.equal(image.error, `The read_image did nothing: work/l/img.png: ${linkedReason(target)}.`);
+      assert.equal(image.error, `The read_image did nothing: "work/l/img.png" can't be reached: ${linkedReason(target)}.`);
     });
 
     test(`read_image gives the link's refusal, not the workspace copy's failure, where that copy can't be read as an image (${target})`, async (t) => {
@@ -254,7 +256,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       writeFileSync(join(away, 'img.png'), 'not read');
       const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
       assert.equal(image.success, false);
-      assert.equal(image.error, `The read_image did nothing: work/l/img.png: ${linkedReason(target)}.`);
+      assert.equal(image.error, `The read_image did nothing: "work/l/img.png" can't be reached: ${linkedReason(target)}.`);
     });
 
     test(`a listing of the directory the link stands at says so instead of walking it (${target})`, async (t) => {
@@ -284,8 +286,8 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.equal(shown(read), `unobserved: ${linkedReason(target)}`, 'readPath');
       const readDir = await readPath(view, rootReal, 'l/sub', 1 << 20);
       assert.equal(shown(readDir), `unobserved: ${linkedReason(target)}`, 'readPath of a directory behind the link');
-      const absent = await confirmAbsent(view, rootReal, 'l/nothing.txt');
-      assert.equal(absent, linkedReason(target), 'confirmAbsent');
+      const absent = await confirmAbsent(view, rootReal, 'l/nothing.txt') as unknown as { reason?: string };
+      assert.equal(absent.reason, linkedReason(target), 'confirmAbsent');
     });
 
     test(`a ".." after a name that isn't there hides no link beyond it (${target})`, async (t) => {
@@ -323,7 +325,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     env.writeDisk('file.txt', 'v1\n');
     symlinkSync(join(env.dir, 'file.txt'), join(env.dir, 'l'));
     const m = await env.open(t);
-    const reason = '"work/l" is a symlink to "work/file.txt", which this mount does not follow';
+    const reason = '"work/l" is a symlink to "work/file.txt", which this mount does not follow; that isn\'t a directory, so nothing lies beneath it';
     const seen = await observePath(env.view(), realpathSync(env.dir), 'l/x.txt');
     assert.equal(shown(seen), `unobserved: ${reason}`);
     await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
@@ -339,12 +341,12 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     env.writeDisk('x.txt', 'v1\n');
     symlinkSync(env.dir, join(env.dir, 'r'));
     const reasons: Array<[string, string]> = [
-      ['work/r/x.txt', 'work/r/x.txt: "work/r" is a symlink to "work", which this mount does not follow; the mount\'s host can set followSymlinks: true'],
+      ['work/r/x.txt', 'work/r/x.txt: "work/r" is a symlink to "work", which this mount does not follow; use "work" in place of "work/r", or whoever runs this host can set followSymlinks: true on mount "work"'],
     ];
     if (process.platform !== 'win32') {
       execFileSync('mkfifo', [join(env.dir, 'pipe')]);
       symlinkSync(join(env.dir, 'pipe'), join(env.dir, 'f'));
-      reasons.push(['work/f/x.txt', 'work/f/x.txt: "work/f" is a symlink to "work/pipe", which this mount does not follow']);
+      reasons.push(['work/f/x.txt', 'work/f/x.txt: "work/f" is a symlink to "work/pipe", which this mount does not follow; that isn\'t a directory, so nothing lies beneath it']);
     }
     const m = await env.open(t);
     for (const [path, reason] of reasons) {
@@ -362,7 +364,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     env.writeDisk('x.txt', 'v1\n');
     symlinkSync(env.dir, join(env.dir, 'l'));
     const seen = await observePath(env.view(), realpathSync(env.dir), 'l/x.txt');
-    assert.equal(shown(seen), 'unobserved: "work/l" is a symlink to "work", which this mount does not follow; the mount\'s host can set followSymlinks: true');
+    assert.equal(shown(seen), 'unobserved: "work/l" is a symlink to "work", which this mount does not follow; use "work" in place of "work/l", or whoever runs this host can set followSymlinks: true on mount "work"');
   });
 
   test('a link into a nested mount\'s directory names the path to use in that mount, as other_mount, and not the setting, which would only reach into it', async (t) => {
@@ -394,7 +396,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     // leads into a nested mount before looking for the workspace's copy.
     const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
     assert.equal(image.success, false);
-    assert.equal(image.error, `The read_image did nothing: work/l/img.png: ${reason}.`);
+    assert.equal(image.error, `The read_image did nothing: "work/l/img.png" can't be reached: ${reason}.`);
   });
 
   test('a path that resolves to another spelling of itself, with no link on its way, is reached by each primitive', async (t) => {
@@ -427,7 +429,9 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       const m = await env.open(t);
       await call(m, 'write', { path: 'work/a/l/new.txt', content: 'new\n' });
       const failure = Object.assign(new Error(`${code}: readlink`), { code });
-      const unsure = `cannot tell whether "work/a" is a symlink (${code === 'EIO' ? 'an input/output error on the disk' : 'not permitted'})`;
+      const unsure = `cannot tell whether "work/a" is a symlink (${code === 'EIO'
+        ? 'an input/output error on the disk); calling again may get past it; if it fails the same way, whoever runs this host can check the disk'
+        : "not permitted); calling again won't change that; whoever runs this host can change the permissions, and calling again then gets past it"}`;
       await withFsPromises('readlink', (readlink) => async (path: string, ...rest: unknown[]) => {
         if (String(path).endsWith(`${sep}a`)) throw failure;
         return readlink(path, ...rest);
@@ -440,11 +444,11 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
           return true;
         });
         const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/a/l/img.png' } });
-        assert.equal(image.error, `The read_image did nothing: Unable to read file: work/a/l/img.png: ${unsure}.`, 'read_image passes the walk\'s words through');
+        assert.equal(image.error, `The read_image did nothing: "work/a/l/img.png" can't be reached: ${unsure}.`, 'read_image passes the walk\'s words through');
         const dir = await checkDir(env.view(), realpathSync(env.dir), 'a/l');
         assert.equal(shown(dir), `unobserved: ${unsure}`);
-        // A materialize gives the same reason, with the advice to fix it and
-        // try again, and no force, which the push would refuse too.
+        // A materialize gives the same reason, with its own way on, and no
+        // force, which the push would refuse too.
         const pushed = await call(m, 'materialize', { path: 'work/a/l/new.txt' });
         assert.equal(skippedReason(pushed, 'a/l/new.txt'), unverified('a/l/new.txt', unsure));
       });
@@ -462,12 +466,13 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     const view = env.view();
     const rootReal = realpathSync(env.dir);
     for (const name of ['gone', 'loop']) {
-      const reason = `"work/${name}" is a symlink, which this mount does not follow`;
+      const reason = `"work/${name}" is a symlink that leads nowhere, which this mount does not follow; whoever runs this host can remove it or make it lead to what it stood for`;
       // Each primitive, asked directly, names it.
       assert.equal(shown(await checkDir(view, rootReal, name)), `unobserved: ${reason}`, `${name}: checkDir`);
       assert.equal(shown(await observePath(view, rootReal, `${name}/x.txt`)), `unobserved: ${reason}`, `${name}: observePath`);
       assert.equal(shown(await readPath(view, rootReal, `${name}/x.txt`, 1 << 20)), `unobserved: ${reason}`, `${name}: readPath`);
-      assert.equal(await confirmAbsent(view, rootReal, `${name}/x.txt`), reason, `${name}: confirmAbsent`);
+      const absent = await confirmAbsent(view, rootReal, `${name}/x.txt`) as unknown as { reason?: string };
+      assert.equal(absent.reason, reason, `${name}: confirmAbsent`);
       const unforced = await call(m, 'materialize', { path: `work/${name}/new.txt` });
       assert.equal(skippedReason(unforced, `${name}/new.txt`), unverified(`${name}/new.txt`, reason), `${name}, unforced`);
       // Forced, the push makes the directories on the way: the link in the
@@ -477,7 +482,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       await assert.rejects(m.readFileFromDisk(`work/${name}/x.txt`), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
         assert.equal(err.code, 'parent_symlink');
-        assert.equal(err.message, `work/${name}/x.txt: "work/${name}" is a symlink, which this mount does not follow`);
+        assert.equal(err.message, `work/${name}/x.txt: ${reason}`);
         return true;
       });
     }
@@ -519,8 +524,10 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     await call(m, 'write', { path: 'work/f.txt', content: 'v2\n' });
     rmSync(join(env.dir, 'f.txt'));
     symlinkSync(join(env.dir, 'elsewhere', 'f.txt'), join(env.dir, 'f.txt'));
-    assert.equal(skippedReason(await call(m, 'materialize', { path: 'work/f.txt' }), 'f.txt'), unverified('f.txt', 'a symlink, which this mount does not follow'));
-    assert.match(skippedReason(await call(m, 'materialize', { path: 'work/f.txt', force: true }), 'f.txt'), /a symlink, which this mount does not follow/);
+    const link = 'disk has a symlink at this path, which this mount does not follow, and no push writes through one, forced or not — '
+      + 'write the file under another path, or whoever runs this host can remove the link, and materializing again then gets past it';
+    assert.equal(skippedReason(await call(m, 'materialize', { path: 'work/f.txt' }), 'f.txt'), `f.txt: ${link}`);
+    assert.equal(skippedReason(await call(m, 'materialize', { path: 'work/f.txt', force: true }), 'f.txt'), `f.txt: not written: ${link}`);
     assert.equal(readFileSync(join(env.dir, 'elsewhere', 'f.txt'), 'utf8'), 'behind the link\n');
   });
 
@@ -535,9 +542,11 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     symlinkSync(join(env.dir, 'elsewhere'), join(env.dir, 'in'));
     const m = await env.open(t);
     assert.deepEqual(await m.readBinaryFromDisk('work/file-link.txt'), { error: 'Symlinks are not allowed: work/file-link.txt' });
-    assert.deepEqual(await m.readBinaryFromDisk('work/out/secret.txt'), { error: 'work/out/secret.txt: "work/out" is a symlink leading outside the mount, which this mount does not follow' });
+    assert.deepEqual(await m.readBinaryFromDisk('work/out/secret.txt'), {
+      error: 'work/out/secret.txt: "work/out" is a symlink leading outside the mount, which this mount does not follow; followed or not, nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it',
+    });
     assert.deepEqual(await m.readBinaryFromDisk('work/in/x.txt'), {
-      error: 'work/in/x.txt: "work/in" is a symlink to "work/elsewhere", which this mount does not follow; the mount\'s host can set followSymlinks: true',
+      error: 'work/in/x.txt: "work/in" is a symlink to "work/elsewhere", which this mount does not follow; use "work/elsewhere" in place of "work/in", or whoever runs this host can set followSymlinks: true on mount "work"',
     });
   });
 
