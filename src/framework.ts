@@ -3681,8 +3681,8 @@ export class AgentFramework {
   private readonly releasesAfterResume = new Map<string, Agent>();
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
-  // context-manager 0.22.1: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2694),
+  // context-manager 0.23.0: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2849),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
   // (context-manager.ts:2321-2337). So such a released manager is collected
