@@ -6776,9 +6776,10 @@ export class AgentFramework {
     // Agent-facing marker in the same system envelope as the failure marker
     // so surfaces render it the same way. The text names the act and not an
     // actor (the wire reason names the call, not who made it). Of delivery
-    // it says only that speech earlier rounds routed live was handed on:
-    // "your output was not delivered" would be a false claim, and with no
-    // receipt for it the agent could take those words as unsent.
+    // it says only what the turn's routing holds: a confirmed live delivery,
+    // speech still being routed, a round whose calls were started. "Your
+    // output was not delivered" would be a false claim, and with no receipt
+    // for it the agent could take those words as unsent.
     // addMessage alone requests no inference: no loop.
     const handedOn = before === 'sending' ? ''
       : `${(stream?.unflushedRounds ?? 0) > 0 ? ` ${CALLS_CUT_OFF}` : ''}` +
@@ -20336,13 +20337,15 @@ export class AgentFramework {
     routing: TurnRouting,
     turnStartedAt: number,
     compiledRequest: NormalizedRequest | undefined,
-    /** This start opened its turn, so nothing of the turn was sent, and the
-     *  note says the turn was stopped before it sent anything; a start that
-     *  continues one (a restart or a retry) may follow rounds already sent,
-     *  so the note says it was stopped before it finished. */
+    /** This start opened its routing. When that routing holds no rounds run
+     *  (a silent retry's carries those of its turn's first stream), nothing
+     *  of the turn was sent, and the note says the turn was stopped before
+     *  it sent anything; otherwise the note says it was stopped before it
+     *  finished. */
     opensTurn: boolean,
   ): void {
-    console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached the turn's start before it ${opensTurn ? 'sent anything' : 'finished'}; it ends there`);
+    const sentNothing = opensTurn && !routing.roundsRan && !routing.unflushedRounds;
+    console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached the turn's start before it ${sentNothing ? 'sent anything' : 'finished'}; it ends there`);
     this.channelRegistry?.stopTyping();
     // A start that continues a turn (a budget or guard restart) follows a
     // frame that kept the turn's tool-result batch, and the guard's recovery,
@@ -20368,7 +20371,7 @@ export class AgentFramework {
         }),
     };
     if (stop.kind === 'caller') {
-      this.settleDeliberateCancel({ ...common, reason: stop.reason ?? 'user', before: opensTurn ? 'sending' : 'finishing' });
+      this.settleDeliberateCancel({ ...common, reason: stop.reason ?? 'user', before: sentNothing ? 'sending' : 'finishing' });
     } else {
       this.settleFrameworkCancel({ ...common, kind: stop.kind });
     }
@@ -23001,9 +23004,9 @@ export class AgentFramework {
             // above; a caller of Agent.cancelStream(reason) /
             // framework.abortInference(reason) hands its reason over here.
             // The marker text therefore names the act and not an actor, and
-            // of delivery says only that speech earlier rounds routed live
-            // was handed on (settleDeliberateCancel): "your output was not
-            // delivered" would be a false claim.
+            // of delivery says only what the turn's routing holds
+            // (settleDeliberateCancel): "your output was not delivered"
+            // would be a false claim.
             const deliberate = reason === 'user';
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)

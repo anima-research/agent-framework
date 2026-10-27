@@ -3382,8 +3382,9 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     const written: string[] = [];
     const addMessage = cm.addMessage.bind(cm);
     cm.addMessage = ((...args: Parameters<typeof addMessage>) => {
+      const id = addMessage(...args);
       for (const block of args[1] as ContentBlock[]) if (block.type === 'text') written.push((block as { text: string }).text);
-      return addMessage(...args);
+      return id;
     }) as typeof cm.addMessage;
     return written;
   };
@@ -3716,6 +3717,29 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
+    it("a user's Stop at a silent turn's retry start, after its first stream was cut off while its tool ran, says the turn was stopped before it finished and that round's calls were started", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, sendTool: true, retries: 1 });
+      try {
+        await h.sendMode('hang');
+        failWhileToolsRun(h.membrane);
+        let stopped = false;
+        onSnapshot(h, 2, () => { stopped = h.framework.abortInference('scout', 'operator stop'); });
+        h.membrane.pushResponse(createMockResponse([text(SPEECH), unplacedSend('s1')], 'tool_use'));
+        (h.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+          agentName: 'scout', reason: 'test', source: 'test', timestamp: Date.now(), suppressProse: true,
+        });
+        await h.until(() => stopped, "the stop reaches the retry's start");
+        await turnEnded(h);
+        assert.equal(h.membrane.calls.length, 1, 'premise: the retry never compiled');
+        const notes = h.texts().filter((t) => t.startsWith('[turn-interrupted]'));
+        assert.equal(notes.length, 1);
+        assert.ok(notes[0]!.includes('stopped before it finished'), notes[0]);
+        assert.ok(notes[0]!.includes(CUT_OFF), notes[0]);
+      } finally {
+        await h.close();
+      }
+    });
+
     it("a retry whose round reaches the context, after a first stream cut off while its tool ran, says the earlier rounds ran and the cut-off round's calls were started", async () => {
       const h = await harness({ xml: true, roundPreamble: true, sendTool: true, retries: 1 });
       try {
@@ -3876,7 +3900,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     it('explicit mode: a failure says nothing of handing on', async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }], retries: 0 });
       try {
-        breakAfterToolRound(h.membrane, 'error');
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
         await h.turn([createMockResponse([text(`>>#room ${SPEECH}`), call('l1', 'channel_list', {})], 'tool_use')]);
         await h.until(() => published(h, SPEECH).length === 1, 'premise: the envelope was delivered live');
         assert.equal(markers(h).length, 1, 'premise: the turn failed');
@@ -4026,6 +4050,23 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         await h.close();
       }
     });
+
+    for (const [mode, shown, said] of [['not-delivered', 'refused', 'could not be delivered'], ['no-receipt', 'unconfirmed', 'was not confirmed']] as const) {
+      it(`hybrid mode: a failure after a plain delivery to its locus that finished ${shown} adds neither sentence, beside the send-failed note`, async () => {
+        const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], retries: 0 });
+        try {
+          h.command({ op: 'publish-mode', mode });
+          breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
+          await h.turn([createMockResponse([text(SPEECH), call('l1', 'channel_list', {})], 'tool_use')]);
+          assert.ok(h.texts().some((t) => t.startsWith('[discord-send-failed]') && t.includes(said)), h.texts().join('\n'));
+          assert.equal(markers(h).length, 1, 'premise: the turn failed');
+          assert.ok(!markers(h)[0]!.includes(HANDED_ON), markers(h)[0]);
+          assert.ok(!markers(h)[0]!.includes(STILL_ROUTING), markers(h)[0]);
+        } finally {
+          await h.close();
+        }
+      });
+    }
 
     it('hybrid mode: a failure after a >>> envelope whose delivery was refused adds neither sentence', async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], retries: 0 });
