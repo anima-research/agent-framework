@@ -1999,13 +1999,15 @@ export interface HostModeStatus {
    * is false until it has. A parked continuation of a turn is counted here
    * and, as a turn alive, in `activeTurns` and `activeTurnAgents`. */
   parkedAdmissions: number;
-  /** Inference requests waiting to start, wherever they wait: queued (parked
-   * by the quiesce wake gate while quiesced, or, while serving, until the
-   * scheduler's next pass takes them), in a scheduler pass's hands, or held
-   * by a provider hold (an acceleration or host hold, or a provider's stated
-   * wait). There, a start that carries a turn on counts as the wakes merged
-   * into it. Continuations of a turn (budget restart, tool results) and a
-   * held turn's retry, which a quiesce lets through, are never counted. */
+  /** Inference requests waiting to start: queued (parked by the quiesce wake
+   * gate while quiesced, or, while serving, until the scheduler's next pass
+   * takes them), in a scheduler pass's hands, or held by a provider hold (an
+   * acceleration or host hold, or a provider's stated wait). There, a start
+   * that carries a turn on counts as the wakes merged into it. A start parked
+   * on provider admission behind an auxiliary call counts in
+   * `parkedAdmissions` instead, with any wakes merged into it. Continuations
+   * of a turn (budget restart, tool results) and a held turn's retry, which
+   * a quiesce lets through, are never counted. */
   gatedRequests: number;
   /** code_execution scripts still running that no call is waiting on: left
    * running after a yield, outside any turn. Quiesce does NOT stop them —

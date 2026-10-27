@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Membrane, MockAdapter, NativeFormatter, rateLimitError } from '@animalabs/membrane';
 import type { ProviderRequest, ProviderRequestOptions, StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, AutobiographicalStrategy } from '../src/index.js';
-import type { EventResponse, HostModeStatus, InferenceRequest, Module, ProcessEvent, ProviderHold, TraceEvent } from '../src/index.js';
+import type { EventResponse, HostModeStatus, Module, ProcessEvent, ProviderHold, TraceEvent } from '../src/index.js';
 
 const QUOTA = "This request would exceed your account's rate limit.";
 const ACCELERATION = "This request would exceed your organization's rate limit acceleration limit.";
@@ -153,14 +153,50 @@ test("a text whose wake an acceleration hold keeps beside a turn's retry counts 
 });
 
 test("a wake in a scheduler pass's hands, while the pass awaits another agent's start, counts in gatedRequests", async (t) => {
-  const h = await host(t, { compressionModel: 'test-compression-model' });
-  const pass = new Map<string, InferenceRequest[]>([['resident', [{ agentName: 'resident', reason: 'admin-nudge', source: 'admin', timestamp: Date.now() }]]]);
-  const passes = (h.framework as unknown as { passRequests: Set<Map<string, InferenceRequest[]>> }).passRequests;
-  passes.add(pass);
-  try {
-    assert.equal(h.status().gatedRequests, 1);
-    assert.equal(h.status().drained, true);
-  } finally {
-    passes.delete(pass);
+  let unblock!: () => void;
+  const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+  let alphaWaiting = false;
+  const hook = {
+    name: 'hook',
+    async start() {},
+    async stop() {},
+    getTools: () => [],
+    async handleToolCall() { return { success: false, error: 'no tools' }; },
+    async onProcess() { return {}; },
+    async gatherContext(agentName: string) {
+      if (agentName === 'alpha') { alphaWaiting = true; await blocked; }
+      return [];
+    },
+  } as unknown as Module;
+  const dir = mkdtempSync(join(tmpdir(), 'af-held-wakes-pass-'));
+  const membrane = new Membrane(new Provider({ completeDelayMs: 1, streamChunkDelayMs: 1 }), { formatter: new NativeFormatter(), retry: { maxRetries: 0, retryDelayMs: 10 } });
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane,
+    agents: [{ name: 'alpha', model: 'test-model', systemPrompt: 'alpha' }, { name: 'beta', model: 'test-model', systemPrompt: 'beta' }],
+    modules: [hook], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  const started: string[] = [];
+  framework.onTrace((event: TraceEvent) => { if (event.type === 'inference:started') started.push(event.agentName); });
+  framework.start();
+  t.after(async () => {
+    unblock();
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  framework.nudgeAgent('alpha');
+  framework.nudgeAgent('beta');
+  const end = Date.now() + 5_000;
+  while (!alphaWaiting) {
+    if (Date.now() > end) assert.fail("alpha's start never waited in its hook");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const status = framework.getHostModeStatus();
+  assert.equal(status.gatedRequests, 1, "beta's wake waits in the pass's hands");
+  assert.deepEqual(status.activeTurnAgents, ['alpha']);
+  unblock();
+  const after = Date.now() + 5_000;
+  while (!(started.includes('beta') && framework.getHostModeStatus().gatedRequests === 0)) {
+    if (Date.now() > after) assert.fail(`beta's turn never started: ${JSON.stringify(framework.getHostModeStatus())}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 });
