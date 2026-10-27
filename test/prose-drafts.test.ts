@@ -324,7 +324,11 @@ function breakAfterToolRound(
             await opts.beforeFailure?.();
             throw opts.failure?.() ?? new MembraneError({ type: 'server', retryable: false, message: 'the stream threw', rawError: { status: 500 } });
           }
-          if (how === 'abort' && !cancelled) { yield { type: 'aborted', reason: 'timeout', partialContent: [{ type: 'text', text: PARTIAL }] } as unknown as StreamEvent; return; }
+          if (how === 'abort' && !cancelled) {
+            await opts.beforeFailure?.();
+            yield { type: 'aborted', reason: 'timeout', partialContent: [{ type: 'text', text: PARTIAL }] } as unknown as StreamEvent;
+            return;
+          }
           while (!cancelled) await new Promise<void>((resolve) => { wake = resolve; });
           const ends = opts.stopEnds ?? 'aborted';
           if (ends === 'aborted') yield { type: 'aborted', reason: 'user', partialContent: [{ type: 'text', text: PARTIAL }] } as unknown as StreamEvent;
@@ -3371,7 +3375,8 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
   const markers = (h: H) => h.texts().filter((t) => t.startsWith('[inference-failed]'));
   const AFTER_ROUNDS = /Your previous turn did not complete: it failed( \([^)]*\))?\. Its earlier rounds ran, and their tool calls ran as their results show/;
   const EARLIER = 'Its earlier rounds ran, and their tool calls ran as their results show.';
-  const CUT_OFF = "Its last round's tool calls were started, but the stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
+  const CUT_OFF = "A round's tool calls were started, but its stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
+  const speechSettled = (h: H) => (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> }).proseSpeechChains.get('scout');
   const capture = (h: H) => {
     const cm = h.framework.getAgent('scout')!.getContextManager();
     const written: string[] = [];
@@ -3551,13 +3556,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       try {
         breakAfterToolRound(h.membrane, 'stop');
         await startTurn(h);
-        const cm = h.framework.getAgent('scout')!.getContextManager();
-        const written: string[] = [];
-        const addMessage = cm.addMessage.bind(cm);
-        cm.addMessage = ((...args: Parameters<typeof addMessage>) => {
-          for (const block of args[1] as ContentBlock[]) if (block.type === 'text') written.push((block as { text: string }).text);
-          return addMessage(...args);
-        }) as typeof cm.addMessage;
+        const written = capture(h);
         await h.framework.stop();
         assert.equal(published(h, SPEECH).length, 0);
         assert.equal(written.filter((t) => t.startsWith(NOTICE)).length, 1, written.join('\n'));
@@ -3567,7 +3566,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
-    it("a stop while the round's tool still runs names nothing, since that round never reached the context", async () => {
+    it("a stop while the round's tool still runs names nothing, since that round never reached the context, and its stop note says the round's calls were started", async () => {
       const h = await harness({ xml: true, roundPreamble: true, sendTool: true });
       try {
         await h.sendMode('hang');
@@ -3578,6 +3577,30 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         await turnEnded(h);
         assert.ok(!h.messages().some((m) => JSON.stringify(m.content).includes(SPEECH)), 'premise: the round is not in the context');
         assert.equal(notices(h).length, 0);
+        const notes = h.texts().filter((t) => t.startsWith('[turn-interrupted]'));
+        assert.equal(notes.length, 1);
+        assert.ok(notes[0]!.includes(CUT_OFF), notes[0]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("a user's Stop during the retry's wait, after a stream cut off while its tool ran, says that round's calls were started", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, sendTool: true, retries: 1, retryDelayMs: 60_000 });
+      try {
+        await h.sendMode('hang');
+        const failed = traced(h, 'inference:failed');
+        failWhileToolsRun(h.membrane);
+        h.membrane.pushResponse(createMockResponse([text(SPEECH), unplacedSend('s1')], 'tool_use'));
+        h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-wait', mode: 'addressed', text: 'a question' });
+        await h.until(failed, 'the failure');
+        await h.until(() => h.framework.abortInference('scout', 'operator stop'), 'the stop reaches the waiting retry');
+        await turnEnded(h);
+        assert.equal(h.membrane.calls.length, 1, 'premise: the retry never ran');
+        assert.equal(markers(h).length, 0, 'premise: the stop note stands in for the failure note');
+        const notes = h.texts().filter((t) => t.startsWith('[turn-interrupted]'));
+        assert.equal(notes.length, 1);
+        assert.ok(notes[0]!.includes(CUT_OFF), notes[0]);
       } finally {
         await h.close();
       }
@@ -3692,7 +3715,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
-    it("a retry whose round reaches the context, after a first stream cut off while its tool ran, says only that the earlier rounds ran", async () => {
+    it("a retry whose round reaches the context, after a first stream cut off while its tool ran, says the earlier rounds ran and the cut-off round's calls were started", async () => {
       const h = await harness({ xml: true, roundPreamble: true, sendTool: true, retries: 1 });
       try {
         await h.sendMode('hang');
@@ -3703,7 +3726,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         assert.equal(h.membrane.calls.length, 2, 'premise: the retry ran');
         assert.equal(markers(h).length, 1);
         assert.ok(markers(h)[0]!.includes(EARLIER), markers(h)[0]);
-        assert.ok(!markers(h)[0]!.includes(CUT_OFF), markers(h)[0]);
+        assert.ok(markers(h)[0]!.includes(CUT_OFF), markers(h)[0]);
       } finally {
         await h.close();
       }
@@ -3819,7 +3842,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       it(`a failure after a live-routed round, reported as ${shown}, says the rounds ran and the speech was handed on, and writes no receipt`, async () => {
         const h = await harness({ retries: 0 });
         try {
-          breakAfterToolRound(h.membrane, how);
+          breakAfterToolRound(h.membrane, how, { beforeFailure: () => speechSettled(h) });
           await h.turn([round()]);
           await h.until(() => published(h, SPEECH).length === 1, 'premise: the speech was routed live');
           assert.deepEqual(published(h, SPEECH).map((p) => p.channelId), [ROOM]);
@@ -3865,7 +3888,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       for (const [words, live] of [[SPEECH, true], [`>>>skip_reply ${SPEECH}`, false]] as const) {
         const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], retries: 0 });
         try {
-          breakAfterToolRound(h.membrane, 'error');
+          breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
           await h.turn([createMockResponse([text(words), call('l1', 'channel_list', {})], 'tool_use')]);
           if (live) await h.until(() => published(h, SPEECH).length === 1, 'premise: the speech went to its locus');
           else assert.equal(published(h, SPEECH).length, 0, 'premise: the speech was kept private');
@@ -3912,7 +3935,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     it("hybrid mode: a failure after a round whose >>> envelope was delivered says it was handed on", async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], retries: 0 });
       try {
-        breakAfterToolRound(h.membrane, 'error');
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
         await h.turn([createMockResponse([text(`>>>${ROOM} ${SPEECH}`), call('l1', 'channel_list', {})], 'tool_use')]);
         await h.until(() => published(h, SPEECH).length === 1, 'premise: the envelope was delivered');
         assert.equal(markers(h).length, 1, 'premise: the turn failed');
@@ -3930,6 +3953,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         await h.turn([createMockResponse([text(SPEECH), call('l1', 'channel_list', {})], 'tool_use')]);
         assert.equal(markers(h).length, 1, 'premise: the turn failed');
         assert.ok(markers(h)[0]!.includes(STILL_ROUTING), markers(h)[0]);
+        assert.ok(!markers(h)[0]!.includes(HANDED_ON), markers(h)[0]);
       } finally {
         await h.close();
       }
@@ -3953,14 +3977,46 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
-    it('locus mode: a failure while the delivery is still being routed says it was handed on, and nothing of it still being routed', async () => {
+    it('locus mode: a failure while the delivery is still being routed says it may yet be posted, and nothing of handing on', async () => {
       const h = await harness({ retries: 0 });
       try {
         h.command({ op: 'publish-mode', mode: 'hang' });
         breakAfterToolRound(h.membrane, 'error');
         await h.turn([round()]);
         assert.equal(markers(h).length, 1, 'premise: the turn failed');
-        assert.ok(markers(h)[0]!.includes(HANDED_ON), markers(h)[0]);
+        assert.ok(markers(h)[0]!.includes(STILL_ROUTING), markers(h)[0]);
+        assert.ok(!markers(h)[0]!.includes(HANDED_ON), markers(h)[0]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    for (const [mode, shown, said] of [['not-delivered', 'refused', 'could not be delivered'], ['no-receipt', 'unconfirmed', 'was not confirmed']] as const) {
+      it(`locus mode: a failure after a delivery that finished ${shown} adds neither sentence, beside the send-failed note`, async () => {
+        const h = await harness({ retries: 0 });
+        try {
+          h.command({ op: 'publish-mode', mode });
+          breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
+          await h.turn([round()]);
+          assert.ok(h.texts().some((t) => t.startsWith('[discord-send-failed]') && t.includes(said)), h.texts().join('\n'));
+          assert.equal(markers(h).length, 1, 'premise: the turn failed');
+          assert.ok(!markers(h)[0]!.includes(HANDED_ON), markers(h)[0]);
+          assert.ok(!markers(h)[0]!.includes(STILL_ROUTING), markers(h)[0]);
+        } finally {
+          await h.close();
+        }
+      });
+    }
+
+    it('hybrid mode: a failure after a >>> envelope whose delivery was refused adds neither sentence', async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], retries: 0 });
+      try {
+        h.command({ op: 'publish-mode', mode: 'not-delivered' });
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
+        await h.turn([createMockResponse([text(`>>>${ROOM} ${SPEECH}`), call('l1', 'channel_list', {})], 'tool_use')]);
+        assert.ok(h.publishes().some((p) => p.event === 'publish-refused'), 'premise: the delivery was refused');
+        assert.equal(markers(h).length, 1, 'premise: the turn failed');
+        assert.ok(!markers(h)[0]!.includes(HANDED_ON), markers(h)[0]);
         assert.ok(!markers(h)[0]!.includes(STILL_ROUTING), markers(h)[0]);
       } finally {
         await h.close();
@@ -4016,7 +4072,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     it("a retry that fails before any round of its own, after the turn's first stream routed one live, says the rounds ran and the speech was handed on", async () => {
       const h = await harness({ retries: 1 });
       try {
-        breakAfterToolRound(h.membrane, 'error');
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
         breakAfterToolRound(h.membrane, 'error', { fromStart: true, stream: 2 });
         await h.turn([round()]);
         assert.equal(h.membrane.calls.length, 2, 'premise: the retry ran');
@@ -4031,7 +4087,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     it("a retry whose request can't be built says the rounds ran and the speech was handed on", async () => {
       const h = await harness({ retries: 1 });
       try {
-        breakAfterToolRound(h.membrane, 'error');
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
         const compiles = failingCompile(h, 2);
         await h.turn([round()]);
         assert.equal(compiles(), 2, 'premise: the retry tried to start');
@@ -4065,6 +4121,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           breakAfterToolRound(h.membrane, 'stop', { stopEnds });
           await startTurn(h);
           await h.until(() => published(h, SPEECH).length === 1, "premise: the round's speech was routed live");
+          await speechSettled(h);
           const before = h.publishes().length;
           assert.equal(h.framework.abortInference('scout', 'operator stop'), true);
           await turnEnded(h);
@@ -4083,7 +4140,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       const h = await harness({ retries: 1, retryDelayMs: 60_000 });
       try {
         const failed = traced(h, 'inference:failed');
-        breakAfterToolRound(h.membrane, 'error');
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
         await startTurn(h);
         await h.until(failed, 'the failure');
         await h.until(() => h.framework.abortInference('scout', 'operator stop'), 'the stop reaches the waiting retry');

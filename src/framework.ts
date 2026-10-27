@@ -1295,7 +1295,7 @@ interface TurnRouting {
   continuation: boolean;
   start?: { branch: string; sequence: number };
   roundsRan?: true;
-  callsCutOff?: true;
+  unflushedRounds?: number;
   unpostedSpeech?: true;
   privateEnd?: true;
   silent?: true;
@@ -1568,6 +1568,7 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
   return new Error(`Ephemeral agent "${name}" refused: the framework is stopping${observed ? ` (${observed})` : ''}`);
 }
 
+const CALLS_CUT_OFF = "A round's tool calls were started, but its stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
 const SPEECH_STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
 const LIVE_SPEECH_UNRECEIPTED = 'Plain speech its rounds routed live was handed on for delivery as written, and no [delivered] line was written for it.';
 
@@ -6780,7 +6781,8 @@ export class AgentFramework {
     // receipt for it the agent could take those words as unsent.
     // addMessage alone requests no inference: no loop.
     const handedOn = before === 'sending' ? ''
-      : `${stream?.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
+      : `${(stream?.unflushedRounds ?? 0) > 0 ? ` ${CALLS_CUT_OFF}` : ''}` +
+        `${stream?.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
     try {
       agent.getContextManager().addMessage(
         'user',
@@ -13694,7 +13696,7 @@ export class AgentFramework {
           const flushedTurn = pendingBlocks ? this.roundTurns?.get(pendingBlocks) : undefined;
           if (flushedTurn) {
             flushedTurn.roundsRan = true;
-            delete flushedTurn.callsCutOff;
+            if (flushedTurn.unflushedRounds) flushedTurn.unflushedRounds--;
           }
           if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent
             && pendingBlocks!.some((b) => b.type === 'text' && (b as { text?: string }).text?.trim())) {
@@ -17976,9 +17978,10 @@ export class AgentFramework {
   }
 
   private noteFailedTurnEnd(agent: Agent, routing: TurnRouting): void {
-    if (routing.roundsRan || routing.callsCutOff) {
+    const callsCutOff = (routing.unflushedRounds ?? 0) > 0;
+    if (routing.roundsRan || callsCutOff) {
       this.exhaustedTurns?.set(agent.name, {
-        roundsRan: routing.roundsRan === true, callsCutOff: routing.callsCutOff === true, liveSpeech: routing.liveSpeech === true,
+        roundsRan: routing.roundsRan === true, callsCutOff, liveSpeech: routing.liveSpeech === true,
         speechRouting: (routing.speechRouting ?? 0) > 0,
       });
     }
@@ -19399,11 +19402,11 @@ export class AgentFramework {
         console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
         return;
       }
-      routing.liveSpeech = true;
       try {
         const outcome = await this.deliverWithUnsent(agent, body, pinned, unsent.draft);
         this.recordProseDelivery(routing, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
         if (outcome.status === 'delivered') {
+          routing.liveSpeech = true;
           this.proseBounceStreaks.delete(agent.name);
           round.onPublished?.(outcome.destination!, body, outcome.messageId);
         } else {
@@ -19439,11 +19442,13 @@ export class AgentFramework {
       return;
     }
     const target = sticky ?? locus;
-    routing.liveSpeech = true;
     try {
       const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
       this.recordProseDelivery(routing, outcome);
-      if (outcome?.delivered) round.onPublished?.(outcome, envelope, outcome.messageId);
+      if (outcome?.delivered) {
+        routing.liveSpeech = true;
+        round.onPublished?.(outcome, envelope, outcome.messageId);
+      }
     } catch (err) {
       console.error('hybrid locus delivery failed:', err);
     }
@@ -20603,7 +20608,7 @@ export class AgentFramework {
       routing = freshTurnRouting();
       routing.silent = true;
       if (continued?.roundsRan) routing.roundsRan = true;
-      if (continued?.callsCutOff) routing.callsCutOff = true;
+      if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -21419,12 +21424,14 @@ export class AgentFramework {
       };
     };
     const enqueueSpeech = (text: string, locus: ChannelRef | null, onPublished: SpeechPublished): void => {
-      streamRouting.liveSpeech = true;
-      chainSpeech(async () => {
+      chainSpeech(routingSpeech(async () => {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
         this.recordProseDelivery(streamRouting, outcome);
-        if (outcome?.delivered) onPublished(outcome, text, outcome.messageId);
-      }, 'mid-turn speech routing failed:');
+        if (outcome?.delivered) {
+          streamRouting.liveSpeech = true;
+          onPublished(outcome, text, outcome.messageId);
+        }
+      }), 'mid-turn speech routing failed:');
     };
 
     // Sticky explicit-send suppression: prose after send_message, aimed where
@@ -21729,7 +21736,7 @@ export class AgentFramework {
             adoptInjectedRound();
             hadToolCalls = true;
             const toolRound = toolRounds++;
-            streamRouting.callsCutOff = true;
+            streamRouting.unflushedRounds = (streamRouting.unflushedRounds ?? 0) + 1;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, calls.length);
             this.recordEphemeralToolCalls(agent.name, calls.length);
             this.emitTrace({
@@ -28157,7 +28164,7 @@ export class AgentFramework {
                 ? `[inference-failed] Your previous turn did not complete: it ` +
                   `failed${cause ? ` (${cause})` : ''}.` +
                   `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
-                  `${ended.callsCutOff ? " Its last round's tool calls were started, but the stream ended before their results came back, so that round isn't in your context; those calls may have taken effect." : ''}` +
+                  `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
                   `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
                   `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''} Reason: `
                 : `[inference-failed] Your previous turn did not complete: the model ` +
