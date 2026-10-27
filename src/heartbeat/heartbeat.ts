@@ -112,6 +112,17 @@ export interface HeartbeatOptions {
   importFrom?: { configPath?: string; remindersPath?: string };
 }
 
+/** One of the heartbeat's scheduled wakes: its next tick or a pending reminder. */
+export interface HeartbeatScheduledWake extends UpcomingWake {
+  kind: 'heartbeat' | 'reminder';
+  at: number;
+  /** Whether it's a silent tick, delivered as one (HeartbeatWake's `silent`). */
+  silent: boolean;
+  /** The text it brings, as of its due time: so the gate can be asked about
+   *  the event it will judge. */
+  text: string;
+}
+
 /** A wake the heartbeat asks the framework to deliver. */
 export type HeartbeatWake =
   | { kind: 'heartbeat'; reason: 'schedule' | 'manual'; silent: boolean; text: string; eventId: string }
@@ -223,6 +234,11 @@ function callAt(dueAt: number, now: () => number, onDue: () => void): () => void
   return () => clearTimeout(timer);
 }
 
+/** The text a tick brings: the time, then its message. */
+function tickText(now: number, message: string, timeZone: string): string {
+  return `[current time: ${formatHeartbeatTime(now, timeZone)}] ${message}`;
+}
+
 /** The text a reminder brings: a header naming it, then its message. */
 export function reminderText(rem: Reminder, now: number, timeZone: string): string {
   let schedule = rem.everySeconds !== null ? `, repeats every ${rem.everySeconds}s` : `, set ${formatHeartbeatTime(rem.createdAt, timeZone)}`;
@@ -318,24 +334,46 @@ export class Heartbeat {
 
   /** What the heartbeat will wake the agent with, soonest first, for the reply judge (UpcomingWake). */
   upcomingWakes(): UpcomingWake[] {
-    const wakes: UpcomingWake[] = [];
+    return this.scheduledWakes().map(({ at, certain, what }) => ({ at, certain, what }));
+  }
+
+  /**
+   * The heartbeat's next tick and its pending reminders, soonest first, each
+   * with its kind and the event it will bring, so the gate can be asked about
+   * it. `whose` words each for the reply judge ("its heartbeat", as
+   * upcomingWakes) or for the agent ("your heartbeat", as skip_reply's
+   * confirmation names one due before its self-wake).
+   */
+  scheduledWakes(whose: 'its' | 'your' = 'its'): HeartbeatScheduledWake[] {
+    const wakes: HeartbeatScheduledWake[] = [];
     const s = this.state;
     if (!s.settings.paused && s.nextFireAt !== null) {
+      const at = Math.max(s.nextFireAt, this.notBefore);
+      const silent = s.settings.deliveryMode === 'silent';
       wakes.push({
-        at: Math.max(s.nextFireAt, this.notBefore),
+        kind: 'heartbeat',
+        at,
         certain: true,
-        what: `its heartbeat (${s.settings.deliveryMode === 'silent' ? 'a silent tick' : 'a check-in prompt'}, every ${shownLength(s.settings.intervalSeconds)})`,
+        what: `${whose} heartbeat (${silent ? 'a silent tick' : 'a check-in prompt'}, every ${shownLength(s.settings.intervalSeconds)})`,
+        silent,
+        // A host's interval can put the tick past the last time a date
+        // shows (readSettings has no ceiling), and a time can't be shown there.
+        text: canHoldTime(at) ? tickText(at, s.settings.message, this.timeZone) : s.settings.message,
       });
     }
     for (const r of s.reminders) {
       const message = r.message.length > 80 ? `${r.message.slice(0, 77)}...` : r.message;
+      const at = Math.max(dueAt(r), this.notBefore);
       wakes.push({
-        at: Math.max(dueAt(r), this.notBefore),
+        kind: 'reminder',
+        at,
         certain: true,
-        what: `its reminder ${JSON.stringify(message)}${r.everySeconds !== null ? ` (repeats every ${shownLength(r.everySeconds)})` : ''}`,
+        what: `${whose} reminder ${JSON.stringify(message)}${r.everySeconds !== null ? ` (repeats every ${shownLength(r.everySeconds)})` : ''}`,
+        silent: false,
+        text: reminderText(r, at, this.timeZone),
       });
     }
-    return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    return wakes.sort((a, b) => a.at - b.at);
   }
 
   /**
@@ -549,7 +587,7 @@ export class Heartbeat {
         kind: 'heartbeat',
         reason,
         silent,
-        text: `[current time: ${formatHeartbeatTime(now, this.timeZone)}] ${s.message}`,
+        text: tickText(now, s.message, this.timeZone),
         eventId: `heartbeat_${now}_${Math.random().toString(36).slice(2, 8)}`,
       });
       log(`fired heartbeat (${reason}${silent ? ', silent' : ''})`);

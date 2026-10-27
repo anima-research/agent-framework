@@ -91,7 +91,7 @@ import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } f
 import { checkToolPattern, describeUnmatchedPattern, type PatternServer } from './mcpl/tool-pattern-check.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
-import { readSkipReplyWake, skipReplyWakeRefusal } from './mcpl/skip-reply-wake.js';
+import { readSkipReplyWake, skipReplyWakeRefusal, type SkipReplyEarlierWake } from './mcpl/skip-reply-wake.js';
 import { convertBlock } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
@@ -798,7 +798,7 @@ import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from '.
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
-import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatWake } from './heartbeat/heartbeat.js';
+import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatScheduledWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -3711,11 +3711,11 @@ export class AgentFramework {
   private readonly releasesAfterResume = new Map<string, Agent>();
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
-  // context-manager 0.23.0: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2849),
+  // context-manager 0.23.1: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2897),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
-  // (context-manager.ts:2321-2337). So such a released manager is collected
+  // (context-manager.ts:2343-2359). So such a released manager is collected
   // only once nothing of its work can still read the store, and stop()
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
@@ -5543,20 +5543,45 @@ export class AgentFramework {
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
-    // The heartbeat's ticks and reminders, which the agent's rules decide as
-    // they decide a heartbeat push: one the rules would hold back is listed
-    // as only a "maybe".
-    if (this.heartbeat && this.heartbeatTargets().includes(agentName)) {
-      const probe = (kind: 'heartbeat' | 'reminder'): boolean => !this.eventGate
-        || this.eventGate.probe(this.heartbeatGateEvent({ kind, eventId: 'probe', text: 'probe' })).trigger;
-      const tickWakes = probe('heartbeat');
-      const reminderWakes = probe('reminder');
-      for (const w of this.heartbeat.upcomingWakes()) {
-        const isReminder = w.what.startsWith('its reminder');
-        wakes.push((isReminder ? reminderWakes : tickWakes) ? w : { ...w, certain: false });
-      }
-    }
+    wakes.push(...this.heartbeatWakesFor(agentName));
     return wakes;
+  }
+
+  /**
+   * The heartbeat's ticks and reminders for `agentName`, soonest first, which
+   * the agent's rules decide as they decide a heartbeat push: one the rules
+   * would hold back is only a "maybe" (`certain` false). Each is probed as
+   * the event its delivery is judged by (deliverHeartbeat): a silent tick as
+   * silent, with the text it will bring, so a rule on the content or the
+   * silent flag decides the probe as it will decide the wake. None for an
+   * agent the heartbeat doesn't wake. `whose` words them for the judge ("its
+   * heartbeat") or for the agent ("your heartbeat").
+   */
+  private heartbeatWakesFor(agentName: string, whose: 'its' | 'your' = 'its'): HeartbeatScheduledWake[] {
+    if (!this.heartbeat || !this.heartbeatTargets().includes(agentName)) return [];
+    const wakes = (w: HeartbeatScheduledWake): boolean => !this.eventGate
+      || this.eventGate.probe(this.heartbeatGateEvent({ kind: w.kind, eventId: 'probe', text: w.text, silent: w.silent })).trigger;
+    return this.heartbeat.scheduledWakes(whose).map((w) => (wakes(w) ? w : { ...w, certain: false }));
+  }
+
+  /**
+   * The heartbeat's wake due before a self-wake due at `selfWakeAt` (ms), for
+   * the skip_reply that armed it: the soonest of its ticks and reminders that
+   * the agent's rules, as they stand, let wake it. The confirmation says when
+   * it's due, not that it will wake the agent (skipReplyNote), so a probe
+   * that can't foresee the gate at the wake's time (a gate.js, a rate limit's
+   * tokens then) leaves it true. A failure here costs only that line: the
+   * self-wake is armed already, and the confirmation goes out without it.
+   */
+  private heartbeatWakeBefore(agentName: string, selfWakeAt: number): SkipReplyEarlierWake | undefined {
+    try {
+      const now = Date.now();
+      const first = this.heartbeatWakesFor(agentName, 'your').find((w) => w.certain && w.at < selfWakeAt);
+      return first ? { inSeconds: Math.max(1, Math.round((first.at - now) / 1000)), what: first.what } : undefined;
+    } catch (err) {
+      console.error(`[self-wake] agent=${agentName}: the heartbeat's wakes couldn't be read for skip_reply's note: ${logDetail(err instanceof Error ? err.message : String(err))}`);
+      return undefined;
+    }
   }
 
   /** The agents the heartbeat wakes: the residents, not conversation forks,
@@ -8339,8 +8364,10 @@ export class AgentFramework {
    * CURRENT settings — maintenance may have moved the folded floor and the
    * branch generation, so verdicts are computed at resume time, never reused.
    * Throws ResumeBlockedError (with all failing verdicts) unless `force`.
-   * Unavailable previews warn and pass — refusing to resume because the
-   * strategy cannot preview would hold hosts hostage to a diagnostic.
+   * Unavailable previews pass, with a warning naming the reason unless it is
+   * `no_preview_support`, a strategy with nothing to preview — refusing to
+   * resume because the strategy cannot preview would hold hosts hostage to a
+   * diagnostic.
    */
   async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
     this.refuseOperatorAfterStop('resume');
@@ -9331,7 +9358,13 @@ export class AgentFramework {
    * see `AutobiographicalStrategy.previewContext` and
    * `Agent.compileWithInjections`.
    *
-   * Returns null when the agent's strategy has no fold plan (non-adaptive).
+   * Returns null when the agent's strategy has nothing to preview: one without
+   * `previewContext`, or a non-adaptive `AutobiographicalStrategy` whose select
+   * fits the budget, built from the framework's own copy of context-manager.
+   * Built from another copy, such a strategy throws its `previewContext
+   * requires adaptiveResolution` error here instead, since the manager
+   * recognises only its own copy's `NoFoldPlanToPreviewError`. Over the
+   * budget, a non-adaptive strategy's preview is an infeasible one.
    */
   previewContextSettings(
     agentName: string,
@@ -9387,9 +9420,9 @@ export class AgentFramework {
    *
    * Never throws for preview-layer reasons: strategy without previewContext,
    * preview overlap, stale branch generation, the hierarchical (non-
-   * adaptive) path, and a context manager that refuses its queries (its
-   * strategy's initialization pending or failed) all come back as
-   * `{available: false, reason}`. Unknown agent still throws, matching the
+   * adaptive) path within its budget, and a context manager that refuses its
+   * queries (its strategy's initialization pending or failed) all come back
+   * as `{available: false, reason}`. Unknown agent still throws, matching the
    * sibling accessors, and so does a patch whose values the agent refuses,
    * whatever its context manager's state. Whether the strategy takes live
    * tail and pace settings is the manager's to say, so while it refuses, a
@@ -26036,10 +26069,18 @@ export class AgentFramework {
         }
         const wake = readSkipReplyWake(enrichedCall.input);
         if (wake.kind === 'wake' && this.eventGate) {
+          const armedAt = Date.now();
           const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          // The heartbeat's tick or reminder due before the timer: if it wakes
+          // the agent, its turn cancels the timer, so the confirmation names
+          // it and the time the self-wake would have left.
+          const earlierWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
           console.error(armed
             ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
+              + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
             : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
+          this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
+          return;
         }
       }
       this.dispatchChannelToolCall(agentName, enrichedCall);
@@ -32731,7 +32772,7 @@ export class AgentFramework {
   /**
    * Dispatch a synthesized channel tool call.
    */
-  private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+  private dispatchChannelToolCall(agentName: string, call: ToolCall, earlierWake?: SkipReplyEarlierWake): void {
     // Conversation forks act only on their home channel. channel_publish and
     // channel_close default a missing channelId to home and reject foreign
     // ones; channel_open is rejected outright — opening channels mutates
@@ -32841,7 +32882,9 @@ export class AgentFramework {
     const readThrough = publisher ? this.publishReadThrough(publisher, call.id) : null;
     const published: { outcome?: PublishOutcome } = {};
 
-    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [] }, published)
+    this.channelRegistry!.handleChannelToolCall(call.name, call.input, {
+      kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(earlierWake ? { earlierWake } : {}),
+    }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);

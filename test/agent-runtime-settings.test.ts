@@ -1514,6 +1514,7 @@ const infeasibleAt = (floor: number) => (budget: { maxTokens: number }) => ({
 
 async function withPreflightFramework(
   fn: (framework: AgentFramework) => Promise<void> | void,
+  agentStrategy: AutobiographicalStrategy = strategy(),
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'agent-settings-preflight-'));
   const framework = await AgentFramework.create({
@@ -1523,7 +1524,7 @@ async function withPreflightFramework(
       name: 'agent',
       model: 'test-model',
       systemPrompt: 'test',
-      strategy: strategy(),
+      strategy: agentStrategy,
       contextBudgetTokens: 550_000,
       maxTokens: 10_000,
     }],
@@ -1625,6 +1626,24 @@ it('previewAgentRuntimeSettings: structured reasons for the strategy throw paths
       assert.equal(preview.reason, reason);
     }
   });
+});
+
+it('previewAgentRuntimeSettings: a hierarchical agent within its budget has no fold plan to preview, so it gets no verdict, as no_preview_support, and resume() warns nothing for it', async (t) => {
+  await withPreflightFramework(async (framework) => {
+    assert.equal(framework.previewContextSettings('agent', 550_000), null);
+    const preview = framework.previewAgentRuntimeSettings('agent');
+    assert.equal(preview.available, false);
+    assert.equal(preview.reason, 'no_preview_support');
+
+    await framework.quiesce();
+    const warn = t.mock.method(console, 'warn', () => {});
+    try {
+      assert.equal((await framework.resume()).quiesced, false);
+    } finally {
+      warn.mock.restore();
+    }
+    assert.deepEqual(warn.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('feasibility preview unavailable')), []);
+  }, new AutobiographicalStrategy({ adaptiveResolution: false }));
 });
 
 it('previewAgentRuntimeSettings: paced patches report effective=live plus an advisory target', async () => {
