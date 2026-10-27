@@ -805,6 +805,16 @@ export class AgentPresentation {
   }
 
   /**
+   * Drop the rows a reader fork was handed as framing (noteFramed) when the
+   * fork is never taken on, so never let go (forget): one its run refused
+   * before registering it (the host quiesced or stopping, a surgery holding
+   * the store). Nothing for a name handed none.
+   */
+  forgetFramed(agent: AgentName): void {
+    this.framed.delete(agent);
+  }
+
+  /**
    * The rows the agent is owed and its window doesn't hold yet, one per
    * body (its first shard not in the window), in record order: its own rows
    * and its arrivals, frozen or not, whatever its turn. None for an agent the

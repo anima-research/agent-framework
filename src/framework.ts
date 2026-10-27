@@ -4485,6 +4485,17 @@ export class AgentFramework {
               ? framework.agents.get(framework.primaryAgentName) : undefined;
             return primary ? primary.getContextManager().getAllMessages() : [];
           },
+          // What a surgery's hold keeps for the primary's store until its
+          // release, as addMessage was given it: a tune-out that ends during
+          // the hold lists its held messages among them (#232 gap 7). A
+          // write straight into a fork's store isn't the primary's. Read
+          // defensively, as releaseSurgeryHeldWrites is.
+          getSurgeryHeldMessages: () => {
+            const primary = framework.primaryAgentName;
+            return (framework.surgeryHeldWrites ?? [])
+              .filter((write) => !write.direct && (write.opts?.forAgent ?? primary) === primary)
+              .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
+          },
           commitDeliveries: () => framework.commitDeliveries(),
           historyTool: () => framework.residentHistoryTool(),
           // Every reader of the shared slot compiles the dump with its own
@@ -14635,6 +14646,14 @@ export class AgentFramework {
     const agentConfig: AgentConfig = {
       ...primaryConfig,
       name,
+      // Its own voice is its name alone, and its turns go out under it: the
+      // principal's other names (selfParticipants) and the name its turns go
+      // out under (presentAs) are the principal's. Inherited, rows stored
+      // under an alias of the principal's would go out to it as its own
+      // turns, the principal's thinking and calls with them, where every
+      // round of a resident's goes out as a transcript (#291, answer 13).
+      selfParticipants: undefined,
+      presentAs: undefined,
       model: cfg.model ?? primaryConfig.model,
       systemPrompt: cfg.systemPrompt,
       strategy: undefined, // its CM owns the windowed strategy instance
@@ -14755,6 +14774,8 @@ export class AgentFramework {
     const name = `reader/${primary}/${invocation.epochId.slice(0, 8)}/${++this.readerForkCounter}`;
 
     void (async () => {
+      // Whether the fork was framed (noteFramed), for its framing's end below.
+      let framed = false;
       try {
         const backlog = invocation.backlog;
         const content = (cfg.framing ?? defaultReaderFraming)({
@@ -14810,6 +14831,7 @@ export class AgentFramework {
         // (presentedToAnyone), so no module or coalescer takes out a row a
         // reader was handed. Its view filter, the residents' it inherits,
         // keeps them out of its compiles, where the framing shows them.
+        framed = true;
         this.presentation?.noteFramed(fork.agent, backlog
           .filter((m) => heldFromResidents(m.metadata as Record<string, unknown> | undefined))
           .map((m) => m.id));
@@ -14863,6 +14885,16 @@ export class AgentFramework {
           returned,
         });
       } finally {
+        // A fork its run refused before taking it on (the host quiesced or
+        // stopping, a surgery holding the store) was never registered, so no
+        // end of its lets it go from the presentation index (forget at
+        // forgetPresentation): its framing goes here. Kept, the rows it was
+        // handed would count as held by a reader that never ran
+        // (framedToAny, holders) for the life of the process, and no
+        // coalescer could replace or withdraw one (removePlacement). A run
+        // that took the fork on let it go at the run's end, so this finds
+        // nothing then; a live agent of the name is left as it is.
+        if (framed && !this.agents.has(name)) this.presentation?.forgetFramed(name);
         this.tuneOutCoordinator?.forgetReader(name);
       }
     })();

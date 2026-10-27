@@ -93,6 +93,18 @@ export interface SubconsciousWindowStart {
 }
 
 /**
+ * What `subconscious/<primary>/window-starts` keeps (`{ v: 1, starts,
+ * inForce? }`): each active tune-out's window start as an index ordinal, by
+ * epoch id, and the ordinal the window start is set to now (`inForce`),
+ * which may be a cancelled tune-out's while another stays active, since a
+ * cancel leaves the start where it was.
+ */
+interface WindowStartsState {
+  starts: Record<string, number>;
+  inForce?: number;
+}
+
+/**
  * Whether a held message is one of this channel's: by its channel id, and by
  * its server where it records one, since two servers can register the same
  * channel id. A message recording neither is taken as the channel's, as
@@ -212,9 +224,19 @@ export interface TuneOutFrameworkHooks {
   /**
    * Read the primary's stored messages (shared slot, unfiltered). A held
    * message is stored as it arrives, even during the resident's turn, so
-   * this is every message an epoch holds (#232 gap 7).
+   * this is every message an epoch holds (#232 gap 7), but for those a live
+   * surgery's hold keeps in memory (getSurgeryHeldMessages).
    */
   getStoredMessages: () => StoredMessage[];
+  /**
+   * The writes for the primary's store that a live surgery's hold keeps in
+   * memory, in arrival order: made while the operator's switch is awaited,
+   * and stored, in that order, only at its release. A tune-out that ends
+   * during the hold has its held messages among them, which its dump lists
+   * and a check counts as it does the stored ones (#232 gap 7). Left out,
+   * none are.
+   */
+  getSurgeryHeldMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
   /**
    * Make what was just delivered durable: a release flips durable epoch
    * state, so its dump must survive a crash in the same window (#232 gap 6).
@@ -343,6 +365,25 @@ export class TuneOutCoordinator {
     return this.channelRegistry.nameShown({ serverId, channelId });
   }
 
+  /**
+   * Every message of the primary's store, in arrival order: those stored,
+   * then those a live surgery's hold keeps in memory until its release
+   * (getSurgeryHeldMessages). What a dump lists and a check counts, so a
+   * tune-out that ends during the hold still has what it held then. A
+   * reader is handed stored rows only (getStoredMessages): those the hold
+   * keeps have no id until stored, and the dump has them.
+   */
+  private residentMessages(): Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> {
+    const stored = this.hooks.getStoredMessages();
+    let kept: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> = [];
+    try {
+      kept = this.hooks.getSurgeryHeldMessages?.() ?? [];
+    } catch (err) {
+      console.error('[tune-out] could not read the writes a surgery holds in memory, so the stored messages alone are read:', err);
+    }
+    return kept.length > 0 ? [...stored, ...kept] : stored;
+  }
+
   /** Restart cadence + expiry timers and re-anchor after a process restart. */
   resumeActiveEpochs(): void {
     for (const { serverId, channelId, params } of this.listActive()) {
@@ -367,7 +408,7 @@ export class TuneOutCoordinator {
     // A window start kept for a tune-out that ended while the process was
     // down, its cancel's own forget not written, goes now.
     this.pruneWindowStarts();
-    this.anchorSubconscious();
+    this.anchorSubconscious('resume');
   }
 
   /** The tune-outs active now, a channel's and the all-except hold, with where each started in the record. */
@@ -385,14 +426,35 @@ export class TuneOutCoordinator {
    * called, so a channel's tune-out entered during an older hold leaves the
    * start at the hold's. Nothing when none is active: the anchor stays where
    * it was, as a cancel leaves it.
+   *
+   * A cancel leaves the start where it was while another tune-out stays
+   * active too, so the subconscious's report on the one cancelled still has
+   * what it held, and the start in force is kept (`inForce`). At a resume
+   * that start is set again rather than the oldest active tune-out's, which
+   * is later than it once the oldest was cancelled: so the window is the
+   * same across a restart. An enter sets the oldest active tune-out's, as it
+   * always has.
    */
-  private anchorSubconscious(): void {
+  private anchorSubconscious(occasion: 'enter' | 'resume' = 'enter'): void {
     const active = this.activeStarts();
     if (active.length === 0) return;
     const sequence = Math.min(...active.map((e) => e.sequence));
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
-    const starts = this.ordinalsKept() ? this.readWindowStarts() : {};
-    const ordinal = epochIds.map((id) => starts[id]).find((o) => o !== undefined);
+    const kept = this.ordinalsKept();
+    const state: WindowStartsState = kept ? this.readWindowState() : { starts: {} };
+    let ordinal = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
+    // At a resume, the start in force before the restart (a cancelled
+    // tune-out's, say), and never past the oldest active one's own start
+    // where one is kept.
+    if (occasion === 'resume' && state.inForce !== undefined) {
+      ordinal = ordinal === undefined ? state.inForce : Math.min(ordinal, state.inForce);
+    }
+    // The start in force from now: this ordinal, or, while the start waits
+    // to be fixed, none until the fix reports it (subconsciousWindowFixed).
+    if (kept && state.inForce !== ordinal) {
+      const { inForce: _was, ...rest } = state;
+      this.writeWindowState(ordinal !== undefined ? { ...rest, inForce: ordinal } : rest);
+    }
     this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds });
   }
 
@@ -416,35 +478,45 @@ export class TuneOutCoordinator {
 
   /**
    * Each tune-out's window start as an ordinal, by epoch id, as kept on the
-   * store's branch now. A state that can't be read, or isn't this format
-   * (`{ v: 1, starts }`), reads as none kept, and is written over at the
-   * next fix, with a line saying so.
+   * store's branch now, and the start in force (`inForce`: the ordinal the
+   * window start was last set to while a tune-out is active), which a
+   * restart sets again (anchorSubconscious). A state that can't be read, or
+   * isn't this format (`{ v: 1, starts, inForce? }`), reads as none kept,
+   * and is written over at the next fix, with a line saying so. A state an
+   * earlier version kept, with no `inForce`, reads as one with none in
+   * force, and a restart sets the oldest active tune-out's start, as that
+   * version did.
    */
-  private readWindowStarts(): Record<string, number> {
+  private readWindowState(): WindowStartsState {
     let raw: unknown;
     try {
       raw = this.channelRegistry.readCoordinatorState(this.windowStartsStateId);
     } catch (err) {
       console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) can't be read, so none is kept:`, err);
-      return {};
+      return { starts: {} };
     }
-    if (raw == null) return {};
-    const state = raw as { v?: unknown; starts?: unknown };
+    if (raw == null) return { starts: {} };
+    const state = raw as { v?: unknown; starts?: unknown; inForce?: unknown };
     if (state.v !== 1 || !state.starts || typeof state.starts !== 'object') {
       console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) aren't in a form this version reads, so none is kept; the next fix writes over them`);
-      return {};
+      return { starts: {} };
     }
+    const isOrdinal = (o: unknown): o is number => typeof o === 'number' && Number.isInteger(o) && o >= 0;
     const starts: Record<string, number> = {};
     for (const [epochId, ordinal] of Object.entries(state.starts as Record<string, unknown>)) {
-      if (typeof ordinal === 'number' && Number.isInteger(ordinal) && ordinal >= 0) starts[epochId] = ordinal;
+      if (isOrdinal(ordinal)) starts[epochId] = ordinal;
     }
-    return starts;
+    return { starts, ...(isOrdinal(state.inForce) ? { inForce: state.inForce } : {}) };
   }
 
-  /** Keep `starts`; a write that fails is logged, and the anchor the strategy holds stays as it is. */
-  private writeWindowStarts(starts: Record<string, number>): void {
+  /** Keep `state`; a write that fails is logged, and the anchor the strategy holds stays as it is. */
+  private writeWindowState(state: WindowStartsState): void {
     try {
-      this.channelRegistry.writeCoordinatorState(this.windowStartsStateId, { v: 1, starts });
+      this.channelRegistry.writeCoordinatorState(this.windowStartsStateId, {
+        v: 1,
+        starts: state.starts,
+        ...(state.inForce !== undefined ? { inForce: state.inForce } : {}),
+      });
     } catch (err) {
       console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) couldn't be written, so a restart fixes them again:`, err);
     }
@@ -454,39 +526,56 @@ export class TuneOutCoordinator {
    * The framework fixed the subconscious's window start for `epochIds` at
    * `ordinal` (its index ordinal, #291): kept for each of them still active,
    * so a later anchor (another tune-out's enter, a restart) sets that
-   * ordinal again rather than converting the tune-out's sequence anew.
+   * ordinal again rather than converting the tune-out's sequence anew, and
+   * kept as the start in force while any tune-out is active, which a
+   * restart sets again (anchorSubconscious).
    */
   subconsciousWindowFixed(epochIds: readonly string[], ordinal: number): void {
     if (!this.ordinalsKept()) return;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
-    const starts = this.readWindowStarts();
+    const state = this.readWindowState();
     let changed = false;
     for (const epochId of epochIds) {
-      if (!active.has(epochId) || starts[epochId] === ordinal) continue;
-      starts[epochId] = ordinal;
+      if (!active.has(epochId) || state.starts[epochId] === ordinal) continue;
+      state.starts[epochId] = ordinal;
       changed = true;
     }
-    if (changed) this.writeWindowStarts(starts);
+    // The window starts there now, whether or not the tune-outs it was fixed
+    // for are active still (one cancelled before its start was fixed leaves
+    // it in force, as any cancel does), while any tune-out is.
+    if (active.size > 0 && state.inForce !== ordinal) {
+      state.inForce = ordinal;
+      changed = true;
+    }
+    if (changed) this.writeWindowState(state);
   }
 
-  /** An ended tune-out's window start goes. */
+  /**
+   * An ended tune-out's window start goes, and, once none is active, the
+   * start in force with it: the next enter sets its own.
+   */
   private forgetWindowStart(epochId: string): void {
     if (!this.ordinalsKept()) return;
-    const starts = this.readWindowStarts();
-    if (!(epochId in starts)) return;
-    delete starts[epochId];
-    this.writeWindowStarts(starts);
+    const state = this.readWindowState();
+    const noneActive = this.activeStarts().length === 0;
+    if (!(epochId in state.starts) && !(noneActive && state.inForce !== undefined)) return;
+    delete state.starts[epochId];
+    if (noneActive) delete state.inForce;
+    this.writeWindowState(state);
   }
 
   /** The window starts of tune-outs no longer active go. */
   private pruneWindowStarts(): void {
     if (!this.ordinalsKept()) return;
-    const starts = this.readWindowStarts();
+    const state = this.readWindowState();
     const active = new Set(this.activeStarts().map((e) => e.epochId));
-    const stale = Object.keys(starts).filter((epochId) => !active.has(epochId));
-    if (stale.length === 0) return;
-    for (const epochId of stale) delete starts[epochId];
-    this.writeWindowStarts(starts);
+    const stale = Object.keys(state.starts).filter((epochId) => !active.has(epochId));
+    // With none active, no start is in force for the resume to set again.
+    const staleInForce = active.size === 0 && state.inForce !== undefined;
+    if (stale.length === 0 && !staleInForce) return;
+    for (const epochId of stale) delete state.starts[epochId];
+    if (staleInForce) delete state.inForce;
+    this.writeWindowState(state);
   }
 
   private armExpiry(serverId: string, channelId: string, params: TuneOutParams): void {
@@ -689,12 +778,14 @@ export class TuneOutCoordinator {
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
     // Backlog: every message held under this epoch, in store order, which
-    // is arrival order: a held message is stored as it arrives (#291).
+    // is arrival order: a held message is stored as it arrives (#291), but
+    // while a surgery holds the store, which keeps it in memory until its
+    // release, after every stored one (residentMessages).
     const epochId = ended.params.epochId;
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
     const backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> =
-      this.hooks.getStoredMessages().filter(ofEpoch);
+      this.residentMessages().filter(ofEpoch);
     // Whole messages: a cap below one shows none, where slice(-0.5) would
     // start at 0 and take them all.
     const cap = Math.floor(ended.params.backlogCap);
@@ -1044,7 +1135,7 @@ export class TuneOutCoordinator {
   /** Channels held by the scope (not by their own epoch) with the count held under it. */
   private scopeHeldCounts(epochId: string): Map<string, { serverId: string; channelId: string; count: number }> {
     const counts = new Map<string, { serverId: string; channelId: string; count: number }>();
-    for (const m of this.hooks.getStoredMessages()) {
+    for (const m of this.residentMessages()) {
       const meta = m.metadata as { tuneOut?: { epochId?: string }; channelId?: string; serverId?: string } | undefined;
       if (meta?.tuneOut?.epochId !== epochId) continue;
       const channelId = typeof meta.channelId === 'string' ? meta.channelId : '(unknown channel)';
@@ -1082,7 +1173,8 @@ export class TuneOutCoordinator {
 
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
-    const all = this.hooks.getStoredMessages().filter(ofEpoch);
+    // Stored, and kept by a surgery's hold until its release (residentMessages).
+    const all = this.residentMessages().filter(ofEpoch);
     const byChannel = new Map<string, Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>>();
     for (const m of all) {
       const channelId = (m.metadata as { channelId?: string } | undefined)?.channelId ?? '(unknown channel)';
@@ -1157,7 +1249,8 @@ export class TuneOutCoordinator {
 
   /** What is held right now — per-channel epochs and the scope — without releasing. */
   check(opts: { peek?: { serverId?: string; channelId: string }; peekLimit?: number } = {}): TuneOutCheck {
-    const stored = this.hooks.getStoredMessages();
+    // Stored, and kept by a surgery's hold until its release (residentMessages).
+    const stored = this.residentMessages();
     const countOf = (epochId: string) => stored.filter(
       (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
     ).length;

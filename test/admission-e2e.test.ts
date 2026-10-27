@@ -200,6 +200,49 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
+  // Review 2, J-AF29: a surgery's hold is the one place a write still waits
+  // in memory, until the hold's release stores it. A tune-out that ends
+  // during the hold (its expiry, say) reads those writes beside the record
+  // (getSurgeryHeldMessages), as it once read the deferral queue; before,
+  // its dump left the message out, and its release stored it under the ended
+  // tune-out's hold, so no resident was ever shown it.
+  it('gap 7 (surgery) — a held message a surgery keeps in memory is counted while held and is in a release made during the hold', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const epochId = internals(f).channelRegistry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as {
+        addMessage(p: string, c: unknown[], m: Record<string, unknown>): string;
+        reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      };
+      // As admission stores a held message, for the primary.
+      const heldMessage = (t: string) => framework.addMessage('antra', [{ type: 'text', text: t }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      heldMessage('stored before the hold');
+      const release = framework.reserveStoreForSurgery('roll back', 'agent');
+      try {
+        assert.equal(heldMessage('kept by the hold'), '', 'premise: the hold keeps it in memory');
+        assert.ok(!has(f, 'kept by the hold'), 'premise: not stored');
+        assert.equal(coordinator.check().channels.find((c) => c.channelId === 'noisy')?.held, 2, 'a check counts it while held');
+        const peek = coordinator.check({ peek: { serverId: 'editor', channelId: 'noisy' } }).peek ?? [];
+        assert.ok(peek.some((line) => line.includes('kept by the hold')), 'and peeks it');
+        // The tune-out ends while the hold is up.
+        assert.ok(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed').ok);
+      } finally {
+        release();
+      }
+      f.alwaysRespond();
+      await f.framework.runUntilIdle();
+      const dump = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(dump, /messages=2/, 'the message the hold kept is counted');
+      assert.match(dump, /antra: stored before the hold\nantra: kept by the hold/, 'and listed, in arrival order');
+      assert.ok(held(find(f, 'kept by the hold')), 'stored at the release, with its hold record, as the dump covers it');
+    } finally { await f.close(); }
+  });
+
   // Ported for #291: a release made behind a live turn is stored at once, so
   // nothing waits in memory for a crash to lose, and no queue file is
   // written. This test once checked the release was persisted in the

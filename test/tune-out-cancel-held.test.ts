@@ -27,8 +27,9 @@ const textOf = (content: ContentBlock[]): string =>
 
 /** Cancels epoch eA of disc:guild:a with the given cap and source, over the
  *  given stored messages, of which the subconscious hasn't seen `unseen`,
- *  and returns what the coordinator added and whose inference it requested. */
-function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; unseen?: number; note?: string }) {
+ *  and those a surgery's hold keeps in memory (`kept`), and returns what the
+ *  coordinator added and whose inference it requested. */
+function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; kept?: Row[]; unseen?: number; note?: string }) {
   const added: Added[] = [];
   const inferences: string[] = [];
   const registry = {
@@ -47,6 +48,7 @@ function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; u
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => opts.stored,
+    getSurgeryHeldMessages: () => opts.kept ?? [],
     unseenBySubconscious: () => opts.unseen ?? 0,
     emitTrace: () => {},
   };
@@ -123,4 +125,20 @@ test('a cancel the subconscious makes itself with no note gets the notice and a 
   const nothingCut = cancelWith({ backlogCap: 10, source: 'subconscious', stored: twoStored });
   assert.equal(nothingCut.notice, undefined, 'with nothing cut and nothing unseen, no notice');
   assert.ok(!nothingCut.inferences.includes('Subconscious'), 'and no report turn');
+});
+
+// Review 2, J-AF29 (#232 gap 7): a write while a surgery holds the store is
+// kept in memory until the hold's release, so a cancel during the hold read
+// the record alone and its dump left the message out.
+test("a cancel during a surgery's hold lists the held messages the hold keeps in memory, after those stored, and counts them against the cap", () => {
+  const { dump, notice } = cancelWith({
+    backlogCap: 2,
+    source: 'duration',
+    stored: [row('Ann', [text('A1 stored')], 'eA'), row('Ann', [text('A2 stored')], 'eA'), ...OTHERS],
+    kept: [row('Ann', [text('A3 kept by the hold')], 'eA'), row('Bo', [text('B2 kept by the hold')], 'eB')],
+  });
+  assert.ok(dump.includes('messages=3') && dump.includes('truncated=1'), `the kept message is counted, and the cap leaves the oldest out: ${dump}`);
+  assert.ok(dump.includes('Ann: A2 stored\nAnn: A3 kept by the hold'), 'it is the newest, shown last');
+  assert.ok(!dump.includes('A1 stored') && !dump.includes('B2'), "the oldest is left out, and another epoch's kept message isn't the dump's");
+  assert.ok(notice && textOf(notice.content).includes("1 of 3 diverted messages, the oldest, weren't delivered raw"), 'and the report is told so');
 });

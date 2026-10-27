@@ -17,7 +17,10 @@
  *     by sequence, as before. (e) A kept ordinal past a shorter window is
  *     clamped and traced. (f) A tune-out active at the upgrade gets its
  *     ordinal right after the window is written down, in record order. (g)
- *     A cancel forgets the tune-out's start.
+ *     A cancel forgets the tune-out's start. (h) A cancel of the oldest
+ *     tune-out while another stays active leaves the start where it was, so
+ *     the report on it reads what it held, and a restart keeps that start
+ *     (its `inForce`) rather than setting the other's.
  *
  * Since #291 every framework presents, so the tests stand in for an earlier
  * release's process by one whose write-down fails (boot's `legacy`), which keeps
@@ -261,6 +264,58 @@ describe("the persistent subconscious's window start (#291, AF-5)", () => {
     assert.deepEqual((await cm.compile(undefined, undefined, dry)).messages.map((m) => textOf(m as never)), before,
       'its window from there is the one the sequence gave');
     assert.deepEqual(h.windowStarts(), { [epochId]: first }, 'and kept, fixed as the coordinator resumed it');
+  });
+});
+
+describe("the persistent subconscious's window start when the oldest tune-out ends first (review 2, J-AF30)", () => {
+  // The start stayed at T1's while T2 stayed active, as a cancel leaves it,
+  // but a restart set T2's (the oldest active then), so the rows between the
+  // two starts left the window across the restart, T1's held rows with them,
+  // and its prefix changed.
+  it('(h) stays where it was at the cancel, and is the same after a restart', { timeout: 120_000 }, async () => {
+    const dir = place();
+    const first = await boot(dir);
+    first.residentRow('PRE-1 before the tune-outs');
+    first.bump();
+    const t1 = first.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t1.ok);
+    first.residentRow('T1-HELD-1 chatter', { tuneOut: { epochId: t1.params.epochId } });
+    first.residentRow('BETWEEN-1 after T1');
+    first.bump();
+    const t2 = first.internals.tuneOutCoordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:quiet' }, { durationSeconds: 3600 }, 'agent-tool');
+    assert.ok(t2.ok, (t2 as { error?: string }).error);
+    first.residentRow('T2-HELD-1 chatter', { tuneOut: { epochId: t2.params.epochId } });
+    await first.framework.runUntilIdle();
+    const start = first.strategy().getAnchorOrdinal();
+    assert.equal(start, first.subCm().ordinalOf(first.rowOf('T1-HELD-1 chatter').id), "premise: T1's start, the oldest");
+    assert.ok(start! < first.subCm().ordinalOf(first.rowOf('BETWEEN-1 after T1').id)!, "premise: before T2's");
+
+    assert.ok(first.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
+    await first.framework.runUntilIdle();
+    assert.equal(first.strategy().getAnchorOrdinal(), start, 'the cancel leaves the start where it was');
+    const report = first.membrane.callsFor(SUB).at(-1)!;
+    assert.ok(report.messages.some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'T1-HELD-1 chatter')),
+      'so its report on T1 reads the row T1 held, not only its line in the dump');
+    const kept = first.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number };
+    const dry = { dryRun: true } as never;
+    const before = (await first.subCm().compile(undefined, undefined, dry)).messages.map((m) => textOf(m as never));
+    await first.framework.stop();
+    frameworks.splice(frameworks.indexOf(first.framework), 1);
+
+    const second = await boot(dir);
+    assert.equal(second.strategy().getAnchorOrdinal(), start, "the start it had, not T2's");
+    const after = (await second.subCm().compile(undefined, undefined, dry)).messages.map((m) => textOf(m as never));
+    assert.deepEqual(after.slice(0, before.length), before, 'over the same window');
+    assert.ok(after.includes('T1-HELD-1 chatter') && after.includes('BETWEEN-1 after T1'), `the rows between the starts stay in it: ${JSON.stringify(after)}`);
+    assert.equal(kept.inForce, start, 'set from the start in force, kept at the cancel');
+    assert.equal(kept.starts[t1.params.epochId], undefined, "while T1's own start was forgotten");
+
+    // Once no tune-out is active, nothing is kept in force: the next enter sets its own.
+    assert.ok(second.internals.tuneOutCoordinator.cancelAllExcept('agent-tool', 'test').ok);
+    await second.framework.runUntilIdle();
+    const none = second.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number };
+    assert.deepEqual(none.starts, {});
+    assert.equal(none.inForce, undefined);
   });
 });
 

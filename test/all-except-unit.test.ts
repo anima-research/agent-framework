@@ -1,8 +1,9 @@
 /**
  * The all-except scope's own rules, on the coordinator alone: exhausting the
  * wake budget pauses the reader rather than ending the hold (#232 §3.2, the
- * decision carried from the issue), and a scope whose deadline passed while
- * the process was down is released at resume.
+ * decision carried from the issue), a scope whose deadline passed while
+ * the process was down is released at resume, and a message a surgery's hold
+ * keeps in memory is counted and released with those stored (#232 gap 7).
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +11,10 @@ import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 
-function harness() {
+type Held = { participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> };
+
+/** `stored`: the primary's stored messages; `kept`: the writes a surgery's hold keeps in memory. */
+function harness(held: { stored?: Held[]; kept?: Held[] } = {}) {
   const state = new Map<string, unknown>();
   const wakes: string[] = [];
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
@@ -32,7 +36,8 @@ function harness() {
     requestInference: (agentName: string) => { wakes.push(agentName); },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
-    getStoredMessages: () => [],
+    getStoredMessages: () => held.stored ?? [],
+    getSurgeryHeldMessages: () => held.kept ?? [],
     currentSequence: () => 1,
     setSubconsciousAnchor: () => {},
     isForkBound: () => false,
@@ -76,5 +81,30 @@ describe('all-except scope on the coordinator', () => {
     assert.ok(h.messages.some((m) => /all channels except work released — duration elapsed/.test(m.text)), 'the release reached the resident');
     assert.ok(h.wakes.includes('scout'), 'and woke them');
     second.stop();
+  });
+
+  // Review 2, J-AF29: the hold's writes are stored only at its release, so
+  // the scope read the record alone and left them out of its counts and its
+  // release.
+  it("counts and releases a held message a surgery's hold keeps in memory, after those stored", () => {
+    const stored: Held[] = [];
+    const kept: Held[] = [];
+    const h = harness({ stored, kept });
+    const c = h.make();
+    const r = c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool');
+    assert.ok(r.ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    const message = (t: string): Held => ({
+      participant: 'user', content: [{ type: 'text', text: t }],
+      metadata: { tuneOut: { epochId }, channelId: 'noisy', serverId: 'disc', author: { name: 'antra' } },
+    });
+    stored.push(message('N1 stored'));
+    kept.push(message('N2 kept by the hold'));
+    assert.deepEqual(c.check().allExcept?.held, { noisy: 2 }, 'a check counts the kept one with the stored one');
+    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
+    const release = h.messages.find((m) => /all channels except work released/.test(m.text))!.text;
+    assert.match(release, /2 messages held in 1 channel/, 'the release counts it');
+    assert.match(release, /messages=2>\nantra: N1 stored\nantra: N2 kept by the hold/, 'and lists it, after the stored one');
+    c.stop();
   });
 });

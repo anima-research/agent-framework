@@ -5,7 +5,9 @@
   reader fork's framing, which names it by its stored id (`heldMessageIds`). Only a surgery's hold keeps it, as it
   keeps any write, in memory until its release. Stored during its target's turn, it takes no clock row. A module's
   context reads such a message as the stored row it is, with `heldFromResidents`, and with `held` for a read for a
-  resident, whose window never holds it; a cancel's dump reads it from the record.
+  resident, whose window never holds it; a cancel's dump reads it from the record, and, for a tune-out that ends
+  while a surgery holds the store, from the writes the hold keeps too, which a `check` counts and peeks while held
+  (#232 gap 7).
 - A cancel the subconscious makes itself, with its note, gets it a report turn when some of its tune-out's stored
   messages are ones it hadn't been shown when it wrote the note (those its window doesn't hold); the notice says how
   many.

@@ -5,7 +5,10 @@
  * lives (presentedToAnyone), so no coalescer withdraws a row a reader was
  * handed. Its view, the residents' it inherits, keeps them out of its
  * compile, where the framing shows them: its first request is the
- * resident's last one, then the resident's reply, then the framing.
+ * resident's last one, then the resident's reply, then the framing. A fork
+ * its run refuses before taking it on (the host quiesced) is let go of its
+ * framing, so a row it was handed counts as held by no reader that never
+ * ran (review 2, J-AF28).
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -42,7 +45,13 @@ type Internals = {
   presentation: {
     presentedToAnyone(id: MessageId): boolean;
     holders(id: MessageId): Array<{ agent: string; via: string }>;
+    framedToAny(id: MessageId): boolean;
+    framed: Map<string, Set<MessageId>>;
   };
+  invokeReaderFork(invocation: {
+    serverId: string; channelId: string; epochId: string; trigger: 'cadence' | 'wake' | 'cancel';
+    notice: string; backlog: unknown[]; dispositions: string | null;
+  }): void;
   removePlacement(p: { agent: string; messageId?: string }): boolean;
   addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): MessageId;
   pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
@@ -137,5 +146,57 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", {
     // Once the fork ends it holds nothing.
     await waitFor('the fork ended', () => !framework.getAgent(during!.fork));
     assert.equal(internals.presentation.presentedToAnyone(during!.held[0]!), false, 'a framed row is held only while the fork lives');
+  });
+
+  // J-AF28: the framing was noted at the fork's derivation, and its run's
+  // refusal (here, a quiesced host's) came before its registration, so no
+  // end of the fork's let it go: the row stayed framed to a fork that never
+  // ran for the life of the process, and no coalescer could take it out.
+  it('lets go of the framing of a fork its run refused before taking it on', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-framing-refused-'));
+    dirs.push(dir);
+    writeFileSync(join(dir, 'commands.txt'), '');
+    const membrane = new WireMembrane();
+    membrane.identify = (request) => (JSON.stringify(request.messages).includes('[Tune-out reader') ? 'reader' : 'scout');
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      subconscious: { enabled: true, reader: 'forks', model: 'test-model', voice: 'Read for scout.' },
+      mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: join(dir, 'status.jsonl'), COMMAND_PATH: join(dir, 'commands.txt') } }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    } as never);
+    frameworks.push(framework);
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+    const internals = framework as unknown as Internals;
+    await framework.start();
+    await waitFor('channel registration', () => internals.channelRegistry.listChannelsRaw().length > 0);
+
+    const entered = internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(entered.ok);
+    const epochId = entered.params.epochId;
+    const id = internals.addMessage('antra', [text('HELD-1 chatter')], { tuneOut: { epochId }, channelId: CHANNEL, serverId: 'disc' });
+    const row = framework.getAgent('scout')!.getContextManager().getAllMessages().find((m) => m.id === id)!;
+    await framework.quiesce({ reason: 'test' });
+    // The invocation a cadence period or a cancel hands the framework.
+    internals.invokeReaderFork({ serverId: 'disc', channelId: CHANNEL, epochId, trigger: 'cadence', notice: '[Tune-out cadence: test]', backlog: [row], dispositions: null });
+    await waitFor("the fork's refusal", () => traces.some((t) => t.type === 'tune-out:reader-fork-failed'));
+    const failed = traces.find((t) => t.type === 'tune-out:reader-fork-failed') as { agentName: string; error: string; returned: number };
+    assert.match(failed.error, /quiesced/, 'premise: its run refused it before taking it on');
+    assert.equal(framework.getAgent(failed.agentName) ?? undefined, undefined, 'premise: never registered');
+    assert.ok(traces.some((t) => t.type === 'tune-out:reader-fork' && (t as { agentName?: string }).agentName === failed.agentName),
+      'premise: framed at its derivation');
+    assert.equal(failed.returned, 1, 'its row goes back to the next reader');
+    await framework.resume();
+    await framework.runUntilIdle();
+
+    assert.equal(internals.presentation.framedToAny(id), false, 'no reader holds it as framing');
+    assert.deepEqual(internals.presentation.holders(id), [], 'nor names a fork that never ran');
+    assert.equal(internals.presentation.presentedToAnyone(id), false);
+    assert.equal(internals.presentation.framed.has(failed.agentName), false, 'nothing is kept for the fork');
+    assert.equal(internals.removePlacement({ agent: 'scout', messageId: id }), true, 'and a coalescer may take the unread row out');
   });
 });

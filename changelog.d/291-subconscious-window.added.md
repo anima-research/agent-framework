@@ -7,13 +7,20 @@
     a later tune-out's enter or a restart sets that ordinal again rather than converting the tune-out's sequence
     anew, and a kept ordinal past a shorter window (after a rollback) is clamped. New trace
     `tune-out:subconscious-window` (`how: 'fixed' | 'clamped'`).
+  - A cancel of the oldest tune-out while another stays active leaves the start where it was, so the
+    subconscious's report on the one cancelled reads what it held, and the start in force is kept too (`inForce`
+    in the same state): a restart sets it again rather than the start of the oldest tune-out still active, so the
+    window is the same across the restart. The next tune-out's enter sets the oldest active one's start, as it
+    always has.
   - A resident's rounds go out to it as a transcript: a line per tool call (the tool's name and its input in brief)
     and per result (the outcome in brief), and none of the resident's thinking, the same in its compiles and in
     what its tool boundary injects (`Agent.setForeignRounds`, `Agent.injectedAsSent`). Its own rounds go as
     stored, and it keeps their signed thinking across a row heard from the residents' slot.
   - A reader fork's framing hand-off presents the held rows it is handed into the fork's window when its run takes
     it on: the fork holds them while it lives (`presentedToAnyone`), so a coalescer doesn't withdraw a row a reader
-    was handed, and its view keeps them out of its compile, where the framing shows them.
+    was handed, and its view keeps them out of its compile, where the framing shows them. A fork its run refuses
+    before taking it on (the host quiesced or stopping, a surgery holding the store) holds none of them: its
+    handed rows go back to the next reader, as before, and no row counts as held by a reader that never ran.
 - `residentContextOptions(name)`, `subconsciousContextOptions({ serves, name?, reAnchorFraction?,
   maxMessageTokens? })`, `residentViewFilter(name)`, `subconsciousViewFilter(name)` and the
   `ContextManagerOpenOptions` type: how the framework opens a resident's context and the subconscious's, for a host
