@@ -272,7 +272,8 @@ export interface ReplyJudgeOptions {
    * wait lasts each judge rule's batch wakes it without the judge being
    * asked. Under `"skip"`, the batch is held in memory while the judge's
    * calls are refused. While a refusal's stated wait lasts, batches that
-   * arrive are held with it, and all are judged once the wait ends or the
+   * arrive are held with it, a rule keeping its newest 100 events as it does
+   * while a turn holds them, and they're judged once the wait ends or the
    * hold is released. A refusal that states no end keeps them held until a
    * later batch's call, which takes them in, gets a verdict, or the hold is
    * released.
@@ -326,7 +327,7 @@ export interface UpcomingWake {
    * When (ms), when known. Absent for one that has no time of its own: one
    * due as soon as the agent is free (a wake already queued, or events
    * buffered behind a running turn), a batch the judge is deciding or will
-   * decide once a turn ends, and one `when` describes.
+   * decide once a turn or the host's quiesce ends, and one `when` describes.
    */
   at?: number;
   /** When, in words, for one due at no time anyone can name (a hold only a

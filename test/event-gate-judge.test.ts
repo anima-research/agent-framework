@@ -1257,7 +1257,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
-  it("tells the judge the events buffered behind a turn that doesn't change the context it reads", async () => {
+  it("tells the judge the events buffered behind a turn that doesn't change the context it reads, and upcomingWakes leaves out a given rule's", async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('upcoming-buffered.json', {
       policies: [
@@ -1273,6 +1273,8 @@ describe('judge rules: what waiting leaves the agent with', () => {
     assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
       ['1 event buffered behind a running turn, delivered when it ends', false],
     ]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient').map((w) => w.what), ['1 event buffered behind a running turn, delivered when it ends']);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'files').map((w) => w.what), ['rule "ambient"\'s batch of 1 event, which the judge is deciding'], "rule files' buffered events are left out with it");
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
@@ -1302,7 +1304,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
-  it("upcomingWakes, given a rule's name, leaves out that rule's batches, collected, decided or held, as 0.28.0's did", async () => {
+  it("upcomingWakes, given a rule's name, leaves out that rule's batches, whether collected, decided or held", async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('upcoming-except.json', {
       policies: [
@@ -1320,6 +1322,26 @@ describe('judge rules: what waiting leaves the agent with', () => {
     assert.deepStrictEqual(listed('second'), ['rule "first"\'s batch of 1 event, held for the judge']);
     assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
     assert.strictEqual(listed().length, 2);
+    gate.dispose();
+  });
+
+  it("tells the judge its own rule's next batch, collecting while a held one is asked", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-own-next.json', {
+      policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } }],
+    }), { judge: judge.fn, residents: ['agent'] });
+    gate.onInferenceStarted('agent');
+    gate.evaluate(chat('first'));
+    await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the first batch held for the turn');
+    gate.evaluate(chat('second'));
+    gate.onInferenceEnded('agent');
+    await until(() => judge.requests.length === 1, 'the held batch asked once the turn ends');
+    assert.deepStrictEqual(judge.requests[0]!.events.map((e) => e.content), ['first']);
+    assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
+      ['rule "ambient"\'s batch of 1 event goes to the judge', false],
+    ]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient'), []);
+    judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
 
