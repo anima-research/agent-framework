@@ -1,1 +1,0 @@
-- **Hosts that set `toolHints: true` on an MCPL server without granting it `pushEvents`:** the reminder that restates a server's open toolsets at an agent's next start, once their announcement has left the context, now comes only for a server granted `pushEvents`, like every other notice of its changes. Grant `pushEvents` to that server to keep the reminders.
