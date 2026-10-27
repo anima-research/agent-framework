@@ -16208,8 +16208,8 @@ export class AgentFramework {
     // Every agent that can read this message must not have compiled past it.
     // Residents share one message slot, so a message one of them read is
     // history for all of them (the never-rewrite rule is about the message,
-    // not the agent that happened to be asked). A reader is one whose own
-    // view holds the message: a tune-out-diverted message never enters a
+    // not the agent that happened to be asked). A reader is one whose view
+    // filter keeps the message: a tune-out-diverted message never enters a
     // resident's compiled view, and only the subconscious reads it through
     // its merged view — no subconscious, nobody reads it.
     const readers = (this.sharedSlotAgents.has(agent)
