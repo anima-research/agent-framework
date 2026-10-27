@@ -45,9 +45,10 @@ export function cutOffRound(response: NormalizedResponse): CutOffRound | undefin
 }
 
 /**
- * Membrane 0.7.2's grammar for the anthropic-xml formatter's XML tool mode,
- * which membrane doesn't export (dist/utils/tool-parser.js:
- * hasUnclosedToolBlock, endsWithPartialToolBlock, INVOKE_REGEX): a block opens
+ * Membrane 0.8.0's grammar (unchanged from 0.7.2) for the anthropic-xml
+ * formatter's XML tool mode. Membrane exports two of its predicates,
+ * hasUnclosedToolBlock and endsWithPartialToolBlock, but not the grammar
+ * itself (dist/utils/tool-parser.js, INVOKE_REGEX): a block opens
  * with `<function_calls>` and each call with `<invoke name="…">`, either tag
  * optionally `antml:` prefixed, and a closer ends the innermost block still
  * open. Its parser takes spans out of an unclosed block's text, which leaves
