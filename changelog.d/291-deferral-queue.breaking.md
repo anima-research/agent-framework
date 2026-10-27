@@ -1,10 +1,13 @@
 - **Hosts and module authors: the deferral queue is gone** (#291). A context write is stored at once, whatever its
   agent's turn and whether the host is quiesced, and enters each agent's window at that agent's presentation points
-  (see the presentation index's entries). Only a live operator surgery (a rollback, a suppression, a branch switch)
-  keeps a write out of the store: it is held in memory, its id is `''`, and its release stores it in arrival order.
-  A crash during the surgery loses such a write; earlier releases kept a quiesced host's queue on disk. A write made
-  while quiesced is on the branch the store was on when it was made: a rollback or a branch switch later in the same
-  quiesce leaves it there, where it used to land on the branch chosen by resume.
+  (see the presentation index's entries). Only two things keep a write out of the store, each holding it in memory
+  with the id `''`: a live operator surgery (a rollback, a suppression, a branch switch), whose release stores it in
+  arrival order, and an agent's context manager that refuses its work after a failed re-initialization, which keeps
+  each write for the agent until a `switchBranch()` re-initializes it and that switch's release stores them in
+  arrival order (if the agent ends first, those the primary takes in its place go on to it and the rest are dropped).
+  A crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's
+  queue on disk. A write made while quiesced is on the branch the store was on when it was made: a rollback or a
+  branch switch later in the same quiesce leaves it there, where it used to land on the branch chosen by resume.
   - **Module authors:** `ModuleContext.addMessage` answers the stored id, never a `held:` handle. `ModuleMessage.held`
     keeps its name with a new meaning: the row is stored and not in the window of the agent the read is for (not yet
     presented to it, or taken out as an undone turn's); its `id`, `sequence` and `timestamp` are the store's. It is
@@ -20,13 +23,18 @@
     carries held messages as `tune-out-cancel-held` rows after it: its view holds them stored. The trace
     `tune-out:reader-fork` loses `queued`.
   - **Hosts:** `WritePlacement.deferredId` and `CoalescingPlacement.deferredId` are removed (a placement names its
-    stored `messageId`, or only its agent while a surgery holds the write). `HostModeStatus.deferredWrites` is
-    deprecated, and counts the writes a live surgery holds (0 otherwise). `quiesce()` no longer writes a queue and
-    never throws `QuiesceBlockedError`, which stays exported, deprecated, for one release; the API server's 409 for
-    it and the `host/command` refusal are gone. `FrameworkConfig.deferredWritesPath` is deprecated: it names where an
+    stored `messageId`, or only its agent while the write is kept in memory). `HostModeStatus.deferredWrites` is
+    deprecated, and counts the writes kept in memory, a live surgery's and those waiting for an agent's recovery (0
+    otherwise). `quiesce()` no longer writes a queue and never throws `QuiesceBlockedError`, which stays exported,
+    deprecated, for one release; the API server's 409 for it and the `host/command` refusal are gone. `FrameworkConfig.deferredWritesPath` is deprecated: it names where an
     earlier release's queue is read from at boot, once. `InferenceRequest.readsRow` is always a stored id.
-  - **Traces:** `puppet:tool-call` loses `deferred`; `dendrite:mail-deferred` fires only for mail a surgery holds;
-    `message:added` no longer comes with the `deferred-flush:*` sources (an imported write's is `deferred-import`).
+  - **Traces:** `puppet:tool-call` loses `deferred`; `dendrite:mail-deferred` fires only for mail kept in memory (a
+    surgery holds it, or its recipient's context manager refuses its work); `message:added` no longer comes with the
+    `deferred-flush:*` sources (an imported write's is `deferred-import`). A write kept in memory is traced once, as a
+    release stores it: `message:added` with its stored id and source `surgery-release`. Its arrival is never traced,
+    where a module's process response, a resident's channel message, a push event and a script's wake traced it with
+    the id `''` (or `'deferred'`) and a fork's channel message didn't, so a consumer keyed on the id or counting a
+    source sees a held write once, under `surgery-release`.
   - **Rollback:** a release before this one reads the queue's record this one leaves (empty), so nothing is lost
     going back, but it reads the record as it reads a store, interleaved: rows stored for an agent during its turn
     are in its next compile where the record put them.

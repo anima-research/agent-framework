@@ -1670,7 +1670,9 @@ function sameCheckpoint(a: TurnCheckpoint, b: TurnCheckpoint): boolean {
 
 /**
  * A write a surgery's hold kept out of every store
- * (AgentFramework.surgeryHeldWrites): what addMessage was given, or, for a
+ * (AgentFramework.surgeryHeldWrites), or one kept for an agent whose context
+ * manager refuses its work until a switch re-initializes it
+ * (AgentFramework.heldForRecovery): what addMessage was given, or, for a
  * write straight into a fork's store (`direct`), the fork's name and the row.
  */
 interface SurgeryHeldWrite {
@@ -2046,11 +2048,13 @@ export interface HostModeStatus {
    * operator sees what is still acting during the window. */
   backgroundScripts: number;
   /**
-   * Context writes a live operator surgery's hold keeps in memory, to be
-   * stored at its release; 0 otherwise. Before #291 it counted the writes
-   * held in the deferred queue, which this release no longer keeps: a write
-   * made while quiesced is stored at once, and no agent is shown another's
-   * until resume.
+   * Context writes kept in memory, to be stored later: those a live
+   * operator surgery's hold keeps until its release, and those kept for an
+   * agent whose context manager refuses its work after a failed
+   * re-initialization, until a switchBranch() re-initializes it; 0
+   * otherwise. Before #291 it counted the writes held in the deferred queue,
+   * which this release no longer keeps: a write made while quiesced is
+   * stored at once, and no agent is shown another's until resume.
    *
    * @deprecated Kept for one release; removed in the next.
    */
@@ -2741,9 +2745,12 @@ export interface ReinitAlertText {
 export const REINIT_MOVES = ['undo', 'redo', 'rollback', 'suppression', 'branch switch'] as const;
 export type ReinitMove = (typeof REINIT_MOVES)[number];
 
-// #291: no queue keeps a write for a manager that refuses its work, so until
-// then a write meant for its agent fails at its writer, which logs it.
-const RECOVERY = 're-initializes it; until then a write for this agent fails at its writer, as no queue keeps it.';
+// #291: no queue keeps a write for a manager that refuses its work. Each
+// write for its agent waits in memory instead (heldForRecovery), its writer
+// answered as a held write's is, until a switch re-initializes the manager
+// and its release stores them in arrival order; a restart loses them, and an
+// agent that ends first passes on the ones the primary takes in its place.
+const RECOVERY = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them.';
 
 export function refusedWorkAlert(move: ReinitMove, cause: string): ReinitAlertText {
   const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
@@ -2777,20 +2784,31 @@ export function restoreAlert(restore: {
 
 export function disposalAlert(disposal: {
   move: ReinitMove;
+  /** The writes kept in memory for it, by the move's hold or while its manager refused its work, that it ended before storing. */
   heldWrites?: number;
+  /** How many of them went on to the primary, which takes them in its place (passesToPrimary); the rest were dropped. */
+  passedOn?: number;
   reinitFailed?: string;
   cleanupFailed?: string;
 }): ReinitAlertText {
-  const { move, heldWrites = 0, reinitFailed, cleanupFailed } = disposal;
+  const { move, heldWrites = 0, passedOn = 0, reinitFailed, cleanupFailed } = disposal;
   const opening = `The ${move} left this conversation agent with no messages of its own, so ` +
     (cleanupFailed
       ? 'it was unregistered and its channel unbound, but its cleanup failed (below). '
       : 'it was disposed and its channel unbound. ') +
     "Its channel's next qualifying message spawns a new fork from the template, under a new name, which needs the " +
     "template's own context manager to be working.";
+  // The writes kept in memory for it (passHeldWritesOn): those the primary
+  // takes in its place went on to it, and the rest were dropped.
+  const writes = (n: number) => (n === 1 ? '1 write' : `${n} writes`);
+  const dropped = heldWrites - passedOn;
   const held = heldWrites === 0
     ? ''
-    : ` ${heldWrites === 1 ? '1 write was' : `${heldWrites} writes were`} held for it while the store was held.`;
+    : dropped === 0
+      ? ` ${writes(heldWrites)} held for it went to the primary.`
+      : passedOn === 0
+        ? ` ${writes(heldWrites)} held for it ${heldWrites === 1 ? "was dropped: it doesn't go" : 'were dropped: none goes'} to the primary.`
+        : ` Of ${writes(heldWrites)} held for it, ${passedOn} went to the primary and ${dropped} ${dropped === 1 ? 'was' : 'were'} dropped.`;
   return {
     opening,
     message: `${opening}${held} Its messages stay on the branches that hold them, but no agent reads them again, ` +
@@ -2810,10 +2828,12 @@ export function longHoldAlert(hold: {
 }): ReinitAlertText {
   const { move, agentName, heldSeconds, queued, reinitializing, waitingForMaintenance } = hold;
   // #291: the hold keeps its writes in memory (surgeryHeldWrites), and its
-  // release stores them; no queue persists them.
+  // release stores them; no queue persists them, nor the writes kept for an
+  // agent whose manager refuses its work (heldForRecovery).
   const opening = `The ${move} has held the store for ${heldSeconds} s, so no turn starts and the writes it holds wait in ` +
     `memory (${queued === 1 ? '1 write' : `${queued} writes`} now). A restart ends the ${move}, the ` +
-    'conversation agents and the runs, and re-initializes the configured agents; the writes the hold keeps are lost.';
+    'conversation agents and the runs, and re-initializes the configured agents; the writes the hold keeps are lost, ' +
+    'as are those kept for a manager refusing its work.';
   const on = reinitializing !== undefined
     ? `, and is re-initializing ${reinitializing}'s context manager now`
     : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
@@ -2830,7 +2850,7 @@ const MOVE_NOUNS: Readonly<Record<string, string>> = {
 
 type ManagerReinitFailure =
   | { agentName: string; error: string }
-  | { agentName: string; disposed: { heldWrites: number; reinitFailed?: string; cleanupFailed?: string } };
+  | { agentName: string; disposed: { heldWrites: number; passedOn: number; reinitFailed?: string; cleanupFailed?: string } };
 
 /** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
 function scriptResultBrief(content: unknown[]): string {
@@ -3290,6 +3310,15 @@ function channelNoticePassOn(metadata: unknown): ChannelNoticePassOn | null {
 function passesToPrimary(metadata: unknown): boolean {
   return (metadata as { kind?: unknown } | null | undefined)?.kind === 'discord-send-failed' ||
     channelNoticePassOn(metadata) !== null || isPrimaryIfUnread(metadata);
+}
+
+/** Whether a write was refused by context-manager's initialization fence:
+ *  its manager's last strategy initialization failed (a re-initialization
+ *  after a branch move, reinitializeManagers), so it refuses every write
+ *  until one succeeds. Only that refusal: any other error a write meets is
+ *  the writer's to hear. */
+function refusesUntilReinitialized(error: unknown): boolean {
+  return error instanceof Error && /^ContextManager\.addMessage requires successful strategy initialization\b/.test(error.message);
 }
 
 /** Whether a stored message or queued write is a module's write for an
@@ -3863,6 +3892,18 @@ export class AgentFramework {
    * (releaseSurgeryHeldWrites).
    */
   private readonly surgeryHeldWrites: SurgeryHeldWrite[] = [];
+  /**
+   * Writes for an agent whose context manager refuses its work, by the
+   * agent's name, each agent's in arrival order: its re-initialization after
+   * a branch move failed (reinitializeManagers), and context-manager's
+   * initialization fence refused a write for it (refusesUntilReinitialized),
+   * at its writer or at a hold's release. Every later write for the agent
+   * waits behind them. They are in memory only, so a restart loses them: the
+   * next move that re-initializes the agent stores them, at its release, as
+   * the hold's own writes (recoverHeldWrites), and an agent that ends first
+   * passes on the ones the primary takes in its place (passHeldWritesOn).
+   */
+  private readonly heldForRecovery = new Map<string, SurgeryHeldWrite[]>();
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
   /**
@@ -4765,13 +4806,16 @@ export class AgentFramework {
           },
           // What a surgery's hold keeps for the primary's store until its
           // release, as addMessage was given it: a tune-out that ends during
-          // the hold lists its held messages among them (#232 gap 7). A
-          // write straight into a fork's store isn't the primary's. Read
+          // the hold lists its held messages among them (#232 gap 7). So do
+          // the writes kept for the primary while its context manager
+          // refuses its work (heldForRecovery), which came first. A write
+          // straight into a fork's store isn't the primary's. Read
           // defensively, as releaseSurgeryHeldWrites is.
           getSurgeryHeldMessages: () => {
             const primary = framework.primaryAgentName;
-            return (framework.surgeryHeldWrites ?? [])
-              .filter((write) => !write.direct && (write.opts?.forAgent ?? primary) === primary)
+            const forPrimary = (write: SurgeryHeldWrite) => !write.direct && (write.opts?.forAgent ?? primary) === primary;
+            return [...(primary ? framework.heldForRecovery?.get(primary) ?? [] : []), ...(framework.surgeryHeldWrites ?? [])]
+              .filter(forPrimary)
               .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
           },
           commitDeliveries: () => framework.commitDeliveries(),
@@ -7981,8 +8025,9 @@ export class AgentFramework {
       gatedRequests: this.pendingRequests.filter((r) => !passesQuiesce(r)).length,
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
       // Deprecated (#291): no queue is kept. What a live surgery's hold
-      // keeps in memory, to land at its release.
-      deferredWrites: this.surgeryHeldWrites?.length ?? 0,
+      // keeps in memory, to land at its release, and what waits in memory
+      // for an agent's recovery (heldForRecovery).
+      deferredWrites: (this.surgeryHeldWrites?.length ?? 0) + this.writesHeldForRecovery(),
       ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
     };
   }
@@ -10631,9 +10676,10 @@ export class AgentFramework {
     );
     if (!placement.messageId) {
       // Held behind a live surgery, in memory (surgeryHeldWrites), to be
-      // stored at its release. `mail-delivered` fires when the message
-      // actually enters its store (releaseLandedMail): published is not
-      // delivered.
+      // stored at its release, or kept for a recipient whose context
+      // manager refuses its work until a move re-initializes it
+      // (heldForRecovery). `mail-delivered` fires when the message actually
+      // enters its store (releaseLandedMail): published is not delivered.
       this.emitTrace({
         type: 'dendrite:mail-deferred',
         mailId: mail.id,
@@ -13261,13 +13307,18 @@ export class AgentFramework {
    * fails stays fenced until a later one succeeds (switchBranch() to the
    * branch the store is on), and its agent's window stays the record until
    * the next move, traced as presentation:failed at `'rebase'`; so does an
-   * agent whose window can't be written down.
+   * agent whose window can't be written down. The writes for it meanwhile
+   * wait in memory (heldForRecovery), and the move whose re-initialization
+   * of it succeeds stores them at its release (recoverHeldWrites).
    */
   private async followBranchMove(except?: string): Promise<ManagerReinitFailure[]> {
     let failures: ManagerReinitFailure[] = [];
     try {
       this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
+      // A manager that refused its work, and doesn't now, has the writes
+      // kept for it meanwhile stored at the move's release, first.
+      this.recoverHeldWrites(failures);
       for (const agent of this.agents.values()) {
         const failed = failures.find((f) => f.agentName === agent.name);
         this.presentation?.rebase(agent, failed && 'error' in failed ? failed.error : undefined);
@@ -13833,6 +13884,102 @@ export class AgentFramework {
     return failures;
   }
 
+  /**
+   * After a move's pass (reinitializeManagers): the writes kept in memory
+   * for each agent whose context manager refused its work
+   * (heldForRecovery), and whose re-initialization didn't fail this time,
+   * go back to the move's hold ahead of the writes it keeps now, which came
+   * after them, each agent's in arrival order. The release stores them
+   * through the ordinary write path and traces each as it lands
+   * (releaseSurgeryHeldWrites); one its manager still refuses there is kept
+   * for it again, and the ones after it wait behind it. An agent gone
+   * meanwhile passes them on (passHeldWritesOn). With no hold, which no
+   * move makes, they are stored now.
+   */
+  private recoverHeldWrites(failures: readonly ManagerReinitFailure[]): void {
+    // Read defensively, as releaseSurgeryHeldWrites is.
+    const kept = this.heldForRecovery;
+    if (!kept || kept.size === 0) return;
+    const recovered: SurgeryHeldWrite[] = [];
+    for (const [agentName, writes] of [...kept]) {
+      if (failures.some((failure) => failure.agentName === agentName)) continue;
+      kept.delete(agentName);
+      if (!this.agents.has(agentName)) {
+        this.passHeldWritesOn(agentName, writes);
+        continue;
+      }
+      console.error(
+        `[surgery] agent=${agentName}: its context manager is re-initialized, so the ${writes.length} write(s) kept in ` +
+        "memory for it while it refused its work go to the move's release, ahead of the writes its hold keeps",
+      );
+      recovered.push(...writes);
+    }
+    if (recovered.length === 0) return;
+    this.surgeryHeldWrites.unshift(...recovered);
+    if (!this.surgeryHold) this.releaseSurgeryHeldWrites();
+  }
+
+  /**
+   * Keep `write` in memory for `agentName`, whose context manager refuses
+   * its work (heldForRecovery), behind the writes already kept for it. The
+   * first one kept is logged with the refusal that began the wait.
+   */
+  private keepForRecovery(agentName: string, write: SurgeryHeldWrite, refusal?: unknown): void {
+    const kept = this.heldForRecovery.get(agentName);
+    if (kept) {
+      kept.push(write);
+      return;
+    }
+    this.heldForRecovery.set(agentName, [write]);
+    console.error(
+      `[surgery] agent=${agentName}: its context manager refuses its work, so this write for it, and each one after it, ` +
+      'waits in memory until switchBranch() re-initializes it and stores them (a restart loses them)' +
+      (refusal === undefined ? '' : `: ${errorMessage(refusal)}`),
+    );
+  }
+
+  /** Whether writes for `agentName` wait in memory for its context manager's recovery (heldForRecovery). */
+  private waitsForRecovery(agentName: string): boolean {
+    // Read defensively, as releaseSurgeryHeldWrites is.
+    return (this.heldForRecovery?.get(agentName)?.length ?? 0) > 0;
+  }
+
+  /** How many writes wait in memory for an agent's recovery (heldForRecovery), every agent's. */
+  private writesHeldForRecovery(): number {
+    let count = 0;
+    for (const writes of this.heldForRecovery?.values() ?? []) count += writes.length;
+    return count;
+  }
+
+  /**
+   * Writes kept in memory for an agent that ended before they were stored
+   * (a fork a move emptied and disposed, or a fork or a run that ended while
+   * a hold kept them or while its context manager refused its work): each
+   * one the primary takes in its place, as a release of the agent's window
+   * passes it on (passesToPrimary: a failed reply, a channel notice its
+   * reader could act on, or a module's write for a run or a fork, which goes
+   * as the write itself), goes on to the primary by name
+   * (passNoticeToPrimary), in arrival order, where a hold keeps it until its
+   * release, as any write. The rest are dropped, which is logged. Never
+   * throws.
+   */
+  private passHeldWritesOn(agentName: string, writes: readonly SurgeryHeldWrite[]): { passed: number; dropped: number } {
+    let passed = 0;
+    for (const write of writes) {
+      if (!passesToPrimary(write.metadata)) continue;
+      if (this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content })) passed++;
+    }
+    const dropped = writes.length - passed;
+    if (dropped > 0) {
+      console.error(
+        `[surgery] ${dropped} write(s) kept in memory for ${agentName}, which has ended, ${dropped === 1 ? 'is' : 'are'} ` +
+        "dropped, as no agent reads them now: only a notice its reader could act on, or a module's write, goes to " +
+        'the primary in its place',
+      );
+    }
+    return { passed, dropped };
+  }
+
   private reportLongHold(hold: { verb: string; agentName: string; since: number; reinitializing?: string }): void {
     const heldMs = Date.now() - hold.since;
     // The writes the hold keeps in memory (surgeryHeldWrites), which its
@@ -13864,8 +14011,24 @@ export class AgentFramework {
     for (const { agentName, home } of forks) {
       const agent = this.agents.get(agentName);
       if (!agent || agent.getContextManager().getMessageCount() > 0) continue;
-      const heldWrites = (this.surgeryHeldWrites ?? [])
-        .filter((write) => (write.direct?.agentName ?? write.opts?.forAgent ?? this.primaryAgentName) === agentName).length;
+      // The writes kept in memory for it leave with it: those kept while its
+      // manager refused its work (heldForRecovery), then those the move's
+      // hold keeps for it, taken out before it is disposed so that neither
+      // its end nor the release meets them. The ones the primary takes in
+      // its place go on to it, held by the hold until its release as any
+      // write; the rest are dropped (passHeldWritesOn).
+      const held = [...(this.heldForRecovery?.get(agentName) ?? [])];
+      this.heldForRecovery?.delete(agentName);
+      const holding = this.surgeryHeldWrites ?? [];
+      for (let i = 0; i < holding.length;) {
+        const write = holding[i]!;
+        if ((write.direct?.agentName ?? write.opts?.forAgent ?? this.primaryAgentName) === agentName) {
+          holding.splice(i, 1);
+          held.push(write);
+        } else {
+          i++;
+        }
+      }
       let cleanupFailed: string | undefined;
       try {
         if (home && this.conversationRouter && this.conversationRouter.getBinding(home)?.agentName === agentName) {
@@ -13875,9 +14038,11 @@ export class AgentFramework {
       } catch (error) {
         cleanupFailed = failureDescription(error);
       }
+      const { passed } = this.passHeldWritesOn(agentName, held);
       const failed = failures.find((f) => f.agentName === agentName && 'error' in f);
       disposals.push({ agentName, disposed: {
-        heldWrites,
+        heldWrites: held.length,
+        passedOn: passed,
         ...(failed && 'error' in failed ? { reinitFailed: failed.error } : {}),
         ...(cleanupFailed !== undefined ? { cleanupFailed } : {}),
       } });
@@ -16307,7 +16472,10 @@ export class AgentFramework {
         const audience = requested && !heldFromResidents(metadata) ? requested : undefined;
         const id = this.addMessage(msg.participant, msg.content, metadata, { placement, ...(audience ? { audience } : {}) });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
-        this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
+        // A write kept in memory (a surgery's hold, or the wait for its
+        // agent's recovery) has no id yet: it is traced once, as it is
+        // stored ('surgery-release').
+        if (id) this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
       }
     }
 
@@ -16603,7 +16771,8 @@ export class AgentFramework {
         if (this.conversationRouter.getBinding(channel)?.agentName === target.name) {
           this.conversationRouter.touch(channel);
         }
-        // A write a surgery holds (no id yet) is stored at the hold's release.
+        // A write kept in memory (no id yet: a surgery's hold, or the wait
+        // for the fork's recovery) is traced once, as it is stored.
         if (placement.messageId) this.emitTrace({ type: 'message:added', messageId: placement.messageId, source: 'mcpl:channel-incoming' });
         if (decision.wake) {
           this.pendingRequests.push({
@@ -16658,7 +16827,8 @@ export class AgentFramework {
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
       placement, audience: AgentFramework.inboundAudience(decision),
     });
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    // A write kept in memory (no id yet) is traced once, as it is stored.
+    if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
     if (decision.locus) this.noteDeliveredOrPark(event);
 
     if (decision.wake) {
@@ -16782,7 +16952,8 @@ export class AgentFramework {
     // the legacy rule). A held or dropped message never is.
     if (admission.locus) this.noteDeliveredOrPark(event as Parameters<AgentFramework['noteDeliveredOrPark']>[0]);
     router.touch(channel);
-    // A write a surgery holds (no id yet) is stored at the hold's release.
+    // A write kept in memory (no id yet: a surgery's hold, or the wait for
+    // the fork's recovery) is traced once, as it is stored.
     if (placement.messageId) this.emitTrace({ type: 'message:added', messageId: placement.messageId, source: 'mcpl:channel-incoming' });
 
     if (trigger) {
@@ -16808,8 +16979,10 @@ export class AgentFramework {
    * alone, and presented at the fork's next point, at once when no turn of
    * its is alive), and where it went: the fork, with the stored id. While a
    * surgery holds the store, storeInFork keeps the write in memory
-   * (surgeryHeldWrites) and the hold's release stores it, so the placement
-   * names the fork alone, with no id yet.
+   * (surgeryHeldWrites) and the hold's release stores it, and while the
+   * fork's context manager refuses its work it keeps it for the move that
+   * re-initializes it (heldForRecovery), so the placement names the fork
+   * alone, with no id yet.
    */
   private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>): CoalescingPlacement {
     const id = this.storeInFork(agent, content, metadata as MessageMetadata);
@@ -18153,8 +18326,9 @@ export class AgentFramework {
 
   /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
    *  shown watermark, never possibly shown (its isUnshown). A placement with
-   *  no stored row, a write a surgery's hold keeps in memory, counts as read
-   *  and as shown: it can't be found again once it is stored. */
+   *  no stored row, a write kept in memory (a surgery's hold, or the wait
+   *  for its agent's recovery), counts as read and as shown: it can't be
+   *  found again once it is stored. */
   private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
@@ -18444,7 +18618,8 @@ export class AgentFramework {
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
         placement, audience: AgentFramework.inboundAudience(decision),
       });
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+      // A write kept in memory (no id yet) is traced once, as it is stored.
+      if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
@@ -20425,17 +20600,31 @@ export class AgentFramework {
    * addMessage, as the fork writes are (a correction
    * handleMcplChannelIncoming delivers, a message routeConversationIncoming
    * routes), stamped for the fork alone. While a surgery holds the store it
-   * is held in memory instead (surgeryHeldWrites) and '' returned; stored,
-   * it enters the fork's window at once when no turn of the fork's is
-   * alive, else at the fork's next point (afterStore).
+   * is held in memory instead (surgeryHeldWrites) and '' returned, and so
+   * is it while the fork's context manager refuses its work after a failed
+   * re-initialization (heldForRecovery, as addMessage keeps a write);
+   * stored, it enters the fork's window at once when no turn of the fork's
+   * is alive, else at the fork's next point (afterStore).
    */
   private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata): MessageId {
     const presents = this.presents(target);
+    const kept = (): SurgeryHeldWrite => ({ participant: 'user', content, metadata, direct: { agentName: target.name }, heldAt: Date.now() });
     if (this.surgeryHold) {
-      this.surgeryHeldWrites.push({ participant: 'user', content, metadata, direct: { agentName: target.name }, heldAt: Date.now() });
+      this.surgeryHeldWrites.push(kept());
       return '' as MessageId;
     }
-    const id = target.getContextManager().addMessage('user', content, withAudience(metadata, [target.name]));
+    if (this.waitsForRecovery(target.name)) {
+      this.keepForRecovery(target.name, kept());
+      return '' as MessageId;
+    }
+    let id: MessageId;
+    try {
+      id = target.getContextManager().addMessage('user', content, withAudience(metadata, [target.name]));
+    } catch (error) {
+      if (!refusesUntilReinitialized(error)) throw error;
+      this.keepForRecovery(target.name, kept(), error);
+      return '' as MessageId;
+    }
     if (presents) this.presentation!.afterStore(target, [id]);
     return id;
   }
@@ -20443,10 +20632,17 @@ export class AgentFramework {
   /**
    * The writes a surgery's hold kept (surgeryHeldWrites), replayed in the
    * order they arrived once the hold and its tokens are released, each by
-   * the path it was held on: addMessage's, or a fork's store. Each is traced
-   * as it is stored (`message:added`, source `surgery-release`, with its
-   * stored id), as its arrival named none. A fork gone since takes nothing,
-   * which is logged. A write that throws now is logged, and the rest go on.
+   * the path it was held on: addMessage's, or a fork's store. Ahead of them
+   * are the writes kept for an agent whose context manager the move
+   * re-initialized after it refused its work (recoverHeldWrites). Each is
+   * traced once, as it is stored (`message:added`, source
+   * `surgery-release`, with its stored id): its arrival named none, and
+   * wasn't traced. A write for an agent whose context manager refuses its
+   * work is kept in memory for it again (heldForRecovery), never dropped,
+   * and is traced when a later move stores it. A write for an agent gone
+   * since goes on to the primary if it is one the primary takes in its
+   * place, and is dropped otherwise (passHeldWritesOn), logged. A write that
+   * throws now is logged, and the rest go on.
    */
   private releaseSurgeryHeldWrites(): void {
     // Read defensively: a framework built from its prototype, as some
@@ -20454,13 +20650,14 @@ export class AgentFramework {
     const held = this.surgeryHeldWrites?.splice(0) ?? [];
     for (const write of held) {
       try {
+        const named = write.direct?.agentName ?? write.opts?.forAgent;
+        if (named !== undefined && !this.agents.has(named)) {
+          this.passHeldWritesOn(named, [write]);
+          continue;
+        }
         let id: MessageId;
         if (write.direct) {
-          const target = this.agents.get(write.direct.agentName);
-          if (!target) {
-            console.error(`[surgery] a channel message held for fork ${write.direct.agentName} has no fork to land in now, so it is dropped`);
-            continue;
-          }
+          const target = this.agents.get(write.direct.agentName)!;
           if (!this.turnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
             this.storeDueClock(target, 'event');
           }
@@ -20525,6 +20722,10 @@ export class AgentFramework {
   ): { id: MessageId; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
     const config = agent.clock;
     if (!config || this.quiesced) return undefined;
+    // None while the agent's writes wait for its context manager's recovery
+    // (heldForRecovery): the manager refuses the row, and the first of those
+    // writes stored at the recovery takes the clock due then.
+    if (this.waitsForRecovery(agent.name)) return undefined;
     let planned: ReturnType<typeof planClock>;
     try {
       planned = planClock({ now: Date.now(), ...this.lastClockOf(agent), config, zone: this.timeZone });
@@ -22157,7 +22358,7 @@ export class AgentFramework {
       try {
         if (target) {
           const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, target);
-          this.emitTrace({ type: 'message:added', messageId: id ?? 'deferred', source: 'prose-bounce' });
+          if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
         }
       } catch (err) {
         console.error('bounceProse: failed to record the unknown-send notice:', err);
@@ -22235,8 +22436,8 @@ export class AgentFramework {
           { system: true, kind: 'prose-bounce', ...(draft ? { draftOwner: name, draftIds: [draft.id] } : {}) } as MessageMetadata,
           target,
         );
+        // A write kept in memory (no id yet) is traced once, as it is stored.
         if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
-        else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
       } catch (err) {
         console.error('bounceProse: failed to record bounce notice:', err);
       }
@@ -26845,11 +27046,8 @@ export class AgentFramework {
         timestamp: Date.now(),
         ...this.readsRowFor(placement, agentName),
       });
-      this.emitTrace({
-        type: 'message:added',
-        messageId: messageId || 'deferred',
-        source: `code-execution-script:${label}`,
-      });
+      // A write kept in memory (no id yet) is traced once, as it is stored.
+      if (messageId) this.emitTrace({ type: 'message:added', messageId, source: `code-execution-script:${label}` });
     } catch (err) {
       console.error(`[code_execution:${agentName}:${label}] wake injection failed: ${err instanceof Error ? err.message : String(err)}`);
       throw err;
@@ -28471,15 +28669,30 @@ export class AgentFramework {
     // release replays it through here (releaseSurgeryHeldWrites). It goes in
     // no window and no store before then, so its placement names only its
     // agent.
-    if (this.surgeryHold && !opts?.imported) {
-      const { placement, ...rest } = opts ?? {};
-      this.surgeryHeldWrites.push({
+    const kept = (): SurgeryHeldWrite => {
+      const { placement: _placement, ...rest } = opts ?? {};
+      return {
         participant, content,
         ...(given !== undefined ? { metadata: given } : {}),
         ...(opts ? { opts: rest } : {}),
         heldAt: Date.now(),
-      });
-      if (placement) placement.agent = agent.name;
+      };
+    };
+    if (this.surgeryHold && !opts?.imported) {
+      this.surgeryHeldWrites.push(kept());
+      if (opts?.placement) opts.placement.agent = agent.name;
+      return '' as MessageId;
+    }
+    // So does an agent's context manager that refuses its work after a
+    // failed re-initialization, until a move re-initializes it: the write
+    // waits in memory, as given, behind those already kept for the agent
+    // (heldForRecovery), and is answered as a held write is, never failed at
+    // its writer. The move that re-initializes the agent stores them at its
+    // release, in arrival order (recoverHeldWrites); one the manager refuses
+    // below is kept so too.
+    if (!opts?.imported && this.waitsForRecovery(agent.name)) {
+      this.keepForRecovery(agent.name, kept());
+      if (opts?.placement) opts.placement.agent = agent.name;
       return '' as MessageId;
     }
 
@@ -28510,11 +28723,23 @@ export class AgentFramework {
       && (!this.turnAlive(agent) || this.assembling.has(agent.name))) {
       this.storeDueClock(agent, 'event');
     }
-    const stored = agent.getContextManager().addMessage(
-      participant,
-      content,
-      opts?.imported ? withDeferredWriteId(metadata, opts.imported.writeId) : metadata,
-    );
+    let stored: MessageId;
+    try {
+      stored = agent.getContextManager().addMessage(
+        participant,
+        content,
+        opts?.imported ? withDeferredWriteId(metadata, opts.imported.writeId) : metadata,
+      );
+    } catch (error) {
+      // context-manager's initialization fence: the manager refuses every
+      // write until a re-initialization succeeds, so this one waits for it
+      // (above). An imported write stays queued for the next boot, as any
+      // the importer can't store.
+      if (opts?.imported || !refusesUntilReinitialized(error)) throw error;
+      this.keepForRecovery(agent.name, kept(), error);
+      if (opts?.placement) opts.placement.agent = agent.name;
+      return '' as MessageId;
+    }
     if (opts?.placement) {
       opts.placement.agent = agent.name;
       opts.placement.messageId = stored;
@@ -28762,7 +28987,8 @@ export class AgentFramework {
   /**
    * Held agent mail is released only when its message has actually entered
    * the recipient's store, as a copy for that recipient — never while a
-   * surgery's hold keeps the write. Called where the framework stores a
+   * surgery's hold, or the wait for the recipient's recovery, keeps the
+   * write in memory. Called where the framework stores a
    * message (addMessage, and the importer's lookup of a write that landed).
    * Both writes reach disk in the same sync, so a crash keeps either both or
    * neither.
@@ -29097,9 +29323,20 @@ export class AgentFramework {
    * write addressed to it meanwhile is treated as for any agent no longer
    * registered (dropped, or passed to the primary if it's a failed reply, a
    * channel notice its reader could act on, or a module's write for a run or
-   * a fork: passesToPrimary).
+   * a fork: passesToPrimary). The writes kept in memory for it while its
+   * context manager refused its work, which no window holds, are judged so
+   * at once.
    */
   private releaseWindowNowOrAfterResume(agent: Agent): void {
+    // The writes kept in memory for it while its context manager refused its
+    // work (heldForRecovery) were never stored, so no window holds them: the
+    // ones the primary takes in its place go on to it now, as its window's
+    // unread notices do, and the rest are dropped (passHeldWritesOn).
+    const kept = this.heldForRecovery?.get(agent.name);
+    if (kept) {
+      this.heldForRecovery.delete(agent.name);
+      this.passHeldWritesOn(agent.name, kept);
+    }
     this.releasedReaders.set(agent, recordedReaderFacts(this.registry, agent.name));
     if (this.quiesced) this.releasesAfterResume.set(agent.name, agent);
     else this.releaseWindow(agent);
@@ -29130,20 +29367,23 @@ export class AgentFramework {
    * the agent who takes the speaker's place. On a host with no primary it
    * goes where a write that names no agent goes, stamped as one. Never
    * throws: it runs inside a release, which must complete whatever this
-   * write meets.
+   * write meets. Whether the primary was told: false when no one is, or
+   * the write failed, each logged.
    */
   private passNoticeToPrimary(
     speaker: string,
     metadata: MessageMetadata | undefined,
     written?: { participant: string; content: ContentBlock[] },
-  ): void {
+  ): boolean {
     const notice = this.noticeForPrimary(speaker, metadata, written);
-    if (!notice) return;
+    if (!notice) return false;
     try {
       this.addMessage(notice.participant, notice.content, notice.metadata,
         this.primaryAgentName ? { audience: [this.primaryAgentName] } : undefined);
+      return true;
     } catch (err) {
       console.error(`[route-failure] failed to tell the primary ${notice.about}:`, err);
+      return false;
     }
   }
 
@@ -29316,8 +29556,11 @@ export class AgentFramework {
    * addMessage's. The write is stored at once whatever its agent's turn
    * (#291), and its stored id returned; it enters the agent's window at the
    * agent's next presentation point, or at once while no turn of it is
-   * alive. Only while a surgery's hold keeps the write in memory is the id
-   * '', and the write is stored at the hold's release.
+   * alive. Only while the write is kept in memory is the id '': a
+   * surgery's hold keeps it until its release stores it, and an agent whose
+   * context manager refuses its work after a failed re-initialization has
+   * it kept until a move re-initializes the agent and its release stores
+   * it (heldForRecovery).
    *
    * With `forAgent`, the write is for the named agent's window, which must
    * be registered when the write is made: a name that isn't, or the empty

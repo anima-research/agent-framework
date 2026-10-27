@@ -68,8 +68,8 @@ export class EmptyContentError extends CoalesceError {
 export interface CoalescingPlacement {
   agent: string;
   /** Stored message id in that agent's context manager. Absent for a write
-   *  a surgery's hold keeps in memory, which counts as read and can't be
-   *  removed. */
+   *  kept in memory (a surgery's hold, or the wait for its agent's
+   *  recovery), which counts as read and can't be removed. */
   messageId?: string;
   /** Set on a stored placement that wasn't presented to `agent` at its
    *  write, because a turn of the agent's was alive (#291's presentation

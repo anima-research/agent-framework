@@ -243,6 +243,47 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
+  // A write for a primary whose context manager refuses its work after a
+  // failed re-initialization waits in memory too, until the switch that
+  // re-initializes it stores it (heldForRecovery): a tune-out reads those
+  // writes as it reads a surgery's hold, so a check counts the message and a
+  // peek shows it while it waits, and it is stored once, with its hold
+  // record, when the switch recovers the primary.
+  it('gap 7 (recovery) — a held message kept in memory for a primary whose manager refuses its work is counted while kept, and stored once, with its hold record, when a switch recovers it', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const epochId = internals(f).channelRegistry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as { addMessage(p: string, c: unknown[], m: Record<string, unknown>): string };
+      // As admission stores a held message, for the primary.
+      const heldMessage = (t: string) => framework.addMessage('antra', [{ type: 'text', text: t }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      heldMessage('stored before the failure');
+      const strategy = f.framework.getAgent('agent')!.getContextManager().getStrategy() as unknown as {
+        initialize?: (...args: unknown[]) => Promise<void>;
+      };
+      const initialize = strategy.initialize?.bind(strategy);
+      let failNext = true;
+      strategy.initialize = async (...args: unknown[]) => {
+        if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+        await initialize?.(...args);
+      };
+      const branch = f.framework.getStore().currentBranch().name;
+      await f.framework.switchBranch(branch);
+      assert.equal(heldMessage('kept for the recovery'), '', 'premise: kept in memory, not refused at its writer');
+      assert.ok(!has(f, 'kept for the recovery'), 'premise: not stored');
+      assert.equal(coordinator.check().channels.find((c) => c.channelId === 'noisy')?.held, 2, 'a check counts it while kept');
+      const peek = coordinator.check({ peek: { serverId: 'editor', channelId: 'noisy' } }).peek ?? [];
+      assert.ok(peek.some((line) => line.includes('kept for the recovery')), 'and peeks it');
+      await f.framework.switchBranch(branch);
+      assert.equal(stored(f).filter((m) => textOf(m).includes('kept for the recovery')).length, 1, 'stored once, at the recovery');
+      assert.ok(held(find(f, 'kept for the recovery')), 'with its hold record');
+    } finally { await f.close(); }
+  });
+
   // Ported for #291: a release made behind a live turn is stored at once, so
   // nothing waits in memory for a crash to lose, and no queue file is
   // written. This test once checked the release was persisted in the

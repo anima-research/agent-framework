@@ -365,6 +365,10 @@ export type TraceEvent =
     })
 
   // Message lifecycle
+  /** A message stored, with its stored id. A write kept in memory first (a
+   *  live surgery's hold, or the wait for its agent's context manager to be
+   *  re-initialized) is traced once, as a release stores it, with source
+   *  `surgery-release`; its arrival isn't traced. */
   | (TraceEventBase & {
       type: 'message:added';
       messageId: string;
@@ -956,8 +960,10 @@ export type TraceEvent =
       from: string;
       to: string;
     })
-  /** Held in memory behind a live surgery (the operator's switch awaited);
-   *  `mail-delivered` follows when the hold's release stores it. */
+  /** Held in memory behind a live surgery (the operator's switch awaited),
+   *  or kept for a recipient whose context manager refuses its work after a
+   *  failed re-initialization; `mail-delivered` follows when a release
+   *  stores it. */
   | (TraceEventBase & {
       type: 'dendrite:mail-deferred';
       mailId: string;

@@ -852,8 +852,9 @@ class ModuleContextImpl implements ModuleContext {
     const id = this.addMessageFn(participant, content, metadata, opts);
 
     // Track external ID if provided: the stored id the write was given
-    // (#291 stores every write at once), or '' for one a surgery's hold
-    // keeps in memory, as earlier releases kept '' for a write they held.
+    // (#291 stores every write at once), or '' for one kept in memory (a
+    // surgery's hold, or the wait for its agent's recovery), as earlier
+    // releases kept '' for a write they held.
     // findMessageByExternalId finds such a write by its external id once it
     // is stored.
     if (metadata?.external) {
@@ -888,7 +889,8 @@ class ModuleContextImpl implements ModuleContext {
     if (entry === undefined) return null;
     // A stored id answers while the store holds its row, and once the row is
     // gone the entry goes, as removeMessage drops it. A '' here names no row:
-    // a write a surgery's hold kept, or one an earlier release held, whose
+    // a write kept in memory (a surgery's hold, or the wait for its agent's
+    // recovery), or one an earlier release held, whose
     // map it persisted with ''. So the message is looked up in the store by
     // its external id, and the first row found is taken, as
     // context-manager's findByExternalId takes it, and its id becomes the

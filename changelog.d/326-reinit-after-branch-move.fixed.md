@@ -22,11 +22,19 @@
   the webhook keeps of a long message, whatever the branches it names, and
   its cause last.
   That agent refuses its
-  work, compiles and message writes included, until `switchBranch()` (to
-  the branch the store is already on, too) re-initializes it. No queue
-  keeps a write for it meanwhile (#291): a write meant for it fails at its
-  writer, which logs it, and so does one the move's hold kept for it, at
-  the hold's release.
+  work, compiles included, until `switchBranch()` (to the branch the store
+  is already on, too) re-initializes it. A write meant for it meanwhile,
+  and one the move's hold kept for it, is neither refused at its writer nor
+  dropped: it waits in memory, answered as a held write is (its id `''`,
+  its placement naming only the agent), and the switch that re-initializes
+  the agent stores the writes so kept at its release, in arrival order,
+  each traced once as it lands (`message:added`, source `surgery-release`,
+  with its stored id), as main's queue stored them. No queue keeps them
+  (#291), so a restart loses them, as the alert says. An agent that ends
+  first passes on to the primary those the primary takes in its place (a
+  module's write for a run or a fork, a failed reply's notice, a channel
+  notice it could act on), and drops the rest, logged.
+  `HostModeStatus.deferredWrites` counts them while they wait.
   The move itself stands. A rollback or suppression whose switch back to the
   source branch fails as well raises the same alert for the agent it named,
   and says which branch the store is on, and whether the agent's manager
@@ -45,7 +53,8 @@
   the store is still up after 60 s raises one `store-held-long` ops alert.
   It says what a restart does: it ends the move, the conversation agents
   and the runs, and re-initializes the configured agents, and loses the
-  writes the hold keeps in memory. Then it names
+  writes the hold keeps in memory, and those kept for a manager refusing
+  its work. Then it names
   the agent the move was for, and the manager its pass is re-initializing
   or the maintenance it's waiting for. It's raised for every move that holds the store: a
   rollback, a suppression and a branch switch.
@@ -53,7 +62,12 @@
   the store moves to is disposed,** as one spawned after the point a move
   returns to has none there. Re-initialized, it would answer with no
   history. Its channel is unbound, and `context-reinit-failed` says so, and
-  how many writes were held for it while the store was held. Its channel's
+  how many writes were held for it, by the move's hold or while its manager
+  refused its work, and how many of them went to the primary: those the
+  primary takes in its place (a module's write for it, a failed reply's
+  notice, a channel notice it could act on) go on to it, stored at the
+  release, and the rest, such as its channel's messages, are dropped,
+  logged. Its channel's
   next qualifying message spawns a new fork from the template, under a new
   name, which needs the template's own context manager to be working. Its
   messages stay in the store, but no agent reads them again, so a switch

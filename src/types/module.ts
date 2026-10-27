@@ -334,9 +334,13 @@ export interface ModuleContext {
    * is stored at once, whatever the agent's turn (#291): it enters the
    * agent's window at the agent's next presentation point, or at once while
    * no turn of it is alive, and until then reads mark it `held`
-   * (ModuleMessage.held). Only while an operator's surgery holds the store
-   * is the id '': the write is kept in memory and stored at the surgery's
-   * end. Writes a release before #291 held and kept across a restart are
+   * (ModuleMessage.held). Only while the write is kept in memory is the id
+   * '': while an operator's surgery holds the store, stored at the
+   * surgery's end, and while the agent's context manager refuses its work
+   * after a failed re-initialization, stored when a switchBranch()
+   * re-initializes it (a restart loses it; if the agent ends first, it goes
+   * to the primary when it is a write the primary takes in its place).
+   * Writes a release before #291 held and kept across a restart are
    * stored once create() imports them, which is after every module's
    * start().
    *
@@ -400,7 +404,8 @@ export interface ModuleContext {
   /**
    * Find the message for an external ID this context added a message under:
    * the row it added, while the store holds it. For a write whose id this
-   * context doesn't keep (one an operator's surgery held, or one a release
+   * context doesn't keep (one kept in memory, by an operator's surgery or
+   * for its agent's recovery, or one a release
    * before #291 held, whose map it kept as ''), the first row the store
    * shows under that external ID. Null when this context added none under
    * it, when the row it added is gone, or when the store shows none for
