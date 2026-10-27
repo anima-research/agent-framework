@@ -67,10 +67,11 @@
   Where an earlier bounce is still held, either notice says that `{{unsent}}`
   names that draft, not these words. In every mode, words a send holds back
   are held as drafts, as in any turn. In locus and hybrid mode a send holds
-  back only speech going where it may have posted, so a private turn's
-  unprefixed speech, which has no target, is held only beside a send whose
-  place the framework can't read, and is kept private beside sends whose
-  places it reads. Speech handlers are told a private turn's speech is
+  back speech going where it may have posted, or, when the framework can't
+  read where it posted, speech going anywhere. A private turn's unprefixed
+  speech, and an envelope of its that names no destination or names one
+  that doesn't resolve, are going nowhere, so no send holds them back: they
+  are kept private. Speech handlers are told a private turn's speech is
   private (`SpeechContext.nonChannelOrigin`), and the built-in Discord
   module posts none of it and edits its thoughts into no message.
 

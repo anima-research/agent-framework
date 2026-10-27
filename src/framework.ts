@@ -1541,7 +1541,8 @@ const roundSilenceOf = (calls: readonly RoundCall[], round: number): TurnSilence
 const mergeSilence = (a: TurnSilence | null, b: TurnSilence | null): TurnSilence | null =>
   a === 'private' || b === 'private' ? 'private' : mergeSends(a, b);
 
-const sendHoldAt = (sends: SendsReached, to: ChannelRef | null): SendHold | undefined => {
+const sendHoldAt = (sends: SendsReached, to: ChannelRef | null, privateTurn: boolean): SendHold | undefined => {
+  if (!to && privateTurn) return undefined;
   if (sends.unknown) return { kind: 'unknown', ...sends.unknown };
   const place = to ? sends.places.get(destinationKey(to)) : undefined;
   return place ? { kind: 'place', place } : undefined;
@@ -17166,7 +17167,7 @@ export class AgentFramework {
           // inbound-only is refused as a target for speech.
           const resolved = this.channelRegistry?.resolveProseTarget(parsed.target!, { forSpeech: true, own: this.ownChannels(routing) });
           const to = resolved && !('error' in resolved) ? { serverId: resolved.serverId, channelId: resolved.channelId } : null;
-          const sendHold = sendHoldAt(sends, to);
+          const sendHold = sendHoldAt(sends, to, routing.nonChannelOrigin);
           if (!sendHold) {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, !routing.nonChannelOrigin, round);
             continue;
@@ -17191,7 +17192,7 @@ export class AgentFramework {
           }
         } else if (envelope.startsWith('>>>')) {
           // Malformed: an attempted destination that names none.
-          const sendHold = sendHoldAt(sends, null);
+          const sendHold = sendHoldAt(sends, null, routing.nonChannelOrigin);
           if (!sendHold) {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, !routing.nonChannelOrigin, round);
             continue;
@@ -17203,7 +17204,7 @@ export class AgentFramework {
           privateCount++;
         } else {
           const target = routing.hybridHold === 'failed' ? null : routing.pin ?? locus;
-          const sendHold = sendHoldAt(sends, target);
+          const sendHold = sendHoldAt(sends, target, routing.nonChannelOrigin);
           if (!sendHold) {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, !routing.nonChannelOrigin, round);
             continue;
@@ -22269,8 +22270,8 @@ export class AgentFramework {
                   }
                 }
               } else if (roundSilence === 'private' || (roundSilence && hasSameRoundPrivateThink)
-                || (roundSilence && sendHoldAt(roundSilence, roundLocus))) {
-                const sendHold = roundSilence === 'private' ? undefined : sendHoldAt(roundSilence, roundLocus);
+                || (roundSilence && sendHoldAt(roundSilence, roundLocus, streamRouting.nonChannelOrigin))) {
+                const sendHold = roundSilence === 'private' ? undefined : sendHoldAt(roundSilence, roundLocus, streamRouting.nonChannelOrigin);
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${roundSilence === 'private' ? 'private' : 'send'}${draftsCause ? ', a drafts round: kept' : ''})`,
                 );
@@ -22898,7 +22899,7 @@ export class AgentFramework {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
                   this.recordProseSuppression(streamRouting, speechSegments.length);
                 } else if (silence && turnProseRouting !== 'explicit'
-                  && (turnProseRouting === 'hybrid' || silence === 'private' || sendHoldAt(silence, resolveTurnLocus()))) {
+                  && (turnProseRouting === 'hybrid' || silence === 'private' || sendHoldAt(silence, resolveTurnLocus(), streamRouting.nonChannelOrigin))) {
                   // Only reachable on a guard recovery that carried the
                   // same-turn send suppression, or a suppressProse trigger
                   // (a fresh text-only turn starts unsilenced). Explicit
@@ -22910,7 +22911,7 @@ export class AgentFramework {
                   } else if (turnProseRouting === 'hybrid') {
                     closingHeld = await this.routeSilencedHybrid(agent, speechRuns, silence, false, textOnlyHold, locus, 'end');
                   } else {
-                    closingHeld = this.holdSilencedProse(agent, speechRuns, sendHoldAt(silence, locus)!, false, textOnlyHold, { target: locus, when: 'end' });
+                    closingHeld = this.holdSilencedProse(agent, speechRuns, sendHoldAt(silence, locus, streamRouting.nonChannelOrigin)!, false, textOnlyHold, { target: locus, when: 'end' });
                   }
                 } else if (turnProseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
@@ -23041,8 +23042,8 @@ export class AgentFramework {
                 }
               } else if (trailingSilence === 'private' || segments.length === 0
                 || (trailingSilence && thinkPrivate)
-                || (trailingSilence && sendHoldAt(trailingSilence, resolveTurnLocus()))) {
-                const sendHold = trailingSilence && trailingSilence !== 'private' ? sendHoldAt(trailingSilence, resolveTurnLocus()) : undefined;
+                || (trailingSilence && sendHoldAt(trailingSilence, resolveTurnLocus(), streamRouting.nonChannelOrigin))) {
+                const sendHold = trailingSilence && trailingSilence !== 'private' ? sendHoldAt(trailingSilence, resolveTurnLocus(), streamRouting.nonChannelOrigin) : undefined;
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
                   `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold || (trailingSilence && thinkPrivate) ? 'turn silenced: send' : 'no trailing prose'})`,

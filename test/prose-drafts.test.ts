@@ -791,24 +791,59 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it("a private turn's words beside a send whose place the framework can't read, and after it, are held as drafts, as any turn's are", async () => {
+  it("a private turn's words beside a send whose place the framework can't read, and after it, are kept private too, since they were going nowhere", async () => {
     for (const proseRouting of ['locus', 'hybrid'] as const) {
-      const h = await harness({ agents: [{ name: 'scout', proseRouting }], sendTool: true });
-      await h.sendMode('no-channel');
-      try {
-        await h.turn([
-          createMockResponse([text('Beside the send.'), unplacedSend('s1')], 'tool_use'),
-          createMockResponse([text('And one after the send.')]),
-        ], 'scout', 'private');
-        assert.ok(!h.publishes().some((p) => p.text.includes('the send.')), `${proseRouting}: no plain speech went out: ${JSON.stringify(h.publishes())}`);
-        assert.deepEqual(h.drafts().map((d) => d.text).sort(), ['And one after the send.', 'Beside the send.'], `${proseRouting}: both are held`);
-        const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
-        assert.doesNotMatch(receipt, /private turn/, `${proseRouting}: ${receipt}`);
-      } finally {
-        await h.close();
+      for (const via of ['private', 'incoming'] as const) {
+        const h = await harness({ agents: [{ name: 'scout', proseRouting }], sendTool: true });
+        await h.sendMode('no-channel');
+        try {
+          await h.turn([
+            createMockResponse([text('Beside the send.'), unplacedSend('s1')], 'tool_use'),
+            createMockResponse([text('And one after the send.')]),
+          ], 'scout', via);
+          assert.ok(!h.publishes().some((p) => p.text.includes('the send.')), `${proseRouting}, ${via}: no plain speech went out: ${JSON.stringify(h.publishes())}`);
+          if (via === 'incoming') {
+            assert.deepEqual(h.drafts().map((d) => d.text).sort(), ['And one after the send.', 'Beside the send.'],
+              `${proseRouting}: control, a channel turn's words beside the send are held, since it may have posted where they were going`);
+            continue;
+          }
+          assert.deepEqual(h.drafts(), [], `${proseRouting}: nothing is held`);
+          const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+          assert.match(receipt, /2 plain-speech segment\(s\) kept private \(private turn/, `${proseRouting}: ${receipt}`);
+        } finally {
+          await h.close();
+        }
       }
     }
   });
+
+  for (const [label, envelope, held] of [
+    ['names no destination', '>>>\nlost words', false],
+    ['names a channel that does not resolve', '>>>#nowhere lost words', false],
+    ['names a channel', `>>>${ROOM} words for the room`, true],
+  ] as const) {
+    it(`hybrid mode: beside a send whose place the framework can't read, a private turn's envelope that ${label} ${held ? 'is held as a draft, since the send may have posted there' : 'keeps its words private, with no draft'}`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
+      await h.sendMode('no-channel');
+      try {
+        await h.turn([
+          createMockResponse([text(envelope), unplacedSend('s1')], 'tool_use'),
+          createMockResponse([text('Done.')]),
+          createMockResponse([]),
+        ], 'scout', 'private');
+        assert.ok(!h.publishes().some((p) => p.text.includes('words')), `nothing the envelope says went out: ${JSON.stringify(h.publishes())}`);
+        if (held) {
+          assert.deepEqual(h.drafts().map((d) => [d.text, d.note]), [['words for the room', `written for >>>${ROOM}`]], 'the envelope is held, and the plain words after it are not');
+        } else {
+          assert.deepEqual(h.drafts(), [], 'nothing holds the words to resend');
+          const notice = h.texts().find((t) => t.startsWith('[prose-routing]') && t.includes('was not delivered'));
+          assert.ok(notice?.includes('It was kept private') && !notice.includes('{{unsent}}'), `the resident is told the words were kept private: ${notice}`);
+        }
+      } finally {
+        await h.close();
+      }
+    });
+  }
 
   it('disabled mode stays draft-free: its narration is private by configuration', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'disabled' }] });
