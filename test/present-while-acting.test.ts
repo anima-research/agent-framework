@@ -706,6 +706,43 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('a chat:system notice in a channel the agent engaged this turn does not move the pin', async () => {
+    // RFC-001 rev 3: a world's weather line is a notice, not a follow-up.
+    // The agent spoke into the world this turn, then the forecast changed
+    // there; nobody spoke, so the pin holds where the conversation is.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still here with you.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = '* world weather: clear (forecast)';
+    module.interjectionMetadata = {
+      channelId: 'eidoverse:world',
+      tags: ['chat:ambient', 'chat:system', 'eidoverse:weather'],
+    };
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      (framework as unknown as {
+        turnRouting: Map<string, { engaged: Set<string> }>;
+      }).turnRouting.get('assistant')!.engaged.add(destinationKey(stub('eidoverse:world')));
+      return origHandle(call);
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Still here with you.', locus: 'chan-live-1' },
+    ], 'the notice in the engaged channel left the pin alone');
+
+    await framework.stop();
+  });
+
   it('an addressed injection from the CURRENT locus does not chatter a notice', async () => {
     // Same-channel addressed input is the ordinary case (the person the
     // agent is already talking to sends another message mid-turn): the pin
@@ -2670,7 +2707,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+  for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted', 'chat:system']) {
     it(`a ${tag} marker injected mid-turn does not clear send suppression (#157)`, async () => {
       // Edits, deletions and reaction removals (RFC-001 core tags, delivered
       // as synthetic incoming messages by e.g. zulip_mcp#23) are markers
