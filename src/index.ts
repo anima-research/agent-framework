@@ -99,6 +99,8 @@ export type { McplServerConfig } from './mcpl/index.js';
 // exactly the way the framework host does: MCPL over stdio or WebSocket, and
 // modern MCP over stdio or Streamable HTTP)
 export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
+// RFC-014: the meta-tools' module and its names.
+export { ToolsetsModule, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/index.js';
 export { ModernMcpConnection } from './mcpl/index.js';
 export type { ModernToolCallResult } from './mcpl/index.js';
 export {

@@ -553,7 +553,7 @@ describe('autoContinue', () => {
     }
   });
 
-  it("the row says the last turn's closing words were held when it had already sent", async () => {
+  it("the row says the last turn's closing words were held when a send held them", async () => {
     const framework = await createFramework(true);
     stubRegistry(framework);
     const internals = framework as unknown as {
@@ -885,7 +885,7 @@ describe('autoContinueNotice', () => {
     );
     assert.equal(
       autoContinueNotice({ agentName: 'lena', stop: 'call skip_reply', last: false, heldAfterSend: true }),
-      '[continue] lena, another turn starts now. Your closing words last turn were held, not sent: that turn had already sent with a send tool. ' +
+      '[continue] lena, another turn starts now. Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going. ' +
         "If you're done, call skip_reply; anything you write without it is sent as usual.",
     );
   });

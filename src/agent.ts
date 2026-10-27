@@ -97,10 +97,15 @@ export interface StartStreamResult {
   /** The compile's `thinkingRecordedAfter`, when it gave one: a reply stored at or below it predates the branch's
    *  thinking-binding record, so the provider may drop its thinking with no strip having missed. */
   thinkingRecordedAfter?: number;
+  /** The key (`branchKey`) of the branch the compile read, when its provenance names one. */
+  thinkingBranch?: string;
   /** Tells the context manager what the stream's later rounds carried after the compiled messages, every round so
    *  far in sent order, with this request's head (context-manager's `noteRequestSent`). Present only where the
    *  model binds its thinking and the context manager keeps a record it can be told of. */
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
+  /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
+   *  Absent when the compile reports no provenance. */
+  carriedBodies?: ReadonlySet<MessageId>;
 }
 import type {
   ContextManager,
@@ -112,6 +117,7 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  ThinkingStrip,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -257,8 +263,7 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
   return { maxConsecutive: max };
 }
 
-/** A branch's key in Agent.unsentSince: its id and when it was created. */
-function branchKey(branch: { readonly id: string; readonly created: number }): string {
+export function branchKey(branch: { readonly id: string; readonly created: number }): string {
   return `${branch.id}\u0000${branch.created}`;
 }
 
@@ -1214,8 +1219,9 @@ export class Agent {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs). Without a watermark, a reader that looks for one takes its own
     // side: the coalescer counts the message as read, and the framework's
-    // unreadNoticesForPrimary counts it as unread. A deferred write's wake
-    // reads the answered watermark instead (deferredWriteDone).
+    // unreadNoticesForPrimary counts it as unread. A wake for a deferred
+    // write or a stored message reads the answered watermark instead
+    // (deferredWriteDone, storedMessageDone).
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
     this.shownWatermark = this.consumedWatermark;
@@ -1261,6 +1267,21 @@ export class Agent {
       && (current.branch !== watermark.branch || current.sequence >= watermark.sequence)) return;
     this.consumedWatermark = watermark;
     this.watermarkMarks++;
+  }
+
+  /**
+   * The branch now (`branchKey`) and its head, as `pendingWatermark` reads it: a message stored on that branch later
+   * has a larger sequence. Sequences are numbered per branch, so one compares with another only on the same branch.
+   */
+  branchHead(): { branch: string; sequence: number } | undefined {
+    const head = this.pendingWatermark();
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (!head || typeof cm.currentBranchRef !== 'function') return undefined;
+    try {
+      return { branch: branchKey(cm.currentBranchRef()), sequence: head.sequence };
+    } catch {
+      return undefined;
+    }
   }
 
   /** The watermark a successful compile will establish (taken before, applied after). */
@@ -1342,6 +1363,25 @@ export class Agent {
   private readonly unsentSince = new Map<string, number>();
 
   /**
+   * A host's hook, called with the messages of each compile built to send
+   * (never a dry run), as the compile is recorded: what the request carries,
+   * after compression and the window have done their work. The framework
+   * uses it to tell when an MCPL toolset's announcement has left the context
+   * (RFC-014 §8.3 reminders). It must not change the messages; one that
+   * throws is logged, and the start goes on.
+   */
+  onCompiledToSend?: (messages: readonly unknown[]) => void;
+
+  /**
+   * A host's hook, called with each committing compile's `thinkingStrip` (never a dry run's) and the key of the
+   * branch it read (`branchKey`), as the compile returns, whether or not its request is then sent, since the
+   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets it
+   * at the agent's first stream unless a host has set one, so a host's own observer stands in for the framework's,
+   * whose `[reasoning]` line for the agent then isn't told.
+   */
+  onThinkingStrip?: (strip: ThinkingStrip, branch: string) => void;
+
+  /**
    * The newest content of `namespace` among this agent's rows stored since
    * its last compile built to send (unsentSince), and whether every part of
    * it is among them: rows a start stored whose compile then didn't record
@@ -1401,6 +1441,14 @@ export class Agent {
    *  filter (isAnotherAgentsInjection): a compile of a shared store without
    *  that filter would mix them in here. */
   private noteRenderedInjections(result: CompileResult): void {
+    // The host's look at what this request carries (onCompiledToSend).
+    if (this.onCompiledToSend) {
+      try {
+        this.onCompiledToSend(result.messages);
+      } catch (err) {
+        console.error(`[agent] ${this.name}: the host's compile observer failed:`, err);
+      }
+    }
     const provenance = result.provenance;
     // The rows stored before this compile on its branch have been compiled
     // to send, whether the request held them or a fold or the strategy's
@@ -1536,6 +1584,13 @@ export class Agent {
       throw error;
     }
     if (watermark) this.applyCompileWatermark(watermark, marksBefore);
+    if (!opts?.dryRun && result.thinkingStrip && this.onThinkingStrip) {
+      try {
+        this.onThinkingStrip(result.thinkingStrip, result.provenance ? branchKey(result.provenance.branch) : '');
+      } catch (err) {
+        console.error(`[agent] ${this.name}: the host's thinking-strip observer failed:`, err);
+      }
+    }
     return result;
   }
 
@@ -2088,10 +2143,10 @@ export class Agent {
     // ran. The stream driver collects it on that stream's terminal event, or
     // at the loop's end when the iterator closed without one, while the
     // stream still owns the agent. This clear is for the records no driver
-    // collects: a dropped turn's, whose stream no driver iterates; one whose
-    // stream's terminal came after another stream took the agent; or a
-    // cancel after the stream's complete event. A fresh stream must not
-    // inherit one and read its own later error as a deliberate stop.
+    // collects: a cancel of a stream no driver iterates; one whose stream's
+    // terminal came after another stream took the agent; or a cancel after
+    // the stream's complete event. A fresh stream must not inherit one and
+    // read its own later error as a deliberate stop.
     this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
@@ -2170,7 +2225,11 @@ export class Agent {
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
       ...this.requestNotes(binding, compiled),
+      ...(compiled.provenance
+        ? { carriedBodies: new Set(compiled.provenance.messages.flatMap((m) => m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : [])) }
+        : {}),
       ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
+      ...(compiled.provenance ? { thinkingBranch: branchKey(compiled.provenance.branch) } : {}),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),
@@ -2285,12 +2344,24 @@ export class Agent {
    * one is still ahead; otherwise the next start drops it. `reason` is
    * provenance for the framework's inference:aborted trace and marker
    * metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never reaches
-   * the provider.
+   * the provider. When the stream's cancel() throws, the throw goes on to
+   * the caller, and the agent still holds the stream, its cancel record as
+   * it was before the call.
    */
   cancelStream(reason?: string): void {
     if ('stream' in this._state && this._state.stream) {
+      // A cancel that throws leaves the stream going and the agent holding
+      // it, so this call's record is taken back, leaving any earlier one: a
+      // later end of that stream, an `error` the provider reports included,
+      // is not read as this stop's.
+      const earlier = this._pendingCancel;
       this._pendingCancel = { reason };
-      this._state.stream.cancel();
+      try {
+        this._state.stream.cancel();
+      } catch (error) {
+        this._pendingCancel = earlier;
+        throw error;
+      }
     } else {
       this._stopWithoutStream = { reason };
     }
@@ -2466,6 +2537,7 @@ export class Agent {
           id: block.id,
           name: block.name,
           input: block.input,
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'text') {
         speechContent.push(block);

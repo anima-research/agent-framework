@@ -70,6 +70,42 @@ test('vector 28: retraction of never-read content leaves no trace and no turn', 
   assert(!f.context().includes('unread_original') && !f.context().includes('deletion_notice'));
 });
 
+for (const shape of ['an update', 'a retraction with a notice', 'a retraction with no notice'] as const) {
+  test(`while a branch switch holds the store, ${shape} of an unread coalesced push keeps the stored message, and ${shape === 'a retraction with no notice' ? 'appends nothing' : 'its text lands after the release'}`, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    await f.send('push/event', f.params('1', 'unread_original', { initial: true }));
+    assert(f.context().includes('unread_original'));
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const before = cm.getMessageCount();
+    const spied = cm as unknown as { setStrategy: (strategy: unknown) => Promise<void> };
+    const setStrategy = spied.setStrategy.bind(cm);
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => { entered = resolve; });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    spied.setStrategy = async (strategy: unknown) => { entered(); await gate; return setStrategy(strategy); };
+    const switching = f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+    const text = shape === 'an update' ? 'held_update' : shape === 'a retraction with a notice' ? 'held_notice' : '';
+    const bounded = <T>(work: Promise<T>, what: string): Promise<T> => Promise.race([
+      work,
+      new Promise<never>((_, reject) => { setTimeout(() => reject(new Error(`${what} didn't come within 10 s`)), 10_000).unref(); }),
+    ]);
+    try {
+      await bounded(reached, "the switch's re-initialization");
+      await bounded(f.send('push/event', f.params('2', text, shape === 'an update' ? {} : { retract: true })), 'the push\'s reply');
+      assert(f.context().includes('unread_original'), 'the stored message stays while the store is held');
+      assert(!f.context().includes('held_update') && !f.context().includes('held_notice'), 'nothing lands while the store is held');
+    } finally {
+      open();
+    }
+    await switching;
+    spied.setStrategy = setStrategy;
+    assert(f.context().includes('unread_original'), 'the stored message stays after the release');
+    if (text) assert(f.context().includes(text), `${text} lands after the release`);
+    else assert.equal(cm.getMessageCount(), before, 'nothing is appended');
+  });
+}
+
 test('vectors 29/34: read original → unread edit → delete keeps the original and appends only the notice', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'read_original', { initial: true }));
@@ -1195,7 +1231,7 @@ test('an assembly for an agent outside the audience of a batch another assembly 
 // another agent's queue (a turn with nothing to read never reaches the model)
 // ---------------------------------------------------------------------------
 
-type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; readsDeferredWrite?: string; channelId?: string };
+type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; readsDeferredWrite?: string; readsStoredMessage?: string; channelId?: string };
 
 type TurnInternals = {
   startAgentStream: (...a: unknown[]) => Promise<unknown>;
@@ -1743,13 +1779,47 @@ test("a wake to read a render neither carries its mark into a merge with other c
     await settles(internals.processInferenceRequests(), 'the merged pass');
     internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }));
     await settles(internals.processInferenceRequests(), 'the pass of two renders');
+    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-1' }));
+    await settles(internals.processInferenceRequests(), 'the pass of two wakes reading one render');
     internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }));
     await settles(internals.processInferenceRequests(), 'the lone pass');
   } finally {
     internals.startAgentStream = start;
     internals.deferredMessages.splice(0);
   }
-  assert.deepEqual(triggers.map((r) => r.readsDeferredWrite), [undefined, undefined, 'render-1'], 'merged with a plain wake, or one reading another render, it drops the mark; alone it keeps it');
+  assert.deepEqual(triggers.map((r) => r.readsDeferredWrite), [undefined, undefined, 'render-1', 'render-1'], 'merged with a plain wake, or one reading another render, it drops the mark; merged with wakes reading the same render, or alone, it keeps it');
+});
+
+test("a wake to read a stored message neither carries its mark into a merge with other causes nor absorbs another wake while parked", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals & { quiesced: boolean };
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const first = cm.addMessage('editor', [{ type: 'text', text: 'stored_one' }]);
+  const second = cm.addMessage('editor', [{ type: 'text', text: 'stored_two' }]);
+  const wake = (extra: Partial<Wake> = {}): Wake => ({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), ...extra });
+  internals.quiesced = true;
+  try {
+    internals.pendingRequests.push(wake({ readsStoredMessage: first }), wake(), wake({ readsStoredMessage: second }));
+    await settles(internals.processInferenceRequests(), 'the parked pass');
+    assert.deepEqual(internals.pendingRequests.map((r) => r.readsStoredMessage), [first, undefined, second], 'each wake stays parked, those reading different messages included');
+  } finally {
+    internals.quiesced = false;
+  }
+  const triggers: Array<{ readsStoredMessage?: string }> = [];
+  const start = internals.startAgentStream;
+  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger as { readsStoredMessage?: string }); return undefined; };
+  try {
+    await settles(internals.processInferenceRequests(), 'the merged pass');
+    internals.pendingRequests.push(wake({ readsStoredMessage: first }), wake({ readsStoredMessage: second }));
+    await settles(internals.processInferenceRequests(), 'the pass of two messages');
+    internals.pendingRequests.push(wake({ readsStoredMessage: first }), wake({ readsStoredMessage: first }));
+    await settles(internals.processInferenceRequests(), 'the pass of two wakes reading one message');
+    internals.pendingRequests.push(wake({ readsStoredMessage: first }));
+    await settles(internals.processInferenceRequests(), 'the lone pass');
+  } finally {
+    internals.startAgentStream = start;
+  }
+  assert.deepEqual(triggers.map((r) => r.readsStoredMessage), [undefined, undefined, first, first], 'merged with a plain wake, or one reading another message, it drops the mark; merged with wakes reading the same message, or alone, it keeps it');
 });
 
 test("a wake to read a render starts its turn until the render's row is at or below the watermark of the agent's answered requests on the current branch", async (t) => {
@@ -1824,7 +1894,7 @@ test("a wake to read a render starts its turn until the render's row is at or be
   // the agent's answered requests stays on the old one until a request on
   // the new one is answered. The render lands at or below that watermark's
   // sequence, so only the branch tells it unread.
-  f.framework.undoLastTurn('agent');
+  await f.framework.undoLastTurn('agent').settled;
   const afterUndo = land('render_1');
   const mark = agent.getAnsweredWatermark();
   assert(mark && mark.branch !== agent.getContextManager().currentBranch().name && afterUndo.sequence <= mark.sequence,
@@ -2052,6 +2122,57 @@ test("a turn a wake to read a render started, held by a provider hold, is retrie
   assert.equal(f.membrane.calls.length, 2, 'the held turn was retried');
 });
 
+test("a turn a wake to read a stored message started, held by a provider hold, is held as an ordinary wake and retried once the hold ends", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  let calls = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+    f.membrane.calls.push(request as never);
+    if (++calls > 1) return new MockYieldingStream([ok()]);
+    return new FailingStream(new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429,
+      message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+      rawError: { status: 429 }, rawRequest: request,
+    } as ConstructorParameters<typeof MembraneError>[0]));
+  };
+  const internals = f.framework as unknown as TurnInternals;
+  const id = f.framework.getAgent('agent')!.getContextManager().addMessage('editor', [{ type: 'text', text: 'stored_message' }]);
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsStoredMessage: id });
+  await settles(f.framework.runUntilIdle(), 'the turn that meets the limit');
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('stored_message'), 'its request read the message');
+  const hold = internals.providerAccelerationCooldowns.get('agent');
+  assert.equal(hold?.heldRequests.length, 1, "the turn's trigger is held");
+  assert.equal(hold!.heldRequests[0].readsStoredMessage, undefined, 'as an ordinary wake, without the mark');
+  hold!.until = Date.now();
+  internals.releaseProviderAccelerationCooldown('agent');
+  await settles(f.framework.runUntilIdle(), 'the retry');
+  assert.equal(f.membrane.calls.length, 2, 'the held turn was retried');
+});
+
+test("a wake to read a stored message starts its turn when the store can't say whether the agent read it", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals;
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { getMessage: (...a: unknown[]) => unknown };
+  const getMessage = cm.getMessage;
+  cm.getMessage = () => { throw new Error('a blob the store names is missing'); };
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsStoredMessage: 'stored-1' });
+  const triggers: unknown[] = [];
+  const start = internals.startAgentStream;
+  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger); return undefined; };
+  const errors: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await settles(internals.processInferenceRequests(), 'the pass');
+  } finally {
+    console.error = error;
+    internals.startAgentStream = start;
+    cm.getMessage = getMessage;
+  }
+  assert.equal(triggers.length, 1, 'in doubt, the wake starts the turn');
+  assert(errors.some((e) => e.includes('stored-1') && e.includes('a blob the store names is missing')), `the failed read is logged: ${JSON.stringify(errors)}`);
+});
+
 test("a wake to read a render starts its turn when the store can't say whether the agent read it", async (t) => {
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as TurnInternals;
@@ -2160,7 +2281,7 @@ test("a provider recovery whose released wakes start no turn ends and reopens au
   assert.equal(internals.providerAccelerationRecoveries.has('agent'), true, 'and the recovery stays for that turn to end');
 });
 
-test("a provider hold keeps a wake to read a render, a batch wake, a batch-only merge and an ordinary wake apart, though they share a millisecond", async (t) => {
+test("a provider hold keeps a wake to read a render or a stored message, a batch wake, a batch-only merge and an ordinary wake apart, though they share a millisecond", async (t) => {
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as TurnInternals;
   const timer = setTimeout(() => {}, 60_000);
@@ -2173,11 +2294,12 @@ test("a provider hold keeps a wake to read a render, a batch wake, a batch-only 
   // merge of other batches.
   const merged = wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'notes'] });
   internals.pendingRequests.push(merged, wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }),
-    wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'other'] }));
+    wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'other'] }), wake({ readsStoredMessage: 'stored-1' }), wake({ readsStoredMessage: 'stored-2' }));
   await settles(internals.processInferenceRequests(), 'the held pass');
   const held = internals.providerAccelerationCooldowns.get('agent')?.heldRequests ?? [];
-  assert.deepEqual(held.map((r) => [r.coalescingSubject, r.coalescingBatchSubjects?.join(','), r.readsDeferredWrite]),
-    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, 'render-1'], [undefined, undefined, 'render-2'], [undefined, 'doc,other', undefined]],
+  assert.deepEqual(held.map((r) => [r.coalescingSubject, r.coalescingBatchSubjects?.join(','), r.readsDeferredWrite ?? r.readsStoredMessage]),
+    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, 'render-1'], [undefined, undefined, 'render-2'], [undefined, 'doc,other', undefined],
+      [undefined, undefined, 'stored-1'], [undefined, undefined, 'stored-2']],
     'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 

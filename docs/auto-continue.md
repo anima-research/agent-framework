@@ -51,8 +51,9 @@ A turn continues when the model ended it (stop reason `end_turn` or
   envelope.
 
 A turn that sent with a send tool and then closed in prose (held, not sent,
-because the turn had already sent) still continues: its closing words can't
-be told from unfinished work. The row tells the agent those words were held.
+some or all of it, because a send that turn may already have posted where it
+was going) still continues: its closing words can't be told from unfinished
+work. The row tells the agent those words were held.
 
 ## What the agent reads
 
@@ -67,10 +68,11 @@ acknowledge themselves and write no receipt):
 
 It names the agent, since residents read one shared message slot. For the
 same reason it is never written while another resident's turn is alive: the
-continuation waits for that turn to end, as a clock row does. When the
-last turn's closing words were held because that turn had already sent, it
-adds `Your closing words last turn were held, not sent: that turn had already
-sent with a send tool.` The last continuation of a run adds `This is the last
+continuation waits for that turn to end, as a clock row does. When some or
+all of the last turn's closing words were held because a send that turn may
+already have posted where they were going, it adds `Some or all of your
+closing words last turn were held, not sent: a send that turn may already have
+posted where they were going.` The last continuation of a run adds `This is the last
 continuation in a row: after this turn you wait for the next event either
 way.` An agent that can't call `skip_reply` is told to end with a
 `>>skip_reply` (explicit) or `>>>skip_reply` (hybrid) envelope instead.
@@ -82,11 +84,14 @@ It is short and event-shaped: longer instruction blocks about output, sent as
 user-role messages, have tripped provider classifiers.
 
 The row is never written for a turn that doesn't run: a wake the inference
-policy drops, or that a quiesce drops, writes none and gives back its count,
-as does one a resumed turn (a budget restart) takes in; a row that can't be
-stored gives back its count, and withdraws a turn the continuation alone
-caused. A write that throws after its row landed counts as written. It is appended before the turn compiles and never
-retracted, so the prompt-cache prefix stays stable.
+policy drops, or that a quiesce drops, writes none and gives back its count;
+a row that can't be stored gives back its count, and withdraws a turn the
+continuation alone caused. A continuation's wake queued beside a turn's
+budget restart, or released beside a tool-result guard's retry by a provider
+hold, waits for that turn, then writes its row as its own turn starts. A
+write that throws after its row landed counts as written. It is appended
+before the turn compiles and never retracted, so the prompt-cache prefix
+stays stable.
 
 ## The next turn
 
