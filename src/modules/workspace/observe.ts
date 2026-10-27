@@ -47,6 +47,7 @@ import { lstat, mkdir, open, readdir, readlink, realpath, stat, statfs } from 'n
 import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
+import { errnoCode, systemWords } from './answers.js';
 
 export interface MountView {
   /**
@@ -147,6 +148,10 @@ export const RACY_WINDOW_MS = 2000;
 
 export const OUTSIDE_PARENT = 'a parent directory resolves outside the mount';
 export const NOT_FOLLOWED = 'a symlink, which this mount does not follow';
+export const DIRECTORY = 'a directory';
+export const NOT_REGULAR = 'not a regular file';
+export const LEAVES_MOUNT = 'a symlink that leaves the mount';
+export const NOT_A_DIRECTORY = 'a parent path is not a directory';
 export const ROOT_UNAVAILABLE = 'the mount root is unavailable';
 export const ROOT_REPLACED =
   'the mount root is not the directory disk last agreed with (an unmounted drive, or a replaced directory): ' +
@@ -412,7 +417,7 @@ export async function coversLanding(view: Pick<MountView, 'include'>, rootReal: 
  */
 export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly NestedMount[] = [], include?: readonly string[]): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
-  if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${found.code})`;
+  if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${systemWords(errnoCode({ code: found.code }), found.code)})`;
   const link = `${spell(found.link)} is a symlink`;
   if (leads === null || leads.kind === 'nowhere') return `${link}, which this mount does not follow`;
   if (leads.kind === 'outside') return `${link} leading outside the mount, which this mount does not follow`;
@@ -957,8 +962,8 @@ export type DirCheck =
    * holds the non-directory in its place.
    */
   | { kind: 'absent'; by: string }
-  /** Unproven either way; `outside` when it resolves outside the mount. */
-  | { kind: 'unobserved'; reason: string; outside?: true };
+  /** Unproven either way; `outside` when it resolves outside the mount, `errno` when a system call failed. */
+  | { kind: 'unobserved'; reason: string; outside?: true; errno?: string };
 
 /** Errors meaning a directory can't be synced on this filesystem, not that syncing it failed. */
 const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP']);
@@ -978,11 +983,16 @@ export class CheckedDir {
     private readonly lexical: string,
     private readonly dev: bigint,
     private readonly ino: bigint,
+    private readonly born: bigint,
   ) {}
 
   /** Which directory it is. */
   identity(): RootIdentity {
-    return { dev: String(this.dev), ino: String(this.ino) };
+    return {
+      dev: String(this.dev),
+      ino: String(this.ino),
+      ...(this.born > 0n ? { born: String(this.born) } : {}),
+    };
   }
 
   /** A path that reaches `name` in this directory. */
@@ -1024,11 +1034,25 @@ export class CheckedDir {
   }
 }
 
+/**
+ * What is at a mount root's path now, followed as the root is: for a
+ * directory, undefined; for anything else, ENOTDIR; and where the path
+ * can't be followed to anything, the errno its stat failed with, ENOENT
+ * when nothing is there.
+ */
+export async function rootAbsence(root: string): Promise<string | undefined> {
+  try {
+    return (await stat(root)).isDirectory() ? undefined : 'ENOTDIR';
+  } catch (err) {
+    return errno(err);
+  }
+}
+
 /** Check the directory at a canonical location, if one is there. */
 async function checkedAt(view: MountView, rel: string, real: string): Promise<CheckedDir | null> {
   const info = await lstat(real, { bigint: true }).catch(() => null);
   if (!info?.isDirectory()) return null;
-  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino);
+  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs);
 }
 
 /**
@@ -1042,12 +1066,12 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     real = await realpath(lexical);
   } catch (err) {
     const code = errno(err);
-    if (code === 'ENOENT' || code === 'ENOTDIR') return rel === '' ? { kind: 'unobserved', reason: ROOT_UNAVAILABLE } : { kind: 'missing' };
+    if (code === 'ENOENT' || code === 'ENOTDIR') return rel === '' ? { kind: 'unobserved', reason: ROOT_UNAVAILABLE, errno: code } : { kind: 'missing' };
     // A link on the way that can't be resolved, such as a loop, is still a
     // link this mount doesn't follow.
     const found = rel === '' ? null : await linkOnTheWay(view, rel);
     if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
-    return { kind: 'unobserved', reason: `cannot resolve the directory (${code ?? String(err)})` };
+    return { kind: 'unobserved', reason: `cannot resolve the directory (${systemWords(code, err)})`, ...(code !== undefined ? { errno: code } : {}) };
   }
   // A mount that doesn't follow symlinks goes through none on the way to a
   // directory, inside the mount or out of it.
@@ -1093,10 +1117,10 @@ export async function locateRoot(view: MountView, rootReal: string): Promise<{ i
 }
 
 /** The mount root as locateRoot finds it, checked, so a caller can ask later whether it's still there. */
-export async function checkRoot(view: MountView, rootReal: string): Promise<{ dir: CheckedDir } | { reason: string }> {
+export async function checkRoot(view: MountView, rootReal: string): Promise<{ dir: CheckedDir } | { reason: string; errno?: string }> {
   const found = await locateDir(view, rootReal, '');
   if (found.kind === 'checked') return { dir: found.dir };
-  return { reason: found.kind === 'unobserved' ? found.reason : ROOT_UNAVAILABLE };
+  return found.kind === 'unobserved' ? { reason: found.reason, ...(found.errno !== undefined ? { errno: found.errno } : {}) } : { reason: ROOT_UNAVAILABLE };
 }
 
 /**
@@ -1137,7 +1161,7 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
       await mkdir(base.at(parts[i]!));
     } catch (err) {
       const code = errno(err);
-      if (code !== 'EEXIST') return { kind: 'unobserved', reason: `cannot create the directory ${childRel} (${code ?? String(err)})` };
+      if (code !== 'EEXIST') return { kind: 'unobserved', reason: `cannot create the directory ${childRel} (${systemWords(code, err)})`, ...(code !== undefined ? { errno: code } : {}) };
     }
     // Made, or there already (made meanwhile, or not a directory): it must
     // be a real directory now, never a symlink or file in its place.
@@ -1147,7 +1171,7 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
       // doesn't follow symlinks, is named as one.
       const there = view.followSymlinks ? null : await lstat(base.at(parts[i]!)).catch(() => null);
       if (there?.isSymbolicLink()) return { kind: 'unobserved', reason: await linkReason(view, rootReal, { link: childRel }) };
-      return { kind: 'unobserved', reason: 'a parent path is not a directory' };
+      return { kind: 'unobserved', reason: NOT_A_DIRECTORY };
     }
     base = checked;
   }
@@ -1190,13 +1214,13 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     } catch (err) {
       const code = errno(err);
       if (code === 'ENOTDIR') return CHANGED;
-      if (code !== 'ENOENT') return `cannot stat (${code ?? String(err)})`;
+      if (code !== 'ENOENT') return `cannot stat (${systemWords(code, err)})`;
       // Absent from a directory that, like each above it, is still the one its path names.
       return proven();
     }
     if (info.isDirectory()) {
       if (last) return CHANGED; // present after all
-      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino);
+      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino, info.birthtimeNs);
       walked.push(cur);
       continue;
     }
@@ -1318,7 +1342,7 @@ async function parentPlacement(view: MountView, rootReal: string, relativePath: 
     // link this mount doesn't follow.
     const found = await linkOnTheWay(view, relativePath, 'parents');
     if (found !== null) return { reason: await linkReason(view, rootReal, found) };
-    return { reason: `cannot resolve the parent directory (${code ?? String(err)})` };
+    return { reason: `cannot resolve the parent directory (${systemWords(code, err)})` };
   }
 }
 
@@ -1339,7 +1363,7 @@ export async function observePath(view: MountView, rootReal: string, relativePat
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT' || code === 'ENOTDIR') return absence(view, rootReal, relativePath);
-    return { kind: 'unobserved', reason: `cannot stat (${code ?? String(err)})` };
+    return { kind: 'unobserved', reason: `cannot stat (${systemWords(code, err)})` };
   }
   if (info.isSymbolicLink()) {
     if (!view.followSymlinks) return { kind: 'unobserved', reason: NOT_FOLLOWED };
@@ -1347,37 +1371,37 @@ export async function observePath(view: MountView, rootReal: string, relativePat
     try {
       target = await stat(lexical, { bigint: true });
     } catch (err) {
-      return { kind: 'unobserved', reason: `a symlink whose target cannot be read (${errno(err) ?? String(err)})` };
+      return { kind: 'unobserved', reason: `a symlink whose target cannot be read (${systemWords(errno(err), err)})` };
     }
     let real: string;
     try {
       real = await realpath(lexical);
     } catch (err) {
-      return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${errno(err) ?? String(err)})` };
+      return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${systemWords(errno(err), err)})` };
     }
-    if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    if (!contained(rootReal, real)) return { kind: 'unobserved', reason: LEAVES_MOUNT };
     const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });
     // A place a nested mount's include leaves out is no mount's, so the link
     // leaves this one (namesNestedPlace).
     if (holder) {
-      return { kind: 'unobserved', reason: holder.names(target.isDirectory()) ? leadsInto(view.name, relativePath, holder) : 'a symlink that leaves the mount' };
+      return { kind: 'unobserved', reason: holder.names(target.isDirectory()) ? leadsInto(view.name, relativePath, holder) : LEAVES_MOUNT };
     }
     if (!target.isFile()) {
-      return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file' };
+      return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : NOT_REGULAR };
     }
     // A file this mount's own include leaves out where the link lands is no
     // file of this mount's (coversLanding). It's judged here, and not only
     // where the file is opened, since a pass takes a copy whose fingerprint
     // the stat vouches for without opening it.
-    if (!(await coversLanding(view, rootReal, real, relativePath))) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    if (!(await coversLanding(view, rootReal, real, relativePath))) return { kind: 'unobserved', reason: LEAVES_MOUNT };
     info = target;
   } else if (info.isDirectory()) {
-    return { kind: 'unobserved', reason: 'a directory' };
+    return { kind: 'unobserved', reason: DIRECTORY };
   } else if (!info.isFile()) {
-    return { kind: 'unobserved', reason: 'not a regular file' };
+    return { kind: 'unobserved', reason: NOT_REGULAR };
   } else if (!(await coversLanding(view, rootReal, join(placement.inside, basename(lexical)), relativePath))) {
     // So is one reached through a link among its directories.
-    return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    return { kind: 'unobserved', reason: LEAVES_MOUNT };
   }
   return { kind: 'file', size: Number(info.size), mtimeMs: Number(info.mtimeMs), mode: Number(info.mode & 0o777n), fp: statFingerprint(info) };
 }
@@ -1414,8 +1438,8 @@ async function openContained(
       const found = await linkOnTheWay(view, relativePath, 'parents');
       return { kind: 'unobserved', reason: found === null ? NOT_FOLLOWED : await linkReason(view, rootReal, found) };
     }
-    if (code === 'EISDIR') return { kind: 'unobserved', reason: 'a directory' };
-    return { kind: 'unobserved', reason: `cannot open (${code ?? String(err)})` };
+    if (code === 'EISDIR') return { kind: 'unobserved', reason: DIRECTORY };
+    return { kind: 'unobserved', reason: `cannot open (${systemWords(code, err)})` };
   }
   let keep = false;
   try {
@@ -1429,8 +1453,8 @@ async function openContained(
     // descriptor holds, so a link gets its own answer whatever it leads to.
     const found = await linkRefusal(view, rootReal, relativePath, real);
     if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
-    if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? 'a directory' : 'not a regular file' };
-    const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
+    if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? DIRECTORY : NOT_REGULAR };
+    const leaves = view.followSymlinks ? LEAVES_MOUNT : OUTSIDE_PARENT;
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: leaves };
     const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });
     // A place a nested mount's include leaves out is no mount's. Reached
@@ -1457,7 +1481,7 @@ async function openContained(
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT') return absence(view, rootReal, relativePath);
-    return { kind: 'unobserved', reason: `cannot read (${code ?? String(err)})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(code, err)})` };
   } finally {
     if (!keep) await handle.close();
   }
@@ -1555,7 +1579,7 @@ export async function readPath(
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT') return absence(view, rootReal, relativePath);
-    return { kind: 'unobserved', reason: `cannot read (${code ?? String(err)})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(code, err)})` };
   } finally {
     await handle.close();
   }
@@ -1615,7 +1639,7 @@ export async function readBytes(
     if (more) return { kind: 'bytes', size: Math.max(Number((await handle.stat({ bigint: true })).size), bytes.length + 1), bytes: null, head: bytes.subarray(0, HEAD_BYTES) };
     return { kind: 'bytes', size: bytes.byteLength, bytes, head: bytes.subarray(0, HEAD_BYTES) };
   } catch (err) {
-    return { kind: 'unobserved', reason: `cannot read (${errno(err) ?? String(err)})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(errno(err), err)})` };
   } finally {
     await handle.close();
   }
@@ -1639,7 +1663,7 @@ export async function readHead(
     const { bytesRead } = await handle.read(head, 0, HEAD_BYTES, 0);
     return { kind: 'head', size: Number(info.size), mtimeMs: Number(info.mtimeMs), head: head.subarray(0, bytesRead) };
   } catch (err) {
-    return { kind: 'unobserved', reason: `cannot read (${errno(err) ?? String(err)})` };
+    return { kind: 'unobserved', reason: `cannot read (${systemWords(errno(err), err)})` };
   } finally {
     await handle.close();
   }
@@ -1768,14 +1792,14 @@ function subtreeAgainst(dir: string, at: string): 'before' | 'holds' | 'after' {
 }
 
 /**
- * Whether a mount's ignore list covers a mount-relative path: the path itself
- * or any directory above it, as the walk's own test reads each entry by its
- * path and name.
+ * Whether a mount's ignore list covers a mount-relative path: the path itself,
+ * a directory or not, or any directory above it, as the walk's own test reads
+ * each entry by its path and kind.
  */
-export function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
+export function coveredByIgnore(relativePath: string, patterns: readonly string[], directory: boolean): boolean {
   const segments = relativePath.split('/').filter(Boolean);
   for (let i = 0; i < segments.length; i++) {
-    if (isIgnored(segments.slice(0, i + 1).join('/'), segments[i]!, patterns)) return true;
+    if (isIgnored(segments.slice(0, i + 1).join('/'), patterns, i < segments.length - 1 || directory)) return true;
   }
   return false;
 }
@@ -1820,42 +1844,89 @@ export function insideMount(relativePath: string, include: readonly string[] | u
 }
 
 /**
- * Whether the include's matcher can read `pattern`: a name or an `*.ext` glob,
- * which covers a file by its own name, or a `dir/**` glob, with no empty, `.`
- * or `..` segment, since those name no entry a path reaches. Where `\` is the
- * platform's separator, as on Windows, a pattern holding one can't name a
- * file either, since every path is read with `\` as a separator
- * (pathSegments). A pattern the matcher can't read would match nothing, and
- * take every file out of the mount unsaid, so the module refuses it.
+ * A pattern of `ignore` or `include`, read as gitignore reads it: its
+ * segments, each a name or a glob with `*` and `?` within it; whether it's a
+ * path from the mount's root (a leading or inner `/`, or a trailing `/**`)
+ * rather than a name at any depth; and whether it matches only directories (a
+ * trailing `/` or `/**`).
  */
-export function includePatternReadable(pattern: unknown, platformSep: string = sep): boolean {
-  const segment = (s: string): boolean => s.length > 0 && s !== '.' && s !== '..' && !(platformSep === '\\' && s.includes('\\'));
-  const name = (s: string): boolean => segment(s) && !s.includes('/') &&
-    (!s.includes('*') || (s.startsWith('*.') && s.length > 2 && !s.slice(1).includes('*')));
-  return typeof pattern === 'string' &&
-    (pattern.endsWith('/**') ? pattern.length > 3 && pattern.slice(0, -3).split('/').every((s) => segment(s) && !s.includes('*')) : name(pattern));
+type Pattern = { segments: Array<string | RegExp>; anchored: boolean; directory: boolean };
+
+const readings = new Map<string, Pattern | string>();
+
+function readPattern(pattern: string): Pattern | string {
+  let reading = readings.get(pattern);
+  if (reading === undefined) {
+    reading = parsePattern(pattern);
+    readings.set(pattern, reading);
+  }
+  return reading;
+}
+
+function parsePattern(pattern: string): Pattern | string {
+  if (pattern.startsWith('!')) return 'a leading "!" makes an exception in a .gitignore, and this list has none, so leave it out';
+  if (pattern.startsWith('#')) return 'a leading "#" marks a comment in a .gitignore, so leave comments out of the list';
+  if (pattern.includes('\\')) return '"\\" is an escape in a .gitignore and a separator on Windows, so no pattern here holds one, and "?" stands for one in a name';
+  if (pattern.endsWith(' ')) return 'a .gitignore drops trailing spaces, so remove them';
+  const anyDepth = pattern.startsWith('**/');
+  let body = anyDepth ? pattern.slice(3) : pattern;
+  const beneath = body.endsWith('/**');
+  const directory = beneath || body.endsWith('/');
+  body = body.slice(0, beneath ? -3 : directory ? -1 : undefined);
+  const anchored = (beneath && !anyDepth) || body.includes('/');
+  if (body.startsWith('/') && !anyDepth) body = body.slice(1);
+  const segments = body.split('/');
+  if (segments.some((s) => s === '' || s === '.' || s === '..')) return 'it has an empty, "." or ".." segment, which names no entry';
+  if (body.includes('**') || (anyDepth && anchored)) return '"**" is read only as a leading "**/" before one name, or a trailing "/**"';
+  const glob = (s: string): string | RegExp => /[*?]/.test(s)
+    ? new RegExp(`^${s.replace(/[.+^${}()|[\]*?]/g, (c) => (c === '*' ? '.*' : c === '?' ? '.' : `\\${c}`))}$`, 'su')
+    : s;
+  return { segments: segments.map(glob), anchored, directory };
+}
+
+function nameMatches(segment: string | RegExp, name: string): boolean {
+  return typeof segment === 'string' ? segment === name : segment.test(name);
+}
+
+function matchesEntry(pattern: Pattern, segments: readonly string[], directory: boolean): boolean {
+  if (pattern.directory && !directory) return false;
+  if (!pattern.anchored) return nameMatches(pattern.segments[0]!, segments[segments.length - 1]!);
+  return segments.length === pattern.segments.length && pattern.segments.every((s, i) => nameMatches(s, segments[i]!));
+}
+
+export function patternRefusal(pattern: unknown, list: 'ignore' | 'include'): string | undefined {
+  if (typeof pattern !== 'string') return "it isn't a string";
+  const reading = readPattern(pattern);
+  if (typeof reading === 'string') return reading;
+  if (list === 'ignore' && pattern.includes('[')) {
+    return '"[" starts a character class in a .gitignore, which this list doesn\'t read, so write each name out, with "?" for a "[" in it';
+  }
+  return undefined;
+}
+
+export function directoryAt(path: string, followSymlinks: boolean): Promise<boolean | undefined> {
+  if (!followSymlinks) return lstat(path).then((s) => s.isDirectory(), () => undefined);
+  return stat(path).then((s) => s.isDirectory(), () => lstat(path).then(() => false, () => undefined));
 }
 
 /**
- * Whether a mount's include covers a mount-relative path. Its patterns take
- * `ignore`'s forms, read for files: a name or `*.ext` pattern covers a path by
- * its own last segment, at any depth, and `dir/**` covers what lies beneath
- * `dir`, and not a file named `dir`. Unlike `ignore`, a pattern that matches
- * a directory's name covers nothing beneath it: each file is covered by its
- * own name, so `gate.json` covers `x/gate.json` and not `x/gate.json/run.sh`,
- * and a subtree is named with `dir/**`. A directory is no file, so it needs
- * no covering: where one is a scope, refusesAsOutside (index.ts) decides.
+ * Whether a mount's include covers a mount-relative path, read as a file: a
+ * pattern that matches only directories covers what lies beneath a directory
+ * it matches, and any other covers a file by its own name or path, and
+ * nothing beneath a directory it matches. So `gate.json` covers `x/gate.json`
+ * and not `x/gate.json/run.sh`, and a subtree is named with `dir/` or
+ * `dir/**`. A directory is no file, so it needs no covering: where one is a
+ * scope, refusesAsOutside (index.ts) decides.
  */
 function coveredByInclude(relativePath: string, include: readonly string[]): boolean {
-  const name = relativePath.slice(relativePath.lastIndexOf('/') + 1);
-  for (const pattern of include) {
-    if (pattern.endsWith('/**')) {
-      if (relativePath.startsWith(pattern.slice(0, -2))) return true;
-    } else if (pattern === name || (pattern.startsWith('*.') && name.endsWith(pattern.slice(1)))) {
-      return true;
-    }
-  }
-  return false;
+  const segments = relativePath.split('/');
+  return include.some((p) => {
+    const pattern = readPattern(p);
+    if (typeof pattern === 'string') return false;
+    if (!pattern.directory) return matchesEntry(pattern, segments, false);
+    for (let k = 1; k < segments.length; k++) if (matchesEntry(pattern, segments.slice(0, k), true)) return true;
+    return false;
+  });
 }
 
 /**
@@ -1864,7 +1935,7 @@ function coveredByInclude(relativePath: string, include: readonly string[]): boo
  * it (#276); one covering only something inside it does.
  */
 export function ignoreBeneath(scope: string, patterns: string[]): string[] {
-  return patterns.filter((pattern) => !coveredByIgnore(scope, [pattern]));
+  return patterns.filter((pattern) => !coveredByIgnore(scope, [pattern], true));
 }
 
 /**
@@ -1918,29 +1989,29 @@ export function inOtherMount(relativePath: string, others: readonly string[]): b
 }
 
 /**
- * Why a walk passes over an entry by design, by its mount-relative path and
- * its name: another mount's directory, the ignore list, or an editor's file
- * name. Undefined when none covers it.
+ * Why a walk passes over an entry by design, by its mount-relative path, its
+ * name and whether it's a directory: another mount's directory, the ignore
+ * list, or an editor's file name. Undefined when none covers it.
  */
-function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly string[]): string | undefined {
+function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly string[], directory: boolean): string | undefined {
   if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
-  if (isIgnored(relativePath, name, patterns)) return IGNORED;
+  if (isIgnored(relativePath, patterns, directory)) return IGNORED;
   if (EDITOR_FILE.test(name)) return EDITOR_FILE_REASON;
   return undefined;
 }
 
 /**
  * Why a sync without a path, and the watcher, pass over a mount-relative
- * path: the path itself or a directory above it is passed over by design, as
- * the walk reads each entry by its path and name. A path in another mount's
- * directory is that mount's, whatever else covers a directory above it.
- * Undefined when nothing covers it.
+ * path, a directory or not: the path itself or a directory above it is passed
+ * over by design, as the walk reads each entry by its path, name and kind. A
+ * path in another mount's directory is that mount's, whatever else covers a
+ * directory above it. Undefined when nothing covers it.
  */
-export function passedOverAt(relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+export function passedOverAt(relativePath: string, patterns: string[], others: readonly string[], directory: boolean): string | undefined {
   if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
   const segments = relativePath.split('/').filter(Boolean);
   for (let i = 0; i < segments.length; i++) {
-    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others, i < segments.length - 1 || directory);
     if (why !== undefined) return why;
   }
   return undefined;
@@ -1956,24 +2027,19 @@ export function passedOverBetween(scope: string, relativePath: string, patterns:
   const segments = relativePath.split('/').filter(Boolean);
   const from = scope === '' ? 0 : scope.split('/').filter(Boolean).length;
   for (let i = from; i < segments.length - 1; i++) {
-    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others, true);
     if (why !== undefined) return why;
   }
   return undefined;
 }
 
-/** Simple ignore patterns, as the watcher and the old walk read them. */
-export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
-  for (const pattern of patterns) {
-    if (pattern === name) return true;
-    if (pattern.endsWith('/**')) {
-      const prefix = pattern.slice(0, -3);
-      if (relativePath === prefix || relativePath.startsWith(prefix + '/')) return true;
-    }
-    if (!pattern.includes('/') && relativePath === pattern) return true;
-    if (pattern.startsWith('*.') && name.endsWith(pattern.slice(1))) return true;
-  }
-  return false;
+/** Whether an ignore pattern matches the entry at a mount-relative path, a directory or not, itself. */
+function isIgnored(relativePath: string, patterns: readonly string[], directory: boolean): boolean {
+  const segments = relativePath.split('/');
+  return patterns.some((p) => {
+    const pattern = readPattern(p);
+    return typeof pattern !== 'string' && matchesEntry(pattern, segments, directory);
+  });
 }
 
 /**
@@ -1987,12 +2053,12 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
   try {
     info = await lstat(real, { bigint: true });
   } catch (err) {
-    if (errno(err) !== 'ENOENT') return { kind: 'unobserved', reason: `cannot stat (${errno(err) ?? String(err)})` };
+    if (errno(err) !== 'ENOENT') return { kind: 'unobserved', reason: `cannot stat (${systemWords(errno(err), err)})` };
     const proof = await confirmAbsent(view, rootReal, rel, 'beneath');
     return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent', by: proof.by };
   }
   if (!info.isDirectory()) return { kind: 'unobserved', reason: CHANGED_WALK };
-  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino) };
+  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs) };
 }
 
 /**
@@ -2025,12 +2091,11 @@ export async function walkScope(
   };
   // A walk that isn't named passes over a scope the mount passes over by
   // design, at it or a directory above it, as its parent's listing would pass
-  // over its entry: a name rule (a bare-name ignore entry, an editor's name)
-  // doesn't match what lies beneath, as a path rule (`cache/**`) does. So a
-  // listing, glob or grep there never starts tracking what the mount leaves
-  // out, and a stored copy beneath it is unobserved, as beneath any region
-  // passed over by design. Its region says how to take what's there in: a
-  // sync that names it, whose scope is walked (#276), below.
+  // over its entry. So a listing, glob or grep there never starts tracking
+  // what the mount leaves out, and a stored copy beneath it is unobserved, as
+  // beneath any region passed over by design. Its region says how to take
+  // what's there in: a sync that names it, whose scope is walked (#276),
+  // below.
   // Another mount's directory is passed over by every walk, named or not,
   // and no sync of this mount takes it in, so its region gives no advice.
   if (scope !== '' && inOtherMount(scope, view.others)) {
@@ -2039,7 +2104,10 @@ export async function walkScope(
     return walk;
   }
   if (!opts.named && scope !== '') {
-    const why = passedOverAt(scope, view.ignore, view.others);
+    let why = passedOverAt(scope, view.ignore, view.others, true);
+    if (why !== undefined && passedOverAt(scope, view.ignore, view.others, false) === undefined) {
+      if ((await directoryAt(join(rootReal, scope), view.followSymlinks)) === false) why = undefined;
+    }
     if (why !== undefined) {
       walk.others.set(scope, why);
       walk.incomplete.push({ path: scope, reason: `${why}: a sync that names this path takes in what's there, editors' files aside`, kind: 'ignored' });
@@ -2173,8 +2241,12 @@ export async function walkScope(
       // Another mount's directory is passed over by its real path too, so a
       // walk that reaches one through a link to a directory above it lists
       // none of that mount's names (nestedRootAtReal).
-      const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others)
+      let passedOver = passedOverBecause(childRel, entry.name, ignore, view.others, entry.isDirectory())
         ?? (!entry.isSymbolicLink() && nestedRootAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
+      if (passedOver === undefined && view.followSymlinks && entry.isSymbolicLink()) {
+        const asDirectory = passedOverBecause(childRel, entry.name, ignore, view.others, true);
+        if (asDirectory !== undefined && (await directoryAt(dir.at(entry.name), true)) === true) passedOver = asDirectory;
+      }
       if (passedOver !== undefined) {
         others.push([childRel, passedOver]);
         regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });
@@ -2214,7 +2286,7 @@ export async function walkScope(
       } else {
         const symlink = entry.isSymbolicLink();
         leaves.push([childRel, false]);
-        others.push([childRel, symlink ? 'a symlink' : 'not a regular file']);
+        others.push([childRel, symlink ? 'a symlink' : NOT_REGULAR]);
         if (symlink) regions.push({ path: childRel, reason: LINK_NOT_WALKED, kind: 'symlink' });
       }
     }
