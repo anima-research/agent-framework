@@ -3740,6 +3740,28 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
+    it("a user's Stop at a silent turn's retry start, after its first stream's round reached the context, says the turn was stopped before it finished, and nothing of calls or delivery", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, sendTool: true, retries: 1 });
+      try {
+        breakAfterToolRound(h.membrane, 'error');
+        let stopped = false;
+        onSnapshot(h, 2, () => { stopped = h.framework.abortInference('scout', 'operator stop'); });
+        h.membrane.pushResponse(round());
+        (h.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+          agentName: 'scout', reason: 'test', source: 'test', timestamp: Date.now(), suppressProse: true,
+        });
+        await h.until(() => stopped, "the stop reaches the retry's start");
+        await turnEnded(h);
+        assert.equal(h.membrane.calls.length, 1, 'premise: the retry never compiled');
+        assert.ok(h.messages().some((m) => m.content.some((b) => b.type === 'tool_result')), "premise: the round's results are in the context");
+        assert.deepEqual(h.texts().filter((t) => t.startsWith('[turn-interrupted]')),
+          ['[turn-interrupted] Your previous turn was stopped before it finished — a deliberate stop, not a failure.']);
+        assert.equal(markers(h).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
     it("a retry whose round reaches the context, after a first stream cut off while its tool ran, says the earlier rounds ran and the cut-off round's calls were started", async () => {
       const h = await harness({ xml: true, roundPreamble: true, sendTool: true, retries: 1 });
       try {
