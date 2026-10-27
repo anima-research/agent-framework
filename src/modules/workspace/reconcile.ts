@@ -53,6 +53,7 @@ import {
   sameRootIdentity,
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
+import { storedBytes, type StoredBytes } from './sync.js';
 import {
   IGNORED,
   type MountView,
@@ -914,8 +915,8 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       byDesign = OTHER_MOUNT;
     } else if (!opts.named) {
       const slash = path.lastIndexOf('/');
-      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others);
-      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others) : undefined;
+      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others, true);
+      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others, false) : undefined;
       byDesign = above ?? own;
     } else if (scope.kind === 'dir') {
       byDesign = passedOverBetween(scope.dir, path, ignoreBeneath(scope.dir, mount.view.ignore), mount.view.others);
@@ -1028,9 +1029,13 @@ export async function reconcilePass(
   }
 
   // The evidence about to be recorded describes the root it was gathered
-  // under, which is recorded first (once per mount), so no crash can leave
-  // evidence without its root.
-  if (gathered.rootIdentity && planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined)) {
+  // under, which is recorded first, so no crash can leave evidence without
+  // its root. Once a root is recorded, every pass that found it offers it,
+  // evidence or none: the same root on a new device, or with its first
+  // birth time, is recorded again (recordRootIdentity writes nothing
+  // otherwise), and a quiet mount's passes are where an old record learns
+  // its birth time.
+  if (gathered.rootIdentity && (agreement.rootIdentity(mount.name) !== undefined || planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined))) {
     agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
   }
 
@@ -1386,12 +1391,12 @@ export async function pushPaths(
         continue;
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
-      const blob = store.getBlob(s.hash);
+      const stored = storedBytes(store, s.hash);
       const forcedMode = mount.modesObserved && s.mode !== undefined && s.mode !== (d.kind === 'file' ? d.mode : undefined) ? s.mode : undefined;
       const agreedMode = priorP?.kind === 'content' ? priorP.mode : undefined;
-      if (blob) {
+      if ('bytes' in stored) {
         plans.push({
-          path, kind: 'write', blob, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
+          path, kind: 'write', blob: stored.bytes, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
           ...(forcedMode !== undefined ? { apply: forcedMode } : {}),
           ...(forcedMode !== undefined && d.kind === 'file' && agreedMode !== d.mode ? { overDisk: true as const } : {}),
           ...(s.mode !== undefined ? { storeMode: s.mode } : {}),
@@ -1400,7 +1405,7 @@ export async function pushPaths(
           ...(agreedMode !== undefined ? { priorMode: agreedMode } : {}),
           ...(d.kind === 'file' && d.mode !== undefined ? { seenMode: d.mode } : {}),
         });
-      } else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+      } else result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
     if (v.mode === 'adopt' && s && d.kind === 'file') {
@@ -1426,7 +1431,7 @@ export async function pushPaths(
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
     // intent) is recorded before anything is pushed over it, and the root it
-    // was learned under before that (once per mount), as a pass does.
+    // was learned under before that, as a pass does.
     if (v.p !== undefined) agreement.recordRootIdentity(mount.name, root.identity);
     if (v.p === 'forget') agreement.forget(mount.name, path);
     else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
@@ -1551,11 +1556,12 @@ export async function pushPaths(
       plans.push({ path, kind: 'unlink', prior, before: agreement.get(mount.name, path), expect });
       continue;
     }
-    const blob = store.getBlob(s.hash);
-    if (!blob) {
-      result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+    const stored = storedBytes(store, s.hash);
+    if (!('bytes' in stored)) {
+      result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
+    const blob = stored.bytes;
     // The store's mode goes to disk with its bytes where the file is new,
     // the push is forced, or disk still has the mode they last agreed on. A
     // push that completes our own unconfirmed one, whose bytes landed, is a
@@ -1773,4 +1779,8 @@ export async function pushPaths(
   if (recorded || agreement.needsBarrier) agreement.barrier();
   agreement.maybeCheckpoint();
   return result;
+}
+
+function unstoredCopy(stored: Exclude<StoredBytes, { bytes: Buffer }>): string {
+  return 'missing' in stored ? 'the workspace copy is missing from the store' : `the workspace copy is unreadable in the store (${stored.unreadable})`;
 }

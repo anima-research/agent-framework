@@ -6,6 +6,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import type { JsStore } from '@animalabs/chronicle';
 
 export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
@@ -17,4 +18,19 @@ export function hashContent(content: string | Buffer): string {
   const hash = createHash('sha256');
   hash.update(content);
   return hash.digest('hex');
+}
+
+export type StoredBytes = { bytes: Buffer } | { missing: true } | { unreadable: string };
+
+export function storedBytes(store: JsStore, hash: string): StoredBytes {
+  try {
+    const blob = store.getBlob(hash);
+    return blob ? { bytes: blob } : { missing: true };
+  } catch (error) {
+    if (store.isClosed()) throw error;
+    // Chronicle's getBlob throws, rather than answering null, for a blob file
+    // it can't read whole or whose format, checksum or hash doesn't check out,
+    // such as one a write cut short left truncated.
+    return { unreadable: error instanceof Error ? error.message : String(error) };
+  }
 }

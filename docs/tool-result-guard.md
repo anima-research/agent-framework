@@ -24,15 +24,27 @@ structured provider `stopReason: 'refusal'`, not keywords in output, ordinary
 provider errors, or natural-language refusal text.
 
 On that signal, every result in the batch is withheld. Tool calls, result IDs,
-and error flags remain intact; each entire payload becomes the guard's notice,
+and error flags remain intact; each entire payload becomes the guard's notice.
+For a result that isn't an error it is
 
 > Tool result withheld by the guard. The tool has already executed.
 
-followed by where the original is (see "Where a withheld original goes"
-below), and, for the workspace's `materialize`, `sync` and `delete`, the fields
-of their results that say what they acted on. The same holds for every withheld
-settlement: a refusal, an aborted stream, a batch that was never submitted, and
-one whose audit sync failed.
+for a call that was refused and never ran (`ToolResult.refused`),
+
+> Tool result withheld by the guard. The tool didn't run.
+
+and for any other error result (`isError`), which can come before or after the
+tool runs,
+
+> Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.
+
+The notice is followed by where the original is (see "Where a withheld original
+goes" below); for an error result whose original was written to a workspace
+file, by "Read it before calling again."; and, for the workspace's
+`materialize`, `sync` and `delete`, by the fields of their results that say
+what they acted on. The same holds for every withheld settlement: a refusal, an
+aborted stream, a batch that was never submitted, and one whose audit sync
+failed.
 
 The refused attempt's partial assistant output is discarded. Inference is
 retried once on the same model, within the same logical turn; executed tools
@@ -264,8 +276,8 @@ retroactive and does not rewrite results already accepted into memory.
 ## Known limits
 
 - **Explicit-send suppression across a budget restart.** A guard recovery
-  carries the same-turn send suppression, so a text-only recovery after a
-  successful explicit send is not routed (locus/hybrid). Context-budget
+  carries the same-turn send suppression, so a text-only recovery is held
+  where an explicit send may have posted (locus/hybrid). Context-budget
   restarts still re-enter without it (inherited, unchanged here).
 - **Audit growth.** Every guarded batch, accepted ones included, archives
   `originals`, `content`, and `wireResults` indefinitely. There is no

@@ -232,13 +232,16 @@ export interface AgentSettingsExtension {
   properties: Record<string, unknown>;
   /** The setting keys this extension owns (must match `properties` keys). */
   keys: string[];
-  /** Current values for the extension's keys. */
+  /** Current values for the extension's keys. A refused agent_settings call
+   *  names what changed by comparing every field this returns, before the
+   *  call and at its refusal. */
   get(agentName: string): Record<string, unknown>;
   /** Apply a partial update (only this extension's keys present) and return
    *  the new values. Throw to surface a validation error to the agent. */
   update(agentName: string, patch: Record<string, unknown>): Record<string, unknown>;
   /** Restore the listed keys (or all when omitted) to defaults and return the
-   *  new values. Optional — extensions without reset semantics are skipped. */
+   *  new values. Optional: without it, a reset of every setting skips the
+   *  extension, and a reset that names one of its keys is refused. */
   reset?(agentName: string, keys?: string[]): Record<string, unknown>;
 }
 

@@ -148,10 +148,11 @@ interface PendingEvent {
 
 /** Where the host put a message the gate wrote: the agent whose window it
  *  went to and, when it was held for that agent's live turn, the id it waits
- *  under in the host's queue. */
+ *  under in the host's queue, or else the id it was stored under. */
 export interface WritePlacement {
   agent?: string;
   deferredId?: string;
+  messageId?: string;
 }
 
 /**

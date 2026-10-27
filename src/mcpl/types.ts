@@ -384,7 +384,9 @@ export interface McplServerConfig {
    *
    * `disabledCapabilities` takes precedence on conflict. `version` and
    * `featureSets` are not maskable here — feature sets have their own
-   * enable/disable knobs above.
+   * enable/disable knobs above — and neither are RFC-014's `toolHints`,
+   * `toolsets` and `surface`, which a server's own `toolHints` config turns
+   * off.
    */
   enabledCapabilities?: string[];
 
