@@ -458,6 +458,28 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it("a row a tune-out holds from the residents isn't in the caller's view, so its image takes no slot: index 0 is the attachment", async () => {
+    const h = await startTurn({
+      prefix: 'sri-tuned-out-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      seedHistory: (framework) => framework.getAgent('prime')!.getContextManager().addMessage('user', [
+        { type: 'text', text: 'diverted' },
+        { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+      ] as ContentBlock[], { tuneOut: { epochId: 'epoch-1' } }),
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("the caller's own stored context injection is in its view, so its image takes index 0", async () => {
     const h = await startTurn({
       prefix: 'sri-own-injection-',
