@@ -1,8 +1,8 @@
 /**
  * Text the framework didn't write (what a participant or a server supplied),
- * put beside structure of the framework's own: the reply judge's document,
- * and notices the framework writes. A value that can end its line can start
- * a line that reads as the framework's own.
+ * put beside structure of the framework's own: the reply judge's document.
+ * A value that can end its line can start a line that reads as the
+ * framework's own.
  */
 
 /** Every form of line break a reader might take for one: CR LF, CR, LF,

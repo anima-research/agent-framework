@@ -2140,7 +2140,8 @@ export class EventGate {
     changesJudgedContext?: (agentName: string) => boolean;
     /** How long a judge request may take (ms). Default 20,000. */
     judgeTimeoutMs?: number;
-    /** What a judge failure does: wake (default) or skip. */
+    /** What a judge failure, or a judge call the framework refuses without
+     *  making it, does: wake (default) or skip (ReplyJudgeOptions.onError). */
     judgeOnError?: 'wake' | 'skip';
     /** Map an event to the registered channel it arrived on (the host knows
      *  how push-event origins compose into channel ids). The gate routes a
@@ -3786,7 +3787,7 @@ export class EventGate {
         ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
         events: events.map((e) => this.judgeEventSummary(e)),
         agentNames,
-        upcomingWakes: this.upcomingWakes(agentNames, state),
+        upcomingWakes: this.upcomingWakesBut(agentNames, { batch: state }),
         signal: abort.signal,
       });
     } catch (err) {
@@ -3848,14 +3849,20 @@ export class EventGate {
   /**
    * The gate's own timers that will wake `agentNames` with no new event, for
    * the judge to weigh what waiting costs: each agent's pending self-wake
-   * (skip_reply's wake_in_seconds), the end of a sleep, and every pending
-   * batch but `asking`, the one the judge is being asked about. A debounce's
-   * batch wakes the agent when it fires. A judge rule's goes to the judge,
-   * whether it's collecting, being decided (with what queued behind it) or
-   * held, so it only may; so may events buffered behind a running turn, which
-   * the gate delivers when that turn ends.
+   * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
+   * batches of rules other than `exceptPolicy`. A debounce's batch wakes the
+   * agent when it fires. A judge rule's goes to the judge, whether it's
+   * collecting, being decided (with what queued behind it) or held, so it
+   * only may; so may events buffered behind a running turn, which the gate
+   * delivers when that turn ends.
    */
-  upcomingWakes(agentNames: string[], asking?: JudgingState): UpcomingWake[] {
+  upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
+    return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
+  }
+
+  /** upcomingWakes without rule `policy`'s batches, or without `batch`, the
+   *  one the judge is being asked about, its rule's others still listed. */
+  private upcomingWakesBut(agentNames: string[], leftOut: { policy?: string; batch?: JudgingState }): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
     const now = this.now();
     for (const name of agentNames) {
@@ -3869,20 +3876,20 @@ export class EventGate {
     }
     const count = (n: number): string => `${n} ${n === 1 ? 'event' : 'events'}`;
     for (const [name, state] of this.debounceTimers) {
-      if (state.events.length === 0) continue;
+      if (name === leftOut.policy || state.events.length === 0) continue;
       const batch = count(state.events.length);
       wakes.push(state.judge
         ? { at: state.dueAt, certain: false, what: `rule "${name}"'s batch of ${batch} goes to the judge` }
         : { at: state.dueAt, certain: true, what: `rule "${name}"'s debounced batch of ${batch}` });
     }
     for (const [name, state] of this.judging) {
-      if (state === asking) continue;
+      if (name === leftOut.policy || state === leftOut.batch) continue;
       const queued = state.queued.length > 0 ? `, with ${count(state.queued.length)} queued behind it` : '';
       wakes.push({ certain: false, what: `rule "${name}"'s batch of ${count(state.events.length)}${queued}, which the judge is deciding` });
     }
     const refusal = this.judgeHeldForRefusal() ? this.judgeRefusal : null;
     for (const [name, held] of this.judgeHeld) {
-      if (held.events.length === 0) continue;
+      if (name === leftOut.policy || held.events.length === 0) continue;
       const batch = `rule "${name}"'s batch of ${count(held.events.length)}`;
       wakes.push(refusal?.until !== undefined
         ? { at: refusal.until, certain: false, what: `${batch}, held for the judge while its calls are refused` }
@@ -4016,9 +4023,10 @@ export class EventGate {
       else this.flushJudgeHeldIfClear();
     }
     const n = state.events.length;
+    const went = wakes ? 'wakes the agent' : this.judgeHeldForRefusal() ? "is held while the judge's calls are refused" : 'goes back to the judge';
     console.error(
       `[gate] Policy "${policyName}": the reply judge's call was refused (${hold}), so its batch of ${n} `
-      + `${n === 1 ? 'event' : 'events'} ${wakes ? 'wakes the agent' : 'is held'} (judge onError "${this.judgeOnError}")`,
+      + `${n === 1 ? 'event' : 'events'} ${went} (judge onError "${this.judgeOnError}")`,
     );
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, refused: 0 } };
     record.verdicts.refused++;
