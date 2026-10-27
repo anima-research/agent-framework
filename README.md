@@ -349,7 +349,8 @@ three ways:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
   `toolLifecycle` `observe` or `inputs` block, a
   `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default,
-  and `toolHints: true`.
+  and `toolHints: true` (an MCPL server takes hints when the setting is left
+  out; a modern server ignores the default).
   A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
@@ -432,15 +433,23 @@ the `mcpl/coalescing` state (retry window 1 h); audit lines are
 
 #### Tool presence and toolsets (RFC-014)
 
-A server configured with `toolHints: true` (default false) is offered
-`experimental.mcpl.toolHints`, and its hints count only if it advertised
-`toolHints` too. Without it nothing changes: every tool is listed as before,
-and the host advertises and reads nothing new.
+Every MCPL server is offered `experimental.mcpl.toolHints` unless its
+configuration sets `toolHints: false`, and its hints count only if it
+advertised `toolHints` too. A server that doesn't advertise them lists every
+tool as before. With `toolHints: false` on a server, the host advertises and
+reads nothing new for it; with it on every server, the `toolsets` module
+below isn't registered either. A server that leaves the setting out has hints
+only where the name `toolsets` is free: if a module or a server's
+`toolPrefix` holds it at startup, those servers have none, and a line says
+so. `toolHints: true` reserves the name, so a prefix that takes it is refused.
 
-With it, the server's static tools stay in the tool list as before, and its
+With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
 enter it, since every change to the list rebuilds the prompt cache. The
-framework registers a `toolsets` module with four constant tools:
+framework registers a `toolsets` module with four constant tools, at startup or
+at the first runtime connect of a server whose hints aren't off, whether or not
+that server presents anything, so the tool list doesn't change when one starts
+to:
 
 - `toolsets--open {server?, toolset?, instance?, options?}` opens a toolset (or
   a named instance of one), and answers with what the server shows on opening

@@ -3853,9 +3853,10 @@ export class AgentFramework {
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
-  /** MCPL RFC-014: every toolHints server's tool presence, for the
+  /** MCPL RFC-014: every hinted server's tool presence, for the
    *  `toolsets` module's meta-tools and reminders. Made when the first
-   *  server configured with `toolHints: true` is set up; null until then. */
+   *  server with tool hints (any not configured `toolHints: false`) is set
+   *  up; null until then. */
   private toolsetHub: ToolsetHub | null = null;
   /** Inference routing policy from FrameworkConfig — stored so the MCPL
    *  subsystem can be lazily initialized by connectMcplServer when the
@@ -4493,8 +4494,9 @@ export class AgentFramework {
       // settings, and its tool prefix, which mustn't collide with a module
       // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
-      // RFC-014: a server configured with toolHints brings the toolsets
-      // module, whose name no prefix may take either.
+      // RFC-014: a server configured with toolHints: true brings the toolsets
+      // module, whose name no prefix may take either. A server that leaves
+      // the setting out has hints only where that name is free (hintsFor).
       if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) moduleNames.add(TOOLSETS_MODULE);
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
@@ -4518,7 +4520,8 @@ export class AgentFramework {
         prefixesSeen.set(prefix, serverConfig.id);
       }
 
-      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) await framework.ensureToolsetsModule();
+      framework.reserveToolsetsName(config.modules, config.mcplServers);
+      if (config.mcplServers.some((serverConfig) => framework.hintsFor(serverConfig))) await framework.ensureToolsetsModule();
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -29436,14 +29439,53 @@ export class AgentFramework {
     });
   }
 
+  /** RFC-014: who held the name `toolsets` at startup (a module, or a
+   *  server's toolPrefix), so a server that leaves toolHints out has none
+   *  for the life of this framework; null when the name was free. */
+  private toolsetsNameHeldAtStart: string | null = null;
+
+  /** At startup: note who holds the name the meta-tools need, and say which
+   *  servers that leaves without hints. */
+  private reserveToolsetsName(modules: readonly Module[], servers: readonly McplServerConfig[]): void {
+    const module = modules.find((m) => m.name === TOOLSETS_MODULE);
+    const server = servers.find((s) => (s.toolPrefix ?? `mcpl--${s.id}`) === TOOLSETS_MODULE);
+    this.toolsetsNameHeldAtStart = module ? `module "${TOOLSETS_MODULE}"` : server ? `MCPL server "${server.id}"'s toolPrefix` : null;
+    const defaulted = servers.filter((s) => s.toolHints !== true && s.toolHints !== false).map((s) => s.id);
+    if (this.toolsetsNameHeldAtStart && defaulted.length) {
+      console.error(
+        `[mcpl] tool hints (RFC-014) stay off for ${defaulted.join(', ')}: the name "${TOOLSETS_MODULE}" their meta-tools need is ` +
+          `${this.toolsetsNameHeldAtStart}. Set toolHints: false on them to say so, or free the name.`,
+      );
+    }
+  }
+
+  /**
+   * RFC-014: whether a server has tool hints. `true` and `false` are as
+   * configured. Left out (or null) they're on, wherever the name `toolsets`
+   * the meta-tools need is free: no other module holds it and no server's
+   * prefix is it, now or at startup. So a configuration that loaded when
+   * hints were opt-in still loads.
+   */
+  private hintsFor(config: McplServerConfig): boolean {
+    if (config.toolHints === true) return true;
+    if (config.toolHints === false) return false;
+    if (this.toolsetsNameHeldAtStart !== null) return false;
+    if ((config.toolPrefix ?? `mcpl--${config.id}`) === TOOLSETS_MODULE) return false;
+    const module = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
+    if (module && !(module instanceof ToolsetsModule)) return false;
+    const owner = this.mcplPrefixMap.get(TOOLSETS_MODULE);
+    return owner === undefined || owner === config.id;
+  }
+
   /**
    * The host capabilities offered to one server: the host's own, plus
-   * RFC-014's `toolHints` where its configuration asks for them. Without it,
-   * the very object every server is offered.
+   * RFC-014's `toolHints` unless its configuration turns them off
+   * (`toolHints: false`). With them off, the very object every server is
+   * offered.
    */
   private mcplHostCapabilitiesFor(config: McplServerConfig): McplHostCapabilities {
     const base = this.mcplHostCapabilities!;
-    return config.toolHints === true ? { ...base, toolHints: true } : base;
+    return this.hintsFor(config) ? { ...base, toolHints: true } : base;
   }
 
   /** RFC-014: every toolHints server's presence, made on first use. */
@@ -29464,14 +29506,14 @@ export class AgentFramework {
   }
 
   /** RFC-014: the `toolsets` module (toolsets--open, --act, --look,
-   *  --close), registered once, by the first server configured with
-   *  toolHints. Its tools don't change after that. */
+   *  --close), registered once, by the first server with tool hints (any
+   *  not configured `toolHints: false`). Its tools don't change after that. */
   private async ensureToolsetsModule(): Promise<void> {
     const hub = this.toolsets();
     const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
     if (existing instanceof ToolsetsModule) return;
     if (existing) {
-      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints needs that name for its meta-tools`);
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server with tool hints needs that name for its meta-tools (configure toolHints: false on every MCPL server to keep the module)`);
     }
     await this.addModule(new ToolsetsModule(hub, (call) => this.changeTaker(call)));
   }
@@ -29678,8 +29720,8 @@ export class AgentFramework {
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
-      // RFC-014: a toolHints server's meta-tools exist before it connects.
-      if (config.toolHints === true) await this.ensureToolsetsModule();
+      // RFC-014: a hinted server's meta-tools exist before it connects.
+      if (this.hintsFor(config)) await this.ensureToolsetsModule();
       // Its policy exchange is in flight from its registration until the
       // exchange settles: an opener that runs meanwhile (a resume, startup's
       // staged open) passes the connection by, so nothing opens its planes
@@ -29693,7 +29735,7 @@ export class AgentFramework {
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
           // RFC-014 §6.1: hints apply as the connection reads them, from its
           // first message, so the tap is on before any I/O can deliver one.
-          if (config.toolHints === true) this.toolsets().controllerFor(config).attach(registering);
+          if (this.hintsFor(config)) this.toolsets().controllerFor(config).attach(registering);
         },
       );
     } catch (error) {
@@ -30018,7 +30060,7 @@ export class AgentFramework {
       // instances; toolHints withdrawn makes every tool static. Its impact is
       // surface-changed, applied, with no grant consequence (§17.6).
       const declarations = toolsetDeclarationsOf(fetched);
-      const toolsetsChanged = config.toolHints === true
+      const toolsetsChanged = this.hintsFor(config)
         && JSON.stringify(declarations) !== JSON.stringify(connection.toolsetDeclarations);
       connection.toolsetDeclarations = declarations;
       if (toolsetsChanged) this.toolsetHub?.get(connection.id)?.manifestChanged(declarations);
@@ -30573,7 +30615,7 @@ export class AgentFramework {
     this.restartClaims().ids.set(config.id, claim);
     this.restartClaims().prefixes.set(prefix, claim);
     try {
-      await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && config.toolHints === true });
+      await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && this.hintsFor(config) });
       try {
         await this.runConnectMcplServer(config, claim);
       } catch (error) {

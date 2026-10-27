@@ -105,9 +105,9 @@ const push = (peer: ScriptedPeer, eventId: string, text: string, extra: Json = {
 });
 
 test('toolHints off: the advertisement, tool list and traffic are as before', async () => {
-  const t = await setup(() => false, { toolHints: undefined });
+  const t = await setup(() => false, { toolHints: false });
   const { toolHints: _hints, toolsets: _toolsets, surface: _surface, ...plainAdvert } = ADVERT;
-  const plain = await setup(() => false, { toolHints: undefined }, plainAdvert);
+  const plain = await setup(() => false, { toolHints: false }, plainAdvert);
   try {
     const offered = t.server.peer.hostCaps?.mcpl as Json;
     assert.ok(!('toolHints' in offered) && !('toolsets' in offered) && !('surface' in offered), 'nothing of RFC-014 offered');
@@ -473,12 +473,71 @@ test('reminders: an open toolset whose announcement left the context is restated
   } finally { await t.done(); }
 });
 
+for (const [label, toolHints] of [['left out', undefined], ['null', null]] as const) {
+  test(`toolHints ${label} is on: the hints are offered, the meta-tools registered, and the server's dynamic tools leave the list`, async () => {
+    const t = await setup(() => false, { toolHints: toolHints as unknown as boolean });
+    try {
+      const offered = t.server.peer.hostCaps?.mcpl as Json;
+      assert.equal(offered.toolHints, true, 'toolHints offered');
+      const names = t.fw.framework.getAllTools().map((x) => x.name);
+      for (const meta of ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close']) assert.ok(names.includes(meta), meta);
+      await waitFor(() => t.server.received.some((m) => m.method === 'toolsets/list'), 'toolsets/list after connecting');
+      await roundTrip(t);
+      await waitFor(() => !t.fw.framework.getAllTools().some((x) => x.name === 'arc--play'), 'a toolset tool leaves the list');
+      assert.ok(t.fw.framework.getAllTools().some((x) => x.name === 'arc--status'), 'a static tool stays');
+    } finally { await t.done(); }
+  });
+}
+
+test('toolHints left out, on a server that does not advertise them: the hints are offered, and its tools are listed whole as before, beside the meta-tools', async () => {
+  const { toolHints: _hints, toolsets: _toolsets, surface: _surface, ...plainAdvert } = ADVERT;
+  const t = await setup(() => false, { toolHints: undefined }, plainAdvert);
+  try {
+    assert.equal((t.server.peer.hostCaps?.mcpl as Json).toolHints, true, 'toolHints offered');
+    const arcTools = t.fw.framework.getAllTools().filter((x) => x.name.startsWith('arc--'))
+      .map((x) => ({ name: x.name, description: x.description, inputSchema: x.inputSchema }));
+    assert.deepEqual(arcTools, TOOLS.map((x) => ({ name: `arc--${String(x.name)}`, description: x.description, inputSchema: x.inputSchema })),
+      'every tool listed whole, in the server\'s order, as before');
+    assert.equal(t.fw.framework.getAllTools().filter((x) => x.name.startsWith('toolsets--')).length, 4, 'the four meta-tools');
+    await roundTrip(t);
+    assert.ok(!t.methods().some((m) => String(m).startsWith('toolsets/')), 'no toolsets/* request to a server without hints');
+  } finally { await t.done(); }
+});
+
+test('where the name toolsets is taken, a server that leaves toolHints out has none, and the configuration loads as it did; true still reserves the name', async () => {
+  const { toolHints: _hints, toolsets: _toolsets, surface: _surface, ...plainAdvert } = ADVERT;
+  const prefixed = await startScriptedServer({ advert: plainAdvert, tools: [{ name: 'list', description: 'List.', inputSchema: { type: 'object', properties: {} } }] });
+  const other = await startScriptedServer({ advert: ADVERT, tools: TOOLS });
+  const logged: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  let fw: Awaited<ReturnType<typeof makeFramework>> | undefined;
+  try {
+    fw = await makeFramework([
+      { id: 'ts', toolPrefix: 'toolsets', url: prefixed.url },
+      { id: 'arc', toolPrefix: 'arc', url: other.url },
+    ] as McplServerConfig[]);
+  } finally { console.error = realError; }
+  try {
+    await waitFor(() => fw!.framework.getAllTools().some((x) => x.name === 'toolsets--list'), 'the toolsets-prefixed server listed');
+    await waitFor(() => fw!.framework.getAllTools().some((x) => x.name === 'arc--play'), 'the other server listed whole');
+    assert.ok(!('toolHints' in (other.peer.hostCaps?.mcpl as Json)), 'no hints offered to the other server');
+    assert.ok(!fw.framework.getAllTools().some((x) => ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close'].includes(x.name)), 'no meta-tools');
+    assert.ok(logged.some((l) => l.includes('tool hints (RFC-014) stay off for ts, arc') && l.includes('"ts"\'s toolPrefix')), logged.join(' | '));
+  } finally { await fw.stop(); await prefixed.close(); await other.close(); }
+  // As before: a server that asks for hints keeps the name, and a prefix that takes it is refused.
+  const dead = { url: 'ws://127.0.0.1:9/mcpl', reconnect: false };
+  await assert.rejects(makeFramework([{ id: 'ts', toolPrefix: 'toolsets', ...dead }, { id: 'arc', toolPrefix: 'arc', toolHints: true, ...dead }]),
+    /toolPrefix "toolsets" collides with module "toolsets"/);
+});
+
 test('toolHints is a boolean, and only for an MCPL server', () => {
   assert.throws(() => assertServerConfigBooleans({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: 'false' as unknown as boolean }), /toolHints/);
   assert.doesNotThrow(() => assertServerConfigBooleans({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: null as unknown as boolean }));
   assert.ok(serverConfigProblems({ id: 's', url: 'https://example.invalid/mcp', toolHints: true }).some((p) => p.includes('"toolHints"')),
     'a modern server refuses it');
   assert.deepEqual(serverConfigProblems({ id: 's', url: 'https://example.invalid/mcp', toolHints: false }), []);
+  assert.deepEqual(serverConfigProblems({ id: 's', url: 'https://example.invalid/mcp' }), [], 'a modern server takes the default: it can\'t negotiate hints, so it is offered none');
   assert.deepEqual(serverConfigProblems({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: true }), []);
 });
 
