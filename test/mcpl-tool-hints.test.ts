@@ -505,31 +505,19 @@ test('toolHints left out, on a server that does not advertise them: the hints ar
   } finally { await t.done(); }
 });
 
-test('where the name toolsets is taken, a server that leaves toolHints out has none, and the configuration loads as it did; true still reserves the name', async () => {
-  const { toolHints: _hints, toolsets: _toolsets, surface: _surface, ...plainAdvert } = ADVERT;
-  const prefixed = await startScriptedServer({ advert: plainAdvert, tools: [{ name: 'list', description: 'List.', inputSchema: { type: 'object', properties: {} } }] });
-  const other = await startScriptedServer({ advert: ADVERT, tools: TOOLS });
-  const logged: string[] = [];
-  const realError = console.error;
-  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
-  let fw: Awaited<ReturnType<typeof makeFramework>> | undefined;
-  try {
-    fw = await makeFramework([
-      { id: 'ts', toolPrefix: 'toolsets', url: prefixed.url },
-      { id: 'arc', toolPrefix: 'arc', url: other.url },
-    ] as McplServerConfig[]);
-  } finally { console.error = realError; }
-  try {
-    await waitFor(() => fw!.framework.getAllTools().some((x) => x.name === 'toolsets--list'), 'the toolsets-prefixed server listed');
-    await waitFor(() => fw!.framework.getAllTools().some((x) => x.name === 'arc--play'), 'the other server listed whole');
-    assert.ok(!('toolHints' in (other.peer.hostCaps?.mcpl as Json)), 'no hints offered to the other server');
-    assert.ok(!fw.framework.getAllTools().some((x) => ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close'].includes(x.name)), 'no meta-tools');
-    assert.ok(logged.some((l) => l.includes('tool hints (RFC-014) are off for arc,') && l.includes('"ts"\'s toolPrefix')), logged.join(' | '));
-  } finally { await fw.stop(); await prefixed.close(); await other.close(); }
-  // As before: a server that asks for hints keeps the name, and a prefix that takes it is refused.
+test('at startup a toolPrefix of toolsets is refused, with or without toolHints: the name is the framework\'s from creation', async () => {
+  // A configuration that loaded when hints were opt-in, with its prefix
+  // taking the name, would leave every agent without the meta-tools the
+  // host's built-in toolset needs; it's refused instead (only a module given
+  // to create() keeps the name, below).
   const dead = { url: 'ws://127.0.0.1:9/mcpl', reconnect: false };
-  await assert.rejects(makeFramework([{ id: 'ts', toolPrefix: 'toolsets', ...dead }, { id: 'arc', toolPrefix: 'arc', toolHints: true, ...dead }]),
-    /toolPrefix "toolsets" collides with module "toolsets"/);
+  for (const [label, servers] of [
+    ['hints left out', [{ id: 'ts', toolPrefix: 'toolsets', ...dead }, { id: 'arc', toolPrefix: 'arc', ...dead }]],
+    ['hints off on it', [{ id: 'ts', toolPrefix: 'toolsets', toolHints: false, ...dead }]],
+    ['hints asked elsewhere', [{ id: 'ts', toolPrefix: 'toolsets', ...dead }, { id: 'arc', toolPrefix: 'arc', toolHints: true, ...dead }]],
+  ] as const) {
+    await assert.rejects(makeFramework(servers as unknown as McplServerConfig[]), /toolPrefix "toolsets" collides with module "toolsets"/, label);
+  }
 });
 
 /** A module that holds the name `toolsets` for itself (a host's own). */

@@ -396,48 +396,52 @@ export class HostPresentation {
   }
 
   /**
-   * The other resident agents a server's disconnect would take it from: those
-   * that have it in their tool list or its tab open. A connection is the
-   * host's, so one agent's closed tab is every agent's.
+   * The other resident agents a server's disconnect would take it from. One
+   * the host presents things to out of its tool list uses the server while
+   * it's in that list or its tab is open; one that can't use the meta-tools
+   * has every server in its list and couldn't open a closed tab again, so it
+   * always does. A connection is the host's, so one agent's closed tab is
+   * every agent's.
    */
   private otherUsers(agentName: string, serverId: string): string[] {
-    return this.deps.residents().filter((other) => other !== agentName && this.active(other)
-      && (this.presentation(other, serverId) === 'full' || this.isOpen(other, tabKey(serverId))));
+    return this.deps.residents().filter((other) => other !== agentName
+      && (!this.active(other) || this.presentation(other, serverId) === 'full' || this.isOpen(other, tabKey(serverId))));
   }
 
   /**
    * `toolsets--close {server}`: a server in the tool list moves to a tab (one
    * change of the tool list); an open tab is hidden; with `disconnect`, the
    * server is disconnected as a closed tab until it's opened again, unless
-   * another resident agent still uses it.
+   * another resident agent still uses it. The disconnect comes first: one
+   * that fails changes nothing.
    */
   async closeServer(agentName: string, serverId: string, opts: { disconnect?: boolean } = {}): Promise<string> {
+    const was = this.presentation(agentName, serverId);
+    const wasOpen = this.isOpen(agentName, tabKey(serverId));
+    let disconnected = false;
     if (opts.disconnect && !this.isClosedTab(serverId)) {
       const users = this.otherUsers(agentName, serverId);
       if (users.length) {
-        return `${serverId} wasn't disconnected: ${users.join(', ')} ${users.length === 1 ? 'has' : 'have'} it in ${users.length === 1 ? 'its' : 'their'} tool list or ${users.length === 1 ? 'its' : 'their'} tab open, and a connection is the host's, every agent's. ` +
-          `Nothing was changed. ${META_TOOL_NAMES.close} {server:"${serverId}"} without disconnect moves it out of your own tool list.`;
+        return `${serverId} wasn't disconnected: ${users.join(', ')} still ${users.length === 1 ? 'uses' : 'use'} it, ` +
+          `and a connection is the host's, every agent's. Nothing was changed. ` +
+          `${META_TOOL_NAMES.close} {server:"${serverId}"} without disconnect moves it out of your own tool list.`;
       }
+      await this.deps.disconnect(serverId);
+      this.doc.closed[serverId] = true;
+      disconnected = true;
     }
     const said: string[] = [];
     const a = this.agent(agentName);
     try {
-      const was = this.presentation(agentName, serverId);
       if (was === 'full') {
         a.servers[serverId] = 'tab';
         said.push(`${serverId}'s tools leave your tool list from your next request (your tool list changed, so that request writes its prompt cache again); its tab: ${META_TOOL_NAMES.open} {server:"${serverId}"}.`);
-      } else if (this.isOpen(agentName, tabKey(serverId))) {
-        said.push(`${this.tabLabel(serverId)} hidden; it stays connected.`);
+      } else if (wasOpen) {
+        said.push(disconnected ? `${this.tabLabel(serverId)} hidden.` : `${this.tabLabel(serverId)} hidden; it stays connected.`);
       }
       a.open = a.open.filter((k) => k !== tabKey(serverId));
-      if (opts.disconnect) {
-        if (this.isClosedTab(serverId)) said.push(`${serverId} is disconnected already.`);
-        else {
-          await this.deps.disconnect(serverId);
-          this.doc.closed[serverId] = true;
-          said.push(`${serverId} disconnected: none of its events reach you until ${META_TOOL_NAMES.open} {server:"${serverId}"} connects it again.`);
-        }
-      }
+      if (disconnected) said.push(`${serverId} disconnected: none of its events reach you until ${META_TOOL_NAMES.open} {server:"${serverId}"} connects it again.`);
+      else if (opts.disconnect) said.push(`${serverId} is disconnected already.`);
     } finally {
       this.save();
     }

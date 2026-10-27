@@ -506,7 +506,9 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   each agent starts; what an agent chose is kept across restarts. A
   connection is the host's, so a closed tab is disconnected for every agent of
   the host, and `disconnect` is refused while another resident agent has the
-  server in its tool list or its tab open. An operator's own connect of a
+  server in its tool list or its tab open, or can't use the meta-tools (it
+  has every server in its list, and couldn't open a closed tab again). A
+  disconnect that fails changes nothing. An operator's own connect of a
   closed tab ends it, and an operator's disconnect forgets the server's tab.
 - **Hidden tools.** A tool an agent hides with `set_tool_visibility` leaves its
   tool list for the built-in toolset, or its server's tab, and comes back when

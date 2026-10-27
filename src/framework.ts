@@ -3441,7 +3441,6 @@ export class AgentFramework {
    *  by the object, not the run's record (ephemeralRuns), which its cleanup
    *  drops before a cancelled stream may count its last usage. */
   private ephemeralAgents: WeakSet<Agent> = new WeakSet();
-  /** Warn only once per Agent instance after utilities are registered. */
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
@@ -3869,7 +3868,7 @@ export class AgentFramework {
   /** The host's own toolsets: the built-in "settings" and MCPL server tabs. */
   private hostPresentation: HostPresentation | null = null;
   /** MCPL servers kept disconnected as closed tabs, with the configuration an open connects them with. */
-  private closedTabConfigs = new Map<string, McplServerConfig>();
+  private closedTabConfigMap?: Map<string, McplServerConfig>;
   /** Inference routing policy from FrameworkConfig — stored so the MCPL
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
@@ -4518,10 +4517,10 @@ export class AgentFramework {
       // settings, and its tool prefix, which mustn't collide with a module
       // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
-      // RFC-014: a server configured with toolHints: true brings the toolsets
-      // module, whose name no prefix may take either. A server that leaves
-      // the setting out has hints only where that name is free (hintsFor).
-      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) moduleNames.add(TOOLSETS_MODULE);
+      // The name `toolsets` is the framework's from creation: its toolsets
+      // module (or a module given here that holds the name) takes it, so no
+      // prefix may.
+      moduleNames.add(TOOLSETS_MODULE);
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
         assertServerConfigBooleans(serverConfig);
@@ -4550,7 +4549,7 @@ export class AgentFramework {
       // an agent last left it) isn't connected until an agent opens it.
       const closed = framework.hostPresentation.startClosed(config.mcplServers);
       for (const serverConfig of config.mcplServers) {
-        if (closed.has(serverConfig.id)) framework.closedTabConfigs.set(serverConfig.id, serverConfig);
+        if (closed.has(serverConfig.id)) framework.closedTabConfigs().set(serverConfig.id, serverConfig);
       }
       await framework.initializeMcpl(config.mcplServers.filter((c) => !closed.has(c.id)), config.inferenceRouting);
     } else if (!config.modules.some((m) => m.name === TOOLSETS_MODULE)) {
@@ -23970,6 +23969,8 @@ export class AgentFramework {
       this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: traced });
       return failure;
     };
+    // utils was removed: said whatever the allowlist names (dispatchToolCall).
+    if (call.name === 'utils') return failed({ success: false, isError: true, error: UTILS_REMOVED });
     if (origin.kind === 'agent') {
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
       if (failure) return failed(failure);
@@ -24048,8 +24049,6 @@ export class AgentFramework {
       const refusal = origin.kind === 'module' ? null : this.heartbeatRefusal(call.callerAgentName ?? '__ephemeral__', call);
       return refusal ? { success: false, error: refusal, isError: true } : this.runHeartbeatTool(call);
     }
-    if (call.name === 'utils') return { success: false, isError: true, error: UTILS_REMOVED };
-
     // Module tools. The caller uses the result in process, so it gets the
     // module's own result, as the module returned it, less a refusal it
     // claims, which is the dispatcher's to say.
@@ -25858,6 +25857,16 @@ export class AgentFramework {
    * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
+    // utils was removed; its utilities are in the built-in toolset. Said
+    // whatever the allowlist names, so an old call learns where they went.
+    if (call.name === 'utils') {
+      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: UTILS_REMOVED });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework',
+        result: this.refusedResult(agentName, call.id, UTILS_REMOVED),
+      });
+      return;
+    }
     const refusal = this.agentToolPermissionFailure(agentName, call) ?? this.markedInputFailure(agentName, call);
     if (refusal) {
       this.pushEvent({
@@ -25913,15 +25922,6 @@ export class AgentFramework {
     // Route synthesized channel tools
     if (enrichedCall.name.startsWith('channel_') && this.channelRegistry) {
       this.dispatchChannelToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    // utils was removed; its utilities are in the built-in toolset.
-    if (enrichedCall.name === 'utils') {
-      this.pushEvent({
-        type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'framework',
-        result: { success: false, isError: true, error: UTILS_REMOVED },
-      });
       return;
     }
 
@@ -28898,6 +28898,10 @@ export class AgentFramework {
     return (this.mcpRestartClaims ??= { ids: new Map(), prefixes: new Map() });
   }
 
+  private closedTabConfigs(): Map<string, McplServerConfig> {
+    return (this.closedTabConfigMap ??= new Map());
+  }
+
   private legacyConnectAborts(): Map<string, AbortController> {
     return (this.legacyConnectAbortMap ??= new Map());
   }
@@ -29510,22 +29514,21 @@ export class AgentFramework {
     });
   }
 
-  /** RFC-014: who held the name `toolsets` at startup (a module, or a
-   *  server's toolPrefix), so a server that leaves toolHints out has none
-   *  for the life of this framework; null when the name was free. */
+  /** RFC-014: who held the name `toolsets` at startup (a module given to
+   *  create(); a server's toolPrefix of it is refused), so a server that
+   *  leaves toolHints out has none for the life of this framework; null when
+   *  the name was free. */
   private toolsetsNameHeldAtStart: string | null = null;
 
   /** At startup: note who holds the name the meta-tools need, and say which
    *  servers that leaves without hints. */
   private reserveToolsetsName(modules: readonly Module[], servers: readonly McplServerConfig[]): void {
     const module = modules.find((m) => m.name === TOOLSETS_MODULE);
-    const server = servers.find((s) => (s.toolPrefix ?? `mcpl--${s.id}`) === TOOLSETS_MODULE);
-    this.toolsetsNameHeldAtStart = module ? `module "${TOOLSETS_MODULE}"` : server ? `MCPL server "${server.id}"'s toolPrefix` : null;
+    this.toolsetsNameHeldAtStart = module ? `module "${TOOLSETS_MODULE}"` : null;
     if (!this.toolsetsNameHeldAtStart) return;
-    // Those that would have had hints: MCPL servers that leave the setting
-    // out, other than the one whose prefix holds the name.
+    // Those that would have had hints: MCPL servers that leave the setting out.
     const defaulted = servers
-      .filter((s) => s !== server && (s.toolHints === undefined || s.toolHints === null) && isLegacyFamily(s))
+      .filter((s) => (s.toolHints === undefined || s.toolHints === null) && isLegacyFamily(s))
       .map((s) => s.id);
     if (defaulted.length) {
       console.error(
@@ -29606,7 +29609,7 @@ export class AgentFramework {
         for (const [id, config] of this.mcplServerConfigs) {
           out.set(id, { id, configured: config.presentation ?? 'full', connected: !!this.mcplServerRegistry?.getServer(id) || this.modernServers().has(id) });
         }
-        for (const [id, config] of this.closedTabConfigs) {
+        for (const [id, config] of this.closedTabConfigs()) {
           if (!out.has(id)) out.set(id, { id, configured: config.presentation ?? 'full', connected: false });
         }
         return [...out.values()];
@@ -29619,13 +29622,13 @@ export class AgentFramework {
         // As a transient close: its checkpoint trees and RFC-014 state stay
         // for the connect its next open makes.
         await this.trackOperatorOperation('mcpl:disconnect', () => this.runDisconnectMcplServer(serverId, { keepToolsets: true, keepCheckpoints: true }));
-        this.closedTabConfigs.set(serverId, config);
+        this.closedTabConfigs().set(serverId, config);
       },
       reconnect: async (serverId) => {
-        const config = this.closedTabConfigs.get(serverId);
+        const config = this.closedTabConfigs().get(serverId);
         if (!config) throw new Error(`no MCPL server "${serverId}" is kept as a closed tab here`);
         await this.connectMcplServer(config);
-        this.closedTabConfigs.delete(serverId);
+        this.closedTabConfigs().delete(serverId);
       },
       log: (line) => console.error(line),
       isUtility: (name) => this.isModuleUtility(name),
@@ -29685,15 +29688,17 @@ export class AgentFramework {
     return this.hostPresentation ? this.hostPresentation.header(agentName, tools) : tools;
   }
 
-  /** RFC-014: the `toolsets` module (toolsets--open, --act, --look,
-   *  --close), registered once, by the first server with tool hints (any
-   *  not configured `toolHints: false`). Its tools don't change after that. */
+  /** The `toolsets` module (toolsets--open, --act, --look, --close): the
+   *  meta-tools of the host's own toolsets and of RFC-014 servers' toolsets.
+   *  Registered once, at create(), unless a module given to create() holds
+   *  the name; a server with toolHints: true then can't have hints, and its
+   *  connect is refused here. Its tools don't change after that. */
   private async ensureToolsetsModule(): Promise<void> {
     const hub = this.toolsets();
     const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
     if (existing instanceof ToolsetsModule) return;
     if (existing) {
-      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints: true needs that name for its meta-tools: set toolHints: false on it, or leave the setting out to have hints only where the name is free`);
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints: true needs that name for its meta-tools: set toolHints: false on it (or leave the setting out: it then has no hints here), or free the name`);
     }
     await this.addModule(new ToolsetsModule(hub, (call) => this.changeTaker(call), this.hostPresentation));
   }
@@ -30608,7 +30613,7 @@ export class AgentFramework {
       throw new Error(`MCP server "${config.id}" was not connected: it was disconnected or lost while its tools were being listed`);
     }
     // Connected, however it was asked for: not a closed tab any more.
-    this.closedTabConfigs.delete(config.id);
+    this.closedTabConfigs().delete(config.id);
     this.hostPresentation?.noteConnected(config.id);
     this.emitMcplToolDiff(oldToolNames, config.id);
   }
@@ -30637,7 +30642,7 @@ export class AgentFramework {
     const claim = this.restartClaims().ids.get(id);
     if (claim) claim.endedBy = `MCP server "${id}" was disconnected, which ends the restart of "${claim.restarting}"`;
     // A closed tab removed by its operator: there's nothing to connect it again with.
-    if (this.closedTabConfigs.delete(id) && !this.mcplServerConfigs.has(id)) {
+    if (this.closedTabConfigs().delete(id) && !this.mcplServerConfigs.has(id)) {
       this.hostPresentation?.noteRemoved(id);
       return;
     }
