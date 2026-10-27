@@ -418,7 +418,7 @@ test("a script's calls carry the turn of the call watching when each reaches the
   let answer!: () => void;
   const held = new Promise<void>((resolve) => (answer = resolve));
   const { scripts } = setup({
-    config: { yieldMs: 100, maxYieldMs: LONGER_THAN_ANY_START_MS, lifetimeMs: NEVER_FIRES_IN_A_TEST_MS },
+    config: { yieldMs: 100 },
     host: {
       dispatch: async (_agent, name, args, context) => {
         contexts.push({ name, ...context });
@@ -432,8 +432,8 @@ test("a script's calls carry the turn of the call watching when each reaches the
       },
     },
   });
-  const yields = fireNextYieldAsSet(scripts, 60_000);
-  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, 60_000);
+  const yields = fireNextYieldAsSet(scripts, LONGER_THAN_ANY_START_MS);
+  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, LONGER_THAN_ANY_START_MS);
   assert.deepEqual(yields, { fired: true }, 'the run yielded as its timer was set');
   assert.equal(r.running, true);
   const first = { turnId: 1, endTurn: false };
@@ -490,7 +490,8 @@ test("a finished script whose child hasn't exited keeps its place in the host un
   const r = await lingering.run('alice', 'return 1;');
   assert.deepEqual(r.ending, { how: 'finished', value: '1' });
   assert.equal(capacity.running, 1, 'its child is alive, so its place is still taken');
-  await lingering.dispose();
+  const disposed = await Promise.race([lingering.dispose().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), LONGER_THAN_ANY_START_MS).unref())]);
+  assert.equal(disposed, true, 'dispose ended its child');
   for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && capacity.running > 0;) await new Promise((res) => setTimeout(res, 10));
   assert.equal(capacity.running, 0, 'the place comes back once the child has exited');
 });
