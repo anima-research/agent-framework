@@ -155,9 +155,10 @@ export type TraceEvent =
        * A turn whose compile was refused for budget is held while compression
        * makes its context fit, instead of failing (#304). It follows the
        * refused attempt's `inference:failed`, as a provider hold does. Its
-       * logical turn stays open; `inference:hold_ended` follows, and then
-       * the turn's fresh compile. After a hold that ended without a fit, a
-       * refusal of that compile takes the error policy's path.
+       * logical turn stays open; `inference:hold_ended` follows, and then,
+       * unless the turn was stopped while held, its fresh compile. After a
+       * hold that ended without a fit, a refusal of that compile takes the
+       * error policy's path.
        */
       type: 'inference:held';
       agentName: string;
