@@ -143,6 +143,39 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     } finally { h.close(); }
   });
 
+  // The record as the releases before the importer wrote it: version 1,
+  // each entry its id, participant and content, with no seq and no heldAt
+  // (host-quiesce.test.ts's stranded-queue case booted on this shape; review2
+  // J-AF18). Only the queued writes are stored, in the record's order.
+  it('a serving boot stores a version-1 record of seq-less entries, exactly those writes, in its order', async () => {
+    const h = await host();
+    try {
+      let framework = await h.boot();
+      let before: number;
+      try { before = rowsOf(framework).length; } finally { await framework.stop(); }
+      mkdirSync(join(h.storePath, 'recovery'), { recursive: true });
+      writeFileSync(join(h.storePath, 'recovery', 'deferred-writes.json'), JSON.stringify({
+        version: 1,
+        pending: [
+          { id: 'stranded-1', participant: 'user', content: text('stranded') },
+          { id: 'stranded-2', participant: 'user', content: text('stranded after it') },
+        ],
+      }));
+      framework = await h.boot();
+      try {
+        assert.equal(framework.getHostModeStatus().quiesced, false);
+        const imported = rowsOf(framework).slice(before);
+        assert.deepEqual(imported.map(textOf), ['stranded', 'stranded after it'], 'exactly the queued writes, in order');
+        assert.deepEqual(imported.map(writeIdOf), ['stranded-1', 'stranded-2']);
+        const cm = framework.getAgent('agent')!.getContextManager();
+        assert.deepEqual(imported.map((m) => cm.windowStatusOf(m.id)), ['in', 'in']);
+        assert.deepEqual(h.readQueue(), { version: 1, pending: [] }, 'the record is cleared');
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try { assert.deepEqual(rowsOf(framework).slice(before).map(textOf), ['stranded', 'stranded after it'], 'a second boot stores nothing'); } finally { await framework.stop(); }
+    } finally { h.close(); }
+  });
+
   it('skips a write that landed before its ack, by its id', async () => {
     const h = await host();
     try {
@@ -245,6 +278,44 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     }
   });
 
+  // A release with the audience stamp stamped a module's write for a run or
+  // a fork as that agent's before queueing it. Passed to the primary at
+  // import, the write is stamped for the primary: with the gone run's stamp
+  // no window would take it, while the log says it was passed (review2
+  // J-AF9). The unstamped twin, from a release before the stamp, goes the
+  // same way.
+  it("passes a gone run's stamped module write to the primary stamped for the primary, into its window", async () => {
+    const h = await host();
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      h.writeQueue([
+        entry('pr1', 1, 'a module write for the run', {
+          participant: 'module-x', forAgent: 'run-1', metadata: { primaryIfUnread: true, audience: ['run-1'] },
+        }),
+        entry('pr2', 2, 'an unstamped module write for the run', {
+          participant: 'module-x', forAgent: 'run-1', metadata: { primaryIfUnread: true },
+        }),
+      ]);
+      const framework = await h.boot();
+      try {
+        const cm = framework.getAgent('agent')!.getContextManager();
+        const passed = rowsOf(framework).filter((m) => ['pr1', 'pr2'].includes(String(writeIdOf(m))));
+        assert.deepEqual(passed.map(textOf), ['a module write for the run', 'an unstamped module write for the run']);
+        assert.deepEqual(passed.map((m) => m.participant), ['module-x', 'module-x'], 'as the write itself');
+        assert.deepEqual(passed.map((m) => audienceOf(m.metadata)?.audience), [['agent'], ['agent']], "the primary's alone");
+        assert.deepEqual(passed.map((m) => (m.metadata as Record<string, unknown>).primaryIfUnread), [undefined, undefined], 'without the mark');
+        assert.deepEqual(passed.map((m) => cm.windowStatusOf(m.id)), ['in', 'in'], "in the primary's window after the boot");
+        assert.deepEqual(h.readQueue().pending, []);
+        assert.ok(errors.some((e) => /2 notice\(s\) queued for an agent that has ended were passed to the primary/.test(e)), errors.join('\n'));
+      } finally { await framework.stop(); }
+    } finally {
+      console.error = error;
+      h.close();
+    }
+  });
+
   it('releases the mail an imported write carries as it is stored, so the boot delivers it no second time', async () => {
     const h = await host();
     try {
@@ -270,6 +341,10 @@ describe('the deferred-write importer (#291, AF-6)', () => {
           'as the importer stored it',
         );
         assert.equal(withText(framework, 'queued mail').length, 1, 'stored once: the boot delivered no second copy');
+        // Released as the importer stored it, the mail has no redelivery to
+        // wake its recipient: the boot's pass asks the wake its delivery did.
+        const pending = (framework as unknown as { pendingRequests: Array<{ agentName: string; reason: string; source: string }> }).pendingRequests;
+        assert.deepEqual(pending.map((r) => [r.agentName, r.reason, r.source]), [['agent', 'agent-message:helper', 'dendrite']]);
       } finally { await framework.stop(); }
     } finally { h.close(); }
   });
@@ -443,7 +518,9 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     { mode: 'big-before-rewrite', label: 'after a 2,101-write import synced, before the record is cleared', count: 2_101 },
   ] as const;
   for (const crash of CRASHES) {
-    it(`a process exit ${crash.label} loses no queued write and stores none twice`, { timeout: 120_000 }, async (t) => {
+    // The suite's own timeout: the 2,101-write case passes in seconds alone,
+    // and ran past 120 s on a loaded full-suite run (review2 J-AF38).
+    it(`a process exit ${crash.label} loses no queued write and stores none twice`, { timeout: 600_000 }, async (t) => {
       const h = await host();
       try {
         h.quiesceRecord();

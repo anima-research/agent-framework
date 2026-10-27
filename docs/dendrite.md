@@ -107,9 +107,10 @@ The `dendrite:agent-created` trace names the kind, the model (whose weights), th
 A host's `stop()` does not end bounded work it cuts off: a fork or job still running when the host stops is left live in the registry snapshot (traced `dendrite:agent-interrupted`, reason `host-stop`), so the next boot ends it as `host-restart` and tells its result recipient — the same as a crash. Before this, `stop()` ended the record as finished or failed and the restart had nothing to report (first live run, 2026-10-12, finding D). Traces emitted during `create()` (restore, interrupted work, resumed epochs) are replayed to a listener that asks for them — `onTrace(listener, { replay: true })` — since every host attaches its sinks after `create()` returns; the buffer is dropped at `start()`.
 
 - Persistent agents are re-created by configuration, as a new incarnation.
-- Every other agent that was live is recorded as ended with reason `host-restart`. If its result route is a message, the recipient is told once that it ended without a result.
+- Every other agent that was live is recorded as ended with reason `host-restart`. If its result route is a message, the recipient is told once that it ended without a result, unless its result is already in the recipient's store.
 - A persistent agent that the configuration no longer declares is ended with reason `not-configured`.
 - Results held from before the restart are delivered, once.
+- Mail already stored for a recipient but not yet in its window (it arrived during a turn the restart cut off) wakes that recipient again, once per sender and kind (`agent-result:<sender>`, `agent-message:<sender>`), before the boot presents it. Mail already in the window asks for no wake.
 
 ## Messages and results
 
@@ -124,8 +125,8 @@ Published is not delivered. Mail is stored as it is sent, and enters the recipie
 
 A result is written to the registry and synced to disk before delivery is attempted. It is released only when its message has entered the recipient's store. Consequences:
 
-- If the recipient is mid-turn, the result waits for its next boundary and stays held until then.
-- If the process stops in between, the next boot delivers it, after checking the recipient's store for the mail id so it is never delivered twice.
+- If the recipient is mid-turn, the result is stored at once and released once the store has synced it; it enters the recipient's window at the turn's next presentation point, and the delivery's wake runs after the turn.
+- If the process stops before the release, the next boot delivers it, after checking the recipient's store for the mail id so it is never delivered twice. If it stops after the release but before the recipient's turn ended, the next boot wakes the recipient for the stored result (see [After a restart](#after-a-restart)).
 - If the recipient no longer exists, the result is held with reason `recipient-gone` until the sender is reparented.
 
 `deliverAgentResult` works after the agent's run has ended. It refuses a `tool-result` route, because there the caller awaiting the run already has the result.

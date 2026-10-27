@@ -4406,6 +4406,7 @@ export class AgentFramework {
     // restart notices and redelivered mail are stored and enter no other
     // agent's window until resume, as any write.
     // First the wakes a tune-out's rows still owe (wakeForUnpresentedTuneOutRows),
+    // and those stored mail still owes its recipients (wakeForUnpresentedMail),
     // read before the pass below presents those rows. Then a pass over every
     // agent taken on (repairAndRest): its own rows stored and not in its
     // window, then what it is owed at rest, now that the stored rows are in.
@@ -4414,6 +4415,7 @@ export class AgentFramework {
     // live context heard removed (retractAbsentRows): an offline recovery's
     // suppressions, made with the host stopped through one agent's context.
     framework.wakeForUnpresentedTuneOutRows();
+    framework.wakeForUnpresentedMail();
     framework.presentation?.repairAndRest();
     framework.presentation?.retractAbsentRows();
     framework.reconcileAgentRegistry(interruptedAgents);
@@ -8167,7 +8169,9 @@ export class AgentFramework {
    * - A write for an agent no longer registered goes to the primary, as its
    *   by-name notice under the write's own id, when it is a failed reply, a
    *   channel notice its reader could act on, or a module's write for a run
-   *   or a fork (passesToPrimary); anything else is dropped, logged.
+   *   or a fork (passesToPrimary); anything else is dropped, logged. The
+   *   notice is stamped for the primary alone, whatever stamp the write was
+   *   queued with: one for the gone agent would put it in no window.
    * - A write that can't be stored cuts its agent: it and that agent's later
    *   writes stay in the record for the next boot, and the other agents' go
    *   on. One context-manager refuses as malformed, which it would at every
@@ -8175,7 +8179,9 @@ export class AgentFramework {
    * - A tune-out's release (`kind: 'tune-out-cancel'`) stored here owes its
    *   agent the wake its cancel requested (#232 gap 6).
    * - Mail an imported write carries is released as it is stored
-   *   (releaseLandedMail), so reconcile doesn't deliver it again.
+   *   (releaseLandedMail), so reconcile doesn't deliver it again; the
+   *   boot's pass after the import asks its recipient's wake
+   *   (wakeForUnpresentedMail), as the delivery did.
    *
    * What is stored is presented to no window here: the pass after the
    * import presents each agent its own rows and what it is owed at rest, and
@@ -8279,8 +8285,16 @@ export class AgentFramework {
           continue;
         }
       }
+      // A notice for the primary is the primary's alone, as passNoticeToPrimary
+      // stamps one: a module's write for the gone agent keeps its metadata,
+      // whose stamp, queued for that agent, no window would read; on a host
+      // with no primary it is stamped as a write that names no agent.
       const write = notice
-        ? { participant: notice.participant, content: notice.content, metadata: notice.metadata }
+        ? {
+          participant: notice.participant,
+          content: notice.content,
+          metadata: withAudience(notice.metadata, primary ? [primary] : this.defaultAudience(undefined, notice.metadata) ?? [target.name]),
+        }
         : {
           participant: entry.participant,
           content: entry.content,
@@ -8296,7 +8310,6 @@ export class AgentFramework {
         id = this.addMessage(write.participant, write.content, write.metadata, {
           imported: { writeId: entry.id },
           ...(!notice && entry.forAgent !== undefined ? { forAgent: entry.forAgent } : {}),
-          ...(notice && primary ? { audience: [primary] } : {}),
         });
       } catch (error) {
         if (error instanceof MalformedContentError) {
@@ -8385,6 +8398,55 @@ export class AgentFramework {
       const kindOf = (m: StoredMessage): unknown => (m.metadata as { kind?: unknown } | undefined)?.kind;
       if (!rows.some((m) => kinds.includes(kindOf(m) as string))) continue;
       this.pendingRequests.push({ agentName: agent.name, reason, source: 'tune-out', timestamp: Date.now() });
+    }
+  }
+
+  /**
+   * At boot, the wakes stored mail still owes its recipients (#291). A
+   * result or a message is stored for its recipient as it is delivered,
+   * whatever the recipient's turn, and its mail released once the store has
+   * synced the row (releaseLandedMail); the wake the delivery asks for is in
+   * memory. Mail stored while a turn of its recipient's was alive stays out
+   * of that agent's window until the turn's next point (its tool boundary
+   * or its end), and its wake runs after the turn; a process that ended
+   * before then lost the wake, and the next boot has nothing left to
+   * deliver: the mail is no longer held (or is released there, its copy
+   * found in the store), and an interrupted job's result, stored, needs no
+   * "ended without a result" notice (resultStoredFor). So each agent the
+   * index presents for is woken, once per sender and kind, for each row of
+   * mail it is owed and its window doesn't hold, as the delivery's wake
+   * (`agent-<kind>:<sender>`, source 'dendrite'), asked for here, before the
+   * boot's pass presents what each agent is owed (repairAndRest). That
+   * covers mail an earlier release left queued, which the importer stores
+   * and releases. The row is the recipient's when it
+   * names that agent as the one it is for (`dendrite.to`); one stored before
+   * mail named its recipient counts for an agent its audience names, so a
+   * slot's observer isn't woken for a resident's mail. Like reconcile's
+   * redelivery of held mail, it doesn't ask whether the sender asked for no
+   * wake (sendAgentMessage's `wake: false`), which the row doesn't record.
+   * Mail in the window already was presented at rest, or sent in a request
+   * of the turn's (at its tool boundary), its wake run or lost as before
+   * #291, and asks for none; nor does a wake with the same reason already
+   * pending. A window that can't be read is logged and asks for nothing.
+   */
+  private wakeForUnpresentedMail(): void {
+    for (const agent of this.agents.values()) {
+      if (!this.presents(agent)) continue;
+      let rows: StoredMessage[];
+      try {
+        rows = this.presentation!.owedOf(agent);
+      } catch (error) {
+        console.error(`[dendrite] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for mail stored in it:`, error);
+        continue;
+      }
+      for (const row of rows) {
+        const stamp = (row.metadata as { dendrite?: { mailId?: unknown; kind?: unknown; to?: unknown; from?: { agent?: unknown } } } | undefined)?.dendrite;
+        if (typeof stamp?.mailId !== 'string') continue;
+        if (stamp.to === undefined ? audienceOf(row.metadata)?.audience.includes(agent.name) === false : stamp.to !== agent.name) continue;
+        const reason = `agent-${String(stamp.kind ?? 'message')}:${String(stamp.from?.agent ?? '')}`;
+        if (this.pendingRequests.some((r) => r.agentName === agent.name && r.reason === reason)) continue;
+        this.pendingRequests.push({ agentName: agent.name, reason, source: 'dendrite', timestamp: Date.now() });
+      }
     }
   }
 
@@ -10630,8 +10692,12 @@ export class AgentFramework {
    * its row is stored, so after a restart that interrupted the agent, its
    * result is no longer held mail but is in the store: a recipient whose
    * turn was alive when it arrived has it stored at once, as an idle one
-   * does (#291). False where the store can't be read, which is logged: the
-   * recipient is told the agent ended without a result, as with none.
+   * does (#291). It counts as handed over even while it is out of the
+   * recipient's window, the turn it arrived in cut off by the restart: the
+   * boot asked that recipient's wake for it again (wakeForUnpresentedMail),
+   * and its pass presented it. False where the store can't be read, which
+   * is logged: the recipient is told the agent ended without a result, as
+   * with none.
    */
   private resultStoredFor(record: AgentRecord, recipient: string): boolean {
     try {
