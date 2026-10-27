@@ -312,7 +312,7 @@ export function judgeQuestion(
     const where = e.channel ? ` in ${field(e.channel)}` : '';
     const who = e.authorId ? ` from ${field(e.authorId)}` : '';
     const addressed = e.addressed ? ' (addresses the agent)' : '';
-    const line = `- ${ago(e.at, now)}${where}${who}${addressed}: ${quoted(e.content)}`;
+    const line = `- ${ago(e.at, now)}${addressed}${where}${who}: ${quoted(e.content)}`;
     if (lines.length > 0 && used + line.length > maxEventChars) break;
     lines.unshift(line);
     used += line.length + 1;

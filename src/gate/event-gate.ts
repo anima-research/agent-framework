@@ -80,6 +80,10 @@ const MAX_JUDGE_INSTRUCTIONS = 4_000;
 const DEFAULT_JUDGE_TIMEOUT_MS = 20_000;
 /** Judge failures in a row after which gate_status names the judge as failing. */
 const JUDGE_FAILING_STREAK = 3;
+function quotedEventLines(events: PendingEvent[]): string[] {
+  return events.filter((e) => !e.inContext).map((e) => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+}
+
 /** The latest instant a Date can name (ms): a later stated end can't be shown. */
 const MAX_DATE_MS = 8.64e15;
 const JUDGE_REFUSAL_MIN_RETRY_MS = 1_000;
@@ -3632,10 +3636,9 @@ export class EventGate {
     // them here would inject a duplicate copy of the message minutes after
     // the fact, reading as fresh input the agent may have already handled.
     // Only events with no context entry of their own carry their content.
-    const quoted = events.filter(e => !e.inContext);
     const referenced = events.filter(e => e.inContext);
 
-    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+    const lines: string[] = quotedEventLines(events);
     // How each referenced channel is named in the line, in order.
     const shown: string[] = [];
     if (referenced.length > 0) {
@@ -3887,7 +3890,7 @@ export class EventGate {
       wakes.push(refusal?.until !== undefined
         ? { at: refusal.until, certain: false, what: `${batch}, held for the judge while its calls are refused` }
         : refusal
-          ? { certain: false, when: 'once a judge call asked after it gets a verdict, or the hold on its calls is released', what: `${batch}, held for the judge` }
+          ? { certain: false, when: 'right after this call, if it gets a verdict; otherwise once a later call does, or the hold on its calls is released', what: `${batch}, held for the judge` }
           : { certain: false, what: `${batch}, held for the judge` });
     }
     if (this.inferenceBuffer.length > 0) {
@@ -3994,7 +3997,22 @@ export class EventGate {
       this.deliverOrBuffer([...state.events, ...state.queued]);
       return;
     }
+    this.storeUnwoken(policyName, state.events);
     if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, judge);
+  }
+
+  private storeUnwoken(policyName: string, events: PendingEvent[]): void {
+    const lines = quotedEventLines(events);
+    if (lines.length === 0) return;
+    const one = lines.length === 1;
+    try {
+      this.addMessageFn('user', [{
+        type: 'text',
+        text: `[Gate: ${lines.length} event${one ? '' : 's'} matched; the reply judge didn't wake you for ${one ? 'it' : 'them'}]\n\n${lines.join('\n')}`,
+      }], { source: 'gate:judge-wait', policies: [policyName] });
+    } catch (err) {
+      console.error(`[gate] Policy "${policyName}": a batch the reply judge let go by couldn't be stored (${errorText(err)})`);
+    }
   }
 
   private refusedJudging(policyName: string, state: JudgingState, err: unknown, durationMs: number): void {
@@ -4678,12 +4696,12 @@ export class EventGate {
       return `The reply judge's calls are refused until ${new Date(refusal.until).toISOString()}: ${refusal.hold}. `
         + (wakes
           ? "Until then, each judge rule's batch wakes the agent without being judged."
-          : `Until then, judge rules' batches are held (${events} now), and they're judged after that.`);
+          : `Until then, judge rules' batches are held (${events} now), and they're judged after that, or sooner if the hold is released.`);
     }
     return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
       + (wakes
         ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
-        : `Judge rules' held batches (${events} now) wait until the next batch is judged or the hold is released.`);
+        : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when the hold is released.`);
   }
 
   // =========================================================================

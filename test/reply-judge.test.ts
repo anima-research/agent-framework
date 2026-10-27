@@ -499,6 +499,13 @@ describe('reply judge: the document', () => {
     assert.ok(question.includes('- 0s ago in #r&amp;d &lt;beds&gt; &#91;b&#93; from u&lt;1&gt; &#91;x&#93;: hi'), question);
   });
 
+  it("puts the gate's addressed marker right after the time, ahead of the channel and the author", () => {
+    const question = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: 'u1', addressed: true, content: 'hi', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(question.includes('- 0s ago (addresses the agent) in #garden from u1: hi'), question);
+  });
+
   it('keeps a value to one line whatever form its line breaks take', () => {
     assert.strictEqual(oneLine('a\r\nb\rc\nd\u000be\u000cf\u0085g\u2028h\u2029i\n\n\nj'), 'a b c d e f g h i j');
   });
