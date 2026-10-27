@@ -272,7 +272,7 @@ describe('contents the store lost, where disk holds the same bytes', () => {
     symlinkSync(join(env.outside, 'a.txt'), join(env.dir, 'a.txt'));
 
     const error = await refused(m, 'read', { path: 'work/a.txt' });
-    assert.equal(error, "The workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/a.txt), so it can't be restored or read. Write the file again, or delete it.");
+    assert.equal(error, "The read did nothing: the workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/a.txt), so it can't be restored or read. Write the file again, or delete it.");
     assert.equal(env.store.getBlob(hash), null);
     assert.deepEqual(env.kinds(), ['workspace-contents-lost']);
 
@@ -292,7 +292,7 @@ describe('contents the store lost, where disk holds the same bytes', () => {
     symlinkSync(join(env.outside, 'a.txt'), join(env.dir, 'a.txt'));
 
     assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
-      "The workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/a.txt), so it can't be restored or read. "
+      "The read did nothing: the workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/a.txt), so it can't be restored or read. "
         + "Once disk's copy can be read, read the file again, which reads it from disk's copy if that copy has the same contents, or sync the path to keep disk's copy and give up the workspace's.");
     rmSync(join(env.dir, 'a.txt'));
     env.writeDisk('a.txt', 'alpha\n');
@@ -376,7 +376,7 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     m = await env.lose(m, hash);
 
     assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
-      "The workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored or read. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
+      "The read did nothing: the workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored or read. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
     assert.equal(env.store.getBlob(hash), null);
     assert.equal(env.store.getBlob(sha('v1\n'))?.toString(), 'v1\n', "disk's own text is the version it was synced at");
     assert.deepEqual(env.alerts.map(({ kind, data }) => ({ kind, data })), [
@@ -407,7 +407,7 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     m = await env.lose(m, hash);
 
     assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
-      "The workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored or read. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
+      "The read did nothing: the workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored or read. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
     assert.equal(await refused(m, 'edit', { path: 'work/a.txt', oldString: 'v2', newString: 'V2' }),
       "The workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored, and the edit changed nothing. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
     await ok(m, 'sync', { path: 'work/a.txt' });
@@ -425,10 +425,10 @@ describe('contents the store lost, where disk holds no copy of them', () => {
 
     for (const path of ['work/a.txt', 'work/b.txt']) {
       assert.equal(await refused(m, 'read', { path }),
-        `The workspace's copy of ${path} is missing from the store, and disk has no copy, so it can't be restored or read. Write the file again, or delete it.`);
+        `The read did nothing: the workspace's copy of ${path} is missing from the store, and disk has no copy, so it can't be restored or read. Write the file again, or delete it.`);
     }
     await ok(m, 'delete', { path: 'work/a.txt' });
-    assert.match(await refused(m, 'read', { path: 'work/a.txt' }), /^File not found/);
+    assert.match(await refused(m, 'read', { path: 'work/a.txt' }), /^The read did nothing: there's no file at "work\/a\.txt"/);
     await ok(m, 'write', { path: 'work/b.txt', content: 'b again\n' });
     assert.equal(await textOf(m, 'work/b.txt'), 'b again\n');
   });
@@ -493,7 +493,7 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     m = await env.lose(m, hash);
 
     assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
-      "The workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored or read. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
+      "The read did nothing: the workspace's copy of work/a.txt is missing from the store, and disk's copy holds other contents, so it can't be restored or read. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
     assert.equal(env.store.getBlob(hash), null);
     assert.deepEqual(env.kinds(), ['workspace-contents-lost']);
   });
@@ -513,9 +513,9 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     symlinkSync(join(env.dir, 'nowhere'), join(env.dir, 'dir'));
 
     assert.equal(await refused(m, 'read', { path: 'work/a.txt' }),
-      "The workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (File not found: work/a.txt), so it can't be restored or read. Write the file again, or delete it.");
+      "The read did nothing: the workspace's copy of work/a.txt is missing from the store, and disk's copy can't be read (File not found: work/a.txt), so it can't be restored or read. Write the file again, or delete it.");
     assert.equal(await refused(m, 'read', { path: 'work/dir/b.txt' }),
-      "The workspace's copy of work/dir/b.txt is missing from the store, and disk's copy can't be read (beneath a symlink that does not lead to a directory inside the mount), so it can't be restored or read. Write the file again, or delete it.");
+      "The read did nothing: the workspace's copy of work/dir/b.txt is missing from the store, and disk's copy can't be read (beneath a symlink that does not lead to a directory inside the mount), so it can't be restored or read. Write the file again, or delete it.");
   });
 
   test("a store closed while a read restores contents fails the read with the store's own error, and tells no damaged blob", async (t) => {
@@ -549,7 +549,7 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     assert.equal(image.find((b: { type: string }) => b.type === 'text').text,
       `Path: work/p.png\nMIME: image/gif\nBytes: ${GIF.byteLength}\nThe workspace's copy of work/p.png is missing from the store, so this is disk's copy, which holds other contents.`);
     assert.equal(await refused(m, 'read_image', { path: 'work/q.png' }),
-      "The workspace's copy of work/q.png is missing from the store, and disk has no copy, so it can't be restored or read. Write the file again, or delete it.");
+      "The read_image did nothing: the workspace's copy of work/q.png is missing from the store, and disk has no copy, so it can't be restored or read. Write the file again, or delete it.");
   });
   test("edit_many tells each file's own state when files share contents the store lost", async (t) => {
     const env = new Env(t);
@@ -582,7 +582,7 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     env.writeDisk('p.png', 'not an image\n');
 
     assert.equal(await refused(m, 'read_image', { path: 'work/p.png' }),
-      "The workspace's copy of work/p.png is missing from the store, and disk's copy holds other contents, so it can't be restored, and disk's copy can't be shown (Unsupported image format: work/p.png). Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
+      `The read_image did nothing: the workspace's copy of work/p.png is missing from the store, and disk's copy holds other contents, so it can't be restored, and disk's copy can't be shown ("work/p.png" isn't a PNG, JPEG, GIF or WebP image, the formats read_image shows). Sync the path to keep disk's copy and give up the workspace's, or write the file again.`);
   });
 
   test("read_image gives disk's reason once where disk's copy can't be read", async (t) => {
@@ -596,7 +596,7 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     symlinkSync(join(env.outside, 'p.png'), join(env.dir, 'p.png'));
 
     assert.equal(await refused(m, 'read_image', { path: 'work/p.png' }),
-      "The workspace's copy of work/p.png is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/p.png), so it can't be restored or read. Write the file again, or delete it.");
+      "The read_image did nothing: the workspace's copy of work/p.png is missing from the store, and disk's copy can't be read (Symlinks are not allowed: work/p.png), so it can't be restored or read. Write the file again, or delete it.");
   });
 
   test("read_image tells a loss while the disk-agreement evidence awaits reopening, since its read checks the root as before", async (t) => {
@@ -625,10 +625,17 @@ describe('contents the store lost, where disk holds no copy of them', () => {
       store.appendJson = append;
     }
     assert.equal(fired, true);
-    assert.match(await refused(m, 'ls', { path: 'work' }), /evidence is unavailable until the store is reopened/);
+    const reopen = "Calling again won't change that; whoever runs this host can reopen it with a restart.";
+    const until = "the workspace can't check its files against disk until its store is reopened: an append to its record of what disk last agreed with failed inside the store, "
+      + `so that record may lack what the append held. ${reopen}`;
+    assert.equal(await refused(m, 'ls', { path: 'work' }), `The ls did nothing: ${until}`);
 
     assert.equal(await refused(m, 'read_image', { path: 'work/p.png' }),
-      "The workspace's copy of work/p.png is missing from the store, and disk has no copy, so it can't be restored or read. Write the file again, or delete it.");
+      "The read_image did nothing: the workspace's copy of work/p.png is missing from the store, and disk has no copy, so it can't be restored or read. "
+      + "Nothing you do clears this until the workspace's store is reopened, and calling again won't change that; whoever runs this host can reopen it with a restart. "
+      + 'After that, write the file again, or delete it.');
+    assert.equal(await refused(m, 'write', { path: 'work/p.png', content: 'x' }), `The write did nothing: ${until}`);
+    assert.equal(await refused(m, 'delete', { path: 'work/p.png' }), `The delete did nothing: ${until}`);
     assert.deepEqual(env.kinds().filter((kind) => kind.startsWith('workspace-contents-')), ['workspace-contents-lost']);
   });
 
@@ -641,9 +648,9 @@ describe('contents the store lost, where disk holds no copy of them', () => {
     assert.match(await refused(m, 'write', { path: 'work/other.txt', content: 'x\n' }), /is configured direct, and runs as 'chronicle' this session/);
 
     assert.equal(await refused(m, 'read', { path: 'work/drafted.txt' }),
-      "The workspace's copy of work/drafted.txt is missing from the store, and disk has no copy, so it can't be restored or read. Sync the path to take disk's deletion, which removes the workspace's copy.");
+      "The read did nothing: the workspace's copy of work/drafted.txt is missing from the store, and disk has no copy, so it can't be restored or read. Sync the path to take disk's deletion, which removes the workspace's copy.");
     await ok(m, 'sync', { path: 'work/drafted.txt' });
-    assert.match(await refused(m, 'read', { path: 'work/drafted.txt' }), /^File not found/);
+    assert.match(await refused(m, 'read', { path: 'work/drafted.txt' }), /^The read did nothing: there's no file at "work\/drafted\.txt"/);
   });
 
   test("whoever runs the host is told that putting back the store's blob file brings the contents back, and it does", async (t) => {
@@ -688,7 +695,7 @@ describe("contents whose blob file the store can't read", () => {
     m = await env.damage(m, hash);
 
     assert.match(await refused(m, 'read', { path: 'work/a.txt' }),
-      /^The workspace's copy of work\/a\.txt is unreadable in the store \(.+\), and disk's copy holds other contents, so it can't be restored or read\. Sync the path to keep disk's copy and give up the workspace's\.$/);
+      /^The read did nothing: the workspace's copy of work\/a\.txt is unreadable in the store \(.+\), and disk's copy holds other contents, so it can't be restored or read\. Sync the path to keep disk's copy and give up the workspace's\.$/);
     await ok(m, 'sync', { path: 'work/a.txt' });
     assert.equal(await textOf(m, 'work/a.txt'), 'v1\n');
   });
@@ -701,9 +708,9 @@ describe("contents whose blob file the store can't read", () => {
     m = await env.damage(m, hash);
 
     assert.match(await refused(m, 'read', { path: 'work/a.txt' }),
-      /^The workspace's copy of work\/a\.txt is unreadable in the store \(.+\), and disk has no copy, so it can't be restored or read\. Delete the file to clear it\.$/);
+      /^The read did nothing: the workspace's copy of work\/a\.txt is unreadable in the store \(.+\), and disk has no copy, so it can't be restored or read\. Delete the file to clear it\.$/);
     await ok(m, 'delete', { path: 'work/a.txt' });
-    assert.match(await refused(m, 'read', { path: 'work/a.txt' }), /^File not found/);
+    assert.match(await refused(m, 'read', { path: 'work/a.txt' }), /^The read did nothing: there's no file at "work\/a\.txt"/);
   });
   test("files sharing contents whose blob the store can't read are all answered from the one file whose disk copy has them, told once", async (t) => {
     for (const [unrestorable, restoring] of [['a.txt', 'b.txt'], ['b.txt', 'a.txt']]) {

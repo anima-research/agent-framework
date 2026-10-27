@@ -57,6 +57,7 @@ import { storedBytes, type StoredBytes } from './sync.js';
 import {
   IGNORED,
   type MountView,
+  NOT_A_DIRECTORY,
   OTHER_MOUNT,
   ROOT_REPLACED,
   type Walk,
@@ -76,6 +77,7 @@ import {
   withinIncludes,
 } from './observe.js';
 import { EffectFailed, type Expect, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
+import { errnoWords } from './answers.js';
 
 export type EntryState =
   | 'synced'
@@ -487,7 +489,7 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
   }
   // A deletion below a file finds nothing there to unlink, so only a write
   // meets this one.
-  if (reason === 'a parent path is not a directory') {
+  if (reason === NOT_A_DIRECTORY) {
     return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
       'move or remove it on disk and materialize again, or write the file under another path';
   }
@@ -507,7 +509,7 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
  * to pass.
  */
 function forcedWay(note: string | undefined, deletion: boolean, forced: string): string {
-  if (note === 'cannot open (EACCES)') return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
+  if (note === `cannot open (${errnoWords('EACCES')})`) return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
   return '';
 }
 

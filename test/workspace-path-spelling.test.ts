@@ -170,10 +170,11 @@ test('a nested mount whose directory is configured as disk spells it is that mou
     writeFileSync(join(dir, 'inner', 'x.txt'), 'inner\n');
     const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/INNER/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(read.success, false);
-    assert.equal(read.error, '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+    const refusal = '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".';
+    assert.equal(read.error, `The read did nothing: ${refusal}`);
     await assert.rejects(workspace.readFileFromDisk('outer/INNER/x.txt'),
       (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount');
-    assert.deepEqual(await workspace.readBinary('outer/INNER/x.txt'), { error: read.error });
+    assert.deepEqual(await workspace.readBinary('outer/INNER/x.txt'), { error: refusal });
   });
 
 test('a nested mount whose directory is configured in another spelling than disk\'s is that mount\'s in either',
@@ -333,7 +334,7 @@ test('a name a mount\'s include doesn\'t cover is refused as given, whether disk
     for (const tool of ['read', 'write', 'ls', 'glob', 'grep', 'sync', 'materialize']) {
       const input = tool === 'glob' || tool === 'grep' ? { path, pattern: 's' } : tool === 'write' ? { path, content: 'x' } : { path };
       const result = await workspace.handleToolCall({ id: tool, name: tool, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-      assert.equal(result.error, refusal, `${tool} ${path}`);
+      assert.equal(result.error, `The ${tool} did nothing: ${refusal}`, `${tool} ${path}`);
     }
     await assert.rejects(workspace.readFileFromDisk(path),
       (err: unknown) => err instanceof WorkspaceReadError && err.code === 'outside_include' && err.message === refusal);
@@ -357,7 +358,7 @@ test("through a link a mount follows, the include judges where the path lands as
   symlinkSync('ELSE', join(dir, 'via'));
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/x.json' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false);
-  assert.ok(String(read.error).endsWith('Symlink escape detected: work/x.json'), String(read.error));
+  assert.ok(String(read.error).startsWith('The read did nothing: "work/x.json" leads through a symlink to a place outside its mount'), String(read.error));
   await assert.rejects(workspace.readFileFromDisk('work/x.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'escape');
   await call('sync', {});
   assert.equal((((await call('grep', { path: 'work', pattern: 'outside the include' })).structured) as { totalMatches: number }).totalMatches, 0);
@@ -485,9 +486,10 @@ test('past a nested mount\'s directory, an answer shows the path as given', { sk
   for (const name of ['HIDDEN.TXT', 'NOPE.TXT']) {
     const path = `outer/INNER/${name}`;
     const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-    assert.equal(read.error, `"outer/inner/${name}" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/${name}".`);
+    const refusal = `"outer/inner/${name}" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/${name}".`;
+    assert.equal(read.error, `The read did nothing: ${refusal}`);
     await assert.rejects(workspace.readFileFromDisk(path),
-      (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount' && err.message === read.error);
+      (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount' && err.message === refusal);
     for (const tool of ['ls', 'glob', 'grep', 'sync', 'materialize']) {
       const input = tool === 'glob' || tool === 'grep' ? { path, pattern: 'h' } : { path };
       const answer = JSON.stringify(await workspace.handleToolCall({ id: tool, name: tool, input } as Parameters<WorkspaceModule['handleToolCall']>[0]));
@@ -577,11 +579,11 @@ test('on a disk that tells case apart, a directory spelled otherwise than a nest
       ];
     });
     const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/Inner/x.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-    assert.equal(read.error, '"outer/Inner/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
+    assert.equal(read.error, 'The read did nothing: "outer/Inner/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
       '"outer/Inner" from "outer/inner", mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/x.txt". If you meant one of this mount\'s own, ' +
       'for a new file use a path outside "outer/Inner" and "outer/inner", and for one already there ask whoever runs this workspace to rename one of "outer/Inner" and "outer/inner".');
     const wrote = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/Inner/x.txt', content: 'written\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-    assert.match(String(wrote.error), /^"outer\/Inner\/x\.txt" may lie in mount "inner", nested in mount "outer"/);
+    assert.match(String(wrote.error), /^The write did nothing: "outer\/Inner\/x\.txt" may lie in mount "inner", nested in mount "outer"/);
     assert.equal(readFileSync(join(dir, 'Inner', 'x.txt'), 'utf8'), 'outer\n');
     assert.equal(workspace.resolveAbsolutePath('outer/Inner/x.txt'), null);
     const listed = await call('ls', { path: 'outer', recursive: true });
@@ -638,22 +640,22 @@ test('on a disk that tells case apart, a link into a nested mount\'s directory n
   const unfollowed = await twoDeepRig(t, false);
   const u = async (link: string) => String((await unfollowed.tool('read', { path: `work/${link}` })).error);
   for (const link of ['l', 'h']) {
-    assert.equal(await u(link), `work/${link}: "work/${link}" is a symlink, which this mount does not follow`);
+    assert.equal(await u(link), `The read did nothing: work/${link}: "work/${link}" is a symlink, which this mount does not follow.`);
     assert.equal(await code(unfollowed.workspace.readFileFromDisk(`work/${link}`)), 'symlink', link);
   }
-  assert.match(await u('m'), /lies in mount "alpha", nested in mount "work": use "alpha\/keep\.md" in place of "work\/m"$/);
-  assert.match(await u('b'), /lies in mount "bin", nested in mount "work": use "bin\/x\.md" in place of "work\/b"$/);
+  assert.match(await u('m'), /lies in mount "alpha", nested in mount "work": use "alpha\/keep\.md" in place of "work\/m"\.$/);
+  assert.match(await u('b'), /lies in mount "bin", nested in mount "work": use "bin\/x\.md" in place of "work\/b"\.$/);
   assert.match(await u('d'), /may lie in mount "bin", nested in mount "work".*use "bin" in place of "work\/d"/);
   for (const link of ['m', 'b', 'd']) assert.equal(await code(unfollowed.workspace.readFileFromDisk(`work/${link}`)), 'other_mount', link);
   const followed = await twoDeepRig(t, true);
   const f = async (link: string) => String((await followed.tool('read', { path: `work/${link}` })).error);
   for (const link of ['l', 'h']) {
-    assert.equal(await f(link), `Symlink escape detected: work/${link}`);
+    assert.equal(await f(link), `The read did nothing: "work/${link}" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; if a mount holds that file, name it by its path there.`);
     assert.equal(await code(followed.workspace.readFileFromDisk(`work/${link}`)), 'escape', link);
   }
-  assert.equal(await f('m'), '"work/m" leads into mount "alpha", nested in mount "work", which neither reads nor writes it: use "alpha/keep.md".');
-  assert.equal(await f('b'), '"work/b" leads into mount "bin", nested in mount "work", which neither reads nor writes it: use "bin/x.md".');
-  assert.match(await f('d'), /^"work\/d" may lead into mount "bin", nested in mount "work".*use "bin"\./);
+  assert.equal(await f('m'), 'The read did nothing: "work/m" leads into mount "alpha", nested in mount "work", which neither reads nor writes it: use "alpha/keep.md".');
+  assert.equal(await f('b'), 'The read did nothing: "work/b" leads into mount "bin", nested in mount "work", which neither reads nor writes it: use "bin/x.md".');
+  assert.match(await f('d'), /^The read did nothing: "work\/d" may lead into mount "bin", nested in mount "work".*use "bin"\./);
   for (const link of ['m', 'b', 'd']) assert.equal(await code(followed.workspace.readFileFromDisk(`work/${link}`)), 'other_mount', link);
 });
 
@@ -664,7 +666,7 @@ test('on a disk that tells case apart, each nested mount that may hold a place j
   assert.match(String(secret?.note), /^it may lie in mount "bin", nested in this one: .*use "bin\/secret\.md"/, JSON.stringify(listed.data));
   assert.match(String((await unfollowed.tool('read', { path: 'work/l' })).error), /may lie in mount "bin", nested in mount "work".*use "bin\/secret\.md" in place of "work\/l"/);
   const followed = await twoDeepRig(t, true, ['keep.md', 'Bin/**']);
-  assert.match(String((await followed.tool('read', { path: 'work/l' })).error), /^"work\/l" may lead into mount "bin", nested in mount "work".*use "bin\/secret\.md"/);
+  assert.match(String((await followed.tool('read', { path: 'work/l' })).error), /^The read did nothing: "work\/l" may lead into mount "bin", nested in mount "work".*use "bin\/secret\.md"/);
 });
 
 test('a nested mount\'s directory is matched level by level as any disk may compare names: in either normalization form and in any case, as fully as a disk that folds names may, at every level', () => {
@@ -728,7 +730,7 @@ test('before a start, a name in another case than a nested mount\'s directory ma
   workspace.initStore(store);
   const wrote = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/INNER/new.md', content: 'x\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(wrote.success, false);
-  assert.match(String(wrote.error), /^"outer\/INNER\/new\.md" may lie in mount "inner", nested in mount "outer"/);
+  assert.match(String(wrote.error), /^The write did nothing: "outer\/INNER\/new\.md" may lie in mount "inner", nested in mount "outer"/);
 });
 
 test('a followed link\'s landing beneath a placement start only guessed at is named as the landing spells it, beside the nested directory\'s spelling where the landing matches it only loosely', async () => {
@@ -793,8 +795,8 @@ test('on a disk that tells case apart, a link into a directory the comparison on
   const remedy = 'If not, ask whoever runs this workspace to rename one of "outer/sub/INNER" and "outer/sub/inner"';
   const read = await unfollowed.tool('read', { path: 'outer/l', offsetChars: 0, limitChars: 100 });
   assert.equal(read.success, false);
-  assert.equal(read.error, 'outer/l: "outer/l" is a symlink to "outer/sub/INNER/x.txt", which this mount does not follow; it may lie in mount "inner", ' +
-    `nested in mount "outer": this workspace can't tell "outer/sub/INNER" from "outer/sub/inner", ${since}, use "inner/x.txt" in place of "outer/l". ${remedy}`);
+  assert.equal(read.error, 'The read did nothing: outer/l: "outer/l" is a symlink to "outer/sub/INNER/x.txt", which this mount does not follow; it may lie in mount "inner", ' +
+    `nested in mount "outer": this workspace can't tell "outer/sub/INNER" from "outer/sub/inner", ${since}, use "inner/x.txt" in place of "outer/l". ${remedy}.`);
   const followed = await nestedRig(t, 'sub/inner', { follow: true, before: (d) => {
     mkdirSync(join(d, 'sub'));
     writeFileSync(join(d, 'l'), 'a file at first\n');
@@ -805,7 +807,7 @@ test('on a disk that tells case apart, a link into a directory the comparison on
   symlinkSync(join('sub', 'INNER', 'x.txt'), join(followed.dir, 'l'));
   const leads = 'it leads to "outer/sub/INNER/x.txt", and this workspace can\'t tell "outer/sub/INNER" from "outer/sub/inner"';
   assert.equal((await followed.tool('read', { path: 'outer/l', offsetChars: 0, limitChars: 100 })).error,
-    `"outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: ${leads}, ${since}, use "inner/x.txt". ${remedy}.`);
+    `The read did nothing: "outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: ${leads}, ${since}, use "inner/x.txt". ${remedy}.`);
   const sync = await followed.tool('sync', {});
   const skipped = ((sync.data as { skipped?: Array<{ path?: string; reason: string }> }).skipped ?? []).find((e) => e.path === 'l');
   assert.equal(skipped?.reason, `disk could not be checked: "outer/l" may lead into mount "inner", nested in mount "outer": ${leads}, ${since}, use "inner/x.txt" in its place. ${remedy}`, JSON.stringify(sync.data));
@@ -830,7 +832,7 @@ test('on a disk that tells case apart, a followed link whose landing outside the
   mkdirSync(join(root, 'elsewhere', 'INNER'));
   writeFileSync(join(root, 'elsewhere', 'INNER', 'x.txt'), 'elsewhere\n');
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/l', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.equal(read.error, '"outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell whether where it leads ' +
+  assert.equal(read.error, 'The read did nothing: "outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell whether where it leads ' +
     'is that mount\'s directory. If you meant that mount\'s directory, use "inner/x.txt"; if not, ask whoever runs this workspace.');
   assert.ok(!String(read.error).includes(root), 'no path of the host');
 });
@@ -865,10 +867,10 @@ test('on a disk that keeps the normalization forms apart, a nested mount start p
   const told = 'this workspace can\'t tell whether "outer/inner" is mount "inner"\'s directory, since the two mounts\' roots are configured in spellings it can\'t tell ' +
     'apart. If you meant that mount\'s directory, use "inner/x.txt".';
   const direct = (await read('outer/inner/x.txt')).error;
-  assert.equal(direct, `"outer/inner/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: ${told} If you meant one of this ` +
+  assert.equal(direct, `The read did nothing: "outer/inner/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: ${told} If you meant one of this ` +
     'mount\'s own, for a new file use a path outside "outer/inner", and for one already there ask whoever runs this workspace to check where the two mounts are configured.');
   const linked = (await read('outer/l')).error;
-  assert.equal(linked, `"outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: it leads to "outer/inner/x.txt", and ${told} ` +
+  assert.equal(linked, `The read did nothing: "outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: it leads to "outer/inner/x.txt", and ${told} ` +
     'If not, ask whoever runs this workspace to check where the two mounts are configured.');
   for (const error of [direct, linked]) assert.ok(!String(error).includes(root), 'no path of the host');
 });
@@ -900,10 +902,10 @@ test('on a disk that keeps the normalization forms apart, a placement start gues
   const read = (path: string) => workspace.handleToolCall({ id: 'r', name: 'read', input: { path, offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   const told = 'this workspace can\'t tell whether "outer/na\\u00efve" is mount "inner"\'s directory, since the two mounts\' roots are configured in spellings it can\'t ' +
     'tell apart. If you meant that mount\'s directory, use "inner/x.txt".';
-  assert.equal((await read('outer/na\u00efve/x.txt')).error, `"outer/na\u00efve/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: ${told} ` +
+  assert.equal((await read('outer/na\u00efve/x.txt')).error, `The read did nothing: "outer/na\u00efve/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: ${told} ` +
     'If you meant one of this mount\'s own, for a new file use a path outside "outer/na\\u00efve" and "outer/nai\\u0308ve", and for one already there ask whoever runs this ' +
     'workspace to check where the two mounts are configured.');
-  assert.equal((await read('outer/l')).error, '"outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: it leads to ' +
+  assert.equal((await read('outer/l')).error, 'The read did nothing: "outer/l" may lead into mount "inner", nested in mount "outer", which neither reads nor writes it: it leads to ' +
     `"outer/na\\u00efve/x.txt", and ${told} If not, ask whoever runs this workspace to check where the two mounts are configured.`);
 });
 
@@ -933,7 +935,7 @@ test('on a disk that keeps the normalization forms apart, start\'s warning names
   assert.ok(warnings.includes('[workspace] Mount "outer" contains mount "inner" where it lies on disk, at inner/, and where it may lie on disk, at real/ ' +
     '— passing over it as another mount\'s directory'), warnings.join('\n'));
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/inner/x.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.equal(read.error, '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+  assert.equal(read.error, 'The read did nothing: "outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
 });
 
 test('on a disk that keeps the normalization forms apart, a directory start placed both surely and by a guess is placed surely', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
@@ -953,7 +955,7 @@ test('on a disk that keeps the normalization forms apart, a directory start plac
   await workspace.start(ctx);
   t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/inner/x.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.equal(read.error, '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+  assert.equal(read.error, 'The read did nothing: "outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
 });
 
 test('on a disk that keeps the normalization forms apart, of two placements at one depth, the one a path matches exactly names the mount', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
@@ -972,7 +974,7 @@ test('on a disk that keeps the normalization forms apart, of two placements at o
   await workspace.start(ctx);
   t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/cafe\u0301/x.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.equal(read.error, '"outer/cafe\u0301/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+  assert.equal(read.error, 'The read did nothing: "outer/cafe\u0301/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
 });
 
 test('on a disk that keeps the normalization forms apart, a directory in the other form of a nested mount\'s is refused showing both by their code points', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
@@ -982,7 +984,7 @@ test('on a disk that keeps the normalization forms apart, a directory in the oth
   } });
   const told = 'this workspace can\'t tell "outer/caf\\u00e9" from "outer/cafe\\u0301", mount "inner"\'s directory. If you meant that mount\'s directory, use';
   assert.equal((await tool('read', { path: 'outer/caf\u00e9/x.txt', offsetChars: 0, limitChars: 100 })).error,
-    `"outer/caf\u00e9/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: ${told} "inner/x.txt". ` +
+    `The read did nothing: "outer/caf\u00e9/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: ${told} "inner/x.txt". ` +
     'If you meant one of this mount\'s own, for a new file use a path outside "outer/caf\\u00e9" and "outer/cafe\\u0301", and for one already there ask whoever runs this workspace to rename one of "outer/caf\\u00e9" and "outer/cafe\\u0301".');
   const listed = (await tool('ls', { path: 'outer', recursive: true })).data as { entries: Array<{ path: string; note?: string }> };
   assert.equal(listed.entries.find((e) => e.path === 'caf\u00e9/held.txt')?.note,
@@ -992,12 +994,12 @@ test('on a disk that keeps the normalization forms apart, a directory in the oth
 test('on a disk that folds case, a name in another case than a nested mount\'s directory lies in it where disk has the directory to spell the path by, and otherwise may, and is refused saying so', { skip: FOLDING_ONLY }, async (t) => {
   const absent = await nestedRig(t, 'inner');
   assert.equal((await absent.tool('write', { path: 'outer/INNER/new.md', content: 'x\n' })).error,
-    '"outer/INNER/new.md" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell "outer/INNER" from ' +
+    'The write did nothing: "outer/INNER/new.md" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell "outer/INNER" from ' +
     '"outer/inner", mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/new.md". If you meant one of this mount\'s own, for a new file use a path ' +
     'outside "outer/INNER" and "outer/inner", and for one already there ask whoever runs this workspace to rename one of "outer/INNER" and "outer/inner".');
   const present = await nestedRig(t, 'inner', { before: (d) => mkdirSync(join(d, 'inner')) });
   assert.equal((await present.tool('write', { path: 'outer/INNER/new.md', content: 'x\n' })).error,
-    '"outer/inner/new.md" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/new.md".');
+    'The write did nothing: "outer/inner/new.md" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/new.md".');
 });
 
 test('where disk folds case and keeps \u00df apart from ss, a directory spelled with ss beside a nested mount at \u00df is that mount\'s, erring toward it', { skip: CASE_NOT_SHARP_S_ONLY }, async (t) => {
@@ -1011,7 +1013,7 @@ test('where disk folds case and keeps \u00df apart from ss, a directory spelled 
     ];
   });
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/strasse/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.equal(read.error, '"outer/strasse/x.txt" may lie in mount "nested", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
+  assert.equal(read.error, 'The read did nothing: "outer/strasse/x.txt" may lie in mount "nested", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
     '"outer/strasse" from "outer/stra\\u00dfe", mount "nested"\'s directory. If you meant that mount\'s directory, use "nested/x.txt". If you meant one of this ' +
     'mount\'s own, for a new file use a path outside "outer/strasse" and "outer/stra\\u00dfe", and for one already there ask whoever runs this workspace to rename one of "outer/strasse" and "outer/stra\\u00dfe".');
   assert.equal(workspace.resolveAbsolutePath('outer/strasse/x.txt'), null);
@@ -1267,7 +1269,7 @@ test('a link that spells a directory as disk does is refused as leading into a n
   });
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'outer/kd/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false);
-  assert.match(String(read.error), /^"outer\/kd\/x\.txt" (?:leads|may lead) into mount "nested", nested in mount "outer".*use "nested\/x\.txt"/);
+  assert.match(String(read.error), /^The read did nothing: "outer\/kd\/x\.txt" (?:leads|may lead) into mount "nested", nested in mount "outer".*use "nested\/x\.txt"/);
   await assert.rejects(workspace.readFileFromDisk('outer/kd/x.txt'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount');
 });
 
@@ -1288,7 +1290,7 @@ test('a mount configured through a link that spells the outer mount\'s root othe
   const listed = await call('ls', { path: 'outer', recursive: true });
   assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'outer/inner/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.match(String(read.error), /^"outer\/inner\/x\.txt" (?:lies|may lie) in mount "nested", nested in mount "outer".*use "nested\/x\.txt"/);
+  assert.match(String(read.error), /^The read did nothing: "outer\/inner\/x\.txt" (?:lies|may lie) in mount "nested", nested in mount "outer".*use "nested\/x\.txt"/);
   assert.equal(workspace.resolveAbsolutePath('outer/inner/x.txt'), null);
 });
 
@@ -1341,7 +1343,7 @@ test('a mount whose configured path reaches the outer mount\'s root through a di
   await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
   t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
   const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'outer/via/self/x.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.match(String(read.error), /^"outer\/via\/self\/x\.txt" (?:lies|may lie) in mount "self", nested in mount "outer", which neither reads nor writes it: .*use "self\/x\.txt"/);
+  assert.match(String(read.error), /^The read did nothing: "outer\/via\/self\/x\.txt" (?:lies|may lie) in mount "self", nested in mount "outer", which neither reads nor writes it: .*use "self\/x\.txt"/);
 });
 
 test('a mount configured as a link to the outer mount\'s own root, spelled otherwise than disk, is nested by its configured path alone, and refuses none of the outer mount\'s other paths', { skip: FOLDING_ONLY }, async (t) => {
@@ -1364,7 +1366,7 @@ test('a mount configured as a link to the outer mount\'s own root, spelled other
   const write = await tool('write', { path: 'outer/y.txt', content: 'outer wrote\n' });
   assert.equal(write.success, true, String(write.error));
   const through = await tool('read', { path: 'outer/self/x.txt' });
-  assert.equal(through.error, '"outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
+  assert.equal(through.error, 'The read did nothing: "outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
 });
 
 test('a nested mount whose root isn\'t made yet holds a place beneath it before the mount it\'s nested in does', async (t) => {
@@ -1379,7 +1381,7 @@ test('a nested mount whose root isn\'t made yet holds a place beneath it before 
   });
   const wrote = await workspace.handleToolCall({ id: 'write', name: 'write', input: { path: 'outer/l/b/new.txt', content: 'x\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(wrote.success, false);
-  assert.equal(wrote.error, '"outer/l/b/new.txt" leads into mount "lower", nested in mount "outer", which neither reads nor writes it: use "lower/new.txt".');
+  assert.equal(wrote.error, 'The write did nothing: "outer/l/b/new.txt" leads into mount "lower", nested in mount "outer", which neither reads nor writes it: use "lower/new.txt".');
 });
 
 for (const { letter, as, gate } of [
@@ -1404,7 +1406,7 @@ for (const { letter, as, gate } of [
     const linked = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'outer/l/hidden.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     if (process.platform === 'linux') {
       const esc = (name: string) => [...name].map((c) => (c.charCodeAt(0) < 0x80 ? c : `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)).join('');
-      assert.equal(linked.error, `"outer/l/hidden.txt" may lead into mount "nested", nested in mount "outer", which neither reads nor writes it: it leads to ` +
+      assert.equal(linked.error, `The read did nothing: "outer/l/hidden.txt" may lead into mount "nested", nested in mount "outer", which neither reads nor writes it: it leads to ` +
         `"outer/x/a${esc(letter)}/hidden.txt", and this workspace can't tell "outer/x/a${esc(letter)}" from "outer/x/a${esc(as)}", mount "nested"'s directory. ` +
         `If you meant that mount's directory, use "nested/hidden.txt". If not, ask whoever runs this workspace to rename one of "outer/x/a${esc(letter)}" and "outer/x/a${esc(as)}".`);
     } else {
@@ -1527,7 +1529,7 @@ test('a file the workspace deleted, which disk comes to list in another case, is
   assert.equal((deleted.data as { path: string }).path, 'work/src/Name.txt');
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/src/Name.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false, 'the read takes nothing in');
-  assert.match(String(read.error), /work\/src\/Name\.txt was deleted in the workspace/);
+  assert.match(String(read.error), /^The read did nothing: "work\/src\/Name\.txt" was deleted in the workspace/);
   await call('materialize', { path: 'work/src/Name.txt', applyDeletions: true });
   assert.deepEqual(readdirSync(join(dir, 'src')).sort(), ['a.ts'], 'the deletion reached disk\'s file');
   const listed = await call('ls', { path: 'work', recursive: true });
@@ -1543,7 +1545,7 @@ test('a file the workspace deleted, which disk then changed and lists in another
   writeFileSync(join(dir, 'src', 'NAME.txt'), 'changed on disk\n');
   const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/src/Name.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   assert.equal(read.success, false, 'the read takes nothing in');
-  assert.match(String(read.error), /work\/src\/Name\.txt is in conflict/);
+  assert.match(String(read.error), /^The read did nothing: "work\/src\/Name\.txt" is in conflict/);
   await call('sync', { path: 'work/src/Name.txt' });
   const status = (await call('status', {})).data as { work: { conflicts: number; pendingWorkspaceDeletions: number } };
   assert.deepEqual([status.work.conflicts, status.work.pendingWorkspaceDeletions], [0, 0], 'the sync settled the conflict and the deletion');
@@ -1710,11 +1712,11 @@ test('an entry\'s spelling takes no path out of a nested mount\'s directory that
   // Where both spellings lie in one nested mount's directory, the refusal
   // names disk's, as without the entries.
   const late = await call('write', { path: 'outer/inner/LATE.txt', content: 'x\n' });
-  assert.equal(late.error, '"outer/inner/LATE.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/LATE.txt".');
+  assert.equal(late.error, 'The write did nothing: "outer/inner/LATE.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/LATE.txt".');
   // As configured, a path is later's.
   await refusedAs('write', { path: 'outer/later/y.txt', content: 'y\n' }, 'later');
   assert.match(String((await call('write', { path: 'outer/LATER/y.txt', content: 'y\n' })).error),
-    /^"outer\/LATER\/y\.txt" may lie in mount "later", nested in mount "outer".*can't tell "outer\/LATER" from "outer\/later"/);
+    /^The write did nothing: "outer\/LATER\/y\.txt" may lie in mount "later", nested in mount "outer".*can't tell "outer\/LATER" from "outer\/later"/);
   // Outside deep's directory, the entry's spelling stands: beside it, and
   // for the directory that holds it.
   const sibling = await call('write', { path: 'outer/PROJ/z.txt', content: 'z\n' });
@@ -1845,7 +1847,7 @@ test("a draft in another case than a nested mount's directory, with history ther
   try {
     const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/INNER/new.md', content: 'through the outer mount\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(write.success, false, `the outer mount took ${JSON.stringify(write.data)}`);
-    assert.match(String(write.error), /^"work\/INNER\/new\.md" may lie in mount "inner", nested in mount "work".*can't tell "work\/INNER" from "work\/inner".*use "inner\/new\.md"/);
+    assert.match(String(write.error), /^The write did nothing: "work\/INNER\/new\.md" may lie in mount "inner", nested in mount "work".*can't tell "work\/INNER" from "work\/inner".*use "inner\/new\.md"/);
   } finally {
     await workspace.stop();
   }

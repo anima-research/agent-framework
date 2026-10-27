@@ -239,7 +239,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       writeFileSync(join(away, 'img.png'), 'not read');
       const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
       assert.equal(image.success, false);
-      assert.equal(image.error, `work/l/img.png: ${linkedReason(target)}`);
+      assert.equal(image.error, `The read_image did nothing: work/l/img.png: ${linkedReason(target)}.`);
     });
 
     test(`read_image gives the link's refusal, not the workspace copy's failure, where that copy can't be read as an image (${target})`, async (t) => {
@@ -254,7 +254,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       writeFileSync(join(away, 'img.png'), 'not read');
       const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
       assert.equal(image.success, false);
-      assert.equal(image.error, `work/l/img.png: ${linkedReason(target)}`);
+      assert.equal(image.error, `The read_image did nothing: work/l/img.png: ${linkedReason(target)}.`);
     });
 
     test(`a listing of the directory the link stands at says so instead of walking it (${target})`, async (t) => {
@@ -394,7 +394,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     // leads into a nested mount before looking for the workspace's copy.
     const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
     assert.equal(image.success, false);
-    assert.equal(image.error, `work/l/img.png: ${reason}`);
+    assert.equal(image.error, `The read_image did nothing: work/l/img.png: ${reason}.`);
   });
 
   test('a path that resolves to another spelling of itself, with no link on its way, is reached by each primitive', async (t) => {
@@ -427,7 +427,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       const m = await env.open(t);
       await call(m, 'write', { path: 'work/a/l/new.txt', content: 'new\n' });
       const failure = Object.assign(new Error(`${code}: readlink`), { code });
-      const unsure = `cannot tell whether "work/a" is a symlink (${code})`;
+      const unsure = `cannot tell whether "work/a" is a symlink (${code === 'EIO' ? 'an input/output error on the disk' : 'not permitted'})`;
       await withFsPromises('readlink', (readlink) => async (path: string, ...rest: unknown[]) => {
         if (String(path).endsWith(`${sep}a`)) throw failure;
         return readlink(path, ...rest);
@@ -440,7 +440,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
           return true;
         });
         const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/a/l/img.png' } });
-        assert.equal(image.error, `Unable to read file: work/a/l/img.png: ${unsure}`, 'read_image passes the walk\'s words through');
+        assert.equal(image.error, `The read_image did nothing: Unable to read file: work/a/l/img.png: ${unsure}.`, 'read_image passes the walk\'s words through');
         const dir = await checkDir(env.view(), realpathSync(env.dir), 'a/l');
         assert.equal(shown(dir), `unobserved: ${unsure}`);
         // A materialize gives the same reason, with the advice to fix it and
