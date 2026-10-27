@@ -2387,7 +2387,8 @@ interface HostCommandParams {
   turns?: number;
   /** Message-granular undo: branch the chronicle so the last N messages
    *  (regardless of participant) are no longer on the active branch.
-   *  Mutually exclusive with `turns`. */
+   *  Counted in the agent's window once it is presented (#291), over the
+   *  rows of the agent's own slot. Mutually exclusive with `turns`. */
   messages?: number;
   /** Message-granular undo: awareness marks on the removed Discord
    *  messages, `none` (the default), `addressed` or `all`. Any other value
@@ -12334,7 +12335,9 @@ export class AgentFramework {
     // No turn checkpoints involved, so this reaches past turn boundaries. The
     // n messages are counted back from the newest of the agent's window on a
     // presented one (#291), where branchAt cuts at the write that presented
-    // the target: rows the cut keeps return to arrivals (returnedToArrivals).
+    // the target: rows the cut keeps return to arrivals (returnedToArrivals),
+    // which wait for the agent's next turn start, and rows presented with
+    // the target stay (keptInWindowAfterTarget).
     if (typeof params.messages === 'number' && params.messages > 0) {
       const agent = this.agents.get(agentName)!;
       if (agent.state.status !== 'idle') {
@@ -12344,18 +12347,35 @@ export class AgentFramework {
       const cm = agent.getContextManager();
       // Counted in what the agent is shown: its window's rows on a presented
       // window (#291), whose order isn't the record's, and the record's rows
-      // on one that is still the record.
-      const windowRows = this.presents(agent) ? cm.getPresentedMessages() : undefined;
-      const total = windowRows ? windowRows.length : cm.getMessageCount();
-      if (n >= total) {
+      // on one that is still the record. Only the rows of the agent's own
+      // slot count, as the record's did: a window can merge a slot the agent
+      // observes (the residents' rows in a persistent subconscious's), and a
+      // rollback finds its target in the agent's own slot alone.
+      let target: StoredMessage | StoredWindowMessage | undefined;
+      let total: number;
+      let observed = 0;
+      if (this.presents(agent)) {
+        const windowRows = cm.getPresentedMessages();
+        let own = 0;
+        for (let i = windowRows.length - 1; i >= 0; i--) {
+          const row = windowRows[i]!;
+          if (cm.getMessage(row.id) === null) { observed++; continue; }
+          if (own === n) { target = row; break; }
+          own++;
+        }
+        total = own;
+      } else {
+        total = cm.getMessageCount();
+        if (n < total) target = cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
+      }
+      if (!target) {
         return {
           ok: false,
-          error: `Cannot remove ${n} message(s) — history has ${total}; at least one must remain.`,
+          error: `Cannot remove ${n} message(s) — history has ${total}` +
+            `${observed > 0 ? ` of ${agentName}'s own (the ${observed} other row(s) of its window are a slot it observes, which an undo doesn't count)` : ''}` +
+            '; at least one must remain.',
         };
       }
-      const target = windowRows
-        ? windowRows[total - 1 - n]!
-        : cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
       try {
         const r = await this.rollbackToMessage(agentName, {
           messageId: String(target.id),
@@ -12371,6 +12391,7 @@ export class AgentFramework {
           ok: true,
           messagesRemoved: r.messagesRemoved,
           ...(r.returnedToArrivals !== undefined ? { returnedToArrivals: r.returnedToArrivals } : {}),
+          ...(r.keptInWindowAfterTarget !== undefined ? { keptInWindowAfterTarget: r.keptInWindowAfterTarget } : {}),
           removedRefs: r.removedRefs,
           markers: r.markers,
           lastVisible: r.lastVisible,
@@ -13286,8 +13307,10 @@ export class AgentFramework {
    * turn-alive — can start a turn while the switch is awaited, and every
    * write made meanwhile is held in memory (surgeryHeldWrites). Release
    * stores what the hold kept, in arrival order, and presents each reserved
-   * agent what it is owed, as at a turn's end. Always release in `finally`:
-   * a token nobody clears wedges the fleet.
+   * agent what it is owed, as at a turn's end, but for the arrivals a
+   * rollback's cut returned, which wait for that agent's next turn start
+   * (presentation.holdUntilStart). Always release in `finally`: a token
+   * nobody clears wedges the fleet.
    */
   private reserveStoreForSurgery(verb: string, agentName: string): () => void {
     if (this.surgeryHold) {
@@ -13354,7 +13377,7 @@ export class AgentFramework {
       // path, in arrival order, on the branch the operator chose (or the
       // restored source), so each idle reader takes it as it is stored; then
       // each agent the hold reserved is presented what it is owed, as at a
-      // turn's end.
+      // turn's end (a rollback's returned arrivals wait: holdUntilStart).
       this.releaseSurgeryHeldWrites();
       for (const name of reserved.keys()) this.presentAtEndOf(this.agents.get(name));
     };
@@ -13516,11 +13539,26 @@ export class AgentFramework {
      * On a presented window (#291), the rows after the target in the
      * agent's window that the cut kept in the record: stored before the
      * write that presented the target, they left the window as arrived and
-     * not presented, and enter it again at the agent's next presentation
-     * point, after the target. Not counted in `messagesRemoved`, and not
-     * marked. Set only on a presented window.
+     * not presented. They wait outside it until the agent's next turn
+     * start, which presents them after what its window holds then: the
+     * surgery's release, a resume, the agent's turn ending or a row
+     * stored for it while it is idle don't bring them back, so the cut
+     * holds until the agent speaks again. A restart before then presents
+     * them at its pass over every agent at rest. Not counted in
+     * `messagesRemoved`, and not marked. Set only on a presented window.
      */
     returnedToArrivals?: number;
+    /**
+     * On a presented window (#291), the rows after the target in the
+     * agent's window that one write presented together with the target (a
+     * batch: two Discord messages that arrived while the agent was busy,
+     * say, presented at its turn's end). The cut is at that write, so they
+     * stay in the window after the target: a branch cut can't separate
+     * them from it. Not removed, so not counted in `messagesRemoved` and
+     * not marked; suppressMessages, or the host's hide by Discord message
+     * id, takes them out. Set only on a presented window.
+     */
+    keptInWindowAfterTarget?: number;
   }> {
     this.refuseOperatorAfterStop('roll back');
     const logBase: OperatorLogInput = {
@@ -13533,7 +13571,8 @@ export class AgentFramework {
     try {
       const marks = checkedDiscordAwarenessMarks(opts.marks);
       this.refuseMarksWithoutLedger(marks);
-      const { cm, tailMessageId, messagesRemoved, discarded, returnedToArrivals } = this.planRollback(agentName, opts.messageId);
+      const { cm, tailMessageId, messagesRemoved, discarded, returnedToArrivals, returnedIds, keptInWindow } = this.planRollback(agentName, opts.messageId);
+      const keptInWindowAfterTarget = keptInWindow?.length;
       const removedRefs = extractDiscordAwarenessRefs(discarded);
       const selection = selectDiscordAwarenessRefs(discarded, marks);
       const sourceBranch = this.store.currentBranch().name;
@@ -13590,6 +13629,14 @@ export class AgentFramework {
             { cause: error },
           );
         }
+        // The rows the cut returned to arrivals wait for the agent's next
+        // turn start (#291): the release below presents each agent what it
+        // is owed at rest, and would put them back after the target at
+        // once, as if the cut had not been made.
+        if (returnedIds && returnedIds.length > 0) {
+          const agent = this.agents.get(agentName);
+          if (agent && this.presents(agent)) this.presentation!.holdUntilStart(agent, returnedIds);
+        }
         // The body change has landed. Nothing after this point turns the
         // rollback into a failure: marks are an outbox outcome, reported
         // apart from the body (`markers`).
@@ -13611,10 +13658,14 @@ export class AgentFramework {
           `${tailMessageId !== opts.messageId ? ` (requested ${opts.messageId}, snapped to end of body group)` : ''}` +
           ` removed=${messagesRemoved}` +
           `${returnedToArrivals ? ` returnedToArrivals=${returnedToArrivals}` : ''}` +
+          `${keptInWindowAfterTarget ? ` keptInWindowAfterTarget=${keptInWindowAfterTarget}` : ''}` +
           ` branch=${branchName} marks=${describeMarkers(markers)}` +
           ` by=${describeRequester(opts.requester)}`,
       );
-      const returned = returnedToArrivals !== undefined ? { returnedToArrivals } : {};
+      const returned = {
+        ...(returnedToArrivals !== undefined ? { returnedToArrivals } : {}),
+        ...(keptInWindowAfterTarget !== undefined ? { keptInWindowAfterTarget } : {}),
+      };
       this.recordOperatorAction({
         ...logBase,
         result: {
@@ -13844,9 +13895,14 @@ export class AgentFramework {
    * target, rows stored after the target and before that write stay in the
    * record. Those of them the agent's window holds were presented after
    * the target: they leave the window as arrived and not presented
-   * (`returnedToArrivals`, set only on a presented window), and enter it
-   * again at the agent's next point. A rollback that neither removes a row
-   * nor returns one is refused as a no-op.
+   * (`returnedToArrivals`, named by `returnedIds`), and enter it again at
+   * the agent's next turn start. The rows of the agent's window after the
+   * target that the write presenting it presented too (`keptInWindow`, a
+   * batch: one write, one presentation point) stay in the window, since no
+   * branch cut separates them from the target. Both are set only on a
+   * presented window. A rollback that neither removes a row nor returns
+   * one is refused as a no-op, saying why: rows presented with the target
+   * are named, with the removals that can take them out.
    */
   private planRollback(agentName: string, messageId: string): {
     cm: ContextManager;
@@ -13854,6 +13910,8 @@ export class AgentFramework {
     messagesRemoved: number;
     discarded: StoredWindowMessage[];
     returnedToArrivals?: number;
+    returnedIds?: MessageId[];
+    keptInWindow?: StoredMessage[];
   } {
     const agent = this.agents.get(agentName);
     if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
@@ -13861,6 +13919,16 @@ export class AgentFramework {
     const total = cm.getMessageCount();
     const requestedIndex = locateMessageIndex(cm, messageId);
     if (requestedIndex < 0) {
+      // A row of a slot the agent's window merges (the residents' rows in a
+      // persistent subconscious's) is on the branch, but not the agent's own
+      // to roll back to: its target is looked for in its own slot.
+      if (this.mergesObservedRow(cm, messageId)) {
+        throw new OperatorActionError(
+          'unknown-message',
+          `Message ${messageId} is in a slot ${agentName} observes, not in its own: a rollback of ${agentName} ` +
+            'takes its target from its own slot',
+        );
+      }
       throw new OperatorActionError('unknown-message', `Message ${messageId} is not on the active branch`);
     }
     const run = bodyGroupRun(cm, requestedIndex);
@@ -13870,16 +13938,29 @@ export class AgentFramework {
     let discarded: StoredWindowMessage[] = after > 0
       ? cm.getMessageWindow(targetIndex + 1, after, { resolveBlobs: false }).messages
       : [];
-    let returnedToArrivals: number | undefined;
+    let window: { returned: MessageId[]; kept: StoredMessage[] } | undefined;
     if (this.presents(agent)) {
       const cut = cm.branchSequenceOf(tailMessageId as MessageId);
       // The slot is in store order, so the rows the cut leaves are a suffix.
       const firstRemoved = discarded.findIndex((m) => m.sequence > cut);
       discarded = firstRemoved < 0 ? [] : discarded.slice(firstRemoved);
-      returnedToArrivals = this.rowsPresentedAfterCut(cm, cut);
+      window = this.windowAfterCut(cm, cut, tailMessageId as MessageId);
     }
     const messagesRemoved = discarded.length;
-    if (messagesRemoved <= 0 && !returnedToArrivals) {
+    if (messagesRemoved <= 0 && !window?.returned.length) {
+      const kept = window?.kept ?? [];
+      if (kept.length > 0) {
+        const n = kept.length;
+        const first = kept[0]!;
+        const discordId = (first.metadata as { messageId?: unknown } | undefined)?.messageId;
+        const named = `${String(first.id)}${discordId !== undefined && discordId !== null && discordId !== '' ? `, Discord message ${String(discordId)}` : ''}`;
+        throw new OperatorActionError('invalid',
+          `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
+          `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
+          `so a rollback to it would change nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
+          `suppress ${n === 1 ? 'it' : 'them'} (suppressMessages), or hide ${n === 1 ? 'it' : 'them'} by Discord message id ` +
+          "(the host's hide command)");
+      }
       throw new OperatorActionError('invalid', after > 0
         // Rows follow it in the record, but the cut keeps every one of them,
         // and the window took none of them after it.
@@ -13888,25 +13969,49 @@ export class AgentFramework {
           'rollback to it would change nothing'
         : `Message ${messageId} is already the tail of the active branch`);
     }
-    return { cm, tailMessageId, messagesRemoved, discarded, ...(returnedToArrivals !== undefined ? { returnedToArrivals } : {}) };
+    return {
+      cm,
+      tailMessageId,
+      messagesRemoved,
+      discarded,
+      ...(window ? { returnedToArrivals: window.returned.length, returnedIds: window.returned, keptInWindow: window.kept } : {}),
+    };
+  }
+
+  /** Whether a slot `cm` merges beside its own holds the row, which its own slot doesn't. */
+  private mergesObservedRow(cm: ContextManager, messageId: string): boolean {
+    try {
+      return cm.getMessage(messageId as MessageId) === null && cm.windowStatusOf(messageId as MessageId) !== 'absent';
+    } catch {
+      return false;
+    }
   }
 
   /**
-   * How many rows of `cm`'s window a branch cut at `cut` keeps in the record
-   * and out of the window: stored at or before the cut, and presented by a
-   * write after it. Read from the window's newest row back: every row's
-   * cut (branchSequenceOf, the write that presented it, or its own sequence
+   * What a branch cut at `cut` does to the rows of `cm`'s window after the
+   * target (`tailId`), in window order: those it keeps in the record and
+   * out of the window (`returned`: stored at or before the cut, and
+   * presented by a write after it), and those it keeps in the window
+   * (`kept`: presented by the write the cut is at, the one that presented
+   * the target, so after the target only when that write presented them
+   * together, a batch). Read from the window's newest row back, to the
+   * target or the first row presented before the cut: every row's cut
+   * (branchSequenceOf, the write that presented it, or its own sequence
    * for a row the write-down presented) grows in window order.
    */
-  private rowsPresentedAfterCut(cm: ContextManager, cut: number): number {
+  private windowAfterCut(cm: ContextManager, cut: number, tailId: MessageId): { returned: MessageId[]; kept: StoredMessage[] } {
     const window = cm.getPresentedMessages();
-    let returned = 0;
+    const returned: MessageId[] = [];
+    const kept: StoredMessage[] = [];
     for (let i = window.length - 1; i >= 0; i--) {
       const row = window[i]!;
-      if (cm.branchSequenceOf(row.id) <= cut) break;
-      if (row.sequence <= cut) returned++;
+      if (row.id === tailId) break;
+      const at = cm.branchSequenceOf(row.id);
+      if (at < cut) break;
+      if (at === cut) kept.unshift(row);
+      else if (row.sequence <= cut) returned.unshift(row.id);
     }
-    return returned;
+    return { returned, kept };
   }
 
   /**
@@ -13963,12 +14068,14 @@ export class AgentFramework {
       ? plan.discarded
       : this.planSuppression(agentName, [...new Set((target as { suppress: string[] }).suppress.map(String))]).targeted;
     // On a presented window (#291): which of the rows no live window holds,
-    // and, for a rollback, which rows the cut keeps that leave the window.
+    // and, for a rollback, which rows the cut keeps that leave the window
+    // and which it keeps in it, after the target.
     const presented = this.presents(this.agents.get(agentName));
     const windowFacts = presented
       ? {
           neverPresented: messages.filter((m) => this.holderNames(m.id as MessageId, m.metadata).length === 0).length,
           ...(plan?.returnedToArrivals !== undefined ? { returnedToArrivals: plan.returnedToArrivals } : {}),
+          ...(plan?.keptInWindow !== undefined ? { keptInWindowAfterTarget: plan.keptInWindow.length } : {}),
         }
       : {};
     const scopeView = (scope: DiscordAwarenessScope): SurgeryMarksPreview['scopes'][DiscordAwarenessScope] => {

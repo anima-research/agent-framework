@@ -126,6 +126,38 @@ describe('offline recovery at the cut, on a presented window (#291, AF-7)', () =
       'counted in the window',
     );
   });
+
+  it("count mode counts the rows of the agent's own slot only, as the live undo does, though its window index names an observed slot's", async () => {
+    // cairn's live context merged another agent's slot, whose rows its
+    // window took between its own. The recovery opens cairn's context
+    // alone, whose listing leaves those rows out, so this held before the
+    // count read only its own slot's rows too; it pins the rule the live
+    // `/undo n` now follows.
+    const dir = mkdtempSync(join(tmpdir(), 'af-offline-presented-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'agent.chronicle');
+    const store = JsStore.openOrCreate({ path: storePath });
+    const other = await ContextManager.open({ store, namespace: 'agents/other', isolate: true });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn', auxiliaryMessageViews: [{ namespace: 'agents/other' }] });
+    cm.presentRows([]);
+    const text = (t: string) => [{ type: 'text', text: t } as ContentBlock];
+    cm.presentRows([cm.addMessage('user', text('own-1'))]);
+    cm.presentRows([other.addMessage('user', text('observed-1'))]);
+    cm.presentRows([cm.addMessage('user', text('own-2'))]);
+    cm.presentRows([other.addMessage('user', text('observed-2'))]);
+    assert.deepEqual(cm.getPresentedMessages().map(textOf), ['own-1', 'observed-1', 'own-2', 'observed-2']);
+    cm.close();
+    other.close();
+    store.close();
+
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messages: 2, dryRun: true }),
+      /Cannot remove 2 message\(s\) — history has 2; at least one must remain/,
+    );
+    const result = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messages: 1, branchName: 'recovery/cairn/own' });
+    assert.equal(result.messagesRemoved, 1, 'own-2, the newest of its own: the anchor is own-1');
+    assert.deepEqual((await recordOn(storePath)).texts, ['own-1']);
+  });
 });
 
 describe("a start takes out of each window the rows an offline recovery removed (#291, AF-7)", () => {

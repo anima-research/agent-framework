@@ -179,10 +179,20 @@ export interface SurgeryMarksPreview {
    * agent's window that the branch cut keeps in the record (stored before
    * the write that presented the target, presented after it). They leave
    * the window as arrived and not presented, and enter it again at the
-   * agent's next presentation point, after the target. Not removed, so not
+   * agent's next turn start, after what its window holds then; nothing at
+   * rest presents them before it (rollbackToMessage). Not removed, so not
    * counted in `messagesRemoved`, and not marked. Set only then.
    */
   returnedToArrivals?: number;
+  /**
+   * For a rollback on a presented window: the rows after the target in the
+   * agent's window that the write presenting the target presented too (a
+   * batch). The cut is at that write, so they stay in the window after the
+   * target. Not removed, so not counted in `messagesRemoved`, and not
+   * marked: a suppression, or a hide by Discord message id, takes them out.
+   * Set only then.
+   */
+  keptInWindowAfterTarget?: number;
   emoji: string;
   scopes: Record<'addressed' | 'all', {
     count: number;

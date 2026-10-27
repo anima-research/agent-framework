@@ -25,7 +25,9 @@
  *   tool boundary as a prefix the live stream can carry, at its turn's end,
  *   and at once while it has no turn alive (present at rest);
  * - nothing of others' while the host is quiesced or under a surgery hold,
- *   which freeze every window but for an agent's own rows.
+ *   which freeze every window but for an agent's own rows;
+ * - the arrivals a rollback's cut took out of an agent's window only at its
+ *   next turn start (holdUntilStart), so the cut holds until it speaks.
  *
  * Arrivals are read from the index itself (getUnpresentedMessages filtered
  * by bearingOf), never from the store's head: a crashed turn's arrivals, a
@@ -401,6 +403,8 @@ export class AgentPresentation {
   private readonly listeners = new Map<AgentName, Set<(event: PresentedEvent) => void>>();
   /** Own rows whose presentation at their write failed, per manager (presentOwn), until they enter its window. */
   private readonly failedOwn = new WeakMap<WindowManager, Set<MessageId>>();
+  /** Arrivals a rollback took out of each manager's window, kept out of it at rest until the agent's next turn start (holdUntilStart). */
+  private readonly heldUntilStart = new WeakMap<WindowManager, Set<MessageId>>();
 
   constructor(private readonly host: PresentationHost) {}
 
@@ -531,13 +535,14 @@ export class AgentPresentation {
     return true;
   }
 
-  /** Let an agent go: its sink off, and what the module kept for it (its memo, its framing) dropped. */
+  /** Let an agent go: its sink off, and what the module kept for it (its memo, its framing, its held arrivals) dropped. */
   forget(agent: PresentedAgent): void {
     agent.setOwnRowSink?.(undefined);
     const cm = agent.getContextManager();
     this.adopted.delete(cm);
     this.memos.delete(cm);
     this.failedOwn.delete(cm);
+    this.heldUntilStart.delete(cm);
     this.framed.delete(agent.name);
     this.generation++;
   }
@@ -641,12 +646,16 @@ export class AgentPresentation {
    * record order, the agent's own rows not in its window and its arrivals
    * (none while frozen); `'compile'`, the backstop before every compile,
    * fresh or resumed, its own rows only. Returns the arrivals presented, one
-   * per body, for the start to weigh.
+   * per body, for the start to weigh. A fresh start ends a rollback's hold
+   * on the arrivals its cut returned (holdUntilStart): they enter with the
+   * rest, in record order.
    */
   presentAtStart(agent: PresentedAgent, occasion: 'turn-start' | 'assembly' | 'compile'): StoredMessage[] {
     if (!this.presenting(agent)) return [];
     // The sweep below decides the own rows a failed write left (presentOwn).
     this.failedOwn.delete(agent.getContextManager());
+    // A fresh start is where a rollback's returned arrivals enter (holdUntilStart).
+    if (occasion !== 'compile') this.heldUntilStart.delete(agent.getContextManager());
     return this.presentPending(agent, occasion, occasion !== 'compile' && !this.host.frozen());
   }
 
@@ -712,6 +721,29 @@ export class AgentPresentation {
    */
   presentAtEnd(agent: PresentedAgent): StoredMessage[] {
     return this.presentAtRest(agent, 'turn-end');
+  }
+
+  /**
+   * The rows a rollback's branch cut took out of the agent's window and
+   * kept in the record (its `returnedToArrivals`, #291): they are arrivals
+   * again, and wait outside the window until the agent's next turn start
+   * (presentAtStart's `'turn-start'` or `'assembly'`), which presents them
+   * with whatever else it is owed, in record order. Until then no point at
+   * rest presents them: not the surgery's release, a resume, a turn's end
+   * or a row stored for the agent while it is idle, so the cut the
+   * operator made is what the agent's window holds until it speaks again.
+   * A tool boundary isn't held back (a turn alive started since). An own
+   * row among them isn't held: own rows enter at every point, as ever. In
+   * memory: a restart presents them at its pass at rest, and an agent let
+   * go (forget) drops them. Rows given again add to those held. Never throws.
+   */
+  holdUntilStart(agent: PresentedAgent, ids: readonly MessageId[]): void {
+    const named = unique(ids);
+    if (named.length === 0) return;
+    const cm = agent.getContextManager();
+    const held = this.heldUntilStart.get(cm) ?? new Set<MessageId>();
+    for (const id of named) held.add(id);
+    this.heldUntilStart.set(cm, held);
   }
 
   /**
@@ -973,10 +1005,10 @@ export class AgentPresentation {
     }
   }
 
-  /** presentAtEnd under a named occasion. */
+  /** presentAtEnd under a named occasion; a rollback's held arrivals wait (holdUntilStart). */
   private presentAtRest(agent: PresentedAgent, occasion: 'turn-end' | 'at-rest'): StoredMessage[] {
     if (!this.presenting(agent) || this.host.turnAlive(agent.name)) return [];
-    return this.presentPending(agent, occasion, !this.host.frozen());
+    return this.presentPending(agent, occasion, !this.host.frozen(), true);
   }
 
   /** The rows the agent was handed as framing (noteFramed) that its window doesn't hold yet, presented in the order handed. */
@@ -1008,11 +1040,15 @@ export class AgentPresentation {
     }
   }
 
-  /** Present the agent's own pending rows, and its arrivals when `arrivals`, in one call; return the arrivals that entered whole. */
-  private presentPending(agent: PresentedAgent, occasion: PresentationOccasion, arrivals: boolean): StoredMessage[] {
+  /**
+   * Present the agent's own pending rows, and its arrivals when `arrivals`
+   * (but those a rollback holds for its next start, with `atRest`), in one
+   * call; return the arrivals that entered whole.
+   */
+  private presentPending(agent: PresentedAgent, occasion: PresentationOccasion, arrivals: boolean, atRest = false): StoredMessage[] {
     try {
       const cm = agent.getContextManager();
-      const bodies = this.pending(agent, arrivals);
+      const bodies = this.pending(agent, arrivals, atRest);
       if (bodies.length === 0) return [];
       const { entered } = this.present(agent, bodies.map((body) => body.shards[0]!.id), occasion, {
         unstamped: bodies.filter((body) => body.unstamped).length,
@@ -1029,11 +1065,14 @@ export class AgentPresentation {
 
   /**
    * The agent's pending bodies, in record order: its own rows not in its
-   * window, and its arrivals when `arrivals`. A body is its run of
-   * unpresented shards (continuesBody), weighed by its first.
+   * window, and its arrivals when `arrivals`, leaving out, with `atRest`,
+   * an arrival a rollback holds for the agent's next start (any shard of
+   * its body held). A body is its run of unpresented shards
+   * (continuesBody), weighed by its first.
    */
-  private pending(agent: PresentedAgent, arrivals: boolean): PendingBody[] {
+  private pending(agent: PresentedAgent, arrivals: boolean, atRest = false): PendingBody[] {
     const cm = agent.getContextManager();
+    const held = atRest ? this.heldUntilStart.get(cm) : undefined;
     const unpresented = cm.getUnpresentedMessages();
     const facts = readerFacts(this.host.registry, agent.name);
     const factsKey = JSON.stringify(facts);
@@ -1060,6 +1099,9 @@ export class AgentPresentation {
       if (bearing === 'elsewhere') continue;
       firstOwed ??= head.sequence;
       if (bearing === 'arrival' && !arrivals) continue;
+      // Still owed (firstOwed), so a later scan starts at or before it.
+      if (bearing === 'arrival' && held && held.size > 0
+        && unpresented.slice(start, i).some((shard) => held.has(shard.id))) continue;
       bodies.push({ shards: unpresented.slice(start, i), bearing, unstamped: audienceOf(head.metadata) === undefined });
     }
     memo.scanFrom = firstOwed !== undefined ? Math.max(memo.scanFrom, firstOwed - 1) : newest;

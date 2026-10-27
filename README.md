@@ -515,10 +515,15 @@ const result = await framework.rollbackToMessage('cairn', {
 An agent's context follows its own window (#291), so the cut is the write
 that presented the target: a rollback removes only the rows stored after
 that write, and the rows stored before it that the window took after the
-target leave the window and enter it again at the agent's next presentation
-point (`returnedToArrivals`, on the result and the preview). The preview's
-`neverPresented` counts the messages it removes that no agent's window
-holds. A removal in place (a `hide`, a suppression on its fork, a module's
+target leave the window and wait outside it until the agent's next turn
+start, so the cut holds until the agent speaks again (`returnedToArrivals`,
+on the result and the preview). Rows that one write presented together with
+the target stay after it (`keptInWindowAfterTarget`), since no branch cut
+separates them from it: a rollback that only they follow is refused and
+names them, and `suppressMessages`, or the host's `hide` by Discord message
+id, takes them out. The preview's `neverPresented` counts the messages it
+removes that no agent's window holds. The host command's `/undo n` counts
+back over the rows of the agent's own slot in its window. A removal in place (a `hide`, a suppression on its fork, a module's
 or the coalescer's removal) takes the rows out of every other agent's window
 that held them too, each at its own place.
 

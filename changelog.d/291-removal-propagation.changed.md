@@ -11,4 +11,7 @@
   agent (#291, decision 1: seeing another agent's thread is a declared relationship), and count them as `leftOut`.
   An `extract` around such a row answers that no message has its id. A call no agent made stays record-wide.
 - The host command's message-granular undo (`messages: n`) and offline recovery's count mode count back in the
-  agent's window once it is presented, whose order isn't the record's.
+  agent's window once it is presented, whose order isn't the record's, over the rows of the agent's own slot: a row
+  of a slot the agent observes, such as a residents' row in a persistent subconscious's window, isn't counted, since
+  a rollback finds its target in the agent's own slot. A rollback to such a row is refused (`unknown-message`) as in
+  a slot the agent observes, not as off the active branch.

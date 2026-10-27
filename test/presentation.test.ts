@@ -590,6 +590,49 @@ describe('the presentation module', () => {
     assert.equal(r.oren.has(own), false);
     assert.equal(r.presentation.presenting(r.oren), false);
   });
+
+  it("arrivals held until the next start (a rollback's returned rows) wait at rest and at the compile sweep, and enter at the next turn start; an own row isn't held", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const returned = r.write(r.oren, 'someone', text('returned'), ['mira']);
+    const own = storeOwnRow(r.mira, 'user', text('a wake line'), undefined, undefined, false);
+    r.alive.delete('mira');
+    assert.equal(r.mira.has(returned), false);
+    r.presentation.holdUntilStart(r.mira, [returned, own]);
+    // At rest: a turn's end (a surgery's release, a resume), and a row
+    // stored for mira while she is idle, which enters alone.
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], 'no arrival entered');
+    assert.equal(r.mira.has(own), true, 'an own row enters at every point, held or not');
+    assert.equal(r.mira.has(returned), false, 'the held arrival waits');
+    const later = r.write(r.oren, 'someone', text('later'), ['mira']);
+    assert.equal(r.mira.has(later), true, 'presented at its write, at rest');
+    assert.equal(r.mira.has(returned), false);
+    r.presentation.repairAndRest();
+    assert.equal(r.mira.has(returned), false);
+    // The backstop before a compile presents own rows only, and keeps the hold.
+    r.presentation.presentAtStart(r.mira, 'compile');
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), []);
+    assert.equal(r.mira.has(returned), false);
+    // A fresh start presents it, and ends the hold.
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [returned]);
+    assert.deepEqual(r.mira.window().slice(-3), ['a wake line', 'later', 'returned'], 'in the order presented');
+    assert.ok(r.presentation.owedOf(r.mira).length === 0);
+  });
+
+  it("a held arrival is still owed, and a forget drops the hold", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const returned = r.write(r.oren, 'someone', text('returned'), ['mira']);
+    r.alive.delete('mira');
+    r.presentation.holdUntilStart(r.mira, [returned]);
+    assert.deepEqual(r.presentation.owedOf(r.mira).map((m) => m.id), [returned], 'owed, though held at rest');
+    assert.deepEqual(r.presentation.arrivalsOf(r.mira).map((m) => m.id), [returned]);
+    r.presentation.forget(r.mira);
+    r.presentation.adopt(r.mira);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [returned], 'the hold went with the forget');
+  });
 });
 
 describe('the presentation module when a store call fails', () => {

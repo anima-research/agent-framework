@@ -32,9 +32,9 @@ export interface OfflineRecoveryBranchOptions {
   contextId?: string;
   /**
    * Backward-compatible alternative: remove the newest N context entries,
-   * counted in the agent's window once it was presented (#291), and in the
-   * record before that; the anchor is the entry before them, cut as for
-   * `messageId`.
+   * counted in the agent's window once it was presented (#291), over the
+   * rows of its own slot, and in the record before that; the anchor is the
+   * entry before them, cut as for `messageId`.
    */
   messages?: number;
   /** Exact Discord messages to suppress on the new branch. */
@@ -171,8 +171,14 @@ export async function createOfflineRecoveryBranch(
       carriers = collectDiscordCarriers(contextManager, firstRemoved, total);
     } else if (presented) {
       // Counted back in the agent's window, whose order isn't the record's:
-      // the anchor is the window's row `count` before its newest.
-      const window = contextManager.getPresentedMessages();
+      // the anchor is the window's row `count` before its newest. Only the
+      // rows of the context's own slot count, as the live undo counts them:
+      // the anchor is looked for in that slot, and a window index can name
+      // a row of a slot the agent observed (the residents' rows in a
+      // persistent subconscious's window). The one context opened here
+      // merges no other slot, so its listing holds none of those today; the
+      // count doesn't lean on that.
+      const window = contextManager.getPresentedMessages().filter((row) => contextManager!.getMessage(row.id) !== null);
       if (count! >= window.length) {
         throw new Error(
           `Cannot remove ${count} message(s) — history has ${window.length}; at least one must remain.`,

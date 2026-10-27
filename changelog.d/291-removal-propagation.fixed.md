@@ -17,5 +17,6 @@
   `rollbackToMessage`, its preview, the host command's message-granular undo and offline recovery counted every row
   after the target as removed, and marked their Discord messages. `messagesRemoved`, the removed refs and the marks
   are now exactly the rows stored after the cut, and offline recovery checks the tool pairs of those rows only. A
-  rollback that would remove nothing and take nothing out of the window (its target was presented with every row
-  after it) is refused as a no-op, saying so.
+  rollback that would remove nothing and take nothing out of the window is refused as a no-op, saying why: when its
+  target was presented in one write with rows after it, the refusal says so, names the first of them, and points to
+  `suppressMessages`, or the host's `hide` for a Discord message, to take them out.
