@@ -20,11 +20,12 @@
     looks after every maintenance pass and every drain kick it starts. It
     takes a fresh verdict only once something that could make the context
     fit has changed: compression's progress or whether it still has
-    compression pending, a message added, edited or removed (other than a
-    stored context injection's arrival, the hold's own note among them), or
-    the agent's runtime settings. A turn released and refused again is held
-    again with its first deadline, and isn't released again until one of
-    those changes.
+    compression pending, a message added, edited or removed (other than the
+    arrival of a stored context injection, the hold's own note among them,
+    or of a clock row), the agent's runtime settings, or the budget its next
+    compile plans at. A turn released and refused again is held again with
+    its first deadline, and isn't released again until one of those
+    changes.
   - **When it ends without a fit:** 30 minutes after the refusal that started
     it, or at once when compression has nothing pending. The turn then runs
     if its context fits by then, and otherwise fails as a refused compile
