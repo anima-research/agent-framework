@@ -4286,5 +4286,22 @@ describe('a closed channel\'s invitation offers the reply its agent\'s mode read
         await h.close();
       }
     });
+    it(`reads the mode of the one agent a deliverTo wakes: ${second}, beside the first agent's ${first}`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: first }, { name: 'quill', proseRouting: second }] });
+      try {
+        (h.framework as unknown as { channelRegistry: { ensureChannelRegistered(s: string, id: string, label: string): void } })
+          .channelRegistry.ensureChannelRegistered('discord', 'discord:g1:side', '#side (Guild One)');
+        await (h.framework as unknown as { handleMcplChannelIncoming(event: unknown): Promise<unknown> }).handleMcplChannelIncoming({
+          type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g1:side', messageId: 'in-side',
+          author: { id: 'u1', name: 'someone' }, content: [{ type: 'text', text: 'over here' }],
+          tags: ['chat:mention', 'chat:addressed', 'chat:from-human'], timestamp: new Date().toISOString(),
+          triggerInference: false, deliverTo: 'quill', acceptedAt: Date.now(),
+        });
+        const invitation = h.texts('quill').find((t) => t.includes('[Channel invitation]'))!;
+        assert.ok(invitation.includes(offered[second].line), invitation);
+      } finally {
+        await h.close();
+      }
+    });
   }
 });

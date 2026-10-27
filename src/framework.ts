@@ -103,7 +103,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { isProseTargetToken, parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { CHANNEL_ON_SERVER_ROUTE, ChannelRegistry, TUNE_OUT_REPLACED, endsWithChannelOnServer, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -14675,6 +14675,7 @@ export class AgentFramework {
         missedCharacters: typeof event.metadata?.missedCharacters === 'number'
           ? event.metadata.missedCharacters
           : undefined,
+        targetAgents: event.targetAgents,
       });
       if (invitation) {
         incomingContent.push(invitation.block);
@@ -15352,6 +15353,7 @@ export class AgentFramework {
     missedMessages?: number;
     /** Characters across those dropped messages. */
     missedCharacters?: number;
+    targetAgents?: readonly string[];
   }): { block: ContentBlock; metadataPatch: Record<string, unknown> } | null {
     if (!this.channelRegistry) return null;
     if (!opts.tags?.includes('chat:addressed')) return null;
@@ -15394,7 +15396,8 @@ export class AgentFramework {
     const withoutOpening = tunedOut
       ? ''
       : " To reply without opening it, decline it first (option 3): a channel you've declined stays closed when you speak there.";
-    const mode = this.deliveryAgent()?.proseRouting ?? 'locus';
+    const woken = opts.targetAgents?.length === 1 ? this.agents.get(opts.targetAgents[0]!) : undefined;
+    const mode = (woken ?? this.deliveryAgent())?.proseRouting ?? 'locus';
     const prefix = mode === 'hybrid' ? '>>>' : '>>';
     const delivered = replyOpens
       ? `it will be delivered there, which opens the channel.${withoutOpening}`
@@ -16368,6 +16371,7 @@ export class AgentFramework {
         missedMessages: typeof origin.missedMessages === 'number' ? origin.missedMessages : undefined,
         missedCharacters:
           typeof origin.missedCharacters === 'number' ? origin.missedCharacters : undefined,
+        targetAgents: event.targetAgents,
       });
       if (invitation) {
         content.push(invitation.block);
@@ -17822,8 +17826,7 @@ export class AgentFramework {
       const resolved = registry.resolveProseTarget(spec, { forSpeech: true, own });
       if ('error' in resolved) {
         const cand = resolved.candidates?.length
-          ? ` It could mean: ${resolved.candidates.join(', ')}.` +
-            (resolved.candidates.some(endsWithChannelOnServer) ? ` ${CHANNEL_ON_SERVER_ROUTE}` : '')
+          ? ` It could mean: ${resolved.candidates.join(', ')}.${registry.publishRouteFor(resolved.candidates) ?? ''}`
           : '';
         return refuse(`Destination "${spec}" did not resolve: ${suppliedValue(resolved.error)}.${cand} Nothing was sent.`);
       }
@@ -19899,8 +19902,7 @@ export class AgentFramework {
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
     this.proseBounceStreaks.set(name, streak);
     const cand = candidates?.length
-      ? ` Known channels it could mean: ${candidates.map(suppliedValue).join(', ')}.` +
-        (candidates.some(endsWithChannelOnServer) ? ` ${CHANNEL_ON_SERVER_ROUTE}` : '')
+      ? ` Known channels it could mean: ${candidates.map(suppliedValue).join(', ')}.${this.channelRegistry?.publishRouteFor(candidates) ?? ''}`
       : '';
     // The examples name the first candidate that is one token, as a target
     // takes it, and shows as itself, so they show the form to write, such as a server-qualified

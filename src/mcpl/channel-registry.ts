@@ -730,12 +730,7 @@ function channelOnServer(ref: ChannelRef): string {
   return `${quotedValue(ref.channelId)} on server ${quotedValue(ref.serverId)}`;
 }
 
-export function endsWithChannelOnServer(candidate: string): boolean {
-  return /"(?:[^"\\]|\\.)*" on server "(?:[^"\\]|\\.)*"(?: \(no channelId reaches it alone\))?$/.test(candidate);
-}
-
-export const CHANNEL_ON_SERVER_ROUTE =
-  'A channel shown by its id and its server is reached by channel_publish with that channelId and that serverId.';
+const CHANNEL_ON_SERVER = /("(?:[^"\\]|\\.)*") on server ("(?:[^"\\]|\\.)*")/g;
 
 /**
  * What one channels/publish attempt established (ChannelRegistry.publish).
@@ -4441,7 +4436,7 @@ export class ChannelRegistry {
     if (own === undefined) {
       resolved = this.resolveTargetByName(name);
     } else if ('neither' in own) {
-      resolved = { error: `"${name}" is the id of this turn's channels on more than one server`, candidates: this.ownCandidates(own.neither).map((c) => c.text) };
+      resolved = { error: `"${name}" is the id of this turn's channels on more than one server`, candidates: this.ownCandidates(own.neither).map((c) => c.prose) };
     } else {
       const entry = this.entryAt(own.channel);
       resolved = entry
@@ -4530,17 +4525,47 @@ export class ChannelRegistry {
    * longer registers, are too, saying so. `reaches` says which a name
    * reaches.
    */
-  private ownCandidates(channels: readonly ChannelRef[]): Array<{ text: string; reaches: boolean; byServer: boolean }> {
+  private ownCandidates(channels: readonly ChannelRef[]): Array<{ text: string; prose: string; reaches: boolean; byServer: boolean }> {
     return channels.map((c) => {
       const entry = this.entryAt(c);
-      if (!entry) return { text: `${channelOnServer(c)} (its server no longer registers it)`, reaches: false, byServer: false };
+      if (!entry) {
+        const text = `${channelOnServer(c)} (its server no longer registers it)`;
+        return { text, prose: text, reaches: false, byServer: false };
+      }
       const qualified = qualifiedChannelName(c);
       const picked = this.entriesNamed(qualified);
-      if (picked.length !== 1 || picked[0] !== entry) return { text: `${channelOnServer(c)} (no channelId reaches it alone)`, reaches: false, byServer: true };
-      return showsAsItself(qualified)
-        ? { text: qualified, reaches: true, byServer: false }
-        : { text: channelOnServer(c), reaches: false, byServer: true };
+      if (picked.length !== 1 || picked[0] !== entry) {
+        const text = `${channelOnServer(c)} (no channelId reaches it alone)`;
+        return { text, prose: text, reaches: false, byServer: true };
+      }
+      return { text: qualified, prose: showsAsItself(qualified) ? qualified : channelOnServer(c), reaches: true, byServer: false };
     });
+  }
+
+  /**
+   * What a refusal listing these candidates says of each channel it shows by
+   * its id and server: the server-qualified name channel_publish's channelId
+   * reaches it by, where that name picks it alone, or that no channelId
+   * reaches it alone. It leaves out a channel no longer registered and one
+   * whose listing already says no channelId reaches it alone, and is empty
+   * when nothing is left.
+   */
+  publishRouteFor(candidates: readonly string[]): string {
+    const parts = new Set<string>();
+    for (const candidate of candidates) {
+      if (candidate.endsWith(' (no channelId reaches it alone)')) continue;
+      for (const [, channelId, serverId] of candidate.matchAll(CHANNEL_ON_SERVER)) {
+        const ref: ChannelRef = { channelId: JSON.parse(channelId!) as string, serverId: JSON.parse(serverId!) as string };
+        const entry = this.entryAt(ref);
+        if (!entry) continue;
+        const qualified = qualifiedChannelName(ref);
+        const picked = this.entriesNamed(qualified);
+        parts.add(picked.length === 1 && picked[0] === entry
+          ? `channel_publish reaches ${channelOnServer(ref)} with channelId ${quotedValue(qualified)}`
+          : `no channelId reaches ${channelOnServer(ref)} alone`);
+      }
+    }
+    return parts.size ? ` For a channel shown by its id and server: ${[...parts].join('; ')}.` : '';
   }
 
   /** A tool's refusal of a name the turn's channels on more than one server
@@ -6144,7 +6169,7 @@ export class ChannelRegistry {
       entry = this.entryAt(serverGiven ? { serverId: input.serverId!, channelId: fallback!.channelId } : fallback!);
     } else if (own && 'neither' in own) {
       if (seen) seen.refusal = 'shared-id';
-      return { success: false, error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted'), isError: true };
+      return { success: false, error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted', false), isError: true };
     } else if (own) {
       entry = this.entryAt(own.channel);
       if (!entry) {

@@ -19,7 +19,7 @@ import { AgentFramework } from '../src/index.js';
 import type { ChannelRef, InferenceRequest, ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { isProseTargetToken } from '../src/mcpl/prose-grammar.js';
-import { CHANNEL_ON_SERVER_ROUTE, ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
 import { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
@@ -656,16 +656,19 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
   // A name no string picks alone: server "a" has "b:room" and server "a:b" has "room", both answering to "a:b:room".
   const odd = fixture([['a', 'b:room'], ['a:b', 'room'], ['c', 'b:room']]);
   const ownOdd: ChannelRef[] = [{ serverId: 'a', channelId: 'b:room' }, { serverId: 'c', channelId: 'b:room' }];
+  // channel_publish takes no serverId, so its refusal names none; channel_open does.
   const oddRefusal = await odd.registry.handleChannelToolCall('channel_publish', { channelId: 'b:room', content: 'x' }, inTurn(ownOdd));
   assert.equal(oddRefusal.error, '"b:room" is the id of this turn\'s channels on more than one server ("b:room" on server "a" (no channelId '
-    + 'reaches it alone), "c:b:room"), so nothing was posted. Call again with channelId "c:b:room". For a channel shown by its id and '
+    + 'reaches it alone), "c:b:room"), so nothing was posted. Call again with channelId "c:b:room".');
+  const oddOpen = await odd.registry.handleChannelToolCall('channel_open', { channelId: 'b:room' }, inTurn(ownOdd));
+  assert.equal(oddOpen.error, '"b:room" is the id of this turn\'s channels on more than one server ("b:room" on server "a" (no channelId '
+    + 'reaches it alone), "c:b:room"), so nothing ran. Call again with channelId "c:b:room". For a channel shown by its id and '
     + 'server, call again with that channelId and that serverId.');
   // None reachable by a name: no "Call again".
   await odd.registry.handleChanged('c', { removed: ['b:room'] });
   const none = await odd.registry.handleChannelToolCall('channel_publish', { channelId: 'b:room', content: 'x' }, inTurn(ownOdd));
   assert.equal(none.error, '"b:room" is the id of this turn\'s channels on more than one server ("b:room" on server "a" (no channelId '
-    + 'reaches it alone), "b:room" on server "c" (its server no longer registers it)), so nothing was posted. For a channel shown by '
-    + 'its id and server, call again with that channelId and that serverId.');
+    + 'reaches it alone), "b:room" on server "c" (its server no longer registers it)), so nothing was posted.');
   // Two named among three: "one of X, Y".
   const three = fixture([['a', 'general'], ['b', 'general'], ['d', 'general']]);
   await three.registry.handleChanged('d', { removed: ['general'] });
@@ -673,6 +676,25 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
   const two = await three.registry.handleChannelToolCall('channel_publish', { channelId: 'general', content: 'x' }, inTurn([a, b, d]));
   assert.equal(two.error, '"general" is the id of this turn\'s channels on more than one server ("a:general", "b:general", "general" on '
     + 'server "d" (its server no longer registers it)), so nothing was posted. Call again with channelId set to one of "a:general", "b:general".');
+});
+
+test("a turn's channels sharing an id whose qualified names don't show as themselves stay reachable by those names, as JSON", async () => {
+  const f = fixture([['a', 'x"y'], ['b', 'x"y']]);
+  const own: ChannelRef[] = [{ serverId: 'a', channelId: 'x"y' }, { serverId: 'b', channelId: 'x"y' }];
+  const inTurn = (refs: ChannelRef[]) => ({ kind: 'agent', agentName: 'scout', own: refs }) as never;
+  for (const [tool, done] of [['channel_publish', 'was posted'], ['channel_open', 'ran']] as const) {
+    const refused = await f.registry.handleChannelToolCall(tool, { channelId: 'x"y', content: 'x' }, inTurn(own));
+    assert.equal(refused.error, '"x"y" is the id of this turn\'s channels on more than one server ("a:x\\"y", "b:x\\"y"), '
+      + `so nothing ${done}. Call again with channelId set to one of them.`, tool);
+  }
+  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: JSON.parse('"a:x\\"y"'), content: 'hello' }, inTurn(own));
+  assert.equal(posted.success, true, posted.error);
+  assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a x"y']);
+  // A `>>` target can't take JSON: the prose resolver lists them by id and server, and says what channel_publish takes.
+  const resolved = f.registry.resolveProseTarget('x"y', { forSpeech: true, own }) as { error?: string; candidates?: string[] };
+  assert.deepEqual(resolved.candidates, ['"x\\"y" on server "a"', '"x\\"y" on server "b"']);
+  assert.equal(f.registry.publishRouteFor(resolved.candidates!), ' For a channel shown by its id and server: channel_publish reaches '
+    + '"x\\"y" on server "a" with channelId "a:x\\"y"; channel_publish reaches "x\\"y" on server "b" with channelId "b:x\\"y".');
 });
 
 test("a default channel's reply anchors survive a withdrawal, as on main, and go with its server's disconnect, as on main, while its ref stays", async () => {
@@ -1258,7 +1280,7 @@ for (const order of orders) {
     assert.ok(bounce.includes('DM: antra (work)'), bounce);
     assert.ok(bounce.includes('">>#<channel> {{unsent}}"'), 'no candidate is one token, so the example is generic');
     assert.ok(bounce.includes('">>@<person> {{unsent}}"'), 'and the DM example a placeholder too');
-    assert.ok(!bounce.includes(CHANNEL_ON_SERVER_ROUTE), 'no candidate is shown by its id and server');
+    assert.ok(!bounce.includes('For a channel shown by its id and server'), 'no candidate is shown by its id and server');
   });
 
   test(`a bounce that shows a candidate by its id and server says which tool reaches it (${registered})`, async (t) => {
@@ -1283,7 +1305,8 @@ for (const order of orders) {
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce')
       .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text))[0] ?? '';
     assert.ok(bounce.includes('"gen\\"a" on server "a"'), bounce);
-    assert.ok(bounce.includes(CHANNEL_ON_SERVER_ROUTE), bounce);
+    assert.ok(bounce.includes('channel_publish reaches "gen\\"a" on server "a" with channelId "a:gen\\"a"'), bounce);
+    assert.ok(!bounce.includes('serverId'), 'channel_publish takes no serverId, so the bounce names none');
   });
 
   test(`a >> delivery that fails names the channel it was for apart, in its bounce (${registered})`, async (t) => {
