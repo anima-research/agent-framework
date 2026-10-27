@@ -1143,7 +1143,13 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[] };
+const TURN_CARRY: unique symbol = Symbol('turn-carry');
+interface TurnCarry {
+  silence: TurnSilence | null;
+  sends: SendsReached | null;
+  read: number;
+}
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry };
 
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
   return (request as MarkedRequest)[MERGED_BATCH];
@@ -1180,6 +1186,17 @@ function asTurnRetry(trigger: InferenceRequest): InferenceRequest {
  *  retry a provider hold keeps for it (TURN_RETRY). */
 function continuesTurn(request: InferenceRequest): boolean {
   return resumesLogicalTurn(request.reason) || isTurnRetry(request);
+}
+
+function turnCarryOf(request: InferenceRequest | undefined): TurnCarry | undefined {
+  return request && continuesTurn(request) ? (request as MarkedRequest)[TURN_CARRY] : undefined;
+}
+
+function withTurnCarry(request: InferenceRequest, carry: TurnCarry | undefined): InferenceRequest {
+  const copy: MarkedRequest = { ...request };
+  if (carry) copy[TURN_CARRY] = carry;
+  else delete copy[TURN_CARRY];
+  return copy;
 }
 
 /**
@@ -1358,6 +1375,7 @@ interface TurnRouting {
    * retracted, isn't there for the agent to answer.
    */
   arrivals: Arrival[];
+  heard?: Map<MessageId, number>;
 }
 
 /** A message that would re-pin its turn's locus (TurnRouting.arrivals). */
@@ -1369,6 +1387,7 @@ interface Arrival {
 
 /** The last TurnRouting.turnId given out: ids increase, and are unique within the process. */
 let lastTurnId = 0;
+let lastHeardAt = 0;
 
 /** Record that a channel has been the turn's trigger or its locus (TurnRouting.wasIn). */
 function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined): void {
@@ -1380,7 +1399,7 @@ function freshTurnRouting(): TurnRouting {
     turnId: ++lastTurnId,
     engaged: new Set(),
     wasIn: [],
-    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [], heard: new Map(),
   };
 }
 
@@ -3308,6 +3327,7 @@ export class AgentFramework {
   // or an ephemeral's disposal. Keyed by the physical stream, so a
   // successor's record is never touched.
   private streamBoundaryEnds = new WeakMap<YieldingStream, (end: StreamBoundaryEnd) => void>();
+  private streamCarries = new WeakMap<YieldingStream, () => TurnCarry>();
 
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message,
    *  or an edit the coalescer marks as the agent's first view; not a system
@@ -3880,8 +3900,6 @@ export class AgentFramework {
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
-  /** Explicit-send or private suppression carried into a tool-result-guard retry. */
-  private guardRetryTurnSilenced = new Map<string, { silence: TurnSilence | null; sends: SendsReached | null }>();
   /** Presentation-only wall-clock zone; persistence remains UTC/epoch. */
   private readonly timeZone: string;
 
@@ -14133,14 +14151,14 @@ export class AgentFramework {
             // boundary's usage report and the restart's trace, so a listener
             // that stops or quiesces the host on either finds the turn waiting
             // for its continuation, with nothing left of the stream to end.
-            const continuation: InferenceRequest = {
+            const continuation = withTurnCarry({
               agentName: agent.name,
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-            };
+            }, currentState.stream ? this.streamCarries.get(currentState.stream)?.() : undefined);
             this.pendingRequests.push(continuation);
             // Context budget exceeded: break the stream, let compile() compress.
             // Mark the cancel as framework-initiated BEFORE cancelling: the
@@ -16971,6 +16989,9 @@ export class AgentFramework {
       // turn's retry (TURN_RETRY), whichever request leads the merge: held
       // again before it takes a token, it keeps the turn alive as before.
       const start: MarkedRequest = requests.some(isTurnRetry) ? asTurnRetry(merged) : merged;
+      const carry = requests.map(turnCarryOf).find((c) => c !== undefined);
+      if (carry) start[TURN_CARRY] = carry;
+      else delete start[TURN_CARRY];
       // A start that carries a turn on and took in wakes that don't records
       // the batch it was merged from (MERGED_BATCH): until it takes its
       // token it stands for them all.
@@ -18455,6 +18476,7 @@ export class AgentFramework {
     const open = this.openLogical.get(agentName);
     if (!open) return;
     if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
+    if (isConversationalInjection(metadata)) (open.heard ??= new Map()).set(messageId, ++lastHeardAt);
     const channel = this.repinChannel(metadata, open);
     if (channel) open.arrivals.push({ messageId, channel });
   }
@@ -18493,6 +18515,14 @@ export class AgentFramework {
     if (routing.typing !== undefined && !sameChannel(routing.typing, channel)) this.channelRegistry?.stopTyping(routing.typing);
     this.channelRegistry?.startTyping(channel);
     routing.typing = channel;
+  }
+
+  private heardSince(agent: Agent, routing: TurnRouting, read: number): boolean {
+    const cm = agent.getContextManager();
+    for (const [messageId, heardAt] of routing.heard ?? []) {
+      if (heardAt > read && cm.getMessage(messageId)) return true;
+    }
+    return false;
   }
 
   /**
@@ -20505,6 +20535,7 @@ export class AgentFramework {
   ): Promise<boolean> {
     const lifecycle = this.lifecycleGeneration;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
+    let carry = turnCarryOf(trigger);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
@@ -20737,6 +20768,7 @@ export class AgentFramework {
       if (head) routing.start = head;
     }
     this.turnRouting.set(agent.name, routing);
+    if (opensTurn) carry = undefined;
     // A turn a start runs on is live again, though an earlier start's settle
     // marked it settled: a resume takes the agent's latest routing, which can
     // be a silent start's that has settled (settledTurns).
@@ -20970,6 +21002,8 @@ export class AgentFramework {
       // it would store while the window is held.
       injections = this.storeInjections(agent, injections);
 
+      if (carry && this.heardSince(agent, routing, carry.read)) carry = undefined;
+      const streamCarry: TurnCarry = { silence: carry?.silence ?? null, sends: carry?.sends ?? null, read: lastHeardAt };
       const {
         stream,
         request: compiledRequest,
@@ -21041,7 +21075,7 @@ export class AgentFramework {
       if (this.conversationAgentHomes.has(agent.name)) {
         const wait = this.providerWaits?.active(agent.name, agent.model);
         // The turn has begun (inference:started), so the hold keeps its retry.
-        if (wait && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(trigger)] : [], false, () => {
+        if (wait && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(withTurnCarry(trigger, carry))] : [], false, () => {
           // The stream the compile made won't be sent: it's cancelled, and
           // this start's window closes, before the hold is reported, so a stop
           // made while inference:failed is delivered finds neither, and the
@@ -21103,6 +21137,7 @@ export class AgentFramework {
               ...(thinkingBranch !== undefined ? { branch: thinkingBranch } : {}),
             }
           : undefined,
+        streamCarry,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -21150,7 +21185,8 @@ export class AgentFramework {
         return false;
       }
 
-      if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+      const retry = trigger && withTurnCarry(trigger, carry);
+      if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
         // (Once stop() has closed admission, nothing is held, and the turn
@@ -21158,7 +21194,7 @@ export class AgentFramework {
         this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing);
         return false;
       }
-      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
       if (statedWait === 'held') {
         // A conversation agent held by the provider's stated wait, as a
         // resident is: the hold's release owns the later compile.
@@ -21207,7 +21243,7 @@ export class AgentFramework {
         // once the retry is held finds the held retry (abortInference's
         // drop), not a window nothing will collect.
         if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-        await this.startAgentStream(agent, trigger && asTurnRetry(trigger), attempt + 1);
+        await this.startAgentStream(agent, retry && asTurnRetry(retry), attempt + 1);
       } else {
         this.noteFailedTurnEnd(agent, routing);
         // Terminal failure with no driveStream: this frame owns teardown.
@@ -21269,6 +21305,7 @@ export class AgentFramework {
     /** Where each block a call reports the provider dropped came from, and the compile's thinking-binding
      *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
     thinkingDrops?: StreamThinkingDrops,
+    carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     const startTime = Date.now();
@@ -21555,12 +21592,10 @@ export class AgentFramework {
     // calls `drafts` and sends nothing else, which keeps its plain speech; a
     // deliberate silence ('private': skip_reply, a silent control-plane turn)
     // keeps them private.
-    const carried = trigger?.reason === 'tool_result_guard_retry' ? this.guardRetryTurnSilenced.get(agent.name) : undefined;
     let silence: TurnSilence | null = trigger?.suppressProse === true
       ? 'private'
-      : carried?.silence === 'private' ? 'private' : carriedSends(carried?.silence ?? null);
-    let turnSends: SendsReached | null = carriedSends(carried?.sends ?? null);
-    this.guardRetryTurnSilenced.delete(agent.name);
+      : carry.silence === 'private' ? 'private' : carriedSends(carry.silence);
+    let turnSends: SendsReached | null = carriedSends(carry.sends);
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -21585,10 +21620,12 @@ export class AgentFramework {
     // saved with its cause as its round is routed (once its calls are
     // dispatched, or, for a round that waits on scripts, once they return),
     // comes back at the next round or at 'complete'. It's this stream's: a
-    // budget restart starts from its trigger, and a tool-result-guard retry
-    // takes the turn's silence as 'complete' restored it, through
-    // guardRetryTurnSilenced.
+    // start that continues the turn takes the turn's silence restored
+    // (TURN_CARRY).
     let silenceBeforeRefusal: TurnSilence | null | undefined;
+    this.streamCarries.set(stream, () => ({
+      silence: silenceBeforeRefusal !== undefined ? silenceBeforeRefusal : silence, sends: turnSends, read: carry.read,
+    }));
 
     // Typing indicator: show "<agent> is typing…" for the whole duration of
     // this turn. Started at the turn's start, before the compile, and here,
@@ -21753,6 +21790,11 @@ export class AgentFramework {
       // The signal itself never moves routing; the boundary re-pins by
       // repinChannel's rule.
       silence = trigger?.suppressProse === true ? 'private' : null;
+    };
+    const retryOf = (failed: InferenceRequest | undefined): InferenceRequest | undefined => {
+      if (!failed) return undefined;
+      adoptInjectedRound();
+      return withTurnCarry(failed, { silence, sends: turnSends, read: carry.read });
     };
 
     // The stream's `complete` is pending from here: every exit reaches the
@@ -22267,13 +22309,12 @@ export class AgentFramework {
                 // Carry same-turn explicit-send suppression into the retry:
                 // a text-only recovery after a successful send must not post
                 // a postscript to a message already delivered.
-                if (silence || turnSends) this.guardRetryTurnSilenced.set(agent.name, { silence, sends: turnSends });
                 // Restart inference inside this logical turn. No tool is
                 // executed again and no settle/checkpoint/locus reset occurs.
-                await this.startAgentStream(agent, {
+                await this.startAgentStream(agent, withTurnCarry({
                   ...trigger, agentName: agent.name, reason: 'tool_result_guard_retry',
                   source: trigger?.source ?? 'framework', timestamp: Date.now(),
-                }, attempt);
+                }, { silence, sends: turnSends, read: carry.read }), attempt);
                 return;
               }
               const lastResult = response.content.reduce((last, block, index) =>
@@ -22685,10 +22726,10 @@ export class AgentFramework {
                   this.recordProseSuppression(streamRouting, speechSegments.length);
                 } else if (silence && turnProseRouting !== 'explicit'
                   && (turnProseRouting === 'hybrid' || silence === 'private' || sendHoldAt(silence, resolveTurnLocus()))) {
-                  // Only reachable on a guard recovery that carried the
-                  // same-turn send suppression, or a suppressProse trigger
-                  // (a fresh text-only turn starts unsilenced). Explicit
-                  // mode is exempt, as mid-turn.
+                  // Only reachable on a start that continues the turn and
+                  // carried its send suppression (TURN_CARRY), or on a
+                  // suppressProse trigger; any other text-only turn starts
+                  // unsilenced. Explicit mode is exempt, as mid-turn.
                   console.error(`[routing] ${agent.name}: text-only prose: turn silenced (${silence === 'private' ? 'private' : 'send'})`);
                   const locus = resolveTurnLocus();
                   if (silence === 'private') {
@@ -22986,15 +23027,16 @@ export class AgentFramework {
             if (agent.streamId !== myStreamId) break;
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
+            const retry = retryOf(trigger);
 
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
-            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
-            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
             if (statedWait === 'held') {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -23034,7 +23076,7 @@ export class AgentFramework {
                   return;
                 }
                 // Marked as its turn's retry, as at the start's failure.
-                await this.startAgentStream(agent, trigger && asTurnRetry(trigger), attempt + 1);
+                await this.startAgentStream(agent, retry && asTurnRetry(retry), attempt + 1);
               } else {
                 // The turn ends here, and its inference:failed doesn't say so,
                 // since a retry usually follows one: an inference:aborted
@@ -23407,7 +23449,8 @@ export class AgentFramework {
       // finds nothing held, and one made after it ends the held turn.
       agent.reset();
       this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
-      if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+      const retry = retryOf(trigger);
+      if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
         this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
@@ -23422,7 +23465,7 @@ export class AgentFramework {
       // the other two failure sites: a conversation agent's stated wait is
       // recorded and its turn held; an ephemeral run whose wait it won't sleep
       // says why it ends.
-      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
       if (statedWait === 'held') {
         this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
         logStream({ success: false,
