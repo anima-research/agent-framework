@@ -19,9 +19,10 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
+import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
+import { readLines } from '../line-reader.js';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
@@ -325,16 +326,18 @@ export class StdioTransport extends McplTransport {
     });
   }
 
+  private readonly stopLines: () => void;
+
   private constructor(
     private readonly child: ChildProcess,
-    private readonly rl: ReadlineInterface,
+    stdout: Readable,
     /** The server this child serves, named in its stderr lines and in what
      *  its reaping reports. */
     serverId: string,
   ) {
     super(serverId);
 
-    this.rl.on('line', (line: string) => this.pushLine(line));
+    this.stopLines = readLines(stdout, (line) => this.pushLine(line));
 
     // Stitch stderr chunks into whole lines (a chunk can split a line, and a
     // character's bytes), and keep the stream's last characters for
@@ -383,12 +386,7 @@ export class StdioTransport extends McplTransport {
       });
     };
     this.child.stdin?.on('error', endOnPipeError);
-    // On the stream itself, since close() closes readline, which takes its own
-    // listener off the stream. While readline is open, its listener, which
-    // came first, re-emits the error on the interface, where an empty
-    // listener absorbs that copy.
     this.child.stdout?.on('error', endOnPipeError);
-    this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
     // stderr carries diagnostics only: a read error on it is reported, to the
     // listeners or else in the log, and never thrown. It ends nothing once
     // the connection is wired; during a handshake the listener is the
@@ -453,8 +451,7 @@ export class StdioTransport extends McplTransport {
         resolve();
       });
     });
-    const rl = createInterface({ input: child.stdout! });
-    return new StdioTransport(child, rl, config.id);
+    return new StdioTransport(child, child.stdout!, config.id);
   }
 
   writeLine(json: string): void {
@@ -492,7 +489,7 @@ export class StdioTransport extends McplTransport {
 
   private async reap(): Promise<void> {
     this.markClosed({ reason: 'closed by host' });
-    this.rl.close();
+    this.stopLines();
     await this.terminate();
   }
 

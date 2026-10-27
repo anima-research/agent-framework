@@ -869,3 +869,10 @@ export function checkServerConfig(config: McplServerConfig): ServerBinding {
   for (const warning of serverConfigWarnings(config)) console.warn(`[mcp] ${warning}`);
   return resolveServerBinding(config);
 }
+
+export function logDroppedLine(serverId: string, line: string): void {
+  if (/^[ \t]*$/.test(line)) return;
+  let length = 0;
+  for (const _ of line) length++;
+  console.error(`MCP server "${serverId}" sent a line of length ${length} that isn't a JSON object, so it was dropped`);
+}

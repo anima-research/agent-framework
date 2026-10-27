@@ -887,6 +887,25 @@ test('a JSON line that is not a JSON-RPC message is a diagnostic, never a crash'
   assert.deepEqual((await connection.callTool('plain', {})).content, [{ type: 'text', text: 'plain' }]);
 });
 
+test('a line that is not JSON is dropped and logged by its length, never its content', async (t) => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  connection.on('error', () => {});
+  await connection.listTools();
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  assert.deepEqual((await connection.callTool('nullframe', {})).content, [{ type: 'text', text: 'after the noise' }]);
+  t.mock.restoreAll();
+  assert.deepEqual(logged, ['MCP server "raw" sent a line of length 21 that isn\'t a JSON object, so it was dropped']);
+});
+
+test('a result holding U+2028 and U+2029 inside a string arrives whole', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  assert.deepEqual((await connection.callTool('separators', {})).content, [{ type: 'text', text: 'one\u2028two\u2029three' }]);
+});
+
 test('close() reaps: a child that ignores SIGTERM is killed before close resolves', async () => {
   const log = scratchLog();
   const connection = await connect('ignore-sigterm', log);

@@ -427,14 +427,15 @@ for (const release of ['live', 'ready', 'readyControlPlane'] as const) {
 }
 
 for (const value of [null, 42, 'hi', true]) {
-  test('non-object inbound ' + JSON.stringify(value) + ' is ignored like a non-JSON line, with no failure report', (t) => {
+  test('non-object inbound ' + JSON.stringify(value) + ' is dropped like a non-JSON line, logged by its length, with no failure report', (t) => {
     const { connection, transport } = wireHarness();
     const errors: unknown[][] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
     const reported: unknown[] = [];
     connection.on('error', (error: unknown) => { reported.push(error); });
-    transport.emit('line', JSON.stringify(value));
-    assert.deepEqual(errors, []);
+    const line = JSON.stringify(value);
+    transport.emit('line', line);
+    assert.deepEqual(errors, [[`MCP server "srv" sent a line of length ${line.length} that isn't a JSON object, so it was dropped`]]);
     assert.deepEqual(reported, []);
   });
 }

@@ -18,10 +18,12 @@
 //   other-revision       every launch's server/discover lists only a revision the client doesn't speak
 //   other-revision-later  launches after the first do
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
-// structured content), plain (text), err (a JSON-RPC error), touch (announces
-// a tool list change on the open subscription), nullframe (writes JSON lines
-// that aren't JSON-RPC messages, then answers), cont (a state-only
-// input_required first leg; the second leg does what arguments.leg2 says:
+// structured content), plain (text), separators (text holding U+2028 and
+// U+2029), err (a JSON-RPC error), touch (announces
+// a tool list change on the open subscription), nullframe (writes a line
+// that isn't JSON and JSON lines that aren't JSON-RPC messages, then
+// answers), cont (a state-only input_required first leg; the second leg
+// does what arguments.leg2 says:
 // 'error', 'hang', 'ok', or 'again' for another state-only round every time.
 // arguments.leg1 'exit' stops reading its input, answers the first leg and
 // exits once that answer is written, so no second leg can reach it, and
@@ -124,6 +126,7 @@ lines.on('line', (line) => {
             },
           },
           { name: 'plain', inputSchema: { type: 'object' } },
+          { name: 'separators', inputSchema: { type: 'object' } },
           { name: 'err', inputSchema: { type: 'object' } },
           { name: 'touch', inputSchema: { type: 'object' } },
           { name: 'nullframe', inputSchema: { type: 'object' } },
@@ -139,6 +142,7 @@ lines.on('line', (line) => {
       const name = m.params?.name;
       if (name === 'op') return result(m.id, { content: [], structuredContent: { value: 'not an integer' } });
       if (name === 'err') return error(m.id, -32603, 'boom', { why: 'on purpose' });
+      if (name === 'separators') return result(m.id, { content: [{ type: 'text', text: 'one\u2028two\u2029three' }] });
       if (name === 'touch') {
         if (subscription !== null) {
           send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed', params: { _meta: { [SUB]: subscription } } });
@@ -155,7 +159,7 @@ lines.on('line', (line) => {
       if (name === 'task') return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'task', taskId: 'task-1' } });
       if (name === 'bare') return send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'no resultType' }] } });
       if (name === 'nullframe') {
-        process.stdout.write('null\n[1,2]\n"just a string"\n{"no":"jsonrpc"}\n');
+        process.stdout.write('plain words, not json\nnull\n[1,2]\n"just a string"\n{"no":"jsonrpc"}\n');
         return result(m.id, { content: [{ type: 'text', text: 'after the noise' }] });
       }
       if (name === 'cont') {
