@@ -607,6 +607,50 @@ for (const [what, thrown] of [
   });
 }
 
+class RejectAfterAnswerStream extends ErrorStream {
+  constructor(private readonly thrown: Error) { super(thrown); }
+  override [Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    let pulls = 0;
+    return {
+      next: async () => {
+        pulls++;
+        if (pulls === 1) return { value: answer('zz-answered'), done: false };
+        throw this.thrown;
+      },
+    };
+  }
+}
+
+class RejectAfterAnswerMembrane extends OptionsMembrane {
+  streams: RejectAfterAnswerStream[] = [];
+  constructor(private readonly cancelThrows: boolean) { super(); }
+  override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
+    if (this.streams.length > 0) return super.streamYielding(request, options);
+    this.streamOptions.push(options);
+    const stream = new RejectAfterAnswerStream(new Error('zz iterator fault after the answer'));
+    if (this.cancelThrows) stream.cancel = () => { stream.isCancelled = true; throw new Error('zz cancel fault'); };
+    this.streams.push(stream);
+    return stream;
+  }
+}
+
+for (const cancelThrows of [false, true]) {
+  test(`a stream whose next() rejects after its answer is cancelled${cancelThrows ? ', and a cancel() that throws is said' : ''}`, async (t: TestContext) => {
+    const membrane = new RejectAfterAnswerMembrane(cancelThrows);
+    const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
+    const events = traceOf(fw);
+    const { lines } = await laterEventLines(t, async () => {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+      await idle(fw);
+    }, 'resident: ');
+    assert.equal(membrane.streams[0]?.isCancelled, true, 'the stream that threw was cancelled');
+    assert.ok(events.some((e) => e.type === 'inference:completed'), 'the answer stood');
+    assert.equal(membrane.streamOptions.length, 1, 'no retry');
+    assert.match(lines[0] ?? '', /the stream threw after its complete event/);
+    assert.equal(lines.filter((l) => l.includes('cancelling the stream that threw failed')).length, cancelThrows ? 1 : 0, 'a cancel that throws is said');
+  });
+}
+
 for (const [what, type, later] of [
   ['a retryable error event', 'error', () => ({ type: 'error', error: err({ type: 'server', retryable: true, httpStatus: 529, message: 'overloaded_error after the answer' }) })],
   ['an aborted event', 'aborted', () => ({ type: 'aborted', reason: 'error' })],

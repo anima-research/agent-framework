@@ -2306,7 +2306,7 @@ const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** The latest instant a Date can hold (epoch ms). */
 const MAX_DATE_MS = 8_640_000_000_000_000;
-/** Under two minutes: connectome-host 0.13's subagent reaper reclaims a
+/** Under two minutes: connectome-host's subagent reaper reclaims a
  *  subagent silent that long with no request in flight. */
 const WAITING_TRACE_EVERY_MS = 60_000;
 /** A stated wait recorded to hold a model longer than this, or until
@@ -2333,6 +2333,13 @@ function isMembraneError(error: unknown): error is MembraneError {
  * rejected.
  */
 async function* turnStreamEvents(stream: YieldingStream, agentName: string): AsyncGenerator<StreamEvent> {
+  const cancelThrown = (): void => {
+    try {
+      stream.cancel();
+    } catch (cancelError) {
+      console.error(`[stream] ${agentName}: cancelling the stream that threw failed, so it may run on: ${describeFailureWithFrames(cancelError)}`);
+    }
+  };
   let decidedBy: StreamEvent['type'] | undefined;
   try {
     for await (const event of stream) {
@@ -2346,15 +2353,12 @@ async function* turnStreamEvents(stream: YieldingStream, agentName: string): Asy
   } catch (error) {
     if (decidedBy !== undefined) {
       console.error(`[stream] ${agentName}: the stream threw after its ${decidedBy} event, which decided its turn; the throw decides nothing: ${describeFailureWithFrames(error)}`);
+      cancelThrown();
       return;
     }
     if (!(isMembraneError(error) && error.retryable === true)) throw error;
     console.error(`[stream] ${agentName}: the stream threw a retryable failure from its iterator, taken as its error event: ${describeFailureWithFrames(error)}`);
-    try {
-      stream.cancel();
-    } catch (cancelError) {
-      console.error(`[stream] ${agentName}: cancelling the stream that threw failed, so it may run on: ${describeFailureWithFrames(cancelError)}`);
-    }
+    cancelThrown();
     yield { type: 'error', error } as StreamEvent;
   }
 }
@@ -5566,7 +5570,8 @@ export class AgentFramework {
    * - An ephemeral run's name is single-use, so a wait recorded for it would
    *   bind nothing, and its caller is waiting on it. A retryable stated wait
    *   up to PROVIDER_ACCELERATION_MAX_COOLDOWN_MS is left to the error policy,
-   *   slept and retried. A longer one, or one that can't be represented, ends
+   *   which sleeps and retries it unless it declines, as a host's own ceiling
+   *   can. A longer one, or one that can't be represented, ends
    *   the run now ('fail'): it is never retried before the provider's time,
    *   and the caller hears why at once.
    * Anything else is the error policy's.
@@ -9797,8 +9802,9 @@ export class AgentFramework {
    * framework drives the stream (emitting traces, logging, dispatching tools).
    * Returns the agent's speech output when it finishes (no more tool calls).
    * Rejects with ProviderWaitNotSleptError when the run ends rather than sleep
-   * a retryable failure's stated wait, and with a plain Error for any other
-   * ending.
+   * a retryable failure's stated wait longer than the framework's ten-minute
+   * cap, and with a plain Error for any other ending, a stated wait its error
+   * policy declines among them.
    *
    * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
    * The task message should already be in the context manager.
