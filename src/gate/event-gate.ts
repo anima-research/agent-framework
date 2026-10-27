@@ -3895,12 +3895,12 @@ export class EventGate {
       wakes.push(refusal?.until !== undefined
         ? { at: refusal.until, certain: false, what: `${batch}, held for the judge while its calls are refused` }
         : refusal
-          ? { certain: false, when: 'right after this call, if it gets a verdict; otherwise once a later call does, or the hold on its calls is released', what: `${batch}, held for the judge` }
-          : { certain: false, what: `${batch}, held for the judge` });
+          ? { certain: false, when: "right after the judge's next verdict, or once the hold on its calls is released", what: `${batch}, held for the judge` }
+          : { certain: false, when: 'once no turn or quiesce holds it', what: `${batch}, held for the judge` });
     }
     const buffered = this.inferenceBuffer.filter((e) => e.policyName !== leftOut.policy).length;
     if (buffered > 0) {
-      wakes.push({ certain: true, when: "once no turn runs and the host isn't quiesced", what: `${count(buffered)} buffered, delivered then` });
+      wakes.push({ certain: true, when: "once no turn runs and the host isn't quiesced", what: `${count(buffered)} buffered for delivery` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
