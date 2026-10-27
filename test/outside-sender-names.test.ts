@@ -208,17 +208,23 @@ test('the ApiServer refuses a participant that is not text, and stores nothing f
   });
 });
 
-test("a host's own api:message whose participant is not text is not stored", async () => {
-  await withFramework(async ({ framework }) => {
+test("a host's own api:message whose participant is not text is not stored, and starts no turn", async () => {
+  await withFramework(async ({ framework, membrane }) => {
     const text = 'from a host whose participant is not text';
     for (const participant of [42, { name: AGENT }, undefined]) {
       framework.pushEvent({ type: 'api:message', participant, content: text } as never);
     }
-    // The control: a text-named event pushed after them is stored, so they were handled before it.
+    // The control: a text-named event pushed after them, asking for no turn, is stored, so they were handled before it.
     const control = 'and then one whose participant is text';
-    framework.pushEvent({ type: 'api:message', participant: 'alice', content: control } as never);
+    framework.pushEvent({ type: 'api:message', participant: 'alice', content: control, triggerInference: false } as never);
     await waitFor('the control message is stored', () => stored(framework, control).length > 0);
     assert.deepEqual(stored(framework, text), []);
+    // A turn that isn't started has no event to wait on, so the test gives one second for a call to come.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(membrane.calls.length, 0, 'no turn was started');
+    // The positive control: a text-named event that asks for a turn starts one.
+    framework.pushEvent({ type: 'api:message', participant: 'alice', content: 'and one that asks for a turn' } as never);
+    await waitFor('a turn for the live control', () => membrane.calls.length > 0);
   });
 });
 
