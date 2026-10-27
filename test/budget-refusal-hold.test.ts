@@ -1953,6 +1953,23 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('reports a stopped hold\'s end even when the turn\'s teardown throws', async () => {
+    await withBacklog({}, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const fw = t.framework as unknown as { endContinuedTurn: (...args: unknown[]) => void };
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
+        fw.endContinuedTurn = () => { throw new Error('teardown broke'); };
+        assert.throws(() => t.framework.abortInference('prime'), /teardown broke/);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+      } finally {
+        delete (fw as Partial<typeof fw>).endContinuedTurn;
+        await t.close();
+      }
+    });
+  });
+
   it('gives a deferred batch\'s wake that joins a held continuation a fresh turn of its own', async () => {
     const t = await heldRestart(['Answered after the restart', 'Answered the batch']);
     try {
