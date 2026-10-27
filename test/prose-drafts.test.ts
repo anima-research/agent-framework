@@ -739,7 +739,7 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it("a private turn's words beside an explicit send, and after it, are held as drafts, as any turn's are", async () => {
+  it("a private turn's words beside a send to a known place, and after it, are kept private, since they were going nowhere the send posted", async () => {
     for (const proseRouting of ['locus', 'hybrid'] as const) {
       const h = await harness({ agents: [{ name: 'scout', proseRouting }] });
       try {
@@ -747,7 +747,43 @@ describe('held prose drafts, end to end', () => {
           createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
           createMockResponse([text('And one after the send.')]),
         ], 'scout', 'private');
-        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], `${proseRouting}: only the explicit send went out`);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], `${proseRouting}: only the explicit send went out`);
+        assert.deepEqual(h.drafts(), [], `${proseRouting}: nothing is held`);
+        const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+        assert.match(receipt, /2 plain-speech segment\(s\) kept private \(private turn/, `${proseRouting}: ${receipt}`);
+      } finally {
+        await h.close();
+      }
+    }
+  });
+
+  it("hybrid mode: a private turn's envelope a send held sets no target, so its later plain speech stays private", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([text(`>>>${ROOM} Words for the room.`), explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('Plain words after.')]),
+      ], 'scout', 'private');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the explicit send went out');
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.note]), [['Words for the room.', `written for >>>${ROOM}`]],
+        'the envelope the send held is a draft, and the plain words after it are not');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(private turn/, receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a private turn's words beside a send whose place the framework can't read, and after it, are held as drafts, as any turn's are", async () => {
+    for (const proseRouting of ['locus', 'hybrid'] as const) {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting }], sendTool: true });
+      await h.sendMode('no-channel');
+      try {
+        await h.turn([
+          createMockResponse([text('Beside the send.'), unplacedSend('s1')], 'tool_use'),
+          createMockResponse([text('And one after the send.')]),
+        ], 'scout', 'private');
+        assert.ok(!h.publishes().some((p) => p.text.includes('the send.')), `${proseRouting}: no plain speech went out: ${JSON.stringify(h.publishes())}`);
         assert.deepEqual(h.drafts().map((d) => d.text).sort(), ['And one after the send.', 'Beside the send.'], `${proseRouting}: both are held`);
         const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
         assert.doesNotMatch(receipt, /private turn/, `${proseRouting}: ${receipt}`);
