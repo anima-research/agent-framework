@@ -247,7 +247,7 @@ export interface ReplyJudgeOptions {
    * at a ratio each response corrects: until one has, a request on text
    * denser than three characters a token (code, or Chinese, Japanese or
    * Korean text) can carry more than the budget, and so can one whose newest
-   * message or newest event alone is over it, since each is always shown. The least is 4,000, a short
+   * message alone is over it, since that is always shown. The least is 4,000, a short
    * tail of the conversation: cheaper and quicker, with less of the room's
    * history to weigh.
    */

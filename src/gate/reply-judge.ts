@@ -21,8 +21,8 @@
  * context's mix of prose and code. Until a response has corrected it, a
  * request on text denser than three characters a token (code, or Chinese,
  * Japanese or Korean text) can carry more than the budget, and so can one whose
- * newest message or newest event alone is over it, since each is always shown
- * (a message cut to its own cap, an event whole). The document is
+ * newest message alone is over it, since the newest message is always shown
+ * (cut to its own cap). The document is
  * sent as a run of chunks that start at an anchor, the first message shown,
  * which stays put while the window grows into its budget: the chunks before
  * the newest stay byte-identical from one request to the next, and a cache
