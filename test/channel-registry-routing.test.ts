@@ -1081,7 +1081,7 @@ test('non-conversational markers do not retarget the default publish locus (#157
   }).setDesiredState('discord', 'chanB', 'open', 'agent-tool');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A', undefined, undefined, 'thread-A'));
 
-  for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+  for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted', 'chat:system']) {
     lookup('chanB')!.open = false;
     registry.handleIncoming('discord', incoming('chanB', `[${tag}] marker`, undefined, [tag]));
     assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
@@ -1115,6 +1115,27 @@ test('non-conversational markers do not retarget the default publish locus (#157
   const last = registry.buildChannelContext(undefined, 'discord')?.incoming;
   assert.equal(last?.messageId, 'm3', 'a real message with no thread becomes the reply anchor');
   assert.equal(last?.threadId, undefined, 'and takes no thread from the one before it');
+});
+
+test('a chat:system notice leaves the default publish locus where the conversation is, ambient or addressed by its place (RFC-001 rev 3)', async () => {
+  // The weather line that took a resident's DM reply into a world: tagged
+  // as overheard chatter, it became the most recent inbound message.
+  const { registry } = makeRegistry(undefined);
+  seedRegistered(registry, 'discord', 'chanA');
+  seedRegistered(registry, 'discord', 'world');
+  registry.handleIncoming('discord', incoming('chanA', 'the conversation'));
+  registry.handleIncoming('discord', incoming('world', '* world weather: clear (forecast)', undefined,
+    ['chat:ambient', 'chat:system', 'eidoverse:weather']));
+  assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
+    'the forecast must not become where unaddressed speech goes');
+  // A notice addressed by its place (a pin in a DM: chat:dm ⇒ addressed)
+  // is still a notice: kind and addressing are separate facets.
+  seedRegistered(registry, 'discord', 'dm');
+  const pin = incoming('dm', '[pinned a message]', undefined, ['chat:dm', 'chat:system']);
+  pin.messages[0]!.messageId = 'm-pin';
+  registry.handleIncoming('discord', pin);
+  assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
+    'a notice in a DM steers nothing either');
 });
 
 test('a marker on a NEVER-conversed channel leaves the locus null, not marker-anchored (#157)', async () => {

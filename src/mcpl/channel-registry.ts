@@ -1909,7 +1909,8 @@ export class ChannelRegistry {
       const incomingEntry = this.channels.get(incomingKey)!;
       const markAccepted = (firstView = false) => {
         // Non-conversational markers (a reaction added or removed, an edit, a
-        // deletion) are ABOUT a message, not one the agent replies to: they
+        // deletion, and a chat:system notice such as a join or the weather)
+        // are ABOUT a message or the place, not one the agent replies to: they
         // must not retarget the default publish locus or become
         // `context.incoming`'s reply anchor. An edit the coalescer delivered
         // as the agent's first view counts as the message it replaced.
