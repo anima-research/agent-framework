@@ -28,13 +28,15 @@ function useRealClock(): void {
   clockMocked = false;
 }
 
+const STEP_MS = 5;
+
 async function advance(ms: number): Promise<void> {
   if (!clockMocked) {
     await new Promise((resolve) => setTimeout(resolve, ms));
     return;
   }
-  for (let step = 0; step < ms; step++) {
-    mock.timers.tick(1);
+  for (let stepped = 0; stepped < ms; stepped += STEP_MS) {
+    mock.timers.tick(Math.min(STEP_MS, ms - stepped));
     await settle();
   }
 }
@@ -44,7 +46,7 @@ async function until(done: () => boolean, what: string, withinMs = 5_000): Promi
   await settle();
   while (!done()) {
     if (Date.now() >= by) assert.fail(`timed out waiting for ${what}`);
-    await advance(1);
+    await advance(STEP_MS);
   }
 }
 
@@ -1207,7 +1209,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
       ['its own skip_reply timer', true],
     ]);
     const selfWake = wakes.find((w) => w.what.includes('skip_reply'))!;
-    assert.ok(Math.abs(selfWake.at! - (t0 + 600_000)) < 2_000, String(selfWake.at! - t0));
+    assert.strictEqual(selfWake.at, t0 + 600_000);
     assert.ok(!wakes.some((w) => w.what.includes('"ambient"')), "the rule being judged isn't listed");
     gate.dispose();
   });
