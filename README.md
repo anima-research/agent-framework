@@ -490,7 +490,8 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   `'builtin'`). None is in the tool list. `toolsets--open {toolset:"settings"}`
   announces them, `toolsets--act {tool, args}` calls one while it's open, under
   its own name and permissions, its `args` checked against the definition first, `toolsets--close {toolset:"settings"}` closes
-  it, and `toolsets--look {toolset:"settings"}` lists them either way.
+  it, and `toolsets--look {toolset:"settings"}` lists them either way. A
+  server's own toolset named `settings` is reached with its `server` named.
 - **Server tabs.** Each MCPL server is presented to each agent one of three
   ways: `full` (its tools in the tool list, the default), a `tab` (connected,
   its events still arriving, none of its tools in the tool list:
