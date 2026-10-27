@@ -760,7 +760,7 @@ describe('judge rules: timing', () => {
       await until(() => judge.waiting() === 1, "the later batch's call");
     });
     const asked = judge.requests.at(-1)!.events.map((e) => e.content);
-    assert.deepStrictEqual([asked.length, asked[0], asked.at(-1)], [100, 'old 20', 'new 59']);
+    assert.deepStrictEqual(asked, [...Array.from({ length: 40 }, (_, i) => `old ${i + 20}`), ...Array.from({ length: 60 }, (_, i) => `new ${i}`)]);
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
@@ -775,7 +775,7 @@ describe('judge rules: timing', () => {
     gate.evaluate(elsewhere('hi'));
     await until(() => judge.waiting() === 1, "second's call");
     assert.deepStrictEqual(judge.requests.at(-1)!.upcomingWakes, [{
-      certain: false, when: 'right after this call, if it gets a verdict; otherwise once a later call does, or the hold on its calls is released', what: 'rule "first"\'s batch of 1 event, held for the judge',
+      certain: false, when: "right after the judge's next verdict, or once the hold on its calls is released", what: 'rule "first"\'s batch of 1 event, held for the judge',
     }]);
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
@@ -1288,9 +1288,9 @@ describe('judge rules: what waiting leaves the agent with', () => {
     await until(() => judge.requests.length === 1, 'the judge rule\'s batch to go to the judge during the fork\'s turn');
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1, 'premise: the debounced batch is buffered behind the fork\'s turn');
     assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
-      ["once no turn runs and the host isn't quiesced", '1 event buffered, delivered then', true],
+      ["once no turn runs and the host isn't quiesced", '1 event buffered for delivery', true],
     ]);
-    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient').map((w) => w.what), ['1 event buffered, delivered then']);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient').map((w) => w.what), ['1 event buffered for delivery']);
     assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'files').map((w) => w.what), ['rule "ambient"\'s batch of 1 event, which the judge is deciding'], "rule files' buffered events are left out with it");
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
@@ -1336,7 +1336,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
     assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
     assert.deepStrictEqual(listed('second'), ['rule "first"\'s batch of 1 event, which the judge is deciding']);
     gate.onInferenceStarted('agent');
-    assert.deepStrictEqual(listed('second'), ['rule "first"\'s batch of 1 event, held for the judge']);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'second'), [{ certain: false, when: 'once no turn or quiesce holds it', what: 'rule "first"\'s batch of 1 event, held for the judge' }]);
     assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
     assert.strictEqual(listed().length, 2);
     gate.dispose();
@@ -1349,7 +1349,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.setQuiesced(true);
     gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
     await until(() => gate.inferenceDiagnostics().bufferedEvents === 1, 'the fired batch buffered while the host is quiesced');
-    assert.deepStrictEqual(gate.upcomingWakes(['agent']), [{ certain: true, when: "once no turn runs and the host isn't quiesced", what: '1 event buffered, delivered then' }]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']), [{ certain: true, when: "once no turn runs and the host isn't quiesced", what: '1 event buffered for delivery' }]);
     gate.dispose();
   });
 
@@ -1366,7 +1366,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.evaluate(chat('again'));
     await until(() => judge.requests.length === 2, 'the next batch asked');
     assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
-      ["once no turn runs and the host isn't quiesced", '1 event buffered, delivered then', true],
+      ["once no turn runs and the host isn't quiesced", '1 event buffered for delivery', true],
     ]);
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();

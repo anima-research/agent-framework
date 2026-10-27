@@ -325,10 +325,10 @@ export interface FailedLastTurn {
 export interface UpcomingWake {
   /**
    * When (ms), when known. Absent for one that has no time of its own: a
-   * wake already queued, due as soon as the agent is free; a batch held for
-   * the judge until a turn or the host's quiesce ends; a batch the judge is
-   * deciding; and one `when` describes, such as events buffered until no
-   * turn runs and the host isn't quiesced.
+   * wake already queued, due as soon as the agent is free; a batch the judge
+   * is deciding; and one `when` describes, such as a batch held for the judge
+   * until no turn or quiesce holds it, or events buffered until no turn runs
+   * and the host isn't quiesced.
    */
   at?: number;
   /** When, in words, for one due at no time anyone can name (a hold only a
