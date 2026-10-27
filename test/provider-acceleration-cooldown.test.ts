@@ -55,11 +55,14 @@ class AccelerationThenSuccessMembrane extends MockMembrane {
 
 class GenericRateLimitThenSuccessMembrane extends MockMembrane {
   private n = 0;
+  constructor(private readonly statedWaitMs: number | null = 1) { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request); this.n++;
     if (this.n === 1) return new ErrorStream(new MembraneError({
       type: 'rate_limit', retryable: true, httpStatus: 429,
-      message: "This request would exceed your organization's rate limit for input tokens per minute; retry after 1", retryAfterMs: 1,
+      message: "This request would exceed your organization's rate limit for input tokens per minute"
+        + (this.statedWaitMs === null ? '' : `; retry after ${this.statedWaitMs}`),
+      ...(this.statedWaitMs === null ? {} : { retryAfterMs: this.statedWaitMs }),
       rawError: { status: 429 }, rawRequest: request,
     }));
     return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'ordinary retry' }])]);
@@ -74,6 +77,15 @@ class AlwaysSuccessMembrane extends MockMembrane {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(framework: AgentFramework, done: () => boolean, what: string): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  while (!done()) {
+    if (performance.now() > deadline) throw new Error(`${what} did not happen within 5 s`);
+    await framework.runUntilIdle();
+    await sleep(10);
+  }
+}
 
 function textOf(request: NormalizedRequest): string {
   return request.messages.flatMap((m) => m.content)
@@ -241,7 +253,8 @@ test('shutdown aborts a primary waiting behind in-flight auxiliary work', async 
 // An ordinary 429 is not organization acceleration. Its stated retry-after
 // (1 ms here) is a provider wait (provider-waits.test.ts): honoured, then one
 // fresh attempt; nothing is left parked.
-test('ordinary 429 does not enter acceleration cooldown: its stated wait passes, then one retry', async () => {
+test('ordinary 429 does not enter acceleration cooldown: its stated wait passes, then one retry', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const dir = mkdtempSync(join(tmpdir(), 'af-provider-generic-'));
   const membrane = new GenericRateLimitThenSuccessMembrane();
   const framework = await AgentFramework.create({
@@ -249,11 +262,20 @@ test('ordinary 429 does not enter acceleration cooldown: its stated wait passes,
     agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
+  const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
   try {
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'ordinary', metadata: {} });
     await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1, 'the retry waits for the stated wait');
+    const waits = framework.providerWaitSnapshot('resident');
+    assert.deepEqual(waits.map((wait) => wait.model), ['test-model'], 'the stated wait binds while the retry waits');
+    const health = framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownUntil: number | null } }> };
+    assert.equal(health.agents.find((agent) => agent.name === 'resident')?.providerAdmission.cooldownUntil, Date.parse(waits[0]!.until!),
+      'held until the stated wait ends, not for an acceleration cooldown');
+    t.mock.timers.tick(2);
+    await waitFor(framework, () => membrane.calls.length >= 2, 'the retry after the wait');
+    await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 2);
-    const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
     assert.equal(internal.providerAccelerationCooldowns.size, 0);
     assert.deepEqual(framework.providerWaitSnapshot('resident'), [], 'the 1 ms wait has passed');
   } finally { await framework.stop(); rmSync(dir, { recursive: true, force: true }); }
@@ -382,23 +404,31 @@ test('providerHold parks a spent-quota 429, re-consults the host per slice witho
 });
 
 test('providerHold returning nothing, or throwing, leaves the ordinary retry path untouched', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'af-provider-host-nohold-'));
-  const membrane = new GenericRateLimitThenSuccessMembrane();
-  const framework = await AgentFramework.create({
-    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
-    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-    providerHold: () => { throw new Error('meter exploded'); },
-  });
-  const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
-  try {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
-    await framework.runUntilIdle();
-    assert.equal(membrane.calls.length, 2, 'ordinary policy retry happened');
-    assert.equal(internal.providerAccelerationCooldowns.size, 0);
-  } finally {
-    await framework.stop();
-    rmSync(dir, { recursive: true, force: true });
+  const hooks = [
+    ['returning nothing', () => undefined],
+    ['throwing', () => { throw new Error('meter exploded'); }],
+  ] as const;
+  for (const [how, hook] of hooks) {
+    let asked = 0;
+    const dir = mkdtempSync(join(tmpdir(), 'af-provider-host-nohold-'));
+    const membrane = new GenericRateLimitThenSuccessMembrane(null);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      providerHold: () => { asked++; return hook(); },
+    });
+    const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
+    try {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
+      await framework.runUntilIdle();
+      assert.equal(asked, 1, `the hook was asked about the failure, ${how}`);
+      assert.equal(membrane.calls.length, 2, `ordinary policy retry happened, with the hook ${how}`);
+      assert.equal(internal.providerAccelerationCooldowns.size, 0, `nothing held, with the hook ${how}`);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 

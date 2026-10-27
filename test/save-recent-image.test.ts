@@ -31,7 +31,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -405,6 +405,28 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(second[0]!.sha256, sha(GIF));
       assert.strictEqual(second[0]!.imageIndex, 1);
       assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), 'index 1 is the attachment');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('each file a save to a mount without autoMaterialize writes says it waits for a materialize, and disk has them only after one', async () => {
+    const h = await startTurn({
+      prefix: 'sri-disk-',
+      responses: [
+        [snapCall('call_snap')],
+        [saveCall('call_save', { path: 'files/pic.png', index: 0, count: 2 })],
+        done,
+      ],
+    });
+    try {
+      const files = saved(await waitForToolResult(h.framework, 'call_save'));
+      assert.deepEqual(files.map((f) => [f.path, f.disk]), [['files/pic-0.png', 'waits for materialize'], ['files/pic-1.png', 'waits for materialize']]);
+      assert.deepEqual(['pic-0.png', 'pic-1.png'].map((name) => existsSync(join(h.mountDir, name))), [false, false], 'not on disk before a materialize');
+      await h.workspace.handleToolCall({ id: 'call_materialize', name: 'materialize', input: { path: 'files' }, callerAgentName: 'prime' });
+      assert.ok(readFileSync(join(h.mountDir, 'pic-0.png')).equals(PNG), 'the snapshot is on disk after it');
+      assert.ok(readFileSync(join(h.mountDir, 'pic-1.png')).equals(GIF), 'the attachment is on disk after it');
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

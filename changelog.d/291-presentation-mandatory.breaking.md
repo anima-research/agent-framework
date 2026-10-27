@@ -1,8 +1,7 @@
 - **Hosts: every agent's context follows its own presentation index** (#291). `FrameworkConfig.presentationIndex`
   is removed: what it turned on is how every framework runs (see the presentation index's entries), and a host's
   configuration that still passes it is read as any unknown key is. `create()` refuses a context-manager without
-  `ContextManager.presentRows`, or without `ContextManager.reinitializeOnStoreBranch` (context-manager's
-  291-reinitialize-on-store-branch entry), which every other live agent's context calls after a branch move. An
+  `ContextManager.presentRows`. An
   agent whose window can't be written down at its registration (another version's index format, a failed write)
   stays in legacy mode, its window the whole record, as before, until a branch move writes its window down on the
   new branch.
@@ -14,7 +13,9 @@
     `redo:completed` traces are removed in favour of `window:undone`, and the API server broadcasts `window:undone`
     in place of `branch:switched` for them. Both are refused while a turn of the agent's is alive, and for an agent
     whose window isn't presented; a redo also on another branch than its undo's, which the base redo switched back
-    to.
+    to. Moving no branch, an undo or redo reserves nothing and re-initializes no context manager, as a branch move
+    does (the 326-reinit-after-branch-move entry), so every other agent goes on compiling, and the result carries
+    no `settled`.
   - **Context-manager's MANIFEST:** with a chronicle that has the batched identity append, the first window
     write-down that holds rows, or any presentation of more than one row, moves the store's MANIFEST to version 2,
     which earlier chronicle builds refuse (context-manager's 291-window-batches entry). Going back to an earlier

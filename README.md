@@ -347,8 +347,9 @@ three ways:
   configuration error: `allowHostCommands: true`, an `enabledCapabilities`
   pattern that matches a capability denied by default, `channelSubscription:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
-  `toolLifecycle` `observe` or `inputs` block, and a
-  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default.
+  `toolLifecycle` `observe` or `inputs` block, a
+  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default,
+  and `toolHints: true`.
   A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
@@ -428,6 +429,94 @@ appends, as it does today. There is no per-subject cap: a busy channel's unread
 backlog is simply its unread backlog. Receipts and subject history are kept in
 the `mcpl/coalescing` state (retry window 1 h); audit lines are
 `mcpl:coalescing` trace events.
+
+#### Tool presence and toolsets (RFC-014)
+
+A server configured with `toolHints: true` (default false) is offered
+`experimental.mcpl.toolHints`, and its hints count only if it advertised
+`toolHints` too. Without it nothing changes: every tool is listed as before,
+and the host advertises and reads nothing new.
+
+With it, the server's static tools stay in the tool list as before, and its
+dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
+enter it, since every change to the list rebuilds the prompt cache. The
+framework registers a `toolsets` module with four constant tools:
+
+- `toolsets--open {server?, toolset?, instance?, options?}` opens a toolset (or
+  a named instance of one), and answers with what the server shows on opening
+  and the tools usable now;
+- `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool down
+  the same path as a direct call of it (the agent's `allowedTools`, the
+  server's tool policy, the state exchange, the reading of its result, RFC-007
+  observers and RFC-008 class rules, which see the server's tool and its class),
+  with only the instance added, in
+  `_meta["mcpl/instance"]`. It first checks `args` against the definition in
+  force for that instance; that check is bounded, and leaves `pattern` and
+  anything nested or branching too far to the server, which checks every
+  call itself;
+- `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
+  and what can be opened, or one tool's signature, description, class and
+  input schema. It
+  re-reads each server that presents toolsets first, and says so when it
+  couldn't; what that changed
+  is in the answer when look restates everything, and otherwise told as a
+  notice;
+- `toolsets--close {server?, toolset?, instance?}` closes it.
+
+`server` can be left out when only one server has the name. By our reading of
+the code, a server with no toolsets stops presenting them once its latest `tools/list` has no dynamic
+tool, so until the rebuild, act takes its last one only with `server` named.
+Hint changes apply
+as their message is read, in `rev` order, whatever becomes of the message (a
+refused push, a result that came after its timeout). A move between static and
+dynamic takes effect when the server's `tools/list` states it, and the tool
+list follows at its next rebuild that lists the server, whichever refresh
+brings it (a move is no reason to rebuild the tool list early). Until then the
+tool is called at either place, where the tool list shows it or where the
+server's latest list put it (RFC-014 §4.2 keeps it working where it is until
+the move applies), and
+once that rebuild has published the list, a notice says where it went. A list
+read while a rebuild is under way can undo a move that rebuild then publishes;
+neither is told, and the next rebuild puts the tool back.
+A skipped rev re-reads `tools/list` and then `toolsets/list`, which the host
+also reads after every (re)connect, adopting what the server kept open and
+never re-opening anything.
+What changed is told where it happened: after a call's own result, after the
+push that explains it, or as a notice (`kind: 'mcpl-toolsets'`, which wakes
+nothing) for a standalone `tools/hints`, a late result, an adoption, a
+recovery, or a call whose result may not reach the agent (a script's, a
+module's or a host's, or one the framework makes itself); an open, close or
+look made that way also shows its caller the change, unless the change has
+already gone as a notice (below). A dynamic tool's change also goes as a notice
+when it wouldn't fit whole within its result's inline cap, or when its call
+fails after the result was read. A call's change also goes as a notice, ahead of its
+result, when a later change goes to the agent before the call's caller has
+taken it, so changes are told in the order they were read (the agent's window
+can still show a call's result, a push's event, or a change its taker couldn't
+show after a change read later). The model's own call's change counts as told
+once its result is handed back: if the turn is stopped while the call is out
+(or, by our reading of the code, the agent is gone), the result is dropped and the change with it, and
+`toolsets--look` shows the state it left. Notices and reminders
+need the server's `pushEvents` grant, like any delivery; without it, a change
+that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told with its
+definition until text describing it has reached the model, except that, by our reading of the code, a puppet's
+open, close or look whose result the store refuses has already counted it. Suggestions are shown, never acted on. Each
+`ended` id is told once while the
+host runs (told ids are kept in memory), short of rare interleavings, such as a
+`toolsets--look` overlapping other reads of the same server, that can tell one
+twice. When an
+open toolset's announcements have left an agent's context (compressed or out
+of the window), the module's `gatherContext` restates what is open, as a
+stored `afterUser` injection (namespace `mcpl-toolsets`), at that agent's next
+start.
+
+A dynamic tool called by its prefixed name is refused, pointing at
+`toolsets--act`, unless the tool list or the server's latest list shows it as
+static (a move waiting for its rebuild). Calls to an undeclared toolset's
+tools are refused while the host has that group closed (RFC-014 §5.4), except
+by a tool's listed name until the rebuild that publishes its move into the
+group. Projection and surface mode are not implemented: a `surface` server's
+static tools are listed like any server's.
 
 #### Per-channel conversation routing (deprecated)
 

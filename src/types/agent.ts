@@ -14,8 +14,9 @@ export type SameRoundThinkTextPolicySource =
 export interface AutoContinueRun {
   /** How the agent stops, as the row puts it ("call skip_reply"). */
   stop: string;
-  /** The turn before ended in words that were held, not sent, because it
-   *  had already sent with a send tool. */
+  /** The turn before ended in words some or all of which were held, not
+   *  sent, because a send in it may already have posted where they were
+   *  going. */
   heldAfterSend?: boolean;
   /** Set by the scheduler: the continuation is the turn's only cause. */
   sole?: boolean;
@@ -254,7 +255,18 @@ export interface AgentConfig {
      *   that the record doesn't account for raises the
      *   `thinking-binding-loss` ops alert, once per incident and again if a
      *   call drops more. The provider reports drops only on a request that
-     *   carries the drop control; without it, such a block is refused.
+     *   carries the drop control; without it, such a block is refused;
+     * - the agent is told, in a `[reasoning] <agent>:` system notice of kind
+     *   `reasoning-loss` stored for it as the framework's other notices are,
+     *   when a committing compile leaves out a stored reply's reasoning at a
+     *   change of the request's head, at a branch's first compile, or in a
+     *   fold or other change to an earlier message that takes a reply of the
+     *   current turn, and, with `dropBlock` set too, when the provider drops
+     *   blocks it can place as the agent's stored replies or the stream's
+     *   rounds, once per incident and again when a call drops more. The
+     *   framework hears compiles through `Agent.onThinkingStrip` from the
+     *   agent's first stream on, unless a host has set its own, so an agent
+     *   driven only through the direct API is never told.
      * The record and the notes
      * vouch for requests as agent-framework hands them to membrane, so a
      * membrane `beforeRequest` hook that changes a request must change every
@@ -570,17 +582,18 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
-  /** Host-owned: this wake's sole cause is this row, which wasn't presented
-   *  to its agent at its write, because a turn of the agent's was alive: a
-   *  coalesced render its turn being assembled doesn't read (wakeToRead), or
-   *  a message, notice or event whose wake was queued with it. It is the
-   *  stored row's id. Once a request that carried the row was answered (an
-   *  answered request's consumed watermark covers it, in the agent's window
-   *  once its context presents rows) and, for a wake that carries a
-   *  channel, the agent has since published into that channel having read
-   *  it, or once the row is not on its store's current branch, the wake
-   *  starts no turn. A row stored and not yet presented to the agent keeps
-   *  its wake. */
+  /** Host-owned: this wake's sole cause is this row, by the stored row's
+   *  id: one stored for its agent as it arrived, or one stored and not
+   *  presented to its agent at its write, because a turn of the agent's was
+   *  alive: a coalesced render its turn being assembled doesn't read
+   *  (wakeToRead), or a message, notice or event whose wake was queued with
+   *  it. Once a request that carried the row was answered (an answered
+   *  request's consumed watermark covers it, in the agent's window once its
+   *  context presents rows) and, for a wake that carries a channel and isn't
+   *  marked `ambient`, the agent has since published into that channel
+   *  having read it, or once the row is not on its store's current branch,
+   *  the wake starts no turn. A row stored and not yet presented to the
+   *  agent keeps its wake. */
   readsRow?: string;
   agentName: string;
   reason: string;

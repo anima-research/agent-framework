@@ -1,14 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
+import type { Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { AutobiographicalStrategy } from '@animalabs/context-manager';
 
 /**
  * The refusal auto-rewind sheds the newest turn (in sequence, newest first,
  * INCLUDING the agent's own turns) as a COMPLETE exchange — a tool_result is
  * removed together with its paired tool_use turn, so no orphaned tool_use /
  * signed thinking block is left behind. It maintains exactly ONE consolidated
- * marker per episode. These exercise the private primitives on a prototype
- * instance with a minimal in-memory ContextManager stub.
+ * marker per episode.
  */
 function makeAgentHarness(messages: any[]) {
   const removed: string[] = [];
@@ -117,4 +123,351 @@ test('marker: six rewinds produce ONE marker, updated in place (not six)', () =>
   assert.equal(edited.length, 5, 'subsequent rewinds edit that one marker in place');
   assert.match(edited[edited.length - 1].content[0].text, /6 most recent turn/, 'marker reflects the running total');
   assert.equal(added[0].meta.kind, 'refusal-rewind');
+});
+
+const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
+
+class Surface implements Module {
+  readonly name = 'surface';
+  framework?: AgentFramework;
+  heardWhileLooking?: string;
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return [{ name: 'look', description: 'Look at something.', inputSchema: { type: 'object', properties: {} } }]; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    if (this.heardWhileLooking) {
+      const heard = new Promise<void>((resolve) => {
+        const off = this.framework!.onTrace((trace) => {
+          if (trace.type === 'message:added' && (trace as { source?: string }).source === 'external-message') { off(); resolve(); }
+        });
+      });
+      this.framework!.pushEvent({ type: 'external-message', source: 'tui', content: this.heardWhileLooking, metadata: {}, triggerInference: false } as never);
+      let bound: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([heard, new Promise((r) => { bound = setTimeout(r, 5000); })]);
+      clearTimeout(bound);
+    }
+    return { success: true, data: 'what the tool saw' };
+  }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    const wakes = (event as { triggerInference?: boolean }).triggerInference !== false;
+    return { addMessages: [{ participant: 'user', content: [text(String(event.content))] }], requestInference: wakes };
+  }
+}
+
+async function rewindRig(
+  script: NormalizedResponse[][],
+  refusalHandling: Record<string, unknown>,
+  setup: {
+    strategy?: unknown;
+    onRequest?: (count: number, framework: AgentFramework) => void;
+    heardWhileLooking?: string;
+  } = {},
+) {
+  const dir = mkdtempSync(join(tmpdir(), 'refusal-rewind-'));
+  const membrane = new MockMembrane();
+  if (setup.heardWhileLooking) membrane.supportsInjectedMessages = true;
+  const surface = new Surface();
+  surface.heardWhileLooking = setup.heardWhileLooking;
+  const requests: NormalizedRequest[] = [];
+  const streams: MockYieldingStream[] = [];
+  const streamYielding = membrane.streamYielding.bind(membrane);
+  let replies = 0;
+  membrane.streamYielding = (request, options) => {
+    requests.push(structuredClone(request));
+    setup.onRequest?.(requests.length, framework);
+    const scripted = script.shift() ?? [];
+    for (const response of scripted.length > 0 ? scripted : [createMockResponse([text(`reply ${++replies}`)])]) membrane.pushResponse(response);
+    const stream = streamYielding(request, options) as MockYieldingStream;
+    streams.push(stream);
+    return stream;
+  };
+  const framework: AgentFramework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout', refusalHandling, ...(setup.strategy ? { strategy: setup.strategy } : {}) }],
+    modules: [surface],
+  } as never);
+  surface.framework = framework;
+  const say = async (content: string, until: number) => {
+    framework.pushEvent({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true } as never);
+    for (let i = 0; i < 200 && requests.length < until; i++) { await framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    await framework.runUntilIdle();
+  };
+  const texts = (request: NormalizedRequest) => request.messages.map((m) => JSON.stringify(m.content));
+  const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
+  return {
+    framework, requests, streams, say, texts, stored,
+    close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
+  };
+}
+
+const refused = (partial?: string) => createMockResponse(partial ? [text(partial)] : [], 'refusal');
+const markerOf = (request: NormalizedRequest) => {
+  const last = request.messages.at(-1)!;
+  const said = JSON.stringify(last.content);
+  return said.includes('[refusal-rewind]') ? said : undefined;
+};
+
+for (const partial of [undefined, 'Here is the start of an answer']) {
+  const kind = partial ? ', with partial text on the refused reply' : '';
+  test(`after one refusal on a message${kind}, the retry doesn't carry that message and the marker says 1`, async () => {
+    const rig = await rewindRig([[], [refused(partial)]], { autoRewind: true, maxRewinds: 3 });
+    try {
+      await rig.say('first question', 1);
+      await rig.say('second question', 3);
+      assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
+      assert.ok(rig.texts(rig.requests[1]!).some((t) => t.includes('second question')), 'the premise: the refused request carried it');
+      const retry = rig.requests[2]!;
+      assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the retry leaves the refused message out');
+      if (partial) assert.ok(!rig.texts(retry).some((t) => t.includes(partial)), "and the refused attempt's text");
+      assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes('[refusal-rewind]')), 'what came before stays');
+      assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+    } finally { await rig.close(); }
+  });
+
+  test(`after two refusals${kind}, the two newest messages that reached a request are gone and the marker says 2`, async () => {
+    const rig = await rewindRig([[], [refused(partial)], [refused(partial)]], { autoRewind: true, maxRewinds: 3 });
+    try {
+      await rig.say('first question', 1);
+      await rig.say('second question', 4);
+      assert.equal(rig.requests.length, 4, 'the turn, two refused requests and the retry');
+      const retry = rig.requests[3]!;
+      assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
+      assert.ok(!rig.texts(retry).some((t) => t.includes('reply 1')), 'and the reply before it');
+      assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes('[refusal-rewind]')), 'what came before stays');
+      assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+    } finally { await rig.close(); }
+  });
+}
+
+for (const partial of [undefined, 'Here is the start of an answer']) {
+  const kind = partial ? ', with partial text on the refused reply' : '';
+  test(`after a refused tool round${kind}, the retry carries neither the tool call, its result nor the refused reply, and the marker says 1`, async () => {
+    const call = { type: 'tool_use', id: 'look-1', name: 'surface--look', input: {} } as ContentBlock;
+    const toolCall = createMockResponse([text('let me look'), call], 'tool_use');
+    const refusedRound = {
+      ...createMockResponse([
+        text('let me look'), call, { type: 'tool_result', toolUseId: 'look-1', content: 'what the tool saw' } as ContentBlock,
+        ...(partial ? [text(partial)] : []),
+      ], 'refusal'),
+      toolCalls: [],
+    };
+    const rig = await rewindRig([[], [toolCall, refusedRound]], { autoRewind: true, maxRewinds: 3 });
+    try {
+      await rig.say('first question', 1);
+      await rig.say('look at it', 3);
+      assert.equal(rig.requests.length, 3, 'the turn, the stream whose tool round was refused, and the retry');
+      assert.match(JSON.stringify(rig.streams[1]!.receivedToolResults), /what the tool saw/, "the premise: the refused round's stream was given the tool's result");
+      const retry = rig.requests[2]!;
+      const sent = JSON.stringify(retry.messages);
+      assert.doesNotMatch(sent, /what the tool saw/, "the tool's result is gone");
+      assert.doesNotMatch(sent, /look-1/, 'and the call it answered');
+      if (partial) assert.ok(!rig.texts(retry).some((t) => t.includes(partial)), "and the refused attempt's text");
+      assert.ok(rig.texts(retry).some((t) => t.includes('look at it')), 'the message before the exchange stays');
+      assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+    } finally { await rig.close(); }
+  });
+}
+
+test('a message injected into the refused round is the newest turn it carried, and is shed first', async () => {
+  const call = { type: 'tool_use', id: 'look-1', name: 'surface--look', input: {} } as ContentBlock;
+  const toolCall = createMockResponse([text('let me look'), call], 'tool_use');
+  const refusedRound = {
+    ...createMockResponse([text('let me look'), call, { type: 'tool_result', toolUseId: 'look-1', content: 'what the tool saw' } as ContentBlock], 'refusal'),
+    toolCalls: [],
+  };
+  const rig = await rewindRig([[], [toolCall, refusedRound]], { autoRewind: true, maxRewinds: 3 }, { heardWhileLooking: 'a message heard while the tool ran' });
+  try {
+    await rig.say('first question', 1);
+    await rig.say('look at it', 3);
+    const injected = rig.streams[1]!.receivedToolResultOptions.flatMap((o) => (o as { injectedMessages?: unknown[] } | undefined)?.injectedMessages ?? []);
+    assert.match(JSON.stringify(injected), /heard while the tool ran/, 'the premise: the refused round carried the injected message');
+    const retry = rig.requests[2]!;
+    assert.ok(!rig.texts(retry).some((t) => t.includes('heard while the tool ran')), 'the injected message is gone');
+    assert.match(JSON.stringify(retry.messages), /what the tool saw/, 'the tool exchange before it stays');
+    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+  } finally { await rig.close(); }
+});
+
+test('an exchange the refused request carried only by its call is shed whole', async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });
+  try {
+    await rig.say('first question', 1);
+    const cm = rig.framework.getAgent('scout')!.getContextManager();
+    cm.addMessage('scout', [text('let me look'), { type: 'tool_use', id: 'look-9', name: 'surface--look', input: {} } as ContentBlock]);
+    cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'look-9', content: 'what the tool saw' } as ContentBlock], { tuneOut: { epochId: 'held' } } as never);
+    await rig.say('second question', 4);
+    const refusedRequest = JSON.stringify(rig.requests[1]!.messages);
+    assert.ok(refusedRequest.includes('look-9') && !refusedRequest.includes('what the tool saw'), 'the premise: the refused request carried the call and not its stored result');
+    const retry = rig.requests[3]!;
+    assert.ok(!JSON.stringify(retry.messages).includes('look-9'), 'the call is gone');
+    // Read onto #291: a shed is the window's (the record keeps what it sets
+    // aside), so the result goes with its call out of the agent's window.
+    const result = rig.stored().find((m) => JSON.stringify(m.content).includes('what the tool saw'))!;
+    assert.notEqual(cm.windowStatusOf(result.id), 'in', 'and so is its result, from the window');
+    assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+  } finally { await rig.close(); }
+});
+
+test('a row no refused request carried, such as tuned-out traffic, is neither removed nor counted', async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });
+  try {
+    await rig.say('first question', 1);
+    rig.framework.getAgent('scout')!.getContextManager()
+      .addMessage('user', [text('traffic of a channel the agent tuned out')], { tuneOut: { epochId: 'tuned-out' } } as never);
+    await rig.say('second question', 4);
+    assert.equal(rig.requests.length, 4, 'the turn, two refused requests and the retry');
+    assert.ok(rig.requests.every((request) => !rig.texts(request).some((t) => t.includes('tuned out'))), 'the premise: no request carries it');
+    const retry = rig.requests[3]!;
+    assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
+    assert.ok(!rig.texts(retry).some((t) => t.includes('reply 1')), 'and the reply before it');
+    assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+    assert.ok(rig.stored().some((m) => JSON.stringify(m.content).includes('tuned out')), 'the tuned-out row stays stored');
+  } finally { await rig.close(); }
+});
+
+test('a message stored after the refused request was sent is neither removed nor counted', async () => {
+  const rig = await rewindRig([[], [refused()]], { autoRewind: true, maxRewinds: 3 }, {
+    onRequest: (count, framework) => {
+      if (count === 2) framework.getAgent('scout')!.getContextManager().addMessage('user', [text('a message stored while it streams')]);
+    },
+  });
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 3);
+    assert.ok(!rig.texts(rig.requests[1]!).some((t) => t.includes('while it streams')), 'the premise: the refused request was sent without it');
+    const retry = rig.requests[2]!;
+    assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
+    assert.ok(rig.texts(retry).some((t) => t.includes('while it streams')), 'the message stored meanwhile stays');
+    assert.ok(rig.texts(retry).some((t) => t.includes('reply 1')), 'and so does what came before');
+    // Read onto #291: the message stored while the refused request streamed
+    // enters the window as that turn ends, after the marker the rewind
+    // stored, so the marker is the retry's last message but one.
+    const markerAt = rig.texts(retry).findIndex((t) => t.includes('[refusal-rewind]'));
+    assert.match(rig.texts(retry)[markerAt] ?? '', /The 1 most recent turn\(s\) were set aside/);
+    assert.ok(rig.texts(retry).slice(markerAt + 1).some((t) => t.includes('while it streams')), 'the message stored meanwhile follows the marker');
+  } finally { await rig.close(); }
+});
+
+test('when no turn the refused request carried is left, the rewind removes only the refused reply, and no later request carries it', async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[refused()], [refused(partial)]], { autoRewind: true, maxRewinds: 3 });
+  try {
+    rig.framework.getAgent('scout')!.getContextManager().addMessage('scout', [text('   ')]);
+    await rig.say('the only question', 2);
+    assert.ok(rig.stored().some((m) => /"text":"   "/.test(JSON.stringify(m.content))), 'an older row that carries nothing stays');
+    assert.ok(!rig.texts(rig.requests[1]!).some((t) => t.includes('the only question')), 'the premise: the retry carried no turn but the marker');
+    await rig.say('a new question', 3);
+    assert.equal(rig.requests.length, 3, 'the refused request, its refused retry, and the next turn');
+    assert.ok(!rig.texts(rig.requests[2]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+  } finally { await rig.close(); }
+});
+
+test("when the rewind gives up at its cap, no later request carries the refused reply's text", async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[], [refused()], [refused(partial)]], { autoRewind: true, maxRewinds: 1 });
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 3);
+    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes('[refusal-rewind]')), 'the premise: one rewind ran, and its retry was refused');
+    await rig.say('a new question', 4);
+    assert.equal(rig.requests.length, 4, 'the turn, the refused request, its refused retry, and the next turn');
+    assert.ok(!rig.texts(rig.requests[3]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+    assert.ok(rig.texts(rig.requests[3]!).some((t) => t.includes('reply 1')), 'and still carries the history before the shed turn');
+  } finally { await rig.close(); }
+});
+
+test("with the rewind off, the next request still carries the refused reply's text", async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[], [refused(partial)]], {});
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 2);
+    await rig.say('a new question', 3);
+    assert.equal(rig.requests.length, 3, 'the turn, the refused request, and the next turn, with no retry');
+    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes(partial)), 'the next request carries the refused reply, as on main');
+  } finally { await rig.close(); }
+});
+
+test('a refused reply stored in shards is removed whole, and the marker says 1', async () => {
+  const long = (tag: string) => Array.from({ length: 400 }, (_, i) => `${tag}${i}`).join(' ');
+  const rig = await rewindRig([[createMockResponse([text(long('answer'))])], [refused(long('partial'))]], { autoRewind: true, maxRewinds: 3 }, {
+    strategy: new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 16_000, kvStableReachTokens: 32_000,
+      compressionModel: 'mock', targetChunkTokens: 100, autoTickOnNewMessage: false,
+    } as never),
+  });
+  try {
+    await rig.say('first question', 1);
+    const shards = rig.stored().filter((m) => m.participant === 'scout');
+    assert.ok(shards.length > 1, 'the premise: a reply this long is stored in shards');
+    await rig.say('second question', 3);
+    const retry = rig.requests[2]!;
+    assert.ok(!rig.texts(retry).some((t) => t.includes('partial')), 'no shard of the refused reply is carried');
+    assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
+    assert.ok(rig.texts(retry).some((t) => t.includes('answer0')), 'what came before stays');
+    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+  } finally { await rig.close(); }
+});
+
+test("/unstick after a refusal whose reply had text sheds that reply first, since the unstick's own request carried it", async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[], [refused(partial)], [refused()]], {});
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 2);
+    const started = await (rig.framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; started?: boolean }>;
+    }).handleHostCommand('test-server', { command: 'unstick', agentName: 'scout' });
+    assert.equal(started.started, true);
+    for (let i = 0; i < 200 && rig.requests.length < 4; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    await rig.framework.runUntilIdle();
+    assert.equal(rig.requests.length, 4, "the unstick's run, refused, and its retry");
+    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes(partial)), "the premise: the unstick's request carried the earlier refused reply");
+    const retry = rig.requests[3]!;
+    assert.ok(!rig.texts(retry).some((t) => t.includes(partial)), 'the retry leaves that reply out');
+    assert.ok(rig.texts(retry).some((t) => t.includes('second question')), 'the message before it stays, for a later shed if the refusals go on');
+    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+  } finally { await rig.close(); }
+});
+
+test("when /unstick gives up at its cap, no later request carries the refused reply's text", async () => {
+  const partial = 'Here is the start of an answer';
+  const rig = await rewindRig([[], [refused()], [refused()], [refused(partial)]], {});
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 2);
+    const started = await (rig.framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; started?: boolean }>;
+    }).handleHostCommand('test-server', { command: 'unstick', agentName: 'scout', maxRewinds: 1 });
+    assert.equal(started.started, true);
+    for (let i = 0; i < 200 && rig.requests.length < 4; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    await rig.framework.runUntilIdle();
+    assert.equal(rig.requests.length, 4, "the premise: the unstick's run, refused, and its one retry, refused with text");
+    assert.ok(markerOf(rig.requests[3]!), 'the premise: the retry followed a rewind');
+    await rig.say('a new question', 5);
+    assert.equal(rig.requests.length, 5, 'the unstick gave up, and the next turn ran');
+    assert.ok(!rig.texts(rig.requests[4]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+    assert.ok(rig.texts(rig.requests[4]!).some((t) => t.includes('reply 1')), 'and still carries the history before the shed turn');
+  } finally { await rig.close(); }
+});
+
+test('/unstick after a refusal sheds the refused message, not the refused reply, and the marker says 1', async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], {});
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 2);
+    assert.equal(rig.requests.length, 2, 'the premise: without autoRewind, the refusal stops there');
+    const started = await (rig.framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; started?: boolean }>;
+    }).handleHostCommand('test-server', { command: 'unstick', agentName: 'scout' });
+    assert.equal(started.started, true);
+    for (let i = 0; i < 200 && rig.requests.length < 4; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    await rig.framework.runUntilIdle();
+    assert.equal(rig.requests.length, 4, "the unstick's run, refused, and its retry");
+    const retry = rig.requests[3]!;
+    assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
+    assert.ok(rig.texts(retry).some((t) => t.includes('reply 1')), 'the reply before it stays');
+    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+  } finally { await rig.close(); }
 });

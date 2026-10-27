@@ -1433,3 +1433,52 @@ test('nudge while quiesced says so', async () => {
     assert.equal(framework.getHostModeStatus().gatedRequests, 1);
   });
 });
+
+test("an abandon whose cancel throws for one agent goes on to abandon the next agent's turn", async () => {
+  const membrane = new HangingMembrane();
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [
+      { name: 'first', model: 'test-model', systemPrompt: 'test' },
+      { name: 'second', model: 'test-model', systemPrompt: 'test' },
+    ],
+    modules: [],
+  });
+  const errors = captureErrors();
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => traces.push(event));
+  const abortedAs = (name: string) => traces
+    .filter((t) => t.type === 'inference:aborted' && (t as { agentName?: string }).agentName === name)
+    .map((t) => (t as { reason?: string }).reason);
+  let restore: (() => void) | undefined;
+  try {
+    framework.start();
+    // first takes its turn token before second, so the abandon reaches it first.
+    framework.nudgeAgent('first', 'operator');
+    await waitFor("first's turn to start", () => membrane.calls.length === 1);
+    framework.nudgeAgent('second', 'operator');
+    await waitFor("second's turn to start", () => membrane.calls.length === 2);
+    const stream = (framework.getAgent('first')!.state as { stream?: { cancel(): void } }).stream!;
+    const cancel = stream.cancel.bind(stream);
+    stream.cancel = () => { throw new Error('zz the stream refused its cancel'); };
+    restore = () => { stream.cancel = cancel; };
+    const quiescing = framework.quiesce({ timeoutMs: 50, abandon: true });
+    await waitFor("second's turn to end as abandoned", () => abortedAs('second').length > 0);
+    assert.deepEqual(abortedAs('second'), ['quiesce_abandoned']);
+    assert.ok(errors.lines.some((l) => l.startsWith("[host-mode] cannot abandon turn for first: its stream's cancel threw")),
+      errors.lines.join('\n'));
+    // first's stream goes on; a caller's stop ends it, and with it the abandon's grace.
+    restore();
+    assert.equal(framework.abortInference('first', 'user'), true);
+    const status = await quiescing;
+    assert.equal(status.quiesced, true);
+    assert.deepEqual(abortedAs('first'), ['user'], "first's turn ends as the caller's stop, not as abandoned");
+  } finally {
+    restore?.();
+    errors.restore();
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

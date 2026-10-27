@@ -641,6 +641,8 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 export function mcplPolicyGrants(config: McplServerConfig): string[] {
   const grants: string[] = [];
   if (isEffective(config.allowHostCommands)) grants.push('allowHostCommands');
+  // RFC-014 tool hints are an MCPL advertisement.
+  if (config.toolHints === true) grants.push('toolHints');
   // An allow-list, except that a pattern matching a path denied by default
   // grants it (computeGrant's explicitlyEnabled), named by the path.
   const enabled = config.enabledCapabilities as unknown;

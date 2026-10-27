@@ -30,7 +30,7 @@ import {
   type ToolCall,
   type ToolResult,
 } from '../src/index.js';
-import { ContextManager, MalformedContentError } from '@animalabs/context-manager';
+import { ContextManager, MalformedContentError, blockAsStored } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { canonicalJson } from '../src/mcpl/inbound-source.js';
@@ -698,46 +698,49 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     ({ type: 'image', source: { type: 'base64', data, mediaType }, ...extra });
   const media = (type: string, data: string, mediaType: string, extra: Record<string, unknown> = {}) =>
     ({ type, source: { type: 'base64', data, mediaType }, ...extra });
-  /** Each body, and whether the store hands it back changed. */
-  const bodies: Record<string, { blocks: unknown[]; changed: boolean }> = {
-    'a labeled image': { blocks: [image(png)], changed: false },
-    'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true },
-    'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true },
-    // One fixture per branch of the copied sniffer, each labeled as something
+  const bodies: Record<string, { blocks: unknown[]; changed: boolean; digest: string }> = {
+    'plain text': { blocks: [{ type: 'text', text: 'hello' }], changed: false, digest: '20e8a9654f001815055a7b61692923120a516fc0095519f521c8c821421cb4b9' },
+    'a labeled image': { blocks: [image(png)], changed: false, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true, digest: '828ac28be2d13e7621768ba98ec74d555409d97567f9c05b1a1428e614cf9233' },
+    // One fixture per signature the store sniffs, each labeled as something
     // else, so a context-manager that stops sniffing one fails here.
-    'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
-    'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true },
-    'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
-    'base64 with a newline in it': { blocks: [image(`${png.slice(0, 11)}\n${png.slice(11)}`)], changed: true },
-    'base64 with whitespace around it': { blocks: [image(`  ${png}\n`)], changed: true },
-    'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true },
-    'base64 with non-zero unused bits': { blocks: [image(png.replace(/8=$/, '9='))], changed: true },
-    'base64 in the URL-safe alphabet': { blocks: [image(png.replace(/\//g, '_'))], changed: true },
+    'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e6e7bf5cc2225c979b2063abbe811ba02db8208e49b8315d0cab6565b55631fc' },
+    'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true, digest: 'd7b8b855a4e81d88931ebf4a1d91c76c57da9d79572f523e29de1b9d23143fb1' },
+    'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e643b5a67e56b99e8c555cd1064bc24ccba134e76a240b99c651934b761a9c72' },
+    'base64 with a newline in it': { blocks: [image(`${png.slice(0, 11)}\n${png.slice(11)}`)], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 with whitespace around it': { blocks: [image(`  ${png}\n`)], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 with non-zero unused bits': { blocks: [image(png.replace(/8=$/, '9='))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 in the URL-safe alphabet': { blocks: [image(png.replace(/\//g, '_'))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image whose data is not base64': { blocks: [image('not base64 at all!')], changed: true, digest: '75f6aed70407609a42b127029df45b37de6f61019f25c9ed8ea76c904c7ab6ed' },
     // Bytes the store has no signature for keep their label. Labeled
     // image/png, so a context-manager that learns to sniff one fails here.
-    'SVG bytes labeled image/png': { blocks: [image(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'))], changed: false },
-    'BMP bytes labeled image/png': { blocks: [image(Buffer.from('424d3a0000000000000036000000', 'hex').toString('base64'))], changed: false },
-    'AVIF bytes labeled image/png': { blocks: [image(Buffer.from('0000001c6674797061766966000000006d696631', 'hex').toString('base64'))], changed: false },
-    'an image whose source is neither base64 nor a URL': { blocks: [{ type: 'image', source: { type: 'file', data: png, mediaType: 'image/png' } }], changed: true },
-    'an image with fields the store drops': { blocks: [image(png, 'image/png', { sourceUrl: 'https://cdn.example/a.png', tokenEstimate: 85 })], changed: true },
-    'an image by URL, its fields kept': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png' }, sourceUrl: 'https://cdn.example/a.png' }], changed: false },
-    'audio, wrapped, with a duration': { blocks: [media('audio', 'SUQz\nAwAAAAAA', 'audio/mpeg', { duration: 3 })], changed: true },
-    'a document with a filename': { blocks: [media('document', 'JVBERi0xLjQ=', 'application/pdf', { filename: 'a.pdf' })], changed: true },
-    'text with lone surrogates': { blocks: [{ type: 'text', text: 'cut \ud83d here, \ude00 there, \ud83d\ud83d twice' }], changed: true },
-    'a key that is not well-formed': { blocks: [{ type: 'text', text: 'x', rawItem: { 'k\ud800': 1, kept: 2 } }], changed: true },
-    'a relabeled image with a text decoration': { blocks: [image(png, 'image/jpeg'), { type: 'text', text: '[invitation]' }], changed: true },
-    'a video with a duration': { blocks: [media('video', 'AAAAGGZ0eXBtcDQy', 'video/mp4', { duration: 2 })], changed: true },
+    'SVG bytes labeled image/png': { blocks: [image(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'))], changed: false, digest: 'b4f895f137c12d828e3c38d9213f02b8126372824adbca4d49c084b2af7c8a99' },
+    'BMP bytes labeled image/png': { blocks: [image(Buffer.from('424d3a0000000000000036000000', 'hex').toString('base64'))], changed: false, digest: '8b4d4b8cd7ad44bebd5612eccb4119fca58cf99179217dc5598fae0910c6cf4e' },
+    'AVIF bytes labeled image/png': { blocks: [image(Buffer.from('0000001c6674797061766966000000006d696631', 'hex').toString('base64'))], changed: false, digest: '29ee62d0947b86ae92afc97520104f1df0971bef0cdc42f896f84238862bf0c7' },
+    'an image whose source is neither base64 nor a URL': { blocks: [{ type: 'image', source: { type: 'file', data: png, mediaType: 'image/png' } }], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image with fields the store drops': { blocks: [image(png, 'image/png', { sourceUrl: 'https://cdn.example/a.png', tokenEstimate: 85 })], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image by URL, its fields kept': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png' }, sourceUrl: 'https://cdn.example/a.png' }], changed: false, digest: '86c0304289fb63c7aa9c553bb4f74715e41f48dd3369c2a9d3036264436deb37' },
+    'audio, wrapped, with a duration': { blocks: [media('audio', 'SUQz\nAwAAAAAA', 'audio/mpeg', { duration: 3 })], changed: true, digest: '98cffd2cea1945c6369cb5e7baff7b9c8227e297bb2065eb75ac756f6be2ec76' },
+    'a document with a filename': { blocks: [media('document', 'JVBERi0xLjQ=', 'application/pdf', { filename: 'a.pdf' })], changed: true, digest: '8d07d2f460b247e61d54154454f0c53601b54996af04de5403ac5059a6a7ef2a' },
+    'text with lone surrogates': { blocks: [{ type: 'text', text: 'cut \ud83d here, \ude00 there, \ud83d\ud83d twice' }], changed: true, digest: '5d9fcff202fa2c652254c3eba7ac8dcf970124927ad4ae27c8ba77d46c460de8' },
+    'a key that is not well-formed': { blocks: [{ type: 'text', text: 'x', rawItem: { 'k\ud800': 1, kept: 2 } }], changed: true, digest: 'a9f7d2e0c020bfbf5b5c7018327a62b27e905283a531cdce6809b2bd0bd40bda' },
+    'a relabeled image with a text decoration': { blocks: [image(png, 'image/jpeg'), { type: 'text', text: '[invitation]' }], changed: true, digest: '5361c3940444c2049c32585c60da69561f6b5a7da723fec876ea2e9cc048d0ec' },
+    'a video with a duration': { blocks: [media('video', 'AAAAGGZ0eXBtcDQy', 'video/mp4', { duration: 2 })], changed: true, digest: 'f861b815a4330c4f428ec70f6842b427755a1f32e70d195b242a419f0e7edc52' },
     // No media type: an image takes its bytes' own (an image without a
     // signature, or other media, is refused at write: see below).
-    'an image without a media type': { blocks: [{ type: 'image', source: { type: 'base64', data: png } }], changed: true },
-    'an image whose media type is undefined': { blocks: [{ type: 'image', source: { type: 'base64', data: png, mediaType: undefined } }], changed: true },
-    'a text block with an undefined field': { blocks: [{ type: 'text', text: 'x', note: undefined }], changed: true },
+    'an image without a media type': { blocks: [{ type: 'image', source: { type: 'base64', data: png } }], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image whose media type is undefined': { blocks: [{ type: 'image', source: { type: 'base64', data: png, mediaType: undefined } }], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'a text block with an undefined field': { blocks: [{ type: 'text', text: 'x', note: undefined }], changed: true, digest: 'e96649c55e4c0362c808071bd07421837b9d6cb02b71739d66e112ef8950ae9e' },
     // Only a non-URL image is blobbed: a URL image keeps even a stray data
     // string as given, and storedBlock must not re-encode it.
-    'an image by URL with a stray data string': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } }], changed: false },
+    'an image by URL with a stray data string': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } }], changed: false, digest: 'bc49add8c15470ee7f0c265407c27a487a5a4db29e0a72bcd67459cb40790d7c' },
+    'a tool_use whose input is a string': { blocks: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: 'not an object' }], changed: true, digest: 'cad2fc7ae441d577c80caf5c1b600b75b1fac068fbad1bb3c927cf5eaa6ecc8e' },
+    'a document whose data is a byte array': { blocks: [{ type: 'document', source: { type: 'base64', data: [...Buffer.from('%PDF-1.4')], mediaType: 'application/pdf' } }], changed: true, digest: '8d07d2f460b247e61d54154454f0c53601b54996af04de5403ac5059a6a7ef2a' },
   };
 
-  it('every body hashes alike as handed to the store and as read back, live and after reopening', async () => {
+  it('every body hashes alike as handed to the store, as read back live and after reopening, and as stamped', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'stored-digest-'));
     const path = join(dir, 'store.chronicle');
     try {
@@ -748,11 +751,12 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
         ids.set(name, cm.addMessage('user', blocks as never, { storedBodyDigest: sourceBodyDigest(blocks) }));
       }
       const check = (when: string) => {
-        for (const [name, { blocks, changed }] of Object.entries(bodies)) {
+        for (const [name, { blocks, changed, digest }] of Object.entries(bodies)) {
           const back = cm.getMessage(ids.get(name)!)!;
           if (changed) assert.notDeepEqual(back.content, blocks, `${when}, ${name}: the store hands it back changed`);
           else assert.deepEqual(back.content, blocks, `${when}, ${name}: the store hands it back as it was`);
           assert.equal(sourceBodyDigest(back.content), (back.metadata as Record<string, unknown>).storedBodyDigest, `${when}, ${name}: it still hashes as handed over`);
+          assert.equal(sourceBodyDigest(back.content), digest, `${when}, ${name}: it hashes as stamped`);
         }
       };
       check('live');
@@ -798,6 +802,40 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('a body the store refuses is digested as given, and nothing is logged for it', (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    for (const block of [
+      { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } },
+      { type: 'image', source: { type: 'base64', data: Buffer.from('<svg/>').toString('base64') } },
+      { type: 'blob_ref', blobKind: 'image', hash: 'deadbeef', mediaType: 'image/png' },
+    ]) {
+      const titled = { ...block, title: 'a' };
+      for (const given of [block, titled]) {
+        assert.throws(() => blockAsStored(given as never), MalformedContentError, `${given.type}: the store refuses it`);
+      }
+      assert.match(sourceBodyDigest([block]), /^[0-9a-f]{64}$/, `${block.type}: it has a digest`);
+      assert.notEqual(sourceBodyDigest([titled]), sourceBodyDigest([block]), `${block.type}: every field of a refused body counts`);
+    }
+    assert.deepEqual(logged, []);
+  });
+
+  it('any other error from the store\'s transform still gives the block\'s digest as given, and is logged once', (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    let reads = 0;
+    const block = {
+      type: 'text',
+      get text() {
+        if (reads++ === 0) throw new TypeError('the first read fails');
+        return 'x';
+      },
+    };
+    assert.equal(sourceBodyDigest([block]), sourceBodyDigest([{ type: 'text', text: 'x' }]));
+    assert.equal(logged.length, 1, logged.join('\n'));
+    assert.match(logged[0], /^\[stored-digest-as-given\] error=TypeError: .*the first read fails/);
   });
 
   it('a block the store keeps as given is digested as given', () => {

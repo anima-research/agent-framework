@@ -562,7 +562,7 @@ export class HistoryModule implements Module {
     channelId?: string;
     n: number;
     side: 'newest' | 'oldest';
-  }): { messages: StoredMessage[]; more: boolean } {
+  }): { messages: StoredMessage[]; more: boolean; total?: number } {
     const cm = this.cm as ContextManager;
     const { fromMs, toMs, channelId, n, side } = opts;
     const newest = side === 'newest';
@@ -580,8 +580,8 @@ export class HistoryModule implements Module {
     const fetch = (f: number | undefined, t: number | undefined, limit: number, offset = 0) =>
       limit <= 0 ? [] : cm.queryMessagesByTimeAndChannel({ fromMs: f, toMs: t, channelId, limit, offset }).messages;
     const total = count(fromMs, toMs);
-    if (n === 0) return { messages: [], more: total > 0 };
-    if (total <= n) return { messages: dirSort(fetch(fromMs, toMs, total)), more: false };
+    if (n === 0) return { messages: [], more: total > 0, total };
+    if (total <= n) return { messages: dirSort(fetch(fromMs, toMs, total)), more: false, total };
 
     // The window is parameterised by its FAR bound `e`: [e, toMs] for the
     // newest side, [fromMs, e] for the oldest; its count is monotone in e.
@@ -607,7 +607,7 @@ export class HistoryModule implements Module {
     }
     const fetchCap = Math.max(4 * n, n + 1000);
     if (inCount <= fetchCap) {
-      return { messages: dirSort(fetch(...win(inside), inCount)).slice(0, n), more: true };
+      return { messages: dirSort(fetch(...win(inside), inCount)).slice(0, n), more: true, total };
     }
     // Overshoot: bisect the far bound. The empty side starts one past the
     // range's near end (newest: past toMs / any date; oldest: before lo).
@@ -622,7 +622,7 @@ export class HistoryModule implements Module {
         inside = mid;
         inCount = c;
         if (c <= fetchCap) {
-          return { messages: dirSort(fetch(...win(mid), c)).slice(0, n), more: true };
+          return { messages: dirSort(fetch(...win(mid), c)).slice(0, n), more: true, total };
         }
       }
     }
@@ -634,7 +634,7 @@ export class HistoryModule implements Module {
     const need = n - near.length;
     const ties = count(inside, inside);
     const edgeMs = fetch(inside, inside, need, newest ? Math.max(0, ties - need) : 0);
-    return { messages: dirSort([...near, ...edgeMs]).slice(0, n), more: true };
+    return { messages: dirSort([...near, ...edgeMs]).slice(0, n), more: true, total };
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -1312,7 +1312,8 @@ export class HistoryModule implements Module {
                   hint:
                     (pageFull
                       ? 'More matching messages exist. '
-                      : `Stopped after scanning ${scanned} messages of the window without reaching its end. `) +
+                      : `Stopped after scanning ${scanned} messages of the window without reaching its end` +
+                        (page.length === 0 ? ', so returning none is not a negative result for the window. ' : '. ')) +
                     `Continue by repeating this call with the same from/to/channelId/author plus ` +
                     `the fields of \`resume\` (windowOffset:${resume.windowOffset}, offset:${resume.offset}, afterId).`,
                 };
@@ -1545,6 +1546,7 @@ export class HistoryModule implements Module {
       !!skipRange && m.timestamp.getTime() === edgeMs && m.sequence >= skipRange[0] && m.sequence <= skipRange[1];
     let windowMessages: StoredMessage[];
     let truncated: boolean;
+    let unscanned: number | undefined;
     {
       // Over-fetch by the number of messages at the edge millisecond (the
       // only ones that can be skipped), then drop the skipped ones.
@@ -1553,6 +1555,7 @@ export class HistoryModule implements Module {
       const pool = skipRange ? w.messages.filter((m) => !isSkipped(m)) : w.messages;
       truncated = w.more || pool.length > maxScan;
       windowMessages = pool.slice(0, maxScan);
+      if (w.total !== undefined) unscanned = w.total - (w.messages.length - pool.length) - windowMessages.length;
     }
     const candidatePoolSize = windowMessages.length;
     const byAuthor = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
@@ -1570,7 +1573,7 @@ export class HistoryModule implements Module {
     // the pool was never looked at) or the pool itself was truncated. The
     // timestamp is the continuation point — from: (oldest) / to: (newest).
     // Boundary is inclusive, so a message at exactly that instant may repeat.
-    const resumeInfo = (scanned: number): Record<string, unknown> => {
+    const resumeInfo = (scanned: number, matched: number): Record<string, unknown> => {
       const stoppedEarly = scanned < candidates.length;
       if (!stoppedEarly && !truncated) return {};
       // Stopped at limit: the last candidate actually looked at. Scanned the
@@ -1608,9 +1611,16 @@ export class HistoryModule implements Module {
         hint:
           (stoppedEarly
             ? 'Stopped at limit; more candidates remain. '
-            : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan). `) +
+            : matched === 0
+              ? `No match among the ${order} ${candidatePoolSize} ${candidatePoolSize === 1 ? 'message' : 'messages'} ` +
+                'scanned (maxScan); ' +
+                (unscanned === undefined
+                  ? 'the rest of this range was not searched'
+                  : `${unscanned} more in this range ${unscanned === 1 ? 'was' : 'were'} not searched`) +
+                ', so this is not a negative result for the range. '
+              : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan). `) +
           `Continue by repeating the call with the fields of \`resume\` (${bound}:"${at}" and skipSequences), ` +
-          'or raise limit/maxScan, or narrow with channelId/author/dates.',
+          `or raise limit/maxScan, or narrow with ${[channelId === undefined ? 'channelId' : null, stoppedEarly && input.author === undefined ? 'author' : null, 'dates'].filter((w) => w !== null).join('/')}.`,
       };
     };
 
@@ -1625,7 +1635,7 @@ export class HistoryModule implements Module {
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
       const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit, view);
-      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned), matches } };
+      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches } };
     }
 
     // Plain substring search (String.prototype.indexOf) is inherently
@@ -1658,7 +1668,7 @@ export class HistoryModule implements Module {
 
     return {
       success: true,
-      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned), matches },
+      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches },
     };
   }
 

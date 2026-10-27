@@ -1274,7 +1274,7 @@ test("a merged start held where an equal request is already held keeps its wakes
   });
 });
 
-test("a budget restart's start merged with a fresh wake and parked: abortInference() puts the wake back, and it runs", async () => {
+test("a budget restart batched with a fresh wake parks alone, the wake left queued: abortInference() keeps the wake, and it runs", async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
@@ -1293,10 +1293,16 @@ test("a budget restart's start merged with a fresh wake and parked: abortInferen
         { agentName: 'resident', reason: 'zz-wake', source: 'test', timestamp: Date.now() },
         { agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() },
       );
-      await fw.runUntilIdle();
-      assert.equal(internal.parkedContinuations.size, 1, 'the merged start parks');
+      // A continuation that resumes its logical turn starts alone: the wake
+      // goes back to the queue rather than into the start, so it waits for
+      // the turn (runUntilIdle would wait with it) while the restart parks.
+      await waitFor(fw, () => internal.parkedContinuations.size === 1, 'the restart parks');
+      const [parked] = [...internal.parkedContinuations] as Request[];
+      assert.equal(parked.reason, 'context_budget_restart');
+      assert.equal(Object.getOwnPropertySymbols(parked).some((s) => s.description === 'merged-batch'), false, 'no batch is merged into the restart');
+      assert.equal(internal.pendingRequests.filter((r) => r.agentName === 'resident' && r.reason === 'zz-wake').length, 1, 'the wake waits in the queue');
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
-      assert.equal(internal.pendingRequests.filter((r) => r.agentName === 'resident' && r.reason === 'zz-wake').length, 1, 'the wake is put back');
+      assert.equal(internal.pendingRequests.filter((r) => r.agentName === 'resident' && r.reason === 'zz-wake').length, 1, 'the stop keeps the wake, once');
       gate.auxiliaryInFlight = 0;
       for (const resolve of gate.idleWaiters.splice(0)) resolve();
       await waitFor(fw, () => membrane.primary >= 1, 'the wake, as a turn of its own');

@@ -465,10 +465,11 @@ export class AgentPresentation {
    * new branch is presented again for an agent left in legacy mode by an
    * earlier branch, its own-row sink installed. A window that can't be
    * written down, or a manager whose strategy couldn't follow the move
-   * (`failure`, from its reinitializeOnStoreBranch), leaves the agent in
-   * legacy mode until the next move, traced as presentation:failed at
-   * `'rebase'`. Arrivals aren't presented here: the framework's surgery
-   * release presents what each agent is owed. Never throws.
+   * (`failure`, from its re-initialization by the framework, #353), leaves
+   * the agent in legacy mode until the next move, traced as
+   * presentation:failed at `'rebase'`. Arrivals aren't presented here: the
+   * framework's surgery release presents what each agent is owed. Never
+   * throws.
    */
   rebase(agent: PresentedAgent, failure?: unknown): void {
     const cm = agent.getContextManager();

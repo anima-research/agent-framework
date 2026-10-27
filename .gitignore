@@ -6,5 +6,5 @@ package-lock.json
 bun.lock
 logs/
 
-# Node diagnostic reports (written to cwd on SIGUSR2 by the diagnostics tests); they list the environment
+# Node diagnostic reports (written on SIGUSR2 when report-on-signal is armed; see test/diagnostics-signal.test.ts)
 report.*.json

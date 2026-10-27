@@ -83,6 +83,27 @@ function mark(branch: string, head: number, length: number | null): ReadMark {
  */
 export function readMarkOf(cm: MarkCm): ReadMark | null {
   try {
+    const head = storeHeadOf(cm);
+    if (head === null) return null;
+    const presented = typeof cm.windowMode === 'function' && cm.windowMode() === 'presented'
+      && typeof cm.indexLength === 'function';
+    return mark(cm.currentBranch!().name, head, presented ? cm.indexLength!() : null);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The store's head as `cm` reads it now, the head a mark readMarkOf takes
+ * keeps: the chronicle head, not the slot's last message, since a compile
+ * reads everything stored on the branch so far, rows merged in from another
+ * slot included. A record sequence, on the branch `cm` is on: for a reader
+ * that compares stored rows' sequences with it on that branch (Agent's
+ * branchHead), not a cover of the window. Null for a context double that
+ * can't say.
+ */
+export function storeHeadOf(cm: MarkCm): number | null {
+  try {
     if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return null;
     const store = typeof cm.getStore === 'function' ? cm.getStore() as { currentSequence?: () => number } : undefined;
     let head = typeof store?.currentSequence === 'function' ? store.currentSequence() : undefined;
@@ -90,9 +111,7 @@ export function readMarkOf(cm: MarkCm): ReadMark | null {
       const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
       head = count > 0 ? cm.getAllMessages().at(-1)?.sequence ?? 0 : 0;
     }
-    const presented = typeof cm.windowMode === 'function' && cm.windowMode() === 'presented'
-      && typeof cm.indexLength === 'function';
-    return mark(cm.currentBranch().name, head, presented ? cm.indexLength!() : null);
+    return head;
   } catch {
     return null;
   }

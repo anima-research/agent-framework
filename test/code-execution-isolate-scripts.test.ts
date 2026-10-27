@@ -373,14 +373,23 @@ test('a second call on a script another call is waiting on is refused, with noth
   assert.deepEqual((await waiting).ending, { how: 'finished', value: '2' });
 });
 
-test('a left script that crashes or reaches its limit wakes its agent', async () => {
-  const { scripts, wakes } = setup({ config: { yieldMs: 100, lifetimeMs: 1_500 } });
-  const crash = await scripts.run('alice', `await tools.echo({}); __crash();`, 0);
-  const limit = await scripts.run('alice', `await tools.slow({ key: 'l' });`, 0);
-  for (let i = 0; i < 400 && scripts.running('alice') > 0; i++) await new Promise((r) => setTimeout(r, 10));
-  const texts = wakes.map(([, text]) => text);
-  assert.ok(texts.some((t) => t.startsWith(`[script ${crash.scriptId}] Your script crashed`)), texts.join('\n'));
-  assert.ok(texts.some((t) => t.startsWith(`[script ${limit.scriptId}] Your script was stopped at its limit`)), texts.join('\n'));
+test('a left script that crashes wakes its agent', { timeout: 60_000 }, async () => {
+  let woke!: (text: string) => void;
+  const wake = new Promise<string>((resolve) => (woke = resolve));
+  const { scripts } = setup({ host: { wake: async (_agent, _scriptId, text) => woke(text) } });
+  const r = await scripts.run('alice', `await tools.echo({}); __crash();`, 0);
+  const text = await wake;
+  assert.ok(text.startsWith(`[script ${r.scriptId}] Your script crashed`), text);
+  await scripts.dispose();
+});
+
+test('a left script that reaches its limit wakes its agent', { timeout: 60_000 }, async () => {
+  let woke!: (text: string) => void;
+  const wake = new Promise<string>((resolve) => (woke = resolve));
+  const { scripts } = setup({ host: { wake: async (_agent, _scriptId, text) => woke(text) }, config: { lifetimeMs: 1_500 } });
+  const r = await scripts.run('alice', `await tools.slow({});`, 0);
+  const text = await wake;
+  assert.ok(text.startsWith(`[script ${r.scriptId}] Your script was stopped at its limit`), text);
   await scripts.dispose();
 });
 

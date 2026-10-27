@@ -690,7 +690,32 @@ describe('stop() with an operator operation in flight', () => {
     } finally { await framework.stop(); }
   });
 
-  it('two API switches handled together each announce their own move', async () => {
+  it('two API switches handled together: the second is refused while the first holds the store, and only the first is announced', async () => {
+    const framework = await create();
+    try {
+      const api = new ApiServer(framework) as unknown as {
+        cmdBranchCreate(params: { name: string }): Promise<unknown>;
+        cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+        cmdBranchCurrent(): Promise<{ name: string }>;
+        broadcast(event: string, data: unknown): void;
+      };
+      await api.cmdBranchCreate({ name: 'a' });
+      await api.cmdBranchCreate({ name: 'b' });
+      const broadcasts: Array<[string, unknown]> = [];
+      api.broadcast = (event, data) => { broadcasts.push([event, data]); };
+      const [first, second] = await Promise.allSettled([api.cmdBranchSwitch({ name: 'a' }), api.cmdBranchSwitch({ name: 'b' })]);
+      assert.equal(first.status, 'fulfilled');
+      assert.ok(
+        second.status === 'rejected' && second.reason instanceof OperatorActionError && second.reason.code === 'agent-busy',
+        second.status === 'rejected' ? String(second.reason) : 'the second switch went through',
+      );
+      assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'a' }]]);
+      assert.equal(framework.getStore().currentBranch().name, 'a');
+      assert.equal((await api.cmdBranchCurrent()).name, 'a');
+    } finally { await framework.stop(); }
+  });
+
+  it('a second API switch started as the first framework call returns announces its own move, as does the first', async () => {
     // A second switch can move the store after the first's framework call
     // has returned and before the API server's continuation for it runs.
     // (It used to be started alongside the first, when a switch with no

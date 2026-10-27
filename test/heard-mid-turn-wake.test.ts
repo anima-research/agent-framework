@@ -667,16 +667,19 @@ describe('a wake for a write heard mid-turn', () => {
     });
   }
 
-  it("a write stored and not presented to one agent marks that agent's wake only, and a write presented to it at once marks none", async () => {
+  it("a write marks the wake of the agent it went to with the id it was stored under, and another agent's wake stays plain", async () => {
     const framework = await createFramework();
     const fw = internals(framework);
-    assert.deepEqual(fw.readsRowFor({ agent: 'assistant' }, 'assistant'), {}, 'its wake starts the turn that reads it');
-    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'assistant'), {},
-      'nor does a write stored and presented to it: its wake starts the turn that reads it');
-    // #291: a row stored during the agent's turn and not presented to it
-    // waits for its turn, by its stored id.
+    // Read onto #291: every write is stored at once, so main's two marks
+    // (readsDeferredWrite for a held write, readsStoredMessage for one stored
+    // as it arrived) are the one readsRow, by the stored id, whether or not
+    // the row was presented to the agent at its write.
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'assistant'), { readsRow: 'm-1' });
     assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'helper'), {}, "another agent's wake stays plain");
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'assistant'), { readsRow: 'm-1' },
+      'a wake can wait while a request reads a stored write, as behind a held continuation');
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'helper'), {}, "another agent's wake stays plain");
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant' }, 'assistant'), {}, 'nor does a write a surgery holds, with no id yet');
     assert.deepEqual(fw.readsRowFor(undefined, 'assistant'), {}, 'nor does a wake with no write');
     await framework.stop();
   });
@@ -684,17 +687,17 @@ describe('a wake for a write heard mid-turn', () => {
   // -------------------------------------------------------------------------
   // A wake without a channel: read is done
 
-  const unchanneled: Array<[string, (framework: AgentFramework) => unknown]> = [
+  const unchanneled: Array<[string, (framework: AgentFramework) => unknown, string]> = [
     ['a push with no channel', (framework) => framework.pushEvent({
       type: 'mcpl:push-event', serverId: 'chat', featureSet: 'notify', eventId: 'e-1',
       content: [text('the build finished')], triggerInference: true,
-    } as unknown as ProcessEvent)],
+    } as unknown as ProcessEvent), 'the build finished'],
     ["a module's one message", (framework) => framework.pushEvent({
       type: 'clock:reminder', source: 'clock', content: 'the kettle is on',
-    } as unknown as ProcessEvent)],
+    } as unknown as ProcessEvent), 'the kettle is on'],
     ["a background script's wake", (framework) => internals(framework).scriptWake(
       'assistant', 'script-1', '[background-script script-1] finished: 42', 'wake',
-    )],
+    ), 'finished: 42'],
   ];
   for (const [what, write] of unchanneled) {
     it(`${what}, heard at the boundary, starts no turn of its own`, async () => {
@@ -710,6 +713,33 @@ describe('a wake for a write heard mid-turn', () => {
         'the turn heard it at its tool boundary');
       assert.equal(membrane.calls.length, 1, 'its wake started no turn');
       droppedOne();
+      await framework.stop();
+    });
+  }
+
+  const storedAsItArrives: Array<[string, string, (framework: AgentFramework) => unknown]> = [
+    ...unchanneled.map(([what, write, shown]): [string, string, (framework: AgentFramework) => unknown] => [what, shown, write]),
+    ['a channel message', 'also this', (framework) => framework.pushEvent(channelMessage(ROOM, 'm-1', 'also this'))],
+    ["the gate's self-wake notice", '[self-wake] your test timer', (framework) => internals(framework).eventGate!.armSelfWake('assistant', 1, 'test')],
+  ];
+  for (const [what, shown, write] of storedAsItArrives) {
+    it(`${what}, stored while the agent has no turn, gives its wake the stored row's id`, async () => {
+      const framework = await createFramework(what.includes('self-wake') ? { gate: { policies: [], default: 'always' } } : {});
+      stubChannelRegistry(framework, ROOM);
+      const triggers: Array<Record<string, unknown>> = [];
+      (framework as unknown as { startAgentStream: (agent: unknown, trigger: unknown) => Promise<unknown> }).startAgentStream =
+        async (_agent, trigger) => { triggers.push(trigger as Record<string, unknown>); return undefined; };
+      write(framework);
+      for (const end = Date.now() + 5000; triggers.length === 0 && Date.now() < end;) {
+        await framework.runUntilIdle();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const row = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .find((m) => JSON.stringify(m.content).includes(shown));
+      assert.ok(row, `${what} was stored`);
+      // Read onto #291: main's readsStoredMessage is readsRow here, the one
+      // mark a wake takes for the stored row it is for.
+      assert.deepEqual(triggers.map((r) => r.readsRow), [row.id], "its wake's turn would start for the row it names");
       await framework.stop();
     });
   }

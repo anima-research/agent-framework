@@ -117,7 +117,7 @@ test('write, edit, edit_many and delete on a direct mount with no mode land on d
   assert.equal(env.text('src/a.ts'), 'alpha\nBETA\n');
   await data(m, 'edit_many', { edits: [{ path: 'ref/src/a.ts', oldString: 'alpha', newString: 'ALPHA' }, { path: 'ref/src/b.ts', oldString: 'two', newString: 'TWO' }] });
   assert.deepEqual([env.text('src/a.ts'), env.text('src/b.ts')], ['ALPHA\nBETA\n', 'one\nTWO\n']);
-  assert.deepEqual(await data(m, 'delete', { path: 'ref/old.txt' }), { path: 'ref/old.txt', deleted: true });
+  assert.deepEqual(await data(m, 'delete', { path: 'ref/old.txt' }), { path: 'ref/old.txt', deleted: true, disk: 'done' });
   assert.throws(() => statSync(join(env.ref, 'old.txt')), { code: 'ENOENT' });
 
   // A new file takes the mode a shell's would.
@@ -1394,7 +1394,7 @@ test('writeBinary writes a direct mount\'s disk, whole, as a write does', async 
   const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]);
   assert.deepEqual(await m.writeBinary('ref/img/dot.png', bytes, 'image/png', { agentName: 'scout' }), {
     success: true,
-    data: { path: 'ref/img/dot.png', size: 7, mimeType: 'image/png' },
+    data: { path: 'ref/img/dot.png', size: 7, mimeType: 'image/png', disk: 'done' },
   });
   assert.deepEqual(readFileSync(join(env.ref, 'img/dot.png')), bytes);
   assert.deepEqual(env.staged(), []);
