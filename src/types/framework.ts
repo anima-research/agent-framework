@@ -6,6 +6,7 @@ import type { ProcessEvent } from './events.js';
 import type { McplServerConfig, InferenceRoutingPolicy } from '../mcpl/types.js';
 import type { ConversationRouterConfig } from '../mcpl/conversation-router.js';
 import type { GateOptions } from '../gate/types.js';
+import type { InferenceBoundsOptions } from '../inference-bounds.js';
 
 // Re-export trace types
 export type { TraceEvent, TraceEventListener } from './trace.js';
@@ -196,6 +197,28 @@ export interface FrameworkConfig {
 
   /** Custom error policy */
   errorPolicy?: ErrorPolicy;
+
+  /**
+   * How long a model call may go without progress before it is cut. A
+   * resident's streamed call, and an MCPL server's, gets membrane's progress
+   * bounds where its adapter's stream reports content (Anthropic, Bedrock),
+   * and on every adapter a flat bound from its last provider event: the
+   * larger of a setup term (the larger of `beforeContentMs` and
+   * `betweenEventsMs`) plus the request's `maxTokens` at
+   * `thinkTokensPerSecond`, and `flatMinimumMs`. An auxiliary call
+   * (compression, the reply judge) and an MCPL server's non-streamed call get
+   * a bound on the whole call from its send, the setup term plus that
+   * allowance (the larger of the setup term and `flatMinimumMs` when it
+   * names no `maxTokens`), unless its
+   * caller passed a `progressTimeoutMs` of its own; where an adapter's
+   * `complete()` streams under the hood, membrane renews it at each parsed
+   * provider event. A call a bound cuts fails
+   * with type `timeout`, and on an agent's turn DefaultErrorPolicy gives each
+   * such call one fresh call. One setting covers every agent. `false` sets
+   * none of these bounds. Default: membrane's PROGRESS_BOUNDS and
+   * FLAT_MINIMUM_MS.
+   */
+  inferenceBounds?: false | InferenceBoundsOptions;
 
   /**
    * Host verdict on a failed inference: "this cannot succeed until later".
@@ -456,7 +479,10 @@ export interface InferencePolicy {
  */
 export interface ErrorPolicy {
   /**
-   * Handle an inference error.
+   * Handle an inference error. `attempt` is how many times the turn's
+   * request has failed before this one; for a deadline expiry (a progress
+   * bound's cut, or one membrane marks), how many times that call's request
+   * has expired in a row before this one.
    */
   onInferenceError(
     error: Error,

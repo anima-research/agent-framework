@@ -11,6 +11,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
+import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
@@ -1184,14 +1185,9 @@ function waitAlertsOnItsOwn(wait: ProviderWait): boolean {
   return wait.until === null || wait.until - wait.setAt > PROVIDER_WAIT_ALERT_MS;
 }
 
-// membrane 0.8.0 marks a deadline it reports as run out with this registered
-// symbol (on a sent request, or the Anthropic SDK's timeout, which covers its
-// connect timeout too), and doesn't export its reader.
-const MEMBRANE_DEADLINE_EXPIRY: unique symbol = Symbol.for('membrane.deadlineExpiry');
-
 function isTransientFailure(error: Error): boolean {
   if (!isMembraneError(error) || error.retryable !== true) return false;
-  if ((error as { [MEMBRANE_DEADLINE_EXPIRY]?: unknown })[MEMBRANE_DEADLINE_EXPIRY] === true) return false;
+  if (isDeadlineExpiry(error)) return false;
   return error.type === 'server' || error.type === 'network' || error.type === 'timeout' || error.type === 'rate_limit';
 }
 
@@ -2288,9 +2284,15 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
  *   schedule, jittered, 10 s doubling to 5 min (by default 13 tries, where
  *   membrane's settings have 7: about 30 min).
  * - rate limited (429): the base schedule with at least 5 tries.
- * - any other retryable failure, a stream deadline on a sent request
- *   included (membrane leaves those to its caller): the base schedule (by
- *   default 3 tries, 1 s then 2 s).
+ * - a deadline expiry, which membrane leaves to its caller: a progress
+ *   bound's cut (FrameworkConfig.inferenceBounds), the adapter's own
+ *   watchdogs, the SDK's request timeout or a runtime's fetch timeout. The
+ *   deadline schedule: by default 2 tries, 1 s apart, so one fresh call. For
+ *   one, the framework's `attempt` counts that call's consecutive expiries,
+ *   not the turn's other failures, so each call a deadline cuts gets its
+ *   fresh call. Settings with no deadline schedule give it their base one.
+ * - any other retryable failure: the base schedule (by default 3 tries, 1 s
+ *   then 2 s).
  * A provider's stated wait (`retryAfterMs`) is waited when it is longer than
  * the backoff, up to the schedule's ceiling, which by default is at least the
  * framework's own cap (PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, ten minutes);
@@ -2312,6 +2314,10 @@ export class DefaultErrorPolicy implements ErrorPolicy {
   }
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
+    if (isDeadlineExpiry(error)) {
+      const decision = retryDecision(this.settings.deadline ? 'deadline' : 'retryable', attempt + 1, undefined, this.settings);
+      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+    }
     if (!isMembraneError(error)) {
       // Not a provider failure membrane classified: retried as any other
       // retryable failure, on the base schedule.
@@ -2320,9 +2326,7 @@ export class DefaultErrorPolicy implements ErrorPolicy {
     }
     if (error.retryable === false) return { retry: false };
     // The facts membrane classifies by, read off the error itself (from either
-    // copy of membrane, as isMembraneError takes one). No `deadline` fact: a
-    // stream deadline is a retryable timeout here, as it was before membrane
-    // 0.7, where membrane itself gives it no retry.
+    // copy of membrane, as isMembraneError takes one).
     const facts = error as { retryable?: boolean; type?: string; httpStatus?: number; message?: string };
     // A failure that doesn't say is retried as an unknown one is; only false refuses (handled above).
     const cls = classifyFailure({ retryable: facts.retryable !== false, type: facts.type, httpStatus: facts.httpStatus, message: facts.message });
@@ -2416,13 +2420,21 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
+const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
+  '(e.g. drop an oversized attachment or an unsupported setting).';
+const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
+const MADE_AGAIN = 'The call was made again, and it timed out again.';
 const OVERLOADED_TURN_TRIES = 13;
-const TURN_RETRY_SETTINGS: RetrySettings = Object.fromEntries(
-  Object.entries(MEMBRANE_RETRY_SETTINGS as RetrySettings).map(([cls, s]) => [cls, s && {
-    ...s,
-    ...(cls === 'overloaded' ? { maxAttempts: OVERLOADED_TURN_TRIES } : {}),
-    statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
-  }])) as RetrySettings;
+const DEADLINE_TURN_TRIES = 2;
+const TURN_RETRY_SETTINGS: RetrySettings = {
+  ...Object.fromEntries(
+    Object.entries(MEMBRANE_RETRY_SETTINGS as RetrySettings).map(([cls, s]) => [cls, s && {
+      ...s,
+      ...(cls === 'overloaded' ? { maxAttempts: OVERLOADED_TURN_TRIES } : {}),
+      statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
+    }])),
+  deadline: { maxAttempts: DEADLINE_TURN_TRIES, firstDelayMs: 1_000, multiplier: 1, maxDelayMs: 1_000, statedWaitCeilingMs: null },
+} as RetrySettings;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -2471,6 +2483,11 @@ async function* turnStreamEvents(stream: YieldingStream, agentName: string): Asy
       if (decidedBy !== undefined) {
         console.error(`[stream] ${agentName}: the stream sent an event (${event.type}) after its ${decidedBy} event, which decided its turn; it and the rest of the stream decide nothing`);
         return;
+      }
+      if (event.type === 'aborted' && event.reason === 'timeout') {
+        decidedBy = 'error';
+        yield { type: 'error', error: deadlineCut(event.message) } as StreamEvent;
+        continue;
       }
       if (event.type === 'complete' || event.type === 'error' || event.type === 'aborted') decidedBy = event.type;
       yield event;
@@ -3371,6 +3388,9 @@ export class AgentFramework {
   private providerAccelerationLastRecovery: Map<string, ProviderAccelerationReceipt> = new Map();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
+  private inferenceBounds: InferenceBounds | null = resolveInferenceBounds(undefined);
+  private readonly deadlineCuts = new Map<string, number>();
+  private readonly freshCallsCut = new Set<string>();
   private providerHoldHook: ProviderHoldHook | undefined;
   /** Provider waits (stated retry-after) per (agent, model), kept across restarts. */
   private providerWaits: ProviderWaits | undefined;
@@ -4059,6 +4079,7 @@ export class AgentFramework {
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
+    resolveInferenceBounds(config.inferenceBounds);
     assertFrameworkSwitches(config);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
@@ -4254,6 +4275,7 @@ export class AgentFramework {
     );
     framework.providerHoldHook = config.providerHold;
     framework.turnRearmMs = turnRearmDelays(config.exhaustedTurnRearmMs);
+    framework.inferenceBounds = resolveInferenceBounds(config.inferenceBounds);
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
@@ -5885,8 +5907,17 @@ export class AgentFramework {
       const value = Reflect.get(obj, prop, receiver);
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
-          const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
-          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
+          const config = (args[0] as { config?: { model?: unknown; maxTokens?: unknown } } | undefined)?.config;
+          const model = config?.model;
+          const options = args[1] as { progressTimeoutMs?: unknown } | undefined;
+          const bounds = this.inferenceBounds;
+          const sent = bounds !== null && options?.progressTimeoutMs === undefined
+            ? [args[0], {
+              ...options,
+              progressTimeoutMs: wholeCallMs(bounds, typeof config?.maxTokens === 'number' ? config.maxTokens : undefined),
+            }, ...args.slice(2)]
+            : args;
+          return admit(() => Reflect.apply(value, this.membrane, sent) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
       }
@@ -10579,6 +10610,7 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
+        this.deadlineCuts.delete(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
         this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
@@ -15382,6 +15414,7 @@ export class AgentFramework {
     this.activeStreams.delete(agentName);
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
+    this.deadlineCuts.delete(agentName);
     this.thinkingLossIncidents.forget(agentName);
     this.reasoningLoss.forget(agentName);
     // Its pending self-wake ends with it, rather than wake a name that's gone.
@@ -20265,6 +20298,7 @@ export class AgentFramework {
     attempt = 0,
     providerGateAlreadyHeld = false,
   ): Promise<void> {
+    if (attempt === 0) this.deadlineCuts.delete(agent.name);
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
     // A stopping framework starts no turn, whoever owns provider admission
@@ -21281,6 +21315,7 @@ export class AgentFramework {
         // This turn's retries are the framework's (errorPolicy below), not
         // membrane's inside each attempt.
         membraneRetries: false,
+        inferenceBounds: this.inferenceBounds,
       });
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
@@ -21463,8 +21498,12 @@ export class AgentFramework {
         return false;
       }
 
+      const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
       const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(routing))
-        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+      if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
+      else this.deadlineCuts.delete(agent.name);
+      if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow, agent);
@@ -23307,8 +23346,12 @@ export class AgentFramework {
               break;
             }
 
+            const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
             const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(streamRouting))
-              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+            if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
+            else this.deadlineCuts.delete(agent.name);
+            if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
             if (action.retry) {
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
@@ -23476,6 +23519,7 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
             // The stream's accumulated fresh input, which is what the
@@ -28542,6 +28586,7 @@ export class AgentFramework {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
     const rearmed = this.exhaustingRearms?.delete(agentName) === true;
+    const madeAgain = this.freshCallsCut?.delete(agentName) === true;
     // The reason is the failure's own message, and a provider can echo the
     // whole rejected request in it: one household's [inference-failed]
     // marker carried ~1.7 MB of its own request back into its context. Every
@@ -28598,9 +28643,10 @@ export class AgentFramework {
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
     if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
-      const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
-        .filter((part): part is string => part !== undefined)
-        .join(', ');
+      const timedOut = errorType === 'timeout';
+      const causeParts = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+        .filter((part): part is string => part !== undefined);
+      const cause = timedOut && causeParts.length === 1 ? '' : causeParts.join(', ');
       try {
         agent.getContextManager().addMessage(
           'user',
@@ -28608,17 +28654,17 @@ export class AgentFramework {
             type: 'text',
             text:
               (ended
-                ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: it ` +
-                  `failed${cause ? ` (${suppliedValue(cause)})` : ''}.` +
+                ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
+                  `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
+                  `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
                   `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
                   `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
                   `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
                   `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''} Reason: `
-                : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: the model ` +
-                  `call failed${cause ? ` (${suppliedValue(cause)})` : ''} and produced no response, so nothing was sent. Reason: `) +
-              `${failureShown(markerReason)}. If this recurs with the same cause, change approach ` +
-              `rather than retrying identically (e.g. drop an oversized attachment ` +
-              `or an unsupported setting).`,
+                : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
+                  `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
+                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''} Reason: `) +
+              `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
@@ -28878,6 +28924,7 @@ export class AgentFramework {
       this.featureSetManager,
       inferenceRouting ?? null,
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      () => this.inferenceBounds,
     );
 
     // Checkpoint manager (Step 8), built and loaded at the top

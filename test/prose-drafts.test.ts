@@ -326,7 +326,7 @@ function breakAfterToolRound(
           }
           if (how === 'abort' && !cancelled) {
             await opts.beforeFailure?.();
-            yield { type: 'aborted', reason: 'timeout', partialContent: [{ type: 'text', text: PARTIAL }] } as unknown as StreamEvent;
+            yield { type: 'aborted', reason: 'error', partialContent: [{ type: 'text', text: PARTIAL }] } as unknown as StreamEvent;
             return;
           }
           while (!cancelled) await new Promise<void>((resolve) => { wake = resolve; });

@@ -2447,7 +2447,7 @@ const SETTLED_AS_IT_LEFT = ['staged', 'linked', 'withheld', 'annotated', 'stub_u
 // gone with it. Pinned for a failure whose stream ends only after the run's
 // caller has deregistered the agent, in both shapes, and for a run the
 // completion watchdog ends while its stream says nothing.
-for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the completion watchdog'] as const) {
+for (const how of ['an uncaused error', 'an abort whose reason is error', 'the completion watchdog'] as const) {
   test(`an ephemeral run that ends by ${how} with its batch pending settles the batch as it leaves`, async () => {
     const h = await harness([[calls('one')]]);
     if (how !== 'the completion watchdog') waitAfterTerminal(h.membrane, () => h.framework.getAgent('ephemeral') === null);
@@ -2460,8 +2460,8 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       stream.processResponse = () => {};
       if (how === 'an uncaused error') {
         stream.events.push({ type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) });
-      } else if (how === 'an abort whose reason is timeout') {
-        stream.events.push({ type: 'aborted', reason: 'timeout' });
+      } else if (how === 'an abort whose reason is error') {
+        stream.events.push({ type: 'aborted', reason: 'error' });
       }
     };
     let outcome = 'pending';
@@ -2482,7 +2482,7 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
     assert.match(outcome, how === 'the completion watchdog' ? /^rejected: Ephemeral agent "ephemeral" stalled/
-      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: timeout/, 'the run ends as expected');
+      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: error/, 'the run ends as expected');
     assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
     const audit = await ephemeralBatchAudit(h.base);
     assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
