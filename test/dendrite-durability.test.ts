@@ -26,6 +26,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, workerSpec } from '../src/index.js';
+import { STORED_INJECTION_KEY, STORED_INJECTION_KIND } from '../src/stored-injections.js';
 import type { AgentSpec, ProcessEvent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -334,6 +335,37 @@ describe('round 2: a change is put back when its write fails; a record of what h
     assert.equal(nova?.ended?.reason, 'not-configured');
     const reopened = await second.inspectAgentContext('nova');
     assert.equal(reopened.getAllMessages().length, 6, 'reopened on the shared slot it read');
+  });
+
+  it('a dropped resident reopens without a co-resident\'s stored context injection, as its live view left it out', async () => {
+    const first = await boot(new GateModule(), ['mira', 'nova']);
+    const nova = first.getAgent('nova')!.getContextManager();
+    for (let i = 0; i < 6; i++) nova.addMessage('user', [{ type: 'text', text: `shared ${i}` }]);
+    // A row stored as mira's context: in the shared slot, but mira's, not conversation.
+    nova.addMessage('system_context:gates', [{ type: 'text', text: 'mira\'s standing context' }], {
+      system: true, kind: STORED_INJECTION_KIND,
+      [STORED_INJECTION_KEY]: { agent: 'mira', namespace: 'agents/mira', contentHash: 'h-1', part: 0, parts: 1 },
+    });
+    // The record holds the row for every reader; each reader's view is what
+    // compile() shows it (the view filter is strategy-facing, not the record).
+    // On this branch that is the reader's window, so the rows are presented to
+    // both residents first (as a turn's end would); the injection is 'elsewhere'
+    // for nova by audience (presentation-audience) and out of its view by filter.
+    const presentTo = (framework: AgentFramework, name: string): void =>
+      (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent(name));
+    presentTo(first, 'mira'); presentTo(first, 'nova');
+    const shows = async (cm: ContextManager) =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.some((m) => textOf(m.content).includes('standing context'));
+    assert.equal(nova.getAllMessages().length, 7, 'the one slot holds the row');
+    assert.equal(await shows(first.getAgent('mira')!.getContextManager()), true, 'mira\'s view has its own injection');
+    assert.equal(await shows(nova), false, 'nova\'s live view leaves it out');
+    await first.stop();
+    const second = await boot(new GateModule(), ['mira']);
+    assert.equal(second.getAgentRecord('nova')?.ended?.reason, 'not-configured');
+    const reopened = await second.inspectAgentContext('nova');
+    assert.equal(reopened.getAllMessages().length, 7, 'reopened on the shared slot it read');
+    assert.equal(await shows(reopened), false, 'and its view, as live, is without mira\'s injection');
+    assert.equal(await shows(second.getAgent('mira')!.getContextManager()), true, 'mira still sees its own');
   });
 });
 

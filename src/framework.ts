@@ -9837,7 +9837,7 @@ export class AgentFramework {
       if (inherit?.mode === 'shared') {
         // Shared reads, separate writes: the child's context is the parent's
         // at a checkpoint, on a branch of its own. Nothing is copied.
-        const derived = await this.deriveSharedContext(config, inherit);
+        const derived = await this.deriveSharedContext(config, inherit, release);
         contextManager = derived.contextManager;
         inherit = derived.inherit;
         namespace = derived.namespace;
@@ -10345,6 +10345,7 @@ export class AgentFramework {
   private async deriveSharedContext(
     config: AgentConfig,
     inherit: NonNullable<AgentSpec['inherit']>,
+    release: ManagerRelease,
   ): Promise<{
     contextManager: ContextManager;
     inherit: NonNullable<AgentSpec['inherit']>;
@@ -10378,7 +10379,9 @@ export class AgentFramework {
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
-      membrane: this.membrane,
+      // The run's auxiliary membrane, as the copy path's: its compression calls
+      // are withdrawn once the run is released (Weft's ninth-round reading).
+      membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
