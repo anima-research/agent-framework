@@ -3851,10 +3851,11 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy`, with those rules' events
-   * buffered behind a running turn. A debounce's batch wakes the agent when
-   * it fires. A judge rule's goes to the judge, whether it's collecting,
-   * being decided (with what queued behind it) or held, so it only may; so
-   * may buffered events, which the gate delivers when that turn ends.
+   * buffered behind a running turn or the host's quiesce. A debounce's batch
+   * wakes the agent when it fires, and buffered events when the gate
+   * delivers them, as the turn or the quiesce ends. A judge rule's batch
+   * goes to the judge, whether it's collecting, being decided (with what
+   * queued behind it) or held, so it only may.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
@@ -3899,7 +3900,7 @@ export class EventGate {
     }
     const buffered = this.inferenceBuffer.filter((e) => e.policyName !== leftOut.policy).length;
     if (buffered > 0) {
-      wakes.push({ certain: false, what: `${count(buffered)} buffered behind a running turn, delivered when it ends` });
+      wakes.push({ certain: true, what: `${count(buffered)} buffered behind a running turn or the host's quiesce, delivered when that ends` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }

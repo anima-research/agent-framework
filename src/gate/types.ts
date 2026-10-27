@@ -324,10 +324,10 @@ export interface FailedLastTurn {
  */
 export interface UpcomingWake {
   /**
-   * When (ms), when known. Absent for one that has no time of its own: one
-   * due as soon as the agent is free (a wake already queued, or events
-   * buffered behind a running turn), a batch the judge is deciding or will
-   * decide once a turn or the host's quiesce ends, and one `when` describes.
+   * When (ms), when known. Absent for one that has no time of its own: a
+   * wake already queued, due as soon as the agent is free; events buffered,
+   * or a batch held for the judge, until a turn or the host's quiesce ends;
+   * a batch the judge is deciding; and one `when` describes.
    */
   at?: number;
   /** When, in words, for one due at no time anyone can name (a hold only a
@@ -352,7 +352,8 @@ export interface JudgeRequest {
   agentNames: string[];
   /** The gate's own timers that will wake those agents with no new event
    *  (upcomingWakes): their self-wakes, a sleep's end, every pending batch
-   *  but this one, and events buffered behind a running turn. The judge adds
+   *  but this one, and events buffered behind a running turn or the host's
+   *  quiesce. The judge adds
    *  what the framework knows besides. */
   upcomingWakes?: UpcomingWake[];
   /** Aborted when the judge's time is up or the gate is disposed. */
