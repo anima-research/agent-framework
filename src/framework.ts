@@ -91,7 +91,7 @@ import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } f
 import { checkToolPattern, describeUnmatchedPattern, type PatternServer } from './mcpl/tool-pattern-check.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
-import { readSkipReplyWake, skipReplyWakeRefusal } from './mcpl/skip-reply-wake.js';
+import { readSkipReplyWake, skipReplyWakeRefusal, type SkipReplyFirstWake } from './mcpl/skip-reply-wake.js';
 import { convertBlock } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
@@ -804,7 +804,7 @@ import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from '.
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
-import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatWake } from './heartbeat/heartbeat.js';
+import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatUpcomingWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -5510,20 +5510,35 @@ export class AgentFramework {
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
-    // The heartbeat's ticks and reminders, which the agent's rules decide as
-    // they decide a heartbeat push: one the rules would hold back is listed
-    // as only a "maybe".
-    if (this.heartbeat && this.heartbeatTargets().includes(agentName)) {
-      const probe = (kind: 'heartbeat' | 'reminder'): boolean => !this.eventGate
-        || this.eventGate.probe(this.heartbeatGateEvent({ kind, eventId: 'probe', text: 'probe' })).trigger;
-      const tickWakes = probe('heartbeat');
-      const reminderWakes = probe('reminder');
-      for (const w of this.heartbeat.upcomingWakes()) {
-        const isReminder = w.what.startsWith('its reminder');
-        wakes.push((isReminder ? reminderWakes : tickWakes) ? w : { ...w, certain: false });
-      }
-    }
+    wakes.push(...this.heartbeatWakesFor(agentName));
     return wakes;
+  }
+
+  /**
+   * The heartbeat's ticks and reminders for `agentName`, soonest first, which
+   * the agent's rules decide as they decide a heartbeat push: one the rules
+   * would hold back is only a "maybe" (`certain` false). None for an agent
+   * the heartbeat doesn't wake. `whose` words them for the judge ("its
+   * heartbeat") or for the agent ("your heartbeat").
+   */
+  private heartbeatWakesFor(agentName: string, whose: 'its' | 'your' = 'its'): HeartbeatUpcomingWake[] {
+    if (!this.heartbeat || !this.heartbeatTargets().includes(agentName)) return [];
+    const probe = (kind: 'heartbeat' | 'reminder'): boolean => !this.eventGate
+      || this.eventGate.probe(this.heartbeatGateEvent({ kind, eventId: 'probe', text: 'probe' })).trigger;
+    const wakes = { heartbeat: probe('heartbeat'), reminder: probe('reminder') };
+    return this.heartbeat.upcomingWakes(whose).map((w) => (wakes[w.kind] ? w : { ...w, certain: false }));
+  }
+
+  /**
+   * The heartbeat's wake that comes before a self-wake due at `selfWakeAt`
+   * (ms), as the skip_reply that armed it is told: the soonest of its ticks
+   * and reminders that the agent's rules let wake it. Its turn cancels the
+   * self-wake (EventGate.onInferenceStarted), so the confirmation says so.
+   */
+  private heartbeatWakeBefore(agentName: string, selfWakeAt: number): SkipReplyFirstWake | undefined {
+    const now = Date.now();
+    const first = this.heartbeatWakesFor(agentName, 'your').find((w) => w.certain && w.at < selfWakeAt);
+    return first ? { inSeconds: Math.max(1, Math.round((first.at - now) / 1000)), what: first.what } : undefined;
   }
 
   /** The agents the heartbeat wakes: the residents, not conversation forks,
@@ -25970,10 +25985,18 @@ export class AgentFramework {
         }
         const wake = readSkipReplyWake(enrichedCall.input);
         if (wake.kind === 'wake' && this.eventGate) {
+          const armedAt = Date.now();
           const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          // The heartbeat's tick or reminder due before the timer wakes the
+          // agent first, and its turn cancels the timer: the confirmation
+          // names it, so the agent isn't told of a wake that won't come.
+          const firstWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
           console.error(armed
             ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
+              + (firstWake ? `; the heartbeat comes first, in ~${firstWake.inSeconds}s` : '')
             : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
+          this.dispatchChannelToolCall(agentName, enrichedCall, firstWake);
+          return;
         }
       }
       this.dispatchChannelToolCall(agentName, enrichedCall);
@@ -32496,7 +32519,7 @@ export class AgentFramework {
   /**
    * Dispatch a synthesized channel tool call.
    */
-  private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+  private dispatchChannelToolCall(agentName: string, call: ToolCall, firstWake?: SkipReplyFirstWake): void {
     // Conversation forks act only on their home channel. channel_publish and
     // channel_close default a missing channelId to home and reject foreign
     // ones; channel_open is rejected outright — opening channels mutates
@@ -32606,7 +32629,9 @@ export class AgentFramework {
     const readThrough = publisher ? this.publishReadThrough(publisher, call.id) : null;
     const published: { outcome?: PublishOutcome } = {};
 
-    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [] }, published)
+    this.channelRegistry!.handleChannelToolCall(call.name, call.input, {
+      kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(firstWake ? { firstWake } : {}),
+    }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);

@@ -418,6 +418,22 @@ describe('the channel registry\'s skip_reply confirmation names the wake the gat
     assert.equal(await note(null), 'Turn ended; nothing sent.');
   });
 
+  it('names the heartbeat the framework says comes first, and only beside a wake it set', async () => {
+    const registry = new ChannelRegistry(
+      {} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { eventGatePresent: true },
+    );
+    const firstWake = { inSeconds: 300, what: 'your heartbeat (a silent tick, every 60 min)' };
+    const noteOf = async (input: Record<string, unknown>) => ((await registry.handleChannelToolCall(
+      'skip_reply', input, { kind: 'agent', agentName: 'agent', firstWake },
+    )) as { data?: { note?: string } }).data?.note;
+    assert.equal(
+      await noteOf({ wake_in_seconds: 900 }),
+      'Turn ended; nothing sent. Your heartbeat (a silent tick, every 60 min) wakes you first, in ~300s, '
+        + 'and that wake cancels your ~900s self-wake: set it again then if you still want it.',
+    );
+    assert.equal(await noteOf({}), 'Turn ended; nothing sent.', 'a skip with no wake has no self-wake to cancel');
+  });
+
   it('a call whose input is null is an ordinary skip, where it used to throw reading wake_in_seconds', async () => {
     const registry = new ChannelRegistry(
       {} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { eventGatePresent: true },

@@ -234,6 +234,11 @@ describe('heartbeat: upcoming wakes', () => {
       [T0 + 20 * 60_000, 'its reminder "water the tomatoes"'],
       [T0 + 14400_000, 'its heartbeat (a check-in prompt, every 4 h)'],
     ]);
+    assert.deepEqual(wakes.map((w) => w.kind), ['reminder', 'heartbeat']);
+    assert.deepEqual(hb.upcomingWakes('your').map((w) => w.what), [
+      'your reminder "water the tomatoes"',
+      'your heartbeat (a check-in prompt, every 4 h)',
+    ], "worded for the agent's own skip_reply confirmation");
     call(hb, 'heartbeat_configure', { paused: true });
     assert.equal(hb.upcomingWakes().length, 1);
     hb.stop();
@@ -564,6 +569,62 @@ describe('the framework\'s heartbeat', () => {
     });
     assert.equal(off.getAllTools().some((tool) => tool.name.startsWith('heartbeat--')), false, 'null leaves it off');
     await off.stop();
+  });
+
+  it("names, in skip_reply's note, the tick or reminder due before its self-wake, as the agent's rules let it wake the agent", async (t) => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const own = mkdtempSync(join(tmpdir(), 'heartbeat-fw-'));
+    const framework = await AgentFramework.create({
+      storePath: join(own, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+      modules: [],
+      heartbeat: { defaults: { intervalSeconds: 600 } },
+      gate: { configPath: join(own, 'gate.json'), config: { policies: [] } },
+    });
+    t.after(async () => { await framework.stop(); rmSync(own, { recursive: true, force: true }); });
+    const internals = framework as unknown as {
+      heartbeat: { start(): void; handleToolCall(name: string, input: unknown): { success: boolean; data?: string } };
+      eventGate: { addPolicy(p: unknown): void };
+      initializeMcpl(servers: []): Promise<void>;
+      pushEvent(event: { type: string; callId?: string; result?: { data?: { note?: string } } }): void;
+      dispatchToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+    };
+    await internals.initializeMcpl([]);
+    internals.heartbeat.start();
+    const notes = new Map<string, string | undefined>();
+    const push = internals.pushEvent.bind(framework);
+    internals.pushEvent = (event) => {
+      if (event.type === 'tool-result' && event.callId) notes.set(event.callId, event.result?.data?.note);
+      else push(event);
+    };
+    const skip = async (id: string, wake: number): Promise<string | undefined> => {
+      internals.dispatchToolCall('scout', { id, name: 'skip_reply', input: { reason: 'later', wake_in_seconds: wake } });
+      for (let i = 0; i < 100 && !notes.has(id); i++) await new Promise((resolve) => setImmediate(resolve));
+      return notes.get(id);
+    };
+    const firstIn = (note: string | undefined, what: string, selfWake: number): number => {
+      const seconds = Number(/ wakes you first, in ~(\d+)s, /.exec(note ?? '')?.[1]);
+      assert.equal(note, `Turn ended; nothing sent. ${what} wakes you first, in ~${seconds}s, `
+        + `and that wake cancels your ~${selfWake}s self-wake: set it again then if you still want it.`);
+      return seconds;
+    };
+
+    const tickIn = firstIn(await skip('s1', 900), 'Your heartbeat (a check-in prompt, every 10 min)', 900);
+    assert.ok(tickIn > 590 && tickIn <= 600, `the tick is ~600s off: ${tickIn}`);
+    assert.equal(await skip('s2', 300), 'Turn ended; nothing sent. Self-wake in ~300s unless something wakes you first.',
+      'a self-wake before the tick is the wake named');
+
+    assert.equal(internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: 'stretch', inSeconds: 120 }).success, true);
+    const reminderIn = firstIn(await skip('s3', 900), 'Your reminder "stretch"', 900);
+    assert.ok(reminderIn > 110 && reminderIn <= 120, `the reminder is ~120s off: ${reminderIn}`);
+
+    // Rules that hold both back: neither wakes the agent, so the self-wake does.
+    internals.eventGate.addPolicy({ name: 'no-ticks', match: { scope: ['mcpl:push-event'], source: 'heartbeat' }, behavior: 'skip' });
+    internals.eventGate.addPolicy({ name: 'no-reminders', match: { scope: ['mcpl:push-event'], source: 'reminder' }, behavior: 'skip' });
+    assert.equal(await skip('s4', 900), 'Turn ended; nothing sent. Self-wake in ~900s unless something wakes you first.');
   });
 
   it("starts and stops with the framework, and refuses a fork's change while showing it the schedule", async (t) => {

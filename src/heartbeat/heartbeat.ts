@@ -112,6 +112,12 @@ export interface HeartbeatOptions {
   importFrom?: { configPath?: string; remindersPath?: string };
 }
 
+/** One of the heartbeat's upcoming wakes: its next tick or a pending reminder. */
+export interface HeartbeatUpcomingWake extends UpcomingWake {
+  kind: 'heartbeat' | 'reminder';
+  at: number;
+}
+
 /** A wake the heartbeat asks the framework to deliver. */
 export type HeartbeatWake =
   | { kind: 'heartbeat'; reason: 'schedule' | 'manual'; silent: boolean; text: string; eventId: string }
@@ -316,26 +322,33 @@ export class Heartbeat {
     return this.tools.some((t) => t.name === canonicalName(name));
   }
 
-  /** What the heartbeat will wake the agent with, soonest first, for the reply judge (UpcomingWake). */
-  upcomingWakes(): UpcomingWake[] {
-    const wakes: UpcomingWake[] = [];
+  /**
+   * What the heartbeat will wake the agent with, soonest first: for the reply
+   * judge (UpcomingWake), which is told of "its heartbeat", and, with `whose`
+   * "your", for the agent's own skip_reply confirmation, which names the one
+   * due before the self-wake it set.
+   */
+  upcomingWakes(whose: 'its' | 'your' = 'its'): HeartbeatUpcomingWake[] {
+    const wakes: HeartbeatUpcomingWake[] = [];
     const s = this.state;
     if (!s.settings.paused && s.nextFireAt !== null) {
       wakes.push({
+        kind: 'heartbeat',
         at: Math.max(s.nextFireAt, this.notBefore),
         certain: true,
-        what: `its heartbeat (${s.settings.deliveryMode === 'silent' ? 'a silent tick' : 'a check-in prompt'}, every ${shownLength(s.settings.intervalSeconds)})`,
+        what: `${whose} heartbeat (${s.settings.deliveryMode === 'silent' ? 'a silent tick' : 'a check-in prompt'}, every ${shownLength(s.settings.intervalSeconds)})`,
       });
     }
     for (const r of s.reminders) {
       const message = r.message.length > 80 ? `${r.message.slice(0, 77)}...` : r.message;
       wakes.push({
+        kind: 'reminder',
         at: Math.max(dueAt(r), this.notBefore),
         certain: true,
-        what: `its reminder ${JSON.stringify(message)}${r.everySeconds !== null ? ` (repeats every ${shownLength(r.everySeconds)})` : ''}`,
+        what: `${whose} reminder ${JSON.stringify(message)}${r.everySeconds !== null ? ` (repeats every ${shownLength(r.everySeconds)})` : ''}`,
       });
     }
-    return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    return wakes.sort((a, b) => a.at - b.at);
   }
 
   /**

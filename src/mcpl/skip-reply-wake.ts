@@ -43,6 +43,34 @@ export function readSkipReplyWake(input: unknown): SkipReplyWake {
   return { kind: 'wake', seconds: Math.floor(Math.min(SKIP_REPLY_WAKE_MAX_SECONDS, seconds)) };
 }
 
+/**
+ * A wake the host knows will come before a skip_reply's self-wake: the
+ * heartbeat's next tick or a reminder, as the agent's rules let it wake the
+ * agent. `what` names it to the agent ("your heartbeat (…)"); `inSeconds` is
+ * how far off it is as the self-wake is armed.
+ */
+export interface SkipReplyFirstWake {
+  inSeconds: number;
+  what: string;
+}
+
+/**
+ * The note a skip_reply's result carries: that the turn ended, and when the
+ * agent is next woken, if it set a wake. When the heartbeat comes first, the
+ * note says so, and that the self-wake goes with that wake: any turn start
+ * cancels a pending self-wake (EventGate.onInferenceStarted), so a timer the
+ * agent still wants after the heartbeat's turn is one it sets again then.
+ */
+export function skipReplyNote(selfWakeSeconds: number | undefined, first?: SkipReplyFirstWake): string {
+  if (selfWakeSeconds === undefined) return 'Turn ended; nothing sent.';
+  if (first === undefined) {
+    return `Turn ended; nothing sent. Self-wake in ~${selfWakeSeconds}s unless something wakes you first.`;
+  }
+  const what = first.what.charAt(0).toUpperCase() + first.what.slice(1);
+  return `Turn ended; nothing sent. ${what} wakes you first, in ~${first.inSeconds}s, `
+    + `and that wake cancels your ~${selfWakeSeconds}s self-wake: set it again then if you still want it.`;
+}
+
 /** The refusal the model reads when its host has no EventGate to set a timer. */
 export const SKIP_REPLY_WAKE_NO_GATE_REFUSAL =
   "Your turn didn't end, and no wake was set: this host can't wake you on a timer, so skip_reply can't take wake_in_seconds here. To end the turn and wait for the next message, call skip_reply without it. Anything you meant to come back to, do now.";
