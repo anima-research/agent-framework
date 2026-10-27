@@ -3187,6 +3187,17 @@ const JUDGE_PARAMETER: ToolParameter = {
   required: ['debounceMs'],
 };
 
+/** Whether a server's configuration resolves to the MCPL (legacy) family,
+ *  the one that can negotiate RFC-014 tool hints. A configuration that names
+ *  no usable transport is refused elsewhere; here it has no hints. */
+function isLegacyFamily(config: McplServerConfig): boolean {
+  try {
+    return resolveServerBinding(config).family === 'legacy';
+  } catch {
+    return false;
+  }
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -29450,25 +29461,31 @@ export class AgentFramework {
     const module = modules.find((m) => m.name === TOOLSETS_MODULE);
     const server = servers.find((s) => (s.toolPrefix ?? `mcpl--${s.id}`) === TOOLSETS_MODULE);
     this.toolsetsNameHeldAtStart = module ? `module "${TOOLSETS_MODULE}"` : server ? `MCPL server "${server.id}"'s toolPrefix` : null;
-    const defaulted = servers.filter((s) => s.toolHints !== true && s.toolHints !== false).map((s) => s.id);
-    if (this.toolsetsNameHeldAtStart && defaulted.length) {
+    if (!this.toolsetsNameHeldAtStart) return;
+    // Those that would have had hints: MCPL servers that leave the setting
+    // out, other than the one whose prefix holds the name.
+    const defaulted = servers
+      .filter((s) => s !== server && (s.toolHints === undefined || s.toolHints === null) && isLegacyFamily(s))
+      .map((s) => s.id);
+    if (defaulted.length) {
       console.error(
-        `[mcpl] tool hints (RFC-014) stay off for ${defaulted.join(', ')}: the name "${TOOLSETS_MODULE}" their meta-tools need is ` +
-          `${this.toolsetsNameHeldAtStart}. Set toolHints: false on them to say so, or free the name.`,
+        `[mcpl] tool hints (RFC-014) are off for ${defaulted.join(', ')}, which leave toolHints out: the name "${TOOLSETS_MODULE}" ` +
+          `the meta-tools need is ${this.toolsetsNameHeldAtStart}. Free the name to give them hints, or set toolHints: false on them to keep them off without this line.`,
       );
     }
   }
 
   /**
-   * RFC-014: whether a server has tool hints. `true` and `false` are as
-   * configured. Left out (or null) they're on, wherever the name `toolsets`
-   * the meta-tools need is free: no other module holds it and no server's
-   * prefix is it, now or at startup. So a configuration that loaded when
-   * hints were opt-in still loads.
+   * RFC-014: whether a server has tool hints. Only an MCPL (legacy-family)
+   * server can: a modern MCP server never has them. `true` and `false` are
+   * as configured. Left out (or null) they're on, wherever the name
+   * `toolsets` the meta-tools need is free: no other module holds it and no
+   * server's prefix is it, now or at startup. So a configuration that loaded
+   * when hints were opt-in still loads.
    */
   private hintsFor(config: McplServerConfig): boolean {
+    if (config.toolHints === false || !isLegacyFamily(config)) return false;
     if (config.toolHints === true) return true;
-    if (config.toolHints === false) return false;
     if (this.toolsetsNameHeldAtStart !== null) return false;
     if ((config.toolPrefix ?? `mcpl--${config.id}`) === TOOLSETS_MODULE) return false;
     const module = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);

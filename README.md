@@ -438,8 +438,9 @@ configuration sets `toolHints: false`, and its hints count only if it
 advertised `toolHints` too. A server that doesn't advertise them lists every
 tool as before. With `toolHints: false` on a server, the host advertises and
 reads nothing new for it; with it on every server, the `toolsets` module
-below isn't registered either. A server that leaves the setting out has hints
-only where the name `toolsets` is free: if a module or a server's
+below isn't registered either. A modern (MCP) server never has hints. An MCPL
+server that leaves the setting out has hints only where the name `toolsets` is
+free: if a module or a server's
 `toolPrefix` holds it at startup, those servers have none, and a line says
 so. `toolHints: true` reserves the name, so a prefix that takes it is refused.
 
