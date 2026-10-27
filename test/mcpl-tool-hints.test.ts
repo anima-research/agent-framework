@@ -612,9 +612,23 @@ test('a modern server that leaves toolHints out has no hints: no meta-tools at s
   const fw = await makeFramework([{ id: 'plain', toolPrefix: 'plain', ...modern }]);
   try {
     assert.deepEqual(metaTools(fw), [], 'none at startup');
+    // A modern runtime connect takes no hints path at all; this pins that it stays so.
     await fw.framework.connectMcplServer({ id: 'plain2', toolPrefix: 'plain2', ...modern }).catch(() => {});
     assert.deepEqual(metaTools(fw), [], 'none after a runtime connect');
   } finally { await fw.stop(); }
+});
+
+test('a server that leaves toolHints out keeps its toolset state across a restart under the same configuration, as one with true does', async () => {
+  const t = await setup(() => false, { toolHints: undefined });
+  try {
+    await waitFor(() => t.server.received.some((m) => m.method === 'toolsets/list'), 'toolsets/list after connecting');
+    await roundTrip(t);
+    const hub = () => (t.fw.framework as unknown as { toolsetHub: { get(id: string): unknown } | null }).toolsetHub;
+    const before = hub()?.get('arc');
+    assert.ok(before, 'a controller for the server');
+    await t.fw.framework.restartMcplServer('arc', { id: 'arc', toolPrefix: 'arc', url: t.server.url });
+    assert.equal(hub()?.get('arc'), before, 'the same controller, kept across the restart');
+  } finally { await t.done(); }
 });
 
 test('a hinted server restarted into a modern configuration under its id leaves no toolset state behind', async () => {

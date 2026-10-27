@@ -29481,7 +29481,8 @@ export class AgentFramework {
    * as configured. Left out (or null) they're on, wherever the name
    * `toolsets` the meta-tools need is free: no other module holds it and no
    * server's prefix is it, now or at startup. So a configuration that loaded
-   * when hints were opt-in still loads.
+   * when hints were opt-in still loads. A name held at startup stays held
+   * for the framework's life.
    */
   private hintsFor(config: McplServerConfig): boolean {
     if (config.toolHints === false || !isLegacyFamily(config)) return false;
@@ -29490,6 +29491,8 @@ export class AgentFramework {
     if ((config.toolPrefix ?? `mcpl--${config.id}`) === TOOLSETS_MODULE) return false;
     const module = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
     if (module && !(module instanceof ToolsetsModule)) return false;
+    // A restart moving its server to the prefix holds the name as a claim.
+    if (this.restartClaims().prefixes.has(TOOLSETS_MODULE)) return false;
     const owner = this.mcplPrefixMap.get(TOOLSETS_MODULE);
     return owner === undefined || owner === config.id;
   }
@@ -29530,7 +29533,7 @@ export class AgentFramework {
     const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
     if (existing instanceof ToolsetsModule) return;
     if (existing) {
-      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server with tool hints needs that name for its meta-tools (configure toolHints: false on every MCPL server to keep the module)`);
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints: true needs that name for its meta-tools: set toolHints: false on it, or leave the setting out to have hints only where the name is free`);
     }
     await this.addModule(new ToolsetsModule(hub, (call) => this.changeTaker(call)));
   }
