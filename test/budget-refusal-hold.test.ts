@@ -1958,6 +1958,27 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('ends a held turn whose stop comes as its hold is reported', async () => {
+    await withBacklog({}, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      let stopped: boolean | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:held' && stopped === undefined) stopped = t.framework.abortInference('prime');
+      });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000));
+        assert.equal(stopped, true, 'the stop is reported taken');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+        assert.equal(t.of('inference:aborted').length, 1);
+        assert.equal(t.internal.budgetHolds.size, 0);
+        assert.equal(t.framework.getHostModeStatus().drained, true);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('refuses a puppeted tool call while a turn is held, naming the hold', async () => {
     await withBacklog({}, async () => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
