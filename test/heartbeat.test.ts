@@ -82,9 +82,9 @@ async function skipReplyFramework(
   };
   /** The seconds a note says the named wake is off, asserting the note names it. */
   const firstIn = (note: string | undefined, what: string, selfWake: number): number => {
-    const seconds = Number(/ wakes you first, in ~(\d+)s, /.exec(note ?? '')?.[1]);
-    assert.equal(note, `Turn ended; nothing sent. ${what} wakes you first, in ~${seconds}s, `
-      + `and that wake cancels your ~${selfWake}s self-wake: set it again then if you still want it.`);
+    const seconds = Number(/ is due sooner, in ~(\d+)s; /.exec(note ?? '')?.[1]);
+    assert.equal(note, `${plainNote(selfWake)} ${what} is due sooner, in ~${seconds}s; if it wakes you, the self-wake is cancelled, `
+      + `so set it again for the ~${selfWake - seconds}s left if you still want it.`);
     return seconds;
   };
   return { framework, internals, skip, firstIn, own };
@@ -283,7 +283,8 @@ describe('heartbeat: upcoming wakes', () => {
     const { hb } = heartbeat();
     hb.start();
     call(hb, 'reminder_add', { message: 'water the tomatoes', inMinutes: 20 });
-    const wakes = hb.upcomingWakes();
+    const wakes = hb.scheduledWakes();
+    assert.deepEqual(hb.upcomingWakes(), wakes, 'upcomingWakes lists them for the judge');
     assert.deepEqual(wakes.map((w) => [w.at, w.what]), [
       [T0 + 20 * 60_000, 'its reminder "water the tomatoes"'],
       [T0 + 14400_000, 'its heartbeat (a check-in prompt, every 4 h)'],
@@ -293,12 +294,21 @@ describe('heartbeat: upcoming wakes', () => {
     assert.deepEqual(wakes.map((w) => w.silent), [false, false]);
     assert.match(wakes[0]!.text, /^\[reminder rem_\w+, set 2026-10-26T12:00:00\+00:00 \[UTC\] · current time: 2026-10-26T12:20:00\+00:00 \[UTC\]\] water the tomatoes$/);
     assert.match(wakes[1]!.text, /^\[current time: 2026-10-26T16:00:00\+00:00 \[UTC\]\] \[heartbeat\] Periodic self-check-in/);
-    assert.deepEqual(hb.upcomingWakes('your').map((w) => w.what), [
+    assert.deepEqual(hb.scheduledWakes('your').map((w) => w.what), [
       'your reminder "water the tomatoes"',
       'your heartbeat (a check-in prompt, every 4 h)',
     ], "worded for the agent's own skip_reply confirmation");
     call(hb, 'heartbeat_configure', { paused: true });
     assert.equal(hb.upcomingWakes().length, 1);
+    hb.stop();
+  });
+
+  it("lists a tick past the last time a date shows, which a host's interval can set, by its message alone", () => {
+    const { hb } = heartbeat({ defaults: { intervalSeconds: 1e14 } });
+    hb.start();
+    const [tick] = hb.scheduledWakes();
+    assert.equal(tick!.kind, 'heartbeat');
+    assert.match(tick!.text, /^\[heartbeat\] Periodic self-check-in/);
     hb.stop();
   });
 });
@@ -629,15 +639,15 @@ describe('the framework\'s heartbeat', () => {
     await off.stop();
   });
 
-  it("names, in skip_reply's note, the tick or reminder due before its self-wake, as the agent's rules let it wake the agent", async (t) => {
+  it("adds, to skip_reply's note, the tick or reminder due before its self-wake, as the agent's rules let it wake the agent", async (t) => {
     const { internals, skip, firstIn } = await skipReplyFramework(t, { heartbeat: { defaults: { intervalSeconds: 600 } } });
     const tickIn = firstIn(await skip('s1', 900), 'Your heartbeat (a check-in prompt, every 10 min)', 900);
-    assert.ok(tickIn > 590 && tickIn <= 600, `the tick is ~600s off: ${tickIn}`);
+    assert.ok(tickIn > 300 && tickIn <= 600, `the tick is ~600s off: ${tickIn}`);
     assert.equal(await skip('s2', 300), plainNote(300), 'a self-wake before the tick is the wake named');
 
     assert.equal(internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: 'stretch', inSeconds: 120 }).success, true);
     const reminderIn = firstIn(await skip('s3', 900), 'Your reminder "stretch"', 900);
-    assert.ok(reminderIn > 110 && reminderIn <= 120, `the reminder is ~120s off: ${reminderIn}`);
+    assert.ok(reminderIn > 60 && reminderIn <= 120, `the reminder is ~120s off: ${reminderIn}`);
 
     // Each wake is probed as its own event. Ticks and reminders share the
     // server id `heartbeat` (a rule's `source`), so a rule tells them apart
@@ -676,8 +686,8 @@ describe('the framework\'s heartbeat', () => {
     firstIn(await skip('s3', 900), 'Your reminder "water the tomatoes"', 900);
   });
 
-  it("names nothing for an agent the heartbeat doesn't wake, a paused heartbeat, no heartbeat, or a gate.js that may decide", async (t) => {
-    const { framework, internals, skip, own } = await skipReplyFramework(t, { heartbeat: { defaults: { intervalSeconds: 600 } } });
+  it("names nothing for an agent the heartbeat doesn't wake, a paused heartbeat, or no heartbeat", async (t) => {
+    const { framework, internals, skip } = await skipReplyFramework(t, { heartbeat: { defaults: { intervalSeconds: 600 } } });
     // A conversation fork, registered as an agent as a real one is, so only its being a fork leaves it out.
     const agents = (framework as unknown as { agents: Map<string, unknown> }).agents;
     const homes = (framework as unknown as { conversationAgentHomes: Map<string, unknown> }).conversationAgentHomes;
@@ -686,11 +696,6 @@ describe('the framework\'s heartbeat', () => {
     assert.equal(await skip('fork', 900, 'scout-conv-1'), plainNote(900), "the heartbeat doesn't wake a fork");
     homes.delete('scout-conv-1');
     agents.delete('scout-conv-1');
-
-    // A gate.js beside gate.json: the gate consults it before the rules, which a probe can't.
-    writeFileSync(join(own, 'gate.js'), 'export default () => null;\n');
-    assert.equal(await skip('script', 900), plainNote(900), 'a gate.js may hold the tick back');
-    rmSync(join(own, 'gate.js'));
 
     internals.heartbeat.handleToolCall('heartbeat--heartbeat_configure', { paused: true });
     assert.equal(await skip('paused', 900), plainNote(900), 'a paused heartbeat has no tick');

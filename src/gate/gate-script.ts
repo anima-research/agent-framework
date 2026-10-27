@@ -162,13 +162,6 @@ export class GateScript {
     return parsed.behavior ?? null;
   }
 
-  /** Whether the script may decide the next event: its worker runs, or the
-   *  file is there for the next evaluate() to load. Reads only, unlike
-   *  evaluate(), so it starts no worker. */
-  mayDecide(): boolean {
-    return this.active || existsSync(this.scriptPath);
-  }
-
   status(): GateScriptStatus {
     return {
       active: this.active,

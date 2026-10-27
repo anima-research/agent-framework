@@ -45,7 +45,7 @@ import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
-import { readSkipReplyWake, skipReplyNote, type SkipReplyFirstWake } from './skip-reply-wake.js';
+import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
 
 // ============================================================================
@@ -1090,9 +1090,9 @@ export type ChannelToolOrigin =
      *  (ChannelRegistry.ownChannelNamed). */
     own?: readonly ChannelRef[];
     /** For a skip_reply whose self-wake the framework armed: the heartbeat's
-     *  wake that comes before it, when one does, which its confirmation
-     *  names (skipReplyNote). */
-    firstWake?: SkipReplyFirstWake;
+     *  wake due before it, when there is one, which its confirmation names
+     *  (skipReplyNote). */
+    earlierWake?: SkipReplyEarlierWake;
   };
 
 /** The machine decision sources a module-origin channel_close may record.
@@ -2392,7 +2392,7 @@ export class ChannelRegistry {
       case 'skip_reply':
         return this.handleToolSkipReply(
           input as { reason?: string; wake_in_seconds?: unknown },
-          origin?.kind === 'agent' ? origin.firstWake : undefined,
+          origin?.kind === 'agent' ? origin.earlierWake : undefined,
         );
 
       default:
@@ -5486,14 +5486,14 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }, firstWake?: SkipReplyFirstWake): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }, earlierWake?: SkipReplyEarlierWake): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
     // EventGate) BEFORE its dispatch reaches this handler, from the same
     // reading, and the framework refuses a wake the host can't set before
     // dispatching. A caller of this registry's handleChannelToolCall
     // (AgentFramework.channels) goes past both, so its note names a wake
     // nothing armed. The framework, which also owns the heartbeat, says
-    // which of its wakes comes first (`firstWake`).
+    // which of its wakes is due before the self-wake (`earlierWake`).
     const wake = readSkipReplyWake(input);
     const selfWake = wake.kind === 'wake' ? wake.seconds : undefined;
     return {
@@ -5509,7 +5509,7 @@ export class ChannelRegistry {
       // on Fable: ~60% of skip_reply result bytes were verbatim input echo).
       data: {
         skipped: true,
-        note: skipReplyNote(selfWake, selfWake !== undefined ? firstWake : undefined),
+        note: skipReplyNote(selfWake, selfWake !== undefined ? earlierWake : undefined),
       },
     };
   }

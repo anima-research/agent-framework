@@ -44,31 +44,38 @@ export function readSkipReplyWake(input: unknown): SkipReplyWake {
 }
 
 /**
- * A wake the host knows will come before a skip_reply's self-wake: the
- * heartbeat's next tick or a reminder, as the agent's rules let it wake the
- * agent. `what` names it to the agent ("your heartbeat (…)"); `inSeconds` is
- * how far off it is as the self-wake is armed.
+ * A wake the heartbeat has due before a skip_reply's self-wake: its next tick
+ * or a reminder, one the agent's rules would let wake it as they stand when
+ * the self-wake is armed. `what` names it to the agent ("your heartbeat
+ * (…)"); `inSeconds` is how far off it is then.
  */
-export interface SkipReplyFirstWake {
+export interface SkipReplyEarlierWake {
   inSeconds: number;
   what: string;
 }
 
 /**
- * The note a skip_reply's result carries: that the turn ended, and when the
- * agent is next woken, if it set a wake. When the heartbeat comes first, the
- * note says so, and that the self-wake goes with that wake: any turn start
- * cancels a pending self-wake (EventGate.onInferenceStarted), so a timer the
- * agent still wants after the heartbeat's turn is one it sets again then.
+ * The note a skip_reply's result carries: that the turn ended, and, when the
+ * agent set a wake, when it fires unless something wakes the agent first.
+ * When the heartbeat has a wake due sooner, the note adds it, and what it
+ * would mean: any turn start cancels a pending self-wake
+ * (EventGate.onInferenceStarted), so a timer the agent still wants after the
+ * heartbeat's turn is one it sets again then, for the time that was left.
+ *
+ * It says when the heartbeat is due, not that it will wake the agent: the
+ * rules can change before then, a rate limit can have no token left, a
+ * gate.js or a host's inference policy can hold the wake back, and a batch or
+ * a queued request can wake the agent sooner. Each of those leaves the note
+ * true.
  */
-export function skipReplyNote(selfWakeSeconds: number | undefined, first?: SkipReplyFirstWake): string {
+export function skipReplyNote(selfWakeSeconds: number | undefined, earlier?: SkipReplyEarlierWake): string {
   if (selfWakeSeconds === undefined) return 'Turn ended; nothing sent.';
-  if (first === undefined) {
-    return `Turn ended; nothing sent. Self-wake in ~${selfWakeSeconds}s unless something wakes you first.`;
-  }
-  const what = first.what.charAt(0).toUpperCase() + first.what.slice(1);
-  return `Turn ended; nothing sent. ${what} wakes you first, in ~${first.inSeconds}s, `
-    + `and that wake cancels your ~${selfWakeSeconds}s self-wake: set it again then if you still want it.`;
+  const note = `Turn ended; nothing sent. Self-wake in ~${selfWakeSeconds}s unless something wakes you first.`;
+  if (earlier === undefined) return note;
+  const what = earlier.what.charAt(0).toUpperCase() + earlier.what.slice(1);
+  const left = Math.max(1, selfWakeSeconds - earlier.inSeconds);
+  return `${note} ${what} is due sooner, in ~${earlier.inSeconds}s; if it wakes you, the self-wake is cancelled, `
+    + `so set it again for the ~${left}s left if you still want it.`;
 }
 
 /** The refusal the model reads when its host has no EventGate to set a timer. */

@@ -112,14 +112,14 @@ export interface HeartbeatOptions {
   importFrom?: { configPath?: string; remindersPath?: string };
 }
 
-/** One of the heartbeat's upcoming wakes: its next tick or a pending reminder. */
-export interface HeartbeatUpcomingWake extends UpcomingWake {
+/** One of the heartbeat's scheduled wakes: its next tick or a pending reminder. */
+export interface HeartbeatScheduledWake extends UpcomingWake {
   kind: 'heartbeat' | 'reminder';
   at: number;
   /** Whether it's a silent tick, delivered as one (HeartbeatWake's `silent`). */
   silent: boolean;
-  /** The text it brings if it fires on time, as delivered: so the gate can
-   *  be asked about the very event it will judge. */
+  /** The text it brings, as of its due time: so the gate can be asked about
+   *  the event it will judge. */
   text: string;
 }
 
@@ -332,14 +332,20 @@ export class Heartbeat {
     return this.tools.some((t) => t.name === canonicalName(name));
   }
 
+  /** What the heartbeat will wake the agent with, soonest first, for the reply judge (UpcomingWake). */
+  upcomingWakes(): UpcomingWake[] {
+    return this.scheduledWakes();
+  }
+
   /**
-   * What the heartbeat will wake the agent with, soonest first: for the reply
-   * judge (UpcomingWake), which is told of "its heartbeat", and, with `whose`
-   * "your", for the agent's own skip_reply confirmation, which names the one
-   * due before the self-wake it set.
+   * The heartbeat's next tick and its pending reminders, soonest first, each
+   * with its kind and the event it will bring, so the gate can be asked about
+   * it. `whose` words each for the reply judge ("its heartbeat", as
+   * upcomingWakes) or for the agent ("your heartbeat", as skip_reply's
+   * confirmation names one due before its self-wake).
    */
-  upcomingWakes(whose: 'its' | 'your' = 'its'): HeartbeatUpcomingWake[] {
-    const wakes: HeartbeatUpcomingWake[] = [];
+  scheduledWakes(whose: 'its' | 'your' = 'its'): HeartbeatScheduledWake[] {
+    const wakes: HeartbeatScheduledWake[] = [];
     const s = this.state;
     if (!s.settings.paused && s.nextFireAt !== null) {
       const at = Math.max(s.nextFireAt, this.notBefore);
@@ -350,7 +356,9 @@ export class Heartbeat {
         certain: true,
         what: `${whose} heartbeat (${silent ? 'a silent tick' : 'a check-in prompt'}, every ${shownLength(s.settings.intervalSeconds)})`,
         silent,
-        text: tickText(at, s.settings.message, this.timeZone),
+        // A host's interval can put the tick past the last time a date
+        // shows (readSettings has no ceiling), and a time can't be shown there.
+        text: canHoldTime(at) ? tickText(at, s.settings.message, this.timeZone) : s.settings.message,
       });
     }
     for (const r of s.reminders) {
