@@ -951,6 +951,13 @@ interface Gathered {
 /** How often a pass gathers again when the branch changes under it. */
 const GATHER_ATTEMPTS = 3;
 
+export async function passRoot(mount: Pick<MountRuntime, 'view' | 'rootReal'>): Promise<{ identity: RootIdentity } | { unavailable: string; cause: Cause; listed: string }> {
+  const root = await locateRoot(mount.view, mount.rootReal);
+  if ('identity' in root) return root;
+  const cause: Cause = root.errno !== undefined ? { errno: root.errno } : {};
+  return { unavailable: root.reason, cause, listed: explained(root.reason, cause, 'list') };
+}
+
 async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRuntime, scope: Scope, opts: PassOptions): Promise<Gathered> {
   // A missing mount root is an unavailable mount (an unmounted drive, a root
   // being replaced), not proof that every file in it was deleted, and so is a
@@ -958,9 +965,10 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // directory a watcher makes where a drive's mountpoint was. The root is
   // the operator's choice and may itself be a symlink to a directory, so it
   // is followed, as `rootReal` is: `followSymlinks` governs links within it.
-  const root = await locateRoot(mount.view, mount.rootReal);
-  const rootUnavailable = 'reason' in root ? root.reason : null;
-  const rootCause = 'reason' in root && root.errno !== undefined ? { errno: root.errno } : {};
+  const root = await passRoot(mount);
+  const rootUnavailable = 'unavailable' in root ? root.unavailable : null;
+  const rootCause = 'unavailable' in root ? root.cause : {};
+  const rootListed = 'unavailable' in root ? root.listed : null;
 
   // The branch is labelled where the tracked candidates are read, with no
   // await between: the decision is checked against this label.
@@ -973,10 +981,10 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
     dirs: [],
     incomplete: [],
   };
-  if (rootUnavailable !== null) {
+  if (rootListed !== null) {
     // Said whether or not anything is tracked: an unavailable mount must not
     // read as a verified empty directory.
-    gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: explained(rootUnavailable, rootCause, 'list') });
+    gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: rootListed });
   }
 
   // Which paths to decide: what disk shows, and what the store, P and intent
@@ -1082,7 +1090,7 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // now, nothing observed counts and nothing is decided from it.
   if (gathered.rootIdentity !== null) {
     const after = await locateRoot(mount.view, mount.rootReal);
-    if (!('identity' in after) || !sameRootIdentity(after.identity, gathered.rootIdentity)) {
+    if (!('identity' in after) || !sameRootIdentity(gathered.rootIdentity, after.identity)) {
       const reason = 'reason' in after ? after.reason : ROOT_REPLACED;
       const errno = 'errno' in after ? after.errno : undefined;
       for (const path of gathered.facts.keys()) gathered.facts.set(path, { kind: 'unobserved', reason, ...(errno !== undefined ? { errno } : {}) });
@@ -1469,7 +1477,7 @@ export async function pushPaths(
   // replaced meanwhile they describe the replacement, so, as a pass does,
   // nothing is decided or recorded from them.
   const after = await locateRoot(mount.view, mount.rootReal);
-  if (!('identity' in after) || !sameRootIdentity(after.identity, root.identity)) {
+  if (!('identity' in after) || !sameRootIdentity(root.identity, after.identity)) {
     const reason = 'reason' in after ? explained(after.reason, after.errno !== undefined ? { errno: after.errno } : {}, 'write') : ROOT_REPLACED;
     for (const path of paths) result.skipped.push({ path, reason });
     return result;

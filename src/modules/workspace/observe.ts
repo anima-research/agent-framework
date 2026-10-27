@@ -46,7 +46,7 @@ import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, readlink, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
-import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
+import { onlyDeviceDiffers, sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 import { OUTSIDE_STEP, UNFOLLOWED_STEP, errnoClause, errnoCode, systemWords } from './answers.js';
 
 export interface MountView {
@@ -164,8 +164,14 @@ export const LEAVES_MOUNT = 'a symlink that leaves the mount';
 export const NOT_A_DIRECTORY = 'a parent path is not a directory';
 export const ROOT_UNAVAILABLE = 'the mount root is unavailable';
 export const ROOT_REPLACED =
-  'the mount root is not the directory disk last agreed with (an unmounted drive, or a replaced directory): ' +
-  'reconnect it; if it was replaced on purpose, sync the mount with acceptRoot to take it as it is now';
+  'the mount root is not the directory disk last agreed with (an unmounted drive, a directory moved aside, or a replaced one); ' +
+  'whoever runs this host can say which: a drive they can reconnect, a directory moved aside they can put back, ' +
+  'and a replaced directory a sync of the mount with acceptRoot takes as it is now';
+export const ROOT_ON_ANOTHER_DEVICE =
+  'the mount root has the inode disk last agreed with, but another device number: a reboot can renumber a volume, ' +
+  'and another volume mounted at the same place can have a root with the same inode; whoever runs this host can ' +
+  'say which, and if it is the same directory, a sync of the mount with acceptRoot takes it as it is now; if not, ' +
+  'they can mount the right volume';
 export const CHANGED = 'it changed while it was observed';
 export const CHANGED_WALK = 'the directory changed while the walk ran';
 export const FILE_CHANGED = 'the file changed while it was read';
@@ -1094,7 +1100,12 @@ export async function rootAbsence(root: string): Promise<string | undefined> {
 async function checkedAt(view: MountView, rel: string, real: string): Promise<CheckedDir | null> {
   const info = await lstat(real, { bigint: true }).catch(() => null);
   if (!info?.isDirectory()) return null;
-  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs);
+  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, bornOf(info));
+}
+
+function bornOf(info: BigIntStats): bigint {
+  // Where statx is unavailable, libuv gives the ctime as the birth time (uv__to_stat).
+  return info.birthtimeNs === info.ctimeNs ? 0n : info.birthtimeNs;
 }
 
 /**
@@ -1141,8 +1152,8 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     // A root that isn't the directory disk last agreed under proves nothing
     // about the files that agreed: an empty mountpoint where a drive was
     // would otherwise read as every file deleted.
-    if (rel === '' && view.rootIdentity && !sameRootIdentity(checked.identity(), view.rootIdentity)) {
-      return { kind: 'unobserved', reason: ROOT_REPLACED };
+    if (rel === '' && view.rootIdentity && !sameRootIdentity(view.rootIdentity, checked.identity())) {
+      return { kind: 'unobserved', reason: onlyDeviceDiffers(view.rootIdentity, checked.identity()) ? ROOT_ON_ANOTHER_DEVICE : ROOT_REPLACED };
     }
     return { kind: 'checked', dir: checked };
   }
@@ -1265,7 +1276,7 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     }
     if (info.isDirectory()) {
       if (last) return { reason: CHANGED }; // present after all
-      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino, info.birthtimeNs);
+      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino, bornOf(info));
       walked.push(cur);
       continue;
     }
@@ -2106,7 +2117,7 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
     return 'reason' in proof ? { kind: 'unobserved', ...proof } : { kind: 'absent', by: proof.by };
   }
   if (!info.isDirectory()) return { kind: 'unobserved', reason: CHANGED_WALK };
-  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs) };
+  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, bornOf(info)) };
 }
 
 /**

@@ -176,6 +176,7 @@ describe('an error no handler threw on purpose', () => {
       const env = new Env(t);
       const m = await env.open([{ name: 'auto', autoMaterialize: true }]);
       await ok(m, 'write', { path: 'auto/a.txt', content: 'one' });
+      await ok(m, 'sync', { mount: 'auto' });
       env.store.appendJson = () => { throw storeError('IO error: No space left on device (os error 28)'); };
       answers[tool] = await refused(m, tool, input);
     }

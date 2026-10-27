@@ -38,9 +38,9 @@ import type {
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, storedBytes, DEFAULT_MAX_FILE_SIZE, type StoredBytes } from './sync.js';
-import { DiskAgreement, EvidenceUnavailable, callGate, sameRootIdentity } from './disk-agreement.js';
+import { DiskAgreement, EvidenceUnavailable, callGate, rootUnreadable, sameRootIdentity, type RootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { CHANGED, type Cause, DIRECTORY, IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, directoryAt, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, patternRefusal, readBytes, readPrefix, realSegments, restBeneath, rootAbsence, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { CHANGED, type Cause, DIRECTORY, IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_ON_ANOTHER_DEVICE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, directoryAt, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, patternRefusal, readBytes, readPrefix, realSegments, restBeneath, rootAbsence, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -61,6 +61,7 @@ import {
   WALK_CAP,
   entryMode,
   explained,
+  passRoot,
   pushPaths,
   reconcilePass,
   settleAdoptionBeforeMutation,
@@ -120,6 +121,19 @@ const DIRECT_READS_AT_ONCE = 16;
 const DIRECT_SYNC_SKIPPED = "a direct mount: its tools read disk as it is, so there's nothing to take in";
 /** Why materialize passes over a writable direct mount, as its result's `skipped` says. */
 const DIRECT_MATERIALIZE_SKIPPED = "a direct mount: its writes are on disk as they're made, so there's nothing to write";
+
+const NOTHING_RECORDED = 'nothing is recorded of this root yet, so any directory at its path is taken as it; the first sync that takes in a file, or materialize that writes one, records it';
+
+const BORN_UNRECORDED = 'no birth time is recorded of this root yet, so a directory made again in its place with the same inode can\'t be told from it; the next sync or ls of this mount records it';
+
+interface RootAsShown { dev: string; ino: string; born?: string }
+
+function asShown(identity: RootIdentity | null): RootAsShown | null {
+  if (identity?.born === undefined) return identity;
+  const ns = BigInt(identity.born);
+  const second = new Date(Number(ns / 1_000_000_000n) * 1000).toISOString().replace(/\.000Z$/, '');
+  return { ...identity, born: `${second}.${String(ns % 1_000_000_000n).padStart(9, '0')}Z` };
+}
 
 export type {
   WorkspaceConfig,
@@ -3221,8 +3235,9 @@ export class WorkspaceModule implements Module {
    * observation checks it (checkRoot), so the read and the evidence agree on
    * which directory the mount is. Once the workspace has recorded the root's
    * identity, a root that resolves to any other directory is refused, in
-   * ROOT_REPLACED's words; with none recorded yet, it need only be a
-   * directory there. A refusal where no directory is at the root's path
+   * ROOT_REPLACED's words, or ROOT_ON_ANOTHER_DEVICE's where only its device
+   * differs and birth times can't tell; with none recorded yet, it need only
+   * be a directory there. A refusal where no directory is at the root's path
    * carries the errno that gives (rootAbsence: ENOENT when nothing is there
    * and ENOTDIR when something else is, which a caller can read as no file,
    * or the errno the root's stat failed with otherwise, such as EACCES). A
@@ -4076,9 +4091,7 @@ export class WorkspaceModule implements Module {
   private async diskLacks(mount: MountState, relativePath: string, path: string, err: unknown): Promise<LostContents['disk']> {
     const absent = err instanceof WorkspaceReadError && err.code !== 'mount_unavailable' && (err.errno === 'ENOENT' || err.errno === 'ENOTDIR');
     if (!absent) return { unreadable: containedRefusal(err, path) };
-    const root = resolve(mount.config.path);
-    const rootReal = await realpath(root).catch(() => root);
-    const view = this.viewOf(mount, this.agreementOrThrow().rootIdentityForRead(mount.config.name));
+    const { view, rootReal } = await this.readView(mount);
     const proof = await confirmAbsent(view, rootReal, relativePath);
     if (!('reason' in proof)) return 'none';
     return { unreadable: proof.reason === CHANGED ? containedRefusal(err, path) : proof.reason };
@@ -5837,6 +5850,8 @@ export class WorkspaceModule implements Module {
     if (input.mount !== undefined && !this.mounts.has(input.mount)) {
       return { success: false, error: didNothing('status', this.noSuchMountField(input.mount, 'covers every mount')), isError: true };
     }
+    const asked = [...this.mounts].filter(([name, mount]) => !mount.direct && (input.mount === undefined || name === input.mount));
+    const roots = new Map(await Promise.all(asked.map(async ([name, mount]) => [name, await this.rootState(mount)] as const)));
 
     for (const [name, mount] of this.mounts) {
       if (input.mount !== undefined && name !== input.mount) continue;
@@ -5856,6 +5871,7 @@ export class WorkspaceModule implements Module {
       const pending = new Set([...conflictPaths, ...deletionPaths, ...owed]);
 
       const currentBranch = store.currentBranch();
+      const root = roots.get(name)!;
       status[name] = {
         path: mount.config.path,
         mode: mount.config.backend === 'direct' ? mount.config.mode ?? 'read-write' : mount.config.mode,
@@ -5875,10 +5891,40 @@ export class WorkspaceModule implements Module {
         lastMaterializedBranch: mount.lastMaterializedBranchId,
         canMaterialize: this.mountMaterializeBlockReason(store, mount) === null,
         ...(mount.lastAgentActionScan ? { lastAgentActionScan: mount.lastAgentActionScan } : {}),
+        ...(input.mount !== undefined || root.unavailable !== undefined ? { root } : {}),
       };
     }
 
     return { success: true, data: status };
+  }
+
+  private async readView(mount: MountState): Promise<{ view: MountView; rootReal: string }> {
+    const root = resolve(mount.config.path);
+    const rootReal = await realpath(root).catch(() => root);
+    return { view: this.viewOf(mount, this.agreementOrThrow().rootIdentityForRead(mount.config.name)), rootReal };
+  }
+
+  private async rootState(mount: MountState): Promise<{ recorded?: RootAsShown | null; now: RootAsShown | null; unavailable?: string; note?: string }> {
+    const read = await this.readView(mount).catch((err: unknown) => {
+      if (err instanceof EvidenceUnavailable) return err;
+      throw err;
+    });
+    if (read instanceof EvidenceUnavailable) {
+      const root = resolve(mount.config.path);
+      const there = await locateRoot(this.viewOf(mount, undefined), await realpath(root).catch(() => root));
+      return { now: asShown('identity' in there ? there.identity : null), unavailable: rootUnreadable(read) };
+    }
+    const { view, rootReal } = read;
+    const recorded = view.rootIdentity ?? null;
+    const found = await passRoot({ view, rootReal });
+    if ('unavailable' in found) {
+      const there = await locateRoot({ ...view, rootIdentity: undefined }, rootReal);
+      return { recorded: asShown(recorded), now: asShown('identity' in there ? there.identity : null), unavailable: found.listed };
+    }
+    const note = this.agreementOrThrow().awaitsReopen ? undefined
+      : recorded === null ? NOTHING_RECORDED
+        : recorded.born === undefined && found.identity.born !== undefined ? BORN_UNRECORDED : undefined;
+    return { recorded: asShown(recorded), now: asShown(found.identity), ...(note !== undefined ? { note } : {}) };
   }
 
   /**
@@ -6867,7 +6913,7 @@ function deletedOnDisk(path: string): string {
 
 function uncheckedFile(shown: string, note: string | undefined, cause: Cause): string {
   if (note === DIRECTORY) return `${shown} is a directory, not a file; ls ${shown} lists what's in it.`;
-  const on = note === ROOT_REPLACED || cause.ownStep === true ? null
+  const on = note === ROOT_REPLACED || note === ROOT_ON_ANOTHER_DEVICE || cause.ownStep === true ? null
     : (note === undefined ? null : wayOn(note, cause, 'read')) ?? 'calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk';
   return `${shown} isn't in the workspace, and disk couldn't be checked: ${sentence(note ?? 'not observed')}${on !== null ? ` ${on[0]!.toUpperCase()}${sentence(on.slice(1))}` : ''}`;
 }
