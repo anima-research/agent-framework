@@ -2196,13 +2196,21 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     try {
       // The hierarchical strategy refuses an over-budget context in its
       // preview and in a dry compile alike. A context that fits has no fold
-      // plan to preview, and the dry compile decides.
+      // plan to preview: context-manager 0.23.0's preview throws, and from
+      // 0.23.1 it returns null. The dry compile decides.
       let fitsFrom = 10_000;
       while (!(await t.dryCompileResolves(fitsFrom)) && fitsFrom < 400_000) fitsFrom += 1_000;
       assert.ok(fitsFrom < 400_000);
       assert.equal(await t.dryCompileResolves(Math.round(fitsFrom * 0.8)), false,
         'its dry compile refuses where the context does not fit, as a committing compile does');
-      assert.throws(() => t.preview(fitsFrom), /requires adaptiveResolution/);
+      let verdict: unknown;
+      try {
+        verdict = t.preview(fitsFrom);
+      } catch (error) {
+        assert.match((error as Error).message, /requires adaptiveResolution/);
+        verdict = null;
+      }
+      assert.equal(verdict, null, 'the preview gives no verdict for a context that fits');
       t.setBudget(Math.round(fitsFrom * 0.8));
       t.framework.start();
       const before = t.previews();
