@@ -6014,12 +6014,12 @@ export class AgentFramework {
       ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() });
     if (existing?.state === 'holding') {
       this.holdRequest(existing.heldRequests, own);
-      this.dropRecordedCheckpoint(agent);
+      this.dropRecordedCheckpoint(agent, trigger);
       endStart();
       return true;
     }
     if (!this.compressionPending(agent)) return false;
-    this.dropRecordedCheckpoint(agent);
+    this.dropRecordedCheckpoint(agent, trigger);
     const now = Date.now();
     const figures = error as Error & { budget?: unknown; actual?: unknown };
     const hold: BudgetHold = existing ?? {
@@ -13698,7 +13698,8 @@ export class AgentFramework {
     this.turnCounters.set(agentName, recorded.turnIndex);
   }
 
-  private dropRecordedCheckpoint(agent: Agent): void {
+  private dropRecordedCheckpoint(agent: Agent, trigger: InferenceRequest | undefined): void {
+    if (trigger?.reason === 'tool_result_guard_retry') return;
     const recorded = this.recordedCheckpoints?.get(agent);
     if (recorded === undefined) return;
     this.recordedCheckpoints.delete(agent);

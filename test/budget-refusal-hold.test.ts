@@ -6,8 +6,19 @@ import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type { EventResponse, InferencePolicy, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import type { NormalizedRequest, YieldingStream } from '@animalabs/membrane';
+import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+
+/** Each stream answers with its own script of rounds. */
+class ScriptedStreamMembrane extends MockMembrane {
+  constructor(private readonly scripts: NormalizedResponse[][]) { super(); }
+  override streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
+    this.calls.push(request);
+    const stream = new MockYieldingStream(this.scripts.shift() ?? []);
+    this.lastStream = stream;
+    return stream;
+  }
+}
 
 class SequentialStreamMembrane extends MockMembrane {
   private streamIdx = 0;
@@ -202,6 +213,9 @@ async function heldRestart(texts: string[], options: {
   fits?: boolean;
   duringTool?: (internal: Internal) => unknown;
   inferencePolicy?: InferencePolicy;
+  /** The tool round's continuation is a refusal, which the tool-result guard
+   *  retries in the turn, instead of a near-cap round that restarts it. */
+  guardRetry?: boolean;
 } = {}) {
   const proto = ContextManager.prototype as unknown as Patchable;
   const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
@@ -216,13 +230,25 @@ async function heldRestart(texts: string[], options: {
   proto.tick = async function () {};
   proto.isReady = function () { return fit; };
   const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-restart-'));
-  const membrane = new SequentialStreamMembrane();
-  membrane.pushResponse(nearCapToolResponse());
-  for (const text of texts) membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
+  const membrane = options.guardRetry
+    ? new ScriptedStreamMembrane([
+      [
+        createMockResponse([{ type: 'tool_use', id: 'call_1', name: 'canned--fetch', input: {} }], 'tool_use'),
+        { ...createMockResponse([{ type: 'text', text: 'refused partial' }], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test-category' } } } } as NormalizedResponse,
+      ],
+      ...texts.map((text) => [createMockResponse([{ type: 'text', text }])]),
+    ])
+    : new SequentialStreamMembrane();
+  if (!options.guardRetry) {
+    membrane.pushResponse(nearCapToolResponse());
+    for (const text of texts) membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
+  }
   const framework = await AgentFramework.create({
     storePath: join(tempDir, 'store'),
     membrane: membrane.asMembrane(),
-    agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
+    agents: [options.guardRetry
+      ? { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, toolResultGuard: true }
+      : { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
     modules: [new BlobToolModule(() => options.duringTool?.(internal))],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 50,
@@ -1030,6 +1056,18 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await t.close();
       }
     });
+  });
+
+  it('keeps the turn\'s one undo step when its tool-result guard\'s retry is held', async () => {
+    const t = await heldRestart(['Answered once it fit'], { guardRetry: true });
+    try {
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the guard\'s retry is refused and held');
+      t.fit();
+      assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 5_000));
+      assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the turn\'s first start recorded its one undo step, and the hold gave none of it back');
+    } finally {
+      await t.close();
+    }
   });
 
   it('gives up the undo step of a start that reaches its compile while the hold waits', async () => {
