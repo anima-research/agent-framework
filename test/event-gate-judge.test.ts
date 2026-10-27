@@ -548,6 +548,18 @@ describe('judge rules: timing', () => {
   const refusal = (text: string, retryAfterMs?: number) =>
     Object.assign(new Error(text), { providerAdmission: 'deferred' as const, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) });
   const judgeState = (gate: EventGate) => gate.getStatus().policies[0]!.judgeState!;
+  /** What the gate logs while `step` runs. */
+  const logDuring = async (step: () => Promise<void>): Promise<string[]> => {
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      await step();
+    } finally {
+      console.error = original;
+    }
+    return logged;
+  };
 
   it('a refused call is traced and counted as a refusal, apart from failures, with its hold and stated end', async () => {
     const judge = scriptedJudge();
@@ -838,8 +850,11 @@ describe('judge rules: timing', () => {
     await until(() => judge.waiting() === 2, "second's call, asked after first's");
     judge.failAt(1, refusal("scout's provider calls are held", 60_000));
     await until(() => gate.getStatus().policies[1]!.judgeState!.heldCount === 1, "second's batch held");
-    judge.failAt(0, refusal('claude-haiku-5-5 is held for scout', 1_000));
-    await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, "first's batch held");
+    const logged = await logDuring(async () => {
+      judge.failAt(0, refusal('claude-haiku-5-5 is held for scout', 1_000));
+      await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, "first's batch held");
+    });
+    assert.ok(logged.some((l) => l.includes("is held while the judge's calls are refused")), JSON.stringify(logged));
     await advance(1_300);
     assert.strictEqual(judge.requests.length, 2, "not asked again at the older refusal's end");
     const errors = gate.getStatus().errors;
@@ -857,10 +872,14 @@ describe('judge rules: timing', () => {
     await until(() => judge.waiting() === 2, "second's call, asked after first's");
     judge.answerAt(1, { reply: false, reason: 'chatter' });
     await until(() => gate.getStatus().policies[1]!.judgeState!.verdicts.wait === 1, "second's verdict applied");
-    judge.failAt(0, refusal("scout's provider calls are held", 60_000));
-    await until(() => judge.waiting() === 1, "first's batch asked again", 1_000);
+    const logged = await logDuring(async () => {
+      judge.failAt(0, refusal("scout's provider calls are held", 60_000));
+      await until(() => judge.waiting() === 1, "first's batch asked again", 1_000);
+    });
     assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['hello']);
     assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('refused')), false, JSON.stringify(gate.getStatus().errors));
+    assert.ok(logged.some((l) => l.includes('goes back to the judge')), JSON.stringify(logged));
+    assert.ok(!logged.some((l) => l.includes('is held')), JSON.stringify(logged));
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
@@ -1280,6 +1299,27 @@ describe('judge rules: what waiting leaves the agent with', () => {
     ]);
     judge.answer({ reply: false, reason: 'chatter' });
     judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("upcomingWakes, given a rule's name, leaves out that rule's batches, collected, decided or held, as 0.28.0's did", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-except.json', {
+      policies: [
+        { name: 'first', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 50 } } },
+        { name: 'second', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 120000 } } },
+      ],
+    }), { judge: judge.fn, residents: ['agent'] });
+    const listed = (exceptPolicy?: string) => gate.upcomingWakes(['agent'], exceptPolicy).map((w) => w.what);
+    gate.evaluate(chat('hello'));
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    await until(() => judge.requests.length === 1, "first's batch to go to the judge");
+    assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
+    assert.deepStrictEqual(listed('second'), ['rule "first"\'s batch of 1 event, which the judge is deciding']);
+    gate.onInferenceStarted('agent');
+    assert.deepStrictEqual(listed('second'), ['rule "first"\'s batch of 1 event, held for the judge']);
+    assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
+    assert.strictEqual(listed().length, 2);
     gate.dispose();
   });
 

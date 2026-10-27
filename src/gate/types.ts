@@ -70,7 +70,10 @@ export interface PassiveSampleConfig {
  * more. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
  * times out wakes the agent (fail open),
- * unless the host set its `onError` to `"skip"`.
+ * unless the host set its `onError` to `"skip"`. A call the framework refuses
+ * without making it isn't a failure, and `onError` decides it as well: under
+ * `"skip"` its batch is held while the judge's calls are refused
+ * (ReplyJudgeOptions.onError).
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
@@ -258,9 +261,22 @@ export interface ReplyJudgeOptions {
   /** The longest (ms) a judge request may take before the batch is decided by
    *  `onError`. Default 20,000. */
   timeoutMs?: number;
-  /** What a judge that fails, times out or answers unreadably does: `"wake"`
-   *  wakes the agent as a debounce would (the default, so a judge outage
-   *  never silences the agent); `"skip"` doesn't. */
+  /**
+   * What a judge that fails, times out or answers unreadably does: `"wake"`
+   * wakes the agent as a debounce would (the default, so a judge outage
+   * never silences the agent); `"skip"` doesn't. It decides a call the
+   * framework refuses without making it too (a hold on the agent's provider
+   * calls or on the judge's model, a surgery's hold on the store, or a
+   * stopping framework), which isn't counted as a failure. Under `"wake"`,
+   * the refused call's batch wakes the agent, and while a refusal's stated
+   * wait lasts each judge rule's batch wakes it without the judge being
+   * asked. Under `"skip"`, the batch is held in memory while the judge's
+   * calls are refused. While a refusal's stated wait lasts, batches that
+   * arrive are held with it, and all are judged once the wait ends or the
+   * hold is released. A refusal that states no end keeps them held until a
+   * later batch's call, which takes them in, gets a verdict, or the hold is
+   * released.
+   */
   onError?: 'wake' | 'skip';
   /** The judge's effort (`output_config.effort`). Default `"low"`: a short
    *  verdict, quickly. `"none"` sends no effort, for a provider that doesn't
@@ -306,10 +322,16 @@ export interface FailedLastTurn {
  * wait and nothing else arrives.
  */
 export interface UpcomingWake {
-  /** When (ms), when known; absent for one due as soon as the agent is free. */
+  /**
+   * When (ms), when known. Absent for one that has no time of its own: one
+   * due as soon as the agent is free (a wake already queued, or events
+   * buffered behind a running turn), a batch the judge is deciding or will
+   * decide once a turn ends, and one `when` describes.
+   */
   at?: number;
   /** When, in words, for one due at no time anyone can name (a hold only a
-   *  release or another call ends); shown in place of `at`. */
+   *  release or another call ends); given without `at`, and shown in its
+   *  place. */
   when?: string;
   /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
   certain: boolean;
@@ -328,8 +350,9 @@ export interface JudgeRequest {
   /** The agents the batch would wake. */
   agentNames: string[];
   /** The gate's own timers that will wake those agents with no new event
-   *  (upcomingWakes): their self-wakes, a sleep's end, other rules' pending
-   *  batches. The judge adds what the framework knows besides. */
+   *  (upcomingWakes): their self-wakes, a sleep's end, every pending batch
+   *  but this one, and events buffered behind a running turn. The judge adds
+   *  what the framework knows besides. */
   upcomingWakes?: UpcomingWake[];
   /** Aborted when the judge's time is up or the gate is disposed. */
   signal: AbortSignal;
