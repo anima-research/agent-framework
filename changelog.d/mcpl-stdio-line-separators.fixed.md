@@ -8,11 +8,12 @@
   U+2028 or U+2029, for legacy MCPL and modern MCP servers alike. The
   `agent-framework-mcp` command reads its stdin the same way, so a client's
   request holding either character gets its answer, not two parse errors.
-- **A line an MCP server sends that isn't JSON is logged when it's
-  dropped,** as is a JSON value that isn't an object from a legacy MCPL
-  server: one stderr line naming the server, the line's length, and whether
-  it isn't JSON, starts like a JSON object but doesn't parse, or is JSON but
-  not an object, never its content. A blank line is still dropped without
-  one, and the WebSocket transport still trims each line first and drops one
-  that trims to nothing. A server that writes plain-text log lines to its
-  stdout gets one such stderr line for each.
+- **A line an MCP server sends that isn't JSON is no longer dropped
+  silently,** and neither is a JSON value that isn't an object from a legacy
+  MCPL server. One stderr line names the server, the line's length, and
+  whether it isn't JSON, starts like a JSON object but doesn't parse, or is
+  JSON but not an object, never its content. A blank line is still dropped
+  without one, and the WebSocket transport still trims each line first and
+  drops one that trims to nothing. Each connection logs the first three
+  such lines, then one line saying that more go unlogged, so a server that
+  writes its logs to stdout doesn't flood the host's.

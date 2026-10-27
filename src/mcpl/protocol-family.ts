@@ -870,8 +870,18 @@ export function checkServerConfig(config: McplServerConfig): ServerBinding {
   return resolveServerBinding(config);
 }
 
-export function logDroppedLine(serverId: string, line: string, reason: 'unparsed' | 'not-object'): void {
+const DROPPED_LINES_LOGGED = 3;
+const droppedLinesLogged = new WeakMap<object, number>();
+
+export function logDroppedLine(serverId: string, line: string, reason: 'unparsed' | 'not-object', connection: object): void {
   if (/^[ \t]*$/.test(line)) return;
+  const logged = droppedLinesLogged.get(connection) ?? 0;
+  if (logged > DROPPED_LINES_LOGGED) return;
+  droppedLinesLogged.set(connection, logged + 1);
+  if (logged === DROPPED_LINES_LOGGED) {
+    console.error(`MCP server "${serverId}" sent another line that isn't a JSON object, so it was dropped; more such lines on this connection are dropped without a log line`);
+    return;
+  }
   let length = 0;
   for (const _ of line) length++;
   const why = reason === 'not-object' ? 'is JSON but not an object'

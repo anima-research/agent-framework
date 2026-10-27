@@ -1331,7 +1331,7 @@ export class McplServerConnection extends EventEmitter {
           reject(closedWhileConnecting());
         };
         const onLine = (line: string) => {
-          const msg = messageFromLine(config.id, line) as JsonRpcResponse | undefined;
+          const msg = messageFromLine(config.id, line, transport) as JsonRpcResponse | undefined;
           if (!msg) return;
           // A request or a notification from the server is never the
           // initialize response, whatever its id: a server's own ids can start
@@ -2372,7 +2372,7 @@ export class McplServerConnection extends EventEmitter {
     // passed is the dead process's (afterBoundary).
     const epoch = this.transportEpoch;
     transport.on('line', (line: string) => {
-      const msg = messageFromLine(this.id, line) as JsonRpcRequest | JsonRpcResponse | undefined;
+      const msg = messageFromLine(this.id, line, transport) as JsonRpcRequest | JsonRpcResponse | undefined;
       if (!msg) return;
       try {
         this.dispatchMessage(msg, epoch);
@@ -2817,16 +2817,16 @@ export class McplServerConnection extends EventEmitter {
   }
 }
 
-function messageFromLine(serverId: string, line: string): object | undefined {
+function messageFromLine(serverId: string, line: string, transport: McplTransport): object | undefined {
   let value: unknown;
   try {
     value = JSON.parse(line);
   } catch {
-    logDroppedLine(serverId, line, 'unparsed');
+    logDroppedLine(serverId, line, 'unparsed', transport);
     return undefined;
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    logDroppedLine(serverId, line, 'not-object');
+    logDroppedLine(serverId, line, 'not-object', transport);
     return undefined;
   }
   return value;

@@ -297,11 +297,12 @@ export function malformedLineDiagnostic(
 
 /**
  * SDK `Transport` over Connectome's stdio spawner. Framing is the same
- * newline-delimited JSON-RPC as legacy. Lines that are not JSON are dropped
- * and logged by their length, as the legacy engine does. Because this is a
- * custom transport, the SDK runs `server/discover` on this very process
- * instead of starting a throwaway copy, and cancels with
- * `notifications/cancelled`, which is the stdio binding's mechanism.
+ * newline-delimited JSON-RPC as legacy. Lines that are not JSON are dropped,
+ * and the first three on a connection that aren't blank are logged by their
+ * length, as the legacy engine does. Because this is a custom transport, the
+ * SDK runs `server/discover` on this very process instead of starting a
+ * throwaway copy, and cancels with `notifications/cancelled`, which is the
+ * stdio binding's mechanism.
  */
 class SpawnerStdioTransport implements Transport {
   onclose?: () => void;
@@ -332,7 +333,8 @@ class SpawnerStdioTransport implements Transport {
     const line = await this.spawning;
     this.line = line;
     line.on('line', (text: string) => {
-      // A line that isn't JSON is dropped and logged by its length, as the
+      // A line that isn't JSON is dropped, and the first three on a
+      // connection that aren't blank are logged by their length, as the
       // legacy engine does. A line that is JSON but not a JSON-RPC message
       // (`null`, an array, a bare value) is a diagnostic. It must never reach
       // a handler that assumes the shape: thrown from this callback, it would
@@ -341,7 +343,7 @@ class SpawnerStdioTransport implements Transport {
       try {
         parsed = JSON.parse(text);
       } catch {
-        logDroppedLine(this.config.id, text, 'unparsed');
+        logDroppedLine(this.config.id, text, 'unparsed', line);
         return;
       }
       let message: JSONRPCMessage;

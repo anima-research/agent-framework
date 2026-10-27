@@ -899,6 +899,22 @@ test('a line that is not JSON is dropped and logged by its length, never its con
   assert.deepEqual(logged, ['MCP server "raw" sent a line of length 21 that isn\'t JSON, so it was dropped']);
 });
 
+test('a modern stdio connection logs the first three lines that are not JSON, then one line says more go unlogged', async (t) => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  assert.deepEqual((await connection.callTool('noise', {})).content, [{ type: 'text', text: 'after the logs' }]);
+  t.mock.restoreAll();
+  assert.deepEqual(logged, [
+    'MCP server "raw" sent a line of length 5 that isn\'t JSON, so it was dropped',
+    'MCP server "raw" sent a line of length 5 that isn\'t JSON, so it was dropped',
+    'MCP server "raw" sent a line of length 5 that isn\'t JSON, so it was dropped',
+    'MCP server "raw" sent another line that isn\'t a JSON object, so it was dropped; more such lines on this connection are dropped without a log line',
+  ]);
+});
+
 test('a result holding U+2028 and U+2029 inside a string arrives whole', async () => {
   const log = scratchLog();
   const connection = await connect('', log);

@@ -55,24 +55,22 @@ process.stdin.on('data', (chunk) => {
     const request = JSON.parse(line);
     if (request.method === 'initialize') {
       process.stdout.write('handshake chatter\n');
-      process.stdout.write('[]\n');
+      process.stdout.write('   \n');
+      process.stdout.write('\n');
       process.stdout.write(' \t{"jsonrpc":"2.0"\n');
       send({jsonrpc:'2.0', id:request.id, result:{protocolVersion:'2024-11-05', capabilities:{tools:{}}}});
     } else if (request.method === 'tools/list') {
-      process.stdout.write('not json at all\n');
-      process.stdout.write('42\n');
-      process.stdout.write('[info] listening on 3000\n');
-      process.stdout.write('\u{1F600} not json\n');
-      process.stdout.write('\u2028\n');
       process.stdout.write(' \t \n');
-      process.stdout.write('\n');
+      process.stdout.write('42\n');
+      process.stdout.write('not json at all\n');
+      process.stdout.write('[]\n');
       send({jsonrpc:'2.0', id:request.id, result:{tools:[]}});
     }
   }
 });
 `;
 
-test('a line a connection drops because it is not a JSON object is logged by its length in characters and why, never its content, in the handshake and once connected; a blank one is not', async () => {
+test('a stdio connection logs the first three lines it drops, in the handshake and once connected, by length and why, never content, then one line says more go unlogged; blank lines are neither logged nor counted', async () => {
   const logged: string[] = [];
   const realError = console.error;
   console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -95,8 +93,8 @@ test('a line a connection drops because it is not a JSON object is logged by its
   const brokenJson = "starts like a JSON object but doesn't parse";
   const notObject = 'is JSON but not an object';
   assert.deepEqual(logged, [
-    dropped(17, notJson), dropped(2, notObject), dropped(18, brokenJson),
-    dropped(15, notJson), dropped(2, notObject), dropped(24, notJson), dropped(10, notJson), dropped(1, notJson),
+    dropped(17, notJson), dropped(18, brokenJson), dropped(2, notObject),
+    'MCP server "dropping" sent another line that isn\'t a JSON object, so it was dropped; more such lines on this connection are dropped without a log line',
   ]);
 });
 

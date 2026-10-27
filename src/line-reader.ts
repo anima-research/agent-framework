@@ -31,7 +31,7 @@ export function readLines(input: Readable, onLine: (line: string) => void, onEnd
     if (!stopped) partial += text.slice(from);
   };
 
-  const onData = (chunk: Buffer | string) => take(typeof chunk === 'string' ? chunk : decoder.write(chunk));
+  const onData = (chunk: Buffer | string) => take(decoder.write(chunk));
   const onStreamEnd = () => {
     take(decoder.end());
     if (!stopped && partial.length > 0) {
