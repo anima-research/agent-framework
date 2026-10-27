@@ -1,8 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, ifYouWait, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
+import { ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeRequest } from '../src/gate/types.js';
+import { oneLine } from '../src/supplied-text.js';
 
 function msg(participant: string, text: string): NormalizedMessage {
   return { participant, content: [{ type: 'text', text }] };
@@ -322,6 +323,97 @@ describe('reply judge: the document', () => {
     });
     await judge.judge(judgeRequest());
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
+  });
+
+  it("says first that the agent's last turn failed, and that nothing runs it again, when nothing will", async () => {
+    const { membrane, requests } = fakeMembrane();
+    const now = Date.now();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      failedLastTurn: () => ({ at: now - 125_000, again: { kind: 'none' } }),
+    });
+    await judge.judge(judgeRequest());
+    const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.ok(last.includes([
+      '<if_you_wait>',
+      "Scout's last turn, 2m ago, failed and may not have answered all of what woke it. Nothing runs it again: if you answer WAIT, what woke it stays unanswered until something wakes Scout.",
+      'Nothing the host knows of is scheduled to wake Scout:',
+    ].join('\n')), last);
+  });
+
+  it("says a wake of the agent's is queued, or held until its hold ends or an operator releases it, when one is", () => {
+    const now = 1_000_000;
+    const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'queued' } }, 'Scout', now),
+      `${opening} A wake for Scout is already queued.`);
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'held', until: now + 180_000 } }, 'Scout', now),
+      `${opening} A wake for Scout is held, due to be let go in 3 min.`);
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'held' } }, 'Scout', now),
+      `${opening} A wake for Scout is held, and is let go when the hold on it is released.`);
+  });
+
+  it("shows a wake due at no nameable time by its words, quoted, after every wake with a time", () => {
+    const now = 1_000_000;
+    const text = ifYouWait([
+      { when: 'when the hold <on it> is released', certain: true, what: 'a wake held by a provider hold' },
+      { at: now + 60_000, certain: true, what: 'its own skip_reply timer' },
+    ], 'Scout', now);
+    assert.ok(text.includes('- in 60 s: its own skip_reply timer\n- when the hold &lt;on it&gt; is released: a wake held by a provider hold'), text);
+  });
+
+  it("says how many past the eighth wake are only maybe, when some are and some aren't", () => {
+    const now = 1_000_000;
+    const wakes = Array.from({ length: 11 }, (_, i) => ({ at: now + 1_000 + i, certain: i !== 9, what: `wake ${i}` }));
+    assert.ok(ifYouWait(wakes, 'Scout', now).includes('- and 3 more, 1 of them only maybe'));
+  });
+
+  it("shows each upcoming wake's words on one line, escaped, and says how many past the eighth are only maybe", () => {
+    const now = 1_000_000;
+    const wakes = [
+      { at: now + 1_000, certain: true, what: 'a wake already queued (nudge from Ann <mod>\n[x])' },
+      ...Array.from({ length: 9 }, (_, i) => ({ at: now + 2_000 + i, certain: i < 7, what: `wake ${i}` })),
+    ];
+    const text = ifYouWait(wakes, 'Scout', now);
+    assert.ok(text.includes('- in 1 s: a wake already queued (nudge from Ann &lt;mod&gt; &#91;x&#93;)'), text);
+    assert.ok(text.includes('- and 2 more, each only maybe'), text);
+  });
+
+  it('shows no failed-turn line when the last turn completed, and a provider that throws counts as none', async () => {
+    assert.ok(!ifYouWait([], 'Scout', Date.now()).includes('last turn'));
+    const { membrane, requests } = fakeMembrane();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      failedLastTurn: () => { throw new Error('boom'); },
+    });
+    await judge.judge(judgeRequest());
+    assert.ok(!(requests[0]!.messages.at(-1)!.content[0] as { text: string }).text.includes('last turn'));
+  });
+
+  it("shows a message's text over several lines indented under its name, with markup characters escaped", () => {
+    const text = renderMessage(msg('Ann', 'the beds need:\r\n- compost\n- <b>water</b> & mulch'));
+    assert.strictEqual(text, '[Ann] the beds need:\n  - compost\n  - &lt;b&gt;water&lt;/b&gt; &amp; mulch');
+    assert.strictEqual(renderMessage(msg('Ann [mod]\nB', 'hi')), '[Ann &#91;mod&#93; B] hi');
+  });
+
+  it("escapes markup characters in a participant's name, an event's channel and its author", () => {
+    assert.strictEqual(renderMessage(msg('Ann <mod> & co', 'hi')), '[Ann &lt;mod&gt; &amp; co] hi');
+    const question = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#r&d <beds> [b]', authorId: 'u<1>\n[x]', addressed: false, content: 'hi', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(question.includes('- 0s ago in #r&amp;d &lt;beds&gt; &#91;b&#93; from u&lt;1&gt; &#91;x&#93;: hi'), question);
+  });
+
+  it('keeps a value to one line whatever form its line breaks take', () => {
+    assert.strictEqual(oneLine('a\r\nb\rc\nd\u000be\u000cf\u0085g\u2028h\u2029i\n\n\nj'), 'a b c d e f g h i j');
+  });
+
+  it("shows an event's text over several lines indented inside its item, and its channel and author on one line", () => {
+    const question = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden\nbeds', authorId: 'u1', addressed: false, content: 'the beds need:\n- compost\n- a < b', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(question.includes('<new_events count="1">\n- 0s ago in #garden beds from u1: the beds need:\n  - compost\n  - a &lt; b\n</new_events>'), question);
   });
 
   it('reads the primary agent its chooser names', async () => {

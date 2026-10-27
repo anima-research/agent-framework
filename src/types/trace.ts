@@ -475,13 +475,16 @@ export type TraceEvent =
   | (TraceEventBase & {
       /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
        *  `reply` or `wait` as the judge answered, `error` when it failed,
-       *  timed out or answered nothing usable; `woke` is whether the batch
-       *  then woke the agent (an error does by the host's onError).
+       *  timed out or answered nothing usable, `refused` when the framework
+       *  made no call (a hold on the agent's provider calls or on the judge's
+       *  model, or a surgery's hold on the store); `woke` is whether the batch
+       *  then woke the agent (an error or a refusal does by the host's
+       *  onError: under "skip" a refused batch is held until the hold ends).
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';
       policyName: string;
-      verdict: 'reply' | 'wait' | 'error';
+      verdict: 'reply' | 'wait' | 'error' | 'refused';
       woke: boolean;
       eventCount: number;
       durationMs: number;
@@ -489,6 +492,10 @@ export type TraceEvent =
       inputTokens?: number;
       cacheReadTokens?: number;
       outputTokens?: number;
+      /** For a refusal: the hold that refused the call, in the framework's words. */
+      hold?: string;
+      /** For a refusal: when its hold said it ends (ms), when it said. */
+      until?: number;
     })
   | (TraceEventBase & {
       /** A batched wake's turn started without its `[Gate: …]` line (the

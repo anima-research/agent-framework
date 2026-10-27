@@ -2,19 +2,27 @@
  * ReplyJudge — the small model a `judge` wake rule asks whether now is a good
  * time for the agent to reply (JudgeConfig).
  *
- * Per batch it takes the request the agent WOULD send if woken now (the
- * framework's previewActivation, a dry run that commits nothing), renders it
- * as one plain-text document (the agent's system prompt, abridged, then its
- * conversation, oldest first), keeps the newest part of that document that
- * fits the judge's input budget, and asks the model, with the agent's own
- * instructions and the batch, for one line: `REPLY: <reason>` or
- * `WAIT: <reason>`.
+ * Per batch it takes the agent's context as a dry run of the request it would
+ * send if woken now (the framework's previewActivation, which commits
+ * nothing), without what modules' gatherContext and MCPL servers'
+ * beforeInference would inject, since gathering those has side effects. It
+ * renders that as one plain-text document (the agent's conversation, oldest
+ * first, then its system prompt, abridged), in which participant text is
+ * escaped and indented so it can't make the document's structure, keeps the
+ * newest part that fits the judge's input budget, and asks the model, with
+ * the agent's own instructions and the batch, for one line:
+ * `REPLY: <reason>` or `WAIT: <reason>`.
  *
- * Cost and latency. The budget (`maxInputTokens`, default 90,000) keeps every
- * request under the 100,000-token line past which Claude Haiku 5.5 costs five
- * times as much. Tokens are estimated from characters, at a ratio the judge
- * corrects from every response's reported input, so the estimate tracks the
- * model's tokenizer and the context's mix of prose and code. The document is
+ * Cost and latency. The budget (`maxInputTokens`, default 90,000) is set to
+ * keep each request under the 100,000-token line past which Claude Haiku 5.5
+ * costs five times as much, but it's met by an estimate. Tokens are estimated
+ * from characters, at a ratio the judge corrects from every response's
+ * reported input, so the estimate tracks the model's tokenizer and the
+ * context's mix of prose and code. Until a response has corrected it, a
+ * request on text denser than three characters a token (code, or Chinese,
+ * Japanese or Korean text) can carry more than the budget, and so can one whose
+ * newest message or newest event alone is over it, since each is always shown
+ * (a message cut to its own cap, an event whole). The document is
  * sent as a run of chunks that start at an anchor, the first message shown,
  * which stays put while the window grows into its budget: the chunks before
  * the newest stay byte-identical from one request to the next, and a cache
@@ -27,7 +35,8 @@
 
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
-import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
+import { normalizeLineBreaks, oneLine } from '../supplied-text.js';
+import type { FailedLastTurn, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
 /** The judge's model when the host names none. */
 export const DEFAULT_JUDGE_MODEL = 'claude-haiku-5-5';
@@ -38,7 +47,7 @@ export const DEFAULT_JUDGE_MAX_INPUT_TOKENS = 90_000;
  *  of the room's history to weigh) sets a budget near it. */
 export const MIN_JUDGE_INPUT_TOKENS = 4_000;
 
-/** Characters per token the judge assumes before any response has told it better. Low, so a first estimate overshoots. */
+/** Characters per token the judge assumes before any response has told it better. */
 const INITIAL_CHARS_PER_TOKEN = 3;
 /** The share of each measured ratio the running estimate takes: more when the
  *  text proved denser than estimated (more tokens a character), which is the
@@ -77,7 +86,7 @@ export interface ReplyJudgeDeps {
   options?: ReplyJudgeOptions;
   /** Which of the batch's agents the judge reads the context of. */
   chooseAgent: (agentNames: string[]) => string | undefined;
-  /** The request the agent would send if woken now, as a dry run (previewActivation). */
+  /** The request the agent would send if woken now, as a dry run (previewActivation), without its injections. */
   preview: (agentName: string) => Promise<NormalizedRequest>;
   /** Count a judge request's usage as the agent's, where its turns' usage is counted. */
   recordUsage?: (agentName: string, usage: DetailedUsage) => void;
@@ -85,6 +94,10 @@ export interface ReplyJudgeDeps {
    *  timers the request carries: wakes the framework has queued or holds. A
    *  provider that throws counts as knowing of none. */
   upcomingWakes?: (agentName: string) => UpcomingWake[] | Promise<UpcomingWake[]>;
+  /** The agent's last turn, when it failed and no turn has completed since:
+   *  the judge then says what woke it may be unanswered. A provider that
+   *  throws counts as no failed turn. */
+  failedLastTurn?: (agentName: string) => FailedLastTurn | undefined;
 }
 
 /** One message of the agent's context, rendered. */
@@ -99,7 +112,20 @@ interface Anchor {
   keys: string[];
 }
 
-/** A message as the document shows it: its participant, and each block as text. Thinking is the agent's own, and isn't shown. */
+function escapeText(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function quoted(text: string): string {
+  return escapeText(normalizeLineBreaks(text)).replace(/\n/g, '\n  ');
+}
+
+function field(text: string): string {
+  return escapeText(oneLine(text)).replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+}
+
+/** A message as the document shows it: its participant, and each block as
+ *  text, quoted (see `quoted`). Thinking is the agent's own, and isn't shown. */
 export function renderMessage(message: NormalizedMessage): string {
   const parts: string[] = [];
   for (const block of message.content as ContentBlock[]) {
@@ -107,7 +133,7 @@ export function renderMessage(message: NormalizedMessage): string {
     if (line) parts.push(line);
   }
   if (parts.length === 0) return '';
-  return cut(`[${message.participant}] ${parts.join('\n')}`, MAX_MESSAGE_CHARS);
+  return cut(`[${field(message.participant)}] ${quoted(parts.join('\n'))}`, MAX_MESSAGE_CHARS);
 }
 
 function renderBlock(block: ContentBlock): string {
@@ -183,19 +209,40 @@ function inWhile(at: number | undefined, now: number): string {
 }
 
 /**
- * What waiting would leave the agent with: what wakes it anyway, soonest
- * first, or that nothing the host knows of is scheduled. A server's own
- * timers (a heartbeat, a reminder) are listed only where the host was told
- * of them, so the empty case says so.
+ * The agent's last turn, when it failed: what woke it may be unanswered,
+ * whether or not the turn sent part of an answer, and whether a wake of the
+ * agent's is on its way without a new event.
  */
-export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number): string {
-  const sorted = [...wakes].sort((a, b) => (a.at ?? now) - (b.at ?? now));
-  const lines = sorted.slice(0, 8).map((w) => `- ${inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${w.what}`);
-  const more = sorted.length > 8 ? [`- and ${sorted.length - 8} more`] : [];
+export function failedTurnLine(failed: FailedLastTurn, agentName: string, now: number): string {
+  const opening = `${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`;
+  switch (failed.again.kind) {
+    case 'queued':
+      return `${opening} A wake for ${agentName} is already queued.`;
+    case 'held':
+      return `${opening} A wake for ${agentName} is held, ${failed.again.until !== undefined ? `due to be let go ${inWhile(failed.again.until, now)}` : 'and is let go when the hold on it is released'}.`;
+    default:
+      return `${opening} Nothing runs it again: if you answer WAIT, what woke it stays unanswered until something wakes ${agentName}.`;
+  }
+}
+
+/**
+ * What waiting would leave the agent with: whether its last turn failed, and
+ * what wakes it anyway, soonest first, or that nothing the host knows of is
+ * scheduled. A server's own timers (a heartbeat, a reminder) are listed only
+ * where the host was told of them, so the empty case says so.
+ */
+export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number, failed?: FailedLastTurn): string {
+  const due = (w: UpcomingWake): number => (w.when !== undefined ? Infinity : w.at ?? now);
+  const sorted = [...wakes].sort((a, b) => (due(a) === due(b) ? 0 : due(a) - due(b)));
+  const listed = sorted.slice(0, 8).map((w) => `- ${w.when !== undefined ? field(w.when) : inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${field(w.what)}`);
+  const rest = sorted.slice(8);
+  const maybe = rest.filter((w) => !w.certain).length;
+  const more = rest.length > 0 ? [`- and ${rest.length} more${maybe > 0 ? `, ${maybe === rest.length ? 'each' : `${maybe} of them`} only maybe` : ''}`] : [];
   return [
     '<if_you_wait>',
-    ...(lines.length > 0
-      ? [`If you answer WAIT and nothing new arrives, ${agentName} is next woken by:`, ...lines, ...more]
+    ...(failed ? [failedTurnLine(failed, agentName, now)] : []),
+    ...(listed.length > 0
+      ? [`If you answer WAIT and nothing new arrives, ${agentName} is next woken by:`, ...listed, ...more]
       : [`Nothing the host knows of is scheduled to wake ${agentName}: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).`]),
     '</if_you_wait>',
   ].join('\n');
@@ -249,6 +296,7 @@ export function judgeSystemPrompt(agentName: string): string {
 /** The closing message: the batch, the agent's instructions, the question. */
 export function judgeQuestion(
   request: Pick<JudgeRequest, 'events' | 'instructions' | 'upcomingWakes'>, agentName: string, now: number, maxEventChars = Infinity,
+  failed?: FailedLastTurn,
 ): string {
   // Newest first into the listing's share, shown oldest first; the rest are
   // counted, so a long held batch can't crowd out the context.
@@ -257,10 +305,10 @@ export function judgeQuestion(
   let i = request.events.length;
   while (i > 0) {
     const e: JudgeEventSummary = request.events[i - 1]!;
-    const where = e.channel ? ` in ${e.channel}` : '';
-    const who = e.authorId ? ` from ${e.authorId}` : '';
+    const where = e.channel ? ` in ${field(e.channel)}` : '';
+    const who = e.authorId ? ` from ${field(e.authorId)}` : '';
     const addressed = e.addressed ? ' (addresses the agent)' : '';
-    const line = `- ${ago(e.at, now)}${where}${who}${addressed}: ${e.content}`;
+    const line = `- ${ago(e.at, now)}${where}${who}${addressed}: ${quoted(e.content)}`;
     if (lines.length > 0 && used + line.length > maxEventChars) break;
     lines.unshift(line);
     used += line.length + 1;
@@ -272,7 +320,7 @@ export function judgeQuestion(
     ...lines,
     '</new_events>',
   ];
-  parts.push('', ifYouWait(request.upcomingWakes ?? [], agentName, now));
+  parts.push('', ifYouWait(request.upcomingWakes ?? [], agentName, now, failed));
   if (request.instructions && request.instructions.trim()) {
     parts.push('', `<instructions_from_${agentName.replace(/[^A-Za-z0-9_-]/g, '_')}>`, request.instructions.trim(), '</instructions_from_' + agentName.replace(/[^A-Za-z0-9_-]/g, '_') + '>');
   }
@@ -290,6 +338,7 @@ export class ReplyJudge {
   private readonly preview: ReplyJudgeDeps['preview'];
   private readonly recordUsage: ReplyJudgeDeps['recordUsage'];
   private readonly extraWakes: ReplyJudgeDeps['upcomingWakes'];
+  private readonly failedLastTurn: ReplyJudgeDeps['failedLastTurn'];
   /** Characters per token, corrected from each response's reported input. */
   private charsPerToken = INITIAL_CHARS_PER_TOKEN;
   private readonly anchors = new Map<string, Anchor>();
@@ -317,6 +366,7 @@ export class ReplyJudge {
     this.preview = deps.preview;
     this.recordUsage = deps.recordUsage;
     this.extraWakes = deps.upcomingWakes;
+    this.failedLastTurn = deps.failedLastTurn;
   }
 
   /** The gate's judge function. */
@@ -345,10 +395,16 @@ export class ReplyJudge {
       extra = [];
     }
     const upcoming = [...(request.upcomingWakes ?? []), ...extra];
+    let failed: FailedLastTurn | undefined;
+    try {
+      failed = this.failedLastTurn?.(agentName);
+    } catch {
+      failed = undefined;
+    }
 
     const system = judgeSystemPrompt(agentName);
     const question = judgeQuestion(
-      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken),
+      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken), failed,
     );
     const fixedChars = system.length + question.length;
 
@@ -477,7 +533,9 @@ export class ReplyJudge {
     const built = await this.buildRequest(request);
     // The native formatter whatever the host's agents use: an XML or
     // completions formatter would end the judge's request in a prefill, which
-    // current Claude models refuse.
+    // current Claude models refuse. (A membrane whose own formatter is OpenAI
+    // Responses', on that adapter outside its subscription mode, keeps it
+    // whatever a request asks: membrane's resolveActiveFormatter.)
     const response = await this.membraneFor(built.agentName).complete(built.request, {
       signal: request.signal,
       formatter: new NativeFormatter(),

@@ -242,10 +242,14 @@ export interface ReplyJudgeOptions {
   /**
    * The most input tokens one judge request may carry, its instructions and
    * the batch included; the context document is cut from its oldest end to
-   * fit. Default 90,000: Claude Haiku 5.5 costs five times as much past
-   * 100,000 input tokens, and the margin covers the estimate's error. The
-   * least is 4,000, a short tail of the conversation: cheaper and quicker,
-   * with less of the room's history to weigh.
+   * fit. Default 90,000, under the 100,000 input tokens past which Claude
+   * Haiku 5.5 costs five times as much. Tokens are estimated from characters,
+   * at a ratio each response corrects: until one has, a request on text
+   * denser than three characters a token (code, or Chinese, Japanese or
+   * Korean text) can carry more than the budget, and so can one whose newest
+   * message or newest event alone is over it, since each is always shown. The least is 4,000, a short
+   * tail of the conversation: cheaper and quicker, with less of the room's
+   * history to weigh.
    */
   maxInputTokens?: number;
   /** The longest (ms) a judge request may take before the batch is decided by
@@ -261,7 +265,8 @@ export interface ReplyJudgeOptions {
   effort?: 'low' | 'medium' | 'high' | 'none';
   /** The prompt cache's lifetime for the judge's context document. `"5m"`
    *  (the default) suits judge rules that fire minutes apart; `"1h"` costs
-   *  more to write and suits ones that fire less often. */
+   *  more to write and suits ones that fire less often. On Bedrock, membrane
+   *  drops it and the cache lives for Bedrock's default. */
   cacheTtl?: '5m' | '1h';
 }
 
@@ -281,6 +286,18 @@ export interface JudgeEventSummary {
 }
 
 /**
+ * The agent's last turn, when it failed (its retries spent) and no turn has
+ * completed since, as the reply judge is told it: when it failed, and whether
+ * a wake of the agent's is on its way with no new event, already queued or
+ * held until a provider hold ends (`until`, absent when it states no end). Neither says the wake starts a turn: the host's inference
+ * policy can still decline it.
+ */
+export interface FailedLastTurn {
+  at: number;
+  again: { kind: 'none' } | { kind: 'queued' } | { kind: 'held'; until?: number };
+}
+
+/**
  * Something that will (or, for a batch going to the judge, may) wake the
  * agent with no new event: what the judge is told would happen if it answers
  * wait and nothing else arrives.
@@ -288,6 +305,9 @@ export interface JudgeEventSummary {
 export interface UpcomingWake {
   /** When (ms), when known; absent for one due as soon as the agent is free. */
   at?: number;
+  /** When, in words, for one due at no time anyone can name (a hold only a
+   *  release or another call ends); shown in place of `at`. */
+  when?: string;
   /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
@@ -462,14 +482,15 @@ export interface GatePolicyStats {
     pendingCount: number;
     /** Whether the judge is deciding one of this rule's batches now. */
     judging: boolean;
-    /** Events held for the judge until the agent's turn (or the host's quiesce) ends. */
+    /** Events held for the judge until the agent's turn (or the host's quiesce) ends, or a refusal's hold ends. */
     heldCount: number;
-    /** Verdicts so far: woke the agent, let the batch go by, and judge failures. */
-    verdicts: { reply: number; wait: number; error: number };
+    /** Verdicts so far: woke the agent, let the batch go by, judge failures,
+     *  and calls the framework refused without making them. */
+    verdicts: { reply: number; wait: number; error: number; refused: number };
     /** The newest verdict. */
     last?: {
       at: number;
-      verdict: 'reply' | 'wait' | 'error';
+      verdict: 'reply' | 'wait' | 'error' | 'refused';
       reason: string;
       eventCount: number;
       durationMs: number;
