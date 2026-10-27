@@ -88,7 +88,18 @@ export interface AgentConfig {
    *  report beside it. Where membrane knows the provider's cache convention
    *  (one other than `'unknown'`), `inputTokens` leaves those out, so there,
    *  where a prompt is mostly cached, this setting doesn't bound the
-   *  request's size: `physicalWindowTokens`, when set, does. Not checked
+   *  request's size: `physicalWindowTokens`, when set, does. The restart is
+   *  declined when context-manager's preview of its compile says it won't
+   *  fit, or the preview fails, which is logged (a strategy with no preview
+   *  restarts as before): the stream goes on, and the next tool boundary
+   *  over this budget considers the restart again. With
+   *  `physicalWindowTokens` unset, nothing else then bounds the stream: it
+   *  goes on until the provider refuses a request at its own window, and
+   *  the turn ends with its failure row. The preview can't count the rows
+   *  the restart's start then stores (such as new or changed afterUser
+   *  injections, or a routing notice for an arrival the turn heard), so a
+   *  restart whose preview leaves less room than those rows take can still
+   *  be refused, and the turn then ends with its failure row. Not checked
    *  mid-turn for an agent whose model binds its thinking
    *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
    *  there would take the turn's own earlier reasoning out of the request,

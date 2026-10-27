@@ -159,6 +159,7 @@ function wireDigest(value: unknown): string {
 }
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: 100_000, reserveForResponse: 4_000 };
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
@@ -329,9 +330,10 @@ export class Agent {
    * closure) so the next activation can close whatever its predecessor left
    * open — see failOpenKvSubmissions. */
   private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
-  /** The current stream's fresh input so far, as membrane's usage event
+  /** The current stream's `inputTokens` so far, as membrane's usage event
    *  reports it (cumulative across the tool loop): what the maxStreamTokens
-   *  budget checks. */
+   *  budget checks. Where membrane knows the provider's cache convention it
+   *  leaves out cache reads and writes; where it doesn't, it can hold them. */
   lastStreamInputTokens = 0;
   /** Real prompt size of the stream's latest provider call that reported a
    *  prompt, which is what the provider billed it: fresh + cache creation +
@@ -339,8 +341,9 @@ export class Agent {
    *  lastStreamUnreportedTokens). Membrane's usage events are cumulative, so
    *  this is the call's share of its event (cumulativeDelta): the whole event
    *  for a stream's first call, and the event's own value where a counter
-   *  went back. THE window-shaped number — `lastStreamInputTokens` alone
-   *  omits cached tokens, which are most of a warm stream's window. 0 until a
+   *  went back. THE window-shaped number — `lastStreamInputTokens` leaves out
+   *  cached tokens wherever membrane knows the provider's cache convention,
+   *  and they are most of a warm stream's window. 0 until a
    *  call on this stream reports a prompt, and the physical-window
    *  projection runs only once one has. */
   lastStreamRealInputTokens = 0;
@@ -545,7 +548,7 @@ export class Agent {
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
     // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    const base = resolved ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
   }
 
@@ -2007,6 +2010,23 @@ export class Agent {
    */
   thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
+  }
+
+  /**
+   * Whether a compile of this agent now, at the budget and with the binding that compile is given, would fit,
+   * committing nothing (`ContextManager.previewContext`). Null where the strategy offers no preview, and on
+   * context-manager 0.23.1's hierarchical path. A select over the budget answers `fits: false`. It throws what
+   * `previewContext` throws: an `UncoveredDropError` from its dry select's coverage check, and on context-manager
+   * 0.23.0 a plain Error from a hierarchical strategy whose select succeeded.
+   * @internal For the framework's restart decision; not a host API.
+   */
+  previewCompile(): { fits: boolean } | null {
+    const thinkingBinding = this.thinkingBindingOption();
+    return this.contextManager.previewContext(
+      this.compileBudget() ?? CONTEXT_MANAGER_DEFAULT_BUDGET,
+      undefined,
+      thinkingBinding ? { thinkingBinding } : undefined,
+    );
   }
 
   /**

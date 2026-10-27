@@ -1106,6 +1106,8 @@ function announcedDomainsOf(announce: unknown): string[] {
   return Array.isArray(domains) ? domains.filter((domain): domain is string => typeof domain === 'string') : [];
 }
 
+const HIERARCHICAL_PREVIEW_REFUSAL = 'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview';
+
 /**
  * Whether a stream resumes its turn's request rather than starting one: a
  * budget restart, or a tool-result-guard retry. Such a start takes in no new
@@ -10077,6 +10079,21 @@ export class AgentFramework {
     run.lastActivity = Date.now();
   }
 
+  private softRestartFits(agent: Agent): boolean {
+    try {
+      return agent.previewCompile()?.fits ?? true;
+    } catch (error) {
+      // context-manager 0.23.0 throws this plain Error from previewContext on the non-adaptive (hierarchical) path
+      // once its dry select has succeeded, since that path has no fold plan to report: the compile fits. 0.23.1
+      // returns null there.
+      if (error instanceof Error && error.constructor === Error && error.message === HIERARCHICAL_PREVIEW_REFUSAL) return true;
+      if (!(error instanceof UncoveredDropError)) {
+        console.error(`[context-budget] ${agent.name}: the restart's preview failed, so the stream goes on: ${describeFailureWithFrames(error)}`);
+      }
+      return false;
+    }
+  }
+
   /**
    * A start dropped before its stream sends anything (its agent was replaced,
    * or stop() closed admission or ended the lifecycle the start began in)
@@ -14007,7 +14024,8 @@ export class AgentFramework {
           const overBudget = currentState.stream
             && !(agent.thinkingBindingOption() !== undefined && agent.physicalWindowTokens !== undefined)
             && agent.lastStreamInputTokens > 0
-            && agent.lastStreamInputTokens > agent.maxStreamTokens;
+            && agent.lastStreamInputTokens > agent.maxStreamTokens
+            && this.softRestartFits(agent);
 
           // Physical-window projection (issue #92): a turn's continuation
           // rounds append to the compiled request without recompiling, so a
@@ -23210,7 +23228,7 @@ export class AgentFramework {
           case 'usage': {
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
-            // The stream's accumulated fresh input, which is what the
+            // The stream's accumulated inputTokens, which is what the
             // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;
 
