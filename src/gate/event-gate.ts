@@ -4077,7 +4077,7 @@ export class EventGate {
    * then refuses again with its new end. Under "wake" nothing is held for it.)
    * Batches held for a refused judge call are judged now, unless a turn or the
    * host's quiesce still holds them; one refused again is held again. A
-   * refusal of a call asked before this, reported after it, holds nothing.
+   * refusal of a call asked before this, reported after it, doesn't stand.
    */
   providerCallsReleased(): void {
     if (this.disposed) return;
