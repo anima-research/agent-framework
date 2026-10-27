@@ -2533,4 +2533,155 @@ describe('the window follows a branch move (#291)', () => {
     assert.equal(h.framework.getUndoRedoState('mira').canRedo, false);
     assert.deepEqual(h.framework.redo('mira'), { redone: false });
   });
+
+  /** An autobiographical strategy that folds small chunks into L1s and merges four of them into an L2, compressing only when ticked. */
+  const folding = () => new AutobiographicalStrategy({
+    compressionModel: 'test-model', targetChunkTokens: 200, recentWindowTokens: 300, headWindowTokens: 0, mergeThreshold: 4,
+    autoTickOnNewMessage: false,
+  });
+  type FoldedSummary = { id: string; level: number; sourceIds: readonly string[] };
+  /** The rows a summary of `cm`'s strategy folds, through every level below it. */
+  const leavesOf = (cm: ContextManager, id: string): string[] => {
+    const summary = cm.getSummary(id) as FoldedSummary | null;
+    if (!summary) return [];
+    return summary.level === 1 ? [...summary.sourceIds] : summary.sourceIds.flatMap((source) => leavesOf(cm, source));
+  };
+  /** The rows the summaries `cm`'s strategy keeps fold. */
+  const foldedBy = (cm: ContextManager): Set<string> => new Set(
+    (cm.getStrategy() as unknown as { summaries: FoldedSummary[] }).summaries.flatMap((s) => leavesOf(cm, s.id)),
+  );
+  /** Tick `cm` until nothing is left to compress. */
+  const drain = async (cm: ContextManager): Promise<void> => {
+    for (let i = 0; i < 2000 && !cm.isReady(); i++) await cm.tick();
+    assert.equal(cm.isReady(), true, 'drained');
+  };
+  /** The rows `cm`'s compile renders, raw or folded in a summary, by their ids. */
+  const renderedBy = async (cm: ContextManager): Promise<string[]> => {
+    const compiled = await cm.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }, undefined, { dryRun: true });
+    const sources = (compiled as { provenance?: { messages: Array<{ kind: string; bodies?: Array<{ messageId: string }>; summaries?: Array<{ id: string }> }> } })
+      .provenance?.messages ?? [];
+    assert.ok(sources.length > 0, 'the compile has provenance');
+    return sources.flatMap((part) => part.kind === 'raw'
+      ? (part.bodies ?? []).map((body) => String(body.messageId))
+      : part.kind === 'summary' ? (part.summaries ?? []).flatMap((s) => leavesOf(cm, s.id)) : []);
+  };
+
+  it("a suppression through one of two folding residents takes the rows out of both windows and out of every summary of the other's: it follows the fork before the removals", async () => {
+    const h = await boot({ mira: folding, oren: folding });
+    // Compression answers with a summary; a turn's stream is the mock's own.
+    let compressions = 0;
+    h.membrane.complete = async () => createMockResponse(blocks(`[summary ${++compressions}] ` + 'mem '.repeat(20)));
+    const ids: string[] = [];
+    for (let i = 0; i < 60; i++) ids.push(String(h.internals.addMessage('someone', blocks(`TAG${i} ` + 'word '.repeat(60)), {}, {})));
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.cm(name).windowMode(), 'presented', name);
+      assert.deepEqual([...new Set(ids.map((id) => h.cm(name).windowStatusOf(id as MessageId)))], ['in'], `setup: every row is in ${name}'s window`);
+      await drain(h.cm(name));
+    }
+    const removed = ids.slice(9, 39);
+    for (const name of ['mira', 'oren']) {
+      const levels = (h.cm(name).getStrategy() as unknown as { summaries: FoldedSummary[] }).summaries.map((s) => s.level);
+      assert.ok(levels.includes(1) && levels.includes(2), `setup: ${name} folded into L1s and L2s: ${levels.join('')}`);
+      const folded = foldedBy(h.cm(name));
+      assert.equal(removed.filter((id) => folded.has(id)).length, removed.length, `setup: ${name}'s summaries fold every row to be removed`);
+    }
+    const refused: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { refused.push(args.map(String).join(' ')); error(...args); };
+    let r: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
+    try {
+      r = await h.framework.suppressMessages('mira', { messageIds: removed });
+      await settled();
+    } finally {
+      console.error = error;
+    }
+    assert.equal(r.messagesRemoved, removed.length);
+    const gone = new Set(removed);
+    for (const name of ['mira', 'oren']) {
+      const cm = h.cm(name);
+      assert.deepEqual([...new Set(removed.map((id) => cm.windowStatusOf(id as MessageId)))], ['absent'], `out of ${name}'s window`);
+      const folded = foldedBy(cm);
+      assert.deepEqual(removed.filter((id) => folded.has(id)), [], `no summary of ${name}'s folds a removed row`);
+      assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile renders no removed row`);
+      await drain(cm);
+      const refolded = foldedBy(cm);
+      assert.deepEqual(removed.filter((id) => refolded.has(id)), [], `nor once ${name}'s kept rows are folded again`);
+      assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile then renders none either`);
+    }
+    assert.deepEqual(refused.filter((line) => /onRetracted failed|requires reinitialization/.test(line)), [], "no strategy refused the rows' leaving");
+    await h.bothServe('after the suppression');
+  });
+
+  it('a rollback whose switch fails, and whose restore succeeds, leaves both residents presented and current on the source', async () => {
+    const h = await boot();
+    const main = h.store.currentBranch().name;
+    const first = h.internals.addMessage('someone', blocks('zz-first'), {}, { forAgent: 'mira' });
+    h.internals.addMessage('someone', blocks('zz-second'), {}, { forAgent: 'mira' });
+    await h.bothServe('before the rollback');
+    const mira = h.cm('mira') as unknown as { initializeStrategy: (...args: unknown[]) => Promise<void> };
+    const initializeStrategy = mira.initializeStrategy;
+    let failNext = true;
+    mira.initializeStrategy = async function (this: unknown, ...args: unknown[]) {
+      if (failNext) { failNext = false; throw new Error('zz-switch-init-failed'); }
+      return initializeStrategy.apply(this, args);
+    };
+    try {
+      await assert.rejects(
+        h.framework.rollbackToMessage('mira', { messageId: first, branchName: 'zz-failed-rollback' }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'failed' && /active branch restored to /.test(e.message),
+      );
+    } finally {
+      mira.initializeStrategy = initializeStrategy;
+    }
+    assert.equal(h.store.currentBranch().name, main);
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.internals.presents(h.framework.getAgent(name)!), true, `${name} presents`);
+      assert.equal(h.cm(name).windowMode(), 'presented', `${name}'s window`);
+    }
+    await h.bothServe('after the failed rollback');
+  });
+
+  it("a suppression whose removals fail after its fork, and whose restore succeeds, has the other resident follow the store back: both presented and current on the source", async () => {
+    const h = await boot();
+    const main = h.store.currentBranch().name;
+    const target = h.internals.addMessage('someone', blocks('zz-to-suppress'), {}, {});
+    await h.bothServe('before the suppression');
+    for (const name of ['mira', 'oren']) assert.equal(h.cm(name).windowStatusOf(target), 'in', `setup: in ${name}'s window`);
+    const mira = h.cm('mira') as unknown as { removeMessage: (...args: unknown[]) => void; removeMessages: (...args: unknown[]) => void };
+    const removeMessage = mira.removeMessage;
+    const removeMessages = mira.removeMessages;
+    mira.removeMessage = () => { throw new Error('zz-removal-failed'); };
+    mira.removeMessages = () => { throw new Error('zz-removal-failed'); };
+    try {
+      await assert.rejects(
+        h.framework.suppressMessages('mira', { messageIds: [target], branchName: 'zz-partly-suppressed' }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'failed' && /active branch restored to /.test(e.message),
+      );
+    } finally {
+      mira.removeMessage = removeMessage;
+      mira.removeMessages = removeMessages;
+    }
+    assert.equal(h.store.currentBranch().name, main);
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.cm(name).windowStatusOf(target), 'in', `the row stays in ${name}'s window on the source`);
+      assert.equal(h.internals.presents(h.framework.getAgent(name)!), true, `${name} presents`);
+      assert.equal(h.cm(name).windowMode(), 'presented', `${name}'s window`);
+    }
+    await h.bothServe('after the failed suppression');
+  });
+
+  for (const move of ['rollback', 'suppression'] as const) {
+    it(`a ${move} drops every redo entry, every agent's: each undid a window of the branch the store left`, async () => {
+      const h = await boot();
+      const first = h.internals.addMessage('someone', blocks('zz-first'), {}, { forAgent: 'oren' });
+      const second = h.internals.addMessage('someone', blocks('zz-second'), {}, { forAgent: 'oren' });
+      await h.bothServe('a round');
+      assert.equal(h.framework.undoLastTurn('mira').undone, true);
+      assert.equal(h.framework.getUndoRedoState('mira').canRedo, true, 'setup');
+      if (move === 'rollback') await h.framework.rollbackToMessage('oren', { messageId: first });
+      else await h.framework.suppressMessages('oren', { messageIds: [second] });
+      assert.equal(h.framework.getUndoRedoState('mira').canRedo, false);
+      assert.deepEqual(h.framework.redo('mira'), { redone: false });
+    });
+  }
 });

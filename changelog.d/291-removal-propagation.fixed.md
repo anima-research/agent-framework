@@ -9,6 +9,12 @@
   before the removal) keeps it, and a window that is still the record is never written to. A window that can't be
   repaired is logged, and the removal stands. A rollback needs none: it is a branch cut, made at the same place in
   every window.
+- A suppression on a presented window takes its rows out of what every reader of them folded (#291). Every other
+  agent's context follows the suppression's fork before the removals, so its strategy hears the rows leave its window:
+  an autobiographical strategy drops each summary that folded one of them, with every summary above it, and folds the
+  rows it keeps again, as the strategy of the context the suppression was made through does. Before, a suppression
+  was not retroactive over derived state, and a summary that had folded a suppressed row went on showing it; on a
+  window that is still the record it still isn't.
 - At start, each window lets go of the rows its record no longer holds that no live context heard removed, such as
   an offline recovery's suppressions, made through the one agent's context it opens with the host stopped
   (`presentation:retracted`, reason `boot`).

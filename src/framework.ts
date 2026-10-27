@@ -14254,9 +14254,13 @@ export class AgentFramework {
    * a marker-scheduling receipt (`markers`); delivery continues without the
    * caller waiting on it.
    *
-   * Not retroactive over derived state: a message already folded into an
-   * autobiographical summary stays in that summary — roll back to before it
-   * entered if that matters.
+   * On a presented window (#291) the removal reaches what every reader on
+   * the store folded: every other agent's context follows the fork before
+   * the removals (followBranchMove), so each one's strategy hears the rows
+   * leave, drops each summary that folded one and folds the rows it keeps
+   * again. In legacy mode it is not retroactive over derived state: a
+   * message already folded into an autobiographical summary stays in that
+   * summary — roll back to before it entered if that matters.
    */
   async suppressMessages(
     agentName: string,
@@ -14313,6 +14317,9 @@ export class AgentFramework {
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
       let moved = false;
+      // What following the fork found (followBranchMove), while the store is
+      // still where that follow left it.
+      let followed: ManagerReinitFailure[] | undefined;
       try {
         // A maintenance tick already running finishes before the fork.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -14340,9 +14347,13 @@ export class AgentFramework {
         try {
           createdBranch = await cm.fork(targetBranch);
           moved = true;
-          // Every other agent's context follows the fork at the release
-          // (followBranchMove), after the removals below, so each strategy
-          // loads the branch as suppressed.
+          // The fork moved the store under every other agent: their contexts
+          // follow it now (followBranchMove), before any removal reaches
+          // their windows. A strategy still at the old branch generation
+          // refuses onRetracted, and the re-initialization after it would
+          // load its summaries of the removed rows over tombstones already
+          // written, so they'd go on rendering what was suppressed.
+          followed = await this.followBranchMove(agentName);
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
@@ -14364,7 +14375,10 @@ export class AgentFramework {
         } catch (error) {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
-          // say honestly whether that restore happened.
+          // say honestly whether that restore happened. The other agents
+          // followed the fork; the release has them follow the store again,
+          // wherever the restore leaves it.
+          followed = undefined;
           const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, createdBranch, agentName, true);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
@@ -14396,7 +14410,10 @@ export class AgentFramework {
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         try {
-          if (moved) this.reportReinitFailures('suppression', await this.followBranchMove(agentName));
+          // A fork that landed was followed at once (above); a failed one, or
+          // one whose removals failed, is followed here, wherever its restore
+          // left the store.
+          if (moved) this.reportReinitFailures('suppression', followed ?? await this.followBranchMove(agentName));
         } finally {
           release();
         }
