@@ -4274,8 +4274,8 @@ describe('a closed channel\'s invitation offers the reply its agent\'s mode read
     hybrid: { line: `1. Reply — write your reply this turn prefixed with ">>>#side"; ${opens}\n`, reply: '>>>#side hello there' },
     locus: {
       line: `1. Reply — your plain speech lands where the latest word on where it lands says: a [routing] notice, or ` +
-        `channel_open's result. If that names #side (Guild One) (discord:g1:side), write your reply with no prefix; ${opens} ` +
-        `Otherwise, or if you see none, to reply here, ${sendTool}, or open it (option 2), whose result says where your plain ` +
+        `channel_open's result. If that is #side (Guild One) (discord:g1:side), write your reply with no prefix; ${opens} ` +
+        `If that is another channel, or you see none, to reply here, ${sendTool}, or open it (option 2), whose result says where your plain ` +
         `speech lands.\n`,
       reply: 'hello there',
     },
@@ -4331,21 +4331,27 @@ describe('a closed channel\'s invitation offers the reply its agent\'s mode read
         await h.close();
       }
     });
-    it(`reads the mode of the one live agent a push names: ${second}, beside the first agent's ${first} and a name no agent has`, async () => {
-      const h = await harness({ agents: [{ name: 'scout', proseRouting: first }, { name: 'quill', proseRouting: second }] });
-      try {
-        (h.framework as unknown as { handleMcplPushEvent(event: unknown): unknown }).handleMcplPushEvent({
-          type: 'mcpl:push-event', serverId: 'discord', featureSet: 'chat', eventId: 'ev-side', timestamp: new Date().toISOString(),
-          origin: { mcplChannelId: 'discord:g1:side', channelName: '#side (Guild One)', authorName: 'someone', messageId: 'in-side' },
-          content: [{ type: 'text', text: 'over here' }], tags: ['chat:mention', 'chat:addressed', 'chat:from-human'],
-          triggerInference: false, targetAgents: ['ghost', 'quill'],
-        });
-        await h.until(() => h.texts('quill').some((t) => t.includes('[Channel invitation]')), 'the invitation');
-        const invitation = h.texts('quill').find((t) => t.includes('[Channel invitation]'))!;
-        assert.ok(invitation.includes(offered[second].line), invitation);
-      } finally {
-        await h.close();
-      }
-    });
+    for (const [targetAgents, reads, which] of [
+      [['ghost', 'quill'], second, `the one live agent a push names: ${second}, beside the first agent's ${first} and a name no agent has`],
+      [['quill', 'quill'], second, `the one agent a push names twice: ${second}, beside the first agent's ${first}`],
+      [['quill', 'scout'], first, `the first agent, when a push names two live agents: ${first}, beside ${second}`],
+    ] as const) {
+      it(`reads the mode of ${which}`, async () => {
+        const h = await harness({ agents: [{ name: 'scout', proseRouting: first }, { name: 'quill', proseRouting: second }] });
+        try {
+          (h.framework as unknown as { handleMcplPushEvent(event: unknown): unknown }).handleMcplPushEvent({
+            type: 'mcpl:push-event', serverId: 'discord', featureSet: 'chat', eventId: 'ev-side', timestamp: new Date().toISOString(),
+            origin: { mcplChannelId: 'discord:g1:side', channelName: '#side (Guild One)', authorName: 'someone', messageId: 'in-side' },
+            content: [{ type: 'text', text: 'over here' }], tags: ['chat:mention', 'chat:addressed', 'chat:from-human'],
+            triggerInference: false, targetAgents: [...targetAgents],
+          });
+          await h.until(() => h.texts('quill').some((t) => t.includes('[Channel invitation]')), 'the invitation');
+          const invitation = h.texts('quill').find((t) => t.includes('[Channel invitation]'))!;
+          assert.ok(invitation.includes(offered[reads].line), invitation);
+        } finally {
+          await h.close();
+        }
+      });
+    }
   }
 });

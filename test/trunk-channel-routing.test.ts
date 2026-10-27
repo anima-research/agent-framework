@@ -168,6 +168,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
 
@@ -232,6 +233,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
 
@@ -302,6 +304,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (c: { serverId: string; channelId: string }) => { asked.push(`${c.serverId}/${c.channelId}`); return '@_reim0n'; },
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i.handleMcplPushEvent(dmEvent('m3'));
@@ -324,6 +327,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i2.handleMcplPushEvent(dmEvent('m4'));
@@ -346,6 +350,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i3.handleMcplPushEvent(dmEvent('m5'));
@@ -384,6 +389,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
         getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
         proseTargetFor: () => target,
         inboundOnlyServer: () => undefined,
+        nameShown: (c: { channelId: string }) => c.channelId,
         stopAll: () => {},
       };
       internals(framework).handleMcplPushEvent(mention(`m-${target ?? 'none'}`));
@@ -414,6 +420,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => '@_reim0n',
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i.handleMcplPushEvent({
@@ -453,6 +460,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => 'Body · ears',
       proseTargetFor: () => '#ears',
       inboundOnlyServer: (channel: { channelId: string }) => (channel.channelId === 'body:ears' ? 'pocket-body' : undefined),
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i.handleMcplPushEvent({
@@ -501,6 +509,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: (c: { channelId: string }) => ({ label: labels[c.channelId] }),
       getChannelLabel: (_serverId: string, id: string) => labels[id],
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     const textOf = () =>

@@ -695,6 +695,29 @@ test("a refusal names the channelId channel_publish reaches a channel it shows b
   assert.equal(odd.registry.publishRouteFor(['"b:room" on server "a" (no channelId reaches it alone)', 'c:b:room']), '');
 });
 
+test("the route a refusal names is the qualified name first, which a turn's own channel withdrawn with the same id doesn't take, and never an empty id", async () => {
+  const f = fixture([['a', 'x"y']]);
+  // Server "b" no longer registers its "x\"y", which is still the turn's own channel.
+  const own: ChannelRef[] = [{ serverId: 'a', channelId: 'x"y' }, { serverId: 'b', channelId: 'x"y' }];
+  const inTurn = { kind: 'agent', agentName: 'scout', own } as never;
+  const route = f.registry.publishRouteFor(['"x\\"y" on server "a"']);
+  assert.equal(route, ' For a channel shown by its id and server: channel_publish reaches "x\\"y" on server "a" with channelId "a:x\\"y".');
+  const offered = JSON.parse(/with channelId (".*")\.$/.exec(route)![1]!) as string;
+  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: offered, content: 'hello' }, inTurn);
+  assert.equal(posted.success, true, posted.error);
+  assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a x"y']);
+  // The bare id would mean both of the turn's channels, and be refused.
+  const bare = await f.registry.handleChannelToolCall('channel_publish', { channelId: 'x"y', content: 'hello' }, inTurn);
+  assert.equal(bare.success, false);
+  // A channel whose id is empty is reached by its qualified name; channel_publish refuses an empty channelId.
+  const empty = fixture([['a', '']]);
+  const emptyRoute = empty.registry.publishRouteFor(['"" on server "a"']);
+  assert.equal(emptyRoute, ' For a channel shown by its id and server: channel_publish reaches "" on server "a" with channelId "a:".');
+  const reached = await empty.registry.handleChannelToolCall('channel_publish', { channelId: 'a:', content: 'hello' });
+  assert.equal(reached.success, true, reached.error);
+  assert.deepEqual(empty.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a ']);
+});
+
 test("a turn's channels sharing an id whose qualified names don't show as themselves stay reachable by those names, as JSON", async () => {
   const f = fixture([['a', 'x"y'], ['b', 'x"y']]);
   const own: ChannelRef[] = [{ serverId: 'a', channelId: 'x"y' }, { serverId: 'b', channelId: 'x"y' }];
@@ -1322,7 +1345,7 @@ for (const order of orders) {
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce')
       .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text))[0] ?? '';
     assert.ok(bounce.includes('"gen\\"a" on server "a"'), bounce);
-    assert.ok(bounce.includes('channel_publish reaches "gen\\"a" on server "a" with channelId "gen\\"a"'), bounce);
+    assert.ok(bounce.includes('channel_publish reaches "gen\\"a" on server "a" with channelId "a:gen\\"a"'), bounce);
     assert.ok(!bounce.includes('serverId'), 'channel_publish takes no serverId, so the bounce names none');
   });
 

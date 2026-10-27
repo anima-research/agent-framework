@@ -15396,7 +15396,7 @@ export class AgentFramework {
     const withoutOpening = tunedOut
       ? ''
       : " To reply without opening it, decline it first (option 3): a channel you've declined stays closed when you speak there.";
-    const named = opts.targetAgents?.filter((name) => this.agents.has(name)) ?? [];
+    const named = [...new Set(opts.targetAgents ?? [])].filter((name) => this.agents.has(name));
     const woken = named.length === 1 ? this.agents.get(named[0]!) : undefined;
     const mode = (woken ?? this.deliveryAgent())?.proseRouting ?? 'locus';
     const prefix = mode === 'hybrid' ? '>>>' : '>>';
@@ -15405,7 +15405,7 @@ export class AgentFramework {
       : 'it will be delivered there, and the channel stays closed.';
     const sendTool = `check whether ${opts.serverId} exposes a send tool that can address it`;
     const plainSpeechRule = `your plain speech lands where the latest word on where it lands says: ` +
-      `a [${NOTICE_TAG.routing}] notice, or channel_open's result. If that names ${this.channelShown(channel)}, ` +
+      `a [${NOTICE_TAG.routing}] notice, or channel_open's result. If that is ${this.channelShown(channel)}, ` +
       `write your reply with no prefix;`;
     const replyOption = inboundOnlyServer
       ? `1. Replying there isn't available: ${inboundOnlyServer} declared this channel inbound-only, so nothing ` +
@@ -15413,10 +15413,11 @@ export class AgentFramework {
       : mode === 'disabled'
         ? `1. Replying in plain text isn't available: your plain text is never published. To speak there, ${sendTool}.\n`
         : mode === 'locus' && tunedOut
-          ? `1. Reply — ${plainSpeechRule} it will be delivered there. Otherwise, or if you see none, to reply here, ${sendTool}.\n`
+          ? `1. Reply — ${plainSpeechRule} it will be delivered there. If that is another channel, or you see none, to reply here, ` +
+            `${sendTool}.\n`
           : mode === 'locus'
-            ? `1. Reply — ${plainSpeechRule} ${delivered} Otherwise, or if you see none, to reply here, ${sendTool}, or open ` +
-              `it (option 2), whose result says where your plain speech lands.\n`
+            ? `1. Reply — ${plainSpeechRule} ${delivered} If that is another channel, or you see none, to reply here, ` +
+              `${sendTool}, or open it (option 2), whose result says where your plain speech lands.\n`
           : target
             ? `1. Reply — write your reply this turn prefixed with "${prefix}${target}"; ${delivered}\n`
             : `1. Reply — no single-word target reaches this channel unambiguously, ` +
@@ -32675,13 +32676,15 @@ export class AgentFramework {
               noteTurnChannel(callingTurn, opened);
               this.lastAnnouncedLocus.set(agentName, opened);
               const inboundOnlyServer = this.channelRegistry?.inboundOnlyServer(opened);
+              // The routing word comes first, ahead of any backscroll, so a
+              // result cut to its head for being long keeps it.
               result = {
                 ...result,
                 data: {
-                  ...(result.data as Record<string, unknown> | undefined),
                   routing: inboundOnlyServer
                     ? `${inboundOnlySpeechNote(inboundOnlyServer)} Other channels need an explicit send tool.`
                     : 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
+                  ...(result.data as Record<string, unknown> | undefined),
                 },
               };
               console.error(

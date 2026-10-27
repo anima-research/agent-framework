@@ -4519,11 +4519,12 @@ export class ChannelRegistry {
   /**
    * The turn's channels a name means neither of (ownChannelNamed), each by a
    * string that reaches it outside the turn's rule: its server-qualified
-   * name, where that picks it alone, since its id is the name refused: as
-   * itself, or as JSON where it wouldn't show as itself, and by its id and
-   * server in `prose`, which a `>>` target reads. One no string picks alone,
-   * and one its server no longer registers, are named by id and server,
-   * saying so. `reaches` says which a name reaches.
+   * name, where that picks it alone, since its id is the name refused. `text`
+   * is that name, which a refusal writes as JSON; `prose`, which a `>>`
+   * target reads, is that name where it shows as itself, else its id and
+   * server. One no string picks alone, and one its server no longer
+   * registers, are named by id and server in both, saying so. `reaches` says
+   * which a name reaches.
    */
   private ownCandidates(channels: readonly ChannelRef[]): Array<{ text: string; prose: string; reaches: boolean; byServer: boolean }> {
     return channels.map((c) => {
@@ -4545,10 +4546,13 @@ export class ChannelRegistry {
   /**
    * What a refusal listing these candidates says of each one that is a
    * channel shown by its id and server: the channelId channel_publish reaches
-   * it by (its id or server-qualified name, whichever picks it alone), or that
-   * no channelId reaches it alone. It leaves out a channel no longer
-   * registered and a candidate that already says no channelId reaches it
-   * alone, and is empty when nothing is left.
+   * it by, or that no channelId reaches it alone. That is its server-qualified
+   * name where that picks it alone, since a bare id is what a turn's own
+   * channels answer to first, whether or not their server still registers
+   * them (ownChannelNamed), and else its id where that picks it alone and
+   * isn't empty (channel_publish refuses an empty one). It leaves out a channel no
+   * longer registered and a candidate that already says no channelId reaches
+   * it alone, and is empty when nothing is left.
    */
   publishRouteFor(candidates: readonly string[]): string {
     const parts = new Set<string>();
@@ -4558,7 +4562,10 @@ export class ChannelRegistry {
       const ref: ChannelRef = { channelId: JSON.parse(shown[1]!) as string, serverId: JSON.parse(shown[2]!) as string };
       const entry = this.entryAt(ref);
       if (!entry) continue;
-      const name = this.nameFor(entry);
+      const name = [qualifiedChannelName(ref), ref.channelId].find((n) => {
+        const named = n === '' ? [] : this.entriesNamed(n);
+        return named.length === 1 && named[0] === entry;
+      });
       parts.add(name !== undefined
         ? `channel_publish reaches ${channelOnServer(ref)} with channelId ${quotedValue(name)}`
         : `no channelId reaches ${channelOnServer(ref)} alone`);
