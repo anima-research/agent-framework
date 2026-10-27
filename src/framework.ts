@@ -91,7 +91,7 @@ import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } f
 import { checkToolPattern, describeUnmatchedPattern, type PatternServer } from './mcpl/tool-pattern-check.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
-import { readSkipReplyWake, skipReplyWakeRefusal } from './mcpl/skip-reply-wake.js';
+import { readSkipReplyWake, skipReplyWakeRefusal, type SkipReplyEarlierWake } from './mcpl/skip-reply-wake.js';
 import { convertBlocks } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
@@ -115,6 +115,7 @@ import { SEND_TOOLS, bareToolName } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
+import { Refusal, errnoCode, errnoWayOn, systemWords } from './modules/workspace/answers.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   goesNative,
@@ -803,9 +804,9 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
-import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
+import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
-import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatWake } from './heartbeat/heartbeat.js';
+import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatScheduledWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -1365,10 +1366,11 @@ interface TurnRouting {
    * for a re-inference, flushed at the end of a stream that didn't settle
    * the turn, or stored by the start that continues it. So is one a boundary
    * drained but couldn't re-pin for, being over budget or without a live
-   * stream. A message stored for another ordinary resident is one whenever
-   * it lands, since residents read one message slot and a boundary weighs
-   * only the messages drained for its own agent (noteForOtherResidents). A
-   * message tune-out diverted isn't one, since a resident's compiled view
+   * stream. A message stored for another ordinary resident is one when it
+   * lands, since residents read one message slot and a boundary weighs only
+   * the messages drained for its own agent (noteForOtherResidents). A message
+   * the agent's own view leaves out, such as one tune-out diverted or another
+   * agent's stored context injection, isn't one, since its compiled view
    * leaves it out. A boundary that re-pins clears them, since what it injects
    * is newer. The turn's next start clears them all, and in locus or hybrid
    * mode first re-pins to the newest one still in the agent's store, as a
@@ -3195,6 +3197,17 @@ const JUDGE_PARAMETER: ToolParameter = {
   required: ['debounceMs'],
 };
 
+/** Whether a server's configuration resolves to the MCPL (legacy) family,
+ *  the one that can negotiate RFC-014 tool hints. A configuration that names
+ *  no usable transport is refused elsewhere; here it has no hints. */
+function isLegacyFamily(config: McplServerConfig): boolean {
+  try {
+    return resolveServerBinding(config).family === 'legacy';
+  } catch {
+    return false;
+  }
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -3722,6 +3735,7 @@ export class AgentFramework {
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
   private readonly openManagerRefs = new WeakMap<ContextManager, WeakRef<ContextManager>>();
+  private readonly storeSees = new WeakMap<ContextManager, (metadata: unknown) => boolean>();
   private readonly collectedManagers = new FinalizationRegistry<WeakRef<ContextManager>>((ref) => this.openManagers.delete(ref));
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -3861,9 +3875,10 @@ export class AgentFramework {
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
-  /** MCPL RFC-014: every toolHints server's tool presence, for the
+  /** MCPL RFC-014: every hinted server's tool presence, for the
    *  `toolsets` module's meta-tools and reminders. Made when the first
-   *  server configured with `toolHints: true` is set up; null until then. */
+   *  server with tool hints (any not configured `toolHints: false`) is set
+   *  up; null until then. */
   private toolsetHub: ToolsetHub | null = null;
   /** Inference routing policy from FrameworkConfig — stored so the MCPL
    *  subsystem can be lazily initialized by connectMcplServer when the
@@ -4288,6 +4303,8 @@ export class AgentFramework {
         upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
       });
       framework.judgeWired = judge !== undefined;
+      const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
+      const heartbeatOn = config.heartbeat !== undefined && config.heartbeat !== null && config.heartbeat !== false;
       framework.eventGate = new EventGate({
         configPath,
         initialConfig: config.gate.config,
@@ -4354,6 +4371,15 @@ export class AgentFramework {
         // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
         // to decide (placeWakeLines).
         isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
+        // What a source can send, for the rule-order notes: an MCPL server's
+        // events reach the gate as its pushes and channel messages only (a
+        // module's events carry a source of the module's own, such as "cli"
+        // or "mcpl:<id>"), and the heartbeat's ticks as pushes.
+        eventTypesFrom: (source) => {
+          if (configuredServerIds.has(source) || framework.mcplServerConfigs.has(source)) return MCPL_GATE_EVENT_TYPES;
+          if (source === 'heartbeat' && heartbeatOn) return ['mcpl:push-event'];
+          return undefined;
+        },
         resolveRouteChannel: (info) => {
           if (info.eventType === 'mcpl:channel-incoming') return info.channelId || undefined;
           if (info.eventType === 'mcpl:push-event') {
@@ -4501,8 +4527,9 @@ export class AgentFramework {
       // settings, and its tool prefix, which mustn't collide with a module
       // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
-      // RFC-014: a server configured with toolHints brings the toolsets
-      // module, whose name no prefix may take either.
+      // RFC-014: a server configured with toolHints: true brings the toolsets
+      // module, whose name no prefix may take either. A server that leaves
+      // the setting out has hints only where that name is free (hintsFor).
       if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) moduleNames.add(TOOLSETS_MODULE);
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
@@ -4526,7 +4553,8 @@ export class AgentFramework {
         prefixesSeen.set(prefix, serverConfig.id);
       }
 
-      if (config.mcplServers.some((serverConfig) => serverConfig.toolHints === true)) await framework.ensureToolsetsModule();
+      framework.reserveToolsetsName(config.modules, config.mcplServers);
+      if (config.mcplServers.some((serverConfig) => framework.hintsFor(serverConfig))) await framework.ensureToolsetsModule();
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -5515,20 +5543,45 @@ export class AgentFramework {
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
-    // The heartbeat's ticks and reminders, which the agent's rules decide as
-    // they decide a heartbeat push: one the rules would hold back is listed
-    // as only a "maybe".
-    if (this.heartbeat && this.heartbeatTargets().includes(agentName)) {
-      const probe = (kind: 'heartbeat' | 'reminder'): boolean => !this.eventGate
-        || this.eventGate.probe(this.heartbeatGateEvent({ kind, eventId: 'probe', text: 'probe' })).trigger;
-      const tickWakes = probe('heartbeat');
-      const reminderWakes = probe('reminder');
-      for (const w of this.heartbeat.upcomingWakes()) {
-        const isReminder = w.what.startsWith('its reminder');
-        wakes.push((isReminder ? reminderWakes : tickWakes) ? w : { ...w, certain: false });
-      }
-    }
+    wakes.push(...this.heartbeatWakesFor(agentName));
     return wakes;
+  }
+
+  /**
+   * The heartbeat's ticks and reminders for `agentName`, soonest first, which
+   * the agent's rules decide as they decide a heartbeat push: one the rules
+   * would hold back is only a "maybe" (`certain` false). Each is probed as
+   * the event its delivery is judged by (deliverHeartbeat): a silent tick as
+   * silent, with the text it will bring, so a rule on the content or the
+   * silent flag decides the probe as it will decide the wake. None for an
+   * agent the heartbeat doesn't wake. `whose` words them for the judge ("its
+   * heartbeat") or for the agent ("your heartbeat").
+   */
+  private heartbeatWakesFor(agentName: string, whose: 'its' | 'your' = 'its'): HeartbeatScheduledWake[] {
+    if (!this.heartbeat || !this.heartbeatTargets().includes(agentName)) return [];
+    const wakes = (w: HeartbeatScheduledWake): boolean => !this.eventGate
+      || this.eventGate.probe(this.heartbeatGateEvent({ kind: w.kind, eventId: 'probe', text: w.text, silent: w.silent })).trigger;
+    return this.heartbeat.scheduledWakes(whose).map((w) => (wakes(w) ? w : { ...w, certain: false }));
+  }
+
+  /**
+   * The heartbeat's wake due before a self-wake due at `selfWakeAt` (ms), for
+   * the skip_reply that armed it: the soonest of its ticks and reminders that
+   * the agent's rules, as they stand, let wake it. The confirmation says when
+   * it's due, not that it will wake the agent (skipReplyNote), so a probe
+   * that can't foresee the gate at the wake's time (a gate.js, a rate limit's
+   * tokens then) leaves it true. A failure here costs only that line: the
+   * self-wake is armed already, and the confirmation goes out without it.
+   */
+  private heartbeatWakeBefore(agentName: string, selfWakeAt: number): SkipReplyEarlierWake | undefined {
+    try {
+      const now = Date.now();
+      const first = this.heartbeatWakesFor(agentName, 'your').find((w) => w.certain && w.at < selfWakeAt);
+      return first ? { inSeconds: Math.max(1, Math.round((first.at - now) / 1000)), what: first.what } : undefined;
+    } catch (err) {
+      console.error(`[self-wake] agent=${agentName}: the heartbeat's wakes couldn't be read for skip_reply's note: ${logDetail(err instanceof Error ? err.message : String(err))}`);
+      return undefined;
+    }
   }
 
   /** The agents the heartbeat wakes: the residents, not conversation forks,
@@ -7128,6 +7181,8 @@ export class AgentFramework {
   private setMcplServerConfig(config: McplServerConfig): void {
     this.mcplServerConfigs.set(config.id, config);
     referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+    // The gate's rule-order notes read which sources are servers.
+    this.eventGate?.sourcesChanged();
   }
 
   /** Register every RFC-005 reference in an MCPL peer's tool-result content
@@ -10496,16 +10551,18 @@ export class AgentFramework {
         'Add or replace a wake rule (a gate.json policy) at runtime — no need to ' +
         'hand-edit the file. The rule is validated and hot-applied immediately. ' +
         'A rule with the same `name` replaces the existing one in place (add a ' +
-        'position to move it). ⚠️ ORDERING IS SEMANTICS: first match wins, and a ' +
-        'matched rule CONSUMES the event — a broad rule placed early makes every ' +
-        'later rule unreachable for its scope, including your addressed-message ' +
-        '(DM/mention) wake rules. Prefer `insertBefore`/`insertAfter` to place a ' +
-        'rule relative to a specific existing rule; use `position: "prepend"` only ' +
-        'when the rule really must beat EVERYTHING. For "additionally wake me ' +
-        'every Nth event / at most N per hour" governors, set `passthrough: true` ' +
-        'so non-firing matches fall through to your normal rules instead of ' +
-        'swallowing them. The result includes a before/after probe table and any ' +
-        'shadow warnings — READ THEM before ending the turn. Two common shapes:\n' +
+        'position to move it). Rules are checked in order and the first one that ' +
+        'matches an event decides it, so the rules below never see that event: a ' +
+        'broad rule placed early takes events from them, your DM and mention ' +
+        'rules included. Place a rule next to a particular one with ' +
+        '`insertBefore`/`insertAfter`; `position: "prepend"` puts it above all of ' +
+        'them. For a rule that only adds wakes ("also wake me every Nth event", ' +
+        '"at most N an hour"), set `passthrough: true`: the events it doesn\'t ' +
+        'wake for go on to your other rules. The result shows how a few common ' +
+        'events are decided before and after the change. Its `shadowWarnings` ' +
+        'are notes on your whole rule list, not only this change, wherever an ' +
+        'earlier rule takes events a later one could get: each says whether that ' +
+        'matters and what to do about it. Two common shapes:\n' +
         '• Watch a FILE/workspace path: match on `mount` + `pathGlob`, e.g. ' +
         '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
         '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
@@ -13444,6 +13501,9 @@ export class AgentFramework {
   }
 
   private async createAgent(config: AgentConfig): Promise<Agent> {
+    const sees = (metadata: unknown): boolean =>
+      !(metadata as { tuneOut?: unknown } | undefined)?.tuneOut
+      && !isAnotherAgentsInjection(metadata, config.name);
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -13464,10 +13524,10 @@ export class AgentFramework {
       // Another agent's stored context injections (stored-injections.ts) are
       // that agent's context, not conversation: they stay out of this view,
       // and so out of its folds, as the residents share this slot.
-      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut
-        && !isAnotherAgentsInjection(message.metadata, config.name),
+      viewFilter: (message) => sees(message.metadata),
     });
     this.trackManager(contextManager);
+    this.storeSees.set(contextManager, sees);
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
@@ -13535,6 +13595,7 @@ export class AgentFramework {
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
+    const sees = (metadata: unknown): boolean => !isAnotherAgentsInjection(metadata, name);
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,
@@ -13545,12 +13606,13 @@ export class AgentFramework {
       // residents' stored context injections (stored-injections.ts): their
       // context, which this agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
-      viewFilter: (message) => !isAnotherAgentsInjection(message.metadata, name),
+      viewFilter: (message) => sees(message.metadata),
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
     this.trackManager(contextManager);
+    this.storeSees.set(contextManager, sees);
 
     // Inherit the principal's inference settings wholesale (fork-template
     // idiom): reasoning effort (thinking), provider params, token ceilings,
@@ -13878,11 +13940,12 @@ export class AgentFramework {
           // with everything queued behind it — the queue keeps its order —
           // for the turn-end flush, where no reply follows it in this stream.
           //
-          // A message a tune-out holds from the residents is drained and
-          // stored like any other, but not injected: every resident's
-          // viewFilter leaves it out of the next compile as well, so the
-          // window's compiled prefix and the live request still match without
-          // it (#232 gap 5).
+          // A message the agent's own view filter leaves out, such as one a
+          // tune-out holds from the residents or another agent's stored
+          // context injection, is drained and stored like any other, but not
+          // injected: the next compile leaves it out as well, so the window's
+          // compiled prefix and the live request still match without it
+          // (#232 gap 5).
           //
           // A stream that declares it can't carry injected messages
           // (supportsInjectedMessages false: membrane's XML prefill path,
@@ -13918,11 +13981,7 @@ export class AgentFramework {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
-              // A message a tune-out holds from the residents is stored (the
-              // subconscious reads it) and left out of every resident's
-              // compiled view; injecting it here would put in the live turn
-              // what the next compile hides (#232 gap 5).
-              if ((msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) continue;
+              if (!this.agentSees(agent, msg.metadata)) continue;
               heard.push({ msg, id, content });
             }
             // Rendered in one call: a render prepares as a compile does, so
@@ -13934,10 +13993,12 @@ export class AgentFramework {
             const rendered = this.renderForInjection(agent, [...(clock ? [clock.id] : []), ...heard.map((h) => h.id)]);
             const first = clock ? 1 : 0;
             // A null is a message the render places before its window. Under
-            // the memory strategy that's one before its recent window, when
-            // what this boundary stored is bigger than it, or any message
-            // while a head window a topic change reset hasn't filled yet. The
-            // next compile still sends it, raw and in order, after the tool
+            // context-manager 0.23.0's memory strategy that's one before its
+            // recent window, when what this boundary stored is bigger than it,
+            // or any message while a head window a topic change reset hasn't
+            // filled yet; from 0.23.1 that strategy gives no null for a
+            // message its view holds. The next compile still sends such a
+            // message, raw and in order, after the tool
             // result, so leaving it out would change the prefix as surely as
             // any form, and the agent wouldn't hear it (context-manager#275's
             // review, R1-1). It goes in as stored, which is the form the next
@@ -13948,13 +14009,12 @@ export class AgentFramework {
             // cap reaches it. And a body the strategy stored in parts goes in
             // whole, joined as the store reads it back, where the next
             // compile sends it in more than one piece.
-            // That rests on two things. The only view filter this framework
-            // gives a store is the tune-out stamp (createAgent's; the other
-            // stores it opens have none), and a stamped message is skipped
-            // above, so no null here means a message the view hides. And the
-            // store and the render run with nothing between them, so nothing
-            // can put a summary in place of what this flush stored, or move
-            // windowed passthrough's anchor past it, before the render. A
+            // That rests on two things. A message the agent's own view filter
+            // leaves out is skipped above, by that filter, so no null here
+            // means a message the view hides. And the store and the render
+            // run with nothing between them, so nothing can put a summary in
+            // place of what this flush stored, or move windowed passthrough's
+            // anchor past it, before the render. A
             // write found here that landed at an earlier flush
             // (writeDrainedInOrder) is the exception: by now a summary may
             // stand in for it, or the anchor be past it, and then it goes in
@@ -16227,19 +16287,13 @@ export class AgentFramework {
     // Every agent that can read this message must not have compiled past it.
     // Residents share one message slot, so a message one of them read is
     // history for all of them (the never-rewrite rule is about the message,
-    // not the agent that happened to be asked). A tune-out-diverted message
-    // never enters a resident's compiled view; only the subconscious reads
-    // it through its merged view — no subconscious, nobody reads it.
-    let readers: Agent[];
-    if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
-      const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
-      if (!subconscious) return true;
-      readers = [subconscious];
-    } else {
-      readers = this.sharedSlotAgents.has(agent)
-        ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
-        : [agent];
-    }
+    // not the agent that happened to be asked). A reader is one whose view
+    // filter keeps the message: a tune-out-diverted message never enters a
+    // resident's compiled view, and only the subconscious reads it through
+    // its merged view — no subconscious, nobody reads it.
+    const readers = (this.sharedSlotAgents.has(agent)
+      ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
+      : [agent]).filter((a) => this.agentSees(a, message.metadata));
     const branch = cm.currentBranch().name;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
     for (const reader of readers) {
@@ -18493,17 +18547,23 @@ export class AgentFramework {
     return { newestRowAt, lastClockAt: undefined };
   }
 
+  private agentSees(agent: Agent, metadata: unknown): boolean {
+    const sees = this.storeSees.get(agent.getContextManager());
+    return !sees || sees(metadata);
+  }
+
   /**
    * Weigh a message that no tool boundary of the agent's open logical turn
    * will weigh: one that would re-pin the locus becomes one of the turn's
-   * arrivals (TurnRouting.arrivals). A message tune-out diverted
-   * (metadata.tuneOut) never enters a resident's compiled view, so the agent
-   * won't see it, and it moves nothing.
+   * arrivals (TurnRouting.arrivals). A message the agent's own view leaves
+   * out, such as one a tune-out diverted (metadata.tuneOut), never enters
+   * its compiled view, so the agent won't see it, and it moves nothing.
    */
   private noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void {
     const open = this.openLogical.get(agentName);
     if (!open) return;
-    if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
+    const agent = this.agents.get(agentName);
+    if (agent && !this.agentSees(agent, metadata)) return;
     if (isConversationalInjection(metadata)) (open.heard ??= new Map()).set(messageId, ++lastHeardAt);
     const channel = this.repinChannel(metadata, open);
     if (channel) open.arrivals.push({ messageId, channel });
@@ -25994,10 +26054,18 @@ export class AgentFramework {
         }
         const wake = readSkipReplyWake(enrichedCall.input);
         if (wake.kind === 'wake' && this.eventGate) {
+          const armedAt = Date.now();
           const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          // The heartbeat's tick or reminder due before the timer: if it wakes
+          // the agent, its turn cancels the timer, so the confirmation names
+          // it and the time the self-wake would have left.
+          const earlierWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
           console.error(armed
             ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
+              + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
             : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
+          this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
+          return;
         }
       }
       this.dispatchChannelToolCall(agentName, enrichedCall);
@@ -26214,7 +26282,7 @@ export class AgentFramework {
     // messages flush at the next turn's START (before its compile — riding
     // their own wake), at the agent's next tool boundary (where they are
     // ALSO injected into the live stream — hear-while-acting — all but a
-    // message a tune-out holds from the residents), or in driveStream's
+    // message the agent's own view leaves out), or in driveStream's
     // finally when the turn ends.
     // Quiesce (issue #122): the window exists to run compression/refold
     // against a FROZEN context — module events and api message.send must not
@@ -26402,18 +26470,20 @@ export class AgentFramework {
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
-   *  clock rows and stored context injections after it aside: a channel
-   *  message by its server, channel and message id, a push event by its
-   *  server and event id, and never one a tune-out holds. Past
+   *  clock rows, stored context injections and rows the agent's own view
+   *  leaves out after it aside: a channel message by its server, channel and
+   *  message id, a push event by its server and event id, and never one the
+   *  agent's view leaves out, such as one a tune-out holds. Past
    *  NEWEST_SCAN_ROWS such rows, it answers no. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
     // A clock row the framework wrote after it (a turn start's, an event's),
     // or a stored context injection (any agent's, a start's), isn't a
     // message a reply could be meant for, so it doesn't count.
     const newest = agent.getContextManager().queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages
-      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata));
+      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata)
+        && this.agentSees(agent, m.metadata));
     const md = newest?.metadata as Record<string, unknown> | undefined;
-    if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
+    if (!md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
     if (entry.eventType === 'mcpl:channel-incoming') {
       return entry.messageId !== undefined && md.messageId === entry.messageId && md.channelId === entry.channelId;
     }
@@ -29465,14 +29535,62 @@ export class AgentFramework {
     });
   }
 
+  /** RFC-014: who held the name `toolsets` at startup (a module, or a
+   *  server's toolPrefix), so a server that leaves toolHints out has none
+   *  for the life of this framework; null when the name was free. */
+  private toolsetsNameHeldAtStart: string | null = null;
+
+  /** At startup: note who holds the name the meta-tools need, and say which
+   *  servers that leaves without hints. */
+  private reserveToolsetsName(modules: readonly Module[], servers: readonly McplServerConfig[]): void {
+    const module = modules.find((m) => m.name === TOOLSETS_MODULE);
+    const server = servers.find((s) => (s.toolPrefix ?? `mcpl--${s.id}`) === TOOLSETS_MODULE);
+    this.toolsetsNameHeldAtStart = module ? `module "${TOOLSETS_MODULE}"` : server ? `MCPL server "${server.id}"'s toolPrefix` : null;
+    if (!this.toolsetsNameHeldAtStart) return;
+    // Those that would have had hints: MCPL servers that leave the setting
+    // out, other than the one whose prefix holds the name.
+    const defaulted = servers
+      .filter((s) => s !== server && (s.toolHints === undefined || s.toolHints === null) && isLegacyFamily(s))
+      .map((s) => s.id);
+    if (defaulted.length) {
+      console.error(
+        `[mcpl] tool hints (RFC-014) are off for ${defaulted.join(', ')}, which leave toolHints out: the name "${TOOLSETS_MODULE}" ` +
+          `the meta-tools need is ${this.toolsetsNameHeldAtStart}. Free the name to give them hints, or set toolHints: false on them to keep them off without this line.`,
+      );
+    }
+  }
+
+  /**
+   * RFC-014: whether a server has tool hints. Only an MCPL (legacy-family)
+   * server can: a modern MCP server never has them. `true` and `false` are
+   * as configured. Left out (or null) they're on, wherever the name
+   * `toolsets` the meta-tools need is free: no other module holds it and no
+   * server's prefix is it, now or at startup. So a configuration that loaded
+   * when hints were opt-in still loads. A name held at startup stays held
+   * for the framework's life.
+   */
+  private hintsFor(config: McplServerConfig): boolean {
+    if (config.toolHints === false || !isLegacyFamily(config)) return false;
+    if (config.toolHints === true) return true;
+    if (this.toolsetsNameHeldAtStart !== null) return false;
+    if ((config.toolPrefix ?? `mcpl--${config.id}`) === TOOLSETS_MODULE) return false;
+    const module = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
+    if (module && !(module instanceof ToolsetsModule)) return false;
+    // A restart moving its server to the prefix holds the name as a claim.
+    if (this.restartClaims().prefixes.has(TOOLSETS_MODULE)) return false;
+    const owner = this.mcplPrefixMap.get(TOOLSETS_MODULE);
+    return owner === undefined || owner === config.id;
+  }
+
   /**
    * The host capabilities offered to one server: the host's own, plus
-   * RFC-014's `toolHints` where its configuration asks for them. Without it,
-   * the very object every server is offered.
+   * RFC-014's `toolHints` unless its configuration turns them off
+   * (`toolHints: false`). With them off, the very object every server is
+   * offered.
    */
-  private mcplHostCapabilitiesFor(config: McplServerConfig): McplHostCapabilities {
+  private mcplHostCapabilitiesFor(config: McplServerConfig, hints = this.hintsFor(config)): McplHostCapabilities {
     const base = this.mcplHostCapabilities!;
-    return config.toolHints === true ? { ...base, toolHints: true } : base;
+    return hints ? { ...base, toolHints: true } : base;
   }
 
   /** RFC-014: every toolHints server's presence, made on first use. */
@@ -29493,14 +29611,14 @@ export class AgentFramework {
   }
 
   /** RFC-014: the `toolsets` module (toolsets--open, --act, --look,
-   *  --close), registered once, by the first server configured with
-   *  toolHints. Its tools don't change after that. */
+   *  --close), registered once, by the first server with tool hints (any
+   *  not configured `toolHints: false`). Its tools don't change after that. */
   private async ensureToolsetsModule(): Promise<void> {
     const hub = this.toolsets();
     const existing = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
     if (existing instanceof ToolsetsModule) return;
     if (existing) {
-      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints needs that name for its meta-tools`);
+      throw new Error(`A module named "${TOOLSETS_MODULE}" is registered, and a server configured with toolHints: true needs that name for its meta-tools: set toolHints: false on it, or leave the setting out to have hints only where the name is free`);
     }
     await this.addModule(new ToolsetsModule(hub, (call) => this.changeTaker(call)));
   }
@@ -29706,23 +29824,27 @@ export class AgentFramework {
     let registeredEpoch = 0;
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
+    // RFC-014: decided once for this connect, so the meta-tools, the offer
+    // and the read tap agree though the state hintsFor reads can change
+    // across the awaits below.
+    const hints = this.hintsFor(config);
     try {
-      // RFC-014: a toolHints server's meta-tools exist before it connects.
-      if (config.toolHints === true) await this.ensureToolsetsModule();
+      // RFC-014: a hinted server's meta-tools exist before it connects.
+      if (hints) await this.ensureToolsetsModule();
       // Its policy exchange is in flight from its registration until the
       // exchange settles: an opener that runs meanwhile (a resume, startup's
       // staged open) passes the connection by, so nothing opens its planes
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
         connectionConfig,
-        this.mcplHostCapabilitiesFor(config),
+        this.mcplHostCapabilitiesFor(config, hints),
         abort.signal,
         (registering) => {
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
           // RFC-014 §6.1: hints apply as the connection reads them, from its
           // first message, so the tap is on before any I/O can deliver one.
-          if (config.toolHints === true) this.toolsets().controllerFor(config).attach(registering);
+          if (hints) this.toolsets().controllerFor(config).attach(registering);
         },
       );
     } catch (error) {
@@ -30047,7 +30169,7 @@ export class AgentFramework {
       // instances; toolHints withdrawn makes every tool static. Its impact is
       // surface-changed, applied, with no grant consequence (§17.6).
       const declarations = toolsetDeclarationsOf(fetched);
-      const toolsetsChanged = config.toolHints === true
+      const toolsetsChanged = this.hintsFor(config)
         && JSON.stringify(declarations) !== JSON.stringify(connection.toolsetDeclarations);
       connection.toolsetDeclarations = declarations;
       if (toolsetsChanged) this.toolsetHub?.get(connection.id)?.manifestChanged(declarations);
@@ -30503,6 +30625,7 @@ export class AgentFramework {
       }
       this.mcplServerConfigs.delete(id);
       referenceRegistry.forgetServerAddress(id, this);
+      this.eventGate?.sourcesChanged();
 
       await this.refreshMcplTools();
       this.emitMcplToolDiff(oldToolNames, id);
@@ -30602,7 +30725,7 @@ export class AgentFramework {
     this.restartClaims().ids.set(config.id, claim);
     this.restartClaims().prefixes.set(prefix, claim);
     try {
-      await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && config.toolHints === true });
+      await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && this.hintsFor(config) });
       try {
         await this.runConnectMcplServer(config, claim);
       } catch (error) {
@@ -32517,7 +32640,7 @@ export class AgentFramework {
   /**
    * Dispatch a synthesized channel tool call.
    */
-  private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+  private dispatchChannelToolCall(agentName: string, call: ToolCall, earlierWake?: SkipReplyEarlierWake): void {
     // Conversation forks act only on their home channel. channel_publish and
     // channel_close default a missing channelId to home and reject foreign
     // ones; channel_open is rejected outright — opening channels mutates
@@ -32627,7 +32750,9 @@ export class AgentFramework {
     const readThrough = publisher ? this.publishReadThrough(publisher, call.id) : null;
     const published: { outcome?: PublishOutcome } = {};
 
-    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [] }, published)
+    this.channelRegistry!.handleChannelToolCall(call.name, call.input, {
+      kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(earlierWake ? { earlierWake } : {}),
+    }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
@@ -33665,9 +33790,10 @@ export class AgentFramework {
           for (let i = messages.length - 1; i >= 0 && collecting(); i--) {
             const content = messages[i]?.content;
             if (!Array.isArray(content)) continue;
-            // Another agent's stored context injection isn't in this agent's
-            // view (stored-injections.ts), so its images aren't either.
-            if (isAnotherAgentsInjection(messages[i]?.metadata, agentName)) continue;
+            // A row the agent's own view leaves out, such as another agent's
+            // stored context injection (stored-injections.ts), isn't in its
+            // window, so its images aren't either.
+            if (!this.agentSees(agent, messages[i]?.metadata)) continue;
             const messagesBack = total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {
@@ -33752,7 +33878,8 @@ export class AgentFramework {
             // error says that whether the entry changed isn't known
             // (writeBinary); the images before it are saved, and the
             // failure says so, as a returned one does.
-            failed(error);
+            console.error(`[save_recent_image] writing "${destination}" failed:`, error);
+            failed(thrownWords(error));
             return;
           }
           const inChronicle = (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
@@ -34233,4 +34360,11 @@ export class AgentFramework {
       // orchestrator gives each server the channel context of its channels.
     };
   }
+}
+
+function thrownWords(error: unknown): string {
+  if (error instanceof Refusal) return error.message;
+  const code = errnoCode(error);
+  const on = errnoWayOn(code, "Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.");
+  return `${systemWords(code, error).replace(/\.$/, '')}. ${on}`;
 }

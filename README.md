@@ -137,6 +137,8 @@ return {
 - **ApiModule** - WebSocket API event processing
 - **WorkspaceModule** - Mountable filesystem abstraction with Chronicle tree state, filesystem watching, and materialization
 
+DiscordModule and ApiModule store a sender's name that comes from outside the framework in a form marked with its source: a Discord author's username as `<name> (Discord)`, and the name on every `api:message` event, from an ApiServer caller or a host's own, as `<name> (API)`. An `api:message` whose `participant` isn't text, which its type doesn't allow, isn't stored, and starts no turn. Such a name is stored on one line: each run of line breaks (U+2028 and U+2029 included) and other control characters becomes one space. The generic name `user`, in any capitalization, is stored as given. Unless a host gives one of its own agents the name `user`, in any capitalization, or a name ending in ` (Discord)` or ` (API)`, such a message never carries an agent's name, so the agent's request never takes it as the agent's own turn. Where an agent's request shows senders' names, the agent sees the marked form, and the unmarked one in rows stored by earlier versions. A host that pushes an `api:message` in an agent's name records a user turn, not that agent's, with the same exception, and the ApiServer's message list returns each message's participant as stored, so a caller sees its own messages under `<name> (API)`. The ApiServer refuses a `participant` that isn't text, as it refuses content that isn't. The bot's own messages that a Discord history sync stores keep the name of the framework's first agent, as before. For a sender from outside, both modules also store the name as sent in `metadata.author` (with the author's Discord id), unless an `api:message` event's metadata already carries an `author` object, which is kept. History's author filter matches a row's `metadata.author` when it has one, and its participant otherwise. Code that tells senders apart should read a row's `metadata.author` (its `name`, and `id` for Discord) when it has one, and its participant otherwise, as the filter does: rows these modules stored in earlier versions have none, unless a host's `api:message` carried one.
+
 ### Event Processing
 
 The framework runs an event loop over a `ProcessQueue`. Each event is processed by all modules, which return `EventResponse` objects. If any response requests inference, the framework compiles context and starts a stream.
@@ -349,7 +351,8 @@ three ways:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
   `toolLifecycle` `observe` or `inputs` block, a
   `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default,
-  and `toolHints: true`.
+  and `toolHints: true` (an MCPL server takes hints when the setting is left
+  out; a modern server ignores the default).
   A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
@@ -432,15 +435,24 @@ the `mcpl/coalescing` state (retry window 1 h); audit lines are
 
 #### Tool presence and toolsets (RFC-014)
 
-A server configured with `toolHints: true` (default false) is offered
-`experimental.mcpl.toolHints`, and its hints count only if it advertised
-`toolHints` too. Without it nothing changes: every tool is listed as before,
-and the host advertises and reads nothing new.
+Every MCPL server is offered `experimental.mcpl.toolHints` unless its
+configuration sets `toolHints: false`, and its hints count only if it
+advertised `toolHints` too. A server that doesn't advertise them lists every
+tool as before. With `toolHints: false` on a server, the host advertises and
+reads nothing new for it; with it on every server, the `toolsets` module
+below isn't registered either. A modern (MCP) server never has hints. An MCPL
+server that leaves the setting out has hints only where the name `toolsets` is
+free: if a module or a server's
+`toolPrefix` holds it at startup, those servers have none, and a line says
+so. `toolHints: true` reserves the name, so a prefix that takes it is refused.
 
-With it, the server's static tools stay in the tool list as before, and its
+With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
 enter it, since every change to the list rebuilds the prompt cache. The
-framework registers a `toolsets` module with four constant tools:
+framework registers a `toolsets` module with four constant tools, at startup or
+at the first runtime connect of a server whose hints aren't off, whether or not
+that server presents anything, so the tool list doesn't change when one starts
+to:
 
 - `toolsets--open {server?, toolset?, instance?, options?}` opens a toolset (or
   a named instance of one), and answers with what the server shows on opening

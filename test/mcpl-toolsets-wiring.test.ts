@@ -179,7 +179,7 @@ test('a server without toolHints keeps 0.27.0\'s reading of a structured-only re
       if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
     },
   });
-  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url } as McplServerConfig]);
+  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: false } as McplServerConfig]);
   try {
     await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'static tools listed');
     const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
@@ -199,7 +199,7 @@ test('a server without toolHints keeps 0.27.0\'s reading of a structured-only er
       if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
     },
   });
-  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url } as McplServerConfig]);
+  const fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: false } as McplServerConfig]);
   try {
     await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'static tools listed');
     const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
@@ -538,7 +538,7 @@ test('a toolHints server removed while its reconnect is pending leaves no toolse
     await first.server.close();
     await waitFor(() => fw.framework.listMcplServers().some((s) => s.id === 'arc' && !s.connected), 'the connection lost, its reconnect pending');
     await fw.framework.disconnectMcplServer('arc');
-    await fw.framework.connectMcplServer({ id: 'arc', toolPrefix: 'arc', url: second.url });
+    await fw.framework.connectMcplServer({ id: 'arc', toolPrefix: 'arc', url: second.url, toolHints: false });
     await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status'), 'the new server\'s tools listed');
     assert.ok(fw.framework.getAllTools().some((t) => t.name === 'arc--peek'), 'peek is listed: no toolset state of the removed server hides it');
     assert.match(resultText(await callTool(fw.framework, 'toolsets--look', {})), /No MCPL server presents toolsets/);

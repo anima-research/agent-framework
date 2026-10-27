@@ -81,6 +81,18 @@ export function errnoWayOn(code: string | undefined, otherwise = 'Calling again 
   return otherwise;
 }
 
+export function errnoClause(code: string | undefined, again: string, then: string): string {
+  const lasting = `${again} won't change that; `;
+  if (code === 'ENAMETOOLONG') return `${lasting}a shorter name would get past it`;
+  const fix = hostFix(code);
+  if (fix !== undefined) {
+    return code !== undefined && PASSING.has(code)
+      ? `${again} may get past it; if it fails the same way, whoever runs this host can ${fix}`
+      : `${lasting}whoever runs this host can ${fix}, and ${then}`;
+  }
+  return `${again} checks it afresh; if the same reason comes back, whoever runs this host can fix it on disk`;
+}
+
 const OS_ERRNO = new Map<number, string>();
 for (const [name, number] of Object.entries(constants.errno)) if (!OS_ERRNO.has(number)) OS_ERRNO.set(number, name);
 
@@ -100,9 +112,15 @@ export function changesFiles(tool: string): boolean {
   return CHANGING.has(tool);
 }
 
-export const ROOT_RECHECK = "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.";
+export const UNFOLLOWED_STEP = 'whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere';
 
-export const ROOT_UNCHECKED = "Calling again won't change that while the mount's directory is gone from its path, and checks it afresh otherwise; whoever runs this host can check the directory and its path.";
+export const MOUNT_IT = 'whoever runs this host can mount it, or a directory that holds it';
+
+export const OUTSIDE_STEP = `nothing done through this mount reaches what it leads to, and ${MOUNT_IT}`;
+
+export const RESOLVED_OUTSIDE_STEP = 'nothing done through this mount reaches where it resolves, and whoever runs this host can mount that place';
+
+export const ROOT_RECHECK = "Calling again may work; if it fails the same way, whoever runs this host can check the mount's directory and its path.";
 
 export const AWAITS_REOPEN = "The workspace can't check its files against disk until its store is reopened, so calling again won't change that; whoever runs this host can reopen it with a restart.";
 

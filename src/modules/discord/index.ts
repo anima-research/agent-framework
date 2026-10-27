@@ -49,6 +49,7 @@ import type {
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
 import { logValue } from '../../mcpl/log-value.js';
 import { unknownToolMessage } from '../unknown-tool.js';
+import { outsideSenderName } from '../sender-name.js';
 import { DiscordRefusal } from './refusal.js';
 
 // Re-export event types for consumers who want to handle them
@@ -845,9 +846,10 @@ export class DiscordModule implements Module {
         ...(stored ? {} : {
           addMessages: [
             {
-              participant: msg.authorName,
+              participant: outsideSenderName(msg.authorName, 'Discord'),
               content: contentBlocks,
               metadata: {
+                author: { id: msg.authorId, name: msg.authorName },
                 external: { source: 'discord', id: msg.discordMessageId },
                 channelId: msg.channelId,
                 timestamp: msg.timestamp,
@@ -1156,14 +1158,12 @@ export class DiscordModule implements Module {
           // For bot's own messages (from previous sessions), use the agent name
           // This ensures continuity of conversation history
           const isBotMessage = discordMsg.authorId === this.state.botUserId;
-          const agentName = ctx.getAgents()[0]?.name;
-          const participantName = isBotMessage
-            ? (agentName ?? discordMsg.authorName)
-            : discordMsg.authorName;
+          const agentName = isBotMessage ? ctx.getAgents()[0]?.name : undefined;
           ctx.addMessage(
-            participantName,
+            agentName ?? outsideSenderName(discordMsg.authorName, 'Discord'),
             content,
             {
+              ...(agentName === undefined ? { author: { id: discordMsg.authorId, name: discordMsg.authorName } } : {}),
               external: { source: 'discord', id: discordMsg.id },
               channelId,
               timestamp: discordMsg.timestamp.getTime(),
