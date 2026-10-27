@@ -359,10 +359,18 @@ export interface GateDecision {
 export interface ShadowWarning {
   /** Name of the earlier (consuming) policy. */
   earlier: string;
-  /** Name of the later policy it makes unreachable. */
+  /** Name of the later policy whose events it takes. */
   later: string;
   /** Event types affected — 'all' when both rules are unscoped. */
   eventTypes: string[] | 'all';
+  /** Whether `earlier` takes every event `later` would match, so `later`
+   *  never applies. */
+  whole: boolean;
+  /** Whether `later` is known to see these types: its scope names them, or
+   *  its source is one whose event types the host knows (an MCPL server's).
+   *  False when `later` names no scope and its source could send anything,
+   *  so the types may never reach it. */
+  known: boolean;
 }
 
 /** One row of the dry-run probe table (see EventGate.probeTable). */

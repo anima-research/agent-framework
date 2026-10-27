@@ -802,7 +802,7 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
-import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
+import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
 import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
@@ -4283,6 +4283,8 @@ export class AgentFramework {
         upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
       });
       framework.judgeWired = judge !== undefined;
+      const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
+      const heartbeatOn = config.heartbeat !== undefined && config.heartbeat !== null && config.heartbeat !== false;
       framework.eventGate = new EventGate({
         configPath,
         initialConfig: config.gate.config,
@@ -4349,6 +4351,15 @@ export class AgentFramework {
         // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
         // to decide (placeWakeLines).
         isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
+        // What a source can send, for the rule-order notes: an MCPL server's
+        // events reach the gate as its pushes and channel messages only (a
+        // module's events carry a source of the module's own, such as "cli"
+        // or "mcpl:<id>"), and the heartbeat's ticks as pushes.
+        eventTypesFrom: (source) => {
+          if (configuredServerIds.has(source) || framework.mcplServerConfigs.has(source)) return MCPL_GATE_EVENT_TYPES;
+          if (source === 'heartbeat' && heartbeatOn) return ['mcpl:push-event'];
+          return undefined;
+        },
         resolveRouteChannel: (info) => {
           if (info.eventType === 'mcpl:channel-incoming') return info.channelId || undefined;
           if (info.eventType === 'mcpl:push-event') {
@@ -10491,16 +10502,16 @@ export class AgentFramework {
         'Add or replace a wake rule (a gate.json policy) at runtime — no need to ' +
         'hand-edit the file. The rule is validated and hot-applied immediately. ' +
         'A rule with the same `name` replaces the existing one in place (add a ' +
-        'position to move it). ⚠️ ORDERING IS SEMANTICS: first match wins, and a ' +
-        'matched rule CONSUMES the event — a broad rule placed early makes every ' +
-        'later rule unreachable for its scope, including your addressed-message ' +
-        '(DM/mention) wake rules. Prefer `insertBefore`/`insertAfter` to place a ' +
-        'rule relative to a specific existing rule; use `position: "prepend"` only ' +
-        'when the rule really must beat EVERYTHING. For "additionally wake me ' +
-        'every Nth event / at most N per hour" governors, set `passthrough: true` ' +
-        'so non-firing matches fall through to your normal rules instead of ' +
-        'swallowing them. The result includes a before/after probe table and any ' +
-        'shadow warnings — READ THEM before ending the turn. Two common shapes:\n' +
+        'position to move it). Rules are checked in order and the first one that ' +
+        'matches an event decides it, so the rules below never see that event: a ' +
+        'broad rule placed early takes events from them, your DM and mention ' +
+        'rules included. Place a rule next to a particular one with ' +
+        '`insertBefore`/`insertAfter`; `position: "prepend"` puts it above all of ' +
+        'them. For a rule that only adds wakes ("also wake me every Nth event", ' +
+        '"at most N an hour"), set `passthrough: true`: the events it doesn\'t ' +
+        'wake for go on to your other rules. The result shows how a few common ' +
+        'events are decided before and after the change, and notes any rule the ' +
+        'new order keeps from applying, with what to do about it. Two common shapes:\n' +
         '• Watch a FILE/workspace path: match on `mount` + `pathGlob`, e.g. ' +
         '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
         '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +

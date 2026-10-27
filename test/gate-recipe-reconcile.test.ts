@@ -906,4 +906,54 @@ describe("wake_add_rule's result", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("leaves out of its rule-order notes the types a rule's source never sends: an MCPL server's or the heartbeat's events aren't external-message", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gate-wake-add-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+      modules: [],
+      syncIntervalMs: 0,
+      heartbeat: { defaults: { intervalSeconds: 3600 } },
+      gate: {
+        configPath: join(dir, 'gate.json'),
+        config: { policies: [{ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' }], default: 'skip' },
+      },
+    });
+    try {
+      const internals = framework as unknown as {
+        dispatchWakeRuleToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+        pushEvent(event: { type: string; result?: { success: boolean; data?: unknown } }): void;
+        mcplServerConfigs: Map<string, unknown>;
+        eventGate: { getStatus(): { shadowWarnings: string[] } };
+      };
+      const pushed: Array<{ type: string; result?: { success: boolean; data?: unknown } }> = [];
+      internals.pushEvent = (event) => { pushed.push(event); };
+      const add = (id: string, input: unknown): { shadowWarnings?: string[] } => {
+        internals.dispatchWakeRuleToolCall('prime', { id, name: 'wake_add_rule', input });
+        const result = pushed.filter((e) => e.type === 'tool-result').pop()?.result;
+        assert.ok(result?.success, JSON.stringify(pushed));
+        return result!.data as { shadowWarnings?: string[] };
+      };
+
+      // A source the framework doesn't know could send anything: the unsure note.
+      const unknown = add('add-1', { name: 'world', match: { source: 'world' }, behavior: 'always' });
+      assert.strictEqual(unknown.shadowWarnings?.length, 1);
+      assert.match(unknown.shadowWarnings![0], /^"cli-input" comes first and takes every external-message event, so "world" sees none\. Nothing to do unless/);
+
+      // Once it's an MCPL server (connected at runtime here), nothing.
+      internals.mcplServerConfigs.set('world', { id: 'world' });
+      assert.deepStrictEqual(internals.eventGate.getStatus().shadowWarnings, []);
+      const known = add('add-2', { name: 'world', match: { source: 'world' }, behavior: 'skip' });
+      assert.strictEqual(known.shadowWarnings, undefined);
+
+      // The framework's heartbeat sends pushes only.
+      const heartbeat = add('add-3', { name: 'heartbeat-wake', match: { source: 'heartbeat' }, behavior: 'always' });
+      assert.strictEqual(heartbeat.shadowWarnings, undefined);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
