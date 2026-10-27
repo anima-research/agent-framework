@@ -1,0 +1,1 @@
+- **Consumers of the reply judge's verdicts:** `judgeState.last.verdict` in gate_status and the `gate:judge-verdict` trace's `verdict` can now be `'refused'`, beside `'reply'`, `'wait'` and `'error'`, for a call the framework refused without making it. Code that handles each value of that union exhaustively needs a `'refused'` case.
