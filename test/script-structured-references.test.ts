@@ -480,6 +480,11 @@ test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `nev
     assert.equal(failed.isError, true);
     assert.ok(JSON.stringify(failed).includes('the plain attach failed'), JSON.stringify(failed));
     assert.equal(plain.payloadNever, undefined);
+    const nestedUri = `https://files.example.invalid/failure-never/${randomUUID()}-nested.pdf`;
+    const nested = referenceRegistry.register((classifyBlock({ type: 'resource', uri: nestedUri }) as { testimony: ReferenceTestimony }).testimony, 'files');
+    answer({ content: [{ type: 'text', text: 'the attach failed', attachment: { type: 'resource', uri: nestedUri, disposition: 'never' } }], isError: true });
+    await script('fwd--whole');
+    assert.equal(nested.payloadNever, true, 'a `never` nested in a failure\'s block marks as a success\'s would');
   });
 });
 
@@ -566,6 +571,19 @@ test("a module tool's result is treated when a server with a prefix that fits it
     const object = JSON.parse(out) as { content: [{ refId: string }] };
     assert.deepEqual(object.content, [{ type: 'resource', refId: object.content[0].refId, name: 'sealed.pdf', savedTo: null, unfetchable: `it's ${UNBOUND_REASON}` }]);
     assert.deepEqual(fetched, [never('connect').uri], 'the exit fetches for it as for any module\'s result');
+  });
+});
+
+test("a module tool's `never` result is passed over and shown with the reason when a server with a prefix that fits its name connects while its call is in flight", async () => {
+  await withPeers(async ({ script, forward, prefixes, fetched }) => {
+    forward.nested = [never('connect-never')];
+    forward.during = () => { prefixes.set('fwd--deep', 'files'); };
+    const out = await script('fwd--deep--nested');
+    assert.equal(prefixes.get('fwd--deep'), 'files', 'the prefix arrived while the call ran');
+    assert.ok(!out.includes('never-token'), out);
+    const object = JSON.parse(out) as { content: [{ refId: string }] };
+    assert.deepEqual(object.content, [{ type: 'resource', refId: object.content[0].refId, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error }]);
+    assert.deepEqual(fetched, [], 'the exit fetches nothing for it');
   });
 });
 

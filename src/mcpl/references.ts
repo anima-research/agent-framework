@@ -740,7 +740,9 @@ export class ReferenceRegistry {
 
   markNever(uri: string): void {
     const record = this.findByUri(uri);
-    if (record && !record.payloadNever) this.markPayload(record);
+    if (!record || record.payloadNever) return;
+    this.keepFirst(uri);
+    this.markPayload(record);
   }
 
   markNevers(claims: ResultClaims): void {

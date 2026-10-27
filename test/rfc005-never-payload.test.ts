@@ -233,6 +233,25 @@ describe('what a marked record shows', () => {
     }
   });
 
+  it("a script's link where inline data marked its payload after the script lane began: the journal keeps the record as it stood, and the object reads the mark", async () => {
+    const uri = uniq('y.txt');
+    const link = { type: 'resource_link', uri, name: 'y.txt' };
+    const record = referenceRegistry.register(testimonyOf(link));
+    const saved = `scratch/refs/${record.refId}.txt`;
+    record.fetchedPath = saved;
+    const journal = referenceRegistry.openJournal();
+    try {
+      await quietly(() => referenceRegistry.markNevers(contentClaims([inlineNever(uri)])));
+      assert.equal(record.payloadNever, true);
+      assert.deepEqual([journal.before(uri)?.payloadNever, journal.before(uri)?.fetchedPath], [undefined, saved], "the line's record as it stood");
+      const claims = contentClaims([link]);
+      const object = referenceBlockForScript(link, undefined, claims, { claims, recordBefore: journal.before }) as Record<string, unknown>;
+      assert.deepEqual(['uri' in object, object.savedTo, object.unfetchable], [false, null, NEVER_TEXT]);
+    } finally {
+      journal.close();
+    }
+  });
+
   it("a link: no uri, whatever later testimony says, where an unmarked link the host can't fetch shows it", () => {
     const shown = uniq('p.txt');
     const plainLink = testimonyOf({ type: 'resource_link', uri: shown, name: 'p.txt' });
@@ -474,6 +493,19 @@ describe("the framework's fetches", () => {
       await framework(fetched).autoFetchReferences(content, 'zz-never-dialed', mode);
       assert.deepEqual([fetched, referenceRegistry.findByUri(uri)?.payloadNever], [[], true]);
     });
+
+    it(`fetch nothing, in ${mode} mode, for a result whose blocks can't be read for a nested \`never\`, and say so`, async () => {
+      const fetched: string[] = [];
+      const uri = uniq('unreadable-veto.bin');
+      const content = [{ type: 'resource', uri }, { type: 'text', text: 'one attachment', attachment: { type: 'resource', uri, disposition: 'never' }, count: BigInt(1) }];
+      assert.throws(() => scriptViewClaims(content, true));
+      const { logged } = await quietly(() => framework(fetched).autoFetchReferences(content, 'zz-never-dialed', mode));
+      assert.deepEqual(fetched, []);
+      assert.equal(logged, "[rfc005] fetched nothing for a result from zz-never-dialed: its blocks couldn't be read for a nested `never`");
+      const unreferenced = [{ type: 'text', text: 'no reference', count: BigInt(1) }];
+      assert.throws(() => scriptViewClaims(unreferenced, true));
+      assert.equal((await quietly(() => framework(fetched).autoFetchReferences(unreferenced, 'zz-never-dialed', mode))).logged, '', 'nothing to withhold, nothing logged');
+    });
   }
 
   it('log no failure for a record a `never` marks while they run', async () => {
@@ -490,6 +522,32 @@ describe("the framework's fetches", () => {
     });
     assert.deepEqual([eager, module].map((u) => referenceRegistry.findByUri(u)?.payloadNever), [true, true]);
     assert.equal(logged, '');
+  });
+
+  it("answer fetch_reference for a marked record with the reason, and fetch nothing", async () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      pushEvent(event: unknown): void;
+      dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+      setMcplServerConfig(config: unknown): void;
+    };
+    Object.assign(fw, {
+      mcplServerConfigs: new Map(),
+      getWorkspaceModule: () => ({ writeBinary: async () => ({ success: true }) }),
+      firstWritableMountName: () => 'scratch',
+      emitTrace: () => {},
+    });
+    fw.setMcplServerConfig({ id: 'zz-never-dispatch', url: BINDING.url });
+    try {
+      const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri: `${ORIGIN}/ok?dispatch-${randomUUID()}`, disposition: 'never' }), 'zz-never-dispatch');
+      const before = served;
+      const answered = new Promise<{ result: { success: boolean; error?: string } }>((resolve) => { fw.pushEvent = (event) => resolve(event as never); });
+      fw.dispatchFetchReferenceToolCall('prime', { id: `call_${record.refId}`, name: 'fetch_reference', input: { ref_id: record.refId } });
+      const { result } = await within('fetch_reference answering', answered);
+      assert.deepEqual([result.success, result.error], [false, `fetch_reference couldn't fetch "${record.refId}": ${NEVER_TEXT}. Calling again won't change that.`]);
+      assert.equal(served, before);
+    } finally {
+      referenceRegistry.forgetServerAddress('zz-never-dispatch', fw);
+    }
   });
 
   it('are made by a fetcher that withholds', () => {

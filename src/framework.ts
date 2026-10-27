@@ -172,11 +172,11 @@ import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
-function neverClaims(content: unknown[]): ResultClaims {
+function neverClaims(content: unknown[]): ResultClaims | undefined {
   try {
     return scriptViewClaims(content, true);
   } catch {
-    return contentClaims(content);
+    return undefined;
   }
 }
 
@@ -7186,7 +7186,8 @@ export class AgentFramework {
     const byUri = new Map<string, {
       record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean; linkOnly: boolean;
     }>();
-    const nevers = claims ?? neverClaims(content);
+    const read = claims ?? neverClaims(content);
+    const nevers = read ?? contentClaims(content);
     referenceRegistry.markNevers(nevers);
     for (const block of content) {
       const c = classifyBlock(block);
@@ -7198,6 +7199,11 @@ export class AgentFramework {
       byUri.set(c.testimony.uri, { record, expiredHere, linkOnly });
     }
     if (mode === 'register') return;
+    // A nested `never` the walk couldn't read may name any of these.
+    if (read === undefined) {
+      if (byUri.size > 0) console.error(`[rfc005] fetched nothing for a result from ${serverId}: its blocks couldn't be read for a nested \`never\``);
+      return;
+    }
     const fetcher = this.getReferenceFetcher();
     const nowMs = Date.now();
     const live = [...byUri.values()]
@@ -24161,7 +24167,7 @@ export class AgentFramework {
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
         if (server && server.capabilities !== null && Array.isArray(result.content)) {
-          referenceRegistry.markNevers(contentClaims(result.content));
+          referenceRegistry.markNevers(neverClaims(result.content) ?? contentClaims(result.content));
         }
         const { data: blocks, ...failure } = direct;
         let shown: ToolResult = failure;
