@@ -62,9 +62,11 @@ export interface PassiveSampleConfig {
  * good time for the agent to reply. The judge reads the agent's context as one
  * document (its newest part), the agent's own `instructions` and the batch,
  * and answers reply or wait. On reply the
- * batch is delivered as a debounce's is; on wait the agent isn't woken: the
- * events are in its context already, as for `defer`, and the next batch is
- * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
+ * batch is delivered as a debounce's is; on wait (or a failure under
+ * `"skip"`) the agent isn't woken, and the next batch is judged afresh. Either
+ * way the events reach its context: MCPL's channel and push events are stored
+ * when they arrive, and any other event's content is stored by the gate,
+ * without a wake when the agent isn't woken. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
  * times out wakes the agent (fail open),
  * unless the host set its `onError` to `"skip"`.
