@@ -225,10 +225,17 @@ export interface GateOptions {
   judge?: ReplyJudgeOptions | null;
   /**
    * Hold message-driven wakes (MCPL channel-incoming / push-event that the
-   * policies would trigger) until no further message has arrived for
-   * `quietMs`, capped at `maxWaitMs` (default 30000) from the first held
-   * message; then wake once. Messages still enter context at arrival. Other
-   * wake sources (scheduled, tool results, heartbeat) are unaffected.
+   * policies would trigger) until no further message has arrived in the same
+   * channel for `quietMs`, capped at `maxWaitMs` (default 30000) from the
+   * channel's first held message; then wake once for the burst. Messages
+   * still enter context at arrival; only the wake waits. A message the
+   * policies didn't trigger extends a hold already open for its channel (a
+   * rate-limited part of the same burst) but opens none. The held wake goes
+   * the way a `debounce` policy's batch does: it carries the burst's route
+   * (`routeChannelId`, so a held DM's reply goes back to the DM), an agent
+   * mid-turn gets it after the turn, a quiesced host at resume, and an agent
+   * asleep when the hold ends gets none (the messages are in context for its
+   * wake). The heartbeat, scheduled wakes and tool results are unaffected.
    * Default off.
    */
   messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
