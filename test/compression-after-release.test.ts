@@ -8,7 +8,7 @@ import { AnthropicAdapter, Membrane, MembraneError, NativeFormatter } from '@ani
 import { CompressionWithdrawn } from '@animalabs/context-manager';
 import { JsStore } from '@animalabs/chronicle';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
-import { Agent, AgentFramework, AutobiographicalStrategy, PassthroughStrategy } from '../src/index.js';
+import { Agent, AgentFramework, AutobiographicalStrategy, PassthroughStrategy, taskForkSpec } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 class CompressionMembrane extends MockMembrane {
@@ -221,6 +221,41 @@ describe('a context manager the framework is done with makes no further provider
       framework.start();
       await run;
       assert.equal(contextManager.isReady(), false, 'compression is still queued when the run ends');
+      const sent = membrane.compressions.length;
+      await sleep(1_000);
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the run ended');
+      await assert.rejects(contextManager.resetHeadWindow(), (error: unknown) => error instanceof CompressionWithdrawn,
+        'a reset with no text is withdrawn');
+      assert.equal(membrane.compressions.length, sent, 'and reached no provider');
+      assert.deepEqual(drainLines(errors.lines), []);
+    } finally {
+      errors.restore();
+      await settle(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a shared-inheritance run that has ended, with compression still queued (the derived manager is on the run\'s membrane)', { timeout: 60_000 }, async () => {
+    const membrane = new CompressionMembrane(200);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const { dir, framework } = await setup('af-done-shared-', membrane, { agents: true });
+    const errors = captureErrors();
+    try {
+      // The parent's slot carries the backlog; the child inherits it shared, on
+      // its own branch, with a draining strategy, so compression queues on the
+      // derived manager (which, before the tenth round, was on the framework's
+      // membrane and so outlived the run's release).
+      addBacklog(framework.getAgent('trunk')!.getContextManager(), 30);
+      const { agent, contextManager } = await framework.createEphemeralAgent(
+        { name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: drainingStrategy() },
+        taskForkSpec('worker', { parent: 'trunk', inherit: { mode: 'shared' } }),
+      );
+      contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      await until(() => membrane.compressions.length >= 1);
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
+      framework.start();
+      await run;
       const sent = membrane.compressions.length;
       await sleep(1_000);
       assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the run ended');

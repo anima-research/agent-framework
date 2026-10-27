@@ -9947,7 +9947,7 @@ export class AgentFramework {
       if (inherit?.mode === 'shared') {
         // Shared reads, separate writes: the child's context is the parent's
         // at a checkpoint, on a branch of its own. Nothing is copied.
-        const derived = await this.deriveSharedContext(config, inherit);
+        const derived = await this.deriveSharedContext(config, inherit, release);
         contextManager = derived.contextManager;
         inherit = derived.inherit;
         namespace = derived.namespace;
@@ -10312,6 +10312,12 @@ export class AgentFramework {
 
   /** Open the context an ended agent left, wherever it lives. */
   private async reopenAgentContext(record: AgentRecord, strategy?: ContextStrategy): Promise<ContextManager> {
+    // The residents' view as createAgent gives it: held rows out, and another
+    // agent's stored context injections out, since those are that agent's
+    // context, not conversation (Weft's ninth-round probe: an ended reader
+    // reopened for inspection showed a co-resident's injection it never saw live).
+    const residentView = (message: StoredMessage): boolean =>
+      RESIDENT_VIEW_FILTER(message) && !isAnotherAgentsInjection(message.metadata, record.name);
     if (record.inherit?.mode === 'shared') {
       const derivation = record.inherit.derivation as ContextDerivationRecord | undefined;
       const reopen = (ContextManager as unknown as { reopenDerived?: ReopenDerived }).reopenDerived;
@@ -10327,7 +10333,7 @@ export class AgentFramework {
         strategy: strategy ?? new PassthroughStrategy(),
         membrane: this.membrane,
         // A context derived from a reader of the shared slot keeps that reader's view.
-        ...(derivation.slots?.messageNamespace === null ? { viewFilter: RESIDENT_VIEW_FILTER } : {}),
+        ...(derivation.slots?.messageNamespace === null ? { viewFilter: residentView } : {}),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
     }
@@ -10342,7 +10348,7 @@ export class AgentFramework {
     return ContextManager.open({
       store: this.store,
       namespace: record.namespace,
-      ...(sharedSlot ? { viewFilter: RESIDENT_VIEW_FILTER } : { isolate: true }),
+      ...(sharedSlot ? { viewFilter: residentView } : { isolate: true }),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -10353,6 +10359,7 @@ export class AgentFramework {
   private async deriveSharedContext(
     config: AgentConfig,
     inherit: NonNullable<AgentSpec['inherit']>,
+    release: ManagerRelease,
   ): Promise<{ contextManager: ContextManager; inherit: NonNullable<AgentSpec['inherit']>; namespace: string }> {
     const parent = this.agents.get(inherit.from);
     if (!parent) {
@@ -10380,7 +10387,9 @@ export class AgentFramework {
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
-      membrane: this.membrane,
+      // The run's auxiliary membrane, as the copy path's: its compression calls
+      // are withdrawn once the run is released (Weft's ninth-round reading).
+      membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
