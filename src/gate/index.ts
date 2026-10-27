@@ -1,4 +1,4 @@
-export { EventGate, wakeProvenance, wakeLineText, type WakeProvenance, type WritePlacement } from './event-gate.js';
+export { EventGate, MCPL_GATE_EVENT_TYPES, wakeProvenance, wakeLineText, type EventTypesFrom, type WakeProvenance, type WritePlacement } from './event-gate.js';
 export type {
   GateConfig,
   GateOptions,

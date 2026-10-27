@@ -830,7 +830,7 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
   inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
   reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
   allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
-  toolHints: 'true advertises MCPL tool hints (RFC-014), so the server\'s dynamic tools are announced in the conversation and called through toolsets--act, and false or leaving it out lists every tool as before',
+  toolHints: 'true advertises MCPL tool hints (RFC-014) to an MCPL server, so its dynamic tools are announced in the conversation and called through toolsets--act; leaving it out does the same wherever the name toolsets is free; false lists every tool as before and advertises none',
 };
 
 /**

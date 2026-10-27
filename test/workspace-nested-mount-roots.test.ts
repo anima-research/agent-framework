@@ -476,7 +476,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     symlinkSync(env.at('outer/a/b/x.txt'), env.at('outer/flink.txt'));
     const unforced = await call(m, 'materialize', { path: 'outer/flink.txt' });
     assert.equal(unforced.data.count, 0);
-    assert.equal(skippedReason(unforced.data, 'flink.txt'), 'flink.txt: cannot verify disk copy ("outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place) — fix it and materialize again');
+    assert.equal(skippedReason(unforced.data, 'flink.txt'), 'flink.txt: cannot verify disk copy ("outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place)');
     const forced = await call(m, 'materialize', { path: 'outer/flink.txt', force: true });
     assert.equal(forced.data.count, 0);
     assert.equal(skippedReason(forced.data, 'flink.txt'), 'flink.txt: not written: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
@@ -645,10 +645,11 @@ describe('a link into a nested mount\'s directory, on a mount that doesn\'t foll
     env.write('work/nested/x.txt', 'inner file\n');
     symlinkSync('nested/x.txt', env.at('work/flink.txt'));
     const m = await env.open(t, [mount('work', env.at('work')), mount('inner', env.at('work/nested'))]);
-    const refusal = 'work/flink.txt: "work/flink.txt" is a symlink to "work/nested/x.txt", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/x.txt" in place of "work/flink.txt"';
+    const reason = '"work/flink.txt" is a symlink to "work/nested/x.txt", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/x.txt" in place of "work/flink.txt"';
+    const refusal = `work/flink.txt: ${reason}`;
     for (const [name, input] of [['read', { path: 'work/flink.txt' }], ['write', { path: 'work/flink.txt', content: 'via work\n' }]] as const) {
       const res = await call(m, name, input);
-      assert.equal(res.error, `The ${name} did nothing: ${refusal}.`, name);
+      assert.equal(res.error, `The ${name} did nothing: "work/flink.txt" can't be reached: ${reason}.`, name);
     }
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
     await assert.rejects(m.readFileFromDisk('work/flink.txt'), (err: unknown) => {
@@ -668,7 +669,8 @@ describe('a link into a nested mount\'s directory, on a mount that doesn\'t foll
     // #468's words for a link whose target isn't there to name.
     const write = await call(m, 'write', { path: 'work/flink.txt', content: 'via work\n' });
     assert.equal(write.success, false);
-    assert.equal(write.error, 'The write did nothing: work/flink.txt: "work/flink.txt" is a symlink, which this mount does not follow.');
+    assert.equal(write.error, 'The write did nothing: "work/flink.txt" can\'t be reached: "work/flink.txt" is a symlink that leads nowhere, which this mount does not follow; '
+      + 'whoever runs this host can remove it or make it lead to what it stood for.');
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
     assert.equal(existsSync(env.at('work/nested/new.txt')), false);
   });
@@ -682,7 +684,7 @@ describe('a link into a nested mount\'s directory, on a mount that doesn\'t foll
     const m = await env.open(t, [mount('work', env.at('work')), mount('inner', env.at('work/nested'))]);
     const write = await call(m, 'write', { path: 'work/l/new.txt', content: 'via work\n' });
     assert.equal(write.success, false);
-    assert.equal(write.error, 'The write did nothing: work/l/new.txt: "work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub" in place of "work/l".');
+    assert.equal(write.error, 'The write did nothing: "work/l/new.txt" can\'t be reached: "work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub" in place of "work/l".');
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
   });
 });
@@ -724,7 +726,7 @@ describe('the checks where disk is acted on, called directly as a push and a rea
 
   test('the located read refuses a file it opens through a link into a nested mount', async (t) => {
     const { view, rootReal } = rig(t);
-    assert.deepEqual(await readPath(view, rootReal, 'flink.txt', 1 << 20), { kind: 'unobserved', reason });
+    assert.deepEqual(await readPath(view, rootReal, 'flink.txt', 1 << 20), { kind: 'unobserved', reason, ownStep: true });
   });
 
   test('a directory made for a push isn\'t made where a link leads into a nested mount\'s root not made yet (G3)', async (t) => {
@@ -733,7 +735,7 @@ describe('the checks where disk is acted on, called directly as a push and a rea
     const nested = [{ dir: 'a/c', name: 'later', real: join(realpathSync(env.at('outer/a')), 'c') }];
     const later = { ...view, nested } as MountView;
     assert.deepEqual(await checkDir(later, rootReal, 'l/c/d', { create: true }), {
-      kind: 'unobserved', reason: '"outer/l/c" leads into mount "later", nested in mount "outer": use "later" in its place',
+      kind: 'unobserved', reason: '"outer/l/c" leads into mount "later", nested in mount "outer": use "later" in its place', ownStep: true,
     });
     assert.equal(existsSync(env.at('outer/a/c')), false, "the nested mount's root wasn't made");
   });
