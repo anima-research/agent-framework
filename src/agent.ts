@@ -1,3 +1,4 @@
+import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
@@ -498,7 +499,13 @@ export class Agent {
     if (this.allowedTools === 'all') {
       return true;
     }
-    return this.allowedTools.includes(toolName);
+    if (this.allowedTools.includes(toolName)) return true;
+    // A heartbeat tool is one tool under either prefix: the framework's
+    // `heartbeat--x` and heartbeat-mcpl's `mcpl--heartbeat--x`, which an
+    // allowedTools written for the server names. Only one of them is ever
+    // offered, since the framework refuses the server beside its heartbeat.
+    const alias = heartbeatToolAlias(toolName);
+    return alias !== undefined && this.allowedTools.includes(alias);
   }
 
   /**

@@ -77,7 +77,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, dryCompileStatsOf, type RenderStats } from './agent.js';
-import { assertBooleanSetting, holdsSettings } from './config-checks.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
@@ -794,7 +794,8 @@ import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from '.
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
-import type { GateEntryRef, WakeLine } from './gate/types.js';
+import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatWake } from './heartbeat/heartbeat.js';
+import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -1703,6 +1704,31 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
       'true arms the liveness watchdog, which ends the process when the main thread misses its heartbeat for thresholdMs, ' +
         'and false or leaving it out doesn\'t',
     );
+  }
+  // The heartbeat: true or an object turns it on; false, null or leaving it
+  // out leaves it off. Any other value (a "false" read from text, a 0) is
+  // refused rather than read as on.
+  const heartbeat: unknown = config.heartbeat;
+  if (heartbeat !== undefined && heartbeat !== null && typeof heartbeat !== 'boolean') {
+    if (typeof heartbeat !== 'object' || Array.isArray(heartbeat)) {
+      throw new Error(`heartbeat must be true, false or an object, such as { defaults: { intervalSeconds: 14400 } }, not ${kindOf(heartbeat)}`);
+    }
+    const h = heartbeat as Record<string, unknown>;
+    if (h.statePath !== undefined && (typeof h.statePath !== 'string' || !h.statePath)) {
+      throw new Error(`heartbeat.statePath must be a path, not ${kindOf(h.statePath)}`);
+    }
+    for (const key of ['defaults', 'importFrom'] as const) {
+      const value = h[key];
+      if (value !== undefined && (value === null || typeof value !== 'object' || Array.isArray(value))) {
+        throw new Error(`heartbeat.${key} must be an object, not ${kindOf(value)}`);
+      }
+    }
+    const from = (h.importFrom ?? {}) as Record<string, unknown>;
+    for (const key of ['configPath', 'remindersPath'] as const) {
+      if (from[key] !== undefined && (typeof from[key] !== 'string' || !from[key])) {
+        throw new Error(`heartbeat.importFrom.${key} must be a path, not ${kindOf(from[key])}`);
+      }
+    }
   }
   if (holdsSettings('processLogging', config.processLogging, '{ persist: true }')) {
     assertBooleanSetting(
@@ -3777,6 +3803,8 @@ export class AgentFramework {
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
   private judgeWired = false;
+  /** The heartbeat (FrameworkConfig.heartbeat), when the host turns it on. */
+  private heartbeat: Heartbeat | null = null;
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
@@ -4238,6 +4266,34 @@ export class AgentFramework {
       });
     }
 
+    // The heartbeat, when the host turns it on: the agent's own schedule of
+    // wakes. heartbeat-mcpl beside it would wake the agent twice and offer
+    // its tools under the same names, so that's refused.
+    if (config.heartbeat !== undefined && config.heartbeat !== null && config.heartbeat !== false) {
+      // heartbeat-mcpl by its id, by a tool prefix that names its tools as
+      // the framework's (or as the old names the framework still answers), or
+      // by the command that runs it under any id. A runtime connect or
+      // restart meets the same check (mcplPrefixCollision).
+      const beside = (config.mcplServers ?? []).find(isHeartbeatMcplServer);
+      if (beside) {
+        throw new Error(
+          `FrameworkConfig.heartbeat is on beside the MCPL server ${JSON.stringify(beside.id)}, which is heartbeat-mcpl or `
+          + 'names its tools as the heartbeat\'s: both would wake the agent, and their tools would share names. Remove the '
+          + 'server to use the framework\'s heartbeat (heartbeat.importFrom can bring its schedule and reminders along), or '
+          + 'turn heartbeat off to keep the server.',
+        );
+      }
+      const opts = config.heartbeat === true ? {} : config.heartbeat;
+      framework.heartbeat = new Heartbeat({
+        statePath: opts.statePath
+          ?? (config.storePath ? join(config.storePath, 'config', 'heartbeat.json') : './data/heartbeat.json'),
+        timeZone: framework.timeZone,
+        ...(opts.defaults ? { defaults: opts.defaults } : {}),
+        ...(opts.importFrom ? { importFrom: opts.importFrom } : {}),
+        deliver: (wake) => framework.deliverHeartbeat(wake),
+      });
+    }
+
     // Liveness watchdog: fail hard if the main thread wedges (opt-in).
     if (config.watchdog?.enabled === true) {
       const { LivenessWatchdog } = await import('./runtime/liveness-watchdog.js');
@@ -4527,6 +4583,7 @@ export class AgentFramework {
     // if it ended while stopped. Before the loop's first pass, so that a wake
     // owed now joins the requests already pending in one turn.
     this.eventGate?.resumeSleep();
+    this.heartbeat?.start();
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -5029,8 +5086,9 @@ export class AgentFramework {
     // Stop typing indicators, and forget the registry's channels
     step(() => this.channelRegistry?.stopAll());
 
-    // Dispose EventGate (clear debounce timers)
+    // Dispose EventGate (clear debounce timers), and stop the heartbeat's timers
     step(() => this.eventGate?.dispose());
+    step(() => this.heartbeat?.stop());
     step(() => this.livenessWatchdog?.stop());
     AgentFramework.diagnosed.delete(this);
 
@@ -5359,7 +5417,137 @@ export class AgentFramework {
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
+    // The heartbeat's ticks and reminders, which the agent's rules decide as
+    // they decide a heartbeat push: one the rules would hold back is listed
+    // as only a "maybe".
+    if (this.heartbeat && this.heartbeatTargets().includes(agentName)) {
+      const probe = (kind: 'heartbeat' | 'reminder'): boolean => !this.eventGate
+        || this.eventGate.probe(this.heartbeatGateEvent({ kind, eventId: 'probe', text: 'probe' })).trigger;
+      const tickWakes = probe('heartbeat');
+      const reminderWakes = probe('reminder');
+      for (const w of this.heartbeat.upcomingWakes()) {
+        const isReminder = w.what.startsWith('its reminder');
+        wakes.push((isReminder ? reminderWakes : tickWakes) ? w : { ...w, certain: false });
+      }
+    }
     return wakes;
+  }
+
+  /** The agents the heartbeat wakes: the residents, not conversation forks,
+   *  ephemeral runs or the subconscious, which keep windows of their own. */
+  private heartbeatTargets(): string[] {
+    return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n)
+      && !this.ephemeralRuns.has(n) && n !== this.subconsciousAgentName);
+  }
+
+  /**
+   * The event a heartbeat wake is to the gate: a push from the server id
+   * `heartbeat`, as heartbeat-mcpl's ticks and reminders were. So the
+   * agent's rules govern it as they governed those (a rule matching
+   * `source: "heartbeat"`, a `defer` default), and its sleep lets it through,
+   * as it lets that server id through.
+   */
+  private heartbeatGateEvent(wake: Pick<HeartbeatWake, 'kind' | 'eventId' | 'text'> & { silent?: boolean }): GateEventInfo {
+    const reminder = wake.kind === 'reminder';
+    return {
+      content: wake.silent ? '' : wake.text,
+      eventType: 'mcpl:push-event',
+      serverId: 'heartbeat',
+      channelId: '',
+      metadata: {
+        eventType: 'mcpl:push-event', serverId: 'heartbeat', featureSet: 'heartbeat',
+        source: reminder ? 'reminder' : 'heartbeat', eventId: wake.eventId,
+        ...(wake.silent ? { silent: true } : {}),
+      },
+      tags: [],
+    };
+  }
+
+  /**
+   * Deliver one of the heartbeat's wakes, as heartbeat-mcpl's push events
+   * were: a message-mode tick's or a reminder's text is stored, and the gate
+   * decides the wake by the agent's rules (heartbeatGateEvent), a sleep
+   * letting it through as it lets that server's pushes through. A silent
+   * tick stores no prompt: its turn, when the gate triggers one, is a silent
+   * heartbeat (silent-heartbeat.ts), prose suppressed. As for a stored push,
+   * the wake of the agent the text was delivered to is dropped once a
+   * request of its own has carried and answered the text (readsWriteFor);
+   * another resident's isn't tied to it.
+   */
+  private deliverHeartbeat(wake: HeartbeatWake): void {
+    const targets = this.heartbeatTargets();
+    const silent = wake.kind === 'heartbeat' && wake.silent;
+    // Without a gate, a push wakes the agent, and so does a tick.
+    const triggers = (): boolean => !this.eventGate || this.eventGate.evaluate(this.heartbeatGateEvent({ ...wake, silent })).trigger;
+    if (silent) {
+      if (!triggers()) return;
+      console.error(`[heartbeat] silent scheduled wake ${logValue(wake.eventId)}`);
+      for (const agentName of targets) {
+        this.pendingRequests.push({
+          agentName, reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+          suppressProse: true,
+          silentHeartbeat: { eventId: wake.eventId, serverId: 'heartbeat' },
+        });
+      }
+      return;
+    }
+    const placement: import('./gate/event-gate.js').WritePlacement = {};
+    const metadata = wake.kind === 'reminder'
+      ? { source: 'reminder', serverId: 'heartbeat', reminderId: wake.reminderId, recurring: wake.recurring, eventId: wake.eventId }
+      : { source: 'heartbeat', serverId: 'heartbeat', reason: wake.reason, eventId: wake.eventId };
+    const id = this.addMessage('user', [{ type: 'text', text: wake.text }], metadata as MessageMetadata, { placement });
+    this.emitTrace({ type: 'message:added', messageId: id, source: wake.kind === 'reminder' ? 'heartbeat:reminder' : 'heartbeat' });
+    // The text is in context whatever the rules decide, as a push's is.
+    if (!triggers()) return;
+    for (const agentName of targets) {
+      this.pendingRequests.push({
+        agentName, reason: wake.kind, source: 'heartbeat', timestamp: Date.now(),
+        ...this.readsWriteFor(placement, agentName),
+      });
+    }
+  }
+
+  /** Handle a call to one of the heartbeat's tools. */
+  private dispatchHeartbeatToolCall(agentName: string, call: ToolCall): void {
+    const refusal = this.heartbeatRefusal(agentName, call);
+    if (refusal) {
+      this.emitTrace({ type: 'tool:failed', module: 'heartbeat', tool: call.name, callId: call.id, error: `${agentName}: ${refusal}` });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'heartbeat', result: this.refusedResult(agentName, call.id, refusal) });
+      return;
+    }
+    this.emitTrace({ type: 'tool:started', module: 'heartbeat', tool: call.name, callId: call.id, input: call.input });
+    const result = this.runHeartbeatTool(call);
+    this.emitTrace({
+      type: result.isError ? 'tool:failed' : 'tool:completed',
+      module: 'heartbeat', tool: call.name, callId: call.id, durationMs: 0,
+      ...(result.isError ? { error: result.error } : {}),
+    });
+    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'heartbeat', result });
+  }
+
+  /**
+   * Why `agentName` may not make this heartbeat call, or null when it may.
+   * The heartbeat is the agent's, and wakes its residents: a conversation
+   * fork, an ephemeral run or the subconscious may look at it, but not
+   * change it or set a reminder that would wake someone else. Refused before
+   * the tool runs, as a fork's sleep is.
+   */
+  private heartbeatRefusal(agentName: string, call: ToolCall): string | null {
+    const tool = call.name.replace(/^(mcpl--)?heartbeat--/, '');
+    if (!HEARTBEAT_CHANGING_TOOLS.includes(tool) || this.heartbeatTargets().includes(agentName)) return null;
+    const one = this.conversationAgentHomes.has(agentName) ? 'conversation'
+      : this.ephemeralRuns.has(agentName) ? 'run' : 'side agent';
+    return `Nothing was changed: the heartbeat and its reminders are the agent's, and wake its residents, so this ${one} can't `
+      + 'change them. heartbeat--heartbeat_status and heartbeat--reminder_list show them.';
+  }
+
+  /** Run a heartbeat call, its throw an error result. */
+  private runHeartbeatTool(call: ToolCall): ToolResult {
+    try {
+      return this.heartbeat!.handleToolCall(call.name, call.input);
+    } catch (err) {
+      return { success: false, error: `${call.name} failed: ${errorMessage(err)}`, isError: true };
+    }
   }
 
   private auxiliaryMembraneFor(agentName: string): Membrane {
@@ -6747,6 +6935,7 @@ export class AgentFramework {
       ...this.mcplTools,
       ...channelTools,
       ...gateTools,
+      ...(this.heartbeat?.getTools() ?? []),
       this.buildAgentSettingsTool(),
       ...(this.getWorkspaceModule()
         ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL,
@@ -23559,6 +23748,13 @@ export class AgentFramework {
     // allowedTools permits, as the model's does, and an unidentified caller
     // is unrestricted, as executeToolCall's doc says; a module, through
     // callTool, is trusted and reaches every utility.
+    // The heartbeat's tools, for callers that await a tool's result (an
+    // in-process call, a puppet, a module's callTool). A module is trusted,
+    // as it is for utils; an agent is held to what dispatch holds it to.
+    if (this.heartbeat?.ownsTool(call.name)) {
+      const refusal = origin.kind === 'module' ? null : this.heartbeatRefusal(call.callerAgentName ?? '__ephemeral__', call);
+      return refusal ? { success: false, error: refusal, isError: true } : this.runHeartbeatTool(call);
+    }
     if (call.name === 'utils') {
       return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true, trustedModule: origin.kind === 'module' });
     }
@@ -25466,6 +25662,12 @@ export class AgentFramework {
     // Route sleep / wake tools
     if ((enrichedCall.name === 'sleep' || enrichedCall.name === 'wake') && this.eventGate) {
       this.dispatchSleepToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // Route the heartbeat's tools (heartbeat--…)
+    if (this.heartbeat?.ownsTool(enrichedCall.name)) {
+      this.dispatchHeartbeatToolCall(agentName, enrichedCall);
       return;
     }
 
@@ -30200,6 +30402,10 @@ export class AgentFramework {
     claim?: McpRestartClaim,
   ): string | null {
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    if (this.heartbeat && isHeartbeatMcplServer(config)) {
+      return `MCPL server "${config.id}" is heartbeat-mcpl, or names its tools as the heartbeat's, and this framework keeps `
+        + 'the heartbeat itself (FrameworkConfig.heartbeat): both would wake the agent, and their tools would share names';
+    }
     if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
       return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`;
     }

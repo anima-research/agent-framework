@@ -299,6 +299,21 @@ export interface FrameworkConfig {
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;
+  /**
+   * The heartbeat: the agent's own periodic check-in and reminders, kept by
+   * the framework (src/heartbeat/heartbeat.ts), with the tools
+   * `heartbeat--heartbeat_status`, `heartbeat--heartbeat_configure`,
+   * `heartbeat--heartbeat_trigger`, `heartbeat--reminder_add`,
+   * `heartbeat--reminder_list` and `heartbeat--reminder_cancel`. `true` turns it
+   * on with its defaults; `false`, null or leaving it out leaves it off. Its
+   * wakes go to the gate as heartbeat-mcpl's pushes did, from the server id
+   * `heartbeat`, so the agent's rules decide them and a sleep lets them
+   * through. It replaces the heartbeat-mcpl server, which is refused beside it
+   * (by its id, a heartbeat tool prefix, or its command), at create and at a
+   * runtime connect: both would wake the agent. `importFrom` brings that
+   * server's schedule and reminders along.
+   */
+  heartbeat?: boolean | null | import('../heartbeat/heartbeat.js').HeartbeatOptions;
 
   /**
    * Liveness watchdog: fail hard (and let the supervisor restart) if the main
