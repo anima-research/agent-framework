@@ -156,8 +156,8 @@ export type TraceEvent =
        * makes its context fit, instead of failing (#304). It follows the
        * refused attempt's `inference:failed`, as a provider hold does. Its
        * logical turn stays open; `inference:hold_ended` follows, and then
-       * the turn's fresh compile, or after a hold that ended without a fit,
-       * its exhaustion.
+       * the turn's fresh compile. After a hold that ended without a fit, a
+       * refusal of that compile takes the error policy's path.
        */
       type: 'inference:held';
       agentName: string;
@@ -187,11 +187,12 @@ export type TraceEvent =
        * queued for the turn's own compile to meet it. 'deadline': the 30
        * minutes passed. 'nothing_pending': compression has nothing pending
        * and the context still doesn't fit. After those two the requests are
-       * queued too, and the turn fails as a refused compile did before the
-       * hold. 'stopped': the turn ended while it was held (an abandon, a
-       * stop of the turn or of the framework, or the agent's leaving), with
-       * its `inference:aborted`; the wakes that joined it go back to the queue
-       * after an abandon or a stop of the turn, and go with it otherwise.
+       * queued too, for one fresh compile, and if it is refused the turn fails
+       * as a refused compile did before the hold. 'stopped': the turn ended
+       * while it was held (an abandon, a stop of the turn or of the
+       * framework, or the agent's leaving), with its `inference:aborted`; the
+       * wakes that joined it go back to the queue after an abandon or a stop
+       * of the turn, and go with it otherwise.
        */
       outcome: 'fit' | 'check_failed' | 'deadline' | 'nothing_pending' | 'stopped';
       /** Since the hold started (`inference:held`'s `since`). */

@@ -28,10 +28,12 @@
     `ops:alert` trace each time, its webhook post at most once per 15 minutes
     for an agent), and says the turn is held until its deadline. A hold's
     drain kicks log as `[budget-hold]`.
-- **Agents:** a turn released from a hold stores a note in the agent's history
-  saying why it waited, where the turn reads it, as an `afterUser` context
-  injection is stored: "[budget-hold] Your context didn't fit its budget
-  (100,201 tokens against 48,568), so this turn waited 7 min for compression
-  to make room." The note lands before the compile the preview judged fit,
-  so at the margin it can tip that compile into a refusal, and the hold then
-  holds the turn again until something it watches changes.
+- **Agents:** the turn's next start once its hold ends, with a fit or
+  without, stores a note in the agent's history saying why it waited, where
+  the turn reads it, as an `afterUser` context injection is stored (while the
+  window is held, the compile places it instead): "[budget-hold] Your context
+  didn't fit its budget (100,201 tokens against 48,568), so this turn waited
+  7 min for compression to make room." The note lands before the compile the
+  preview judged fit, so at the margin it can tip that compile into a
+  refusal, and the hold then holds the turn again until something it watches
+  changes.
