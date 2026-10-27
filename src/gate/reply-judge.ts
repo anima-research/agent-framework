@@ -23,8 +23,10 @@
  * Japanese or Korean text) can carry more than the budget, and so can one whose
  * newest message alone is over it, since the newest message is always shown
  * (cut to its own cap). A request the provider refuses as too long is asked
- * once more with the ratio halved, to no less than one character a token;
- * refused again, it fails as any failed call does. The document is
+ * once more from a fresh window, with the ratio it was built at halved, to no
+ * less than one character a token, unless it was built at one already; refused
+ * again, it fails as any failed call does. The lower ratio stays for later
+ * requests until responses correct it. The document is
  * sent as a run of chunks that start at an anchor, the first message shown,
  * which stays put while the window grows into its budget: the chunks before
  * the newest stay byte-identical from one request to the next, and a cache
@@ -384,7 +386,7 @@ export class ReplyJudge {
   }
 
   /** Build the judge's request for one batch: the system prompt, the document in chunks, the question. */
-  async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string; chars: number }> {
+  async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
     const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
     const preview = await this.preview(agentName);
@@ -469,6 +471,7 @@ export class ReplyJudge {
     return {
       agentName,
       chars,
+      ratio: this.charsPerToken,
       request: {
         system,
         messages,
@@ -549,12 +552,12 @@ export class ReplyJudge {
     try {
       response = await this.ask(built, request.signal);
     } catch (err) {
-      if ((err as { type?: unknown } | null)?.type !== 'context_length' || this.charsPerToken <= 1) throw err;
-      const was = this.charsPerToken;
-      this.charsPerToken = Math.max(1, was / 2);
+      if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= 1) throw err;
+      this.charsPerToken = Math.min(this.charsPerToken, Math.max(1, built.ratio / 2));
+      this.anchors.delete(built.agentName);
       console.error(
-        `[gate] the reply judge's request of ${built.chars} characters was refused as too long; its estimate goes from `
-        + `${was.toFixed(2)} to ${this.charsPerToken.toFixed(2)} characters a token, and the batch is asked once more`,
+        `[gate] the reply judge's request of ${built.chars} characters, built at ${built.ratio.toFixed(2)} characters a token, `
+        + `was refused as too long; the estimate is now ${this.charsPerToken.toFixed(2)}, and the batch is asked once more`,
       );
       built = await this.buildRequest(request);
       response = await this.ask(built, request.signal);

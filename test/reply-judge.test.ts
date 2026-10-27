@@ -46,14 +46,15 @@ function conversation(n: number, size = 400): NormalizedMessage[] {
   return out;
 }
 
-/** A provider that refuses as too long the first `refusals` requests, with `error` (a context-length error by default). */
-function refusingMembrane(refusals: number, error?: Error) {
+/** A provider that refuses, with `error` (a context-length error by default), the requests `refuses` picks by their 1-based number, or the first `refuses` of them. */
+function refusingMembrane(refuses: number | ((n: number) => boolean), error?: Error) {
+  const refused = typeof refuses === 'number' ? (n: number) => n <= refuses : refuses;
   const requests: NormalizedRequest[] = [];
   const size = (r: NormalizedRequest) => r.messages.reduce((n, m) => n + m.content.reduce((k, b) => k + (b.type === 'text' ? b.text.length : 0), 0), 0);
   const membrane = {
     complete: async (request: NormalizedRequest) => {
       requests.push(request);
-      if (requests.length <= refusals) {
+      if (refused(requests.length)) {
         throw error ?? new MembraneError({ type: 'context_length', retryable: false, message: 'prompt is too long: 1200000 tokens > 1000000 maximum', rawError: { status: 400 } });
       }
       return {
@@ -68,24 +69,26 @@ function refusingMembrane(refusals: number, error?: Error) {
 }
 
 describe('reply judge: a request refused as too long', () => {
-  const judgeOver = (membrane: Membrane) => new ReplyJudge({
+  const judgeOver = (membrane: Membrane, messages = 60, maxInputTokens = 4_000) => new ReplyJudge({
     membraneFor: () => membrane, chooseAgent: (n) => n[0],
-    preview: async () => ({ messages: conversation(60), config: { model: 'x', maxTokens: 1 } }),
-    options: { maxInputTokens: 4_000 },
+    preview: async () => ({ messages: conversation(messages), config: { model: 'x', maxTokens: 1 } }),
+    options: { maxInputTokens },
   });
+  const quietly = async <T>(run: () => Promise<T>): Promise<T> => {
+    const original = console.error;
+    console.error = () => {};
+    try {
+      return await run();
+    } finally {
+      console.error = original;
+    }
+  };
 
   it('is asked once more, smaller', async () => {
     const { membrane, requests, size } = refusingMembrane(1);
     const judge = judgeOver(membrane);
     const before = judge.estimateRatio();
-    const original = console.error;
-    console.error = () => {};
-    let verdict;
-    try {
-      verdict = await judge.judge(judgeRequest());
-    } finally {
-      console.error = original;
-    }
+    const verdict = await quietly(() => judge.judge(judgeRequest()));
     assert.strictEqual(verdict.reply, true);
     assert.strictEqual(requests.length, 2);
     assert.ok(size(requests[1]!) < size(requests[0]!), `${size(requests[1]!)} < ${size(requests[0]!)}`);
@@ -94,14 +97,39 @@ describe('reply judge: a request refused as too long', () => {
 
   it('refused again, fails as any failed call does, after two requests', async () => {
     const { membrane, requests } = refusingMembrane(2);
-    const original = console.error;
-    console.error = () => {};
-    try {
-      await assert.rejects(judgeOver(membrane).judge(judgeRequest()), /prompt is too long/);
-    } finally {
-      console.error = original;
-    }
+    await quietly(() => assert.rejects(judgeOver(membrane).judge(judgeRequest()), /prompt is too long/));
     assert.strictEqual(requests.length, 2);
+  });
+
+  it('is asked smaller though the window from the last request still fits, by starting a fresh window', async () => {
+    // The first batch is answered, and its window holds the whole conversation; the second is refused.
+    const { membrane, requests, size } = refusingMembrane((n) => n === 2);
+    const judge = judgeOver(membrane, 50, 20_000);
+    await quietly(() => judge.judge(judgeRequest()));
+    await quietly(() => judge.judge(judgeRequest()));
+    assert.strictEqual(requests.length, 3);
+    assert.strictEqual(size(requests[1]!), size(requests[0]!), 'premise: the refused request is the answered one again');
+    assert.ok(size(requests[2]!) < size(requests[1]!), `${size(requests[2]!)} < ${size(requests[1]!)}`);
+  });
+
+  it('keeps the lower ratio for later batches, down to one character a token, where a refusal is no longer asked again', async () => {
+    const { membrane, requests } = refusingMembrane(() => true);
+    const judge = judgeOver(membrane);
+    const asked: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const before = requests.length;
+      await quietly(() => assert.rejects(judge.judge(judgeRequest()), /prompt is too long/));
+      asked.push(requests.length - before);
+    }
+    assert.deepStrictEqual(asked, [2, 2, 1]);
+    assert.strictEqual(judge.estimateRatio(), 1);
+  });
+
+  it('halves the ratio once for two requests built at it and refused together', async () => {
+    const { membrane } = refusingMembrane(() => true);
+    const judge = judgeOver(membrane);
+    await quietly(() => Promise.allSettled([judge.judge(judgeRequest()), judge.judge(judgeRequest())]));
+    assert.strictEqual(judge.estimateRatio(), 1.5);
   });
 
   it("isn't asked again for any other failure", async () => {
