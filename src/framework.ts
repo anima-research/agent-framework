@@ -15396,24 +15396,27 @@ export class AgentFramework {
     const withoutOpening = tunedOut
       ? ''
       : " To reply without opening it, decline it first (option 3): a channel you've declined stays closed when you speak there.";
-    const woken = opts.targetAgents?.length === 1 ? this.agents.get(opts.targetAgents[0]!) : undefined;
+    const named = opts.targetAgents?.filter((name) => this.agents.has(name)) ?? [];
+    const woken = named.length === 1 ? this.agents.get(named[0]!) : undefined;
     const mode = (woken ?? this.deliveryAgent())?.proseRouting ?? 'locus';
     const prefix = mode === 'hybrid' ? '>>>' : '>>';
     const delivered = replyOpens
       ? `it will be delivered there, which opens the channel.${withoutOpening}`
       : 'it will be delivered there, and the channel stays closed.';
     const sendTool = `check whether ${opts.serverId} exposes a send tool that can address it`;
+    const plainSpeechRule = `your plain speech lands where the latest word on where it lands says: ` +
+      `a [${NOTICE_TAG.routing}] notice, or channel_open's result. If that names ${this.channelShown(channel)}, ` +
+      `write your reply with no prefix;`;
     const replyOption = inboundOnlyServer
       ? `1. Replying there isn't available: ${inboundOnlyServer} declared this channel inbound-only, so nothing ` +
         `you write is posted into it. To speak there, use ${inboundOnlyServer}'s own tools.\n`
       : mode === 'disabled'
         ? `1. Replying in plain text isn't available: your plain text is never published. To speak there, ${sendTool}.\n`
         : mode === 'locus' && tunedOut
-          ? `1. Reply — your plain text goes to your turn's channel; to reply here, ${sendTool}.\n`
+          ? `1. Reply — ${plainSpeechRule} it will be delivered there. Otherwise, or if you see none, to reply here, ${sendTool}.\n`
           : mode === 'locus'
-            ? `1. Reply — your plain text goes to the channel the latest [${NOTICE_TAG.routing}] notice names. If it names ` +
-              `this channel, write your reply with no prefix; ${delivered} Otherwise, or if you see none, to reply here, ` +
-              `${sendTool}.\n`
+            ? `1. Reply — ${plainSpeechRule} ${delivered} Otherwise, or if you see none, to reply here, ${sendTool}, or open ` +
+              `it (option 2), whose result says where your plain speech lands.\n`
           : target
             ? `1. Reply — write your reply this turn prefixed with "${prefix}${target}"; ${delivered}\n`
             : `1. Reply — no single-word target reaches this channel unambiguously, ` +

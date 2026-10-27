@@ -179,7 +179,8 @@ describe('batched wake routing', () => {
       .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text));
     const invitation = texts.find((t) => t.includes('[Channel invitation]') && t.includes('first')) ??
       texts.find((t, i) => t.includes('[Channel invitation]') && texts[i - 1]?.includes('first'));
-    assert.ok(invitation?.includes('If it names this channel, write your reply with no prefix'), String(invitation));
+    assert.ok(invitation?.includes('If that names #room'), String(invitation));
+    assert.ok(invitation?.includes('write your reply with no prefix'), String(invitation));
     assert.ok(invitation?.includes('Otherwise, or if you see none, to reply here'), String(invitation));
     const routing = texts.filter((t) => t.startsWith('[routing]'));
     assert.ok(routing.length >= 1 && routing.at(-1)!.includes('general'), JSON.stringify(routing));

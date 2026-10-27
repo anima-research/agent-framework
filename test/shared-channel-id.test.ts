@@ -678,6 +678,23 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
     + 'server "d" (its server no longer registers it)), so nothing was posted. Call again with channelId set to one of "a:general", "b:general".');
 });
 
+test("a refusal names the channelId channel_publish reaches a channel it shows by id and server by, or says none reaches it alone", async () => {
+  // Server "a"'s "b\"x:room" is the only channel with that id, though its qualified name is server "a:b\"x"'s "room"'s too.
+  const f = fixture([['a', 'b"x:room'], ['a:b"x', 'room']]);
+  for (const candidate of ['"b\\"x:room" on server "a"', '#lounge = "b\\"x:room" on server "a"']) {
+    assert.equal(f.registry.publishRouteFor([candidate]), ' For a channel shown by its id and server: channel_publish reaches '
+      + '"b\\"x:room" on server "a" with channelId "b\\"x:room".', candidate);
+  }
+  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: 'b"x:room', content: 'hello' });
+  assert.equal(posted.success, true, posted.error);
+  assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a b"x:room']);
+  // Server "a"'s "b:room": its id is server "c"'s too, and its qualified name server "a:b"'s "room"'s.
+  const odd = fixture([['a', 'b:room'], ['a:b', 'room'], ['c', 'b:room']]);
+  assert.equal(odd.registry.publishRouteFor(['"b:room" on server "a"']),
+    ' For a channel shown by its id and server: no channelId reaches "b:room" on server "a" alone.');
+  assert.equal(odd.registry.publishRouteFor(['"b:room" on server "a" (no channelId reaches it alone)', 'c:b:room']), '');
+});
+
 test("a turn's channels sharing an id whose qualified names don't show as themselves stay reachable by those names, as JSON", async () => {
   const f = fixture([['a', 'x"y'], ['b', 'x"y']]);
   const own: ChannelRef[] = [{ serverId: 'a', channelId: 'x"y' }, { serverId: 'b', channelId: 'x"y' }];
@@ -1305,7 +1322,7 @@ for (const order of orders) {
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce')
       .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text))[0] ?? '';
     assert.ok(bounce.includes('"gen\\"a" on server "a"'), bounce);
-    assert.ok(bounce.includes('channel_publish reaches "gen\\"a" on server "a" with channelId "a:gen\\"a"'), bounce);
+    assert.ok(bounce.includes('channel_publish reaches "gen\\"a" on server "a" with channelId "gen\\"a"'), bounce);
     assert.ok(!bounce.includes('serverId'), 'channel_publish takes no serverId, so the bounce names none');
   });
 

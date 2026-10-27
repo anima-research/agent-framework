@@ -399,7 +399,10 @@ test("a closed-channel invitation in a tuned-out channel doesn't offer the decli
   }, 'agent-tool');
   assert.equal(registry.isChannelOpen(ref(channelId)), false);
   const tunedOut = invite(channelId, '#upkeep');
-  assert.match(tunedOut, /1\. Reply — your plain text goes to your turn's channel; to reply here, check whether discord exposes a send tool that can address it\.\n/);
+  assert.ok(tunedOut.includes("1. Reply — your plain speech lands where the latest word on where it lands says: a [routing] notice, "
+    + "or channel_open's result. If that names #upkeep (discord:g1:444555), write your reply with no prefix; it will be delivered there. "
+    + 'Otherwise, or if you see none, to reply here, check whether discord exposes a send tool that can address it.\n'), tunedOut);
+  assert.doesNotMatch(tunedOut, /open it \(option 2\)/);
   assert.doesNotMatch(tunedOut, /decline it first/);
   assert.equal((await registry.handleChannelToolCall('channel_decline', { channelId, messageId: 'm7' }, origin)).success, false,
     'channel_decline refuses it');

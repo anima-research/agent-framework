@@ -4239,6 +4239,32 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
   });
 });
 
+describe('plain speech whose turn\'s channel is tuned out', () => {
+  it('lands in that channel, as the tuned-out invitation\'s reply line says', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'locus' }] });
+    try {
+      const registry = (h.framework as unknown as {
+        channelRegistry: { ensureChannelRegistered(s: string, id: string, label: string): void; enterTuneOut(s: string, c: string, p: unknown, src: string): void };
+      }).channelRegistry;
+      registry.ensureChannelRegistered('discord', 'discord:g1:side', '#side (Guild One)');
+      let tunedOut = false;
+      h.framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started' && !tunedOut) {
+          tunedOut = true;
+          registry.enterTuneOut('discord', 'discord:g1:side', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+        }
+      });
+      h.membrane.pushResponse(createMockResponse([text('hello there')]));
+      h.command({ op: 'incoming', channelId: 'discord:g1:side', messageId: 'in-side', mode: 'addressed', text: 'over here' });
+      await h.until(() => h.publishes().some((p) => p.event === 'publish'), 'the publish');
+      assert.equal(tunedOut, true, 'the channel was tuned out before the turn spoke');
+      assert.deepEqual(h.publishes().filter((p) => p.event === 'publish').map((p) => [p.channelId, p.text]), [['discord:g1:side', 'hello there']]);
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 describe('a closed channel\'s invitation offers the reply its agent\'s mode reads', () => {
   const opens = 'it will be delivered there, which opens the channel. To reply without opening it, decline it first (option 3): ' +
     'a channel you\'ve declined stays closed when you speak there.';
@@ -4247,8 +4273,10 @@ describe('a closed channel\'s invitation offers the reply its agent\'s mode read
     explicit: { line: `1. Reply — write your reply this turn prefixed with ">>#side"; ${opens}\n`, reply: '>>#side hello there' },
     hybrid: { line: `1. Reply — write your reply this turn prefixed with ">>>#side"; ${opens}\n`, reply: '>>>#side hello there' },
     locus: {
-      line: `1. Reply — your plain text goes to the channel the latest [routing] notice names. If it names this channel, ` +
-        `write your reply with no prefix; ${opens} Otherwise, or if you see none, to reply here, ${sendTool}.\n`,
+      line: `1. Reply — your plain speech lands where the latest word on where it lands says: a [routing] notice, or ` +
+        `channel_open's result. If that names #side (Guild One) (discord:g1:side), write your reply with no prefix; ${opens} ` +
+        `Otherwise, or if you see none, to reply here, ${sendTool}, or open it (option 2), whose result says where your plain ` +
+        `speech lands.\n`,
       reply: 'hello there',
     },
     disabled: { line: `1. Replying in plain text isn't available: your plain text is never published. To speak there, ${sendTool}.\n`, reply: 'hello there' },
@@ -4297,6 +4325,22 @@ describe('a closed channel\'s invitation offers the reply its agent\'s mode read
           tags: ['chat:mention', 'chat:addressed', 'chat:from-human'], timestamp: new Date().toISOString(),
           triggerInference: false, deliverTo: 'quill', acceptedAt: Date.now(),
         });
+        const invitation = h.texts('quill').find((t) => t.includes('[Channel invitation]'))!;
+        assert.ok(invitation.includes(offered[second].line), invitation);
+      } finally {
+        await h.close();
+      }
+    });
+    it(`reads the mode of the one live agent a push names: ${second}, beside the first agent's ${first} and a name no agent has`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: first }, { name: 'quill', proseRouting: second }] });
+      try {
+        (h.framework as unknown as { handleMcplPushEvent(event: unknown): unknown }).handleMcplPushEvent({
+          type: 'mcpl:push-event', serverId: 'discord', featureSet: 'chat', eventId: 'ev-side', timestamp: new Date().toISOString(),
+          origin: { mcplChannelId: 'discord:g1:side', channelName: '#side (Guild One)', authorName: 'someone', messageId: 'in-side' },
+          content: [{ type: 'text', text: 'over here' }], tags: ['chat:mention', 'chat:addressed', 'chat:from-human'],
+          triggerInference: false, targetAgents: ['ghost', 'quill'],
+        });
+        await h.until(() => h.texts('quill').some((t) => t.includes('[Channel invitation]')), 'the invitation');
         const invitation = h.texts('quill').find((t) => t.includes('[Channel invitation]'))!;
         assert.ok(invitation.includes(offered[second].line), invitation);
       } finally {

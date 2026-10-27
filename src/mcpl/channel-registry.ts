@@ -723,14 +723,14 @@ function withEmbeddedTextMarked(block: unknown): unknown {
 }
 
 /** A channel told apart by its id and its server, for one no string picks
- *  alone: `"b:room" on server "a"`, each a JSON literal a channel tool's
- *  channelId and serverId take back (quotedValue). No input takes it for a
- *  name. */
+ *  alone or whose name wouldn't show as itself: `"b:room" on server "a"`,
+ *  each a JSON literal a channel tool's channelId and serverId take back
+ *  (quotedValue). No input takes the whole form for a name. */
 function channelOnServer(ref: ChannelRef): string {
   return `${quotedValue(ref.channelId)} on server ${quotedValue(ref.serverId)}`;
 }
 
-const CHANNEL_ON_SERVER = /("(?:[^"\\]|\\.)*") on server ("(?:[^"\\]|\\.)*")/g;
+const CHANNEL_ON_SERVER_AT_END = /("(?:[^"\\]|\\.)*") on server ("(?:[^"\\]|\\.)*")$/;
 
 /**
  * What one channels/publish attempt established (ChannelRegistry.publish).
@@ -4519,11 +4519,11 @@ export class ChannelRegistry {
   /**
    * The turn's channels a name means neither of (ownChannelNamed), each by a
    * string that reaches it outside the turn's rule: its server-qualified
-   * name, where that picks it alone and shows as itself, since its id is the
-   * name refused. One whose qualified name doesn't show as itself is named by
-   * its id and server; one no string picks alone, and one its server no
-   * longer registers, are too, saying so. `reaches` says which a name
-   * reaches.
+   * name, where that picks it alone, since its id is the name refused: as
+   * itself, or as JSON where it wouldn't show as itself, and by its id and
+   * server in `prose`, which a `>>` target reads. One no string picks alone,
+   * and one its server no longer registers, are named by id and server,
+   * saying so. `reaches` says which a name reaches.
    */
   private ownCandidates(channels: readonly ChannelRef[]): Array<{ text: string; prose: string; reaches: boolean; byServer: boolean }> {
     return channels.map((c) => {
@@ -4543,27 +4543,25 @@ export class ChannelRegistry {
   }
 
   /**
-   * What a refusal listing these candidates says of each channel it shows by
-   * its id and server: the server-qualified name channel_publish's channelId
-   * reaches it by, where that name picks it alone, or that no channelId
-   * reaches it alone. It leaves out a channel no longer registered and one
-   * whose listing already says no channelId reaches it alone, and is empty
-   * when nothing is left.
+   * What a refusal listing these candidates says of each one that is a
+   * channel shown by its id and server: the channelId channel_publish reaches
+   * it by (its id or server-qualified name, whichever picks it alone), or that
+   * no channelId reaches it alone. It leaves out a channel no longer
+   * registered and a candidate that already says no channelId reaches it
+   * alone, and is empty when nothing is left.
    */
   publishRouteFor(candidates: readonly string[]): string {
     const parts = new Set<string>();
     for (const candidate of candidates) {
-      if (candidate.endsWith(' (no channelId reaches it alone)')) continue;
-      for (const [, channelId, serverId] of candidate.matchAll(CHANNEL_ON_SERVER)) {
-        const ref: ChannelRef = { channelId: JSON.parse(channelId!) as string, serverId: JSON.parse(serverId!) as string };
-        const entry = this.entryAt(ref);
-        if (!entry) continue;
-        const qualified = qualifiedChannelName(ref);
-        const picked = this.entriesNamed(qualified);
-        parts.add(picked.length === 1 && picked[0] === entry
-          ? `channel_publish reaches ${channelOnServer(ref)} with channelId ${quotedValue(qualified)}`
-          : `no channelId reaches ${channelOnServer(ref)} alone`);
-      }
+      const shown = CHANNEL_ON_SERVER_AT_END.exec(candidate);
+      if (!shown) continue;
+      const ref: ChannelRef = { channelId: JSON.parse(shown[1]!) as string, serverId: JSON.parse(shown[2]!) as string };
+      const entry = this.entryAt(ref);
+      if (!entry) continue;
+      const name = this.nameFor(entry);
+      parts.add(name !== undefined
+        ? `channel_publish reaches ${channelOnServer(ref)} with channelId ${quotedValue(name)}`
+        : `no channelId reaches ${channelOnServer(ref)} alone`);
     }
     return parts.size ? ` For a channel shown by its id and server: ${[...parts].join('; ')}.` : '';
   }
