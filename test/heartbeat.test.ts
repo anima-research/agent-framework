@@ -62,7 +62,8 @@ async function skipReplyFramework(
   t.after(async () => { await framework.stop(); rmSync(own, { recursive: true, force: true }); });
   const internals = framework as unknown as {
     heartbeat: { start(): void; handleToolCall(name: string, input: unknown): { success: boolean; data?: string } };
-    eventGate: { addPolicy(p: unknown): void; removePolicy(name: string): boolean };
+    eventGate: { addPolicy(p: unknown): void; removePolicy(name: string): boolean; probe(info: unknown): unknown; selfWakeTimers: Map<string, unknown> };
+    upcomingWakesFor(agentName: string): Array<{ what: string; certain: boolean }>;
     initializeMcpl(servers: []): Promise<void>;
     pushEvent(event: { type: string; callId?: string; result?: { data?: { note?: string } } }): void;
     dispatchToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
@@ -284,7 +285,8 @@ describe('heartbeat: upcoming wakes', () => {
     hb.start();
     call(hb, 'reminder_add', { message: 'water the tomatoes', inMinutes: 20 });
     const wakes = hb.scheduledWakes();
-    assert.deepEqual(hb.upcomingWakes(), wakes, 'upcomingWakes lists them for the judge');
+    assert.deepEqual(hb.upcomingWakes(), wakes.map(({ at, certain, what }) => ({ at, certain, what })),
+      "upcomingWakes lists them for the judge, with 0.28.0's fields only");
     assert.deepEqual(wakes.map((w) => [w.at, w.what]), [
       [T0 + 20 * 60_000, 'its reminder "water the tomatoes"'],
       [T0 + 14400_000, 'its heartbeat (a check-in prompt, every 4 h)'],
@@ -684,6 +686,26 @@ describe('the framework\'s heartbeat', () => {
     internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: 'water the tomatoes', inSeconds: 240 });
     internals.eventGate.addPolicy({ name: 'no-stretch', match: { scope: ['mcpl:push-event'], filter: { type: 'text', pattern: 'stretch' } }, behavior: 'skip' });
     firstIn(await skip('s3', 900), 'Your reminder "water the tomatoes"', 900);
+
+    // The reply judge's list is probed the same way, in its own words: the
+    // held-back reminder is only a "maybe", the others certain.
+    const judged = () => internals.upcomingWakesFor('scout').map((w) => [w.what, w.certain]);
+    assert.deepEqual(judged(), [
+      ['its reminder "stretch"', false],
+      ['its reminder "water the tomatoes"', true],
+      ['its heartbeat (a silent tick, every 10 min)', true],
+    ]);
+    internals.eventGate.addPolicy({ name: 'no-silent', match: { scope: ['mcpl:push-event'], metadataTrue: ['silent'] }, behavior: 'skip' });
+    assert.deepEqual(judged().at(-1), ['its heartbeat (a silent tick, every 10 min)', false], 'the silent tick held back by its flag');
+    assert.deepEqual(judged()[1], ['its reminder "water the tomatoes"', true], 'which leaves a reminder certain');
+  });
+
+  it("sends the plain note, with the self-wake armed, when the heartbeat's wakes can't be read", async (t) => {
+    const { internals, skip } = await skipReplyFramework(t, { heartbeat: { defaults: { intervalSeconds: 600 } } });
+    internals.eventGate.probe = () => { throw new Error('probe failed'); };
+    assert.equal(await skip('s1', 900), plainNote(900));
+    assert.ok(internals.eventGate.selfWakeTimers.has('scout'), 'the self-wake is armed');
+    assert.ok(errors.some((e) => /the heartbeat's wakes couldn't be read for skip_reply's note: "?probe failed/.test(String(e[0]))), JSON.stringify(errors));
   });
 
   it("names nothing for an agent the heartbeat doesn't wake, a paused heartbeat, or no heartbeat", async (t) => {

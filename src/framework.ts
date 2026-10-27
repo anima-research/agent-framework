@@ -26003,7 +26003,7 @@ export class AgentFramework {
           const earlierWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
           console.error(armed
             ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
-              + (earlierWake ? `; the heartbeat is due sooner, in ~${earlierWake.inSeconds}s` : '')
+              + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
             : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
           this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
           return;

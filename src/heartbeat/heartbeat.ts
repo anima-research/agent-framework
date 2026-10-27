@@ -334,7 +334,7 @@ export class Heartbeat {
 
   /** What the heartbeat will wake the agent with, soonest first, for the reply judge (UpcomingWake). */
   upcomingWakes(): UpcomingWake[] {
-    return this.scheduledWakes();
+    return this.scheduledWakes().map(({ at, certain, what }) => ({ at, certain, what }));
   }
 
   /**
