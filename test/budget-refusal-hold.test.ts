@@ -1041,7 +1041,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           assert.match(e.message, /Cannot undo while prime is idle\+turn-alive \(a budget hold/);
           return true;
         });
-        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the earlier turn is still there to undo');
+        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 2, 'the earlier turn and the held one are there to undo once it ends');
         assert.ok(storedText(t.framework).includes('Are you there?'));
       } finally {
         await t.close();
@@ -1059,6 +1059,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
         backlog.fit = true;
         assert.ok(await turnOver(t));
+        assert.ok(storedText(t.framework).includes('Answered once it fit'));
         assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the refused start left no undo step of its own');
         assert.equal(t.framework.undoLastTurn('prime').undone, true);
         const text = storedText(t.framework);
@@ -1076,12 +1077,37 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       try {
         t.send('First message');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the retry\'s compile is refused and held');
+        t.send('Second message, while held');
+        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
         backlog.fit = true;
         assert.ok(await turnOver(t));
+        assert.ok(storedText(t.framework).includes('Answered once it fit'));
         assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
         assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        assert.ok(storedText(t.framework).includes('First message') && !storedText(t.framework).includes('Answered once it fit'),
-          'which takes the reply and leaves the input');
+        const text = storedText(t.framework);
+        assert.ok(text.includes('First message') && !text.includes('Answered once it fit'), 'which takes the reply and leaves the input');
+        assert.ok(!text.includes('Second message, while held'), 'and takes the message that arrived while the retry waited');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('leaves a held turn that is stopped its own undo step, so an undo takes nothing from the turn before', async () => {
+    await withBacklog({ fit: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000, responses: 2 });
+      try {
+        t.send('First message');
+        assert.ok(await turnOver(t));
+        backlog.fit = false;
+        t.send('Second message');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.equal(t.framework.abortInference('prime'), true);
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000));
+        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 2, 'the turn before and the stopped one');
+        assert.equal(t.framework.undoLastTurn('prime').undone, true);
+        const text = storedText(t.framework);
+        assert.ok(text.includes('Answered once it fit') && text.includes('Second message'), 'the undo takes the stopped turn alone');
       } finally {
         await t.close();
       }
@@ -1093,12 +1119,16 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     try {
       assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the retry after the failed stream is refused and held');
       assert.ok(toolBlocks(t.framework) >= 2, 'the turn\'s tool round is in its history');
+      t.framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'Added while held' }]);
       t.fit();
       assert.ok(await turnOver(t));
+      assert.ok(storedText(t.framework).includes('Answered once it fit'));
       assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
       assert.equal(t.framework.undoLastTurn('prime').undone, true);
       assert.equal(toolBlocks(t.framework), 0, 'the undo takes the rounds the turn ran before its hold');
-      assert.ok(storedText(t.framework).includes('fetch it') && !storedText(t.framework).includes('Answered once it fit'));
+      const text = storedText(t.framework);
+      assert.ok(text.includes('fetch it') && !text.includes('Answered once it fit') && !text.includes('Added while held'),
+        'and the reply and what arrived while the retry waited');
     } finally {
       await t.close();
     }
@@ -1108,8 +1138,10 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     const t = await heldRestart(['Answered once it fit'], { guardRetry: true });
     try {
       assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the guard\'s retry is refused and held');
+      assert.ok(toolBlocks(t.framework) >= 2, 'the round the guard\'s retry follows is in the turn\'s history');
       t.fit();
       assert.ok(await turnOver(t));
+      assert.ok(storedText(t.framework).includes('Answered once it fit'));
       assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the turn\'s first start recorded its one undo step, and the hold gave none of it back');
       assert.equal(t.framework.undoLastTurn('prime').undone, true);
       assert.equal(toolBlocks(t.framework), 0, 'the undo takes the tool round the guard\'s retry followed');
@@ -1984,9 +2016,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('keeps the undo history whole at its limit: a held start gives back the checkpoint its record evicted', async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+  it('keeps the undo history at its limit as a turn without a hold leaves it', async () => {
+    await withBacklog({}, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
       const checkpoints = t.framework as unknown as {
         getTurnCheckpoints: (agentName: string) => Array<{ turnIndex: number }>;
         saveTurnCheckpoints: (agentName: string, checkpoints: unknown[]) => void;
@@ -1998,16 +2030,19 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         checkpoints.turnCounters.set('prime', 20);
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.deepEqual(checkpoints.getTurnCheckpoints('prime'), full,
-          'the twenty checkpoints from before the turn, the oldest included, each as it was');
-        assert.equal(checkpoints.turnCounters.get('prime'), 20, 'and the turn index the held start took');
+        backlog.fit = true;
+        assert.ok(await turnOver(t));
+        const kept = checkpoints.getTurnCheckpoints('prime');
+        assert.deepEqual(kept.slice(0, 19), full.slice(1), 'the nineteen newest from before the turn, each as it was');
+        assert.equal(kept.length, 20);
+        assert.equal(kept[19]!.turnIndex, 20, 'and the turn\'s own, with the index it took');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('invalidates redo at a held start, as at any turn\'s first start, and leaves undo as it was', async () => {
+  it('invalidates redo at a held start, as at any turn\'s first start', async () => {
     await withBacklog({ fit: true }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       try {
@@ -2019,8 +2054,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         backlog.fit = false;
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.deepEqual(t.framework.getUndoRedoState('prime'), { ...before, canRedo: false, redoDepth: 0 },
-          'the held start invalidated redo and left undo as it was');
+        assert.deepEqual(t.framework.getUndoRedoState('prime'), { ...before, canUndo: true, undoDepth: before.undoDepth + 1, canRedo: false, redoDepth: 0 },
+          'the held start invalidated redo and its turn is one undo step');
       } finally {
         await t.close();
       }
