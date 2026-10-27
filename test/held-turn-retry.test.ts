@@ -1048,6 +1048,26 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
   });
 });
 
+test("a merged start its released wait puts back in the queue counts as the wakes merged into it there, until the next pass takes it", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      go();
+      assert.equal(internal.pendingRequests.length, 1, 'the released wait queued the merged start');
+      const status = fw.getHostModeStatus();
+      assert.equal(status.gatedRequests, 1, 'the wake merged into the queued start waits');
+      assert.deepEqual(status.activeTurnAgents, ['resident'], 'the start carries the turn on');
+      await fw.runUntilIdle();
+      assert.equal(fw.getHostModeStatus().gatedRequests, 0, 'nothing waits once the pass has taken it');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 for (const how of ['parked', 'held again'] as const) test(`a wake merged into a held turn's released retry counts once while the merged start is ${how}: in ${how === 'parked' ? 'parkedAdmissions' : 'gatedRequests'}, and the turn stays alive`, async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);

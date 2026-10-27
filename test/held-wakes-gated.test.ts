@@ -120,6 +120,32 @@ test("a text whose wake a provider's stated wait holds, recorded by a failed com
   assert.equal(h.started(), 0, 'no turn has started');
 });
 
+test("a wake a host hold keeps through a quiesce counts once, held and then parked by the quiesce gate, and no turn starts until resume()", async (t) => {
+  let spent = true;
+  const h = await host(t, {
+    compressionModel: 'test-compression-model',
+    providerHold: (error) => ((error as { type?: unknown }).type === 'rate_limit' && spent ? { holdMs: 200, reason: 'subscription quota spent' } : undefined),
+  });
+  h.provider.compression = { message: QUOTA, retryAfterMs: 90_000 };
+  h.compress();
+  await h.until('the host hold from the compression failure', () => h.logged.some((line) => /host hold \(subscription quota spent\) from an auxiliary call/.test(line)));
+  h.text('hello before the quiesce');
+  await h.until('the held wake counted', () => h.status().gatedRequests === 1);
+  const quiesced = await h.framework.quiesce({ reason: 'test', timeoutMs: 1_000 });
+  assert.equal(quiesced.drained, true, 'no turn is alive');
+  assert.equal(quiesced.gatedRequests, 1, 'the held wake, counted under the quiesce');
+  spent = false;
+  h.provider.compression = undefined;
+  await h.until('the hold released', () => h.logged.some((line) => /\[provider-cooldown\] agent=resident released after .* 1 retained request\(s\)/.test(line)));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(h.status().gatedRequests, 1, 'the wake, now parked by the quiesce gate, counted once');
+  assert.equal(h.status().drained, true);
+  assert.equal(h.started(), 0, 'no turn starts while quiesced');
+  await h.framework.resume();
+  await h.until('the turn after resume', () => h.started() === 1);
+  await h.until('nothing waiting once it has run', () => h.status().gatedRequests === 0 && h.status().drained);
+});
+
 test('a text whose wake a hold keeps after a stop dropped its turn\'s retry counts in gatedRequests, and drained stays true', async (t) => {
   const h = await host(t, { compressionModel: 'test-compression-model' });
   h.provider.primary = { message: ACCELERATION, retryAfterMs: 61_000 };
