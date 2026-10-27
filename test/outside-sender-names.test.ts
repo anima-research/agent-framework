@@ -91,9 +91,10 @@ async function compiled(membrane: MockMembrane, text: string): Promise<{ partici
   await waitFor('a request carrying the message', () => membrane.calls.some(carries));
   const request = membrane.calls.find(carries)!;
   const message = request.messages.find((m) => JSON.stringify(m.content).includes(text))!;
+  assert.equal(request.assistantParticipant, AGENT, 'the request names the agent as its assistant');
   const built = new NativeFormatter().buildMessages(request.messages, {
     participantMode: 'multiuser',
-    assistantParticipant: request.assistantParticipant ?? AGENT,
+    assistantParticipant: request.assistantParticipant,
   });
   const provider = built.messages.find((m) => JSON.stringify(m).includes(text))!;
   return { participant: message.participant, role: (provider as { role: string }).role };
@@ -136,6 +137,12 @@ test("an API caller named as the agent is stored as '<name> (API)' and compiles 
     assert.deepEqual(await compiled(membrane, text), { participant: `${AGENT} (API)`, role: 'user' });
     const [row] = stored(framework, text);
     assert.deepEqual(row?.metadata?.author, { name: AGENT });
+    // The ApiServer's message list returns the participant as stored.
+    const server = new ApiServer(framework, { port: 0, host: '127.0.0.1' }) as unknown as {
+      cmdMessageList(params?: unknown): Promise<{ messages: Array<{ participant: string; content: unknown }> }>;
+    };
+    const listed = (await server.cmdMessageList({})).messages.filter((m) => JSON.stringify(m.content).includes(text));
+    assert.deepEqual(listed.map((m) => m.participant), [`${AGENT} (API)`]);
   });
 });
 
@@ -158,11 +165,15 @@ test("a sender named the generic 'user', in any case, is stored as given, from D
   });
 });
 
-test("a sender's name that spans lines is stored on one line, before its marker", async () => {
+test("a sender's name that spans lines or holds other control characters is stored on one line, before its marker, and kept as sent in its author", async () => {
   await withFramework(async ({ framework, membrane }) => {
     const text = 'from a caller whose name has line breaks';
-    framework.pushEvent({ type: 'api:message', participant: 'a\nb\r\nc\u2028d\u2029\u2029e\u0085f', content: text } as never);
-    assert.equal((await compiled(membrane, text)).participant, 'a b c d e f (API)');
+    const name = 'a\nb\r\nc\u2028d\u2029\u2029e\u0085f\tg\u0000h';
+    framework.pushEvent({ type: 'api:message', participant: name, content: text } as never);
+    assert.equal((await compiled(membrane, text)).participant, 'a b c d e f g h (API)');
+    const [row] = stored(framework, text);
+    assert.equal(row?.participant, 'a b c d e f g h (API)');
+    assert.deepEqual(row?.metadata?.author, { name });
   });
 });
 
@@ -180,12 +191,18 @@ test('the ApiServer refuses a participant that is not text, and stores nothing f
     const server = new ApiServer(framework, { port: 0, host: '127.0.0.1' }) as unknown as {
       cmdMessageSend(params: unknown): Promise<unknown>;
     };
+    const pushed: unknown[] = [];
+    const push = framework.pushEvent.bind(framework);
+    (framework as unknown as { pushEvent: (event: unknown) => void }).pushEvent = (event) => { pushed.push(event); push(event as never); };
     const text = 'from a caller whose name is not text';
-    for (const participant of [42, { name: AGENT }, [AGENT]]) {
+    for (const participant of [42, true, { name: AGENT }, [AGENT]]) {
       await assert.rejects(server.cmdMessageSend({ participant, content: text }), /participant must be text/);
     }
+    await assert.rejects(server.cmdMessageSend({ participant: null, content: text }), /participant and content are required/);
+    assert.equal(pushed.length, 0, 'a refused send pushes no event');
     // The control: a caller named in text is stored, after the refused sends would have been.
     await server.cmdMessageSend({ participant: 'alice', content: text });
+    assert.equal(pushed.length, 1);
     await waitFor('the control message is stored', () => stored(framework, text).length > 0);
     assert.deepEqual(stored(framework, text).map((m) => m.participant), ['alice (API)']);
   });
@@ -223,8 +240,12 @@ test("an API event's author that isn't an object is replaced by the caller's pla
   await withFramework(async ({ framework, membrane }) => {
     const text = 'from a host whose author is a bare string';
     framework.pushEvent({ type: 'api:message', participant: 'alice', content: text, metadata: { author: 'someone' } } as never);
+    const nullText = 'from a host whose author is null';
+    framework.pushEvent({ type: 'api:message', participant: 'alice', content: nullText, metadata: { author: null } } as never);
     await compiled(membrane, text);
     assert.deepEqual(stored(framework, text)[0]?.metadata?.author, { name: 'alice' });
+    await waitFor('the null-author message is stored', () => stored(framework, nullText).length > 0);
+    assert.deepEqual(stored(framework, nullText)[0]?.metadata?.author, { name: 'alice' });
   });
 });
 
@@ -238,6 +259,8 @@ test("history's author filter finds a Discord author by name in rows stored befo
       isReply: false, mentionedUserIds: ['bot'], attachments: [], timestamp: new Date(1_000),
     });
     await compiled(membrane, 'stored after');
+    assert.equal(stored(framework, 'stored after')[0]?.participant, 'alice (Discord)');
+    assert.equal(stored(framework, 'stored before')[0]?.participant, 'alice');
     const history = new HistoryModule();
     history.bind(cm);
     const extract = async (author: string): Promise<string[]> => {
