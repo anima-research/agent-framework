@@ -817,6 +817,28 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("a private turn's budget restart after a send whose place the framework can't read keeps the restart's words private, where a channel turn's are held", async () => {
+    for (const via of ['private', 'incoming'] as const) {
+      const h = await harness({ agents: [{ name: 'scout', maxStreamTokens: 5 }], sendTool: true });
+      await h.sendMode('no-channel');
+      try {
+        onSecondStream(h.membrane, createMockResponse([text('After the restart.')]));
+        await h.turn([createMockResponse([unplacedSend('s1')], 'tool_use')], 'scout', via);
+        assert.equal(h.membrane.calls.length, 2, `${via}: premise, the stream restarted once`);
+        assert.ok(!h.publishes().some((p) => p.text.includes('After the restart.')), `${via}: the restart's words went nowhere: ${JSON.stringify(h.publishes())}`);
+        if (via === 'incoming') {
+          assert.deepEqual(h.drafts().map((d) => d.text), ['After the restart.'], "control: the restart carries a channel turn's hold");
+          continue;
+        }
+        assert.deepEqual(h.drafts(), [], 'nothing is held');
+        const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+        assert.match(receipt, /1 plain-speech segment\(s\) kept private \(private turn/, receipt);
+      } finally {
+        await h.close();
+      }
+    }
+  });
+
   for (const [label, envelope, held] of [
     ['names no destination', '>>>\nlost words', false],
     ['names a channel that does not resolve', '>>>#nowhere lost words', false],
