@@ -969,7 +969,7 @@ describe('a file tool naming a path passed over by design', () => {
       assert.equal(stored(), 'v2\n', "and stores disk's change");
       env.rmDisk(path);
       const gone = await refused(m, 'read', { path: `work/${path}` });
-      assert.equal(gone, `File not found: work/${path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`);
+      assert.equal(gone, `The read did nothing: there's no file at "work/${path}" any more: disk's copy was deleted since the workspace last agreed with it, and the workspace took that in first. ls or glob lists the files that exist.`);
       assert.equal(stored(), null, "and disk's deletion is stored");
     });
   }
@@ -1122,7 +1122,7 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     // (parseFilePath), and edit_many stores none of its edits, the outer
     // mount's own included.
     const nestedRefusal = '"work/a/b/inner.txt" lies in mount "deep", nested in mount "work", which neither reads nor writes it: use "deep/inner.txt".';
-    assert.equal(await refused(m, 'edit', { path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }), nestedRefusal);
+    assert.equal(await refused(m, 'edit', { path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }), `The edit did nothing: ${nestedRefusal}`);
     assert.equal(await refused(m, 'edit_many', { edits: [{ path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }] }),
       `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${nestedRefusal}`);
     assert.equal(await refused(m, 'edit_many', { edits: [
@@ -3655,7 +3655,7 @@ describe('shell deletions', () => {
       env.rmDisk('gone.txt');
       m = await run(env, m);
       assert.equal(env.store.treeGet(TREE, 'gone.txt'), null, 'the tree entry is removed');
-      assert.match(await refused(m, 'read', { path: 'work/gone.txt' }), /File not found/);
+      assert.match(await refused(m, 'read', { path: 'work/gone.txt' }), /^The read did nothing: there's no file at "work\/gone\.txt"/);
       assert.ok(env.eventsOf('workspace:deleted').some((e) => e.paths.includes('work/gone.txt')), 'a deleted event was pushed');
     });
   }
@@ -4155,8 +4155,8 @@ describe('restarts and faults', () => {
     // C against A on disk B as both-changed and record a sticky conflict. It
     // refuses instead, and records nothing.
     env.store.switchBranch('draft-c');
-    assert.match(await refused(m, 'ls', { path: 'work', recursive: true }), /evidence is unavailable until the store is reopened/);
-    assert.match(await refused(m, 'materialize', { path: 'work/a.txt' }), /evidence is unavailable until the store is reopened/);
+    assert.match(await refused(m, 'ls', { path: 'work', recursive: true }), /^The ls did nothing: the workspace can't check its files against disk until its store is reopened/);
+    assert.match(await refused(m, 'materialize', { path: 'work/a.txt' }), /^The materialize did nothing: the workspace can't check its files against disk until its store is reopened/);
     const intents = (m as unknown as { intents: Map<string, { get(path: string): { conflict?: unknown } | undefined }> }).intents;
     assert.equal(intents.get('work')!.get('a.txt')?.conflict, undefined, 'no conflict was recorded');
 
@@ -4236,7 +4236,7 @@ describe('restarts and faults', () => {
       storeSync.call(env.store);
     };
     try {
-      assert.match(await refused(m, 'ls', { path: 'work' }), /injected EIO at the barrier/);
+      assert.match(await refused(m, 'ls', { path: 'work' }), /^The ls of "work" stopped on an error the workspace didn't expect: an input\/output error on the disk\./);
       assert.equal((m as any).agreement.needsBarrier, true, 'the obligation survives the failed pass');
       DiskAgreement.prototype.set = set;
       syncs = 0;
@@ -7388,7 +7388,7 @@ describe('on-agent-action', () => {
     env.store.createBranch('other', main);
     const error = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
       () => refused(m, 'read', { path: 'work/b.txt' }));
-    assert.equal(error, 'work/b.txt is not in the workspace, and disk could not be checked (the selected branch kept changing while the scan ran). Read again to check it.');
+    assert.equal(error, `The read did nothing: "work/b.txt" isn't in the workspace, and disk couldn't be checked: the selected branch kept changing while the scan ran. Make the same call again, which checks disk first.`);
   });
 
   /**
@@ -7440,9 +7440,9 @@ describe('on-agent-action', () => {
         assert.equal(again.success, true, `${tool} again: ${JSON.stringify(again)}`);
       }
     }
-    const unchecked = `work/new.txt is not in the workspace, and disk could not be checked (${KEPT_CHANGING}). Make the same call again, which checks disk first.`;
+    const unchecked = `"work/new.txt" isn't in the workspace, and disk couldn't be checked: ${KEPT_CHANGING}. Make the same call again, which checks disk first.`;
     assert.deepEqual(answers, {
-      delete: unchecked,
+      delete: `The delete did nothing: ${unchecked}`,
       readBinary: unchecked,
       edit: `work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Make the same call again, which checks disk first.`,
       edit_many: 'The edit_many call stored none of its edits: 1 problem.\n\n'
@@ -7530,8 +7530,8 @@ describe('on-agent-action', () => {
     const read = await m.readBinary('work/new.txt');
     const deleted = await m.handleToolCall({ id: 't', name: 'delete', input: { path: 'work/new.txt' } });
     assert.ok('error' in read, JSON.stringify(read));
-    assert.match(read.error, /^work\/new\.txt is not in the workspace, and disk could not be checked \(.+\)\.$/);
-    assert.equal(read.error, deleted.error);
+    assert.match(read.error, /^"work\/new\.txt" isn't in the workspace, and disk couldn't be checked: .+$/);
+    assert.equal(deleted.error, `The delete did nothing: ${read.error}`);
   });
 
   test("an edit under a pass that decided, with a region left incomplete, applies to the workspace's copy and says so, where one that decided nothing refuses", async (t) => {
@@ -7810,7 +7810,7 @@ describe('a named mount, and a path the workspace and disk hold differently', ()
     ] } as Partial<WorkspaceConfig>);
     const status = await call(m, 'status', { mount: 'work' });
     assert.deepEqual(Object.keys(status.mounts ?? status), ['work'], JSON.stringify(status));
-    assert.match(await refused(m, 'status', { mount: 'nowhere' }), /Unknown mount: nowhere/);
+    assert.match(await refused(m, 'status', { mount: 'nowhere' }), /^The status did nothing: "mount" is "nowhere", which is no mount's name/);
     const done = await call(m, 'materialize', { mount: 'second' });
     assert.equal(done.count, 0);
     assert.match(JSON.stringify(done.skipped), /a read-only mount: materialize writes nothing to it/);

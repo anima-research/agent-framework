@@ -117,7 +117,7 @@ describe('a mount root configured through a symlink', () => {
     assert.deepEqual(env.tree('inner'), ['x.txt']);
     const read = await call(m, 'read', { path: 'outer/a/b/x.txt' });
     assert.equal(read.success, false);
-    assert.equal(read.error, '"outer/a/b/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+    assert.equal(read.error, 'The read did nothing: "outer/a/b/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
     await readsBack(m, 'inner/x.txt', "the inner mount's");
   });
 
@@ -132,7 +132,7 @@ describe('a mount root configured through a symlink', () => {
       assert.equal((await call(m, 'sync', {})).success, true);
       assert.deepEqual(env.tree('outer'), ['top.txt'], `the outer mount took none of the inner mount's files in (absolute target: ${absolute})`);
       const read = await call(m, 'read', { path: 'outer/c/inner-dir/x.txt' });
-      assert.equal(read.error, '"outer/c/inner-dir/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+      assert.equal(read.error, 'The read did nothing: "outer/c/inner-dir/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
       await readsBack(m, 'inner/x.txt', "the inner mount's");
     }
   });
@@ -165,7 +165,7 @@ describe('a mount root configured through a symlink', () => {
       const m = await env.open(t, [mount('w', env.at('w')), mount('in', env.at('w/in'))]);
       env.write(`w/${dir}/f.txt`, "the inner mount's\n");
       const read = await call(m, 'read', { path: `w/${dir}/f.txt` });
-      assert.equal(read.error, `"w/${dir}/f.txt" lies in mount "in", nested in mount "w", which neither reads nor writes it: use "in/f.txt".`, target);
+      assert.equal(read.error, `The read did nothing: "w/${dir}/f.txt" lies in mount "in", nested in mount "w", which neither reads nor writes it: use "in/f.txt".`, target);
       await readsBack(m, 'in/f.txt', "the inner mount's");
     }
   });
@@ -181,7 +181,7 @@ describe('a mount root configured through a symlink', () => {
     const write = await call(m, 'write', { path: 'outer/y.txt', content: 'outer wrote\n' });
     assert.equal(write.success, true, write.error);
     const through = await call(m, 'read', { path: 'outer/self/x.txt' });
-    assert.equal(through.error, '"outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
+    assert.equal(through.error, 'The read did nothing: "outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
     await readsBack(m, 'self/x.txt', "the outer mount's");
   });
 
@@ -196,7 +196,7 @@ describe('a mount root configured through a symlink', () => {
     assert.equal((await call(m, 'sync', {})).success, true);
     assert.deepEqual(env.tree('outer'), ['x.txt'], 'the outer mount passed over the link');
     const through = await call(m, 'read', { path: 'outer/self/x.txt' });
-    assert.equal(through.error, '"outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
+    assert.equal(through.error, 'The read did nothing: "outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
   });
 
   test('a mount configured as a link back to the outer mount\'s root keeps the nesting by configured path when its path reaches that root through a link above it', async (t) => {
@@ -210,7 +210,7 @@ describe('a mount root configured through a symlink', () => {
     assert.equal((await call(m, 'sync', {})).success, true);
     assert.deepEqual(env.tree('outer'), ['x.txt'], 'the outer mount passed over the link');
     const through = await call(m, 'read', { path: 'outer/self/x.txt' });
-    assert.equal(through.error, '"outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
+    assert.equal(through.error, 'The read did nothing: "outer/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
   });
 
   test('an outer mount configured through a link keeps the nesting by configured path of a mount configured through a link inside it that leads out of it', async (t) => {
@@ -226,7 +226,7 @@ describe('a mount root configured through a symlink', () => {
     symlinkSync(env.at('o'), env.at('ol'));
     const m = await env.open(t, [mount('outer', env.at('ol'), { followSymlinks: true }), mount('self', env.at('o/via/self'))]);
     const through = await call(m, 'read', { path: 'outer/via/self/x.txt' });
-    assert.equal(through.error, '"outer/via/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
+    assert.equal(through.error, 'The read did nothing: "outer/via/self/x.txt" lies in mount "self", nested in mount "outer", which neither reads nor writes it: use "self/x.txt".');
   });
 
   test('a mount configured as a link inside the outer mount to a directory above it is nested by its configured path, and holds the outer mount where it is', async (t) => {
@@ -239,11 +239,11 @@ describe('a mount root configured through a symlink', () => {
     assert.deepEqual(env.tree('outer'), ['x.txt']);
     assert.deepEqual(env.tree('up'), ['top.txt']);
     const through = await call(m, 'read', { path: 'outer/up/top.txt' });
-    assert.equal(through.error, '"outer/up/top.txt" lies in mount "up", nested in mount "outer", which neither reads nor writes it: use "up/top.txt".');
+    assert.equal(through.error, 'The read did nothing: "outer/up/top.txt" lies in mount "up", nested in mount "outer", which neither reads nor writes it: use "up/top.txt".');
     const write = await call(m, 'write', { path: 'outer/up/new.txt', content: 'outer wrote\n' });
-    assert.equal(write.error, '"outer/up/new.txt" lies in mount "up", nested in mount "outer", which neither reads nor writes it: use "up/new.txt".');
+    assert.equal(write.error, 'The write did nothing: "outer/up/new.txt" lies in mount "up", nested in mount "outer", which neither reads nor writes it: use "up/new.txt".');
     const back = await call(m, 'read', { path: 'up/outer/x.txt' });
-    assert.equal(back.error, '"up/outer/x.txt" lies in mount "outer", nested in mount "up", which neither reads nor writes it: use "outer/x.txt".');
+    assert.equal(back.error, 'The read did nothing: "up/outer/x.txt" lies in mount "outer", nested in mount "up", which neither reads nor writes it: use "outer/x.txt".');
     await readsBack(m, 'up/top.txt', "the upper mount's");
     await readsBack(m, 'outer/x.txt', "the outer mount's");
   });
@@ -262,7 +262,7 @@ describe('a mount root configured through a symlink', () => {
     for (const [path, use] of [['outer/a/b/x.txt', 'inner/x.txt'], ['outer/via/x.txt', 'inner/x.txt']] as const) {
       const read = await call(m, 'read', { path });
       assert.equal(read.success, false, path);
-      assert.equal(read.error, `"${path}" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "${use}".`);
+      assert.equal(read.error, `The read did nothing: "${path}" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "${use}".`);
     }
   });
 
@@ -274,7 +274,7 @@ describe('a mount root configured through a symlink', () => {
     assert.equal((await call(m, 'sync', {})).success, true);
     assert.deepEqual(env.tree('outer'), []);
     const read = await call(m, 'read', { path: 'outer/a/b/x.txt' });
-    assert.equal(read.error, '"outer/a/b/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+    assert.equal(read.error, 'The read did nothing: "outer/a/b/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
   });
 
   test('an inner root not made yet, beneath a link into the outer mount, is nested where it would be made', async (t) => {
@@ -284,7 +284,7 @@ describe('a mount root configured through a symlink', () => {
     const m = await env.open(t, [mount('outer', env.at('outer'), { autoMaterialize: true }), mount('inner', env.at('via/newdir'))]);
     const write = await call(m, 'write', { path: 'outer/a/newdir/x.txt', content: 'outer wrote\n' });
     assert.equal(write.success, false);
-    assert.equal(write.error, '"outer/a/newdir/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+    assert.equal(write.error, 'The write did nothing: "outer/a/newdir/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
     assert.equal(existsSync(env.at('outer/a/newdir')), false, "the inner mount's root wasn't made by the outer mount");
   });
 });
@@ -300,11 +300,11 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     ]);
     const read = await call(m, 'read', { path: 'work/l/x.txt' });
     assert.equal(read.success, false);
-    assert.equal(read.error, leadsInto('work/l/x.txt', 'work', 'inner', 'inner/sub/x.txt'));
+    assert.equal(read.error, `The read did nothing: ${leadsInto('work/l/x.txt', 'work', 'inner', 'inner/sub/x.txt')}`);
     await readsBack(m, 'inner/sub/x.txt', 'inner file');
     const write = await call(m, 'write', { path: 'work/l/new.txt', content: 'via work\n' });
     assert.equal(write.success, false);
-    assert.equal(write.error, leadsInto('work/l/new.txt', 'work', 'inner', 'inner/sub/new.txt'));
+    assert.equal(write.error, `The write did nothing: ${leadsInto('work/l/new.txt', 'work', 'inner', 'inner/sub/new.txt')}`);
     assert.equal(existsSync(env.at('work/nested/sub/new.txt')), false);
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
     await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
@@ -337,14 +337,14 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
       mount('inner', env.at('work/a/b'), { autoMaterialize: true }),
     ]);
     const read = await call(m, 'read', { path: 'work/l/b/x.txt' });
-    assert.equal(read.error, leadsInto('work/l/b/x.txt', 'work', 'inner', 'inner/x.txt'));
+    assert.equal(read.error, `The read did nothing: ${leadsInto('work/l/b/x.txt', 'work', 'inner', 'inner/x.txt')}`);
     await readsBack(m, 'inner/x.txt', 'inner file');
     const top = await call(m, 'read', { path: 'work/l/top.txt' });
     assert.equal(top.success, true, top.error);
     assert.match(top.structured.content, /outer file under a/);
     for (const [path, use] of [['work/l/b/new.txt', 'inner/new.txt'], ['work/l/b/deep/new.txt', 'inner/deep/new.txt']] as const) {
       const write = await call(m, 'write', { path, content: 'via work\n' });
-      assert.equal(write.error, leadsInto(path, 'work', 'inner', use));
+      assert.equal(write.error, `The write did nothing: ${leadsInto(path, 'work', 'inner', use)}`);
     }
     assert.equal(existsSync(env.at('work/a/b/new.txt')), false);
     assert.equal(existsSync(env.at('work/a/b/deep')), false);
@@ -361,7 +361,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     ]);
     for (const [path, use] of [['work/flink.txt', 'inner/new.txt'], ['work/l/x.txt', 'inner/sub/x.txt']] as const) {
       const write = await call(m, 'write', { path, content: 'via work\n' });
-      assert.equal(write.error, leadsInto(path, 'work', 'inner', use));
+      assert.equal(write.error, `The write did nothing: ${leadsInto(path, 'work', 'inner', use)}`);
     }
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
     assert.equal(existsSync(env.at('work/nested/new.txt')), false);
@@ -378,14 +378,14 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     symlinkSync('../y.txt', env.at('work/nested/sub/flink.txt'));
     const m = await env.open(t, [mount('work', env.at('work'), { followSymlinks: true }), mount('inner', env.at('work/nested'))]);
     const write = await call(m, 'write', { path: 'work/alias/flink.txt', content: 'via work\n' });
-    assert.equal(write.error, leadsInto('work/alias/flink.txt', 'work', 'inner', 'inner/y.txt'));
+    assert.equal(write.error, `The write did nothing: ${leadsInto('work/alias/flink.txt', 'work', 'inner', 'inner/y.txt')}`);
     // A `..` after a link inside the target is taken from where that link
     // leads too: x leads to nested/sub/deep, so x/../z.txt is nested/sub/z.txt.
     env.write('work/nested/sub/deep/keep.txt', 'inner\n');
     symlinkSync('nested/sub/deep', env.at('work/x'));
     symlinkSync('x/../z.txt', env.at('work/flink2.txt'));
     const second = await call(m, 'write', { path: 'work/flink2.txt', content: 'via work\n' });
-    assert.equal(second.error, leadsInto('work/flink2.txt', 'work', 'inner', 'inner/sub/z.txt'));
+    assert.equal(second.error, `The write did nothing: ${leadsInto('work/flink2.txt', 'work', 'inner', 'inner/sub/z.txt')}`);
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
     assert.equal(existsSync(env.at('work/nested/y.txt')), false);
     assert.equal(existsSync(env.at('work/nested/sub/z.txt')), false);
@@ -403,7 +403,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     symlinkSync('nested/sub', env.at('work/l'));
     const image = await call(m, 'read_image', { path: 'work/l/img.png' });
     assert.equal(image.success, false);
-    assert.equal(image.error, leadsInto('work/l/img.png', 'work', 'inner', 'inner/sub/img.png'));
+    assert.equal(image.error, `The read_image did nothing: ${leadsInto('work/l/img.png', 'work', 'inner', 'inner/sub/img.png')}`);
   });
 
   test('a file link into it is taken in by no sync, and a copy held from before is neither read, searched nor pushed through it', async (t) => {
@@ -417,7 +417,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     const sync = await call(m, 'sync', {});
     assert.equal(skippedReason(sync.data, 'flink.txt'), 'disk could not be checked: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
     const read = await call(m, 'read', { path: 'outer/flink.txt' });
-    assert.equal(read.error, leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt'));
+    assert.equal(read.error, `The read did nothing: ${leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt')}`);
     for (const path of ['outer', 'outer/flink.txt']) {
       const grep = await call(m, 'grep', { pattern: 'copy', path });
       assert.deepEqual(grep.structured.results, [], `grep of ${path} searched none of the copy held from before`);
@@ -426,7 +426,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     // A write made now, with the link in place, is refused at the tool
     // (anima-research/agent-framework#530's third case).
     const write = await call(m, 'write', { path: 'outer/flink.txt', content: 'outer wrote\n' });
-    assert.equal(write.error, leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt'));
+    assert.equal(write.error, `The write did nothing: ${leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt')}`);
     const materialize = await call(m, 'materialize', { path: 'outer/flink.txt', force: true });
     assert.equal(materialize.data.count, 0);
     assert.equal(skippedReason(materialize.data, 'flink.txt'), 'flink.txt: not written: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
@@ -557,7 +557,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
       ['delete', { path: 'outer/alias/x.txt' }],
     ] as const) {
       const res = await call(m, name, input);
-      assert.equal(res.error, leadsInto(String(input.path), 'outer', 'inner', `inner/${String(input.path).slice('outer/alias/'.length)}`), name);
+      assert.equal(res.error, `The ${name} did nothing: ${leadsInto(String(input.path), 'outer', 'inner', `inner/${String(input.path).slice('outer/alias/'.length)}`)}`, name);
     }
     const many = await call(m, 'edit_many', { edits: [{ path: 'outer/alias/x.txt', oldString: 'old', newString: 'outer-edited' }] });
     assert.equal(many.error, `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${leadsInto('outer/alias/x.txt', 'outer', 'inner', 'inner/x.txt')}`);
@@ -612,7 +612,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     }, async () => {
       const image = await call(m, 'read_image', { path: 'work/l/img.png' });
       assert.equal(image.success, false);
-      assert.equal(image.error, '"work/l/img.png" leads into mount "inner", nested in mount "work": use "inner/sub/img.png" in its place');
+      assert.equal(image.error, 'The read_image did nothing: "work/l/img.png" leads into mount "inner", nested in mount "work": use "inner/sub/img.png" in its place.');
     });
     assert.equal(swapped, true);
   });
@@ -632,7 +632,7 @@ describe('a root placed at each start', () => {
     symlinkSync(env.at('outer/c'), env.at('via'));
     await m.start({ ...ctx, isRestart: true } as unknown as ModuleContext);
     const read = await call(m, 'read', { path: 'outer/c/y.txt' });
-    assert.equal(read.error, '"outer/c/y.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/y.txt".');
+    assert.equal(read.error, 'The read did nothing: "outer/c/y.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/y.txt".');
     await readsBack(m, 'outer/a/b/x.txt', 'under a/b');
   });
 });
@@ -648,7 +648,7 @@ describe('a link into a nested mount\'s directory, on a mount that doesn\'t foll
     const refusal = 'work/flink.txt: "work/flink.txt" is a symlink to "work/nested/x.txt", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/x.txt" in place of "work/flink.txt"';
     for (const [name, input] of [['read', { path: 'work/flink.txt' }], ['write', { path: 'work/flink.txt', content: 'via work\n' }]] as const) {
       const res = await call(m, name, input);
-      assert.equal(res.error, refusal, name);
+      assert.equal(res.error, `The ${name} did nothing: ${refusal}.`, name);
     }
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
     await assert.rejects(m.readFileFromDisk('work/flink.txt'), (err: unknown) => {
@@ -668,7 +668,7 @@ describe('a link into a nested mount\'s directory, on a mount that doesn\'t foll
     // #468's words for a link whose target isn't there to name.
     const write = await call(m, 'write', { path: 'work/flink.txt', content: 'via work\n' });
     assert.equal(write.success, false);
-    assert.equal(write.error, 'work/flink.txt: "work/flink.txt" is a symlink, which this mount does not follow');
+    assert.equal(write.error, 'The write did nothing: work/flink.txt: "work/flink.txt" is a symlink, which this mount does not follow.');
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
     assert.equal(existsSync(env.at('work/nested/new.txt')), false);
   });
@@ -682,7 +682,7 @@ describe('a link into a nested mount\'s directory, on a mount that doesn\'t foll
     const m = await env.open(t, [mount('work', env.at('work')), mount('inner', env.at('work/nested'))]);
     const write = await call(m, 'write', { path: 'work/l/new.txt', content: 'via work\n' });
     assert.equal(write.success, false);
-    assert.equal(write.error, 'work/l/new.txt: "work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub" in place of "work/l"');
+    assert.equal(write.error, 'The write did nothing: work/l/new.txt: "work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub" in place of "work/l".');
     assert.deepEqual(env.tree('work'), [], 'nothing was stored');
   });
 });
