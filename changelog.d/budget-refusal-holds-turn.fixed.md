@@ -33,12 +33,12 @@
     first held. The 30 minutes also bound a compression that is pending but
     doesn't move. The hold lives in memory: a restart drops it, and the
     agent's next wake compiles afresh.
-  - **Undo:** one held turn is one undo step. When the turn's first start is
-    the one refused, it gives back the checkpoint it recorded, with the oldest
-    one it evicted at the limit of 20, and the released start records the
-    turn's, so the undo keeps the messages that arrived while it waited. When
-    a retry is refused, an error policy's or a tool-result guard's, the turn
-    keeps the checkpoint its first start recorded, before what it had done,
-    and the undo takes the messages that arrived while it waited too. The
-    redo its new work invalidated stays invalidated, as at any turn's first
-    start.
+  - **Undo:** a hold adds no undo step. When the refused start recorded a
+    checkpoint, as a turn's first start does, the start the hold releases
+    moves it to after the messages that arrived while the turn waited, so
+    the undo keeps them, and a hold that's stopped leaves it where it was.
+    When a retry is refused, an error policy's or a tool-result guard's, the
+    turn keeps the checkpoint its first start recorded, before what it had
+    done, and the undo takes the messages that arrived while it waited too.
+    The redo its new work invalidated stays invalidated, as at any turn's
+    first start.
