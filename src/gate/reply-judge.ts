@@ -22,7 +22,9 @@
  * request on text denser than three characters a token (code, or Chinese,
  * Japanese or Korean text) can carry more than the budget, and so can one whose
  * newest message alone is over it, since the newest message is always shown
- * (cut to its own cap). The document is
+ * (cut to its own cap). A request the provider refuses as too long is asked
+ * once more with the ratio halved, to no less than one character a token;
+ * refused again, it fails as any failed call does. The document is
  * sent as a run of chunks that start at an anchor, the first message shown,
  * which stays put while the window grows into its budget: the chunks before
  * the newest stay byte-identical from one request to the next, and a cache
@@ -529,17 +531,34 @@ export class ReplyJudge {
     this.charsPerToken = Math.min(6, Math.max(1, this.charsPerToken));
   }
 
-  private async decide(request: JudgeRequest): Promise<JudgeVerdict> {
-    const built = await this.buildRequest(request);
+  private ask(built: { agentName: string; request: NormalizedRequest }, signal: AbortSignal): Promise<NormalizedResponse> {
     // The native formatter whatever the host's agents use: an XML or
     // completions formatter would end the judge's request in a prefill, which
     // current Claude models refuse. (A membrane whose own formatter is OpenAI
     // Responses', on that adapter outside its subscription mode, keeps it
     // whatever a request asks: membrane's resolveActiveFormatter.)
-    const response = await this.membraneFor(built.agentName).complete(built.request, {
-      signal: request.signal,
+    return this.membraneFor(built.agentName).complete(built.request, {
+      signal,
       formatter: new NativeFormatter(),
-    });
+    }) as Promise<NormalizedResponse>;
+  }
+
+  private async decide(request: JudgeRequest): Promise<JudgeVerdict> {
+    let built = await this.buildRequest(request);
+    let response: NormalizedResponse;
+    try {
+      response = await this.ask(built, request.signal);
+    } catch (err) {
+      if ((err as { type?: unknown } | null)?.type !== 'context_length' || this.charsPerToken <= 1) throw err;
+      const was = this.charsPerToken;
+      this.charsPerToken = Math.max(1, was / 2);
+      console.error(
+        `[gate] the reply judge's request of ${built.chars} characters was refused as too long; its estimate goes from `
+        + `${was.toFixed(2)} to ${this.charsPerToken.toFixed(2)} characters a token, and the batch is asked once more`,
+      );
+      built = await this.buildRequest(request);
+      response = await this.ask(built, request.signal);
+    }
     const usage = (response as NormalizedResponse).details?.usage;
     if (usage) this.recordUsage?.(built.agentName, usage);
     const inputTokens = (response.usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheCreationTokens ?? 0);
