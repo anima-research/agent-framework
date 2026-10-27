@@ -82,7 +82,7 @@ import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolR
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
-import { isMarkerTagged } from './mcpl/tags.js';
+import { isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -392,9 +392,11 @@ const HOST_METADATA_KEYS = [
  * agent might actually be replying to — rather than ambient machinery.
  * System markers (`system: true` — send-failed notices, routing notices) and
  * non-conversational marker tags (reactions added/removed, edits, deletions
- * — MCPL RFC-001) don't count: they are about an existing message, so they
- * neither clear explicit-send suppression nor re-pin a turn's locus at a tool
- * boundary. An edit can also be the first version of a message the agent
+ * — MCPL RFC-001 — and, by rev 3, `chat:system` notices such as a join or a
+ * world's weather) don't count: they are about an existing message or about
+ * the place, not said to anyone, so they neither clear explicit-send
+ * suppression nor re-pin a turn's locus at a tool boundary. An edit can also
+ * be the first version of a message the agent
  * sees: when the coalescer delivers a version of a message of which no
  * version may have been shown to the agent (still queued, or stored above
  * every reader's shown watermark), the host marks the delivery
@@ -404,7 +406,7 @@ const HOST_METADATA_KEYS = [
  * is still a notice about that message and stays a marker. An edit of a
  * message the host never received looks like any other edit and stays a
  * marker too. A marker that wakes the agent can still set that turn's speech
- * channel (agent-framework#189).
+ * channel (agent-framework#189); a `chat:system` notice can't (systemNotice).
  */
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
@@ -659,6 +661,13 @@ const isAddressedMessage = (
  *  (RFC-001) is known to ask nothing of the agent. */
 const ambientMark = (tags?: string[]): { ambient?: true } =>
   Array.isArray(tags) && tags.includes('chat:ambient') ? { ambient: true } : {};
+
+/** A wake's `systemNotice` mark: a message its server tagged `chat:system`
+ *  (RFC-001 rev 3) is a notice about the place (a join, the weather), not
+ *  something anyone said there, so it never picks where the turn's plain
+ *  speech goes. */
+const systemNoticeMark = (tags?: string[]): { systemNotice?: true } =>
+  isSystemNotice(tags) ? { systemNotice: true } : {};
 
 // parseProsePrefix lives in ./mcpl/prose-grammar.ts. The outgoing stream
 // (Spec 14.3) needs no grammar of its own: it carries what delivery
@@ -10732,6 +10741,7 @@ export class AgentFramework {
     'chat:deleted': 'A deletion',
     'chat:reaction': 'An emoji reaction was added',
     'chat:reaction-remove': 'A reaction was removed',
+    'chat:system': 'A notice from the platform or place (join, pin, weather), not a message anyone sent',
     'chat:has-image': 'Has an image attachment',
     'chat:has-audio': 'Has an audio attachment',
     'chat:has-file': 'Has a file attachment',
@@ -10746,7 +10756,7 @@ export class AgentFramework {
    * Mark an inference refusal visibly: react on the message that holds the
    * refused agent's conversational locus (the most recent incoming channel
    * message that isn't a reaction, reaction removal, edit or deletion
-   * marker, apart from an edit the coalescer delivers on acceptance as the
+   * marker or a chat:system notice, apart from an edit the coalescer delivers on acceptance as the
    * agent's first view; an ephemeral run has none, so a subagent's refusal
    * marks no message) with a category-specific emoji. Best-effort —
    * failures are logged, never thrown, and non-Discord loci are silently
@@ -14499,6 +14509,7 @@ export class AgentFramework {
             channelId: event.channelId, channelServerId: event.serverId,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
             addressed: isAddressedMessage(event.tags, event.metadata),
+            ...systemNoticeMark(event.tags),
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
@@ -14582,6 +14593,8 @@ export class AgentFramework {
           // picks the turn's frozen speech locus.
           addressed,
           ...ambientMark(event.tags),
+          // A notice (chat:system) picks no channel for the turn.
+          ...systemNoticeMark(event.tags),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           ...this.readsWriteFor(placement, agentName),
         });
@@ -14695,6 +14708,7 @@ export class AgentFramework {
         channelId: event.channelId, channelServerId: event.serverId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags, event.metadata),
+        ...systemNoticeMark(event.tags),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
@@ -15978,6 +15992,10 @@ export class AgentFramework {
         channelId, ...(channelId !== undefined ? { channelServerId: occ.serverId } : {}),
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
+        // No systemNotice mark here: a render folds the batch's every
+        // occurrence, and only its latest's tags are at hand, so marking it
+        // would hide a folded message's channel whenever a notice came last.
+        // A batch of notices alone names its channel, as before rev 3.
         // A render folds the batch's every notice, so it asks nothing of the
         // agent only when each of them was marked ambient, not the latest
         // alone; only its wake is judged by what was read (readsDeferredWrite).
@@ -16245,6 +16263,7 @@ export class AgentFramework {
           // selection just like their channels/incoming counterparts.
           addressed: isAddressedMessage(event.tags, event.origin),
           ...ambientMark(event.tags),
+          ...systemNoticeMark(event.tags),
           ...(silentHeartbeat ? {
             suppressProse: true,
             // The tick's instruction rides its request-only separator
@@ -16634,9 +16653,14 @@ export class AgentFramework {
       // wake is marked ambient when its message's server tagged it
       // chat:ambient, or for a render, every notice the render stands for:
       // such a message asked nothing of the agent, so reading it was all its
-      // wake was for. One with neither tag is judged as addressed.
+      // wake was for, as for a chat:system notice. One with neither tag is
+      // judged as addressed.
       const read = requests.filter((r) => {
-        const to = r.channelId === undefined || r.ambient === true ? undefined : { serverId: r.source, channelId: r.channelId };
+        // A chat:system notice asks nothing either, ambient or not, and no
+        // speech is routed by it, so waiting for one in its channel would
+        // keep its wake forever.
+        const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
+          ? undefined : { serverId: r.source, channelId: r.channelId };
         return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to)
           : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to);
       });
@@ -16732,6 +16756,10 @@ export class AgentFramework {
       //      someone explicitly spoke TO the agent);
       //   2. else the most recent channel-bearing request (ambient message in
       //      an open channel — legacy last-inbound semantics).
+      // A chat:system notice (RFC-001 rev 3: weather in a world, someone
+      // joining) names no channel at all: nobody spoke there, so a turn it
+      // wakes alone takes the global fallback, as a heartbeat does, and the
+      // agent sends there explicitly if it means to.
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
@@ -16757,7 +16785,7 @@ export class AgentFramework {
       // its wake was queued first.
       let continuationReq: InferenceRequest | undefined;
       for (const r of requests) {
-        if (!r.channelId) continue;
+        if (!r.channelId || r.systemNotice) continue;
         if (r.reason === AUTO_CONTINUE_REASON) {
           continuationReq ??= r;
           continue;
@@ -16819,6 +16847,10 @@ export class AgentFramework {
         // Only the mark this batch decided, never one requests[0] carried.
         autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,
+        // The channel above is never a notice's, so neither is the mark:
+        // inherited from requests[0], it would hide that message's channel
+        // from the selection if this start were merged again.
+        systemNotice: undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false
