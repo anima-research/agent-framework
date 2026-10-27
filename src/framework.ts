@@ -2397,7 +2397,7 @@ interface BudgetHold {
   checking: boolean;
   lookedAt?: string;
   ended?: { outcome: 'deadline' | 'nothing_pending' };
-  keepsCheckpoint: boolean;
+  checkpoint: RecordedTurnCheckpoint | undefined;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -6020,15 +6020,14 @@ export class AgentFramework {
       return true;
     }
     if (!this.compressionPending(agent)) return false;
-    if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
     const now = Date.now();
     const figures = error as Error & { budget?: unknown; actual?: unknown };
     const hold: BudgetHold = existing ?? {
       state: 'holding', startedAt: now, until: now + this.budgetHoldMs, heldRequests: [],
-      errorType, reason: '', budget: undefined, actual: undefined, checking: false, keepsCheckpoint: false,
+      errorType, reason: '', budget: undefined, actual: undefined, checking: false, checkpoint: undefined,
     };
     hold.state = 'holding';
-    hold.keepsCheckpoint = checkpoint === undefined;
+    hold.checkpoint = checkpoint;
     hold.heldRequests = [own];
     hold.errorType = errorType;
     hold.reason = boundFailureText(String(error.message), FAILURE_SUMMARY_MAX_CHARS);
@@ -20667,11 +20666,14 @@ export class AgentFramework {
     if (!dropped || !drop) return reportHold();
     // A primary a provider hold left pending for what it released won't run
     // now, when nothing else of the agent's waits (endPendingPrimary).
-    if (!this.pendingRequests.some((r) => r.agentName === agentName) && !this.providerAccelerationCooldowns.get(agentName)?.heldRequests.length) {
-      this.endPendingPrimary(agentName);
+    try {
+      if (!this.pendingRequests.some((r) => r.agentName === agentName) && !this.providerAccelerationCooldowns.get(agentName)?.heldRequests.length) {
+        this.endPendingPrimary(agentName);
+      }
+      this.endContinuedTurn(agentName, drop);
+    } finally {
+      reportHold();
     }
-    this.endContinuedTurn(agentName, drop);
-    reportHold();
   }
 
   /**
@@ -21129,13 +21131,16 @@ export class AgentFramework {
       trigger = own;
     }
 
-    // Record turn checkpoint before inference (only on first attempt, not
-    // retries, nor the start a budget hold released when the turn kept the
-    // checkpoint its first start recorded)
+    // Record turn checkpoint before inference (only on first attempt, not retries)
     let checkpoint: RecordedTurnCheckpoint | undefined;
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
       const hold = this.budgetHolds?.get(agent.name);
-      if (!(hold && hold.state !== 'holding' && hold.keepsCheckpoint)) checkpoint = this.recordTurnCheckpoint(agent.name);
+      if (hold === undefined || hold.state === 'holding') {
+        checkpoint = this.recordTurnCheckpoint(agent.name);
+      } else if (hold.checkpoint !== undefined) {
+        this.dropTurnCheckpoint(agent.name, hold.checkpoint);
+        checkpoint = this.recordTurnCheckpoint(agent.name);
+      }
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 
