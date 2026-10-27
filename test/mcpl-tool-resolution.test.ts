@@ -113,7 +113,13 @@ async function standIns(servers: Server[], agent: Record<string, unknown> = {}, 
     push(event);
   };
 
-  /** Call `name` by one path: the stand-in it reached, as `<id>:<tool>`, or how it was answered without one. */
+  /**
+   * Call `name` by one path: the stand-in it reached, as `<id>:<tool>`, or how
+   * it was answered without one: `refused` when the dispatcher refused it
+   * before it opened (ToolResult.refused), as the model's path does and a
+   * script's call too, and `failed` for any other failure, a programmatic
+   * path's answer for the same reason included.
+   */
   const call = async (path: Path, name: string): Promise<string> => {
     const count = reached.length;
     const c: ToolCall = { id: `call-${path}-${name}`, name, input: {} };
@@ -124,13 +130,13 @@ async function standIns(servers: Server[], agent: Record<string, unknown> = {}, 
       if (reached.length > count) return reached.at(-1)!;
       await waitFor(() => answers.has(c.id), `the model's answer to ${name}`);
       const answer = answers.get(c.id)!;
-      return answer.success ? `answered: ${String(answer.data)}` : `refused: ${answer.error}`;
+      return answer.success ? `answered: ${String(answer.data)}` : `${answer.refused ? 'refused' : 'failed'}: ${answer.error}`;
     }
     const result = path === 'executeToolCall'
       ? await h.fw.executeToolCall({ ...c, callerAgentName: 'assistant' })
       : await h.module.ctx!.callTool(c);
     if (reached.length > count) return reached.at(-1)!;
-    return result.success ? `answered: ${String(result.data)}` : `refused: ${result.error}`;
+    return result.success ? `answered: ${String(result.data)}` : `${result.refused ? 'refused' : 'failed'}: ${result.error}`;
   };
 
   return {
@@ -207,12 +213,12 @@ test("a tool its own server's policy denies isn't in that server's listing, so e
   }
 });
 
-test("a call of a tool its server's policy denies is refused on every path, not sent", async () => {
+test("a call of a tool its server's policy denies is sent on no path: the model's is refused, the others fail", async () => {
   // Left out of the listing, `foo--secret` resolves to the longest prefix, `foo`'s, whose policy refuses it.
   const h = await standIns([{ id: 'short', prefix: 'foo', lists: ['secret', 'echo'], disabledTools: ['secret'] }]);
   try {
     for (const path of PATHS) {
-      assert.equal(await h.call(path, 'foo--secret'), `refused: foo--secret isn't allowed by this host's policy for the "short" server, ` +
+      assert.equal(await h.call(path, 'foo--secret'), `${path === 'model' ? 'refused' : 'failed'}: foo--secret isn't allowed by this host's policy for the "short" server, ` +
         "so the call didn't run, and calling it again won't change that. If you need it, ask whoever runs this host.", `by ${path}`);
     }
     assert.equal(await h.call('executeToolCall', 'foo--echo'), 'short:echo', 'an allowed tool is sent');
@@ -238,11 +244,13 @@ test('a programmatic call sends the tool name the model\'s call sends, though th
 test('a name an MCPL prefix fits goes to MCPL on every path, even with no config for its server', async () => {
   const h = await standIns([{ id: 'short', prefix: 'foo', lists: ['echo'] }]);
   try {
-    // A prefix with neither a config nor a server: refused as MCPL, never handed to a module.
+    // A prefix with neither a config nor a server: answered as MCPL, never handed to a module.
     h.internals.mcplPrefixMap.set('ghost', 'ghost');
-    // Every path says the same: the server isn't connected, and won't be on its own.
+    // Every path's text says the same: the server isn't connected, and won't be
+    // on its own. The model's call is refused; the others, which open no
+    // RFC-007 call, fail.
     for (const path of ['executeToolCall', 'ctx.callTool', 'model'] as const) {
-      assert.equal(await h.call(path, 'ghost--echo'), `refused: The "ghost" server that provides ghost--echo isn't connected, ` +
+      assert.equal(await h.call(path, 'ghost--echo'), `${path === 'model' ? 'refused' : 'failed'}: The "ghost" server that provides ghost--echo isn't connected, ` +
         "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.", `by ${path}`);
     }
     // A server with no config is still sent the call.
@@ -262,7 +270,7 @@ test('a name no MCPL prefix fits falls through to the module registry on the pro
     for (const path of ['executeToolCall', 'ctx.callTool'] as const) {
       assert.equal(await h.call(path, 'ctx-capture--ping'), 'answered: module:ping', `a module's tool, by ${path}`);
       // `foo` is the start of `foobar`, but a prefix takes the separator too.
-      assert.equal(await h.call(path, 'foobar--echo'), 'refused: Module not found: foobar', `foobar--echo, by ${path}`);
+      assert.equal(await h.call(path, 'foobar--echo'), 'failed: Module not found: foobar, so nothing was done', `foobar--echo, by ${path}`);
     }
     assert.deepEqual(h.reached, [], 'no server was reached');
   } finally {

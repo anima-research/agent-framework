@@ -38,10 +38,10 @@ describe('skip_reply wake capability', () => {
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       getChannelTools: () => [],
-      resolveLocus: () => 'channel:test',
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
       routeSpeech: async (_agent: string, text: string) => {
         routed.push(text);
-        return { delivered: true, channelId: 'channel:test' };
+        return { delivered: true, serverId: 'stub', channelId: 'channel:test' };
       },
       handleChannelToolCall: async (_name: string, input: { wake_in_seconds?: number }) => ({
         success: true, endTurn: true,
@@ -124,8 +124,8 @@ describe('skip_reply wake capability', () => {
       agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async () => ({ delivered: true, channelId: 'channel:test' }),
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async () => ({ delivered: true, serverId: 'stub', channelId: 'channel:test' }),
       handleChannelToolCall: async () => ({ success: true, endTurn: true, data: { skipped: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -153,8 +153,8 @@ describe('skip_reply wake capability', () => {
     });
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       handleChannelToolCall: async () => ({ success: true, data: { delivered: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -188,16 +188,18 @@ describe('skip_reply wake capability', () => {
     });
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       handleChannelToolCall: async () => ({ success: true, data: { delivered: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
     await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
       .startAgentStream(agent, { agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
     await framework.runUntilIdle();
+    const drafts = (framework as unknown as { proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> } })
+      .proseDrafts.open('agent').map((d) => [d.text, d.reason]);
     await framework.stop();
-    return { routed, streams: membrane.calls.length, completed };
+    return { routed, streams: membrane.calls.length, completed, drafts };
   }
   const send = (id: string): ContentBlock =>
     ({ type: 'tool_use', id, name: 'channel_publish', input: { channelId: 'channel:test', content: 'sent' } } as ContentBlock);
@@ -221,11 +223,11 @@ describe('skip_reply wake capability', () => {
     assert.deepEqual(routed, []);
   });
 
-  it('a budget restart after a refused wake starts from its trigger, as after any other round', async () => {
-    // A send silences the rest of its stream; then a round crosses the
+  it('a budget restart after a refused wake keeps the send\'s hold, as after any other round', async () => {
+    // A send silences the rest of its turn; then a round crosses the
     // stream's budget, and the turn restarts. Whether that round was a refused
     // wake or a plain tool call, the restarted stream speaks the same: nothing
-    // of the refused call outlives its stream.
+    // of the refused call outlives its own round.
     const restartedAfter = (store: string, second: ContentBlock) => {
       const overBudget = createMockResponse([{ type: 'text', text: 'this round stays private' }, second] as ContentBlock[], 'tool_use');
       overBudget.usage = { inputTokens: 100, outputTokens: 5 };
@@ -238,8 +240,10 @@ describe('skip_reply wake capability', () => {
     const plain = await restartedAfter('restart-plain', { type: 'tool_use', id: 'think-2', name: 'think', input: { content: 'a plan' } } as ContentBlock);
     assert.equal(refused.streams, 2, 'the refused round crossed the budget, and the turn restarted');
     assert.equal(plain.streams, 2);
-    assert.deepEqual(plain.routed, ['after the restart'], 'the restarted stream starts from its trigger, unsilenced');
+    assert.deepEqual(plain.routed, [], 'the restarted stream keeps the send\'s hold');
+    assert.ok(plain.drafts.some(([t, reason]) => t === 'after the restart' && reason === 'explicit-send'), JSON.stringify(plain.drafts));
     assert.deepEqual(refused.routed, plain.routed);
+    assert.ok(refused.drafts.some(([t, reason]) => t === 'after the restart' && reason === 'explicit-send'), JSON.stringify(refused.drafts));
   });
 
   it('keeps the existing successful end-turn behavior when EventGate exists', async () => {
@@ -293,8 +297,8 @@ describe('refused wake: no lifecycle events; a wake_in_seconds the host can\'t s
     const routed: string[] = [];
     const handled: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       // What reached the registry: a skip_reply ends the turn, and a send
       // silences the rest of it.
       handleChannelToolCall: async (toolName: string) => {

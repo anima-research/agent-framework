@@ -11,6 +11,12 @@
 //   error         a JSON-RPC error (-32603), not a version verdict
 //   hang          never answers
 //   slow          `ok`, after SLOW_INIT_MS (default 600)
+//   deaf-ping     at initialize, closes its stdin and says so on stderr, then
+//                 pings the client, whose answer fails with EPIPE; answers
+//                 `ok` once it gets SIGUSR2, and stays up
+//   deaf-ping-answered  as deaf-ping, but sends nothing until SIGUSR2, then
+//                 writes the ping and the `ok` answer together, so the client
+//                 reads both in one callback
 //   ok-then-<mode>  `ok` on the first start recorded in startLog, <mode> after
 //
 // IGNORE_SIGTERM=1 makes the process survive SIGTERM (only SIGKILL ends it).
@@ -21,7 +27,7 @@
 // nullcursor (nextCursor null), endless (a new cursor on every page, so the
 // list never ends), badlater (a well-formed first page, then a page with no
 // tools array). Tool `die` exits the process.
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 
 let mode = process.argv[2] ?? 'ok';
 const startLog = process.argv[3];
@@ -59,6 +65,31 @@ process.stdin.on('data', (chunk) => {
       else if (mode === 'error') error(m.id, -32603, 'initialize failed on purpose');
       else if (mode === 'hang') { /* never answers */ }
       else if (mode === 'slow') setTimeout(() => reply(m.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} } }), Number(process.env.SLOW_INIT_MS ?? 600));
+      else if (mode === 'deaf-ping' || mode === 'deaf-ping-answered') {
+        const ok = { jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} } } };
+        const ping = { jsonrpc: '2.0', id: 'server-ping', method: 'ping' };
+        process.stdin.removeAllListeners('data');
+        process.stdin.removeAllListeners('end');
+        // Node keeps a stdio descriptor open when its stream is destroyed, so
+        // the read end is closed by hand once the stream is done with it, and
+        // /dev/null takes fd 0 at once, as libuv assumes fds 0 to 2 stay taken
+        // (see deafen() in modern-raw-server.mjs).
+        process.stdin.once('close', () => {
+          try { closeSync(0); } catch { /* already closed */ }
+          openSync('/dev/null', 'r');
+          // SIGUSR2's handler is in place before the stderr line, which a test
+          // may take as its cue to send it: until then the signal's default
+          // action would end the process.
+          process.once('SIGUSR2', mode === 'deaf-ping-answered'
+            ? () => process.stdout.write(`${JSON.stringify(ping)}\n${JSON.stringify(ok)}\n`)
+            : () => send(ok));
+          process.stderr.write('deaf-ping: stdin closed\n');
+          if (mode === 'deaf-ping') send(ping);
+        });
+        process.stdin.destroy();
+        setInterval(() => {}, 1 << 30);
+        return;
+      }
       else reply(m.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} } });
     } else if (m.method === 'tools/list') {
       const cursor = m.params?.cursor;

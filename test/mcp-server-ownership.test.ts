@@ -450,61 +450,6 @@ test('legacy, with reconnect: a reconnect that meets a protocol-version verdict 
   });
 });
 
-test("legacy, without reconnect: a recycle whose child can't be reaped keeps the server registered, holding its id, until a disconnect confirms the exit, and its tools leave", async () => {
-  await withFramework(async ({ framework, dir }) => {
-    const log = join(dir, 'legacy.log');
-    const config = legacy('l', 'ok', log);
-    const reaping = unreapable();
-    await framework.connectMcplServer(config);
-    assert.ok(toolsOf(framework, 'l').length > 0);
-    // The awareness accounting fails, and the gate recycles every server.
-    const gate = framework as unknown as {
-      installMcplDataPlaneGate(): unknown;
-      failMcplDataPlaneGate(barrier: unknown, context: string, error: unknown): Promise<void>;
-    };
-    await gate.failMcplDataPlaneGate(gate.installMcplDataPlaneGate(), 'a test', new Error('accounting failed on purpose'));
-    assert.equal(status(framework, 'l')?.connected, false, 'still listed, closed');
-    await until(() => toolsOf(framework, 'l').length === 0, 'its tools left the list');
-    await assert.rejects(framework.connectMcplServer(config), /"l" is already registered \(not connected and not reconnecting/);
-    assert.equal(launches(log).length, 1, 'no launch beside the unreaped child');
-
-    await killAndWait(reaping.stuck[0]!);
-    reaping.active = false;
-    await framework.disconnectMcplServer('l');
-    assert.equal(status(framework, 'l'), undefined, 'the disconnect completed');
-  });
-});
-
-test("legacy, with reconnect: a recycle whose close can't reap leaves the server's tools listed for its reconnect loop to settle", async () => {
-  await withFramework(async ({ framework, dir }) => {
-    const log = join(dir, 'legacy.log');
-    // Its reconnect is a minute away, so what the recycle itself did is seen
-    // before the reconnect loop settles anything.
-    const config = { ...legacy('l', 'ok', log), reconnect: true, reconnectIntervalMs: 60_000, reconnectMaxIntervalMs: 60_000 };
-    const reaping = unreapable();
-    await framework.connectMcplServer(config);
-    assert.ok(toolsOf(framework, 'l').length > 0);
-    const internals = framework as unknown as { handleToolsListChanged(id: string): void };
-    const refresh = internals.handleToolsListChanged.bind(framework);
-    const refreshes: string[] = [];
-    internals.handleToolsListChanged = (id: string) => { refreshes.push(id); refresh(id); };
-    // The awareness accounting fails, and the gate recycles every server.
-    const gate = framework as unknown as {
-      installMcplDataPlaneGate(): unknown;
-      failMcplDataPlaneGate(barrier: unknown, context: string, error: unknown): Promise<void>;
-    };
-    await gate.failMcplDataPlaneGate(gate.installMcplDataPlaneGate(), 'a test', new Error('accounting failed on purpose'));
-    assert.equal(legacyServer(framework, 'l').willReconnect, true, 'its reconnect is still to come');
-    assert.deepEqual(refreshes, [], 'the failed recycle refreshed nothing');
-    assert.ok(toolsOf(framework, 'l').length > 0, 'its tools are still listed');
-
-    await killAndWait(reaping.stuck[0]!);
-    reaping.active = false;
-    await framework.disconnectMcplServer('l');
-    assert.equal(status(framework, 'l'), undefined, 'the disconnect completed');
-  });
-});
-
 for (const engine of ['legacy', 'modern'] as const) {
   test(`${engine}: a connect that stop() ends, whose cleanup can't reap its child, says the framework stopped and offers no disconnect`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));

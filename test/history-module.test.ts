@@ -726,5 +726,6 @@ describe('HistoryModule', () => {
     assert.equal(result.success, false);
     assert.equal(result.isError, true);
     assert.match(result.error ?? '', /There's no tool "history--bogus"/);
+    assert.equal(result.refused, undefined);
   });
 });

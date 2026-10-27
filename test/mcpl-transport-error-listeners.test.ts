@@ -72,7 +72,8 @@ test("a transport with nothing listening for 'error' logs its errors, and gives 
   });
   const stdio = new (StdioTransport as any)(child, new EventEmitter(), 'child-srv') as StdioTransport;
   const ws = new EventEmitter();
-  const socket = new (WebSocketTransport as any)(ws, 'ws-srv') as WebSocketTransport;
+  // The socket's configuration and the url it dialed, which its errors are masked with.
+  const socket = new (WebSocketTransport as any)(ws, { id: 'ws-srv', url: 'ws://127.0.0.1:1/mcpl' }, 'ws://127.0.0.1:1/mcpl') as WebSocketTransport;
   assert.doesNotThrow(() => child.emit('error', new Error('kill EPERM')));
   assert.doesNotThrow(() => child.stderr.emit('error', new Error('read EIO')));
   assert.doesNotThrow(() => ws.emit('error', new Error('Invalid WebSocket frame: invalid opcode 3')));

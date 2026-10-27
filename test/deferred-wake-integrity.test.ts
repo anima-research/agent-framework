@@ -16,7 +16,10 @@
  *     it (turn-start flush runs before the locus announcement and compile).
  *  2. addMessage defers on turn-alive (activeTurnTokens), not merely
  *     stream-alive — the compile window between dequeue and stream
- *     registration is closed to cross-turn writers.
+ *     registration is closed to cross-turn writers: what they write is
+ *     deferred, and what is deferred before the turn's checkpoint lands as
+ *     the turn's input through its own flushes (flushForStart), unless the
+ *     host is quiesced by then, when it waits for resume().
  *  3. endTurn edge: a message stored at an endTurn tool boundary (collected
  *     for injection but never delivered — the stream is cancelled) is seen by
  *     the follow-up turn its own wake starts, positioned AFTER the turn that
@@ -115,9 +118,9 @@ class DmModule implements Module {
 function stubChannelRegistry(framework: AgentFramework) {
   const routed: Array<{ text: string; locus: string | null }> = [];
   const explicit: Record<string, unknown> = {
-    resolveLocus: () => 'dm-antra',
-    routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
-      routed.push({ text, locus: locus ?? null });
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'dm-antra' }),
+    routeSpeech: async (_agent: string, text: string, locus?: { serverId: string; channelId: string } | null) => {
+      routed.push({ text, locus: locus?.channelId ?? null });
     },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,

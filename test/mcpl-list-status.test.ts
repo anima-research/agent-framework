@@ -99,6 +99,9 @@ test('listMcplServers lists a refused configuration as refused, shows urls redac
   framework.mcplServerConfigs = new Map<string, Record<string, unknown>>([
     ['both', { id: 'both', command: 'node', url: 'wss://u:pw@x.example/mcpl?token=sekret' }],
     ['slow', { id: 'slow', url: 'https://x.example/mcp', requestTimeoutMs: 0 }],
+    // A deadline JSON can hold and String() can't print: listed as refused
+    // rather than throwing out of the whole list.
+    ['odd', { id: 'odd', url: 'https://x.example/mcp', requestTimeoutMs: JSON.parse('{"toString": 1}') }],
     ['docs', { id: 'docs', url: 'https://mcp.example/mcp?api_key=sekret&region=eu' }],
     ['chat', { id: 'chat', url: 'wss://user:pw@chat.example/mcpl' }],
     ['zap', { id: 'zap', url: 'https://mcp.zapier.com/api/mcp/s/sekretZt4kQ9xW2vLm8/mcp' }],
@@ -120,6 +123,7 @@ test('listMcplServers lists a refused configuration as refused, shows urls redac
   assert.equal(slow.family, 'modern');
   assert.equal(slow.transport, 'http');
   assert.match(slow.refused!, /requestTimeoutMs must be an integer from 1/);
+  assert.match(byId.get('odd')!.refused!, /requestTimeoutMs must be an integer from 1 to 2147483647 for a modern server \(got \[a value that cannot be printed\]\)/);
   // Usable: nothing refused. MCPL policy doesn't apply to a modern server.
   const docs = byId.get('docs')!;
   assert.deepEqual([docs.family, docs.transport, docs.refused, docs.policyEstablished], ['modern', 'http', null, null]);

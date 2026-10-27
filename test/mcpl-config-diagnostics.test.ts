@@ -130,7 +130,7 @@ test('refreshMcplTools: a live server that advertised no MCP tools does not hold
       sendToolsList: async () => { throw new Error('Method not found'); },
     };
     fw.mcplServerRegistry = { getAllServers: () => [prov, quiet] };
-    fw.modelFacingToolNames = () => new Set(fw.mcplTools.map((t: { name: string }) => t.name));
+    fw.patternableToolNames = () => new Set(fw.mcplTools.map((t: { name: string }) => t.name));
     fw.toolPatternChecksArmed = true;
     const capture = captureConsoleError();
     try {

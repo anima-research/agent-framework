@@ -6,7 +6,9 @@
  *
  *  - tombstone: the workspace deleted the path while disk kept a copy (no
  *    autoMaterialize, or a refused unlink). The hash is the deleted entry's,
- *    so even a legacy entry with no disk evidence keeps a durable intent.
+ *    so even a legacy entry with no disk evidence keeps a durable intent. A
+ *    tombstone beside an entry that's still there, left by a change that
+ *    stopped partway (commitToolChanges), is no deletion, and guards nothing.
  *  - origin 'store': the entry was created through workspace tools and disk
  *    has never agreed with it.
  *  - conflict: disk and workspace diverged in a way no rule may resolve
@@ -17,6 +19,7 @@
  */
 
 import type { JsStore } from '@animalabs/chronicle';
+import { storedBytes } from './sync.js';
 
 export type ConflictKind =
   /** Disk, workspace and the last agreement all differ. */
@@ -54,9 +57,11 @@ export interface BranchIntent {
   origin?: 'store';
   conflict?: ConflictRecord;
   /**
-   * Why a recorded intent can't be read (its blob missing from the store, or
-   * not an intent): a tombstone or conflict it held is unknown, never absent.
-   * Never written; a put replaces the damaged record.
+   * Why a recorded intent can't be read (its blob missing from the store,
+   * a blob chronicle can't read, or not an intent): a tombstone or conflict
+   * it held is unknown, never absent.
+   * Never written; a put replaces the damaged record, unless it puts the same
+   * contents over a blob file chronicle can't read, which chronicle keeps.
    */
   unreadable?: string;
 }
@@ -68,8 +73,10 @@ function isEmpty(intent: BranchIntent): boolean {
 
 /** A recorded intent's blob, read; a damaged one says why it can't be. */
 function readIntent(store: JsStore, blobHash: string): BranchIntent {
-  const blob = store.getBlob(blobHash);
-  if (!blob) return { unreadable: "its record's blob is missing from the store" };
+  const stored = storedBytes(store, blobHash);
+  if ('missing' in stored) return { unreadable: "its record's blob is missing from the store" };
+  if ('unreadable' in stored) return { unreadable: `its record's blob can't be read from the store (${stored.unreadable})` };
+  const blob = stored.bytes;
   try {
     const parsed = JSON.parse(blob.toString('utf-8')) as unknown;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as BranchIntent;

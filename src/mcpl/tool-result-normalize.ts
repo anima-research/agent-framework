@@ -7,7 +7,10 @@
  * An MCP result has two views, and each consumer gets its own:
  * - **The content array is the server's model-facing view.** Text stays text,
  *   and an inline image stays native when a provider can take it: one of the
- *   types providers accept, within their per-image size. Anything else the
+ *   types providers accept, within the framework's own per-image limit. That
+ *   limit applies to every image this reading carries, whichever route it goes
+ *   to: it's kept for providers that enforce one, though some routes take
+ *   more. Anything else the
  *   provider format can't carry (audio, binary blobs, other images) is saved
  *   to the workspace, and a bounded stub says where it went. A stub tells the
  *   reader where the payload is; nothing is dropped silently. If a payload
@@ -36,7 +39,8 @@ export const MALFORMED_CONTENT_NOTICE =
   '[malformed result: its content is not a list of blocks; the tool may already have completed]';
 
 /** Saves a payload under a host-chosen name; resolves to its workspace path,
- *  or null when there is nowhere writable to put it. */
+ *  or null when there is no writable workspace mount without an include to
+ *  put it in. */
 export type SaveToolPayload = (fileName: string, bytes: Buffer, mimeType: string) => Promise<string | null>;
 
 /** Stub fields are bounded independently of anything the server sends. */
@@ -47,8 +51,13 @@ const STUB_FIELD_POINTS = 200;
 const URI_POINTS = 2048;
 /** The image types providers take inline. Any other image is saved. */
 const NATIVE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-/** The decoded size providers take per inline image: the same 5 MB ceiling
- *  the framework's read_image tool guards. A larger image is saved. */
+/** This reading's per-image limit on decoded size, applied to every image it
+ *  carries, whichever route it goes to: a larger image is shown as a stub, and
+ *  saved to the workspace where it can be (payloadStub). It's kept for
+ *  providers that enforce one, though some routes take more. The framework's
+ *  read_image tool refuses an image past the same 5 MB. The RFC-005 lanes (an
+ *  MCPL peer's or a module's content, and the push lanes) hold an image to no
+ *  such limit. */
 const NATIVE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 
 /** Why a payload isn't shown inline, unless said otherwise. */
@@ -135,13 +144,17 @@ export interface StandardToolResult {
  * Content that is present but isn't a list of blocks makes it a malformed
  * result, never an empty success. A tool's error result with no words, or
  * only whitespace, reads as `noWords`, which the framework words for its
- * server and tool.
+ * server and tool. A payload stub with no `save` says why nothing could
+ * keep it in `noSave`: no workspace mounted unless the caller words it
+ * otherwise, as the framework does for a host whose only writable mount
+ * is direct.
  */
 export async function normalizeStandardToolResult(
   result: StandardToolResult,
   label: string,
   save: SaveToolPayload | null,
   noWords = 'Tool call failed',
+  noSave = 'no workspace is mounted to save it',
 ): Promise<ToolResult> {
   const malformed = result.content !== undefined && !Array.isArray(result.content);
   const raw: unknown[] = Array.isArray(result.content) ? result.content : [];
@@ -161,7 +174,7 @@ export async function normalizeStandardToolResult(
     const what = `[${kind}${opts.origin ? ` ${bounded(opts.origin, URI_POINTS)}` : ''}: ${bounded(mimeType)}, ${size}`;
     if (!save) {
       lost++;
-      return `${what}. Not retained: ${why}, and no workspace is mounted to save it]`;
+      return `${what}. Not retained: ${why}, and ${noSave}]`;
     }
     const fileName = `${label}-${++saved}.${extensionFor(mimeType)}`;
     const path = await save(fileName, Buffer.from(base64, 'base64'), mimeType).catch((error: unknown) => {
@@ -201,7 +214,7 @@ export async function normalizeStandardToolResult(
           // provider may refuse, and with it the whole request.
           blocks.push({ type: 'image', data: block.data.replace(/\s+/g, ''), mimeType: native });
         } else {
-          const why = native ? `over the ${humanSize(NATIVE_IMAGE_MAX_BYTES)} a model takes per image` : UNSUPPORTED;
+          const why = native ? `over the ${humanSize(NATIVE_IMAGE_MAX_BYTES)} this host sends inline per image` : UNSUPPORTED;
           blocks.push({ type: 'text', text: await payloadStub(kind, block.data, mimeType, { why }) });
         }
         break;

@@ -1,9 +1,12 @@
 /**
  * A tool result's data never reaches the agent, or its history, with an
  * RFC-005 reference's uri, wherever in the data it sits: data that isn't a
- * content array of blocks the serializer recognizes is written as JSON with
- * each reference as its stub and inline data claiming a uri or a disposition
- * withheld. Everything else in it is written as JSON writes it, as before.
+ * string or a content array of blocks the serializer recognizes is written
+ * as JSON with each reference as its stub and inline data claiming a uri or
+ * a disposition withheld. Everything else in it is written as JSON writes
+ * it, as before. MCP's resource_link is a reference too, and where the host
+ * can't fetch one, as with no server, it shows its uri, the agent's only
+ * handle on it, unless the uri may carry a credential.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,7 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import type { ScriptToolResult } from '../src/index.js';
+import { answerText, scriptCall } from './helpers/script-call.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
@@ -121,9 +124,25 @@ describe('data the serializer doesn\'t read as content blocks', () => {
   });
 
   it('writes data with nothing RFC-005 governs exactly as JSON does', () => {
-    const plain = [{ id: 1, url: URI, type: 'zz-record' }, { type: 'resource_link', uri: URI, name: 'zz' }, 'zz', 7, null];
+    const plain = [{ id: 1, url: URI, type: 'zz-record' }, 'zz', 7, null];
     assert.equal(toolResultDataToHistoryString(plain), JSON.stringify(plain));
     assert.equal(toolResultDataToHistoryString({ a: 1 }), '{"a":1}');
+  });
+
+  it("governs MCP's resource_link at any depth: one the host can't fetch shows its uri only where it can't carry a credential", () => {
+    // References (RFC-005 §8.1) with no server, as a module's are. A link's
+    // uri is the agent's only handle on it, so it stays where it can't carry
+    // a credential, as the JSON showed it; a resource's never shows.
+    const signed = { type: 'resource_link', uri: URI, name: 'zz.pdf', mimeType: 'application/pdf' };
+    const plainUri = 'https://zz-files.example/plain.pdf';
+    const plainLink = { ...signed, uri: plainUri };
+    const text = toolResultDataToHistoryString([{ id: 1, type: 'zz-record' }, signed, 'zz', RESOURCE, plainLink]);
+    assert.ok(!text.includes(SIGNATURE), text);
+    const [record, signedShown, plain, stub, plainShown] = parsed(text) as [unknown, string, string, string, string];
+    assert.deepEqual([record, plain], [{ id: 1, type: 'zz-record' }, 'zz']);
+    assert.match(signedShown, /^\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result — it's not tied to any server/);
+    assert.match(stub, STUB);
+    assert.equal(plainShown, `[resource link "zz.pdf": ${plainUri}, application/pdf; not fetched]`);
   });
 
   it('writes a record that only shares a type name, with no uri and no string data, as JSON does', () => {
@@ -146,7 +165,8 @@ describe('data the serializer doesn\'t read as content blocks', () => {
 
   it("governs MCP's embedded resource, whose uri sits under resource, at any depth", () => {
     const embedded = { type: 'resource', resource: { uri: URI, mimeType: 'application/pdf', blob: BASE64 } };
-    const line = '[Reference not shown: it arrived without a link.]';
+    // Its contents show as the block they make, and a pdf's data is no block any lane shows.
+    const line = "[Resource not shown: this host can't display its data (application/pdf, 24B).]";
     const nested = toolResultDataToHistoryString({ result: { content: [embedded] } });
     assert.ok(!nested.includes(SIGNATURE) && !nested.includes(BASE64), nested);
     assert.deepEqual(parsed(nested), { result: { content: [line] } });
@@ -307,16 +327,14 @@ describe('a model\'s call answered with such data', () => {
 });
 
 describe('a script given such data', () => {
-  type ScriptFramework = {
-    dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
-    handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
-  };
+  type ScriptFramework = { dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult> };
+  const script = async (fw: ScriptFramework) => answerText(await scriptCall(fw as unknown as AgentFramework, 'zz-agent', 'zz_tool', {}));
 
   it('gets the text history stores, with each reference as its stub and the rest as JSON writes it', async () => {
     const fw = Object.create(AgentFramework.prototype) as ScriptFramework;
     const shot = { type: 'image', data: BASE64, mimeType: 'image/png' };
     fw.dispatchScriptToolCall = async () => ({ success: true, data: { file: RESOURCE, shot, page: 2 } });
-    const { text } = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    const text = await script(fw);
     assert.ok(!text.includes(SIGNATURE), text);
     const result = parsed(text) as { file: string; shot: unknown; page: number };
     assert.match(result.file, STUB);
@@ -332,12 +350,26 @@ describe('a script given such data', () => {
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     let text: string;
     try {
-      ({ text } = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {}));
+      text = await script(fw);
     } finally {
       console.error = error;
     }
     assert.ok(!text.includes(SIGNATURE), text);
     assert.match(text, /^zz-text\n\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result/);
     assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: it's not tied to any server, so there's nowhere to fetch it from$/.test(line)), logged.join('\n'));
+  });
+
+  it("tries the fetch for a structured failure's references too, since the script reads its blocks", async () => {
+    const fw = Object.create(AgentFramework.prototype) as ScriptFramework;
+    fw.dispatchScriptToolCall = async () => ({ success: false, isError: true, error: 'partly failed', data: [{ type: 'text', text: 'zz-text' }, RESOURCE], structured: { partial: true } });
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      await script(fw);
+    } finally {
+      console.error = error;
+    }
+    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed/.test(line)), logged.join('\n'));
   });
 });

@@ -44,8 +44,8 @@ test('a ping on a connected transport is answered with an empty result; a ping n
 
 test('a ping is answered at once while the planes are paused, and nothing is held for it', () => {
   const { connection, receive, written } = bareConnection();
-  // Before ready() both planes are closed, as at startup; a quiesce or the
-  // awareness barrier holds the data plane the same way.
+  // Before ready() both planes are closed, as at startup; a quiesce holds the
+  // data plane the same way.
   receive({ jsonrpc: '2.0', id: 3, method: 'ping' });
   assert.deepEqual(written(), [{ jsonrpc: '2.0', id: 3, result: {} }]);
   assert.equal((connection as any).bufferedEvents.length, 0);

@@ -39,6 +39,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -637,12 +638,14 @@ describe('a stop at a tool boundary', () => {
         allowedTools: 'all',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'fetch it' }]);
-      // Its idle watchdog disposes the run while the round's write is held.
-      const run = framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      // Once the round's write is held, the test makes the run look idle, and
+      // its idle watchdog disposes the run.
+      const run = framework.runEphemeralToCompletion(agent, contextManager, UNREACHED_WATCHDOG);
       const ended = run.then(() => null, (error: unknown) => error);
       framework.start();
       await within("the round's spill write to start", spills.entered);
       assert.equal(agent.state.status, 'ready', "the round's result is in and its boundary is storing it");
+      silenceRun(framework, 'worker');
 
       const error = await within('the run to be disposed', ended);
       assert.match(String(error), /stalled/, 'the watchdog ended the run');

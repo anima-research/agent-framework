@@ -48,8 +48,13 @@ export interface McplPushEvent {
   targetAgents?: string[];
   /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
   coalescingSubject?: string;
-  /** RFC-006 assembly: materialized for this agent's turn (store directly). */
+  /** RFC-006 assembly: materialized for this agent's turn, stored directly
+   *  while its assembly runs, after what is queued for it (the framework's
+   *  addMessage, bypassDeferralFor). */
   assemblingFor?: string;
+  /** The coalescer's mark: the agent's first view of the subject (see
+   *  CoalescedOccurrence.firstView). */
+  firstView?: boolean;
   /** Host acceptance time (epoch ms), stamped where the push is admitted. */
   acceptedAt?: number;
   /** Framework-owned source envelope, frozen at a coalesced occurrence's
@@ -224,12 +229,15 @@ export class PushHandler {
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
+      // The host's own fields come after the server's origin, as a channel
+      // message's do, so an origin can't give the gate another server's id,
+      // feature set, event id or event type.
       const metadata: Record<string, unknown> = {
+        ...(params.origin ?? {}),
         serverId,
         featureSet: params.featureSet,
         eventId: params.eventId,
         eventType: 'mcpl:push-event',
-        ...(params.origin ?? {}),
         ...(params.tags ? { tags: params.tags } : {}),
       };
       triggerInference = this.shouldTriggerInference(textContent, metadata);

@@ -199,6 +199,8 @@ test('configuration mistakes throw before anything is launched', async () => {
   const dir = scratch();
   const refused: Array<[Partial<McplServerConfig>, RegExp]> = [
     [{ requestTimeoutMs: 0 }, /requestTimeoutMs must be an integer/],
+    // A deadline JSON can hold and String() can't print is refused like any other.
+    [{ requestTimeoutMs: JSON.parse('{"toString": 1}') }, /requestTimeoutMs must be an integer from 1 to 2147483647 for a modern server \(got \[a value that cannot be printed\]\)/],
     [{ protocol: undefined }, /not configured for modern MCP/],
     [{ token: 't' }, /"token" applies only to a network \(url\) server/],
     [{ url: 'https://x.invalid/mcp' }, /"command" and "url" are both set/],

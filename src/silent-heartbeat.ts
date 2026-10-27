@@ -7,19 +7,22 @@
  * - A silent heartbeat tick stores no prompt row (#216): its reply is written
  *   straight after whatever the window held before it — often the previous
  *   assistant message, since a suppressed tick leaves no delivery receipt
- *   behind. Every row a tick writes is stamped with `metadata.silentHeartbeat`,
- *   and a separator carrying the tick's instruction is rendered before the
- *   first of the tick's rows that survives compilation.
+ *   behind. Every row the tick's reply writes is stamped with
+ *   `metadata.silentHeartbeat`, and a separator carrying the tick's
+ *   instruction is rendered before the first of those rows that survives
+ *   compilation. A context injection its start stores (stored-injections.ts)
+ *   is unstamped: it's history the agent saw, not the tick's speech, so a
+ *   policy that drops a tick's rows leaves it.
  * - A compile that ends on the agent's own message gets a trailing
  *   `[Continue]` turn (some models reject a trailing assistant message). The
  *   reply it prompts is stored straight after that message, so the reply's
  *   rows are stamped `metadata.promptedBy` (`RequestOnlyPrompt`), and the turn
  *   is rendered before the first of them that survives. A reply follows the
  *   prompt when what it was sent ends on that `[Continue]`, or on the tool
- *   results of a reply that followed it (`toolLoopPrompt`): a stream start
- *   and each round of a stream alike. A reply sent anything else after the
- *   results (a message that arrived meanwhile) follows that, and carries no
- *   prompt.
+ *   results of a reply that followed it (`toolLoopPrompt`), stored context
+ *   injections after those results aside: a stream start and each round of
+ *   a stream alike. A reply sent anything else after the results (a message
+ *   that arrived meanwhile) follows that, and carries no prompt.
  *
  * Without the row, the wire formatter merges consecutive same-role messages:
  * the reply would read as an unprompted continuation of the earlier response,
@@ -75,9 +78,13 @@ export interface SilentHeartbeatTick {
   serverId: string;
 }
 
-/** `metadata.silentHeartbeat` on every row a tick's turn writes. Residents
- * share one message slot, so the stamp names the agent whose turn wrote it
- * (tool_result rows are stored as `user`). */
+/** `metadata.silentHeartbeat` on the rows of a tick's own turn (its reply,
+ * tool results and their wrappers). What the framework stores of its own
+ * accord is left unstamped, a clock row (at the turn's start or a tool
+ * boundary) or a context injection, so a retention policy that drops a
+ * tick's rows keeps it. Residents share one message
+ * slot, so the stamp names the agent whose turn wrote it (tool_result rows
+ * are stored as `user`). */
 export interface SilentHeartbeatStamp extends SilentHeartbeatTick {
   agentName: string;
   /** The separator text the tick's request rendered, which later compiles

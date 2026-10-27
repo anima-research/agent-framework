@@ -24,15 +24,27 @@ structured provider `stopReason: 'refusal'`, not keywords in output, ordinary
 provider errors, or natural-language refusal text.
 
 On that signal, every result in the batch is withheld. Tool calls, result IDs,
-and error flags remain intact; each entire payload becomes the guard's notice,
+and error flags remain intact; each entire payload becomes the guard's notice.
+For a result that isn't an error it is
 
 > Tool result withheld by the guard. The tool has already executed.
 
-followed by where the original is (see "Where a withheld original goes"
-below), and, for the workspace's `materialize`, `sync` and `delete`, the fields
-of their results that say what they acted on. The same holds for every withheld
-settlement: a refusal, an aborted stream, a batch that was never submitted, and
-one whose audit sync failed.
+for a call that was refused and never ran (`ToolResult.refused`),
+
+> Tool result withheld by the guard. The tool didn't run.
+
+and for any other error result (`isError`), which can come before or after the
+tool runs,
+
+> Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.
+
+The notice is followed by where the original is (see "Where a withheld original
+goes" below); for an error result whose original was written to a workspace
+file, by "Read it before calling again."; and, for the workspace's
+`materialize`, `sync` and `delete`, by the fields of their results that say
+what they acted on. The same holds for every withheld settlement: a refusal, an
+aborted stream, a batch that was never submitted, and one whose audit sync
+failed.
 
 The refused attempt's partial assistant output is discarded. Inference is
 retried once on the same model, within the same logical turn; executed tools
@@ -64,10 +76,11 @@ wire cost (chars/4 plus a flat per-image cost) in `reserveForResponse`, so
 substituting them for the placeholders cannot push a restart's request past
 its budget.
 
-While a submitted batch is pending (or a recovery is running), streamed text
-and its `inference:tokens` trace events are held at one publication
+While a submitted batch is pending (or a recovery is running), the
+round's `inference:tokens` trace events are held at one publication
 boundary; they are released in order on a clean round and discarded on a
-guard refusal.
+guard refusal. The outgoing stream needs no hold: it carries only what
+delivery publishes, and a refused attempt publishes nothing.
 
 Normal successful rounds admit the preceding results to memory. This works
 for framework yielding streams (including ephemeral agents and context-budget
@@ -157,8 +170,10 @@ exchange, its unsubmitted payload is not admitted to memory.
 
 Each withheld result's original is written, as the result was stored (its
 text; for a result over the inline cap, its capped text, whose own note names
-the file with the whole output), to a file under the first writable mount's
-`tool-results/` directory, named
+the file with the whole output), to a file under the `tool-results/`
+directory of the first writable mount without an include that isn't
+configured direct (a direct mount's directory is a checkout, whether it runs
+direct or as 'chronicle'), named
 `<date>-withheld-<batch>-<index>-<toolUseId>.txt` with any character outside
 `A-Za-z0-9._-` replaced and the name cut to 80 characters. Its stub names it:
 
@@ -167,9 +182,9 @@ the file with the whole output), to a file under the first writable mount's
 
 Otherwise the stub names the guard's audit record, for an operator:
 
-- with no writable workspace, or once the framework is stopping: "Its result is
-  kept in the guard's audit record (framework/tool-result-guard), for an
-  operator.";
+- with no writable mount without an include that isn't configured direct, or once the framework is
+  stopping: "Its result is kept in the guard's audit record
+  (framework/tool-result-guard), for an operator.";
 - when the write failed: "Writing its result to workspace file … failed, so it
   is kept only in the guard's audit record …". The error itself stays in the
   audit record and the logs;
@@ -223,8 +238,8 @@ Two audit records describe it, each with `batchId`, `messageId` and
   `{ toolUseId, path }` is a written file; with `error`, a failed write; with
   `unfinished: true`, a write still under way at the deadline. `{ toolUseId,
   error }` is a write that threw. `{ toolUseId, skipped }` is no write:
-  `no_workspace_file` (no writable workspace, or the framework was stopping),
-  `workspace_unanswered` (an earlier write was still under way past its
+  `no_workspace_file` (no writable mount without an include that isn't configured direct, or the framework
+  was stopping), `workspace_unanswered` (an earlier write was still under way past its
   deadline), `batch_deadline` (the batch had no time left to start another write), or `branch_changed` (the workspace declined the write before its tree entry was set).
 
 The `annotated` record describes what each spill reported when the batch's annotation finished. An `unfinished` entry is not updated when the underlying write later settles.
@@ -260,10 +275,6 @@ retroactive and does not rewrite results already accepted into memory.
 
 ## Known limits
 
-- **Explicit-send suppression across a budget restart.** A guard recovery
-  carries the same-turn send suppression, so a text-only recovery after a
-  successful explicit send is not routed (locus/hybrid). Context-budget
-  restarts still re-enter without it (inherited, unchanged here).
 - **Audit growth.** Every guarded batch, accepted ones included, archives
   `originals`, `content`, and `wireResults` indefinitely. There is no
   retention policy and no restore tool; large payloads are blobs, but a full
@@ -271,9 +282,9 @@ retroactive and does not rewrite results already accepted into memory.
 - **Token stats.** The context manager's token-stats cache is not
   write-through on edit, so a stats read taken while a batch was pending can
   keep pricing that message as the placeholder.
-- **Held stream text on abort.** Text held while a submitted batch is
-  pending is dropped (not previewed) if the stream aborts or errors before
-  the round settles.
+- **Held token traces on abort.** `inference:tokens` traces held while a
+  submitted batch is pending are dropped (not previewed) if the stream
+  aborts or errors before the round settles.
 - **Withheld originals in the workspace.** Every reader of the mount can read
   a withheld original's file, and nothing removes it; delete it as any
   workspace file.

@@ -16,10 +16,10 @@
  * - Everything else is left unrouted and dropped by the framework — the
  *   trunk is a dormant template, not a listener.
  *
- * Bindings expire after an idle TTL. Expiry runs a final closure turn on the
- * fork (see framework wiring) and unbinds; the next qualifying message on
- * that channel spawns a *fresh* fork (generation + 1) from the current
- * trunk, so handbook/template updates propagate between engagements.
+ * Bindings expire after an idle TTL. Expiry unbinds the channel and runs a
+ * final closure turn on the fork (see framework wiring); the next qualifying
+ * message on that channel spawns a *fresh* fork (generation + 1) from the
+ * current trunk, so handbook/template updates propagate between engagements.
  *
  * The binding table is in-memory — bindings are re-established by the next
  * qualifying message after a restart. The generation counters, by contrast,
@@ -37,6 +37,7 @@
 import { createHash } from 'node:crypto';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ChannelDescriptor } from './types.js';
+import { destinationKey, type ChannelRef } from './channel-registry.js';
 
 // ============================================================================
 // Config & types
@@ -108,6 +109,9 @@ export interface ConversationRouterConfig {
 
 export interface ConversationBinding {
   channelId: string;
+  /** The channel's server: channel ids are unique only within one server's
+   *  connection (MCPL §14.2), so each server's channel has its own binding. */
+  serverId: string;
   agentName: string;
   /** Engagement counter per channel — fresh forks get a new generation. */
   generation: number;
@@ -157,11 +161,15 @@ export const DEFAULT_CLOSURE_PROMPT =
 export class ConversationRouter {
   private config: ConversationRouterConfig;
 
-  /** Active bindings, keyed by channelId. */
+  /** Active bindings, keyed by the channel's server and id (destinationKey):
+   *  two servers' channels with one id are two conversations. */
   private bindings = new Map<string, ConversationBinding>();
 
-  /** Engagement counter per channel — survives unbind, so a re-bound channel
-   * gets a distinct fork agent name. */
+  /** Engagement counter per channel id — survives unbind, so a re-bound
+   * channel gets a distinct fork agent name. Kept by bare id, as it's
+   * persisted: two servers sharing an id share a counter, which still never
+   * repeats a name, and their forks' names differ anyway, since each hashes
+   * its server (forkAgentName). */
   private generations = new Map<string, number>();
 
   constructor(config: ConversationRouterConfig) {
@@ -191,7 +199,7 @@ export class ConversationRouter {
    * unchanged; a failed spawn doesn't leave a dangling route.
    */
   route(facts: IncomingMessageFacts): RoutingDecision {
-    const existing = this.bindings.get(facts.channelId);
+    const existing = this.bindings.get(bindingKey({ serverId: facts.serverId ?? '', channelId: facts.channelId }));
 
     if (existing) {
       return {
@@ -223,39 +231,44 @@ export class ConversationRouter {
    * Record a binding after the framework successfully spawned the fork.
    * Returns the new binding.
    */
-  bind(channelId: string, agentName: string, generation: number, now = Date.now()): ConversationBinding {
-    this.generations.set(channelId, generation);
+  bind(channel: ChannelRef, agentName: string, generation: number, now = Date.now()): ConversationBinding {
+    // The counter is kept by bare id, and two servers' spawns on one id run
+    // beside each other, so a bind can finish after a later spawn's: the
+    // counter keeps the higher, or the next spawn would propose a fork name
+    // already used.
+    this.generations.set(channel.channelId, Math.max(this.generations.get(channel.channelId) ?? 0, generation));
     const binding: ConversationBinding = {
-      channelId,
+      channelId: channel.channelId,
+      serverId: channel.serverId,
       agentName,
       generation,
       boundAt: now,
       lastActivity: now,
     };
-    this.bindings.set(channelId, binding);
+    this.bindings.set(bindingKey(channel), binding);
     return binding;
   }
 
   /** Record delivered activity on an existing binding. Does not bind a
    * channel or advance its generation. Call after successful delivery, not
    * when previewing a route. The optional clock supports deterministic use. */
-  touch(channelId: string, now = Date.now()): void {
-    const binding = this.bindings.get(channelId);
+  touch(channel: ChannelRef, now = Date.now()): void {
+    const binding = this.bindings.get(bindingKey(channel));
     if (binding) binding.lastActivity = now;
   }
 
-  unbind(channelId: string): void {
-    this.bindings.delete(channelId);
+  unbind(channel: ChannelRef): void {
+    this.bindings.delete(bindingKey(channel));
   }
 
-  getBinding(channelId: string): ConversationBinding | undefined {
-    return this.bindings.get(channelId);
+  getBinding(channel: ChannelRef): ConversationBinding | undefined {
+    return this.bindings.get(bindingKey(channel));
   }
 
   /** Reverse lookup: the channel an agent is bound to, if any. */
-  channelForAgent(agentName: string): string | undefined {
+  channelForAgent(agentName: string): ChannelRef | undefined {
     for (const binding of this.bindings.values()) {
-      if (binding.agentName === agentName) return binding.channelId;
+      if (binding.agentName === agentName) return { serverId: binding.serverId, channelId: binding.channelId };
     }
     return undefined;
   }
@@ -264,8 +277,10 @@ export class ConversationRouter {
     return Array.from(this.bindings.values());
   }
 
-  /** Bindings whose idle TTL has elapsed. Does not unbind — the framework
-   * runs the closure turn first, then calls unbind(). */
+  /** Bindings whose idle TTL has elapsed. Does not unbind: the framework
+   * unbinds each one first, so the channel's next message goes to a newer
+   * fork, or nowhere, and then runs the old fork's closure turn
+   * (sweepExpiredConversations). */
   expired(now = Date.now()): ConversationBinding[] {
     const ttl = this.idleTtlMs;
     return this.getBindings().filter((b) => now - b.lastActivity >= ttl);
@@ -301,7 +316,10 @@ export class ConversationRouter {
     return Object.fromEntries(this.generations);
   }
 
-  /** Restore persisted engagement counters (see exportGenerations). */
+  /** Raise each channel's engagement counter to at least the given
+   * generation, never lowering one: the persisted counters at startup (see
+   * exportGenerations), or a spawn's generation whose fork ended before the
+   * spawn could bind it. */
   hydrateGenerations(generations: Record<string, number>): void {
     for (const [channelId, generation] of Object.entries(generations)) {
       if (typeof generation === 'number' && generation > (this.generations.get(channelId) ?? 0)) {
@@ -319,6 +337,11 @@ export class ConversationRouter {
 
 /** The readable part of a fork's name stops here: uniqueness rides on the hash. */
 const FORK_NAME_READABLE_MAX = 64;
+
+/** A binding's key: its channel's server and id (destinationKey). */
+function bindingKey(channel: ChannelRef): string {
+  return destinationKey(channel);
+}
 
 /**
  * A fork's agent name: `<prefix>-<readable>-g<generation>-<hash>`, such as

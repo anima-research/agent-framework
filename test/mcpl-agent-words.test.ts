@@ -25,6 +25,7 @@ import {
 import { convertBlock } from '../src/mcpl/convert-block.js';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplTransport } from '../src/mcpl/transport.js';
 import { WITHHELD_TEXT } from '../src/mcpl/protocol-family.js';
 import { logValue } from '../src/mcpl/log-value.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
@@ -61,13 +62,15 @@ test("a reference block that can't be read says which part is missing, and what 
     assert.equal(referenceStubOrNull(block), text);
     assert.deepEqual(convertBlock(block as never, 'test', 'words'), { type: 'text', text });
   }
-  // Beside inline data, any string uri, an empty one too, stays withheld as
-  // on main: the tool-result lane can't show every inline shape yet, and
-  // showing this audio would put its data into history as raw JSON.
+  // Beside inline data, an empty link is no link either, now that the
+  // tool-result lane gives every inline shape its marker: this audio shows as
+  // a tool result's audio does, and its data stays out of history.
   const audio = { type: 'audio', data: 'aGVsbG8=', mimeType: 'audio/wav', uri: '' };
-  assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: true });
+  assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: false });
   const stored = toolResultDataToHistoryString([{ type: 'text', text: 't' }, audio]);
-  assert.ok(stored.includes(INLINE_WITHHELD_TEXT) && !stored.includes('aGVsbG8='), stored);
+  assert.equal(stored, "t\n[Audio not shown: this host's tool results carry only text and images (audio/wav, 6B).]");
+  // A link that isn't empty still withholds it.
+  assert.deepEqual(classifyBlock({ ...audio, uri: 'https://zz.example/a.wav' }), { kind: 'inline', contradiction: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -140,15 +143,16 @@ test("a server's error answer is shown as the server's, and its method, id and c
   assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: 42$/), 'the log has the number');
 });
 
-test("a server's error answer that echoes a credential reaches the caller as sent, and the log redacted", async (t) => {
+test("a server's error answer that echoes a credential reaches the caller and the log redacted", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   const token = 'tok-0123456789abcdef';
   const connection = await McplServerConnection.connect(config({ env: { API_TOKEN: token } }), HOST_CAPS);
   t.after(() => connection.close());
   connection.ready();
-  // A JSON-RPC answer passes as it is (redactServerText's scope).
+  // The server's words are in an error the caller gets, so a credential
+  // its configuration holds leaves them (redactServerText's scope).
   await assert.rejects(connection.sendToolsCall('echo-token', {}),
-    { message: `The "words" server answered with an error: bad token ${token}` });
+    { message: 'The "words" server answered with an error: bad token redacted' });
   // The log is a record of the server's text, so the credential leaves it,
   // in a message of any JSON value.
   await assert.rejects(connection.sendToolsCall('echo-token-object', {}), { message: NO_WORDS });
@@ -158,7 +162,7 @@ test("a server's error answer that echoes a credential reaches the caller as sen
   assert.ok(!lines.some((line) => line.includes(token)), 'no log line has the token');
 });
 
-test("an error answer whose configuration can't be read settles its call, and its log line withholds the server's text", async (t) => {
+test("an error answer whose configuration can't be read settles its call, and its error and its log line withhold the server's text", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   // A stdio server's env, as the framework gives it, is a getter, which
   // throws once the reaction baseline's ledger can't be read.
@@ -173,10 +177,89 @@ test("an error answer whose configuration can't be read settles its call, and it
   connection.ready();
   unreadable = true;
   await within(assert.rejects(connection.sendToolsCall('refuse', {}),
-    { message: 'The "words" server answered with an error: Missing Access' }), 'settled call');
+    { message: `The "words" server answered with an error: ${WITHHELD_TEXT}` }), 'settled call');
   const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
   assert.ok(!lines.some((line) => line.includes('Missing')), lines.join('\n'));
   assert.ok(lines.some((line) => /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: /.test(line) && line.endsWith(logValue(WITHHELD_TEXT))), lines.join('\n'));
+});
+
+test("a request JSON can't write is refused before anything is kept for it: not sent, in the modern engine's words (#556)", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  for (const args of [{ n: 1n }, cyclic]) {
+    await assert.rejects(connection.sendToolsCall('refuse', args), {
+      outcome: 'not-sent',
+      message: 'The request wasn\'t sent: this host couldn\'t send it to the "words" server, so nothing ran. If calling it again fails, ask whoever runs this host.',
+    });
+  }
+  assert.equal((connection as unknown as { pendingRequests: Map<unknown, unknown> }).pendingRequests.size, 0, 'nothing kept pending');
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words": tools\/call \(id=\d+\) not sent, since it can't be written as JSON: "Do not know how to serialize a BigInt"$/),
+    errors.mock.calls.map((call) => String(call.arguments[0])).join('\n'));
+});
+
+test("a request refused as not sent is refused through its promise when the host's logger throws (#556)", async (t) => {
+  t.mock.method(console, 'error', () => { throw new Error('the logger is down'); });
+  class PipeTransport extends McplTransport {
+    constructor() { super(); }
+    readonly kind = 'stdio' as const;
+    failed: Error | undefined;
+    writeFails: Error | undefined;
+    override get pipeFailure(): Error | undefined { return this.failed; }
+    writeLine(): void { if (this.writeFails) throw this.writeFails; }
+    async close(): Promise<void> {}
+  }
+  const transport = new PipeTransport();
+  const connection = new (McplServerConnection as any)('words', null, transport) as McplServerConnection;
+  let refused: Promise<unknown> | undefined;
+  // Arguments JSON can't write.
+  assert.doesNotThrow(() => { refused = connection.sendToolsCall('refuse', { n: 1n }); });
+  await assert.rejects(refused!, { outcome: 'not-sent' });
+  // A write the transport refuses at once.
+  transport.writeFails = new Error('the stream is destroyed');
+  assert.doesNotThrow(() => { refused = connection.sendToolsCall('refuse', {}); });
+  await assert.rejects(refused!, { outcome: 'not-sent' });
+  // A stdio pipe that has failed, with nothing else to refuse the write.
+  transport.writeFails = undefined;
+  transport.failed = new Error('write EPIPE');
+  assert.doesNotThrow(() => { refused = connection.sendToolsCall('refuse', {}); });
+  await assert.rejects(refused!, { outcome: 'not-sent' });
+});
+
+test("error answers read their connection's configuration once each until a read succeeds, and not after (#540's review, R1-2)", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  // A stdio server's env, as the framework gives it, is a getter, which reads
+  // the reaction baseline's ledger from disk each time, and throws while the
+  // ledger can't be read.
+  let reads = 0;
+  let unreadable = false;
+  const counted = config();
+  Object.defineProperty(counted, 'env', {
+    enumerable: true,
+    get: () => { reads++; if (unreadable) throw new Error('reaction-baseline ledger unreadable'); return {}; },
+  });
+  const connection = await McplServerConnection.connect(counted, HOST_CAPS);
+  t.after(() => { unreadable = false; return connection.close(); });
+  connection.ready();
+  const refused = (words = 'Missing Access') => assert.rejects(connection.sendToolsCall('refuse', {}), { message: `The "words" server answered with an error: ${words}` });
+  const answerLines = () => errors.mock.calls.map((call) => String(call.arguments[0])).filter((line) => / answered tools\/call /.test(line));
+  // While the ledger can't be read, each answer's words and line are
+  // withheld, each answer reads it once, and the next answer reads it again.
+  unreadable = true;
+  let before = reads;
+  await refused(WITHHELD_TEXT);
+  await refused(WITHHELD_TEXT);
+  assert.equal(reads - before, 2);
+  assert.ok(answerLines().every((line) => line.endsWith(logValue(WITHHELD_TEXT))), answerLines().join('\n'));
+  // Once a read succeeds, the redaction it built is kept.
+  unreadable = false;
+  before = reads;
+  for (let i = 0; i < 3; i++) await refused();
+  assert.equal(reads - before, 1, 'read for the first of these answers only');
+  assert.ok(answerLines().at(-1)!.includes('Missing'), answerLines().join('\n'));
 });
 
 test("an error answer settles its call when writing its log line throws", async (t) => {
@@ -485,7 +568,7 @@ test("an MCPL tool's error result with no words says so, and that its effect is 
 
 test("a conversation bound to its channel is told it can't open another, and where to reply", () => {
   const { framework, events } = frameworkWith(null);
-  framework.conversationAgentHomes = new Map([['fork', 'home-1']]);
+  framework.conversationAgentHomes = new Map([['fork', { serverId: 'srv', channelId: 'home-1' }]]);
   framework.toolLifecycleEmitter = undefined;
   framework.dispatchChannelToolCall('fork', { id: 'c1', name: 'channel_open', input: { channelId: 'elsewhere' } });
   assert.equal(events[0]?.result?.error,

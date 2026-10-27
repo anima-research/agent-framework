@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { Module, ModuleContext, ProcessEvent, ProcessState, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
 class HeartbeatModule implements Module {
@@ -53,6 +54,7 @@ class ToolThenFrameworkRetryMembrane {
   asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
 }
 
+/** Its late answer comes once the test releases it. */
 class LateCompletionAfterIdleStream implements YieldingStream {
   private events: StreamEvent[] = [];
   private wake: (() => void) | null = null;
@@ -61,17 +63,19 @@ class LateCompletionAfterIdleStream implements YieldingStream {
   get toolDepth() { return 0; }
   provideToolResults(): void {}
   cancel(): void { /* Simulate a provider that ignores cancellation and terminates later. */ }
-  constructor() {
-    setTimeout(() => {
+  constructor(released: Promise<void>, private readonly onDriven: () => void, private readonly onAnswerOut: () => void) {
+    void released.then(() => {
       this.events.push({ type: 'complete', response: createMockResponse([{ type: 'text', text: 'late answer' }] as ContentBlock[]) } as StreamEvent);
       this.wake?.(); this.wake = null;
-    }, 120);
+    });
   }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     yield { type: 'tokens', content: 'partial', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
+    this.onDriven();
     while (true) {
       while (this.events.length) {
         const event = this.events.shift()!;
+        if (event.type === 'complete') this.onAnswerOut();
         yield event;
         if (event.type === 'complete') return;
       }
@@ -80,8 +84,22 @@ class LateCompletionAfterIdleStream implements YieldingStream {
   }
 }
 class LateCompletionAfterIdleMembrane {
+  /** Resolves once the framework has taken the stream's first event. */
+  readonly driven: Promise<void>;
+  /** Resolves as the stream hands the framework its late answer. */
+  readonly answerOut: Promise<void>;
+  /** Lets the stream's late answer come. */
+  release!: () => void;
+  private markDriven!: () => void;
+  private markAnswerOut!: () => void;
+  private readonly released: Promise<void>;
+  constructor() {
+    this.driven = new Promise((resolve) => { this.markDriven = resolve; });
+    this.answerOut = new Promise((resolve) => { this.markAnswerOut = resolve; });
+    this.released = new Promise((resolve) => { this.release = resolve; });
+  }
   async complete(): Promise<NormalizedResponse> { throw new Error('not used'); }
-  streamYielding(): YieldingStream { return new LateCompletionAfterIdleStream(); }
+  streamYielding(): YieldingStream { return new LateCompletionAfterIdleStream(this.released, this.markDriven, this.markAnswerOut); }
   asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
 }
 
@@ -107,6 +125,22 @@ class RetryingWrapperMembrane {
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
 
+/**
+ * `promise`, or a failure once it has taken `ms`, so a test fails rather than
+ * hangs. It's a hang guard, not a check on how fast the host works, so it's
+ * set wide, as coalescing-fixture's REPLY_DEADLINE_MS is: a loaded host's
+ * stall needn't be in proportion to the work waited on.
+ */
+async function within<T>(what: string, promise: Promise<T>, ms = 60_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} took longer than ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, late]);
+  } finally { clearTimeout(timer); }
+}
+
 async function run(enabled?: boolean, allowedTools?: string[]) {
   const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-')); dirs.push(dir);
   const membrane = new MockMembrane();
@@ -120,8 +154,10 @@ async function run(enabled?: boolean, allowedTools?: string[]) {
   const routed: string[] = [];
   const outgoing: string[] = [];
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:test',
-    routeSpeech: async (_agent: string, speech: string) => { routed.push(speech); return { delivered: true, channelId: 'world:test' }; },
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+    routeSpeech: async (_agent: string, speech: string, _to: { serverId: string; channelId: string }) => {
+      routed.push(speech); return { delivered: true, serverId: 'stub', channelId: 'world:test' };
+    },
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
   }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
@@ -132,16 +168,42 @@ async function run(enabled?: boolean, allowedTools?: string[]) {
   return { routed, outgoing, all, module };
 }
 
+/** Its stream's late tool call comes once the test releases it. */
 class LateToolAfterIdleMembrane {
+  /** Resolves once the framework has taken the stream's first event. */
+  readonly driven: Promise<void>;
+  /** Resolves as the stream hands the framework its late tool call. */
+  readonly lateOut: Promise<void>;
+  /** Resolves once the framework has left the stream, at its end or by a break. */
+  readonly left: Promise<void>;
+  /** Lets the late tool call come. */
+  release!: () => void;
+  private markDriven!: () => void;
+  private markLateOut!: () => void;
+  private markLeft!: () => void;
+  private readonly released: Promise<void>;
+  constructor() {
+    this.driven = new Promise((resolve) => { this.markDriven = resolve; });
+    this.lateOut = new Promise((resolve) => { this.markLateOut = resolve; });
+    this.left = new Promise((resolve) => { this.markLeft = resolve; });
+    this.released = new Promise((resolve) => { this.release = resolve; });
+  }
   streamYielding(): YieldingStream {
+    const membrane = this;
     return {
       isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0,
       provideToolResults: () => {}, cancel: () => {},
       async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-        yield { type: 'tokens', content: 'starting', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] } } as StreamEvent;
-        yield { type: 'complete', response: createMockResponse([{ type: 'text', text: 'late' }]) } as StreamEvent;
+        try {
+          yield { type: 'tokens', content: 'starting', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
+          membrane.markDriven();
+          await membrane.released;
+          membrane.markLateOut();
+          yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] } } as StreamEvent;
+          yield { type: 'complete', response: createMockResponse([{ type: 'text', text: 'late' }]) } as StreamEvent;
+        } finally {
+          membrane.markLeft();
+        }
       },
     } as YieldingStream;
   }
@@ -172,7 +234,9 @@ describe('tool wrapper prose guard integration', () => {
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [module],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string, _to: { serverId: string; channelId: string }) => {
+        routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_c: string, _a: string, _id: string, _i: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
@@ -190,7 +254,7 @@ describe('tool wrapper prose guard integration', () => {
     const module = new HeartbeatModule(); const membrane = new ToolThenFrameworkRetryMembrane(); const routed: string[] = [];
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [module] });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' }; },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
@@ -209,7 +273,7 @@ describe('tool wrapper prose guard integration', () => {
     ]);
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', maxStreamTokens: 1, toolWrapperProseGuard: true }], modules: [module] });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' }; },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
@@ -219,7 +283,7 @@ describe('tool wrapper prose guard integration', () => {
     assert.ok(!all.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'));
   });
 
-  it('buffers then delivers ordinary prose when enabled', async () => {
+  it("a guarded turn's ordinary prose streams what delivery publishes", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-ordinary-')); dirs.push(dir);
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary answer.' }] as ContentBlock[]));
@@ -229,8 +293,10 @@ describe('tool wrapper prose guard integration', () => {
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [new HeartbeatModule()],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      routeSpeech: async (_agent: string, text: string, _to: { serverId: string; channelId: string }) => {
+        routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
@@ -240,7 +306,8 @@ describe('tool wrapper prose guard integration', () => {
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
     assert.deepEqual(routed, ['Ordinary answer.']);
-    assert.deepEqual(outgoing, [], 'guarded turns buffer ordinary prose until completion');
+    assert.deepEqual(outgoing, ['Ordinary answer.'],
+      'the guard classifies before delivery, and the stream carries what delivery publishes');
     assert.ok(all.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'Ordinary answer.')));
     assert.ok(!all.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'));
   });
@@ -254,14 +321,15 @@ describe('tool wrapper prose guard integration', () => {
     membrane.pushResponse(createMockResponse([{
       type: 'text', text: '<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>',
     }] as ContentBlock[]));
-    const module = new HeartbeatModule(); const routed: string[] = [];
+    const module = new HeartbeatModule(); const routed: string[] = []; const outgoing: string[] = [];
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }],
       modules: [module],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }), routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:test' }; },
+      sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
@@ -270,6 +338,8 @@ describe('tool wrapper prose guard integration', () => {
     await framework.stop();
     assert.equal(module.calls, 1, 'genuine structured tool executes exactly once');
     assert.deepEqual(routed, ['<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>']);
+    assert.deepEqual(outgoing, ['<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>'],
+      'posted as ordinary prose, it streams as delivery publishes it');
     assert.ok(all.some((m) => m.content.some((b) => b.type === 'text' && b.text.includes('<mcpl--heartbeat--heartbeat_status>'))));
     assert.ok(!all.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'));
   });
@@ -327,18 +397,34 @@ describe('tool wrapper prose guard integration', () => {
   it('idle-watchdog disposal cancels and ignores late tool events', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-late-tool-')); dirs.push(dir);
     const module = new HeartbeatModule();
-    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new LateToolAfterIdleMembrane().asMembrane(), agents: [], modules: [module] });
+    const membrane = new LateToolAfterIdleMembrane();
+    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [], modules: [module] });
     await framework.start();
     const created = await framework.createEphemeralAgent({ name: 'late-tool-after-idle', model: 'test', systemPrompt: 'sys', allowedTools: 'all', toolWrapperProseGuard: true });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'check' }]);
-    await assert.rejects(framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 100, idleTimeoutMs: 20, idlePollMs: 5 }), /stalled/);
-    await new Promise((resolve) => setTimeout(resolve, 260));
-    assert.equal(module.calls, 0, 'late structured call never executes after disposal');
-    assert.equal(framework.getAgent(created.agent.name), null);
-    const internals = framework as unknown as { activeStreams: Map<string, unknown>; pendingAssistantBlocks: Map<string, unknown> };
-    assert.equal(internals.activeStreams.has(created.agent.name), false, 'disposal removes the old active stream handle');
-    assert.equal(internals.pendingAssistantBlocks.has(created.agent.name), false, 'disposal removes pending tool blocks');
-    await framework.stop();
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+    const ended = run.then(() => null, (error: unknown) => error);
+    try {
+      // Once the stream is driven, the test makes the run look idle, and its
+      // idle watchdog disposes it. Only then does the late tool call come.
+      await within('the stream to be driven', membrane.driven);
+      silenceRun(framework, created.agent.name);
+      assert.match(String(await within('the run to end', ended)), /stalled/, 'the idle watchdog ended the run');
+      membrane.release();
+      await within('the late tool call to reach the framework', membrane.lateOut);
+      await within('the framework to leave the stream', membrane.left);
+      await within('the framework to go idle', framework.runUntilIdle());
+      assert.equal(module.calls, 0, 'late structured call never executes after disposal');
+      assert.equal(framework.getAgent(created.agent.name), null);
+      const internals = framework as unknown as { activeStreams: Map<string, unknown>; pendingAssistantBlocks: Map<string, unknown> };
+      assert.equal(internals.activeStreams.has(created.agent.name), false, 'disposal removes the old active stream handle');
+      assert.equal(internals.pendingAssistantBlocks.has(created.agent.name), false, 'disposal removes pending tool blocks');
+    } finally {
+      // A failure before the release would leave the stream held, and stop()
+      // waiting on it.
+      membrane.release();
+      await framework.stop();
+    }
   });
 
   it('refuses ephemeral name reuse before a stale stream can bind to a successor', async () => {
@@ -381,7 +467,7 @@ describe('tool wrapper prose guard integration', () => {
       disposeConversationAgent(agentName: string): void;
       agents: Map<string, object>;
     };
-    const fork = { name: 'fork' };
+    const fork = { name: 'fork', toolResultGuard: { hasPending: false } };
     internals.agents.set('fork', fork);
     internals.logicalTurnToolCalls.set(fork, { turnToken: 1, count: 1 });
     internals.disposeConversationAgent('fork');
@@ -410,24 +496,33 @@ describe('tool wrapper prose guard integration', () => {
     const typing: string[] = [];
     const outgoing: Array<[string, string]> = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      startTyping: (channel: string) => typing.push(`start:${channel}`),
-      stopTyping: (channel?: string) => typing.push(`stop:${channel ?? '(all)'}`),
-      routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      startTyping: (channel: { channelId: string }) => typing.push(`start:${channel.channelId}`),
+      stopTyping: (channel?: { channelId: string }) => typing.push(`stop:${channel?.channelId ?? '(all)'}`),
+      routeSpeech: async (_agent: string, text: string, _to: { serverId: string; channelId: string }) => {
+        return { delivered: true, serverId: 'stub', channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => outgoing.push(['chunk', delta]),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => outgoing.push(['complete', text]),
-      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
-      resolveProseTarget: () => ({ channelId: 'world:test' }),
+      getDefaultPublishChannel: () => ({ serverId: 'stub', channelId: 'world:test' }), isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      resolveProseTarget: () => ({ serverId: 'stub', channelId: 'world:test' }),
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     const created = await framework.createEphemeralAgent({ name: 'ephemeral-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
     const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
     framework.start();
-    assert.deepEqual(await run, { speech: 'Ordinary ephemeral answer.', toolCallsCount: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.ok(typing.includes('stop:(all)'), 'terminal physical frame stops typing after ephemeral caller disposal');
-    assert.ok(outgoing.some(([kind, text]) => kind === 'complete' && text === 'Ordinary ephemeral answer.'), 'terminal physical frame finalizes outgoing stream');
-    await framework.stop();
+    try {
+      assert.deepEqual(await run, { speech: 'Ordinary ephemeral answer.', toolCallsCount: 0 });
+      // The terminal frame's teardown stops typing and sends the complete.
+      const until = Date.now() + 5000;
+      while (Date.now() < until && !(typing.includes('stop:(all)') && outgoing.some(([kind]) => kind === 'complete'))) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.ok(typing.includes('stop:(all)'), 'terminal physical frame stops typing after ephemeral caller disposal');
+      assert.ok(outgoing.some(([kind, text]) => kind === 'complete' && text === 'Ordinary ephemeral answer.'), 'terminal physical frame finalizes outgoing stream');
+    } finally {
+      await framework.stop();
+    }
   });
 
   it('releases a conversation name reservation after transient creation failure', async () => {
@@ -437,45 +532,64 @@ describe('tool wrapper prose guard integration', () => {
       agents: [{ name: 'trunk', model: 'test', systemPrompt: 'sys' }], modules: [],
       conversations: { templateAgent: 'trunk', bind: { channel: 'mention' } },
     });
-    const internals = framework as unknown as { store: Record<PropertyKey, unknown>; createConversationAgent(name: string, channelId: string): Promise<{ name: string }> };
+    const internals = framework as unknown as { store: Record<PropertyKey, unknown>; createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ name: string }> };
     const goodStore = internals.store;
     internals.store = new Proxy(goodStore, { get(target, prop) {
       if (prop === 'getMessages' || prop === 'appendMessage' || prop === 'getStateJson') throw new Error('transient store failure');
       const value = Reflect.get(target, prop);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    await assert.rejects(internals.createConversationAgent('trunk-chan-g1', 'world:chan'), /transient store failure/);
+    await assert.rejects(internals.createConversationAgent('trunk-chan-g1', { serverId: 'stub', channelId: 'world:chan' }), /transient store failure/);
     internals.store = goodStore;
-    const retried = await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
+    const retried = await internals.createConversationAgent('trunk-chan-g1', { serverId: 'stub', channelId: 'world:chan' });
     assert.equal(retried.name, 'trunk-chan-g1');
     await framework.stop();
   });
 
 
-  it('idle-disposed ephemeral stops typing and finalizes every started outgoing stream', async () => {
+  it("idle-disposed ephemeral stops typing, and text it never delivered doesn't stream", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-idle-terminal-')); dirs.push(dir);
-    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new LateCompletionAfterIdleMembrane().asMembrane(), agents: [], modules: [] });
+    const membrane = new LateCompletionAfterIdleMembrane();
+    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [], modules: [] });
     const events: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      startTyping: (channel: string) => events.push(`start:${channel}`),
-      stopTyping: (channel?: string) => events.push(`stop:${channel ?? '(all)'}`),
-      routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      startTyping: (channel: { channelId: string }) => events.push(`start:${channel.channelId}`),
+      stopTyping: (channel?: { channelId: string }) => events.push(`stop:${channel?.channelId ?? '(all)'}`),
+      routeSpeech: async (_agent: string, text: string, _to: { serverId: string; channelId: string }) => {
+        return { delivered: true, serverId: 'stub', channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => events.push(`chunk:${delta}`),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => events.push(`complete:${text}`),
-      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
-      resolveProseTarget: () => ({ channelId: 'world:test' }),
+      getDefaultPublishChannel: () => ({ serverId: 'stub', channelId: 'world:test' }), isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      resolveProseTarget: () => ({ serverId: 'stub', channelId: 'world:test' }),
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     const created = await framework.createEphemeralAgent({ name: 'idle-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
-    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 500, idleTimeoutMs: 20, idlePollMs: 5 });
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+    const ended = run.then(() => null, (error: unknown) => error);
     framework.start();
-    await assert.rejects(run, /stalled/);
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
-    assert.ok(events.some((event) => event.startsWith('chunk:')), 'probe actually opened an outgoing stream');
-    assert.ok(events.some((event) => event.startsWith('complete:')), 'every started outgoing stream receives a terminal complete');
-    await framework.stop();
+    try {
+      // Once the stream is driven, the test makes the run look idle, and its
+      // idle watchdog disposes it. Only then does the late answer come.
+      await within('the stream to be driven', membrane.driven);
+      silenceRun(framework, created.agent.name);
+      assert.match(String(await within('the run to end', ended)), /stalled/, 'the idle watchdog ended the run');
+      // The disposed frame's typing stops in its teardown, which runs once
+      // its late answer has come in.
+      membrane.release();
+      await within('the late answer to reach the framework', membrane.answerOut);
+      const until = Date.now() + 60_000;
+      while (Date.now() < until && !events.includes('stop:(all)')) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
+      assert.deepEqual(events.filter((event) => event.startsWith('chunk:') || event.startsWith('complete:')), [],
+        "the partial text and the disposed frame's late answer were never delivered, so neither streams");
+    } finally {
+      // A failure before the release would leave the stream held, and stop()
+      // waiting on it.
+      membrane.release();
+      await framework.stop();
+    }
   });
 
 });

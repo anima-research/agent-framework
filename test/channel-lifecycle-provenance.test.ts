@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
+import { ChannelRegistry, desiredStateInLog } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
@@ -13,7 +17,7 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
  * predated the server declaring its bootstrap preference.
  */
 
-function makeRegistry() {
+function makeRegistry(store?: JsStore) {
   const serverRegistry = {
     getServer: (_id: string) => ({ sendChannelsPublish: async () => ({ delivered: true }) }),
   } as unknown as McplServerRegistry;
@@ -22,6 +26,7 @@ function makeRegistry() {
     {} as FeatureSetManager,
     () => {},
     () => {},
+    store ? { store } : undefined,
   );
   const r = registry as unknown as {
     ensureInitialDesiredState(serverId: string, ch: { id: string; type: string; label: string; direction: string; initiallyOpen?: boolean }): void;
@@ -60,4 +65,49 @@ test('initiallyOpen at first sight registers open with server-bootstrap provenan
   const { r } = makeRegistry();
   r.ensureInitialDesiredState('eidoverse', ch(true));
   assert.equal(r.getDesiredState('eidoverse', 'world:commons'), 'open');
+});
+
+test("desiredStateInLog reads a server's channel's last decision from a store's lifecycle log, by the rule a registry replayed from it reads", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'desired-state-in-log-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  try {
+    assert.equal(desiredStateInLog(store, 'a', 'c-1'), undefined, 'a store no registry has written to');
+    const { registry, r } = makeRegistry(store);
+    r.setDesiredState('a', 'c-1', 'open', 'opened-by-reply');
+    r.setDesiredState('a', 'c-1', 'closed', 'agent-tool');
+    r.setDesiredState('a', 'c-2', 'open', 'opened-by-reply');
+    // One channel id on two servers, each with its own decision.
+    r.setDesiredState('a', 'c-3', 'open', 'opened-by-reply');
+    r.setDesiredState('b', 'c-3', 'closed', 'agent-tool');
+    registry.enterTuneOut('a', 'c-9', { epochId: 'e-9', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+    // Records the rule doesn't read as a decision: another kind, a channel id
+    // that isn't text, a tune-out with no params, a state no build writes.
+    // A decision with no source is still a decision.
+    for (const item of [
+      { kind: 'channel-renamed', serverId: 'a', channelId: 'c-5', desired: 'open', source: 'agent-tool' },
+      { kind: 'desired-state', serverId: 'a', channelId: 6, desired: 'open', source: 'agent-tool' },
+      { kind: 'desired-state', serverId: 'a', channelId: 'c-7', desired: 'tuned-out', source: 'agent-tool' },
+      { kind: 'desired-state', serverId: 'a', channelId: 'c-8', desired: 'maybe', source: 'agent-tool' },
+      { kind: 'desired-state', serverId: 'a', channelId: 'c-10', desired: 'open' },
+    ]) store.appendToStateJson('mcpl/channel-lifecycle', { ...item, timestamp: new Date().toISOString() } as never);
+    assert.equal(desiredStateInLog(store, 'a', 'c-1'), 'closed', 'the last decision wins');
+    assert.equal(desiredStateInLog(store, 'a', 'c-2'), 'open');
+    assert.equal(desiredStateInLog(store, 'a', 'c-3'), 'open', "a's own decision");
+    assert.equal(desiredStateInLog(store, 'b', 'c-3'), 'closed', "b's own decision");
+    assert.equal(desiredStateInLog(store, 'b', 'c-2'), undefined, "another server's channel");
+    assert.equal(desiredStateInLog(store, 'a', 'c-9'), 'tuned-out');
+    for (const [server, id] of [['a', 'c-5'], ['a', '6'], ['a', 'c-7'], ['a', 'c-8']]) {
+      assert.equal(desiredStateInLog(store, server!, id!), undefined, `${server}:${id} isn't a decision`);
+    }
+    assert.equal(desiredStateInLog(store, 'a', 'c-10'), 'open', 'a decision with no source');
+    assert.equal(desiredStateInLog(store, 'a', 'c-4'), undefined, 'none on record');
+    const replayed = makeRegistry(store).registry;
+    for (const [server, id] of [['a', 'c-1'], ['a', 'c-2'], ['a', 'c-3'], ['b', 'c-3'], ['b', 'c-2'], ['a', 'c-9'],
+      ['a', 'c-5'], ['a', '6'], ['a', 'c-7'], ['a', 'c-8'], ['a', 'c-10'], ['a', 'c-4']]) {
+      assert.equal(replayed.getDesiredState(server!, id!), desiredStateInLog(store, server!, id!), `${server}:${id}`);
+    }
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -25,9 +25,9 @@ export function heldWriteId(id: MessageId): string | undefined {
 
 /**
  * Whether a row matches `filter` as context-manager's queryMessages matches a
- * stored one. That's its MessageStore's private matchesFilter at 0.14.1, which
- * the package doesn't export, so the rule is copied here, and a test compares
- * the two on the same rows. A row matches the external source, one of the
+ * stored one. That's its MessageStore's private matchesFilter, the same at
+ * 0.14.1, 0.16.0, 0.17.1 and 0.18.0, which the package doesn't export, so the rule is copied
+ * here, and a test compares the two on the same rows. A row matches the external source, one of the
  * external ids (an empty list filters nothing), the participant, and each
  * metadata path, dot-separated, by strict equality.
  */
@@ -56,4 +56,18 @@ function valueAt(value: unknown, path: string): unknown {
     value = (value as Record<string, unknown>)[part];
   }
   return value;
+}
+
+/**
+ * A row as a module's context answers it: marked `heldFromResidents` when it
+ * carries the stamp a tune-out puts on a message it holds from the residents
+ * (`metadata.tuneOut`). Every resident's viewFilter leaves a stamped row out
+ * of its compiled view (framework.ts, createAgent), and a tool boundary
+ * stores a stamped write without injecting it into the live turn, so a
+ * marked row is one the store keeps and no resident is shown
+ * (ModuleMessage.heldFromResidents says where its text can still reach
+ * one). Any other row comes back as it is.
+ */
+export function asModuleRow<T extends Pick<StoredMessage, 'metadata'>>(row: T): T & { heldFromResidents?: true } {
+  return (row.metadata as { tuneOut?: unknown } | undefined)?.tuneOut ? { ...row, heldFromResidents: true } : row;
 }

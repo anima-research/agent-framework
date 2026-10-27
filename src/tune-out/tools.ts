@@ -113,7 +113,10 @@ export interface SubconsciousConfig {
    * agent-prefixed identifier.
    */
   name?: string;
-  /** Model id; defaults to the primary agent's (same-model side-process). */
+  /** Model id; defaults to the primary agent's (same-model side-process).
+   *  Another id, compared exactly, makes the subconscious leave out the
+   *  fields that describe the primary's model, its window and its thinking
+   *  binding (SUBCONSCIOUS_MODEL_FIELDS); nothing here sets its own. */
   model?: string;
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the

@@ -1,6 +1,6 @@
 /**
  * A tool's structured result end to end: a real MCPL connection, the
- * framework's dispatch, and a real Python script. Adapted from
+ * framework's dispatch, and a real script on the engine. Adapted from
  * anima-research/agent-framework#181's test of the same name, which first
  * found scripts losing structuredContent. Beside what a script reads, it
  * checks that the model's own calls and the stored history keep the readable
@@ -44,7 +44,7 @@ class UnconvertibleModule implements Module {
   async stop(): Promise<void> {}
   async onProcess(): Promise<EventResponse> { return {}; }
   getTools(): ToolDefinition[] {
-    return ['cyclic', 'bigint', 'cyclic_data', 'cyclic_error', 'bare_throw'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
+    return ['cyclic', 'bigint', 'cyclic_data', 'cyclic_error', 'bare_throw', 'falsy_false', 'falsy_zero', 'falsy_null'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
@@ -55,6 +55,10 @@ class UnconvertibleModule implements Module {
     if (name === 'cyclic_error') return { success: false, isError: true, error: 'db timeout', data: text('failed'), structured: cyclic };
     // A toJSON that throws a value with no prototype, so String() can't describe it either.
     if (name === 'bare_throw') return { success: true, data: text('bare'), structured: { toJSON() { throw Object.create(null); } } };
+    // Structured views that are values though they're falsy: kept because they're present.
+    if (name === 'falsy_false') return { success: true, data: text('falsy'), structured: false };
+    if (name === 'falsy_zero') return { success: true, data: text('falsy'), structured: 0 };
+    if (name === 'falsy_null') return { success: true, data: text('falsy'), structured: null };
     return { success: true, data: cyclic };
   }
 }
@@ -80,7 +84,7 @@ test("a script reads a structured result whole, the model's calls and history ke
     }
   }));
   if (!wss.address()) await new Promise<void>((resolve) => wss.once('listening', resolve));
-  const dir = mkdtempSync(join(tmpdir(), 'pytc-structured-'));
+  const dir = mkdtempSync(join(tmpdir(), 'script-structured-'));
   const membrane = new MockMembrane();
   let framework: AgentFramework | undefined;
   try {
@@ -101,47 +105,51 @@ test("a script reads a structured result whole, the model's calls and history ke
     assert.deepEqual(direct.structured, envelope);
 
     const code = [
-      'import json',
-      `ENVELOPE = json.loads(${JSON.stringify(JSON.stringify(envelope))})`,
-      `TRANSCRIPT = ${JSON.stringify(transcript)}`,
-      'r = json.loads(await fixture__inspect({"variant": "dual"}))',
-      'assert r == {"content": [{"type": "text", "text": TRANSCRIPT}], "structuredContent": ENVELOPE, "isError": False}, r',
-      'empty = json.loads(await fixture__inspect({"variant": "empty"}))',
-      'assert empty["structuredContent"] == {} and empty["content"] == [{"type": "text", "text": "not the empty object"}], empty',
-      'only = json.loads(await fixture__inspect({"variant": "only"}))',
-      'assert only == {"content": [], "structuredContent": ENVELOPE, "isError": False}, only',
-      // Without structured content, a result is the text it always was.
-      'plain = await fixture__inspect({"variant": "plain"})',
-      'assert plain == json.dumps("plain text"), plain',
-      'absent = await fixture__inspect({"variant": "absent"})',
-      'assert absent == "", absent',
-      'error = json.loads(await fixture__inspect({"variant": "error"}))',
-      'assert error == {"content": [{"type": "text", "text": "run refused"}], "structuredContent": {"state": "rejected"}, "isError": True, "error": "run refused"}, error',
-      // Over the cap, with no workspace to save it to: a failure, never a success missing its result.
-      'large = json.loads(await fixture__inspect({"variant": "large"}))',
-      'assert large["isError"] is True and large["oversized"]["savedTo"] is None and large["oversized"]["chars"] > 5000000, large',
-      'assert "could not be delivered" in large["error"], large',
+      'const check = (ok, what, value) => { if (!ok) throw new Error(what + ": " + JSON.stringify(value).slice(0, 500)); };',
+      'const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);',
+      `const ENVELOPE = ${JSON.stringify(envelope)};`,
+      `const TRANSCRIPT = ${JSON.stringify(transcript)};`,
+      'const r = await tools["fixture--inspect"]({ variant: "dual" });',
+      'check(same(r, { content: [{ type: "text", text: TRANSCRIPT }], structuredContent: ENVELOPE, isError: false }), "dual", r);',
+      'const empty = await tools["fixture--inspect"]({ variant: "empty" });',
+      'check(same(empty.structuredContent, {}) && same(empty.content, [{ type: "text", text: "not the empty object" }]), "empty", empty);',
+      'const only = await tools["fixture--inspect"]({ variant: "only" });',
+      'check(same(only, { content: [], structuredContent: ENVELOPE, isError: false }), "only", only);',
+      // Without structured content, a result is one text block of the
+      // model's text, which for a text result is that text, and no structured view.
+      'const plain = await tools["fixture--inspect"]({ variant: "plain" });',
+      'check(same(plain, { content: [{ type: "text", text: "plain text" }], structuredContent: null, isError: false }), "plain", plain);',
+      'const absent = await tools["fixture--inspect"]({ variant: "absent" });',
+      'check(same(absent, { content: [{ type: "text", text: "" }], structuredContent: null, isError: false }), "absent", absent);',
+      'const error = await tools["fixture--inspect"]({ variant: "error" });',
+      'check(same(error, { content: [{ type: "text", text: "run refused" }], structuredContent: { state: "rejected" }, isError: true }), "error", error);',
+      // Past main's old 5 MB cap: whole, within the script's memory bound.
+      'const large = await tools["fixture--inspect"]({ variant: "large" });',
+      'check(large.isError === false && large.structuredContent.output.length === 5000000, "large", large.isError);',
       // Results JSON can't hold: the dispatch makes each an error naming the
       // tool (a module's result has to be stored), which a script reads as
       // its error text, structured or not.
-      'cyclic = await loop__cyclic({})',
-      'assert cyclic.startswith("Error: Tool \'loop--cyclic\' ") and "circular" in cyclic, cyclic',
-      'bigint = await loop__bigint({})',
-      'assert bigint.startswith("Error: Tool \'loop--bigint\' ") and "BigInt" in bigint, bigint',
-      'cyclic_data = await loop__cyclic_data({})',
-      'assert cyclic_data.startswith("Error: Tool \'loop--cyclic_data\' ") and "circular" in cyclic_data, cyclic_data',
-      'assert all(e.endswith("The call itself completed.") for e in [cyclic, bigint, cyclic_data]), "completed"',
+      'const errorText = async (name) => { const e = await tools[name]({}); check(e.isError === true, name + " is an error", e); return e.content[0].text; };',
+      'const cyclic = await errorText("loop--cyclic");',
+      // The runtime's own words for a cycle: "circular" under Node, "cyclic" under Bun.
+      'check(cyclic.startsWith("Tool \'loop--cyclic\' ") && /circular|cyclic/i.test(cyclic), "cyclic", cyclic);',
+      'const bigint = await errorText("loop--bigint");',
+      'check(bigint.startsWith("Tool \'loop--bigint\' ") && bigint.includes("BigInt"), "bigint", bigint);',
+      'const cyclicData = await errorText("loop--cyclic_data");',
+      'check(cyclicData.startsWith("Tool \'loop--cyclic_data\' ") && /circular|cyclic/i.test(cyclicData), "cyclic_data", cyclicData);',
+      'check([cyclic, bigint, cyclicData].every((e) => e.endsWith("The call itself completed.")), "completed", null);',
       // An error result that can't be converted keeps the tool's own error.
-      'cyclic_error = await loop__cyclic_error({})',
-      'assert cyclic_error.endswith("The call itself completed, with this error: db timeout"), cyclic_error',
-      'bare_throw = await loop__bare_throw({})',
-      'assert "(a value with no text form)" in bare_throw, bare_throw',
-      'print(r["structuredContent"]["runId"], r["structuredContent"]["state"], r["structuredContent"]["output"])',
+      'const cyclicError = await errorText("loop--cyclic_error");',
+      'check(cyclicError.endsWith("The call itself completed, with this error: db timeout"), "cyclic_error", cyclicError);',
+      'const bareThrow = await errorText("loop--bare_throw");',
+      'check(bareThrow.includes("(a value with no text form)"), "bare_throw", bareThrow);',
+      'for (const [name, value] of [["loop--falsy_false", false], ["loop--falsy_zero", 0], ["loop--falsy_null", null]]) { const f = await tools[name]({}); check(f.structuredContent === value && f.content.length === 1 && f.isError === false, name, f); }',
+      'text(r.structuredContent.runId + " " + r.structuredContent.state + " " + r.structuredContent.output);',
     ].join('\n');
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'model-direct', name: 'fixture--inspect', input: { variant: 'dual' } },
       { type: 'tool_use', id: 'model-only', name: 'fixture--inspect', input: { variant: 'only' } },
-      { type: 'tool_use', id: 'model-python', name: 'code_execution', input: { code } },
+      { type: 'tool_use', id: 'model-script', name: 'code_execution', input: { code } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([]));
     const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Inspect work.', allowedTools: 'all' });
@@ -152,12 +160,11 @@ test("a script reads a structured result whole, the model's calls and history ke
     const resultOf = (id: string) => results.find((r) => r.toolUseId === id)!.content;
     // The model reads the content: the text when there is some, and the
     // structured JSON only when the content has none.
-    assert.equal(resultOf('model-direct'), JSON.stringify(transcript));
-    assert.match(resultOf('model-only'), /\\"runId\\":\\"r41\\"/);
-    const python = JSON.parse(resultOf('model-python'));
-    assert.equal(python.stderr, '');
-    assert.equal(python.return_code, 0);
-    assert.equal(python.stdout.trim(), 'r41 running café 🌱');
+    assert.equal(resultOf('model-direct'), transcript);
+    assert.match(resultOf('model-only'), /"runId":"r41"/);
+    const script = resultOf('model-script');
+    assert.match(script, /^Script s\d+-[0-9a-z]{4} finished\./, script);
+    assert.ok(script.endsWith('Its output:\nr41 running café 🌱\n'), script);
     assert.deepEqual(calls, ['dual', 'dual', 'only', 'dual', 'empty', 'only', 'plain', 'absent', 'error', 'large']);
 
     // The stored history holds what the model read: the readable direct
@@ -168,9 +175,9 @@ test("a script reads a structured result whole, the model's calls and history ke
     const storedOf = (id: string) => JSON.stringify(stored.find((b) => b.toolUseId === id)!.content);
     assert.ok(storedOf('model-direct').includes('Readable transcript'));
     assert.ok(!storedOf('model-direct').includes('nextCursor'));
-    assert.ok(!storedOf('model-python').includes('nextCursor'));
-    assert.ok(!storedOf('model-python').includes('short rendering'));
-    assert.ok(!storedOf('model-python').includes('structuredContent'));
+    assert.ok(!storedOf('model-script').includes('nextCursor'));
+    assert.ok(!storedOf('model-script').includes('short rendering'));
+    assert.ok(!storedOf('model-script').includes('structuredContent'));
   } finally {
     await framework?.stop();
     for (const client of wss.clients) client.terminate();

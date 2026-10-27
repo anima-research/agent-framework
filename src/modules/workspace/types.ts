@@ -17,6 +17,73 @@ export interface MountConfig {
   /** Access mode */
   mode: 'read-write' | 'read-only';
   /**
+   * Where the mount's tools get what they read (default: 'chronicle').
+   * - 'chronicle': the workspace keeps the mount's files in its store, where
+   *   writes and edits land first, and takes in disk's changes under the
+   *   three-way rule as `read`, listings, searches, syncs and scans reach
+   *   them. Its tools read the store's copy.
+   * - 'direct': for a checkout, such as a git one, whose history is its
+   *   own. Every read, listing and search is disk's own copy as it is when
+   *   it runs, and none of its files go into the store. No scan or watcher
+   *   runs, so no call waits behind one, and `sync`, `materialize` and the
+   *   watch settings have nothing to act on. Not with `watch` other than
+   *   'never', `watchDebounceMs`, `watchRootPollMs`, a `wakeOnChange` that
+   *   would wake (true, or a non-empty list) or `autoMaterialize: true`:
+   *   each of those would never act, and the workspace refuses the mount.
+   *   Writable, as any mount with no `mode` is, its `write`, `edit`,
+   *   `edit_many` and `delete` land on disk when they answer, or don't
+   *   happen: a file is staged beside itself in `.workspace-staged-<id>` and
+   *   renamed over itself, keeping its mode, so no reader sees half of it;
+   *   an edit is applied to disk's text as it is now, and again on top of a
+   *   change another writer makes meanwhile; and `edit_many` checks every
+   *   edit before writing its files one by one, naming each file's outcome
+   *   if a write fails partway. A file with other hard links gets a file of
+   *   its own at its path, and the others keep the old text; a file this
+   *   process may not write is refused. Nothing is synced, so a power loss
+   *   can lose a write its answer called landed. An undo or other move of
+   *   the store's head leaves the files as they are, and at the agent's next
+   *   start the framework tells it once that writes from turns its history
+   *   no longer holds are still on disk. Where each agent's latest write
+   *   lies is saved at a clean stop, in a record no branch switch rewinds,
+   *   so a restart on another branch still tells it, and after a crash a
+   *   move away from the writes since then isn't told. The framework's own
+   *   files, its
+   *   tool-result spills, saved payloads and fetched references, never go to
+   *   a mount configured direct. Its `ignore`
+   *   has a default (see there). Paths, links, its `include`, other mounts'
+   *   directories, size limits and the walk cap hold as on a 'chronicle'
+   *   mount. Its tools read and write beneath whatever directory is at its
+   *   root when each call starts, with no check against the one a
+   *   'chronicle' run of it last agreed with, so a root repointed through a
+   *   link is read and written where it leads now. Where that root now lies
+   *   elsewhere than the last start placed it, each call nests in it, as a
+   *   start would now, every mount
+   *   configured on or beneath its path, where that path leads beneath its root,
+   *   and every other mount whose root, as that start placed it, lies
+   *   beneath where its root lies now, or whose configured path lies
+   *   beneath a directory that start found there. A mount configured
+   *   elsewhere whose own root has moved since, and the other mounts' own
+   *   placements, wait for the next start, so a direct root moved into
+   *   another mount's directory is still that mount's too.
+   *
+   * A mount configured 'direct' runs as 'chronicle' from a start that finds
+   * the store holding changes there that disk lacks, on the branch selected
+   * then: a draft, a workspace deletion or a conflict, as `status` counts
+   * them pending, or an intent the workspace can't read, which may hold one
+   * of those. They stay in view, and the workspace says so on stderr and
+   * through the framework's ops alerts, naming them and the ways to start it
+   * direct. Until a start finds none held, it takes no writes, edits or
+   * deletions, so what's held only shrinks: a `sync` of a held path takes
+   * disk's copy, and a `materialize` naming the mount writes the store's.
+   * It runs unwatched, and walks by the direct kind's default
+   * ignore list where its config names none; `ls` without a path, and
+   * `status`, give its `backend` as 'chronicle' and that list. A mount that
+   * ran direct and runs as 'chronicle' again takes in what disk changed
+   * meanwhile as its listings, searches and syncs reach it, as an unwatched
+   * 'chronicle' mount does after any time away.
+   */
+  backend?: 'chronicle' | 'direct';
+  /**
    * Watch mode for filesystem changes:
    * - 'always': chokidar watches continuously; each event re-observes its paths
    * - 'on-agent-action': after each completed agent tool batch, the mount is
@@ -25,8 +92,8 @@ export interface MountConfig {
    *   the round goes on. Each scan walks from the mount's start, so on a
    *   mount over its `walkCap` it covers the first `walkCap` entries every
    *   time, and files past them come in as `walkCap` describes
-   * - 'never': no background reads; listings and lazy reads still observe
-   *   the paths they show
+   * - 'never': no background reads; listings still observe the paths they
+   *   show, and a read observes a path the store doesn't hold
    */
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
@@ -34,26 +101,219 @@ export interface MountConfig {
   /** Poll interval in ms for checking watched root identity changes (default: 2000) */
   watchRootPollMs?: number;
   /**
-   * Simple ignore patterns (NOT full gitignore syntax). Supported forms:
-   * - Exact name match: ".git", "node_modules"
-   * - Directory glob: "node_modules/**" (anything under node_modules)
-   * - Extension glob: "*.pyc" (any file ending in .pyc)
+   * Patterns in these of gitignore's forms, each covering the files
+   * gitignore's reading of it covers, with three differences: names compare
+   * exactly, as git's do with `core.ignorecase` off (its default folds case
+   * on macOS and Windows); "?" matches one character where git's matches
+   * one byte, so the two differ on names outside ASCII; and on a mount that
+   * follows links, a link to a directory counts as a directory, where git
+   * reads every link as a file:
+   * - A name, matched at any depth: ".git", "node_modules". Within a name,
+   *   "*" matches any run of characters and "?" any one: "*.pyc",
+   *   "npm-debug.log*".
+   * - A trailing "/" matches only a directory: "build/" covers every
+   *   directory named build, with what lies beneath it, and no file of that
+   *   name.
+   * - A leading or inner "/" makes a path from the mount's root: "/dist"
+   *   covers only the root's dist, and "a/b" only the root's a/b.
+   * - "**" as the first segment, before one name, matches that name at any
+   *   depth, as the name alone does; with a trailing "/**" as well, it reads
+   *   as the name with a trailing "/".
+   * - A trailing "/**" covers a directory from the root and what lies
+   *   beneath it: "node_modules/**" covers only the root's node_modules, and
+   *   no file of that name.
+   * The module refuses, when it's built, a pattern of any other form, such as
+   * a leading "!" or "#", a "[", a "\", a trailing space, "**" anywhere
+   * else, or an empty, "." or ".." segment, naming the pattern and why. A
+   * "?" can stand for a "[" or "\" in a name.
+   *
    * A sync without a path and the watcher pass over what the list covers,
    * and over entries with an editor's swap or backup file name whatever it
    * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
    * (the whole name), and names ending in `~` or in `.subl…tmp`, matched by
    * `^\..+\.sw[px]$`, `~$` and `\.subl.*\.tmp$`.
+   *
+   * A mount configured direct (`backend`) whose config names no list takes
+   * `node_modules`, `dist`, `.git`, `build`, `coverage`, `target`,
+   * `__pycache__` and `.venv`, each matching that name at any depth,
+   * whichever kind it runs as. A direct mount's walks of the whole mount,
+   * and of any path no pattern covers, pass over what the list covers. A
+   * listing, glob or grep whose path, or whose pattern's directory, the
+   * list covers is walked all the same, the patterns covering it set aside
+   * and the rest applying beneath it, as a sync that names a path walks it
+   * on a 'chronicle' mount.
    */
   ignore?: string[];
+  /**
+   * The files this mount holds, when it holds only some of what is under its
+   * path: patterns in `ignore`'s forms, read for files, and a `[` read as
+   * itself, so `[id].tsx` names that file. A pattern that matches
+   * only directories, with a trailing `/` or `/**`, covers what lies beneath a
+   * directory it matches: `fixtures/` every file beneath a directory named
+   * fixtures, at any depth, and `docs/**` or `/docs/` every file beneath the
+   * root's docs. Any other pattern covers a file by its own name, at any
+   * depth, or by its path from the root (`/gate.json`, `src/*.ts`). Unlike
+   * `ignore`, such a pattern covers nothing beneath a directory it matches,
+   * since each file is covered by its own name or path: `["gate.json"]` holds
+   * every file named `gate.json`, and no other file beneath a directory of
+   * that name.
+   *
+   * It's the mount's boundary for content: no workspace path reads, stores,
+   * serves or writes back a file it doesn't cover, and no tool lists,
+   * matches or names one, beyond echoing a path it was given, which it may
+   * spell as disk does. A walk passes over one and counts it under
+   * `passedOver`, and passes over a link its names don't cover with the
+   * reason a mount without an include gives a link it doesn't enter, "a
+   * symlink, not walked", where the link leads to a directory, and wherever
+   * it leads on a mount that doesn't follow links. No pass decides a change
+   * the watcher reports there, and a materialize doesn't write it back even
+   * when the workspace's history holds it. A materialize that names a
+   * directory inside the mount counts each such entry beneath it under
+   * `passedOver`,
+   * with the reason and without its path, a deletion or conflict held there
+   * included; one of the whole mount takes none of them up. The file
+   * operations (read, write, edit, delete, and the module's binary and disk
+   * reads and writes) refuse a path it doesn't cover as outside the mount's
+   * include, a directory's included, and `resolveAbsolutePath` returns null
+   * for one; the mount's root is inside. Whether a name is taken isn't
+   * withheld: a refusal may show that something occupies a path the caller
+   * named. On a mount that follows links, a path is judged where it lands as
+   * well as where it's named, as disk spells it there: a covered path that
+   * reaches a file the include doesn't cover, through a link at the path or
+   * on its way, is refused as one that leaves the mount (the file operations
+   * refuse it before anything is stored), and a listing from where a link
+   * leads passes over such a file. A covered path whose landing realpath
+   * can't resolve, as for a loop or a directory this process can't search,
+   * is refused too, by every file operation, a delete included, since
+   * where it lands can't be judged.
+   *
+   * A sync, materialize, grep, glob or ls that names a path the include
+   * doesn't cover takes it as a directory, its scope, exactly where a listing
+   * names one: where disk has a directory reached from the mount's root
+   * through directories, with no link among them, or the workspace's history
+   * holds an entry beneath it that the include covers, and that a nested
+   * mount's include covers too where it lies in that mount's directory. A
+   * directory `ignore` covers is a scope too when it's named, though a
+   * listing passes over it. Each refuses any other path the include doesn't
+   * cover. A covered path is a file to a sync, materialize or grep when disk
+   * or history has a file there, and otherwise a directory; a glob takes its
+   * path as a directory. Beneath a directory, each passes over what the
+   * include doesn't cover, and a listing that isn't recursive names each
+   * directory directly beneath its path that disk has, and each that a
+   * covered entry in history implies, with only the files the include
+   * covers. A mount running direct has no history (`backend`), so there
+   * disk alone decides each of these. `ignore` still applies to what
+   * `include` covers.
+   *
+   * On a disk that folds names, the parse reads a path in disk's spelling,
+   * as the walk names what it lists, so a covered name whose file disk
+   * spells otherwise is outside the mount, and the include's refusal shows
+   * the path as given. A path that names one of the workspace's entries
+   * exactly, or does once its directories take disk's spelling, keeps the
+   * entry's spelling, as the parse gives it, and what lies past a link on
+   * the way keeps the caller's spelling, since the parse reads nothing past
+   * a link. Other answers name a path as the parse spells it, a name the
+   * include leaves out included, since how disk spells a name the caller
+   * gave is no content of that file. Where a
+   * followed path lands is judged as disk spells it there, and a path that
+   * meets no link where the parse names it.
+   * `resolveAbsolutePath`, which is synchronous, judges the include on the
+   * path as given and follows no link: on such a disk it returns the path to
+   * a covered name's file that disk spells otherwise, and null for a covered
+   * file named in another case.
+   *
+   * A path in a nested mount's directory is that mount's, whatever this
+   * include covers: every tool gives the answer that names the mount holding
+   * it and the path to use there. Through a link a mount follows, a place in
+   * that directory is named only where it's a directory, or a file covered,
+   * with no file on its way, by that mount's own include and by the include
+   * of each other nested mount whose directory may hold it, from the
+   * innermost out to the first that surely holds it, and is otherwise
+   * refused as leaving the mount. A listing, or a pass, names a file there
+   * only where those includes cover it. On a mount that doesn't follow
+   * links, a link on a path's way is refused, as on any such mount
+   * (followSymlinks).
+   * Every check compares a path with a nested mount's directory level by
+   * level, as any disk may compare names: in either Unicode normalization
+   * form and in any case, as fully as a disk that folds names may compare
+   * them, at every level, whatever the disk does there, and reading nothing
+   * from the disk to do so. Start places each root the same way, so a mount
+   * configured through a link, or in a spelling, other than disk's is found
+   * nested. So a path, a walk or the workspace's history that names the
+   * directory in any spelling a disk may take for it reaches that mount,
+   * whether or not the directory is on disk yet, and so does a link whose
+   * target spells it otherwise. Where a link leads into the directory, the
+   * place beneath it is judged, and named, as disk spells it. A path that names the directory itself keeps what lies
+   * beneath as given, since that is the nested mount's to name. Where a disk
+   * keeps apart two names the comparison joins, it errs toward the nested
+   * mount, in where start places a mount as in every check: a name in
+   * another case, on a disk that tells case apart; a name in the other
+   * normalization form, on a disk that keeps the forms apart; and a name the
+   * comparison folds with it that a disk keeps apart, such as `ss` beside a
+   * nested `ß`, or one that differs from it only by a default-ignorable code
+   * point, such as a soft hyphen, on a disk that keeps those. Such a
+   * directory, or file, is no mount's, and every tool that names it is
+   * refused as a path that may lie in the nested mount, with the two
+   * spellings the workspace can't tell apart, and, for a link, where it
+   * leads, when that lies in this mount. The answer gives a step for each
+   * thing the caller may have meant: that mount's path to use; for a new
+   * file of this mount's, a path outside both spellings; and for one already
+   * there, whoever runs the workspace renaming one of the two spellings.
+   * Where start placed the nested mount only by a guess, comparing the real
+   * roots, as for two mounts' roots configured in spellings it can't tell
+   * apart, a path there is a guess too, however exactly it matches, and the
+   * answer names that directory as the path spells it, with the nested
+   * directory's spelling only in the step for a new file, names no host
+   * path, and asks for the configuration to be checked. Three cases fall
+   * outside this, as for any nested mount, and a fourth on a direct one: on a
+   * disk whose folding goes past the comparison's, which joins names that
+   * differ only by default-ignorable code points, in normalization form or in
+   * case, in full case folding, as Linux's casefold does, a name the
+   * comparison keeps apart can reach the directory; a second path to the
+   * directory that isn't a link, such as a bind mount, isn't found to lead
+   * there, though a walk passes over it, knowing each nested root by which
+   * directory it is; a nested mount whose root moves while running, as
+   * `acceptRoot` takes, stays placed where it was until the next start, but
+   * for the calls of a direct mount whose root has moved and on or beneath
+   * whose path it's configured, which place it where it lies; and where a
+   * direct mount's root is repointed between a read's parse and its open, or
+   * a write's parse and its staging, a race left to whoever writes the disk,
+   * a mount nested in it by its directories alone, since its real root holds
+   * that root, can have the read serve a path in its directory, or the write
+   * land there.
+   *
+   * Text the host registers for a path (`registerGeneratedTextFile`) is
+   * served there whatever the include says, since it isn't one of the
+   * mount's files: it's matched by the path a spelling resolves to, before
+   * anything else checks the path, so every spelling that resolves to its
+   * registered path reads it, and none writes it. On a disk that folds names,
+   * a spelling in another case isn't its path, and reaches whatever file disk
+   * has there. The framework keeps its own files (`tool-results/`, `refs/`)
+   * only in a writable mount without an include, and what it kept in a mount
+   * before the mount had one is outside the mount once it has one, unless the
+   * include covers it.
+   *
+   * Left out, the mount holds everything under its path. Given, it's a list
+   * of at least one pattern, and the module refuses one `ignore` would
+   * refuse but for a `[`.
+   */
+  include?: string[];
   /**
    * Whether to follow symlinks (default: false). Without it, no symlink on a
    * path is followed: not one at the path itself, and not one among the
    * directories on its way beneath the mount's root, wherever it leads. A path
    * with a symlink among its directories is refused naming the link, and for
-   * a link inside the mount, its target. A mount root that is
-   * itself a symlink is still the root. With it, a symlink on a path is
-   * followed while what it reaches stays inside the mount. Either way, a
-   * listing or a sync's walk descends into no symlinked directory.
+   * a link inside the mount, its target where a tool could name it: a
+   * directory, or a file the include of the mount it lies in covers, where
+   * that mount has one. On a mount with an include, a link the include
+   * doesn't cover is outside the mount itself, and its refusal tells nothing
+   * of where it leads. A mount root that is itself a symlink is still the
+   * root. With it, a symlink on a path is followed while what it reaches
+   * stays inside the mount, which on a mount with an include means a
+   * directory or a file the include covers. Either way, a listing or a
+   * sync's walk descends
+   * into no symlinked directory beneath its scope; with it, a scope named
+   * through a link is listed from where the link leads.
    */
   followSymlinks?: boolean;
   /** Maximum file size in bytes (default: 5MB) */
@@ -75,8 +335,12 @@ export interface MountConfig {
    * `glob`, `grep`) take up to it from their scope's start every time:
    * `glob`'s is the directory its pattern's segments before the first
    * wildcard name beneath its `path`, and `grep`'s the deeper of its `path`
-   * and its `glob` filter's directory, as far as disk lists each segment
-   * with that spelling as a directory, not a link. Each directory's listing
+   * and its `glob` filter's directory. For a pattern or filter whose first
+   * segment names the mount, either tool starts at the deeper of its `path`
+   * and the directory the rest names from the mount's root, and walks
+   * nothing where neither holds the other. Either way, the walk descends as
+   * far as disk lists each segment with that spelling as a directory, not a
+   * link. Each directory's listing
    * is read whole, so a deletion is seen wherever the walk lists, whatever
    * it took.
    *
@@ -102,7 +366,8 @@ export interface MountConfig {
   /**
    * If true, writes/edits/deletes via the module's tools materialize to the
    * filesystem immediately (not just into Chronicle tree state). Required for
-   * any mount shared across agents as a communication channel — without it,
+   * any store-backed mount shared across agents as a communication channel (a
+   * direct mount's writes reach disk without it, and it's refused there) — without it,
    * another agent's watcher on the same directory sees nothing. The watcher
    * suppresses its own echoes, so this doesn't cause self-wake loops.
    */
@@ -148,6 +413,13 @@ export interface WorkspaceConfig {
 export interface MountState {
   /** The mount config */
   config: MountConfig;
+  /**
+   * Whether the mount runs direct (`MountConfig.backend`), as the workspace
+   * decides when initStore gives the store and again at each start: a mount
+   * configured direct runs as 'chronicle' while the store holds changes
+   * there that disk lacks.
+   */
+  direct: boolean;
   /** Tree state ID in Chronicle */
   treeStateId: string;
   /** Branch-local intent (tombstones, store origin, conflicts) for this mount's paths */
@@ -255,6 +527,20 @@ export interface EditInput {
   newString: string;
   /** Replace all occurrences (default: false) */
   replaceAll?: boolean;
+}
+
+export interface EditManyInput {
+  /** The edits, each matched in its file as the call reads it, all in one mount's files. */
+  edits: Array<{
+    /** File path (mount-prefixed) */
+    path: string;
+    /** Exact text to replace */
+    oldString: string;
+    /** Text to replace it with */
+    newString: string;
+    /** How many times oldString occurs in the file (default: 1); every one is replaced. */
+    occurrences?: number;
+  }>;
 }
 
 export interface DeleteInput {

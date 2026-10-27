@@ -21,6 +21,10 @@
  * key: `eventId` is present only when the producer supplied one.
  */
 
+import { createHash } from 'node:crypto';
+import { blockAsStored, MalformedContentError } from '@animalabs/context-manager';
+import { logDetail, logValue } from './log-value.js';
+
 /** The MCPL admission lane that accepted an item. Its contract decides what
  *  an `eventId` is worth: `push/event` deduplicates by eventId, and RFC-006
  *  coalesced admission (`coalesced: true`) guarantees stable retries and
@@ -153,4 +157,104 @@ export function conversationKey(source: InboundSource): string | undefined {
   }
   if (source.kind === 'surface') return JSON.stringify(['surface', source.surface]);
   return undefined;
+}
+
+/**
+ * JSON with object keys sorted at every level, written as the store's append
+ * keeps a value (its native UTF-8 write, which the real-store digest table
+ * checks): an `undefined` object entry is dropped; a string is well-formed
+ * (each lone surrogate comes back as U+FFFD); and an entry whose key isn't
+ * well-formed is dropped (the store doesn't keep it). An `undefined` array
+ * element is written as `null`, as JSON writes it: the store's append
+ * refuses a body holding one, so no stored copy does. So a value
+ * hashes alike however its keys were ordered (content read back from the
+ * store has them in a different order than it was written), and alike
+ * before and after the store. editMessage writes JSON instead, so an edited
+ * copy can keep what an append wouldn't; it has changed anyway.
+ *
+ * It expects JSON-shaped values, as the MCPL lanes deliver them (parsed from
+ * JSON). Any other object is written by its own enumerable entries, unlike
+ * JSON.stringify: a Date becomes `{}`, as the store's own write keeps it, but
+ * a deferred write recovered from its JSON file brings it back as a string.
+ *
+ * sourceBodyDigest's serializer, kept out of the package API: serialization
+ * and framing both stay inside sourceBodyDigest, so consumers don't
+ * duplicate either (`canonicalJson(blocks)` alone hashes differently).
+ */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([k, v]) => v !== undefined && k.isWellFormed())
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
+  }
+  if (typeof value === 'string') return JSON.stringify(value.toWellFormed());
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * blockAsStored throws a `MalformedContentError` for a block the store
+ * refuses on write, a caller-supplied `blob_ref` among them. Such a block
+ * has no stored form, and whatever is thrown, it is digested as given.
+ */
+function storedBlock(block: unknown): unknown {
+  try {
+    return blockAsStored(block as Parameters<typeof blockAsStored>[0]);
+  } catch (err) {
+    if (!(err instanceof MalformedContentError)) {
+      const { name, message } = (err ?? {}) as { name?: unknown; message?: unknown };
+      console.error(
+        `[stored-digest-as-given] error=${logValue(typeof name === 'string' ? name : typeof err)}: ` +
+        logDetail(typeof message === 'string' ? message : ''),
+      );
+    }
+    return block;
+  }
+}
+
+/**
+ * The version identity of a delivered body (agreed with the receipts lane,
+ * room-220 #46752–#47210): SHA-256 hex of `canonicalJson([blocks])` over the
+ * ContentBlock[] the framework stores for the body — after MCPL conversion,
+ * before any host decoration is added and before storage shards it — with
+ * each block as the store keeps it, which context-manager's `blockAsStored`
+ * gives. So a body hashes alike as delivered, as handed to storage, and as
+ * read back unsharded from the store with its blobs resolved, except one
+ * whose blocks the store changes together: when it mends a `tool_use` whose
+ * input isn't an object, it also releases a raw replay form (`rawXml`,
+ * `rawItem`) that the message's other blocks share, which no one block's
+ * stored form shows. A body an MCPL lane stamps is never one. A block the
+ * store refuses on write, a `blob_ref` among them, is digested as given. The
+ * one-element array keeps the framing an undecorated, unsharded stored copy
+ * has always hashed to, so a stamped copy and an older copy of the same body
+ * share a version where the store keeps the body as it did then.
+ *
+ * A digest is a digest under the context-manager release that computed it: a
+ * release that changes what the store keeps, such as its set of image
+ * signatures, changes the digest of a body it touches.
+ *
+ * Ingestion stamps it as `metadata.sourceBodyDigest`, and the same function
+ * over exactly the blocks handed to storage (decorations included) as
+ * `metadata.storedBodyDigest`, on both MCPL lanes. Both live outside the
+ * frozen admission envelope: they describe the body actually delivered (a
+ * materialization, a correction), not the admission. Neither proves later
+ * presence or completeness. An unsharded stored copy that no longer hashes
+ * to its storedBodyDigest was changed after delivery (editMessage keeps
+ * metadata), or holds blocks the store changes together, or its digest was
+ * taken under a release that kept some block of it differently: a
+ * context-manager release that changed a stored form, or an agent-framework
+ * release from 0.24.0 up to the one that brought in blockAsStored, which
+ * took stored forms from a copy of the store's transform. Digests already
+ * stamped are never recomputed. A body the store shards carries the whole
+ * body's two digests on every shard, and no shard hashes to them. Check a
+ * copy read back with its blobs resolved (getAllMessages, getMessage, or
+ * getMessageWindow without `resolveBlobs: false`): a blob reference never
+ * matches.
+ *
+ * Exported from the package root, so a consumer checks a copy against either
+ * field with this same function rather than a copy of it.
+ */
+export function sourceBodyDigest(blocks: readonly unknown[]): string {
+  return createHash('sha256').update(canonicalJson([blocks.map(storedBlock)])).digest('hex');
 }

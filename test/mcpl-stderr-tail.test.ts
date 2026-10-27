@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 
 import { STDERR_TAIL_CHARS, StdioTransport } from '../src/mcpl/transport.js';
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplServerConnection, McplUnreapedLaunchError, stderrTailOf, withStderr } from '../src/mcpl/server-connection.js';
 import { AgentFramework } from '../src/framework.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -189,16 +189,17 @@ test("a connect and a reconnect that fail their handshakes report the server's s
   connection.ready();
   const failure = 'MCPL server "needs-token" transport closed before handshake completed (child process exited)';
   // The log lines are records, so the server's credentials are redacted
-  // there; the event carries the tail as the server wrote it.
+  // there, and the event carries the failed connect's tail, redacted as the
+  // host gets it on the error.
   const stderr = '. The last of its stderr:\n  stderr: "fatal: DISCORD_TOKEN redacted was refused"';
   const first = await within(connectFailed, null);
   assert.ok(first, 'the first connect failed and was reported within 15 s');
-  assert.deepEqual(first, { error: failure, stderrTail: 'fatal: DISCORD_TOKEN tok-0123456789abcdef was refused', attempt: 0 });
+  assert.deepEqual(first, { error: failure, stderrTail: 'fatal: DISCORD_TOKEN redacted was refused', attempt: 0 });
   assert.ok(logged.includes(`MCPL server "needs-token" initial connect failed, will retry: ${failure}${stderr}`), logged.join('\n'));
   const event = await within(reconnectFailed, null);
   assert.ok(event, 'a reconnect attempt failed within 15 s');
   assert.equal(event.error, failure);
-  assert.equal(event.stderrTail, 'fatal: DISCORD_TOKEN tok-0123456789abcdef was refused');
+  assert.equal(event.stderrTail, 'fatal: DISCORD_TOKEN redacted was refused');
   assert.ok(logged.includes(`MCPL server "needs-token" reconnect failed: ${failure}${stderr}`), logged.join('\n'));
 });
 
@@ -287,6 +288,98 @@ test("at startup, a failed connect's trace and log line carry the server's stder
     rmSync(dir, { recursive: true, force: true });
   });
   const failed = traces.find((event) => event.type === 'mcpl:server-connect-failed');
+  assert.equal(failed?.stderrTail, 'fatal: DISCORD_TOKEN redacted was refused');
+  assert.ok(
+    logged.some((line) => line.startsWith('Failed to connect MCPL server "needs-token"') && line.endsWith('stderr: "fatal: DISCORD_TOKEN redacted was refused"')),
+    logged.join('\n'),
+  );
+  assert.ok(!logged.join('\n').includes('tok-0123456789abcdef'));
+});
+
+test("a failed connect's stderr tail is found under the errors that wrap it, the nearest first, and a cause chain that loops ends", () => {
+  const handshake = Object.assign(new Error('MCPL server "w" initialize handshake timed out'), { stderrTail: 'waiting for DISCORD_TOKEN' });
+  const unreaped = new McplUnreapedLaunchError({ close: async () => {} }, handshake, new Error('it could not be reaped'));
+  const refused = new Error(`${unreaped.message}. MCP server "w" stays registered, closed, until its exit is confirmed`, { cause: unreaped });
+  assert.equal(stderrTailOf(unreaped), 'waiting for DISCORD_TOKEN');
+  assert.equal(stderrTailOf(refused), 'waiting for DISCORD_TOKEN');
+  assert.match(withStderr(refused, (text) => text), /^\. The last of its stderr:\n {2}stderr: "waiting for DISCORD_TOKEN"$/);
+  // Three causes down, as when a disconnect ended the connect: the
+  // framework's refusal over the ended one over the unreaped launch's error.
+  const ended = new Error('MCP server "w" was not connected: it was disconnected while connecting', { cause: unreaped });
+  assert.equal(stderrTailOf(new Error('stays registered', { cause: ended })), 'waiting for DISCORD_TOKEN');
+  // An error's own tail comes before one further down.
+  assert.equal(stderrTailOf(Object.assign(new Error('outer', { cause: handshake }), { stderrTail: 'its own' })), 'its own');
+  // A chain that ends with no tail anywhere has none.
+  assert.equal(stderrTailOf(new Error('outer', { cause: new Error('inner') })), undefined);
+  // A chain that loops, with no tail in it, ends with none. Its links count
+  // the reads of their cause, so a walk with no bound fails here rather
+  // than hanging the file.
+  let reads = 0;
+  const first = new Error('first');
+  const second = new Error('second');
+  for (const [error, next] of [[first, second], [second, first]] as const) {
+    Object.defineProperty(error, 'cause', {
+      get() {
+        if (++reads > 100) throw new Error('the walk did not stop');
+        return next;
+      },
+    });
+  }
+  assert.equal(stderrTailOf(first), undefined);
+});
+
+test("at startup, a failed connect whose launch can't be reaped still traces and logs the server's stderr, redacted", { timeout: 30_000 }, async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  // The cleanup's signals don't reach the child, so its exit can't be
+  // confirmed, and its pipe fails once it has said why on stderr, while it
+  // still runs.
+  const realSpawn = StdioTransport.spawn;
+  const stuck: Array<() => Promise<void>> = [];
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (c) => {
+    const transport = await realSpawn.call(StdioTransport, c);
+    const child = (transport as unknown as { child: ChildProcess }).child;
+    const realKill = child.kill.bind(child);
+    child.kill = () => true;
+    const exited = new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+      else child.once('exit', () => resolve());
+    });
+    stuck.push(() => { realKill('SIGKILL'); return exited; });
+    transport.once('stderr', () => setImmediate(() => transport.emit('error', new Error('read EPIPE'))));
+    return transport;
+  };
+  const dir = mkdtempSync(join(tmpdir(), 'mcpl-stderr-tail-'));
+  const traces: Array<Record<string, unknown>> = [];
+  let framework: AgentFramework | undefined;
+  t.after(async () => {
+    (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn;
+    // Each child really ends now, so stop() confirms its exit.
+    await Promise.all(stuck.map((kill) => kill()));
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }],
+    modules: [{
+      name: 'watcher',
+      async start(ctx: { onTrace(listener: (event: unknown) => void): void }) { ctx.onTrace((event) => traces.push(event as never)); },
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: false }; },
+      async onProcess() { return {}; },
+    } as never],
+    mcplServers: [{
+      id: 'needs-token',
+      command: process.execPath,
+      args: ['-e', "console.error('fatal: DISCORD_TOKEN ' + process.env.DISCORD_TOKEN + ' was refused'); setInterval(() => {}, 1 << 30)"],
+      env: { DISCORD_TOKEN: 'tok-0123456789abcdef' },
+    }],
+  });
+  const failed = traces.find((event) => event.type === 'mcpl:server-connect-failed');
+  assert.match(String(failed?.error), /its cleanup also failed: .*could not be reaped/);
   assert.equal(failed?.stderrTail, 'fatal: DISCORD_TOKEN redacted was refused');
   assert.ok(
     logged.some((line) => line.startsWith('Failed to connect MCPL server "needs-token"') && line.endsWith('stderr: "fatal: DISCORD_TOKEN redacted was refused"')),

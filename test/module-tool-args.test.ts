@@ -162,6 +162,8 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
     await withFramework(async (framework, probe) => {
       const result = await call(framework, {});
       assert.equal(result.isError, true);
+      // Checked once the call has opened: a failure that says nothing was done, not a refusal.
+      assert.equal(result.refused, undefined);
       assert.equal(result.error, 'Nothing was done: probe--echo needs "path" (a string), and this call gave none.');
       assert.equal(probe.calls.length, 0, 'the handler never saw the call');
     });

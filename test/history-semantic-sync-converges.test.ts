@@ -9,8 +9,9 @@ import type { ContentBlock } from '@animalabs/membrane';
  * The incremental sync must CONVERGE: repeated bounded ticks over a store
  * denser than the tick budget end with every message indexed.
  *
- * Each tick re-walks the overlap window behind the service's watermark
- * (messages stamped slightly out of order are picked up that way; the
+ * Each tick re-walks the overlap window behind the message watermark, the
+ * branch's message cursor or, without one, the service's (messages stamped
+ * slightly out of order are picked up that way; the
  * service dedups the re-sends). Those re-sends are free for the service but
  * they were not free for the tick's item budget: when the overlap window
  * held more indexable messages than the budget, every tick spent the whole

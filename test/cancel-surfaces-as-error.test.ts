@@ -518,8 +518,8 @@ async function toolTurn(tool: 'end' | 'fetch', reports: CancelReport) {
   // turn's end writes its delivery receipt. Everything else the framework
   // asks of the registry is a no-op.
   const channels: Record<string, unknown> = {
-    resolveLocus: () => 'chan-live',
-    routeSpeech: async (_agent: string, _text: string, locus?: string | null) => (locus ? { delivered: true, channelId: locus } : null),
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'chan-live' }),
+    routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) => (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
     getDescriptor: () => undefined,

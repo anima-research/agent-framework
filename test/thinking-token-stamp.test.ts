@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
+import { AnthropicAdapter, Membrane, NativeFormatter } from '@animalabs/membrane';
 import type {
   Module,
   ModuleContext,
@@ -26,7 +27,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { stampThinkingTokenEstimates } from '../src/thinking-token-stamp.js';
+import { stampThinkingTokenEstimates, withoutTokenEstimates } from '../src/thinking-token-stamp.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const SIG_A = 'A'.repeat(4_000);
@@ -146,6 +147,139 @@ describe('thinking token stamp through the stream loop', () => {
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('withoutTokenEstimates (pure)', () => {
+  it('drops the stamp from each top-level block, copying only what held one', () => {
+    const thinking = { type: 'thinking', thinking: '', signature: SIG_A, tokenEstimate: 7 } as ContentBlock;
+    const redacted = { type: 'redacted_thinking', data: 'R', tokenEstimate: 9 } as ContentBlock;
+    const plain = { type: 'text', text: 'hi' } as ContentBlock;
+    // Stored history the helper doesn't recognize goes on as it is, for
+    // membrane to judge, rather than failing every request here.
+    const untouched = { participant: 'User', content: [plain, null, 'odd'] as unknown as ContentBlock[] };
+    const holder = { participant: 'assistant', content: [thinking, redacted, plain] };
+    const out = withoutTokenEstimates([untouched, holder]);
+    assert.equal(out[0], untouched, 'a message with no stamp is passed on as it is');
+    assert.deepEqual(out[1]!.content, [
+      { type: 'thinking', thinking: '', signature: SIG_A },
+      { type: 'redacted_thinking', data: 'R' },
+      plain,
+    ]);
+    assert.equal(out[1]!.content[2], plain, 'an unstamped block in a copied message is the same object');
+    assert.equal((thinking as Stamped).tokenEstimate, 7, 'each block handed in keeps its stamp');
+    assert.equal((redacted as Stamped).tokenEstimate, 9, 'each block handed in keeps its stamp');
+    assert.equal(holder.content[0], thinking, 'the message handed in is unchanged');
+  });
+});
+
+/**
+ * Membrane's real Anthropic request builder, each reply scripted: what each
+ * request would put on the wire is kept in `sent`.
+ */
+class WireAnthropic extends AnthropicAdapter {
+  readonly sent: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+  readonly replies: Array<{ content: ContentBlock[]; stopReason: string; usage: { inputTokens: number; outputTokens: number } }> = [];
+  constructor() { super({ apiKey: 'test', cacheKeepalive: { enabled: false } } as never); }
+  override async stream(...args: Parameters<AnthropicAdapter['stream']>): ReturnType<AnthropicAdapter['stream']> {
+    const [request, callbacks, options] = args;
+    const wire = (this as unknown as { buildRequest(r: unknown, onAltered?: unknown): unknown })
+      .buildRequest(request, (options as { onContentAltered?: unknown } | undefined)?.onContentAltered);
+    this.sent.push(JSON.parse(JSON.stringify(wire)));
+    const reply = this.replies.shift()
+      ?? { content: [{ type: 'text', text: 'done' }] as ContentBlock[], stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 2 } };
+    for (const block of reply.content) if (block.type === 'text') callbacks.onChunk(block.text);
+    return { ...reply, model: request.model, rawRequest: wire, raw: {} } as never;
+  }
+}
+
+class Speaker implements Module {
+  readonly name = 'test';
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(): Promise<ToolResult> { return { success: true }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'User', content: [{ type: 'text' as const, text: String(event.content) }] }], requestInference: true };
+  }
+}
+
+describe('the stamp stays in the store and off the wire', () => {
+  const DATA = 'R'.repeat(1_000);
+
+  /** A framework whose first reply carries a signed thinking block and a
+   *  redacted_thinking block, which it stores stamped. */
+  async function stampedFramework(dir: string) {
+    const adapter = new WireAnthropic();
+    adapter.replies.push({
+      content: [
+        { type: 'thinking', thinking: '', signature: SIG_A } as ContentBlock,
+        { type: 'redacted_thinking', data: DATA } as ContentBlock,
+        { type: 'text', text: 'hi' },
+      ],
+      stopReason: 'end_turn',
+      usage: { inputTokens: 100, outputTokens: 2_000 },
+    });
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new Membrane(adapter, { formatter: new NativeFormatter() }),
+      agents: [{ name: 'assistant', model: 'claude-sonnet-4-5', systemPrompt: 'Test' }],
+      modules: [new Speaker()],
+    });
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    return { adapter, framework };
+  }
+
+  function storedStamps(framework: AgentFramework): Array<[string, unknown]> {
+    const messages = (framework.getAgent('assistant')!.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: Stamped[] }>;
+    return messages.flatMap((m) => m.content)
+      .filter((b) => b.type === 'thinking' || b.type === 'redacted_thinking')
+      .map((b) => [b.type, b.tokenEstimate]);
+  }
+
+  function assertSentUnstamped(sent: WireAnthropic['sent'][number] | undefined): void {
+    assert.ok(sent, 'a second request was built');
+    assert.ok(!JSON.stringify(sent).includes('tokenEstimate'), 'no block on the wire carries tokenEstimate');
+    const assistant = sent.messages.find((m) => m.role === 'assistant');
+    assert.deepEqual(
+      (assistant?.content as Array<{ type: string }>).filter((b) => b.type === 'thinking' || b.type === 'redacted_thinking'),
+      [{ type: 'thinking', thinking: '', signature: SIG_A }, { type: 'redacted_thinking', data: DATA }],
+      "each thinking block goes out with the API's own fields, as stored",
+    );
+  }
+
+  it('on a framework turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'thinking-stamp-wire-'));
+    const { adapter, framework } = await stampedFramework(dir);
+    try {
+      const stamps = storedStamps(framework);
+      assert.equal(stamps.length, 2);
+      for (const [, stamp] of stamps) assert.equal(typeof stamp, 'number', 'the first reply stored its thinking blocks stamped');
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'again', metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+      assertSentUnstamped(adapter.sent[1]);
+      assert.deepEqual(storedStamps(framework), stamps, 'the store keeps each stamp');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('through the direct API (runInference)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'thinking-stamp-wire-direct-'));
+    const { adapter, framework } = await stampedFramework(dir);
+    try {
+      const stamps = storedStamps(framework);
+      assert.equal(stamps.length, 2);
+      await framework.getAgent('assistant')!.runInference([]);
+      assertSentUnstamped(adapter.sent[1]);
+      assert.deepEqual(storedStamps(framework), stamps, 'the store keeps each stamp');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

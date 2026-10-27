@@ -12,7 +12,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, type Module } from '../src/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
-import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 function recordingModule(name: string, stop: () => Promise<void> = async () => {}, start: () => Promise<void> = async () => {}) {
@@ -85,45 +84,33 @@ test('a create() whose module fails to start stops every module it started, that
 
 test('a create() that fails after its MCP servers connected closes them, in both engines, and frees its store', async t => {
   const dir = tempDir(t);
-  const outboxPath = join(dir, 'awareness.json');
-  // A pending Discord awareness batch makes startup run the awareness barrier
-  // after the server connects; its second reconciliation fails.
-  const outbox = new DiscordAwarenessOutbox(outboxPath);
-  const batch = outbox.prepare({ agentName: 'assistant', sourceBranch: 'source', targetBranch: 'main',
-    activationPolicy: 'explicit',
-    refs: [{ serverId: 'discord', channelId: 'discord:guild:startup', messageId: 'message-1' }] });
-  assert.ok(batch);
-  outbox.activate(batch.id);
+  const eventsPath = join(dir, 'events.jsonl');
   const config = {
     ...baseConfig(join(dir, 'store')),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
-    discordAwarenessOutboxPath: outboxPath,
-    discordAwarenessDeadlineMs: 1_000,
     // The modern server connects first, so both engines hold a server when
     // the failure comes.
     mcplServers: [{
       id: 'modern', command: process.execPath, protocol: 'modern' as const,
       args: [fileURLToPath(new URL('./fixtures/modern-raw-server.mjs', import.meta.url)), '', join(dir, 'modern.jsonl')],
     }, {
-      id: 'discord', command: process.execPath,
-      args: [fileURLToPath(new URL('./fixtures/awareness-barrier-mcpl-server.mjs', import.meta.url))],
+      id: 'chat', command: process.execPath,
+      args: [fileURLToPath(new URL('./fixtures/reregistering-mcpl-server.mjs', import.meta.url))],
       requestTimeoutMs: 1_000, enabledFeatureSets: ['chat'],
-      env: { STATUS_PATH: join(dir, 'status.jsonl'), LEDGER_PATH: outboxPath },
+      env: { EVENTS_PATH: eventsPath },
     }],
   };
-  const reconcile = DiscordAwarenessOutbox.prototype.reconcileForBranch;
-  let reconciliations = 0;
-  const injected = t.mock.method(DiscordAwarenessOutbox.prototype, 'reconcileForBranch',
-    function (this: DiscordAwarenessOutbox, ...args: Parameters<typeof reconcile>) {
-      if (++reconciliations === 2) throw new Error('injected reconcile failure');
-      return reconcile.apply(this, args);
-    });
-  await rejectsWithItsOwnError(AgentFramework.create(config),
-    /^Discord awareness accounting failed during .*: injected reconcile failure$/);
+  // Startup discovers tools once every server is connected; that step fails
+  // here.
+  const injected = t.mock.method(AgentFramework.prototype as unknown as { refreshMcplTools(): Promise<void> },
+    'refreshMcplTools', async () => { throw new Error('injected tool discovery failure'); });
+  await rejectsWithItsOwnError(AgentFramework.create(config), /^injected tool discovery failure$/);
   injected.mock.restore();
-  const initialized = readFileSync(join(dir, 'status.jsonl'), 'utf8').split('\n').filter(Boolean)
+  // The fixture registers its channel once the host has sent
+  // notifications/initialized, so this record says the handshake had finished.
+  const initialized = readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean)
     .map(line => JSON.parse(line) as { event: string; pid?: number })
-    .find(record => record.event === 'initialized');
+    .find(record => record.event === 'register-sent');
   assert.ok(initialized?.pid, 'the MCPL server had finished its handshake before the failure');
   const modern = readFileSync(join(dir, 'modern.jsonl'), 'utf8').split('\n').filter(Boolean)
     .map(line => JSON.parse(line) as { event: string; method?: string; pid?: number });

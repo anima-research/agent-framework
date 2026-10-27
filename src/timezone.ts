@@ -2,8 +2,10 @@
  * Agent-visible wall-clock formatting.
  *
  * Persistence and protocol timestamps should remain epoch milliseconds or UTC
- * ISO strings.  These helpers are only for presentation boundaries where a
- * timestamp is rendered into an agent's context or a tool result.
+ * ISO strings.  These helpers are for presentation boundaries where a
+ * timestamp is rendered into an agent's context or a tool result, and the
+ * zone resolveTimeZone gives also places clock rows' boundaries
+ * (clock-rows.ts).
  */
 
 export function isValidTimeZone(timeZone: string): boolean {

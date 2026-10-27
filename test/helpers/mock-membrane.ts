@@ -23,8 +23,8 @@ export function createMockResponse(
     .join('');
 
   const toolCalls = content
-    .filter((b): b is ContentBlock & { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> } => b.type === 'tool_use')
-    .map((b) => ({ id: b.id, name: b.name, input: b.input }));
+    .filter((b): b is ContentBlock & { type: 'tool_use'; id: string; name: string; input: Record<string, unknown>; unparseableInput?: string } => b.type === 'tool_use')
+    .map((b) => ({ id: b.id, name: b.name, input: b.input, ...(b.unparseableInput !== undefined ? { unparseableInput: b.unparseableInput } : {}) }));
 
   return {
     content,
@@ -94,7 +94,11 @@ export class MockYieldingStream implements YieldingStream {
     }
 
     if (response.usage) {
-      this.events.push({ type: 'usage', usage: response.usage } as StreamEvent);
+      // A response may carry the round report its usage event closes
+      // (`round`, a test-only field), as membrane 0.6.0's yielding streams
+      // send it.
+      const round = (response as { round?: unknown }).round;
+      this.events.push({ type: 'usage', usage: response.usage, ...(round ? { round } : {}) } as StreamEvent);
     }
 
     if (response.toolCalls.length > 0) {
@@ -106,6 +110,7 @@ export class MockYieldingStream implements YieldingStream {
           id: tc.id,
           name: tc.name,
           input: tc.input as Record<string, unknown>,
+          ...(tc.unparseableInput !== undefined ? { unparseableInput: tc.unparseableInput } : {}),
         })),
         context: {
           rawText: '',
@@ -209,6 +214,11 @@ export class MockMembrane {
       return createMockResponse([{ type: 'text', text: 'Default response' }]);
     }
     return this.responses[this.responseIndex++];
+  }
+
+  /** The direct Agent API's call, recorded and answered as complete is. */
+  async stream(request: NormalizedRequest, _options?: unknown): Promise<NormalizedResponse> {
+    return this.complete(request);
   }
 
   streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {

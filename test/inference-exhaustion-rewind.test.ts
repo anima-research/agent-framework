@@ -105,6 +105,22 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
 });
 
+test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
+  const { fw, messages, added, restore } = makeHarness({ messages: [
+    { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },
+    { id: 'a0', participant: 'agent', content: [{ type: 'text', text: 'an answer' }] },
+    { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+    { id: 'a1', participant: 'agent', content: [] },
+  ] });
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
+    'the newest message is gone, and the empty row after it stays with what came before');
+  const marker = added.find((m) => m.meta.kind === 'refusal-rewind');
+  assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
+});
+
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {
@@ -190,8 +206,8 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   assert.ok(errs.some((e) => e.includes('nothing left to shed')));
 });
 
-// Anarchid's review of membrane #56 (M3): from #56 (in membrane 0.5.87, this
-// package's floor) one status table serves every adapter, so `invalid_request` also
+// Anarchid's review of membrane #56 (M3): from #56 (in membrane 0.5.87, below
+// this package's floor) one status table serves every adapter, so `invalid_request` also
 // reaches agent-framework for an Anthropic 404 (a model that doesn't exist),
 // which no shed can fix. With 0.5.86 the raw-fetch Responses adapter already
 // files every status it doesn't list as invalid_request. The breaker runs
@@ -305,7 +321,7 @@ test("a membrane error's type and status reach the gate through the exhausted tr
 });
 
 test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a context_length at 413, and nothing else', () => {
-  // Every membrane error type (0.5.87), the framework's own two, and none.
+  // Every membrane error type (0.6.0), the framework's own two, and none.
   const types = ['invalid_request', 'rate_limit', 'context_length', 'auth', 'server', 'network', 'timeout', 'abort',
     'safety', 'unsupported', 'unknown', 'over_budget', 'context_refusal', undefined];
   const statuses: Array<number | undefined> = [undefined];

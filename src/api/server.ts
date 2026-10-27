@@ -489,6 +489,12 @@ export class ApiServer {
     if (!params.participant || !params.content) {
       throw new Error('participant and content are required');
     }
+    // ApiModule stores the message as one text block, which context-manager
+    // refuses unless its text is a string, so content that isn't text is
+    // refused here, where the caller hears it, rather than at dispatch.
+    if (typeof params.content !== 'string') {
+      throw new Error('content must be text');
+    }
 
     // Push api:message event for the ApiModule to handle
     this.framework.pushEvent({
@@ -512,8 +518,7 @@ export class ApiServer {
     const contextManager = agent.getContextManager();
     // A dry run: listed, never sent, so it persists no fold resolutions and
     // queues none of the compression its fold plan calls for (see
-    // Agent.compileWithInjections for what a dry run still leaves, and for
-    // context-manager#160's thinking binding).
+    // Agent.compileWithInjections for what a dry run still leaves).
     const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
@@ -587,14 +592,14 @@ export class ApiServer {
 
     const from = this.currentBranch;
 
-    // The framework switches the store, starts the delivery of its Discord
-    // awareness marks behind the data-plane gate, and re-materializes the
-    // config mount. It refuses during a live turn or once stop() has begun,
-    // and stop() waits for one already running. It moves the store once any
-    // maintenance already running has finished, so the move can come after
-    // this call returns. The event names this switch's own move, from the
-    // branch read here to the one it was asked for: another switch can move
-    // the store again before this one continues.
+    // The framework switches the store and re-materializes the config mount;
+    // a branch switch adds or removes no Discord awareness marks. It refuses
+    // during a live turn or once stop() has begun, and stop() waits for one
+    // already running. It moves the store once any maintenance already
+    // running has finished, so the move can come after this call returns.
+    // The event names this switch's own move, from the branch read here to
+    // the one it was asked for: another switch can move the store again
+    // before this one continues.
     let switched = false;
     try {
       await this.framework.switchBranch(params.name);
@@ -644,11 +649,10 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.undoLastTurn(params.agentName);
+    const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
+    await settled;
 
     if (result.undone) {
-      // Marks follow behind the data-plane gate; the undo doesn't wait for Discord.
-      this.framework.startDiscordAwarenessDelivery('undo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
@@ -664,11 +668,10 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.redo(params.agentName);
+    const { settled, ...result } = this.framework.redo(params.agentName);
+    await settled;
 
     if (result.redone) {
-      // Marks follow behind the data-plane gate; the redo doesn't wait for Discord.
-      this.framework.startDiscordAwarenessDelivery('redo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,

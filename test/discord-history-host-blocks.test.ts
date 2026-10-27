@@ -14,6 +14,7 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { Collection } from 'discord.js';
+import { bodyBoundsIn } from '@animalabs/context-manager';
 import { DiscordModule, DiscordJsClient } from '../src/modules/discord/index.js';
 import type {
   DiscordAttachment,
@@ -31,6 +32,7 @@ interface Row {
   metadata: Record<string, unknown> & { external: { source: string; id: string }; channelId: string };
   timestamp: Date;
   bodyGroupId?: string;
+  shardIndex?: number;
 }
 
 interface Harness {
@@ -94,10 +96,11 @@ function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}, { stor
     if (r.bodyGroupId) throw new Error(`Cannot edit shard ${id}`);
     r.content = content;
   };
-  // As the framework does, removing a shard takes out its whole body.
+  // As the framework does, removing a shard takes out its whole body, read
+  // by context-manager's rule in store order.
   const remove = (id: string) => {
-    const r = held(id);
-    for (const gone of r.bodyGroupId ? rows.filter((other) => other.bodyGroupId === r.bodyGroupId) : [r]) rows.splice(rows.indexOf(gone), 1);
+    const { from, to } = bodyBoundsIn(rows, rows.indexOf(held(id)));
+    rows.splice(from, to - from + 1);
   };
   harness.ctx = {
     queryMessages: (q: { source?: string; externalIds?: string[]; metadata?: Record<string, unknown> }) => {
@@ -547,8 +550,8 @@ test('a history sync leaves no record of itself once it ends, when it writes and
 
 test('a message stored as a body is removed whole by a live delete and the history sync, and its text is left as stored', async (t) => {
   // A body: one Discord message stored as shards that share its metadata.
-  const body = (id: string, timestamp: number) => ['a', 'b'].map((part) => ({
-    ...row(id, [text(`part ${part}`)], true, timestamp), id: `stored-${id}${part}`, bodyGroupId: `g-${id}`,
+  const body = (id: string, timestamp: number) => ['a', 'b'].map((part, shardIndex) => ({
+    ...row(id, [text(`part ${part}`)], true, timestamp), id: `stored-${id}${part}`, bodyGroupId: `g-${id}`, shardIndex,
   }));
   const { harness, edits, removed, apply, rows } = setup([...body('s1', 1_000), ...body('s2', 2_000), ...body('s3', 3_000), ...body('s4', 4_000)], {
     fetchHistory: async () => [history('s3', 'part a', 3_000, [notes]), history('s1', 'changed', 1_000, [])],

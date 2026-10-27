@@ -53,9 +53,11 @@ import {
   sameRootIdentity,
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
+import { storedBytes, type StoredBytes } from './sync.js';
 import {
   IGNORED,
   type MountView,
+  NOT_A_DIRECTORY,
   OTHER_MOUNT,
   ROOT_REPLACED,
   type Walk,
@@ -72,8 +74,10 @@ import {
   readPath,
   sniffImageMime,
   walkScope,
+  withinIncludes,
 } from './observe.js';
 import { EffectFailed, type Expect, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
+import { errnoWords } from './answers.js';
 
 export type EntryState =
   | 'synced'
@@ -485,7 +489,7 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
   }
   // A deletion below a file finds nothing there to unlink, so only a write
   // meets this one.
-  if (reason === 'a parent path is not a directory') {
+  if (reason === NOT_A_DIRECTORY) {
     return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
       'move or remove it on disk and materialize again, or write the file under another path';
   }
@@ -505,7 +509,7 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
  * to pass.
  */
 function forcedWay(note: string | undefined, deletion: boolean, forced: string): string {
-  if (note === 'cannot open (EACCES)') return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
+  if (note === `cannot open (${errnoWords('EACCES')})`) return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
   return '';
 }
 
@@ -856,16 +860,22 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   }
 
   // Which paths to decide: what disk shows, and what the store, P and intent
-  // track. The tracked ones are read synchronously, on this branch.
+  // track. The tracked ones are read synchronously, on this branch. A path
+  // the mount's include doesn't cover is outside the mount, so no pass
+  // decides it: the workspace's history may hold it from before the include,
+  // and it stays there as it is. So is one in a nested mount's directory
+  // that mount's include leaves out, such as history taken in before the
+  // mount was nested there: it's no mount's (namesNestedPlace).
   const candidates = new Set<string>();
+  const inside = (p: string): boolean => withinIncludes(mount.view, p);
   let walk: Walk | null = null;
   if (scope.kind === 'paths') {
-    for (const p of scope.paths) candidates.add(p);
+    for (const p of scope.paths) if (inside(p)) candidates.add(p);
   } else {
     const prefix = scope.dir ? scope.dir + '/' : undefined;
-    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope)) candidates.add(e.path);
-    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
-    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
+    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope) && inside(e.path)) candidates.add(e.path);
+    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope) && inside(p)) candidates.add(p);
+    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope) && inside(p)) candidates.add(p);
     if (rootUnavailable === null) {
       const resumeAfter = opts.resume ? agreement.walkResumesAfter(mount.name, scope.dir) : undefined;
       walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? mount.walkCap, {
@@ -907,8 +917,8 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       byDesign = OTHER_MOUNT;
     } else if (!opts.named) {
       const slash = path.lastIndexOf('/');
-      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others);
-      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others) : undefined;
+      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others, true);
+      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others, false) : undefined;
       byDesign = above ?? own;
     } else if (scope.kind === 'dir') {
       byDesign = passedOverBetween(scope.dir, path, ignoreBeneath(scope.dir, mount.view.ignore), mount.view.others);
@@ -1021,9 +1031,13 @@ export async function reconcilePass(
   }
 
   // The evidence about to be recorded describes the root it was gathered
-  // under, which is recorded first (once per mount), so no crash can leave
-  // evidence without its root.
-  if (gathered.rootIdentity && planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined)) {
+  // under, which is recorded first, so no crash can leave evidence without
+  // its root. Once a root is recorded, every pass that found it offers it,
+  // evidence or none: the same root on a new device, or with its first
+  // birth time, is recorded again (recordRootIdentity writes nothing
+  // otherwise), and a quiet mount's passes are where an old record learns
+  // its birth time.
+  if (gathered.rootIdentity && (agreement.rootIdentity(mount.name) !== undefined || planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined))) {
     agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
   }
 
@@ -1146,8 +1160,8 @@ export async function reconcilePass(
       // it, so it's always named. Another mount's directory met beneath the
       // scope is passed over by design even where this mount's tree holds
       // copies there: no tool of this mount syncs, pushes or clears them
-      // (listings show them, naming their holder), so naming the directory
-      // as unreached would never clear.
+      // (listings show those that mount's include covers, naming their
+      // holder), so naming the directory as unreached would never clear.
       const wholeScope = scope.kind === 'dir' && scope.dir !== '' && region.path === scope.dir;
       const unreached = hides && region.reason !== OTHER_MOUNT;
       if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) result.incomplete.push({ path: region.path, reason: region.reason });
@@ -1379,12 +1393,12 @@ export async function pushPaths(
         continue;
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
-      const blob = store.getBlob(s.hash);
+      const stored = storedBytes(store, s.hash);
       const forcedMode = mount.modesObserved && s.mode !== undefined && s.mode !== (d.kind === 'file' ? d.mode : undefined) ? s.mode : undefined;
       const agreedMode = priorP?.kind === 'content' ? priorP.mode : undefined;
-      if (blob) {
+      if ('bytes' in stored) {
         plans.push({
-          path, kind: 'write', blob, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
+          path, kind: 'write', blob: stored.bytes, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
           ...(forcedMode !== undefined ? { apply: forcedMode } : {}),
           ...(forcedMode !== undefined && d.kind === 'file' && agreedMode !== d.mode ? { overDisk: true as const } : {}),
           ...(s.mode !== undefined ? { storeMode: s.mode } : {}),
@@ -1393,7 +1407,7 @@ export async function pushPaths(
           ...(agreedMode !== undefined ? { priorMode: agreedMode } : {}),
           ...(d.kind === 'file' && d.mode !== undefined ? { seenMode: d.mode } : {}),
         });
-      } else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+      } else result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
     if (v.mode === 'adopt' && s && d.kind === 'file') {
@@ -1419,7 +1433,7 @@ export async function pushPaths(
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
     // intent) is recorded before anything is pushed over it, and the root it
-    // was learned under before that (once per mount), as a pass does.
+    // was learned under before that, as a pass does.
     if (v.p !== undefined) agreement.recordRootIdentity(mount.name, root.identity);
     if (v.p === 'forget') agreement.forget(mount.name, path);
     else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
@@ -1544,11 +1558,12 @@ export async function pushPaths(
       plans.push({ path, kind: 'unlink', prior, before: agreement.get(mount.name, path), expect });
       continue;
     }
-    const blob = store.getBlob(s.hash);
-    if (!blob) {
-      result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+    const stored = storedBytes(store, s.hash);
+    if (!('bytes' in stored)) {
+      result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
+    const blob = stored.bytes;
     // The store's mode goes to disk with its bytes where the file is new,
     // the push is forced, or disk still has the mode they last agreed on. A
     // push that completes our own unconfirmed one, whose bytes landed, is a
@@ -1766,4 +1781,8 @@ export async function pushPaths(
   if (recorded || agreement.needsBarrier) agreement.barrier();
   agreement.maybeCheckpoint();
   return result;
+}
+
+function unstoredCopy(stored: Exclude<StoredBytes, { bytes: Buffer }>): string {
+  return 'missing' in stored ? 'the workspace copy is missing from the store' : `the workspace copy is unreadable in the store (${stored.unreadable})`;
 }
