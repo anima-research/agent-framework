@@ -3705,11 +3705,11 @@ export class AgentFramework {
   private readonly releasesAfterResume = new Map<string, Agent>();
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
-  // context-manager 0.23.0: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2849),
+  // context-manager 0.23.1: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2897),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
-  // (context-manager.ts:2321-2337). So such a released manager is collected
+  // (context-manager.ts:2343-2359). So such a released manager is collected
   // only once nothing of its work can still read the store, and stop()
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
@@ -8310,8 +8310,10 @@ export class AgentFramework {
    * CURRENT settings — maintenance may have moved the folded floor and the
    * branch generation, so verdicts are computed at resume time, never reused.
    * Throws ResumeBlockedError (with all failing verdicts) unless `force`.
-   * Unavailable previews warn and pass — refusing to resume because the
-   * strategy cannot preview would hold hosts hostage to a diagnostic.
+   * Unavailable previews pass, with a warning naming the reason unless it is
+   * `no_preview_support`, a strategy with nothing to preview — refusing to
+   * resume because the strategy cannot preview would hold hosts hostage to a
+   * diagnostic.
    */
   async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
     this.refuseOperatorAfterStop('resume');
@@ -9301,7 +9303,13 @@ export class AgentFramework {
    * see `AutobiographicalStrategy.previewContext` and
    * `Agent.compileWithInjections`.
    *
-   * Returns null when the agent's strategy has no fold plan (non-adaptive).
+   * Returns null when the agent's strategy has nothing to preview: one without
+   * `previewContext`, or a non-adaptive `AutobiographicalStrategy` whose select
+   * fits the budget, built from the framework's own copy of context-manager.
+   * Built from another copy, such a strategy throws its `previewContext
+   * requires adaptiveResolution` error here instead, since the manager
+   * recognises only its own copy's `NoFoldPlanToPreviewError`. Over the
+   * budget, a non-adaptive strategy's preview is an infeasible one.
    */
   previewContextSettings(
     agentName: string,
@@ -9357,9 +9365,9 @@ export class AgentFramework {
    *
    * Never throws for preview-layer reasons: strategy without previewContext,
    * preview overlap, stale branch generation, the hierarchical (non-
-   * adaptive) path, and a context manager that refuses its queries (its
-   * strategy's initialization pending or failed) all come back as
-   * `{available: false, reason}`. Unknown agent still throws, matching the
+   * adaptive) path within its budget, and a context manager that refuses its
+   * queries (its strategy's initialization pending or failed) all come back
+   * as `{available: false, reason}`. Unknown agent still throws, matching the
    * sibling accessors, and so does a patch whose values the agent refuses,
    * whatever its context manager's state. Whether the strategy takes live
    * tail and pace settings is the manager's to say, so while it refuses, a
