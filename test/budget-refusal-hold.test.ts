@@ -755,6 +755,11 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         t.send('Joined while held');
         assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
         assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'a wake that joined the hold waits to start');
+        const upcoming = (t.framework as unknown as { upcomingWakesFor(n: string): Array<{ at?: number; certain: boolean; what: string }> }).upcomingWakesFor('prime');
+        assert.equal(upcoming.length, 1);
+        assert.equal(upcoming[0]!.certain, true);
+        assert.match(upcoming[0]!.what, /^a turn held for its context budget, once its context fits, by \S+Z at the latest$/,
+          'a reply judge is told the held turn will run');
         await assert.rejects(t.framework.switchBranch('main'), (e: Error) => {
           assert.match(e.message, /prime is idle\+turn-alive \(a budget hold keeps its turn to start again once its context fits, or at \S+ at the latest: Compile plan would exceed hard budget/);
           assert.match(e.message, /end it with quiesce with abandon: true/);
@@ -1977,6 +1982,37 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await t.close();
       }
     });
+  });
+
+  it('leaves no record of a released turn whose compile a stop or a disposal reaches', async () => {
+    for (const end of ['stop', 'disposal'] as const) {
+      let open!: () => void;
+      const until = new Promise<void>((resolve) => { open = resolve; });
+      await withBacklog({ compileGate: { nth: 2, until } }, async (backlog) => {
+        const t = await residentTurn({ maintenanceIntervalMs: 50 });
+        let closed = false;
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+          backlog.fit = true;
+          assert.ok(await pollUntil(() => backlog.compiles === 2, 3_000), 'the hold released the turn into its compile');
+          if (end === 'stop') {
+            const stopping = t.close();
+            open();
+            await stopping;
+            closed = true;
+          } else {
+            t.internal.disposeConversationAgent('prime');
+            open();
+            assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the compile ended with the agent gone');
+          }
+          assert.equal(t.internal.budgetHolds.size, 0, `nothing of the hold is left after the ${end}`);
+        } finally {
+          open();
+          if (!closed) await t.close();
+        }
+      });
+    }
   });
 
   it('refuses a puppeted tool call while a turn is held, naming the hold', async () => {
