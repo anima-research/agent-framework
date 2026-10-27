@@ -80,10 +80,6 @@ const MAX_JUDGE_INSTRUCTIONS = 4_000;
 const DEFAULT_JUDGE_TIMEOUT_MS = 20_000;
 /** Judge failures in a row after which gate_status names the judge as failing. */
 const JUDGE_FAILING_STREAK = 3;
-function quotedEventLines(events: PendingEvent[]): string[] {
-  return events.filter((e) => !e.inContext).map((e) => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
-}
-
 /** The latest instant a Date can name (ms): a later stated end can't be shown. */
 const MAX_DATE_MS = 8.64e15;
 const JUDGE_REFUSAL_MIN_RETRY_MS = 1_000;
@@ -3636,9 +3632,10 @@ export class EventGate {
     // them here would inject a duplicate copy of the message minutes after
     // the fact, reading as fresh input the agent may have already handled.
     // Only events with no context entry of their own carry their content.
+    const quoted = events.filter(e => !e.inContext);
     const referenced = events.filter(e => e.inContext);
 
-    const lines: string[] = quotedEventLines(events);
+    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     // How each referenced channel is named in the line, in order.
     const shown: string[] = [];
     if (referenced.length > 0) {
@@ -3997,22 +3994,7 @@ export class EventGate {
       this.deliverOrBuffer([...state.events, ...state.queued]);
       return;
     }
-    this.storeUnwoken(policyName, state.events);
     if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, judge);
-  }
-
-  private storeUnwoken(policyName: string, events: PendingEvent[]): void {
-    const lines = quotedEventLines(events);
-    if (lines.length === 0) return;
-    const one = lines.length === 1;
-    try {
-      this.addMessageFn('user', [{
-        type: 'text',
-        text: `[Gate: ${lines.length} event${one ? '' : 's'} matched; the reply judge didn't wake you for ${one ? 'it' : 'them'}]\n\n${lines.join('\n')}`,
-      }], { source: 'gate:judge-wait', policies: [policyName] });
-    } catch (err) {
-      console.error(`[gate] Policy "${policyName}": a batch the reply judge let go by couldn't be stored (${errorText(err)})`);
-    }
   }
 
   private refusedJudging(policyName: string, state: JudgingState, err: unknown, durationMs: number): void {
