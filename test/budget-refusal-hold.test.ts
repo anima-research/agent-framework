@@ -196,6 +196,11 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
  *  channel module does. */
 class InboxModule implements Module {
   readonly name = 'inbox';
+  gatherContext?: () => Promise<Array<{ namespace: string; position: 'afterUser'; content: Array<{ type: 'text'; text: string }> }>>;
+  /** With `context`, each start gathers an `afterUser` injection of its text. */
+  constructor(context?: () => string) {
+    if (context) this.gatherContext = async () => [{ namespace: 'inbox:status', position: 'afterUser', content: [{ type: 'text', text: context() }] }];
+  }
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools() { return []; }
@@ -335,6 +340,8 @@ const heldRequests = (framework: AgentFramework): number | undefined => {
 async function residentTurn(options: {
   maintenanceIntervalMs: number; holdMs?: number; recheckMs?: number; responses?: number; inferencePolicy?: InferencePolicy;
   thinkingBinding?: { binds: boolean; dropBlock: boolean };
+  /** An injection the inbox gathers at each start (InboxModule). */
+  context?: () => string;
   /** A store the test keeps, to open again after a stop; one of its own when left out. */
   storePath?: string;
 }) {
@@ -348,7 +355,7 @@ async function residentTurn(options: {
     storePath: options.storePath ?? join(tempDir!, 'store'),
     membrane: membrane.asMembrane(),
     agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', ...(options.thinkingBinding ? { thinkingBinding: options.thinkingBinding } : {}) }],
-    modules: [new InboxModule()],
+    modules: [new InboxModule(options.context)],
     syncIntervalMs: 0,
     maintenanceIntervalMs: options.maintenanceIntervalMs,
     ...(options.inferencePolicy ? { inferencePolicy: options.inferencePolicy } : {}),
@@ -756,10 +763,10 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
         assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'a wake that joined the hold waits to start');
         const upcoming = (t.framework as unknown as { upcomingWakesFor(n: string): Array<{ at?: number; certain: boolean; what: string }> }).upcomingWakesFor('prime');
-        assert.equal(upcoming.length, 1);
-        assert.equal(upcoming[0]!.certain, true);
-        assert.match(upcoming[0]!.what, /^a turn held for its context budget, once its context fits, by \S+Z at the latest$/,
-          'a reply judge is told the held turn will run');
+        assert.deepEqual(upcoming, [{
+          at: (holdOf(t) as unknown as { until: number }).until, certain: true,
+          what: 'a turn held for its context budget, which runs once its context fits, and by then at the latest',
+        }], 'a reply judge is told the held turn will run, by its deadline at the latest');
         await assert.rejects(t.framework.switchBranch('main'), (e: Error) => {
           assert.match(e.message, /prime is idle\+turn-alive \(a budget hold keeps its turn to start again once its context fits, or at \S+ at the latest: Compile plan would exceed hard budget/);
           assert.match(e.message, /end it with quiesce with abandon: true/);
@@ -1181,6 +1188,26 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.equal(backlog.previews, previews);
         backlog.stalled = false;
         assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'and once compression moves');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('does not release a re-refused turn again on what its own start stored, an injection whose content changed included', async () => {
+    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, stalled: true }, async (backlog) => {
+      let starts = 0;
+      const t = await residentTurn({ maintenanceIntervalMs: 50, context: () => `status at start ${++starts}` });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'released once, refused, and held again');
+        const stored = (t.framework.getAgent('prime')!.getContextManager().queryMessages({}).messages as unknown as Array<{ content: Array<{ text?: string }> }>)
+          .filter((m) => (m.content[0]?.text ?? '').startsWith('status at start'));
+        assert.equal(stored.length, 2, 'each start stored the injection, changed');
+        const compiles = backlog.compiles;
+        await new Promise((r) => setTimeout(r, 600));
+        assert.equal(t.of('inference:held').length, 2, 'no release on what the released start stored');
+        assert.equal(backlog.compiles, compiles);
       } finally {
         await t.close();
       }
