@@ -9,8 +9,6 @@ import { AgentFramework } from '../src/index.js';
 import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
-/** A stream whose round after its tool results fails, as a provider's
- *  stream can mid-turn. */
 class FailsAfterToolsStream extends MockYieldingStream {
   override provideToolResults(results: unknown[], options?: Parameters<MockYieldingStream['provideToolResults']>[1]): void {
     super.provideToolResults(results, options);
@@ -18,8 +16,6 @@ class FailsAfterToolsStream extends MockYieldingStream {
   }
 }
 
-/** Each stream answers with its own script of rounds; a script that ends in
- *  'fails' fails after its last tool round. */
 class ScriptedStreamMembrane extends MockMembrane {
   constructor(private readonly scripts: Array<Array<NormalizedResponse | 'fails'>>) { super(); }
   override streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
@@ -63,12 +59,10 @@ function stored(framework: AgentFramework): Array<{ text: string; metadata: Reco
   }));
 }
 const storedText = (framework: AgentFramework): string => stored(framework).map((m) => m.text).join('\n');
-/** The tool calls and results the agent's history holds. */
 const toolBlocks = (framework: AgentFramework): number => {
   const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content?: Array<{ type: string }> }>;
   return msgs.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
 };
-/** The turn is over: it completed and holds no turn token, so a store move is admitted. */
 const turnOver = (t: { of: (type: string) => unknown[]; internal: { activeTurnTokens: Map<string, number> } }, completed = 1): Promise<boolean> =>
   pollUntil(() => t.of('inference:completed').length >= completed && !t.internal.activeTurnTokens.has('prime'), 5_000);
 
@@ -101,7 +95,6 @@ interface Backlog {
   previewError?: Error; dryRunGate?: Promise<void>; dryRunMs?: number; slowCompile?: { nth: number; ms: number };
   compileGate?: { nth: number; until: Promise<void> };
   bindings: { compile: unknown[]; dryRun: unknown[]; preview: unknown[] };
-  /** Each refusal a committing compile threw, and the budget each preview was asked at. */
   thrown: Error[]; previewBudgets: unknown[];
 }
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
@@ -244,11 +237,7 @@ async function heldRestart(texts: string[], options: {
   fits?: boolean;
   duringTool?: (internal: Internal) => unknown;
   inferencePolicy?: InferencePolicy;
-  /** The tool round's continuation is a refusal, which the tool-result guard
-   *  retries in the turn, instead of a near-cap round that restarts it. */
   guardRetry?: boolean;
-  /** The stream fails after its tool round, and the error policy retries the
-   *  turn. */
   failsAfterTools?: boolean;
 } = {}) {
   const proto = ContextManager.prototype as unknown as Patchable;
@@ -1239,15 +1228,17 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
+        const cm = t.framework.getAgent('prime')!.getContextManager();
+        const clockRows = (): number => (cm.queryMessages({}).messages as unknown as Array<{ metadata?: { kind?: string } }>)
+          .filter((m) => m.metadata?.kind === 'clock').length;
+        const before = clockRows();
         await new Promise((r) => setTimeout(r, 1_100));
         backlog.fit = true;
         backlog.refuseCompiles = Infinity;
-        const cm = t.framework.getAgent('prime')!.getContextManager();
         const messages = cm.queryMessages({}).messages;
         cm.editMessage(messages[messages.length - 1]!.id, [{ type: 'text', text: 'Hi?' }]);
         assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'released on the edit, refused, and held again');
-        const clocks = (cm.queryMessages({}).messages as unknown as Array<{ metadata?: { kind?: string } }>).filter((m) => m.metadata?.kind === 'clock');
-        assert.equal(clocks.length, 2, 'the released start stored a clock row, a boundary after the first start\'s');
+        assert.equal(clockRows(), before + 1, 'the released start stored a clock row, a boundary after the last');
         const compiles = backlog.compiles;
         await new Promise((r) => setTimeout(r, 600));
         assert.equal(t.of('inference:held').length, 2, 'no release on the clock row the released start stored');

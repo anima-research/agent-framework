@@ -2397,10 +2397,6 @@ interface BudgetHold {
   checking: boolean;
   lookedAt?: string;
   ended?: { outcome: 'deadline' | 'nothing_pending' };
-  /** The refused start didn't record the turn's checkpoint (a retry, or a
-   *  tool-result guard's), so the turn keeps the one its first start
-   *  recorded, before what the turn has done, and the released start records
-   *  none. */
   keepsCheckpoint: boolean;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
@@ -6231,9 +6227,6 @@ export class AgentFramework {
     this.takeBudgetHold(agentName)?.report('dropped with it');
   }
 
-  /** Ends a hold with its turn: the record and its timers go, and its held
-   *  requests come back to the caller, who reports the end once it has done
-   *  with them and with the turn. */
   private takeBudgetHold(agentName: string): { requests: InferenceRequest[]; report: (wakes: string) => void } | undefined {
     const hold = this.budgetHolds?.get(agentName);
     if (!hold) return undefined;
@@ -20670,7 +20663,6 @@ export class AgentFramework {
       requests.push(...left);
     }
     this.pendingRequests.push(...back);
-    // The hold's end is reported once its turn is over and its wakes are back.
     const reportHold = (): void => budgetHold?.report(putsBack ? 'put back in the queue' : 'dropped with it');
     if (!dropped || !drop) return reportHold();
     // A primary a provider hold left pending for what it released won't run
