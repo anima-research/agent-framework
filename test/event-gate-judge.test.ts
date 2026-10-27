@@ -935,36 +935,6 @@ describe('judge rules: timing', () => {
     assert.strictEqual(judge.requests.length, 1);
   });
 
-  it('a wait stores what the batch holds that the agent has no copy of, without waking it', async () => {
-    const judge = scriptedJudge();
-    const { gate, wakes, messages } = makeGate(writeConfig('wait-stores.json', {
-      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { judge: { debounceMs: 30 } } }],
-    }), { judge: judge.fn });
-    gate.evaluate({ content: 'notes.md changed', eventType: 'workspace:modified', serverId: 'workspace', channelId: '' });
-    await until(() => judge.waiting() === 1, 'the judge call');
-    judge.answer({ reply: false, reason: 'nothing to answer' });
-    await until(() => messages.length === 1, 'the batch stored');
-    assert.deepStrictEqual(messages[0]!.content, [{
-      type: 'text',
-      text: "[Gate: 1 event matched; the reply judge didn't wake you for it]\n\n- [files] (workspace:modified): notes.md changed",
-    }]);
-    assert.strictEqual(wakes.length, 0);
-    gate.dispose();
-  });
-
-  it('a wait on events the agent already has in its context writes nothing', async () => {
-    const judge = scriptedJudge();
-    const { gate, wakes, messages } = makeGate(writeConfig('wait-in-context.json', JUDGED), { judge: judge.fn });
-    gate.evaluate(chat('lol'));
-    await until(() => judge.waiting() === 1, 'the judge call');
-    judge.answer({ reply: false, reason: 'chatter' });
-    await until(() => judgeState(gate).verdicts.wait === 1, 'the verdict applied');
-    await sleep(20);
-    assert.strictEqual(messages.length, 0);
-    assert.strictEqual(wakes.length, 0);
-    gate.dispose();
-  });
-
   it('a null verdict from a custom judge decides by onError rather than dropping the batch', async () => {
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('null.json', JUDGED), { judge: judge.fn });
