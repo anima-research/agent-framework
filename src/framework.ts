@@ -3880,6 +3880,8 @@ export class AgentFramework {
       notifyOps: (kind, agentName, message, data) => this.notifyOps(kind, agentName, message, data),
       windowStatusOf: (id, opts) => this.windowStatusFor(id, opts),
       observes: (observer, observed) => this.observesOwnRowsOf(observer, observed),
+      viewKeeps: (row, opts) => this.viewKeepsFor(row, opts),
+      agentNameOf: (contextManager) => this.agentNameOfContext(contextManager),
     });
   }
 
@@ -28285,6 +28287,38 @@ export class AgentFramework {
   private observesOwnRowsOf(observer: string, observed: string): boolean {
     if (observer === observed) return false;
     return readerFacts(this.registry, observer).observed.some((slot) => slot.owners.includes(observed));
+  }
+
+  /**
+   * A module's view lookup (ModuleContext.viewKeeps, #291): whether the
+   * delivery agent's view, or the named agent's, which must be registered,
+   * as for windowStatusFor, keeps a row, so its requests carry it while its
+   * window holds it. The view is the one its context was opened with
+   * (liveViewFilterOf, through the agent a shared derivation's view came
+   * from): a resident's leaves out held traffic and the other agents'
+   * stored context injections, the subconscious's those injections only,
+   * and an agent opened with no view keeps every row. An agent the registry
+   * has no record of is read through a resident's view, the one that keeps
+   * least.
+   */
+  private viewKeepsFor(row: StoredMessage, opts?: { forAgent?: string }): boolean {
+    const named = opts?.forAgent;
+    const agent = named === undefined ? this.deliveryAgent() : named === '' ? undefined : this.agents.get(named);
+    if (!agent) {
+      if (named !== undefined) throw this.unknownAgentError(named, 'A query');
+      throw new Error('No agents configured');
+    }
+    const record = this.registry.get(agent.name);
+    const view = record ? this.liveViewFilterOf(this.viewOwnerOf(record)) : residentViewFilter(agent.name);
+    return view === undefined || view(row);
+  }
+
+  /** The live agent whose context a context manager is (ModuleContext.agentNameOf, #291), or undefined. */
+  private agentNameOfContext(contextManager: ContextManager): string | undefined {
+    for (const agent of this.agents.values()) {
+      if (agent.getContextManager() === contextManager) return agent.name;
+    }
+    return undefined;
   }
 
   private createFrameworkState(): FrameworkState {

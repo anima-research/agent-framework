@@ -1,5 +1,6 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   StoredMessage,
@@ -448,8 +449,8 @@ export interface ModuleContext {
    * agent's when none is primary), or with `opts.forAgent`, the named
    * agent, which must be registered, as for queryMessages: a name that
    * isn't throws. A tool that reads the record for an agent, such as the
-   * history module's, says with it which of the rows it returns the agent
-   * isn't being shown.
+   * history module's, says with it, and with viewKeeps, which of the rows it
+   * returns the agent isn't being shown.
    *
    * Optional: a framework from before the presentation index, or a host's
    * own context, doesn't offer it. Call as `ctx.windowStatusOf?.(...)`.
@@ -461,11 +462,36 @@ export interface ModuleContext {
    * (dendrite's relationships): one of its edges reads a slot `observed`
    * owns. Seeing another agent's rounds is a declared relationship (#291,
    * decision 1), so a tool that reads the record for an agent leaves out
-   * another agent's own rows its window doesn't hold unless this is true.
+   * another agent's own rows it isn't shown unless this is true.
    * False for a name the registry doesn't know. Optional, as
    * windowStatusOf is, and offered with it.
    */
   observes?(observer: string, observed: string): boolean;
+
+  /**
+   * Whether an agent's view keeps a stored row (#291): whether its requests
+   * carry the row while its window holds it. windowStatusOf answers before
+   * the view's filter, and a window written down from the record the
+   * residents share can hold rows the view never sends: another agent's
+   * stored context injection, and, for an agent whose view leaves held
+   * traffic out (a resident), a row a tune-out holds from the residents. A
+   * row the agent is shown is one windowStatusOf reads `'in'` and this
+   * keeps. It reads the view the agent's context was opened with
+   * (context-options.ts), for the delivery agent, or with `opts.forAgent`
+   * the named agent, which must be registered, as for windowStatusOf: a name
+   * that isn't throws. Optional, as windowStatusOf is, and offered with it.
+   */
+  viewKeeps?(row: StoredMessage, opts?: { forAgent?: string }): boolean;
+
+  /**
+   * The live agent whose context `contextManager` is (the one its
+   * `getContextManager()` returns), or undefined when it is no live
+   * agent's (#291). A module a host binds to an agent's context, as it binds
+   * the history module, reads that context's record and summaries; this
+   * says whose they are, so another agent's call can be told from that
+   * agent's own. Optional, as windowStatusOf is, and offered with it.
+   */
+  agentNameOf?(contextManager: ContextManager): string | undefined;
 
   /**
    * Get info about all agents.

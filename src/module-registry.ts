@@ -1,10 +1,12 @@
 import type { JsStateRegistration, JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   MessageQuery,
   ContextInjection,
+  StoredMessage,
   WindowStatus,
 } from '@animalabs/context-manager';
 import type {
@@ -129,11 +131,13 @@ export class ModuleRegistry {
     message: string,
     data?: Record<string, unknown>,
   ) => void;
-  /** The window lookups ModuleContext.windowStatusOf and observes give
-   *  modules (#291), when the framework offers them. Readonly-public, as
-   *  notifyOpsFn is. */
+  /** The window lookups ModuleContext.windowStatusOf, observes, viewKeeps
+   *  and agentNameOf give modules (#291), when the framework offers them.
+   *  Readonly-public, as notifyOpsFn is. */
   readonly windowStatusOfFn?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
   readonly observesFn?: (observer: string, observed: string) => boolean;
+  readonly viewKeepsFn?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
+  readonly agentNameOfFn?: (contextManager: ContextManager) => string | undefined;
 
   constructor(
     store: JsStore,
@@ -154,6 +158,10 @@ export class ModuleRegistry {
       windowStatusOf?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
       /** Whether one agent observes another's own rows (ModuleContext.observes). */
       observes?: (observer: string, observed: string) => boolean;
+      /** Whether an agent's view keeps a stored row (ModuleContext.viewKeeps). */
+      viewKeeps?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
+      /** The live agent whose context a context manager is (ModuleContext.agentNameOf). */
+      agentNameOf?: (contextManager: ContextManager) => string | undefined;
     }
   ) {
     this.store = store;
@@ -170,6 +178,8 @@ export class ModuleRegistry {
     this.notifyOpsFn = options.notifyOps;
     this.windowStatusOfFn = options.windowStatusOf;
     this.observesFn = options.observes;
+    this.viewKeepsFn = options.viewKeeps;
+    this.agentNameOfFn = options.agentNameOf;
   }
 
   /**
@@ -675,6 +685,8 @@ class ModuleContextImpl implements ModuleContext {
    *  a module can tell a framework that has them from one that hasn't. */
   readonly windowStatusOf?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
   readonly observes?: (observer: string, observed: string) => boolean;
+  readonly viewKeeps?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
+  readonly agentNameOf?: (contextManager: ContextManager) => string | undefined;
 
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
@@ -716,6 +728,10 @@ class ModuleContextImpl implements ModuleContext {
     if (windowStatusOf) this.windowStatusOf = (id, opts) => windowStatusOf(id, opts);
     const observes = registry.observesFn;
     if (observes) this.observes = (observer, observed) => observes(observer, observed);
+    const viewKeeps = registry.viewKeepsFn;
+    if (viewKeeps) this.viewKeeps = (row, opts) => viewKeeps(row, opts);
+    const agentNameOf = registry.agentNameOfFn;
+    if (agentNameOf) this.agentNameOf = (contextManager) => agentNameOf(contextManager);
 
     // Load external ID map from state if exists
     const state = this.getState<{ externalIdMap?: Record<string, string> }>();

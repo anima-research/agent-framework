@@ -7,6 +7,11 @@
  * doesn't hold says so (`window: 'not-shown' | 'undone'`), and for an
  * agent's call another agent's own rows its window doesn't hold are left
  * out unless it observes that agent (decision 1), counted as `leftOut`. A
+ * row the caller's window holds and its view leaves out (another agent's
+ * stored context injection, a held row in a resident's window) isn't shown
+ * to it either (ModuleContext.viewKeeps). The summaries `overview` and
+ * `semantic_search` read fold the bound agent's context, so for another
+ * agent's call that doesn't observe it they are left out too (FW-AF-7). A
  * call no agent made reads the record whole, marked for the delivery agent.
  * Without the lookup, every tool and every answer is as it was.
  *
@@ -18,7 +23,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
+import type { ContextManager, MessageId, MessageMetadata, StoredMessage, TimeRangeSummaryEntry } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, HistoryModule, storeOwnRow } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
@@ -189,6 +194,139 @@ describe("the history tools' window marks (#291, AF-7)", () => {
     assert.throws(() => ctx.windowStatusOf?.(h.ids.both, { forAgent: 'zz-stranger' }), /Unknown agent: "zz-stranger"/);
     assert.equal(ctx.observes?.('Subconscious', 'mira'), true, "the subconscious's edge reads the residents' slot");
     assert.equal(ctx.observes?.('oren', 'mira'), false);
+
+    // Whose context a context manager is.
+    assert.equal(ctx.agentNameOf?.(h.cm('mira')), 'mira');
+    assert.equal(ctx.agentNameOf?.(h.cm('oren')), 'oren');
+    assert.equal(ctx.agentNameOf?.(h.cm('Subconscious')), 'Subconscious');
+    assert.equal(ctx.agentNameOf?.({} as ContextManager), undefined, 'a context that is no live agent\'s');
+
+    // What each agent's view keeps: a resident's leaves out held traffic and
+    // the other agents' stored injections, the subconscious's the injections only.
+    const row = (metadata: Record<string, unknown>) => ({ id: 'r', participant: 'x', content: [], metadata }) as unknown as StoredMessage;
+    const injection = row({ contextInjection: { agent: 'mira', namespace: 'notes', contentHash: 'h', part: 0, parts: 1 } });
+    const held = row({ tuneOut: { epochId: 'e1' } });
+    assert.equal(ctx.viewKeeps?.(injection), true, "the delivery agent's own injection");
+    assert.equal(ctx.viewKeeps?.(injection, { forAgent: 'oren' }), false);
+    assert.equal(ctx.viewKeeps?.(injection, { forAgent: 'Subconscious' }), false);
+    assert.equal(ctx.viewKeeps?.(held, { forAgent: 'oren' }), false);
+    assert.equal(ctx.viewKeeps?.(held, { forAgent: 'Subconscious' }), true, 'the subconscious reads held traffic');
+    assert.equal(ctx.viewKeeps?.(row({}), { forAgent: 'oren' }), true);
+    assert.throws(() => ctx.viewKeeps?.(held, { forAgent: 'zz-stranger' }), /Unknown agent: "zz-stranger"/);
+  });
+
+  it("a row the caller's window holds that its view leaves out isn't shown: another agent's injection is left out, a held row marked (J-AF13)", async () => {
+    const h = await boot();
+    const ch = { channelId: 'discord:g1:c1' };
+    const mark = (agent: string) => ({ agent, namespace: 'notes', contentHash: 'h', part: 0, parts: 1 });
+    // A row a tune-out holds from the residents.
+    const held = h.internals.addMessage('someone', [text('zz-held')], { ...ch, tuneOut: { epochId: 'e1' } } as MessageMetadata);
+    // mira's stored context injection, an own row of hers.
+    const injection = storeOwnRow(h.framework.getAgent('mira')!, 'system_context:notes', [text('zz-miras-injection')],
+      { ...ch, system: true, kind: 'context-injection', contextInjection: mark('mira') } as MessageMetadata);
+    // One from before the audience stamp, stored past the framework and so
+    // presented to no one (last, as boot's `out` is): its mark alone names
+    // whose it is.
+    const legacy = h.cm('mira').addMessage('system_context:notes', [text('zz-miras-legacy-injection')],
+      { ...ch, system: true, kind: 'context-injection', contextInjection: mark('mira') } as MessageMetadata);
+    // As a window written down from the shared record leaves them in oren's.
+    h.cm('oren').presentRows([injection, legacy, held]);
+    for (const id of [injection, legacy, held]) assert.equal(h.cm('oren').windowStatusOf(id), 'in', 'the premise: oren\'s window holds it');
+    const compiled = JSON.stringify((await h.cm('oren').compile()).messages);
+    for (const t of ['zz-miras-injection', 'zz-miras-legacy-injection', 'zz-held']) {
+      assert.equal(compiled.includes(t), false, `the premise: oren's requests never carry ${t}`);
+    }
+
+    const forOren = await h.call('extract', {}, 'oren');
+    const ids = new Map(marks(forOren.messages).map(([id, m]) => [id, m]));
+    assert.equal(ids.has(injection), false, "mira's injection is left out for oren");
+    assert.equal(ids.has(legacy), false, "and so is her injection from before the stamp");
+    assert.equal(ids.get(held), 'not-shown', 'a held row is marked as one oren is never shown');
+    assert.equal(forOren.leftOut, 3, "mira's round and both her injections");
+    const found = await h.call('search', { query: 'zz-' }, 'oren');
+    assert.deepEqual(marks(found.matches).filter(([id]) => id === injection || id === legacy || id === held), [[held, 'not-shown']]);
+
+    // mira is shown her own injection; the one stored past the framework was never presented to her.
+    const forMira = await h.call('extract', {}, 'mira');
+    const miraMarks = new Map(marks(forMira.messages).map(([id, m]) => [id, m]));
+    assert.equal(miraMarks.get(injection), '-');
+    assert.equal(miraMarks.get(legacy), 'not-shown');
+    // A call no agent made reads the record whole.
+    const operator = await h.call('extract', {});
+    const all = new Set(marks(operator.messages).map(([id]) => id));
+    for (const id of [injection, legacy, held]) assert.ok(all.has(id));
+    assert.equal('leftOut' in operator, false);
+  });
+
+  it("overview and semantic_search leave out mira's summaries for oren, who doesn't observe her, and not for mira, an operator or an observer (J-AF12)", async () => {
+    const h = await boot({ subconscious: true });
+    const now = Date.now();
+    const createdMs = now - 1_000;
+    const entry: TimeRangeSummaryEntry = {
+      id: 's1', level: 1, content: 'zz-miras-summary', tokens: 3, startMs: now - 60_000, endMs: now + 60_000,
+      firstMessageId: 'a', lastMessageId: 'b', firstSequence: 0, lastSequence: Number.MAX_SAFE_INTEGER, createdMs, sourceIds: [],
+    };
+    // mira's context, the one the module is bound to, holds one summary.
+    Object.assign(h.cm('mira'), {
+      getSummariesInRange: () => [entry],
+      getMaxSummaryLevel: () => 1,
+      getSummary: (id: string) => (id === 's1' ? { id: 's1', level: 1, content: entry.content, tokens: 3, created: createdMs } : null),
+    });
+
+    const overview = async (caller?: string) => {
+      const data = await h.call('overview', {}, caller);
+      const summarized = (data.entries as Array<Record<string, unknown>>).filter((e) => e.summarized === true);
+      assert.equal(summarized.length, 1, JSON.stringify(data));
+      return { data, entry: summarized[0]! };
+    };
+    const forOren = await overview('oren');
+    assert.equal(forOren.entry.content, null, "oren gets no text of mira's summary");
+    assert.equal(forOren.entry.contentLeftOut, true);
+    assert.equal(forOren.entry.level, 1, 'its level and counts stay');
+    assert.equal(typeof forOren.entry.messageCount, 'number');
+    assert.equal(forOren.data.summariesLeftOut, 1);
+    assert.equal(JSON.stringify(forOren.data).includes('zz-miras-summary'), false);
+    for (const caller of ['mira', undefined, 'Subconscious']) {
+      const seen = await overview(caller);
+      assert.equal(seen.entry.content, 'zz-miras-summary', `${caller ?? 'an operator'} gets the summary's text`);
+      assert.equal('contentLeftOut' in seen.entry, false);
+      assert.equal('summariesLeftOut' in seen.data, false);
+    }
+
+    const mod = new HistoryModule({ semantic: { url: 'http://127.0.0.1:9', namespace: 'n', syncIntervalMs: 0 } });
+    await mod.start(h.surface.ctx);
+    mod.bind(h.cm('mira'));
+    const internals = mod as unknown as { indexer: { dispose(): void } | null; semanticClient: { search: (q: unknown) => Promise<unknown> } };
+    internals.indexer?.dispose();
+    internals.indexer = null;
+    let searches = 0;
+    internals.semanticClient.search = async (q) => {
+      searches++;
+      const kinds = (q as { kinds?: string[] }).kinds;
+      const sum = { id: `sum:s1@${createdMs}`, score: 0.9, ts: entry.startMs / 1000, channel: null, kind: 'summary', level: 1, meta: {} };
+      const msg = { id: `msg:${h.ids.both}`, score: 0.8, ts: now / 1000, channel: 'discord:g1:c1', kind: 'message', level: null, meta: {} };
+      const hits = kinds?.[0] === 'summary' ? [sum] : [sum, msg];
+      return { namespace: 'n', hits, count_indexed: 2, timing_ms: { embed: 1, search: 1 } };
+    };
+    const semantic = async (caller: string | undefined, input: Record<string, unknown> = {}) => {
+      const data = await h.call('semantic_search', { query: 'zz', ...input }, caller, mod);
+      return { ids: (data.hits as Array<Record<string, unknown>>).map((x) => x.id), index: data.index as { leftOut?: number } };
+    };
+    const oren = await semantic('oren');
+    assert.deepEqual(oren.ids, [`msg:${h.ids.both}`], 'no sum: hit for oren');
+    assert.equal(oren.index.leftOut, 1, 'the summary hit is counted as left out');
+    for (const caller of ['mira', undefined, 'Subconscious']) {
+      const seen = await semantic(caller);
+      assert.deepEqual(seen.ids, ['sum:s1', `msg:${h.ids.both}`], `${caller ?? 'an operator'} gets the summary hit`);
+      assert.equal(seen.index.leftOut, undefined);
+    }
+    // A search of summaries alone keeps nothing for oren, so it isn't searched again deeper.
+    searches = 0;
+    const onlySummaries = await semantic('oren', { kinds: 'summaries', limit: 1 });
+    assert.deepEqual(onlySummaries.ids, []);
+    assert.equal(onlySummaries.index.leftOut, 1);
+    assert.equal(searches, 1);
+    await mod.stop();
   });
 
   it('the tool descriptions gain the window sentence only with the lookup, and are as they were without it', async () => {
@@ -211,7 +349,14 @@ describe("the history tools' window marks (#291, AF-7)", () => {
     assert.match(tools.get('semantic_search')!, /A message hit that isn't in your context carries `window`/);
     assert.doesNotMatch(tools.get('semantic_search')!, /a message you undid/);
     assert.match(plain.get('semantic_search')!, /a message you undid/);
-    for (const name of ['stats', 'overview']) assert.equal(tools.get(name), plain.get(name), `${name} is unchanged`);
+    assert.match(tools.get('semantic_search')!, /and so are summary hits when the summaries fold another agent's context/);
+    // stats is an aggregate over the record and stays as it was. overview's
+    // summaries' text is left out for another agent's call that doesn't
+    // observe the bound agent (FW-AF-7, J-AF12), so it gains a sentence too,
+    // which this test pinned as unchanged before.
+    assert.equal(tools.get('stats'), plain.get('stats'), 'stats is unchanged');
+    assert.ok(tools.get('overview')!.startsWith(plain.get('overview')!), 'overview keeps its description');
+    assert.match(tools.get('overview')!.slice(plain.get('overview')!.length), /^ The summaries fold one agent's context, the one this history is bound to/);
     await withLookup.stop();
   });
 });

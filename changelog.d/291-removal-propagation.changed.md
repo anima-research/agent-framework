@@ -7,9 +7,20 @@
   reads `'undone'` (`windowStatusOf`) and is marked so in the history tools. On a window that is still the record
   the shed removes the rows from it, as before.
 - For an agent's call, the history tools (`extract`, `search`, `semantic_search`) leave out another agent's own rows
-  (its rounds, its notes, a puppeted call) that the caller's window doesn't hold, unless the caller observes that
-  agent (#291, decision 1: seeing another agent's thread is a declared relationship), and count them as `leftOut`.
-  An `extract` around such a row answers that no message has its id. A call no agent made stays record-wide.
+  (its rounds, its notes, its stored context injections, a puppeted call) that the caller isn't shown, unless the
+  caller observes that agent (#291, decision 1: seeing another agent's thread is a declared relationship), and count
+  them as `leftOut`. A row the caller is shown is one its window holds and its view keeps: another agent's stored
+  injection, or a row a tune-out holds, in a resident's window written down from the shared record is never in its
+  requests, so the injection is left out and the held row is marked `not-shown`. A stored injection from before the
+  audience stamp counts as the own row of the agent its mark names. An `extract` around a row left out answers that
+  no message has its id. A call no agent made stays record-wide, and so does the bound agent's own.
+- The summaries the history module reads fold the context it is bound to, its agent's own rounds and notes among
+  them, so for another agent's call that doesn't observe that agent (#291, decision 1) they are left out, for now:
+  `overview` returns each summarized span with its time, level and counts and without its text (`content: null`,
+  `contentLeftOut: true`, counted in `summariesLeftOut`), and `semantic_search` leaves out summary hits, counted in
+  `index.leftOut`. A search of summaries alone for such a caller isn't searched again deeper. An agent's call where
+  the framework can't say whose context the module is bound to (no `ModuleContext.agentNameOf`, or a context that is
+  no live agent's) leaves them out too. Serving such a caller its own context's summaries is later work.
 - The host command's message-granular undo (`messages: n`) and offline recovery's count mode count back in the
   agent's window once it is presented, whose order isn't the record's, over the rows of the agent's own slot: a row
   of a slot the agent observes, such as a residents' row in a persistent subconscious's window, isn't counted, since

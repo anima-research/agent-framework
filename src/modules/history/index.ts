@@ -36,13 +36,25 @@
  * window is the rows its requests were given, which once agents share a
  * slot is not the whole record. Where the framework offers the window
  * lookup (ModuleContext.windowStatusOf), each entry `extract`, `search` and
- * `semantic_search` return for a row the caller's window doesn't hold says
- * so (`window: "not-shown" | "undone"`), relative to the agent whose call
- * it is, or to the delivery agent for a call no agent made; and for an
- * agent's call, another agent's own rows (its rounds, its notes) that its
- * window doesn't hold are left out unless it observes that agent
- * (decision 1), counted as `leftOut`. An operator's call stays record-wide.
- * `stats` and `overview` stay aggregates over the record, unmarked. Without
+ * `semantic_search` return for a row the caller isn't shown says so
+ * (`window: "not-shown" | "undone"`), relative to the agent whose call it
+ * is, or to the delivery agent for a call no agent made. A row the caller
+ * is shown is one its window holds and its view keeps
+ * (ModuleContext.viewKeeps): a window written down from the shared record
+ * can hold another agent's stored context injection or a held row, which
+ * its requests never carry. For an agent's call, another agent's own rows
+ * (its rounds, its notes, its stored injections) that it isn't shown are
+ * left out unless it observes that agent (decision 1), counted as
+ * `leftOut`. The summaries `overview` and `semantic_search` read fold the
+ * bound context's agent's window (ModuleContext.agentNameOf says whose), so
+ * for another agent's call that doesn't observe that agent they are left
+ * out too: `overview` keeps each summarized span's time, level and counts
+ * and leaves out its text (`content: null`, `contentLeftOut: true`,
+ * counted as `summariesLeftOut`), and `semantic_search` leaves out summary
+ * hits, counted in `index.leftOut`. That is for now; serving such a caller
+ * its own context's summaries is later work. An operator's call stays
+ * record-wide, and so does the bound agent's own. `stats` stays an
+ * aggregate over the record, unmarked, as do overview's counts. Without
  * the lookup every tool and every answer is as it was before the index.
  *
  * Every query dispatch collapses onto `queryMessagesByTimeAndChannel` — its
@@ -66,6 +78,7 @@ import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexTe
 import { unknownToolMessage } from '../unknown-tool.js';
 import { safeSlice } from '../../safe-slice.js';
 import { audienceOf } from '../../dendrite/audience.js';
+import { storedInjectionMarkOf } from '../../stored-injections.js';
 
 // ============================================================================
 // Tool input shapes
@@ -689,8 +702,10 @@ export class HistoryModule implements Module {
     // With the framework's window lookup (#291), entries say which rows the
     // caller isn't being shown, and another agent's own rows are left out
     // for an agent that doesn't observe it: one sentence more in each
-    // description that returns rows. Without it, the tools are as they were.
-    const windowNote = this.ctx?.windowStatusOf ? WINDOW_NOTE : '';
+    // description that returns rows, and in overview's, whose summaries'
+    // text is left out the same way. Without it, the tools are as they were.
+    const windowed = !!this.ctx?.windowStatusOf;
+    const windowNote = windowed ? WINDOW_NOTE : '';
     return [
       {
         name: 'stats',
@@ -811,7 +826,8 @@ export class HistoryModule implements Module {
           'with a clear error rather than silently returning no spans. An entry marked boundaryUncertain:true ' +
           'had a millisecond-timestamp collision at its edge with another span (rare — two distinct messages ' +
           'landing in the same millisecond); its messageCount is still exact but tokensEstimate may be off by ' +
-          'a small, bounded amount.',
+          'a small, bounded amount.' +
+          (windowed ? WINDOW_NOTE_OVERVIEW : ''),
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -898,7 +914,7 @@ export class HistoryModule implements Module {
         case 'search':
           return await this.handleSearch((call.input ?? {}) as SearchInput, this.viewFor(call));
         case 'overview':
-          return this.handleOverview((call.input ?? {}) as OverviewInput);
+          return this.handleOverview((call.input ?? {}) as OverviewInput, this.viewFor(call));
         case 'semantic_search':
           return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput, this.viewFor(call));
         default:
@@ -934,16 +950,31 @@ export class HistoryModule implements Module {
    * and then every entry is as it was before the presentation index. The
    * caller is the agent whose call it is (callerAgentName), or, for a call
    * no agent made (an operator's, a host's), the delivery agent, for marks
-   * only. A row the caller's window doesn't hold is marked (`window`); for
-   * an agent's call, another agent's own row (its rounds, its notes) that
-   * its window doesn't hold is left out, unless it observes that agent:
-   * seeing another agent's thread is a declared relationship (decision 1).
-   * Each row's status is read once per call.
+   * only. A row the caller is shown is one its window holds and its view
+   * keeps (ModuleContext.viewKeeps): a window written down from the record
+   * the residents share can hold another agent's stored context injection,
+   * or a row a tune-out holds from the residents, which the caller's
+   * requests never carry. A row the caller isn't shown is marked
+   * (`window`); for an agent's call, another agent's own row (its rounds,
+   * its notes, its stored injections) that it isn't shown is left out,
+   * unless it observes that agent: seeing another agent's thread is a
+   * declared relationship (decision 1). Each row's status is read once per
+   * call.
+   *
+   * The bound context's summaries fold its agent's window, that agent's own
+   * rounds and notes among it, so for another agent's call that doesn't
+   * observe that agent they are left out too (`leavesSummaries`). That is
+   * for now: serving such a caller summaries of its own context is later
+   * work. An agent's call where the framework can't say whose context the
+   * module is bound to (ModuleContext.agentNameOf missing, or answering
+   * that it is no live agent's) leaves them out as well. A call no agent
+   * made, and the bound agent's own, read them as before.
    */
   private viewFor(call: ToolCall): CallerView | undefined {
     const ctx = this.ctx;
     if (!ctx?.windowStatusOf) return undefined;
     const caller = call.callerAgentName;
+    const forCaller = caller === undefined ? undefined : { forAgent: caller };
     const statuses = new Map<string, WindowStatus | null>();
     // Set once a lookup throws: an agent the framework no longer knows. Its
     // rows carry no mark, and its window is taken as holding nothing.
@@ -954,7 +985,7 @@ export class HistoryModule implements Module {
       let status = statuses.get(id);
       if (status === undefined) {
         try {
-          status = ctx.windowStatusOf!(msg.id, caller === undefined ? undefined : { forAgent: caller });
+          status = ctx.windowStatusOf!(msg.id, forCaller);
         } catch {
           unknown = true;
           return null;
@@ -963,6 +994,25 @@ export class HistoryModule implements Module {
       }
       return status;
     };
+    // Whether the caller's view keeps a row its window holds. Without the
+    // lookup, every row its window holds is taken as shown, as before it.
+    const kept = new Map<string, boolean>();
+    const keeps = (msg: StoredMessage): boolean => {
+      if (!ctx.viewKeeps) return true;
+      const id = String(msg.id);
+      let keep = kept.get(id);
+      if (keep === undefined) {
+        try {
+          keep = ctx.viewKeeps(msg, forCaller);
+        } catch {
+          unknown = true;
+          return false;
+        }
+        kept.set(id, keep);
+      }
+      return keep;
+    };
+    const shown = (msg: StoredMessage): boolean => statusOf(msg) === 'in' && keeps(msg);
     const observed = new Map<string, boolean>();
     const observes = (owner: string): boolean => {
       let sees = observed.get(owner);
@@ -976,17 +1026,32 @@ export class HistoryModule implements Module {
       }
       return sees;
     };
+    let leavesSummaries = false;
+    if (caller !== undefined) {
+      let bound: string | undefined;
+      try {
+        bound = this.cm ? ctx.agentNameOf?.(this.cm) : undefined;
+      } catch {
+        bound = undefined;
+      }
+      leavesSummaries = bound === undefined || (bound !== caller && !observes(bound));
+    }
     return {
       mark: (msg) => {
         const status = statusOf(msg);
-        return status === 'undone' ? 'undone' : status === 'out' || status === 'absent' ? 'not-shown' : undefined;
+        if (status === 'undone') return 'undone';
+        if (status === 'out' || status === 'absent') return 'not-shown';
+        return status === 'in' && !keeps(msg) ? 'not-shown' : undefined;
       },
       leaves: (msg) => {
         if (caller === undefined) return false;
-        const owner = audienceOf(msg.metadata)?.ownRowOf;
+        // A stored injection from before the audience stamp names its agent
+        // in its own mark: it is that agent's context, as every view reads it.
+        const owner = audienceOf(msg.metadata)?.ownRowOf ?? storedInjectionMarkOf(msg.metadata)?.agent;
         if (owner === undefined || owner === caller) return false;
-        return statusOf(msg) !== 'in' && !observes(owner);
+        return !shown(msg) && !observes(owner);
       },
+      leavesSummaries,
     };
   }
 
@@ -1805,7 +1870,9 @@ export class HistoryModule implements Module {
     // undone message stays on it and comes back, marked `window: "undone"`
     // for the caller when the framework offers the window lookup (viewFor),
     // as is one the caller wasn't shown; another agent's own row the caller
-    // doesn't observe is left out (index.leftOut).
+    // doesn't observe is left out (index.leftOut), and so is a summary hit
+    // for another agent's call that doesn't observe the agent whose context
+    // the summaries fold (viewFor's leavesSummaries).
     // A branch made from an earlier point, as a rollback makes one, can mint
     // a summary id another branch already used, so a summary's key carries
     // its creation time too, and a hit whose time isn't this branch's
@@ -1852,6 +1919,7 @@ export class HistoryModule implements Module {
         if (!s) return 'offBranch';
         if (sum.createdMs === null) return 'superseded';
         if (s.created !== sum.createdMs) return 'offBranch';
+        if (view?.leavesSummaries) return 'leftOut';
         const text = summaryIndexText(s, this.semanticCfg!);
         // An empty text here is mostly defensive: context-manager drops a
         // summary that's empty after trimming when it loads, and refuses to
@@ -1890,9 +1958,12 @@ export class HistoryModule implements Module {
         return v === 'ok';
       });
     };
+    // A search of summaries alone, for a caller they're left out for, keeps
+    // no hit however deep it goes, so it isn't searched again.
+    const keepsNone = wantsSummariesOnly && view?.leavesSummaries === true;
     for (;;) {
       check();
-      if (onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
+      if (keepsNone || onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
       k = Math.min(SEMANTIC_MAX_FETCH, k * 4);
       try {
         res = await runSearch(k);
@@ -1961,7 +2032,7 @@ export class HistoryModule implements Module {
           droppedOffBranch,
           /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
           droppedStale,
-          /** Hits for another agent's own rows the caller isn't shown and doesn't observe, left out (#291); only when there were any. */
+          /** Hits left out for the caller (#291): another agent's own rows it isn't shown and doesn't observe, and, for another agent's call that doesn't observe the agent whose context the summaries fold, summary hits; only when there were any. */
           ...(leftOut > 0 ? { leftOut } : {}),
           /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
           searchAgainError,
@@ -1971,7 +2042,7 @@ export class HistoryModule implements Module {
     };
   }
 
-  private handleOverview(input: OverviewInput): ToolResult {
+  private handleOverview(input: OverviewInput, view?: CallerView): ToolResult {
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
@@ -2290,6 +2361,14 @@ export class HistoryModule implements Module {
     // `filtered.length - limit` has no such cliff, at limit:0 it's
     // `slice(filtered.length)` -> `[]`, the honest answer.
     const capped = truncated ? filtered.slice(filtered.length - limit) : filtered;
+    // The summaries fold the bound context's agent's window, its own rounds
+    // and notes among it (#291). For another agent's call that doesn't
+    // observe that agent (viewFor's leavesSummaries) a summarized span keeps
+    // its time, level and counts, which are the record's, and leaves out its
+    // text: `content: null` and `contentLeftOut: true`, counted at the top as
+    // `summariesLeftOut`.
+    const leavesContent = view?.leavesSummaries === true;
+    const summariesLeftOut = leavesContent ? capped.filter((e) => e.summarized).length : 0;
 
     return {
       success: true,
@@ -2307,6 +2386,7 @@ export class HistoryModule implements Module {
         ...(input.level !== undefined ? { level: input.level } : { maxLevelAvailable: cm.getMaxSummaryLevel() }),
         truncated,
         totalSpans,
+        ...(summariesLeftOut > 0 ? { summariesLeftOut } : {}),
         entries: capped.map((e) => {
           // When channelId narrows the response, the numbers an agent will
           // actually reason over (messageCount/tokensEstimate) are scoped
@@ -2324,7 +2404,11 @@ export class HistoryModule implements Module {
             from: new Date(e.startMs).toISOString(),
             to: new Date(e.endMs).toISOString(),
             summarized: e.summarized,
-            ...(e.summarized ? { content: e.content, level: e.level } : {}),
+            ...(e.summarized
+              ? leavesContent
+                ? { content: null, contentLeftOut: true, level: e.level }
+                : { content: e.content, level: e.level }
+              : {}),
             // Set only when this entry's boundary-tie disambiguation (see
             // the correction pass above) found and corrected a
             // millisecond-timestamp collision at its edge. messageCount is
@@ -2569,7 +2653,14 @@ const WINDOW_NOTE =
 const WINDOW_NOTE_SEMANTIC =
   ' A message hit that isn\'t in your context carries `window` ("undone" for one an undo or a refusal rewind took ' +
   'out of it, "not-shown" for one you were never shown); another agent\'s own turns and notes are left out unless ' +
-  'you observe that agent, counted in index.leftOut.';
+  'you observe that agent, and so are summary hits when the summaries fold another agent\'s context (the one this ' +
+  'history is bound to) and you don\'t observe that agent, all counted in index.leftOut.';
+
+/** overview's form of it: its entries are spans, and only a summary's text is the bound agent's. */
+const WINDOW_NOTE_OVERVIEW =
+  ' The summaries fold one agent\'s context, the one this history is bound to: when that isn\'t yours and you don\'t ' +
+  'observe that agent, a summarized span comes back with its time, level and counts but not its text ' +
+  '(content:null, contentLeftOut:true), and summariesLeftOut says how many did.';
 
 /**
  * Where a row an entry returns stands with the caller's window (#291), when
@@ -2582,10 +2673,12 @@ type WindowMark = 'not-shown' | 'undone';
 
 /** How one call's caller sees the record (HistoryModule.viewFor). */
 interface CallerView {
-  /** The row's mark for the caller, or undefined for a row in its window. */
+  /** The row's mark for the caller, or undefined for a row it is shown (its window holds it and its view keeps it). */
   mark(msg: StoredMessage): WindowMark | undefined;
-  /** Whether the row is left out for the caller: another agent's own row its window doesn't hold and it doesn't observe. */
+  /** Whether the row is left out for the caller: another agent's own row it isn't shown and whose agent it doesn't observe. */
   leaves(msg: StoredMessage): boolean;
+  /** Whether the bound context's summaries are left out for the caller: another agent's call that doesn't observe the agent whose context it is. */
+  readonly leavesSummaries: boolean;
 }
 
 /** `{ window }` for a defined mark, nothing otherwise, so an entry in the caller's window is as it always was. */
