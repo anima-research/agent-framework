@@ -9803,8 +9803,8 @@ export class AgentFramework {
    * Returns the agent's speech output when it finishes (no more tool calls).
    * Rejects with ProviderWaitNotSleptError when the run ends rather than sleep
    * a retryable failure's stated wait longer than the framework's ten-minute
-   * cap, and with a plain Error for any other ending, a stated wait its error
-   * policy declines among them.
+   * cap, or one it can't represent, and with a plain Error for any other
+   * ending, a stated wait its error policy declines among them.
    *
    * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
    * The task message should already be in the context manager.
