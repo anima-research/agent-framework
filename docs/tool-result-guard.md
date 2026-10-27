@@ -275,10 +275,6 @@ retroactive and does not rewrite results already accepted into memory.
 
 ## Known limits
 
-- **Explicit-send suppression across a budget restart.** A guard recovery
-  carries the same-turn send suppression, so a text-only recovery is held
-  where an explicit send may have posted (locus/hybrid). Context-budget
-  restarts still re-enter without it (inherited, unchanged here).
 - **Audit growth.** Every guarded batch, accepted ones included, archives
   `originals`, `content`, and `wireResults` indefinitely. There is no
   retention policy and no restore tool; large payloads are blobs, but a full
