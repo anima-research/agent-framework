@@ -5517,16 +5517,18 @@ export class AgentFramework {
   /**
    * The heartbeat's ticks and reminders for `agentName`, soonest first, which
    * the agent's rules decide as they decide a heartbeat push: one the rules
-   * would hold back is only a "maybe" (`certain` false). None for an agent
-   * the heartbeat doesn't wake. `whose` words them for the judge ("its
+   * would hold back is only a "maybe" (`certain` false). Each is probed as
+   * the event its delivery is judged by (deliverHeartbeat): a silent tick as
+   * silent, with the text it will bring, so a rule on the content or the
+   * silent flag decides the probe as it will decide the wake. None for an
+   * agent the heartbeat doesn't wake. `whose` words them for the judge ("its
    * heartbeat") or for the agent ("your heartbeat").
    */
   private heartbeatWakesFor(agentName: string, whose: 'its' | 'your' = 'its'): HeartbeatUpcomingWake[] {
     if (!this.heartbeat || !this.heartbeatTargets().includes(agentName)) return [];
-    const probe = (kind: 'heartbeat' | 'reminder'): boolean => !this.eventGate
-      || this.eventGate.probe(this.heartbeatGateEvent({ kind, eventId: 'probe', text: 'probe' })).trigger;
-    const wakes = { heartbeat: probe('heartbeat'), reminder: probe('reminder') };
-    return this.heartbeat.upcomingWakes(whose).map((w) => (wakes[w.kind] ? w : { ...w, certain: false }));
+    const wakes = (w: HeartbeatUpcomingWake): boolean => !this.eventGate
+      || this.eventGate.probe(this.heartbeatGateEvent({ kind: w.kind, eventId: 'probe', text: w.text, silent: w.silent })).trigger;
+    return this.heartbeat.upcomingWakes(whose).map((w) => (wakes(w) ? w : { ...w, certain: false }));
   }
 
   /**
@@ -5534,8 +5536,12 @@ export class AgentFramework {
    * (ms), as the skip_reply that armed it is told: the soonest of its ticks
    * and reminders that the agent's rules let wake it. Its turn cancels the
    * self-wake (EventGate.onInferenceStarted), so the confirmation says so.
+   * None while a gate.js script may decide: the gate consults it before the
+   * rules, and a probe can't (EventGate.probe), so the agent isn't told for
+   * certain of a wake the script may hold back.
    */
   private heartbeatWakeBefore(agentName: string, selfWakeAt: number): SkipReplyFirstWake | undefined {
+    if (this.eventGate?.scriptMayDecide()) return undefined;
     const now = Date.now();
     const first = this.heartbeatWakesFor(agentName, 'your').find((w) => w.certain && w.at < selfWakeAt);
     return first ? { inSeconds: Math.max(1, Math.round((first.at - now) / 1000)), what: first.what } : undefined;

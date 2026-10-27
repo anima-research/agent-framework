@@ -3334,6 +3334,13 @@ export class EventGate {
     return false;
   }
 
+  /** Whether a gate.js script may decide the next event (GateScript.mayDecide):
+   *  evaluate() consults it before the rules and probe() doesn't, so a probe
+   *  may not say what the gate will decide. */
+  scriptMayDecide(): boolean {
+    return this.gateScript.mayDecide();
+  }
+
   /**
    * Evaluate an event against the declarative policy table WITHOUT side
    * effects: no counters advance, no debounce batches form, no stats or

@@ -116,6 +116,11 @@ export interface HeartbeatOptions {
 export interface HeartbeatUpcomingWake extends UpcomingWake {
   kind: 'heartbeat' | 'reminder';
   at: number;
+  /** Whether it's a silent tick, delivered as one (HeartbeatWake's `silent`). */
+  silent: boolean;
+  /** The text it brings if it fires on time, as delivered: so the gate can
+   *  be asked about the very event it will judge. */
+  text: string;
 }
 
 /** A wake the heartbeat asks the framework to deliver. */
@@ -229,6 +234,11 @@ function callAt(dueAt: number, now: () => number, onDue: () => void): () => void
   return () => clearTimeout(timer);
 }
 
+/** The text a tick brings: the time, then its message. */
+function tickText(now: number, message: string, timeZone: string): string {
+  return `[current time: ${formatHeartbeatTime(now, timeZone)}] ${message}`;
+}
+
 /** The text a reminder brings: a header naming it, then its message. */
 export function reminderText(rem: Reminder, now: number, timeZone: string): string {
   let schedule = rem.everySeconds !== null ? `, repeats every ${rem.everySeconds}s` : `, set ${formatHeartbeatTime(rem.createdAt, timeZone)}`;
@@ -332,20 +342,27 @@ export class Heartbeat {
     const wakes: HeartbeatUpcomingWake[] = [];
     const s = this.state;
     if (!s.settings.paused && s.nextFireAt !== null) {
+      const at = Math.max(s.nextFireAt, this.notBefore);
+      const silent = s.settings.deliveryMode === 'silent';
       wakes.push({
         kind: 'heartbeat',
-        at: Math.max(s.nextFireAt, this.notBefore),
+        at,
         certain: true,
-        what: `${whose} heartbeat (${s.settings.deliveryMode === 'silent' ? 'a silent tick' : 'a check-in prompt'}, every ${shownLength(s.settings.intervalSeconds)})`,
+        what: `${whose} heartbeat (${silent ? 'a silent tick' : 'a check-in prompt'}, every ${shownLength(s.settings.intervalSeconds)})`,
+        silent,
+        text: tickText(at, s.settings.message, this.timeZone),
       });
     }
     for (const r of s.reminders) {
       const message = r.message.length > 80 ? `${r.message.slice(0, 77)}...` : r.message;
+      const at = Math.max(dueAt(r), this.notBefore);
       wakes.push({
         kind: 'reminder',
-        at: Math.max(dueAt(r), this.notBefore),
+        at,
         certain: true,
         what: `${whose} reminder ${JSON.stringify(message)}${r.everySeconds !== null ? ` (repeats every ${shownLength(r.everySeconds)})` : ''}`,
+        silent: false,
+        text: reminderText(r, at, this.timeZone),
       });
     }
     return wakes.sort((a, b) => a.at - b.at);
@@ -562,7 +579,7 @@ export class Heartbeat {
         kind: 'heartbeat',
         reason,
         silent,
-        text: `[current time: ${formatHeartbeatTime(now, this.timeZone)}] ${s.message}`,
+        text: tickText(now, s.message, this.timeZone),
         eventId: `heartbeat_${now}_${Math.random().toString(36).slice(2, 8)}`,
       });
       log(`fired heartbeat (${reason}${silent ? ', silent' : ''})`);
