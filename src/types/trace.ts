@@ -115,6 +115,23 @@ export type TraceEvent =
       stack?: string;
     })
   | (TraceEventBase & {
+      /**
+       * A turn waiting out its error policy's delay before a retry says so:
+       * as the wait begins, with when it is due to end, and again every 60
+       * seconds while it lasts, while its agent is the one registered under
+       * its name, and never after the wait ends (its time coming, a stop, or
+       * an abort). The failure being retried is the `inference:failed` just
+       * before it. A host watching for agents gone quiet can tell a waiting
+       * one from a stuck one by it.
+       */
+      type: 'inference:waiting';
+      agentName: string;
+      /** When the wait is due to end (epoch ms): it counts down by its
+       *  timers, so a stalled event loop can end it later. Absent for a wait
+       *  too long for a date. */
+      until?: number;
+    })
+  | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
