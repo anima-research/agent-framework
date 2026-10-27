@@ -66,7 +66,8 @@ export interface PassiveSampleConfig {
  * `"skip"`) the agent isn't woken, and the next batch is judged afresh. The
  * events are in its context either way when they're stored as they arrive, as
  * MCPL's channel and push events are, and as the framework's own modules store
- * theirs; a wait, like `defer`, adds nothing more. Rules are read in order, as ever: a mention rule placed ahead
+ * the message an event of theirs carries; a wait, like `defer`, adds nothing
+ * more. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
  * times out wakes the agent (fail open),
  * unless the host set its `onError` to `"skip"`.
