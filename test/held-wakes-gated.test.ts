@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Membrane, MockAdapter, NativeFormatter, rateLimitError } from '@animalabs/membrane';
 import type { ProviderRequest, ProviderRequestOptions, StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, AutobiographicalStrategy } from '../src/index.js';
-import type { EventResponse, HostModeStatus, Module, ProcessEvent, ProviderHold, TraceEvent } from '../src/index.js';
+import type { EventResponse, HostModeStatus, InferenceRequest, Module, ProcessEvent, ProviderHold, TraceEvent } from '../src/index.js';
 
 const QUOTA = "This request would exceed your account's rate limit.";
 const ACCELERATION = "This request would exceed your organization's rate limit acceleration limit.";
@@ -124,7 +124,9 @@ test('a text whose wake a hold keeps after a stop dropped its turn\'s retry coun
   const h = await host(t, { compressionModel: 'test-compression-model' });
   h.provider.primary = { message: ACCELERATION, retryAfterMs: 61_000 };
   h.text('the turn that fails into an acceleration hold');
-  await h.until('the hold keeping the turn for its retry', () => h.status().activeTurns === 1 && h.started() === 1 && !h.status().drained);
+  await h.until('the acceleration hold keeping the turn for its retry', () => h.logged.some((line) => /\[provider-cooldown\] agent=resident organization acceleration 429 .* 1 request\(s\) retained/.test(line)));
+  assert.equal(h.status().activeTurns, 1, 'the held retry is the turn');
+  assert.equal(h.status().drained, false);
   assert.equal(h.framework.abortInference('resident', 'stopped by its caller'), true);
   await h.until('the turn ended', () => h.status().activeTurns === 0);
   h.text('a text after the stop');
@@ -138,7 +140,9 @@ test("a text whose wake an acceleration hold keeps beside a turn's retry counts 
   const h = await host(t, { compressionModel: 'test-compression-model' });
   h.provider.primary = { message: ACCELERATION, retryAfterMs: 61_000 };
   h.text('the turn that fails into an acceleration hold');
-  await h.until('the hold keeping the turn for its retry', () => h.status().activeTurns === 1 && h.started() === 1 && !h.status().drained);
+  await h.until('the acceleration hold keeping the turn for its retry', () => h.logged.some((line) => /\[provider-cooldown\] agent=resident organization acceleration 429 .* 1 request\(s\) retained/.test(line)));
+  assert.equal(h.status().activeTurns, 1, 'the held retry is the turn');
+  assert.equal(h.status().drained, false);
   assert.equal(h.status().gatedRequests, 0, 'the retry is the turn, not a waiting request');
   h.text('a text during the hold');
   await h.until('the arrival counted', () => h.status().gatedRequests === 1);
@@ -146,4 +150,17 @@ test("a text whose wake an acceleration hold keeps beside a turn's retry counts 
   assert.equal(h.status().activeTurns, 1);
   assert.deepEqual(h.status().activeTurnAgents, ['resident']);
   assert.equal(h.started(), 1, 'no turn has started since the failure');
+});
+
+test("a wake in a scheduler pass's hands, while the pass awaits another agent's start, counts in gatedRequests", async (t) => {
+  const h = await host(t, { compressionModel: 'test-compression-model' });
+  const pass = new Map<string, InferenceRequest[]>([['resident', [{ agentName: 'resident', reason: 'admin-nudge', source: 'admin', timestamp: Date.now() }]]]);
+  const passes = (h.framework as unknown as { passRequests: Set<Map<string, InferenceRequest[]>> }).passRequests;
+  passes.add(pass);
+  try {
+    assert.equal(h.status().gatedRequests, 1);
+    assert.equal(h.status().drained, true);
+  } finally {
+    passes.delete(pass);
+  }
 });
