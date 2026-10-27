@@ -168,3 +168,25 @@ test('a request on stdin holding U+2028 or U+2029 inside a string gets its answe
     await api.close();
   }
 });
+
+test("the command's answers on stdout carry U+2028 and U+2029 escaped, and parse back to the same text", async () => {
+  const api = await standInApi();
+  const child = spawn(process.execPath, [BIN], { env: { PATH: process.env.PATH ?? '', AGENT_FRAMEWORK_WS_URL: api.url }, stdio: ['pipe', 'pipe', 'pipe'] });
+  try {
+    await within(api.connected, 10_000, 'the server connected to the stand-in API');
+    let out = '';
+    const answered = new Promise<void>((resolve) => child.stdout.on('data', (chunk) => {
+      out += String(chunk);
+      if (out.endsWith('\n') && out.includes('"id":9')) resolve();
+    }));
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'no\u2028such\u2029method' }) + '\n');
+    await within(answered, 10_000, 'the server answered');
+    assert.equal(/[\u2028\u2029]/.test(out), false, out);
+    const answer = JSON.parse(out.trim());
+    assert.equal(answer.id, 9);
+    assert.equal(answer.error.message, 'Method not found: no\u2028such\u2029method');
+  } finally {
+    child.kill();
+    await api.close();
+  }
+});

@@ -12,7 +12,7 @@
  */
 
 import WebSocket from 'ws';
-import { readLines } from '../line-reader.js';
+import { escapeLineSeparators, readLines } from '../line-reader.js';
 import type { ApiRequest, ApiResponse, ApiEvent } from './types.js';
 
 // ============================================================================
@@ -656,7 +656,7 @@ export class McpServer {
   }
 
   private send(message: JsonRpcResponse | JsonRpcNotification): void {
-    process.stdout.write(JSON.stringify(message) + '\n');
+    process.stdout.write(escapeLineSeparators(JSON.stringify(message)) + '\n');
   }
 
   close(): void {

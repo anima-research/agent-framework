@@ -22,7 +22,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
-import { readLines } from '../line-reader.js';
+import { escapeLineSeparators, readLines } from '../line-reader.js';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
@@ -459,7 +459,7 @@ export class StdioTransport extends McplTransport {
     // transport is ending it.
     if (this.pipeError) return;
     // stdin may be gone if the child died between the closed-check and here.
-    this.child.stdin?.write(json + '\n');
+    this.child.stdin?.write(escapeLineSeparators(json) + '\n');
   }
 
   private closing: Promise<void> | null = null;
@@ -693,7 +693,7 @@ export class WebSocketTransport extends McplTransport {
 
   writeLine(json: string): void {
     if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(json);
+      this.ws.send(escapeLineSeparators(json));
     }
   }
 

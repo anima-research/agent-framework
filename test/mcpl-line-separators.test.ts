@@ -109,3 +109,36 @@ test('once the host closes a stdio transport, a line its child writes after the 
   await transport.close();
   assert.deepEqual(lines, ['{"ready":true}']);
 });
+
+test('a line the host writes to a stdio server carries U+2028 and U+2029 escaped, and parses back to the same message', async () => {
+  const recordingServer = String.raw`
+let input = '';
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+  let end;
+  while ((end = input.indexOf('\n')) >= 0) {
+    process.stderr.write('WROTE ' + Buffer.from(input.slice(0, end), 'utf8').toString('hex') + '\n');
+    input = input.slice(end + 1);
+  }
+});
+setInterval(() => {}, 1000);
+`;
+  const transport = await StdioTransport.spawn({ id: 'recording', command: process.execPath, args: ['-e', recordingServer] });
+  try {
+    const heard = new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('the recording server heard no line within 10 s')), 10_000);
+      transport.on('stderr', (line: string) => {
+        if (!line.startsWith('WROTE ')) return;
+        clearTimeout(timer);
+        resolve(line.slice('WROTE '.length));
+      });
+    });
+    const request = { jsonrpc: '2.0', id: 7, method: 'channels/publish', params: { channelId: 'c1', content: [{ type: 'text', text: 'one\u2028two\u2029three' }] } };
+    transport.writeLine(JSON.stringify(request));
+    const written = Buffer.from(await heard, 'hex').toString('utf8');
+    assert.equal(/[\u2028\u2029]/.test(written), false, written);
+    assert.deepEqual(JSON.parse(written), request);
+  } finally {
+    await transport.close();
+  }
+});

@@ -52,3 +52,7 @@ export function readLines(input: Readable, onLine: (line: string) => void, onEnd
   input.on('end', onStreamEnd);
   return stop;
 }
+
+export function escapeLineSeparators(json: string): string {
+  return json.replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
