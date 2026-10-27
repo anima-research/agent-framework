@@ -186,15 +186,22 @@ describe('heartbeat: state across restarts', () => {
     writeFileSync(configPath, JSON.stringify({ intervalSeconds: 7200, paused: false, message: 'hello', deliveryMode: 'silent' }));
     const rem = { id: 'rem_abc', message: 'old one', createdAt: T0 - 1000, fireAt: T0 + 60_000, everySeconds: null };
     writeFileSync(remindersPath, JSON.stringify([rem, { junk: true }]));
-    const { hb, wakes } = heartbeat({ importFrom: { configPath, remindersPath } });
-    hb.start();
+    const before = [readFileSync(configPath), readFileSync(remindersPath)];
+    const first = heartbeat({ importFrom: { configPath, remindersPath } });
+    first.hb.start();
     assert.deepEqual(saved().settings, { intervalSeconds: 7200, paused: false, message: 'hello', deliveryMode: 'silent' });
     assert.deepEqual(saved().reminders, [rem]);
-    assert.ok(existsSync(configPath) && existsSync(remindersPath));
+    assert.ok(readFileSync(configPath).equals(before[0]!) && readFileSync(remindersPath).equals(before[1]!), 'the files are left byte for byte');
     mock.timers.tick(60_000);
-    assert.ok(wakes.some((w) => w.kind === 'reminder' && w.reminderId === 'rem_abc'));
+    assert.ok(first.wakes.some((w) => w.kind === 'reminder' && w.reminderId === 'rem_abc'));
     assert.ok(errors.some((e) => String(e[0]).includes('dropped reminder')));
-    hb.stop();
+    first.hb.stop();
+    // heartbeat-mcpl's files change after the import; a later start keeps what was imported.
+    writeFileSync(configPath, JSON.stringify({ intervalSeconds: 600, paused: true, message: 'changed', deliveryMode: 'message' }));
+    const second = heartbeat({ importFrom: { configPath, remindersPath } });
+    second.hb.start();
+    assert.deepEqual(saved().settings, { intervalSeconds: 7200, paused: false, message: 'hello', deliveryMode: 'silent' });
+    second.hb.stop();
   });
 
   it("imports heartbeat-mcpl's saved null interval as paused", () => {
@@ -287,9 +294,16 @@ describe('heartbeat: failures and old names', () => {
     assert.match(call(hb, 'heartbeat_status').data!, /Not saved: .* couldn't be read/);
     hb.stop();
     rmSync(path, { recursive: true });
+    // A repaired file in its place, read by the next start (not the missing-file path).
+    writeFileSync(path, JSON.stringify({
+      v: 1, settings: { intervalSeconds: 3600, paused: false, message: 'repaired', deliveryMode: 'message' }, nextFireAt: null, reminders: [],
+    }));
     hb.start();
+    assert.match(call(hb, 'heartbeat_status').data!, /message="repaired"/);
+    assert.doesNotMatch(call(hb, 'heartbeat_status').data!, /Not saved/);
     assert.equal(call(hb, 'heartbeat_configure', { intervalHours: 2 }).success, true);
     assert.equal(saved().settings.intervalSeconds, 7200);
+    assert.equal(saved().settings.message, 'repaired');
     hb.stop();
   });
 
@@ -392,7 +406,10 @@ describe('the framework\'s heartbeat', () => {
       pendingRequests: Array<{ agentName: string; reason: string; suppressProse?: boolean; silentHeartbeat?: { eventId: string; serverId: string } }>;
     };
     internals.heartbeat.start();
+    const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages().length;
+    const before = stored();
     internals.heartbeat.handleToolCall('heartbeat--heartbeat_trigger', {});
+    assert.equal(stored(), before, 'a silent tick stores no prompt');
     const [req] = internals.pendingRequests;
     assert.equal(req!.suppressProse, true);
     assert.equal(req!.silentHeartbeat!.serverId, 'heartbeat');
@@ -417,6 +434,136 @@ describe('the framework\'s heartbeat', () => {
         mcplServers: [server],
       }), new RegExp(`beside the MCPL server "${server.id}", which is heartbeat-mcpl or names its tools as the heartbeat's`));
     }
+  });
+
+  it("goes to the gate as a heartbeat push: the agent's rules decide its wake, a sleep doesn't hold it, and the judge's list follows the rules", async (t) => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const own = mkdtempSync(join(tmpdir(), 'heartbeat-fw-'));
+    const configPath = join(own, 'gate.json');
+    const framework = await AgentFramework.create({
+      storePath: join(own, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+      modules: [],
+      heartbeat: true,
+      gate: { configPath, config: { policies: [] } },
+    });
+    t.after(async () => { await framework.stop(); rmSync(own, { recursive: true, force: true }); });
+    const internals = framework as unknown as {
+      heartbeat: { start(): void; handleToolCall(name: string, input: unknown): { success: boolean } };
+      pendingRequests: Array<{ agentName: string; reason: string }>;
+      eventGate: { addPolicy(p: unknown): void; removePolicy(name: string): boolean; setSleep(s: number, n?: string, a?: string): unknown; clearSleep(): boolean; probeTable(): Array<{ probe: string; wouldWake: boolean }> };
+      upcomingWakesFor(n: string): Array<{ what: string; certain: boolean }>;
+    };
+    internals.heartbeat.start();
+    const tick = () => { internals.pendingRequests.length = 0; internals.heartbeat.handleToolCall('heartbeat--heartbeat_trigger', {}); return internals.pendingRequests.length; };
+    const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages().length;
+    assert.equal(tick(), 1, 'no rules: it wakes the agent');
+    internals.eventGate.addPolicy({ name: 'no-ticks', match: { scope: ['mcpl:push-event'], source: 'heartbeat' }, behavior: 'skip' });
+    const before = stored();
+    assert.equal(tick(), 0, 'a rule that skips heartbeat pushes holds it back');
+    assert.equal(stored(), before + 1, 'and its text is stored all the same, as a push is');
+    assert.equal(internals.eventGate.probeTable().find((r) => r.probe === 'heartbeat')!.wouldWake, false, "the probe's heartbeat row agrees");
+    assert.ok(internals.upcomingWakesFor('scout').some((w) => w.what.startsWith('its heartbeat') && !w.certain), 'the judge is told only "maybe"');
+    internals.eventGate.removePolicy('no-ticks');
+    internals.eventGate.setSleep(600, undefined, 'scout');
+    assert.equal(tick(), 1, 'a sleep lets it through, as it let the heartbeat server through');
+    internals.eventGate.clearSleep();
+    assert.ok(internals.upcomingWakesFor('scout').some((w) => w.what.startsWith('its heartbeat') && w.certain));
+  });
+
+  it('a defer default holds the tick back, as it held a heartbeat push', async (t) => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const own = mkdtempSync(join(tmpdir(), 'heartbeat-fw-'));
+    const framework = await AgentFramework.create({
+      storePath: join(own, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+      modules: [],
+      heartbeat: true,
+      gate: { configPath: join(own, 'gate.json'), config: { default: 'defer', policies: [] } },
+    });
+    t.after(async () => { await framework.stop(); rmSync(own, { recursive: true, force: true }); });
+    const internals = framework as unknown as {
+      heartbeat: { start(): void; handleToolCall(name: string, input: unknown): unknown };
+      pendingRequests: unknown[];
+    };
+    internals.heartbeat.start();
+    internals.heartbeat.handleToolCall('heartbeat--heartbeat_trigger', {});
+    assert.equal(internals.pendingRequests.length, 0);
+  });
+
+  it('answers every call path, wakes no ephemeral run, allows either name to an agent allowed one, and refuses heartbeat-mcpl at a runtime connect', async (t) => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const own = mkdtempSync(join(tmpdir(), 'heartbeat-fw-'));
+    const framework = await AgentFramework.create({
+      storePath: join(own, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' },
+        { name: 'narrow', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled', allowedTools: ['mcpl--heartbeat--heartbeat_status'] },
+      ],
+      modules: [],
+      heartbeat: true,
+    });
+    t.after(async () => { await framework.stop(); rmSync(own, { recursive: true, force: true }); });
+    const internals = framework as unknown as {
+      heartbeat: { start(): void };
+      agents: Map<string, unknown>;
+      ephemeralRuns: Map<string, unknown>;
+      heartbeatTargets(): string[];
+      mcplPrefixCollision(config: unknown): string | null;
+    };
+    internals.heartbeat.start();
+    // An in-process call (executeToolCall, as a script or a puppet takes) reaches the heartbeat.
+    const listed = await framework.executeToolCall({ id: 'x', name: 'heartbeat--reminder_list', input: {}, callerAgentName: 'scout' } as never);
+    assert.equal(listed.success, true, JSON.stringify(listed));
+    assert.match(String(listed.data), /No reminders set/);
+    // An ephemeral run is no resident: it isn't woken.
+    internals.agents.set('run-1', internals.agents.get('scout'));
+    internals.ephemeralRuns.set('run-1', {});
+    assert.deepEqual(internals.heartbeatTargets().sort(), ['narrow', 'scout']);
+    internals.ephemeralRuns.delete('run-1');
+    internals.agents.delete('run-1');
+    // allowedTools written for heartbeat-mcpl's name allows the framework's.
+    const narrow = framework.getAgent('narrow')!;
+    assert.equal(narrow.canUseTool('heartbeat--heartbeat_status'), true);
+    assert.equal(narrow.canUseTool('mcpl--heartbeat--heartbeat_status'), true);
+    assert.equal(narrow.canUseTool('heartbeat--reminder_add'), false);
+    // A heartbeat-mcpl connected or restarted at run time is refused, as at create.
+    assert.match(String(internals.mcplPrefixCollision({ id: 'ticks', command: 'node', args: ['heartbeat-mcpl/dist/src/index.js'] })),
+      /is heartbeat-mcpl, or names its tools as the heartbeat's/);
+    assert.equal(internals.mcplPrefixCollision({ id: 'discord', command: 'node', args: ['discord.js'] }), null);
+  });
+
+  it('refuses a heartbeat setting that is neither true, false, null nor an object', async () => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    for (const [value, says] of [['false', /heartbeat must be true, false or an object/], [0, /heartbeat must be true, false or an object/], [{ statePath: 3 }, /heartbeat.statePath must be a path/]] as const) {
+      await assert.rejects(AgentFramework.create({
+        storePath: join(dir, `store-bad-${String(value).length}`),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+        modules: [],
+        heartbeat: value as never,
+      }), says);
+    }
+    const off = await AgentFramework.create({
+      storePath: join(dir, 'store-null'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+      modules: [],
+      heartbeat: null,
+    });
+    assert.equal(off.getAllTools().some((tool) => tool.name.startsWith('heartbeat--')), false, 'null leaves it off');
+    await off.stop();
   });
 
   it("starts and stops with the framework, and refuses a fork's change while showing it the schedule", async (t) => {
@@ -445,10 +592,16 @@ describe('the framework\'s heartbeat', () => {
     const results: Array<{ isError?: boolean; error?: string; data?: unknown }> = [];
     const push = internals.pushEvent.bind(framework);
     internals.pushEvent = (event) => { if (event.type === 'tool-result') results.push(event.result!); else push(event); };
+    // A fork registered as an agent, as a real one is, so only its being a fork refuses it.
+    const agents = (framework as unknown as { agents: Map<string, unknown> }).agents;
+    agents.set('scout-conv-1', agents.get('scout'));
     internals.conversationAgentHomes.set('scout-conv-1', {});
     internals.dispatchHeartbeatToolCall('scout-conv-1', { id: 'a', name: 'heartbeat--reminder_add', input: { message: 'x', inMinutes: 1 } });
     internals.dispatchHeartbeatToolCall('scout-conv-1', { id: 'b', name: 'heartbeat--heartbeat_status', input: {} });
     internals.conversationAgentHomes.delete('scout-conv-1');
+    agents.delete('scout-conv-1');
+    const state = JSON.parse(readFileSync(join(own, 'store', 'config', 'heartbeat.json'), 'utf-8'));
+    assert.deepEqual(state.reminders, [], 'the refused reminder was not set');
     assert.equal(results[0]!.isError, true);
     assert.match(String(results[0]!.error), /Nothing was changed: the heartbeat and its reminders are the agent's, and wake its residents, so this conversation can't change them/);
     assert.equal(results[1]!.isError, undefined);

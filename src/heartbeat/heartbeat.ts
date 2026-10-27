@@ -12,10 +12,12 @@
  * This was heartbeat-mcpl, an MCPL server; it moved here so the framework
  * knows when the agent's next scheduled wake is (the reply judge is told,
  * EventGate.upcomingWakes) and needs no server, policy exchange or push
- * delivery to keep it. Its tools keep the names agents knew them by,
- * `heartbeat--heartbeat_status` and the rest, and its wakes are delivered as
- * they were: past the gate's rules and through a sleep, like the agent's own
- * `skip_reply` timer.
+ * delivery to keep it. Its tools are listed as `heartbeat--heartbeat_status`
+ * and the rest, and calls by heartbeat-mcpl's names (`mcpl--heartbeat--…`)
+ * reach them too. Its wakes go to the gate as that server's pushes did, a
+ * push from the server id `heartbeat`, so the agent's rules decide them as
+ * they decided those, and a sleep lets them through, as it let that server
+ * id through.
  *
  * State (the schedule, when the next tick is due, and the reminders) is one
  * JSON file, by default `{storePath}/config/heartbeat.json`. A first start
@@ -40,6 +42,28 @@ export const HEARTBEAT_TOOL_PREFIX = 'heartbeat--';
  *  and the default tool prefix: a call by that name, as the agent's context
  *  may still show them, reaches the same tool. */
 export const LEGACY_HEARTBEAT_TOOL_PREFIX = 'mcpl--heartbeat--';
+/**
+ * Whether an MCPL server is heartbeat-mcpl, or names its tools as the
+ * heartbeat's: by its id, a tool prefix of `heartbeat` or `mcpl--heartbeat`,
+ * or a command or argument that runs heartbeat-mcpl. The framework's
+ * heartbeat refuses one beside it, at create and at a runtime connect.
+ */
+export function isHeartbeatMcplServer(server: { id: string; toolPrefix?: string }): boolean {
+  if (server.id === 'heartbeat' || server.toolPrefix === 'heartbeat' || server.toolPrefix === 'mcpl--heartbeat') return true;
+  const { command, args } = server as { command?: unknown; args?: unknown };
+  const parts = [command, ...(Array.isArray(args) ? args : [])];
+  return parts.some((part) => typeof part === 'string' && /heartbeat-mcpl/.test(part));
+}
+
+/** A heartbeat tool's name under the other prefix, for a name under one: the
+ *  framework's `heartbeat--x` and heartbeat-mcpl's `mcpl--heartbeat--x` are
+ *  one tool. Undefined for any other name. */
+export function heartbeatToolAlias(name: string): string | undefined {
+  if (name.startsWith(LEGACY_HEARTBEAT_TOOL_PREFIX)) return `${HEARTBEAT_TOOL_PREFIX}${name.slice(LEGACY_HEARTBEAT_TOOL_PREFIX.length)}`;
+  if (name.startsWith(HEARTBEAT_TOOL_PREFIX)) return `${LEGACY_HEARTBEAT_TOOL_PREFIX}${name.slice(HEARTBEAT_TOOL_PREFIX.length)}`;
+  return undefined;
+}
+
 /** The tools that change the schedule, as against the two that only show it. */
 export const HEARTBEAT_CHANGING_TOOLS: readonly string[] = ['heartbeat_configure', 'heartbeat_trigger', 'reminder_add', 'reminder_cancel'];
 
