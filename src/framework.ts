@@ -7134,6 +7134,8 @@ export class AgentFramework {
   private setMcplServerConfig(config: McplServerConfig): void {
     this.mcplServerConfigs.set(config.id, config);
     referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+    // The gate's rule-order notes read which sources are servers.
+    this.eventGate?.sourcesChanged();
   }
 
   /** Register every RFC-005 reference in an MCPL peer's tool-result content
@@ -10510,8 +10512,10 @@ export class AgentFramework {
         'them. For a rule that only adds wakes ("also wake me every Nth event", ' +
         '"at most N an hour"), set `passthrough: true`: the events it doesn\'t ' +
         'wake for go on to your other rules. The result shows how a few common ' +
-        'events are decided before and after the change, and notes any rule the ' +
-        'new order keeps from applying, with what to do about it. Two common shapes:\n' +
+        'events are decided before and after the change. Its `shadowWarnings` ' +
+        'are notes on your whole rule list, not only this change, wherever an ' +
+        'earlier rule takes events a later one could get: each says whether that ' +
+        'matters and what to do about it. Two common shapes:\n' +
         '• Watch a FILE/workspace path: match on `mount` + `pathGlob`, e.g. ' +
         '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
         '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
@@ -30493,6 +30497,7 @@ export class AgentFramework {
       }
       this.mcplServerConfigs.delete(id);
       referenceRegistry.forgetServerAddress(id, this);
+      this.eventGate?.sourcesChanged();
 
       await this.refreshMcplTools();
       this.emitMcplToolDiff(oldToolNames, id);

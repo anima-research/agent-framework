@@ -311,6 +311,45 @@ describe('shadow lint', () => {
     assert.match(formatShadowWarning(warnings[0]), /takes "discord-all"'s mcpl:channel-incoming events, so "discord-all" applies only to its others/);
   });
 
+  it("says a rule never applies when an earlier rule's scope covers all of its scope, with no source known", () => {
+    const warnings = findShadowedPolicies([
+      { name: 'mcpl-catch-all', match: { scope: ['mcpl:push-event', 'mcpl:channel-incoming'] }, behavior: 'skip' },
+      { name: 'incoming', match: { scope: ['mcpl:channel-incoming'] }, behavior: 'always' },
+    ]);
+    assert.deepStrictEqual(
+      warnings.map((w) => ({ ...w })),
+      [{ earlier: 'mcpl-catch-all', later: 'incoming', eventTypes: ['mcpl:channel-incoming'], whole: true, known: true }],
+    );
+    assert.match(formatShadowWarning(warnings[0]), /^"incoming" never applies: "mcpl-catch-all" comes first/);
+  });
+
+  it("notes nothing for a rule whose scope its source narrows to nothing", () => {
+    const never = { name: 'world-cli', match: { source: 'world', scope: ['external-message'] }, behavior: 'always' as const };
+    assert.deepStrictEqual(findShadowedPolicies([CLI_INPUT, never], mcplServers('world')), []);
+    // Unknown, it's the whole of that rule.
+    assert.strictEqual(findShadowedPolicies([CLI_INPUT, never])[0].whole, true);
+  });
+
+  it("traces the notes again when the sources the host knows change, an empty list when the last goes, and not again for the same set", () => {
+    const known = new Set<string>();
+    const { gate, traces } = makeGate({ policies: [CLI_INPUT, WORLD], default: 'skip' }, (source) => (known.has(source) ? MCPL_GATE_EVENT_TYPES : undefined));
+    const shadowTraces = () => traces.filter((t) => t.type === 'gate:shadow-warnings');
+    assert.strictEqual(shadowTraces().length, 1, 'the start traces the note');
+    known.add('world');
+    gate.sourcesChanged();
+    assert.strictEqual(shadowTraces().length, 2);
+    assert.deepStrictEqual(shadowTraces()[1].warnings, []);
+    assert.strictEqual(shadowTraces()[1].reason, 'sources-changed');
+    gate.sourcesChanged();
+    // A rule change that brings no note doesn't trace the cleared one again.
+    gate.addPolicy({ name: 'unrelated', match: { source: 'other', scope: ['mcpl:push-event'] }, behavior: 'always' });
+    assert.strictEqual(shadowTraces().length, 2);
+    known.delete('world');
+    gate.sourcesChanged();
+    assert.strictEqual(shadowTraces().length, 3);
+    assert.strictEqual((shadowTraces()[2].warnings as string[]).length, 1);
+  });
+
   it("gate_status reads the sources the host knows now, as servers connect, with no change to the rules", () => {
     const known = new Set<string>();
     const { gate } = makeGate({ policies: [CLI_INPUT, WORLD], default: 'skip' }, (source) => (known.has(source) ? MCPL_GATE_EVENT_TYPES : undefined));

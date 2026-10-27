@@ -361,7 +361,9 @@ export interface ShadowWarning {
   earlier: string;
   /** Name of the later policy whose events it takes. */
   later: string;
-  /** Event types affected — 'all' when both rules are unscoped. */
+  /** Event types affected: those of `later`'s (its scope's, narrowed to the
+   *  ones its source is known to send) that `earlier` covers. 'all' only when
+   *  neither rule has a scope and `later`'s source could send any type. */
   eventTypes: string[] | 'all';
   /** Whether `earlier` takes every event `later` would match, so `later`
    *  never applies. */

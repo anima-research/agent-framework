@@ -3519,17 +3519,28 @@ export class EventGate {
   }
 
   /**
-   * Recompute shadow warnings and, when the set changed and is non-empty,
-   * emit a `gate:shadow-warnings` trace so the hazard lands in ops
-   * observability at the moment the order changed — not at the next missed
-   * DM. Called from writeConfig and reloadIfChanged.
+   * The sources the host knows changed (eventTypesFrom answers differently),
+   * as when an MCPL server connects or is removed: the rule-order notes are
+   * made again, and traced if they changed, as a change to the rules would.
+   */
+  sourcesChanged(): void {
+    this.refreshShadowWarnings('sources-changed');
+  }
+
+  /**
+   * Recompute shadow warnings and, when the set changed, emit a
+   * `gate:shadow-warnings` trace so the hazard lands in ops observability at
+   * the moment the order changed — not at the next missed DM — and, with an
+   * empty list, the moment the last of them went. Called from writeConfig,
+   * reloadIfChanged and sourcesChanged.
    */
   private refreshShadowWarnings(reason: string): void {
     const warnings = this.lintShadows();
     const fingerprint = JSON.stringify(warnings);
     if (fingerprint === this.shadowWarningsFingerprint) return;
+    const hadSome = this.shadowWarningsFingerprint !== '[]';
     this.shadowWarningsFingerprint = fingerprint;
-    if (warnings.length > 0) {
+    if (warnings.length > 0 || hadSome) {
       this.emitTrace({
         type: 'gate:shadow-warnings',
         reason,
