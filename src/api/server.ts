@@ -649,7 +649,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.undoLastTurn(params.agentName);
+    const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
+    await settled;
 
     if (result.undone) {
       this.broadcast('branch:switched', {
@@ -667,7 +668,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.redo(params.agentName);
+    const { settled, ...result } = this.framework.redo(params.agentName);
+    await settled;
 
     if (result.redone) {
       this.broadcast('branch:switched', {

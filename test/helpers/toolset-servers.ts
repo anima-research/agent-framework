@@ -19,6 +19,7 @@ import { ToolsetServer, type ToolsetServerSpec } from '@animalabs/mcpl-core/tool
 
 import { AgentFramework } from '../../src/index.js';
 import type { McplServerConfig } from '../../src/mcpl/types.js';
+import type { FrameworkConfig } from '../../src/types/framework.js';
 import type { Module, ModuleContext, ProcessEvent, ProcessState, EventResponse, ToolDefinition, ToolResult } from '../../src/index.js';
 import { MockMembrane } from './mock-membrane.js';
 
@@ -76,6 +77,8 @@ export async function startScriptedServer(opts: {
   tools: Json[];
   /** tools/list's `_meta["mcpl/rev"]`, read at each list. */
   listRev?: () => number | undefined;
+  /** Answers a tools/list itself when it returns true. */
+  onList?: (msg: Json, peer: ScriptedPeer) => boolean;
   on?: (msg: Json, peer: ScriptedPeer) => void;
 }) {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
@@ -105,6 +108,7 @@ export async function startScriptedServer(opts: {
           if (msg.id !== undefined) peer.reply(msg.id, { accepted: true });
           return;
         case 'tools/list': {
+          if (opts.onList?.(msg, peer)) return;
           const rev = opts.listRev?.();
           peer.reply(msg.id, { tools: opts.tools, ...(rev !== undefined ? { _meta: { 'mcpl/rev': rev } } : {}) });
           return;
@@ -166,8 +170,8 @@ class Quiet implements Module {
   }
 }
 
-/** A framework with one agent and the given MCPL servers. */
-export async function makeFramework(servers: McplServerConfig[]) {
+/** A framework with one agent and the given MCPL servers; `options` replaces any of its config. */
+export async function makeFramework(servers: McplServerConfig[], options: Partial<FrameworkConfig> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-toolsets-'));
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
@@ -176,6 +180,7 @@ export async function makeFramework(servers: McplServerConfig[]) {
     agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
     modules: [new Quiet()],
     mcplServers: servers,
+    ...options,
   });
   await framework.start();
   return {

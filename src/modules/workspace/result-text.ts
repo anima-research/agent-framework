@@ -30,6 +30,8 @@ export function shownValue(value: string | number | boolean | null): string {
   return JSON.stringify(value).replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }
 
+export type DiskState = 'done' | 'waits for materialize' | 'waits for materialize with applyDeletions' | 'in conflict with disk';
+
 /** A header line: a field's key and its value as shownValue writes it. */
 export const fieldLine = (key: string, value: string | number | boolean | null): string => `${key}: ${shownValue(value)}`;
 

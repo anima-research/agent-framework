@@ -226,7 +226,7 @@ test('edit and edit_many answer their counts and notes, the files edit_many chan
     const edit = await call('edit', { path: 'work/a.txt', oldString: 'four', newString: 'FOUR' }, 24_000);
     const done = fields<{ size: number; changed: string }>(edit);
     assert.equal(done.changed, '     2\ttwo\n     3\tthree\n     4\tFOUR\n     5\tfive\n     6\tsix');
-    assert.equal(textOf(edit), `path: work/a.txt\nsize: ${done.size}\nreplacements: 1\n--- changed ---\n${done.changed}`);
+    assert.equal(textOf(edit), `path: work/a.txt\nsize: ${done.size}\nreplacements: 1\ndisk: waits for materialize\n--- changed ---\n${done.changed}`);
 
     const many = await call('edit_many', { edits: [
       { path: 'work/a.txt', oldString: 'one', newString: 'ONE' },
@@ -237,6 +237,7 @@ test('edit and edit_many answer their counts and notes, the files edit_many chan
     assert.equal(textOf(many), [
       'edits: 2',
       'replacements: 2',
+      'disk: waits for materialize',
       '--- files ---',
       `work/a.txt: size ${both.files[0]!.size}, replacements 1, edits 1`,
       `work/b.txt: size ${both.files[1]!.size}, replacements 1, edits 2. The file's CRLF line ends are kept.`,
@@ -264,7 +265,7 @@ test("an edit's receipt is held to the call's limit as its text measures it", as
     const receipt = fields<{ files: unknown[]; filesNotListed: number }>(listed);
     assert.ok(receipt.filesNotListed > 0 && receipt.files.length > 0, `${receipt.files.length} listed, ${receipt.filesNotListed} not`);
     assert.equal(receipt.files.length + receipt.filesNotListed, 40);
-    assert.match(textOf(listed), new RegExp(`^edits: 40\nreplacements: 40\nfilesNotListed: ${receipt.filesNotListed}\n--- files ---\n`));
+    assert.match(textOf(listed), new RegExp(`^edits: 40\nreplacements: 40\ndisk: waits for materialize\nfilesNotListed: ${receipt.filesNotListed}\n--- files ---\n`));
     assert.ok(textOf(listed).length <= 1_000);
   });
 });
@@ -426,9 +427,9 @@ test("a receipt quotes a note and a kept mode that hold a line break, in edit's 
   const planned = planFile(decodeForEdit(bytes)!, bytes, [{ index: 0, oldText: 'old', newText: 'new', expected: 1 }]);
   assert.ok('plan' in planned);
   const file = { path: 'work/a.txt', plan: planned.plan, notes: ['note\nwith a break'], modeKept: 'kept\u2028here' };
-  assert.match(textOf(editReceipt('edit', [file], 1, 24_000)),
+  assert.match(textOf(editReceipt('edit', [file], 1, 24_000, 'done')),
     /\nnote: "note\\nwith a break"\nmodeKept: "kept\\u2028here"\n--- changed ---\n/);
-  assert.match(textOf(editReceipt('edit_many', [file, { path: 'work/b.txt', plan: planned.plan, notes: [] }], 2, 24_000)),
+  assert.match(textOf(editReceipt('edit_many', [file, { path: 'work/b.txt', plan: planned.plan, notes: [] }], 2, 24_000, 'done')),
     /\n--- files ---\nwork\/a\.txt: size 4, replacements 1, edits 1; modeKept: "kept\\u2028here"\. "note\\nwith a break"\nwork\/b\.txt: size 4, replacements 1, edits 1\n/);
 });
 

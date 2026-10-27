@@ -13,12 +13,12 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
-import { coversLanding, includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
+import { coversLanding, insideMount, patternRefusal, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
@@ -1642,33 +1642,28 @@ describe('mount include', () => {
     assert.equal(firstWritable(only), null, 'as a setup with no writable mount');
   });
 
-  test('a pattern holding "\\" is unreadable where "\\" is the separator, and part of a name where it isn\'t', () => {
-    // Windows reads every path with `\` as a separator, so no file there is named `sub\gate.json`.
-    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.equal(includePatternReadable(pattern, '\\'), false, pattern);
-    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(includePatternReadable(pattern, '\\'), true, pattern);
-    assert.equal(includePatternReadable('sub\\gate.json', '/'), true, 'where "/" is the separator, "\\" is a character of the name');
+  test('a pattern holding "\\" is refused on every platform, where "/" is the separator too', () => {
+    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.notEqual(patternRefusal(pattern, 'include'), undefined, pattern);
+    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(patternRefusal(pattern, 'include'), undefined, pattern);
   });
 
   test('include is checked when the module is built, and the refusal names the mount and what it refused', () => {
     const mount = (include: unknown): MountConfig => ({ name: 'work', path: '/tmp/x', mode: 'read-write', include } as MountConfig);
-    const refusal = (include: unknown, ending: string): void => {
+    const refusal = (include: unknown, said: string): void => {
       assert.throws(() => new WorkspaceModule({ mounts: [mount(include)] }), (err: unknown) => err instanceof Error
-        && err.message.startsWith('[workspace] Mount "work": include must be a non-empty list of names') && err.message.endsWith(ending),
-      ending);
+        && err.message.startsWith(`[workspace] Mount "work": ${said}`),
+      said);
     };
-    for (const bad of [[], 42, 'gate.json']) refusal(bad, `, not ${JSON.stringify(bad)}`);
-    for (const entry of ['sub/file.txt', 'foo*', '*', '*.', '*.js*', 'a/*/**', '/**', '', '.', '..', './**', '../**', 'a/../**', undefined]) {
-      refusal([entry], `; ${JSON.stringify(entry) ?? String(entry)} is none of these`);
+    for (const bad of [[], 42, 'gate.json']) refusal(bad, `include must be a non-empty list of patterns, not ${JSON.stringify(bad)}`);
+    for (const entry of ['/**', '', '.', '..', './**', '../**', 'a/../**', 'a\\b.json', undefined]) {
+      refusal([entry], `include pattern ${JSON.stringify(entry) ?? String(entry)} isn't read: `);
     }
-    // A value JSON can't write is shown as JavaScript writes it, not thrown on, inside a value too.
-    refusal([1n], '; 1n is none of these');
-    refusal({ pattern: 1n }, ', not [object Object]');
-    refusal(['gate.json', 'foo*'], '; "foo*" is none of these');
-    for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**']]) {
+    refusal([1n], 'include pattern 1n isn\'t read: ');
+    refusal({ pattern: 1n }, 'include must be a non-empty list of patterns, not [object Object]');
+    refusal(['gate.json', '!gate.json'], 'include pattern "!gate.json" isn\'t read: ');
+    for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**'], ['sub/file.txt'], ['foo*'], ['*'], ['*.'], ['*.js*'], ['a/*/**'], ['fixtures/'], ['/gate.json'], ['[id].tsx']]) {
       assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(good)] }), JSON.stringify(good));
     }
-    // Where "/" is the separator, "\" is part of a name, so a pattern may hold one.
-    if (sep === '/') assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(['a\\b.json'])] }), 'a pattern holding "\\"');
   });
 });
 
