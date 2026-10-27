@@ -31,9 +31,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
   EventResponse,
@@ -2177,7 +2177,10 @@ describe('ToolImageLedger', () => {
   });
 });
 
-it('a write that throws before its tree entry names the images already saved', async () => {
+it("a write that throws before its tree entry names the images already saved, and the error it sends the host's operator to is in the host's log", async () => {
+  const logged: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
   const h = await startTurn({
     prefix: 'sri-throw-',
     responses: [
@@ -2196,10 +2199,98 @@ it('a write that throws before its tree entry names the images already saved', a
   });
   try {
     const result = await waitForToolResult(h.framework, 'call_save');
+    console.error = realError;
     assert.equal(result.isError, true);
     assert.match(result.content, /injected tree exception/);
     assert.match(result.content, /already saved: files\/images-0.png/);
+    assert.match(result.content, /whoever runs this host can find the whole error in this host's log/);
+    assert.ok(logged.some((args) => args.some((a) => a instanceof Error && a.message === 'injected tree exception')), `logged: ${JSON.stringify(logged.map((args) => args.map(String)))}`);
+  } finally { console.error = realError; await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
+const ROOT_WRITES = typeof process.getuid === 'function' && process.getuid() === 0;
+
+it("a write the store refuses says why in plain words and who can fix it, and names the images already saved", {
+  skip: (process.platform === 'win32' && 'POSIX permissions') || (ROOT_WRITES && 'root writes past permissions'),
+}, async () => {
+  const h = await startTurn({
+    prefix: 'sri-store-refuses-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const write = workspace.writeBinary.bind(workspace);
+      let writes = 0;
+      workspace.writeBinary = async (...args) => {
+        if (++writes !== 2) return write(...args);
+        // The second image meets the store as a locked disk leaves it: given
+        // a byte more, it's a blob the store doesn't hold yet, and the
+        // store's directories can't be written, so the store's own write
+        // throws.
+        const [path, bytes, ...rest] = args;
+        const mounts = (workspace as unknown as { mounts: Map<string, { config: { path: string } }> }).mounts;
+        const dirs = [join(dirname(mounts.get('files')!.config.path), 'store')];
+        for (let i = 0; i < dirs.length; i++) {
+          for (const entry of readdirSync(dirs[i]!, { withFileTypes: true })) if (entry.isDirectory()) dirs.push(join(dirs[i]!, entry.name));
+        }
+        for (const dir of dirs) chmodSync(dir, 0o555);
+        try {
+          return await write(path, Buffer.concat([bytes, Buffer.from([0])]), ...rest);
+        } finally {
+          for (const dir of dirs) chmodSync(dir, 0o755);
+        }
+      };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    assert.equal(result.isError, true);
+    assert.ok(result.content.includes('save_recent_image: failed writing "files/images-1.png": permission denied. '
+      + "Calling again won't change that; whoever runs this host can change the permissions. (already saved: files/images-0.png)"), result.content);
+    assert.doesNotMatch(result.content, /IO error|os error/);
   } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
+it("a write the workspace refuses, as while its store awaits reopening, reaches the agent in the workspace's own words, and is in the host's log", async () => {
+  const logged: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  const h = await startTurn({
+    prefix: 'sri-refused-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const write = workspace.writeBinary.bind(workspace);
+      let writes = 0;
+      workspace.writeBinary = async (...args) => {
+        if (++writes === 2) {
+          // An append to the record of what disk last agreed with fails, so
+          // the workspace awaits its store's reopening and refuses changes.
+          const inner = workspace as unknown as { store: { appendJson: (...a: unknown[]) => unknown }; agreement: { set: (...a: unknown[]) => unknown } };
+          const append = inner.store.appendJson;
+          inner.store.appendJson = () => { throw Object.assign(new Error('IO error: No space left on device (os error 28)'), { code: 'GenericFailure' }); };
+          assert.throws(() => inner.agreement.set('files', 'other.txt', { kind: 'absent' }));
+          inner.store.appendJson = append;
+        }
+        return write(...args);
+      };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    console.error = realError;
+    assert.equal(result.isError, true);
+    assert.ok(result.content.includes('save_recent_image: failed writing "files/images-1.png": the workspace can\'t check its files against disk until its store is reopened: '
+      + 'an append to its record of what disk last agreed with failed inside the store, so that record may lack what the append held. '
+      + "Calling again won't change that; whoever runs this host can reopen it with a restart. (already saved: files/images-0.png)"), result.content);
+    assert.ok(logged.some((args) => args.some((a) => a instanceof Error && a.message.startsWith("the workspace can't check its files against disk until its store is reopened"))),
+      `logged: ${JSON.stringify(logged.map((args) => args.map(String)))}`);
+  } finally { console.error = realError; await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
 });
 
 it('a save whose write fails after its tree entry, through the workspace itself, is reported saved with its failure', async () => {

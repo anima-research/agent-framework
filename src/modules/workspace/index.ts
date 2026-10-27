@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, storedBytes, DEFAULT_MAX_FILE_SIZE, type StoredBytes } from './sync.js';
 import { DiskAgreement, EvidenceUnavailable, callGate, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { CHANGED, DIRECTORY, IGNORED, LEAVES_MOUNT, NONBLOCK, NOT_FOLLOWED, NOT_REGULAR, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, directoryAt, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, patternRefusal, readBytes, readPrefix, realSegments, restBeneath, rootAbsence, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { CHANGED, type Cause, DIRECTORY, IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beneathRoot, checkDir, checkRoot, confirmAbsent, coversLanding, directoryAt, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, nestedAtReal, nestedGuess, nestedHolder, nestedStep, observePath, parsedSpelling, passedOverAt, pathSegments, patternRefusal, readBytes, readPrefix, realSegments, restBeneath, rootAbsence, sameRoot, shownLeads, sniffImageMime, surelyAtRoot, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedGuess, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -60,12 +60,14 @@ import {
   NOT_PUSHED_IN_OTHER_MOUNT,
   WALK_CAP,
   entryMode,
+  explained,
   pushPaths,
   reconcilePass,
   settleAdoptionBeforeMutation,
+  wayOn,
 } from './reconcile.js';
 import { EffectFailed, unlinkContained } from './effects.js';
-import { AWAITS_REOPEN, ROOT_RECHECK, ROOT_UNCHECKED, Refusal, changesFiles, didNothing, errnoCode, errnoWayOn, errnoWords, hostFix, onlyTheHost, systemWords, unexpectedAnswer } from './answers.js';
+import { AWAITS_REOPEN, MOUNT_IT, ROOT_RECHECK, Refusal, UNFOLLOWED_STEP, changesFiles, didNothing, errnoCode, errnoWayOn, errnoWords, hostFix, onlyTheHost, systemWords, unexpectedAnswer } from './answers.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { closestNames } from '../../closest-names.js';
 import { RecordJournal } from '../../record-journal.js';
@@ -270,6 +272,12 @@ class NotRegularFile extends WorkspaceReadError {
   }
 }
 
+class LinkOnTheWay extends WorkspaceReadError {
+  constructor(code: WorkspaceReadErrorCode, message: string, readonly reason: string, errno?: string) {
+    super(code, message, 'readlink', errno);
+  }
+}
+
 class RootUnavailable extends WorkspaceReadError {
   constructor(readonly mount: string, readonly reason: string | null, stage: WorkspaceReadStage, errno?: string, readonly refusal?: Refusal) {
     super('mount_unavailable', reason === null ? `Mount unavailable: ${mount}` : `Mount unavailable: ${mount}: ${reason}`, stage, errno);
@@ -316,10 +324,10 @@ export interface ReadFileFromDiskOptions {
  * Why a pass decided nothing, or null where it decided its paths. A pass gives
  * up deciding, and reports no path, when the selected branch kept changing
  * while it gathered, or when a sync's branch was no longer selected; it then
- * carries no branchId, and the region it leaves incomplete says why.
+ * carries no branchId, and says why in `undecided`.
  */
 function undecidedOf(pass: PassResult): string | null {
-  return pass.branchId === undefined ? (pass.incomplete[0]?.reason ?? 'the pass decided nothing') : null;
+  return pass.branchId === undefined ? (pass.undecided ?? 'the pass decided nothing') : null;
 }
 
 function errnoOf(err: unknown): string | undefined {
@@ -385,15 +393,16 @@ async function linkReadError(
   rootReal: string,
 ): Promise<WorkspaceReadError> {
   if (!('link' in found)) {
-    return new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${linkWords(mount.config.name, found, null)}`, 'readlink', found.code);
+    const reason = linkWords(mount.config.name, found, null);
+    return new LinkOnTheWay('not_found', `Unable to read file: ${mountPrefixedPath}: ${reason}`, reason, found.code);
   }
   const leads = await shownLeads(rootReal, rootReal, found, mount.config.include);
-  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested, mount.config.include)}`;
+  const reason = linkWords(mount.config.name, found, leads, nested, mount.config.include);
   const holder = leads?.kind === 'inside' ? nestedHolder(leads.target, nested) : undefined;
   const code = leads?.kind === 'outside' ? 'escape'
     : leads?.kind === 'inside' && holder && namesHolder(leads, nested) ? 'other_mount'
     : relativePath === found.link ? 'symlink' : 'parent_symlink';
-  return new WorkspaceReadError(code, reason, 'readlink');
+  return new LinkOnTheWay(code, `${mountPrefixedPath}: ${reason}`, reason);
 }
 
 /**
@@ -3133,6 +3142,14 @@ export class WorkspaceModule implements Module {
     return names.length === 0 ? 'this workspace has no mounts' : `the mounts are ${listed(names.map((name) => JSON.stringify(name)))}`;
   }
 
+  private emptyPathField(mount: string | undefined, bare: string): string {
+    const empty = '"path" is "", which names no file or directory.';
+    if (mount === undefined) return `${empty} Leaving "path" out ${bare}.`;
+    if (mount === '') return `${empty} "mount" is "" too; leaving both out ${bare}.`;
+    if (this.mounts.has(mount)) return `${empty} Leaving "path" out covers mount ${JSON.stringify(mount)}.`;
+    return `${empty} "mount" is ${JSON.stringify(mount)}, which is no mount's name; ${this.mountList()}. Leaving both out ${bare}.`;
+  }
+
   private noSuchMountField(given: string, bare: string): string {
     const [close] = closestNames(given, [...this.mounts.keys()], 1);
     return `"mount" is ${JSON.stringify(given)}, which is no mount's name; ${this.mountList()}.`
@@ -3896,7 +3913,7 @@ export class WorkspaceModule implements Module {
         return `${shown} is in conflict: the workspace deleted it and disk changed it since. ` +
           'Sync this path to take the disk version.';
       case 'unverified':
-        return uncheckedFile(shown, report.note);
+        return uncheckedFile(shown, report.note, report.noteCause ?? {});
       default:
         return missing ?? `there's no file at ${shown}. ls or glob lists the files that exist.`;
     }
@@ -4063,8 +4080,8 @@ export class WorkspaceModule implements Module {
     const rootReal = await realpath(root).catch(() => root);
     const view = this.viewOf(mount, this.agreementOrThrow().rootIdentityForRead(mount.config.name));
     const proof = await confirmAbsent(view, rootReal, relativePath);
-    if (typeof proof !== 'string') return 'none';
-    return { unreadable: proof === CHANGED ? containedRefusal(err, path) : proof };
+    if (!('reason' in proof)) return 'none';
+    return { unreadable: proof.reason === CHANGED ? containedRefusal(err, path) : proof.reason };
   }
 
   private async restoreEach<T extends { relativePath: string; file: string; hash: string; size: number; what: 'saved' | 'conflict-disk' }>(
@@ -5031,7 +5048,7 @@ export class WorkspaceModule implements Module {
         // whether the file is gone, so it's taken as the agent's write too.
         if (error instanceof EffectFailed && error.touched) {
           this.recordDirectWrite(mount, agentName, since);
-          return { success: false, isError: true, error: `The delete of ${path} failed after it reached the file, so the file may be gone: ${directReason(error)}. ls shows whether it is.` };
+          return { success: false, isError: true, error: `The delete of ${JSON.stringify(path)} failed after it reached the file, so the file may be gone: ${directReason(error)}. ls shows whether it is.` };
         }
         return { success: false, isError: true, error: directDidNothing('delete', path, error) };
       }
@@ -5384,7 +5401,8 @@ export class WorkspaceModule implements Module {
       .filter((region) => region.kind === 'error' || region.kind === 'cap' || (region.kind === 'ignored' && region.path === dir && dir !== ''))
       .map((region) => ({
         path: region.path,
-        reason: region.reason === OTHER_MOUNT ? this.otherMountNote(mount.config.name, region.path, 'list', moved) : region.reason,
+        reason: region.reason === OTHER_MOUNT ? this.otherMountNote(mount.config.name, region.path, 'list', moved)
+          : explained(region.reason, region.errno !== undefined ? { errno: region.errno } : {}, 'list'),
       }));
     return {
       view,
@@ -6003,7 +6021,10 @@ export class WorkspaceModule implements Module {
     const modesKept: Array<{ mount: string; path: string; reason: string }> = [];
 
     let explicit: { mount: MountState; relativePath: string } | null = null;
-    if (input.path) {
+    if (input.path !== undefined) {
+      if (input.path === '') {
+        return { success: false, error: didNothing('materialize', this.emptyPathField(input.mount, "covers every mount that takes writes and doesn't already write them straight to disk")), isError: true };
+      }
       const parsed = await this.parsePath(input.path);
       explicit = parsed;
       // A path outside the mount's include that's no scope (refusesAsOutside)
@@ -6017,7 +6038,7 @@ export class WorkspaceModule implements Module {
     let mountsToMaterialize: Array<{ name: string; mount: MountState }>;
     if (explicit) {
       mountsToMaterialize = [{ name: explicit.mount.config.name, mount: explicit.mount }];
-    } else if (input.mount) {
+    } else if (input.mount !== undefined) {
       const m = this.mounts.get(input.mount);
       if (!m) {
         return { success: false, error: didNothing('materialize', this.noSuchMountField(input.mount, "covers every mount that takes writes and doesn't already write them straight to disk")), isError: true };
@@ -6224,7 +6245,8 @@ export class WorkspaceModule implements Module {
 
     // A path names its own mount; otherwise the given mount, or every mount.
     let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
-    if (input.path) {
+    if (input.path !== undefined) {
+      if (input.path === '') return { success: false, error: didNothing('sync', this.emptyPathField(input.mount, 'covers every mount')), isError: true };
       const { mount, relativePath, moved, root } = await this.parsePath(input.path);
       // A path outside the mount's include that's no scope (refusesAsOutside)
       // is refused; beneath a directory, the walk passes over what the include
@@ -6233,7 +6255,7 @@ export class WorkspaceModule implements Module {
         return { success: false, error: didNothing('sync', new OutsideIncludeError(input.path, mount.config).message), isError: true };
       }
       targets = [{ name: mount.config.name, mount, relativePath }];
-    } else if (input.mount) {
+    } else if (input.mount !== undefined) {
       const m = this.mounts.get(input.mount);
       if (!m) {
         return { success: false, error: didNothing('sync', this.noSuchMountField(input.mount, 'covers every mount')), isError: true };
@@ -6312,7 +6334,7 @@ export class WorkspaceModule implements Module {
       // refused" don't look identical from the outside.
       for (const r of pass.reports.values()) {
         if (r.state === 'unverified') {
-          allSkipped.push({ mount: name, path: r.path, reason: `disk could not be checked: ${r.note ?? 'not observed'}` });
+          allSkipped.push({ mount: name, path: r.path, reason: `disk could not be checked: ${explained(r.note ?? 'not observed', r.noteCause ?? {}, 'sync')}` });
         } else if (r.state === 'disk-only') {
           allSkipped.push({ mount: name, path: r.path, reason: 'disk-only: binary or over the size limit, never stored' });
         }
@@ -6799,7 +6821,13 @@ function directReason(error: unknown): string {
 }
 
 function directWayOn(error: unknown): string | null {
-  return error instanceof FileChanged ? 'Calling again reads it afresh.' : error instanceof WriteRefused ? error.wayOn : null;
+  if (error instanceof FileChanged) return 'Calling again reads it afresh.';
+  if (error instanceof WriteRefused) return error.wayOn;
+  if (error instanceof EffectFailed) {
+    if (error.detail.errno !== undefined) return errnoWayOn(error.detail.errno);
+    if (error.detail.again === true) return 'Calling again checks it afresh.';
+  }
+  return null;
 }
 
 function directDidNothing(tool: string, path: string, error: unknown): string {
@@ -6837,16 +6865,11 @@ function deletedOnDisk(path: string): string {
   return `there's no file at ${JSON.stringify(path)} any more: disk's copy was deleted since the workspace last agreed with it, and the workspace took that in first. ls or glob lists the files that exist.`;
 }
 
-function uncheckedFile(shown: string, note: string | undefined): string {
+function uncheckedFile(shown: string, note: string | undefined, cause: Cause): string {
   if (note === DIRECTORY) return `${shown} is a directory, not a file; ls ${shown} lists what's in it.`;
-  const on = note === ROOT_UNAVAILABLE ? ROOT_UNCHECKED
-    : note === ROOT_REPLACED ? null
-      : note === NOT_FOLLOWED ? "Calling again won't change that; if you know the file it leads to, name that file by its own path."
-        : note === LEAVES_MOUNT ? "Calling again won't change that; if a mount holds the file it leads to, name it by its path there."
-          : note === NOT_REGULAR ? onlyTheHost('put a regular file there')
-            : note === CHANGED ? 'Calling again checks it afresh.'
-              : 'Calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk.';
-  return `${shown} isn't in the workspace, and disk couldn't be checked: ${sentence(note ?? 'not observed')}${on !== null ? ` ${on}` : ''}`;
+  const on = note === ROOT_REPLACED || cause.ownStep === true ? null
+    : (note === undefined ? null : wayOn(note, cause, 'read')) ?? 'calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk';
+  return `${shown} isn't in the workspace, and disk couldn't be checked: ${sentence(note ?? 'not observed')}${on !== null ? ` ${on[0]!.toUpperCase()}${sentence(on.slice(1))}` : ''}`;
 }
 
 function namesRoot(path: string, mount: string): string {
@@ -6887,16 +6910,16 @@ function readRefusal(err: WorkspaceReadError, path: string): string {
     }
     return `${shown} can't be read: ${sentence(err.reason)}`;
   }
-  if (err.stage === 'readlink') return sentence(err.message);
+  if (err instanceof LinkOnTheWay) return `${shown} can't be reached: ${sentence(err.reason)}`;
   switch (err.code) {
     case 'directory':
       return `${shown} is a directory, not a file; ls ${shown} lists what's in it.`;
     case 'symlink':
       return `${shown} is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. `
-        + 'Calling again won\'t change that; if you know the file it leads to, name that file by its own path.';
+        + `Calling again won't change that; ${UNFOLLOWED_STEP}.`;
     case 'escape':
       return `${shown} leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. `
-        + 'Calling again won\'t change that; if a mount holds that file, name it by its path there.';
+        + `Calling again won't change that; ${MOUNT_IT}.`;
     case 'changed':
       return `${shown} changed on disk while it was being read. Calling again reads it afresh.`;
     case 'not_found':
