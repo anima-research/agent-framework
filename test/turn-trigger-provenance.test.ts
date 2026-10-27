@@ -586,6 +586,32 @@ describe('private wins, one way', () => {
     });
   }
 
+  for (const [kind, tag, mark] of [['ambient', 'chat:ambient', 'ambient'], ['system', 'chat:system', 'systemNotice']] as const) {
+    it(`a stored room message tagged ${kind}, whose wake waits for a private turn's budget restart, starts no turn once the restart has answered, reaches no channel, and isn't named`, async () => {
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => {
+        const id = framework!.getAgent('scout')!.getContextManager().addMessage('user', [{ type: 'text', text: 'a word from the room' }], { channelId: ROOM, serverId: 'discord', tags: [tag] } as never);
+        internals(framework!).pendingRequests.push({ ...roomWake(), addressed: false, [mark]: true, readsStoredMessage: id } as never);
+      });
+      const rig = await surfaceRig({ maxStreamTokens: 5, modules: [tool] });
+      framework = rig.framework;
+      try {
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+        rig.framework.pushEvent(tuiMessage());
+        await rig.until(() => rig.starts.length >= 2, 'the turn and its restart');
+        await rig.until(() => rig.framework.getAgent('scout')!.state.status === 'idle' && rig.i.pendingRequests.length === 0, 'the wake judged');
+        await rig.framework.runUntilIdle();
+        await new Promise((r) => setTimeout(r, 100));
+        await rig.framework.runUntilIdle();
+        assert.deepEqual(rig.starts.map((s) => s.reason), ['external-message', 'context_budget_restart'], `the wake is dropped: ${JSON.stringify(rig.starts)}`);
+        assert.deepEqual(rig.routed, [], 'nothing reached a channel');
+        assert.deepEqual(rig.texts().filter((t) => t.startsWith('[routing] This private turn also holds')), [], 'no notice names the room');
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
   it("a boundary that injects a private surface's message makes the room's turn private from there, and its notice rides the injections", async () => {
     let framework: AgentFramework | undefined;
     const tool = robot(() => framework!.pushEvent(tuiMessage('for your eyes only')));
@@ -877,6 +903,34 @@ describe('private wins, one way', () => {
       }
     }
   });
+
+  for (const how of ['private from its start', 'private from a tool boundary', 'a channel turn'] as const) {
+    it(`in explicit mode, a turn that wrote a >> target and then sleeps announces ${how === 'a channel turn' ? 'there, as a channel turn' : `nowhere, ${how}`}`, async () => {
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => { if (how === 'private from a tool boundary') framework!.pushEvent(tuiMessage('for your eyes only')); });
+      const rig = await surfaceRig({ gate: { config: { policies: [], default: 'always' } }, agent: { proseRouting: 'explicit' }, modules: [tool] });
+      framework = rig.framework;
+      try {
+        rig.membrane.pushResponse(createMockResponse([
+          { type: 'text', text: '>>discord:g:other a note for them' },
+          { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+        ] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 60, message: 'going quiet' } }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([]));
+        if (how === 'private from its start') rig.framework.pushEvent(tuiMessage()); else rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => rig.starts.length >= 1, 'the turn');
+        await rig.framework.runUntilIdle();
+        await new Promise((r) => setTimeout(r, 50));
+        assert.deepEqual(rig.routed, [
+          { text: 'a note for them', locus: 'discord:g:other' },
+          ...(how === 'a channel turn' ? [{ text: 'going quiet', locus: 'discord:g:other' }] : []),
+        ], JSON.stringify(rig.routed));
+      } finally {
+        (rig.framework as unknown as { eventGate: { clearSleep(): unknown } }).eventGate.clearSleep();
+        await rig.close();
+      }
+    });
+  }
 
   it("a silent turn's boundary that stores private input makes that turn private and marks the next start", async () => {
     let framework: AgentFramework | undefined;
