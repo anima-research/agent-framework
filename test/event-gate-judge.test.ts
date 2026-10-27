@@ -14,8 +14,9 @@ function writeConfig(name: string, config: unknown): string {
   return path;
 }
 
-// node:test's mock timers leave setImmediate real, so promise chains and I/O
-// callbacks run between the mocked clock's steps.
+// node:test's mock timers leave setImmediate real, so promise chains, and I/O
+// callbacks already due, run between the mocked clock's steps; slower I/O
+// isn't waited for.
 async function settle(): Promise<void> {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
 }
@@ -223,6 +224,21 @@ describe('judge rules: verdicts', () => {
     assert.deepStrictEqual(state.verdicts, { reply: 1, wait: 0, error: 0, refused: 0 });
     assert.strictEqual(state.last!.reason, 'a direct question');
     assert.strictEqual(state.last!.inputTokens, 1234);
+    gate.dispose();
+  });
+
+  it('a wait on an event outside MCPL writes nothing either, as defer doesn\'t: its module stores its own message', async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes, messages } = makeGate(writeConfig('wait-module-event.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { judge: { debounceMs: 30 } } }],
+    }), { judge: judge.fn });
+    gate.evaluate({ content: 'notes.md changed', eventType: 'workspace:modified', serverId: 'workspace', channelId: '' });
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.answer({ reply: false, reason: 'nothing to answer' });
+    await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the verdict applied');
+    await advance(50);
+    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(wakes.length, 0);
     gate.dispose();
   });
 
@@ -1964,7 +1980,8 @@ describe('a mention rule ahead of a judge rule, end to end over an MCPL server',
   const GENERAL = 'discord:g1:general';
 
   it("wakes the agent without the judge once its message is stored; its turn stops the judge deciding the judge rule's earlier batch, which is judged after the turn, and one turn runs", async (t) => {
-    // The MCPL server is a child process on its own real clock.
+    // The MCPL server is a child process whose replies arrive in real time;
+    // stepping a mocked clock while waiting for them would spend its bound first.
     useRealClock();
     const { mkdtempSync, appendFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
