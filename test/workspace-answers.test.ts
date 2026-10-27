@@ -286,7 +286,8 @@ describe('a system error with no code', () => {
     assert.equal(systemWords('EACCES', new Error('EACCES: permission denied, open \'/host/path\'')), 'permission denied');
     assert.equal(systemWords(undefined, new Error('the stat was cut short')), 'the stat was cut short');
     assert.equal(systemWords(undefined, new Error('x'.repeat(600))), `${'x'.repeat(500)}… (600 characters)`);
-    assert.equal(linkWords('work', { unsure: 'a', code: 'the readlink was cut short' }, null), 'cannot tell whether "work/a" is a symlink (the readlink was cut short)');
+    assert.equal(linkWords('work', { unsure: 'a', code: 'the readlink was cut short' }, null),
+      'cannot tell whether "work/a" is a symlink (the readlink was cut short); calling again checks it afresh; if the same reason comes back, whoever runs this host can fix it on disk');
   });
 
   test("a read that fails without a code isn't called a pipe, a socket or a device", async (t) => {
@@ -425,9 +426,9 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
     symlinkSync(join(env.root, 'outside', 'o.png'), join(env.root, 'work', 'link.png'));
     symlinkSync(join(env.root, 'outside', 'o.png'), join(env.root, 'follow', 'out.png'));
     assert.equal(await refused(m, 'read_image', { path: 'work/link.png' }),
-      'The read_image did nothing: "work/link.png" is a symlink, and its mount doesn\'t follow symlinks, so the workspace\'s tools don\'t go through it. Calling again won\'t change that; if you know the file it leads to, name that file by its own path.');
+      'The read_image did nothing: "work/link.png" is a symlink, and its mount doesn\'t follow symlinks, so the workspace\'s tools don\'t go through it. Calling again won\'t change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere.');
     assert.equal(await refused(m, 'read_image', { path: 'follow/out.png' }),
-      'The read_image did nothing: "follow/out.png" leads through a symlink to a place outside its mount, so the workspace\'s tools don\'t reach it. Calling again won\'t change that; if a mount holds that file, name it by its path there.');
+      'The read_image did nothing: "follow/out.png" leads through a symlink to a place outside its mount, so the workspace\'s tools don\'t reach it. Calling again won\'t change that; whoever runs this host can mount it, or a directory that holds it.');
   });
 
   test('a file disk refuses to read says why in plain words, and who can change it', { skip: IS_ROOT && 'root reads past file modes' }, async (t) => {
@@ -440,10 +441,10 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
     assert.equal(await refused(m, 'read_image', { path: 'work/locked.png' }),
       'The read_image did nothing: "work/locked.png" can\'t be read from disk: permission denied. Calling again won\'t change that; whoever runs this host can change the permissions.');
     assert.equal(await refused(m, 'read', { path: 'work/locked.txt' }),
-      'The read did nothing: "work/locked.txt" isn\'t in the workspace, and disk couldn\'t be checked: cannot open (permission denied). Calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk.');
+      'The read did nothing: "work/locked.txt" isn\'t in the workspace, and disk couldn\'t be checked: cannot open (permission denied). Calling again won\'t change that; whoever runs this host can change the permissions, and a read then reaches it.');
   });
 
-  test("a mount whose directory is gone, or is now a file, says who can put it back, and a reason that doesn't tell gone from moved says who can check it", async (t) => {
+  test("a mount whose directory is gone, or is now a file, says who can put it back", async (t) => {
     const env = new Env(t);
     const m = await env.open([{ name: 'gone' }, { name: 'dgone', backend: 'direct' }, { name: 'dfile', backend: 'direct' }]);
     rmSync(join(env.root, 'gone'), { recursive: true });
@@ -455,7 +456,7 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
     assert.equal(await refused(m, 'read', { path: 'dgone/a.txt' }), `The read did nothing: the directory of mount "dgone" isn't on disk, so nothing in it can be read. ${back}`);
     assert.equal(await refused(m, 'read', { path: 'gone/a.txt' }),
       'The read did nothing: "gone/a.txt" isn\'t in the workspace, and disk couldn\'t be checked: the mount root is unavailable. '
-      + "Calling again won't change that while the mount's directory is gone from its path, and checks it afresh otherwise; whoever runs this host can check the directory and its path.");
+      + "Calling again won't change that; whoever runs this host can put the mount's directory back at its path, and a read then reaches it.");
     assert.equal(await refused(m, 'delete', { path: 'dgone/a.txt' }), `The delete did nothing to "dgone/a.txt": the mount root isn't on disk. ${back}`);
     assert.equal(await refused(m, 'write', { path: 'dgone/a.txt', content: 'x' }), `The write did nothing to "dgone/a.txt": the mount root is unavailable. ${back}`);
     assert.equal(await refused(m, 'write', { path: 'dfile/a.txt', content: 'x' }), `The write did nothing to "dfile/a.txt": the mount root is unavailable. ${back}`);
@@ -609,9 +610,9 @@ describe('a call the workspace refuses says what it did not do, quotes what it w
     writeFileSync(join(env.dir('outside'), 'o.txt'), 'outside');
     symlinkSync(join(env.root, 'outside', 'o.txt'), join(env.root, 'follow', 'out.txt'));
     assert.equal(await refused(m, 'read', { path: 'follow/dangling.txt' }),
-      'The read did nothing: "follow/dangling.txt" isn\'t in the workspace, and disk couldn\'t be checked: a symlink whose target cannot be read (nothing is there). Calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk.');
+      'The read did nothing: "follow/dangling.txt" isn\'t in the workspace, and disk couldn\'t be checked: a symlink whose target cannot be read (nothing is there). Calling again checks it afresh; if the same reason comes back, whoever runs this host can fix it on disk.');
     assert.equal(await refused(m, 'read', { path: 'follow/out.txt' }),
-      'The read did nothing: "follow/out.txt" isn\'t in the workspace, and disk couldn\'t be checked: a symlink that leaves the mount. Calling again won\'t change that; if a mount holds the file it leads to, name it by its path there.');
+      'The read did nothing: "follow/out.txt" isn\'t in the workspace, and disk couldn\'t be checked: a symlink that leaves the mount. Calling again won\'t change that; nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it.');
   });
 
   test('a direct mount says what stops a write or an edit, and the way on', async (t) => {
@@ -746,7 +747,7 @@ describe('false texts', () => {
     assert.deepEqual(data.skipped, [{
       mount: 'follow',
       reason: 'dl.txt: not written: a symlink that leads nowhere is at this path, and a push makes a file only where nothing is, forced or not; '
-        + 'whoever runs this host can remove the link or make it lead to a file, and a materialize then writes it',
+        + 'whoever runs this host can remove the link, and materializing again then gets past it',
     }]);
   });
 

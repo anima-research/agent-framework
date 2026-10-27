@@ -971,6 +971,8 @@ describe('present while acting', () => {
     // leaves it out, so the agent never sees it.
     ['an addressed message that tune-out diverts leaves the locus where it was',
       { ...addressed('discord:dm:antra'), tuneOut: { epochId: 'epoch-1' } }, 'chan-live-1'],
+    ["an addressed message carrying another agent's stored context injection mark leaves the locus where it was",
+      { ...addressed('discord:dm:antra'), contextInjection: { agent: 'another', namespace: 'test', contentHash: 'h', part: 0, parts: 1 } }, 'chan-live-1'],
     ['an addressed system marker from another channel leaves the locus where it was',
       { ...addressed('discord:dm:antra'), system: true }, 'chan-live-1'],
   ] as const) {

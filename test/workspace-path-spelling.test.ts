@@ -640,7 +640,7 @@ test('on a disk that tells case apart, a link into a nested mount\'s directory n
   const unfollowed = await twoDeepRig(t, false);
   const u = async (link: string) => String((await unfollowed.tool('read', { path: `work/${link}` })).error);
   for (const link of ['l', 'h']) {
-    assert.equal(await u(link), `The read did nothing: work/${link}: "work/${link}" is a symlink, which this mount does not follow.`);
+    assert.equal(await u(link), `The read did nothing: "work/${link}" can't be reached: "work/${link}" is a symlink, which this mount does not follow; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere.`);
     assert.equal(await code(unfollowed.workspace.readFileFromDisk(`work/${link}`)), 'symlink', link);
   }
   assert.match(await u('m'), /lies in mount "alpha", nested in mount "work": use "alpha\/keep\.md" in place of "work\/m"\.$/);
@@ -650,7 +650,7 @@ test('on a disk that tells case apart, a link into a nested mount\'s directory n
   const followed = await twoDeepRig(t, true);
   const f = async (link: string) => String((await followed.tool('read', { path: `work/${link}` })).error);
   for (const link of ['l', 'h']) {
-    assert.equal(await f(link), `The read did nothing: "work/${link}" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; if a mount holds that file, name it by its path there.`);
+    assert.equal(await f(link), `The read did nothing: "work/${link}" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; whoever runs this host can mount it, or a directory that holds it.`);
     assert.equal(await code(followed.workspace.readFileFromDisk(`work/${link}`)), 'escape', link);
   }
   assert.equal(await f('m'), 'The read did nothing: "work/m" leads into mount "alpha", nested in mount "work", which neither reads nor writes it: use "alpha/keep.md".');
@@ -795,7 +795,7 @@ test('on a disk that tells case apart, a link into a directory the comparison on
   const remedy = 'If not, ask whoever runs this workspace to rename one of "outer/sub/INNER" and "outer/sub/inner"';
   const read = await unfollowed.tool('read', { path: 'outer/l', offsetChars: 0, limitChars: 100 });
   assert.equal(read.success, false);
-  assert.equal(read.error, 'The read did nothing: outer/l: "outer/l" is a symlink to "outer/sub/INNER/x.txt", which this mount does not follow; it may lie in mount "inner", ' +
+  assert.equal(read.error, 'The read did nothing: "outer/l" can\'t be reached: "outer/l" is a symlink to "outer/sub/INNER/x.txt", which this mount does not follow; it may lie in mount "inner", ' +
     `nested in mount "outer": this workspace can't tell "outer/sub/INNER" from "outer/sub/inner", ${since}, use "inner/x.txt" in place of "outer/l". ${remedy}.`);
   const followed = await nestedRig(t, 'sub/inner', { follow: true, before: (d) => {
     mkdirSync(join(d, 'sub'));
@@ -1220,7 +1220,7 @@ test('through a link that spells a nested mount\'s directory otherwise than disk
   assert.match(await code('outer/k.json'), /^other_mount: .*use "nested\/kept\.json"/);
   assert.equal(await code('outer/h.txt'), 'escape: Symlink escape detected: outer/h.txt');
   const synced = await workspace.handleToolCall({ id: 'sync', name: 'sync', input: { path: 'outer/h.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  assert.deepEqual((synced.data as { skipped: unknown[] }).skipped, [{ mount: 'outer', path: 'h.txt', reason: 'disk could not be checked: a symlink that leaves the mount' }]);
+  assert.deepEqual((synced.data as { skipped: unknown[] }).skipped, [{ mount: 'outer', path: 'h.txt', reason: 'disk could not be checked: a symlink that leaves the mount — syncing this path again won\'t change that; nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it' }]);
 });
 
 test('through a link that spells a nested mount\'s directory otherwise than disk, the outer mount reads, lists, writes and makes nothing there', { skip: FOLDING_ONLY }, async (t) => {

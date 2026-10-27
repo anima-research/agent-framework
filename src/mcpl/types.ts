@@ -193,8 +193,8 @@ export interface McplHostCapabilities {
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
-  /** RFC-014 §6.3: this host presents tool hints. Sent only to a server
-   *  whose config sets `toolHints: true`. */
+  /** RFC-014 §6.3: this host presents tool hints. Sent to every server
+   *  with hints (McplServerConfig.toolHints: on unless false). */
   toolHints?: boolean;
 }
 
@@ -508,16 +508,20 @@ export interface McplServerConfig {
   toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
 
   /**
-   * MCPL RFC-014 (tool presence, toolsets and surfaces). Default false: the
-   * host advertises nothing and treats every tool as static, byte for byte as
-   * before. When true, the host advertises `experimental.mcpl.toolHints`, and
-   * honours hints only from a server that advertised `toolHints` too. Then
-   * the server's static tools stay in the tool list as before, and its
-   * dynamic tools (toolset tools, `mcpl/presence: "dynamic"`) leave it: they
-   * are announced in the conversation as they become visible and invisible,
-   * and called through the `toolsets` module's `toolsets--act`, opened with
-   * `toolsets--open`, inspected with `toolsets--look` and closed with
-   * `toolsets--close`. Only `true` turns it on, and null counts as not set.
+   * MCPL RFC-014 (tool presence, toolsets and surfaces). On unless set to
+   * `false`: the host advertises `experimental.mcpl.toolHints`, registers the
+   * `toolsets` module's meta-tools, and honours hints only from a server that
+   * advertised `toolHints` too. Such a server's static tools stay in the tool
+   * list as before, and its dynamic tools (toolset tools, `mcpl/presence:
+   * "dynamic"`) leave it: they are announced in the conversation as they
+   * become visible and invisible, and called through `toolsets--act`, opened
+   * with `toolsets--open`, inspected with `toolsets--look` and closed with
+   * `toolsets--close`. A server that doesn't advertise `toolHints` lists every
+   * tool as before. `false` advertises nothing and treats every tool as
+   * static, byte for byte as 0.28.0 did. Omitted and null are on wherever
+   * the name `toolsets` is free (no module holds it, no server's
+   * `toolPrefix` is it, no restart is moving a server to it); a name held at
+   * startup stays held for the framework's life. `true` reserves that name.
    */
   toolHints?: boolean;
 }

@@ -13,8 +13,9 @@
  * results, in the results of calls that changed them, in push events and in
  * notices) and called through `toolsets--act`, which this module only
  * resolves (resolveAct): the framework dispatches the call it resolves to
- * down the same path as a direct call of the server's tool. The module is registered when a server is
- * configured with `toolHints: true`; its tools never change after that.
+ * down the same path as a direct call of the server's tool. The module is registered when an MCPL
+ * server has tool hints (`toolHints` not false; left out, where the name `toolsets` is free), at
+ * startup or at its first runtime connect; its tools never change after that.
  *
  * Its gatherContext publishes the RFC §8.3 reminder, as a stored `afterUser`
  * injection, when an agent's earlier announcements of an open toolset have

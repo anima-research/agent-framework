@@ -186,7 +186,7 @@ describe('RFC-014 against the reference ToolsetServer, toolHints off (vectors 26
 
   before(async () => {
     srv = await serveToolsetServer(arcadeSpec(calls), 'agent:plain');
-    fw = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url }]);
+    fw = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url, toolHints: false }]);
     await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arcade--scores'), 'tools listed');
   });
   after(async () => {
@@ -212,7 +212,7 @@ describe('RFC-014 against the reference ToolsetServer, toolHints off (vectors 26
     await call('play', { point: 'E5' });
     assert.deepEqual(calls, ['p1:play:{"point":"D4"}', 'p2:play:{"point":"E5"}']);
     // A second connection of the principal has no current instance: it must choose.
-    const other = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url }]);
+    const other = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url, toolHints: false }]);
     try {
       await waitFor(() => other.framework.getAllTools().some((t) => t.name === 'arcade--play'), 'listed');
       const blind = await other.framework.executeToolCall({ id: 'blind', name: 'arcade--play', input: { point: 'F6' } } as never);

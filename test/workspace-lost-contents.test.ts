@@ -802,8 +802,10 @@ describe("contents whose blob file the store can't read", () => {
     const done = await ok(m, 'materialize', { path: 'work' });
     assert.deepEqual(done.materialized, [{ mount: 'work', path: 'b.txt' }]);
     assert.equal(done.skipped.length, 1);
-    assert.match(done.skipped[0].reason, /^a\.txt: the workspace copy is unreadable in the store \(.+\)$/);
+    assert.match(done.skipped[0].reason, /^a\.txt: the workspace copy is unreadable in the store \(.+\) — a read of this path takes disk's copy where it can, and otherwise says what can be done$/);
     assert.deepEqual([env.readDisk('a.txt'), env.readDisk('b.txt')], ['v1\n', 'b draft\n']);
+    assert.match(await refused(m, 'read', { path: 'work/a.txt' }), /so it can't be restored or read\. Sync the path to keep disk's copy and give up the workspace's\.$/,
+      'the read the skip names says what can be done');
   });
 
   test("a forced materialize over disk's newer copy skips a file whose blob it can't read, saying why, and leaves disk's copy", async (t) => {
@@ -816,8 +818,9 @@ describe("contents whose blob file the store can't read", () => {
     const done = await ok(m, 'materialize', { path: 'work/a.txt', force: true });
     assert.deepEqual(done.materialized ?? [], []);
     assert.equal(done.skipped.length, 1);
-    assert.match(done.skipped[0].reason, /^a\.txt: the workspace copy is unreadable in the store \(.+\)$/);
+    assert.match(done.skipped[0].reason, /^a\.txt: the workspace copy is unreadable in the store \(.+\) — a read of this path takes disk's copy where it can, and otherwise says what can be done$/);
     assert.equal(env.readDisk('a.txt'), 'v2, on disk\n');
+    assert.equal(await textOf(m, 'work/a.txt'), 'v2, on disk\n', "the read the skip names takes disk's copy");
   });
 
   test("a branch intent whose blob the store can't read leaves its path unverified, saying why, rather than failing the listing", async (t) => {
