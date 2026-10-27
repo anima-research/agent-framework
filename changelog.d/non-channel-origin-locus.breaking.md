@@ -8,10 +8,13 @@
   and hybrid mode, a `[routing]` notice tells its resident which channels'
   messages the turn holds, and that its plain speech reaches none of them,
   so the resident can answer there with an explicit send, or in hybrid
-  mode with a `>>>` envelope. In explicit and disabled mode no channel's
-  message moves where plain speech goes, so none is named. Before, the
-  turn's plain speech went to the channel, with the private input in its
-  context. An operator's `nudge` or `unstick`, or the API's
+  mode with a `>>>` envelope. A message whose wake is dropped once the
+  turn has read and answered it, as an ambient or system message's is,
+  starts no turn, so the notice may not name its channel; on `main` such a
+  message gets no reply of its own either. In explicit and disabled mode no
+  channel's message moves where plain speech goes, so none is named.
+  Before, the turn's plain speech went to the channel, with the private
+  input in its context. An operator's `nudge` or `unstick`, or the API's
   `inference.request`, is private too while the agent's stored history
   holds a private surface's message, even right after a channel turn: an
   `unstick` asked in a room posts its outcome notice there, and the answer

@@ -65,10 +65,14 @@
   were kept private and how to publish, or, when the send threw, that they may
   have gone out. Only a bare `{{unsent}}` resend keeps the draft it sent.
   Where an earlier bounce is still held, either notice says that `{{unsent}}`
-  names that draft, not these words. In every mode, words a send silenced are
-  held as drafts, as in any turn. Speech handlers are told a private turn's
-  speech is private (`SpeechContext.nonChannelOrigin`), and the built-in
-  Discord module posts none of it and edits its thoughts into no message.
+  names that draft, not these words. In every mode, words a send holds back
+  are held as drafts, as in any turn. In locus and hybrid mode a send holds
+  back only speech going where it may have posted, so a private turn's
+  unprefixed speech, which has no target, is held only beside a send whose
+  place the framework can't read, and is kept private beside sends whose
+  places it reads. Speech handlers are told a private turn's speech is
+  private (`SpeechContext.nonChannelOrigin`), and the built-in Discord
+  module posts none of it and edits its thoughts into no message.
 
   A private turn's `channel_publish` must name its channel: a call without
   `channelId` is refused, a conversation fork's included, and the refusal says
