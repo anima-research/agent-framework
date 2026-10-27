@@ -6091,6 +6091,9 @@ export class AgentFramework {
     trigger: InferenceRequest | undefined,
     /** The turn checkpoint the refused start recorded. */
     checkpoint: RecordedTurnCheckpoint | undefined,
+    /** Ends the refused start once the hold has its retry, before the hold
+     *  is reported, so a stop made when it is reported ends the held turn. */
+    endStart: () => void,
   ): boolean {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return false;
@@ -6110,6 +6113,7 @@ export class AgentFramework {
     if (existing?.state === 'holding') {
       this.holdRequest(existing.heldRequests, own);
       if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
+      endStart();
       return true;
     }
     if (!this.compressionPending(agent)) return false;
@@ -6140,6 +6144,7 @@ export class AgentFramework {
       hold.recheck.unref?.();
     }
     this.budgetHolds.set(agent.name, hold);
+    endStart();
     this.emitTrace({
       type: 'inference:held',
       agentName: agent.name,
@@ -21826,11 +21831,11 @@ export class AgentFramework {
       }
 
       const retry = trigger && withTurnCarry(trigger, carry);
-      if (this.holdForBudgetRefusal(agent, err, retry, checkpoint)) {
-        // A compile refused for budget waits for compression, not the error
-        // policy (#304): the hold keeps the turn's retry, and its release
-        // check owns the later compile.
-        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing);
+      // A compile refused for budget waits for compression, not the error
+      // policy (#304): the hold keeps the turn's retry, and its release check
+      // owns the later compile.
+      if (this.holdForBudgetRefusal(agent, err, retry, checkpoint,
+        () => this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing))) {
         return false;
       }
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
