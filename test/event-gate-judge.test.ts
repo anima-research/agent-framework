@@ -248,7 +248,7 @@ describe('judge rules: verdicts', () => {
     console.error = () => {};
     try {
       gate.evaluate(chat('hello'));
-      await sleep(200);
+      await until(() => wakes.length === 1, 'the timed-out judge to wake the agent');
     } finally {
       console.error = original;
     }

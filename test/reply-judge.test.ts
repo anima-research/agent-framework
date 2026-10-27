@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import { MembraneError } from '@animalabs/membrane';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
 import { ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeRequest } from '../src/gate/types.js';
@@ -44,6 +45,71 @@ function conversation(n: number, size = 400): NormalizedMessage[] {
   for (let i = 0; i < n; i++) out.push(msg(i % 3 === 0 ? 'Scout' : `user${i % 5}`, `message ${i} ` + 'x'.repeat(size)));
   return out;
 }
+
+/** A provider that refuses as too long the first `refusals` requests, with `error` (a context-length error by default). */
+function refusingMembrane(refusals: number, error?: Error) {
+  const requests: NormalizedRequest[] = [];
+  const size = (r: NormalizedRequest) => r.messages.reduce((n, m) => n + m.content.reduce((k, b) => k + (b.type === 'text' ? b.text.length : 0), 0), 0);
+  const membrane = {
+    complete: async (request: NormalizedRequest) => {
+      requests.push(request);
+      if (requests.length <= refusals) {
+        throw error ?? new MembraneError({ type: 'context_length', retryable: false, message: 'prompt is too long: 1200000 tokens > 1000000 maximum', rawError: { status: 400 } });
+      }
+      return {
+        content: [{ type: 'text', text: 'REPLY: asked directly' }],
+        stopReason: 'end_turn',
+        usage: { inputTokens: Math.ceil(size(request) / 3), outputTokens: 12 },
+        details: { usage: { inputTokens: Math.ceil(size(request) / 3), outputTokens: 12 }, model: { actual: 'claude-haiku-5-5' } },
+      };
+    },
+  } as unknown as Membrane;
+  return { membrane, requests, size };
+}
+
+describe('reply judge: a request refused as too long', () => {
+  const judgeOver = (membrane: Membrane) => new ReplyJudge({
+    membraneFor: () => membrane, chooseAgent: (n) => n[0],
+    preview: async () => ({ messages: conversation(60), config: { model: 'x', maxTokens: 1 } }),
+    options: { maxInputTokens: 4_000 },
+  });
+
+  it('is asked once more, smaller', async () => {
+    const { membrane, requests, size } = refusingMembrane(1);
+    const judge = judgeOver(membrane);
+    const before = judge.estimateRatio();
+    const original = console.error;
+    console.error = () => {};
+    let verdict;
+    try {
+      verdict = await judge.judge(judgeRequest());
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(verdict.reply, true);
+    assert.strictEqual(requests.length, 2);
+    assert.ok(size(requests[1]!) < size(requests[0]!), `${size(requests[1]!)} < ${size(requests[0]!)}`);
+    assert.strictEqual(before, 3, 'premise: the starting ratio');
+  });
+
+  it('refused again, fails as any failed call does, after two requests', async () => {
+    const { membrane, requests } = refusingMembrane(2);
+    const original = console.error;
+    console.error = () => {};
+    try {
+      await assert.rejects(judgeOver(membrane).judge(judgeRequest()), /prompt is too long/);
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(requests.length, 2);
+  });
+
+  it("isn't asked again for any other failure", async () => {
+    const { membrane, requests } = refusingMembrane(1, new MembraneError({ type: 'server', retryable: true, message: 'upstream 500', rawError: { status: 500 } }));
+    await assert.rejects(judgeOver(membrane).judge(judgeRequest()), /upstream 500/);
+    assert.strictEqual(requests.length, 1);
+  });
+});
 
 describe('reply judge: verdicts', () => {
   it('parses REPLY and WAIT lines, with or without markdown', () => {
