@@ -2046,11 +2046,15 @@ export interface HostModeStatus {
    * is false until it has. A parked continuation of a turn is counted here
    * and, as a turn alive, in `activeTurns` and `activeTurnAgents`. */
   parkedAdmissions: number;
-  /** Inference requests parked by the quiesce wake gate (while quiesced), or
-   * simply queued (while serving — non-zero right after a resume until the
-   * scheduler's next pass consumes them). Continuations of a held turn
-   * (budget restart, tool results) and a held turn's retry, which a quiesce
-   * lets through, are never counted. */
+  /** Inference requests waiting to start: queued (parked by the quiesce wake
+   * gate while quiesced, or, while serving, until the scheduler's next pass
+   * takes them), in a scheduler pass's hands, or held by a provider hold (an
+   * acceleration or host hold, or a provider's stated wait). There, a start
+   * that carries a turn on counts as the wakes merged into it. A start parked
+   * on provider admission behind an auxiliary call counts once in
+   * `parkedAdmissions` instead, however many wakes are merged into it.
+   * Continuations of a turn (budget restart, tool results) and a held turn's
+   * retry, which a quiesce lets through, are never counted. */
   gatedRequests: number;
   /** code_execution scripts still running that no call is waiting on: left
    * running after a yield, outside any turn. Quiesce does NOT stop them —
@@ -8018,7 +8022,11 @@ export class AgentFramework {
       activeTurns: holders.size,
       activeTurnAgents: [...holders].sort(),
       parkedAdmissions,
-      gatedRequests: this.pendingRequests.filter((r) => !passesQuiesce(r)).length,
+      gatedRequests: [
+        ...this.pendingRequests,
+        ...[...this.passRequests].flatMap((pass) => [...pass.values()].flat()),
+        ...[...this.providerAccelerationCooldowns.values()].flatMap((c) => c.heldRequests),
+      ].flatMap((r) => mergedBatch(r) ?? [r]).filter((r) => !passesQuiesce(r)).length,
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
       deferredWrites: this.deferredMessages.length,
       ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
@@ -8177,7 +8185,7 @@ export class AgentFramework {
     });
     console.error(
       status.drained
-        ? `[host-mode] quiesced — drained, ${status.gatedRequests} wake(s) parked`
+        ? `[host-mode] quiesced — drained, ${status.gatedRequests} wake(s) waiting`
         : `[host-mode] quiesced but drain ${abandoned ? 'needed abandon and' : 'timed out —'} ` +
           `${status.activeTurns} turn(s) still alive` +
           (status.parkedAdmissions > 0
@@ -11149,7 +11157,7 @@ export class AgentFramework {
    *   return the snapshot; the operator lever for draining quarantine or
    *   advancing merges during a quiesce window.
    *
-   *   host-status — report the quiesce state (drained / parked wakes /
+   *   host-status — report the quiesce state (drained / waiting wakes /
    *   scripts left running).
    *
    *   release-provider-wait — end an agent's provider wait (a provider's
