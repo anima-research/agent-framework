@@ -68,6 +68,7 @@ async function errorLines<T>(run: (lines: string[]) => Promise<T>): Promise<T> {
 
 interface Backlog {
   ticks: number; fitAt: number; readyAt: number; fit: boolean;
+  refused: boolean;
   alwaysPending: boolean; stalled: boolean; previewless: boolean; refuseCompiles: number;
   previews: number; dryRuns: number; dryRunsRunning: number; mostDryRunsRunning: number; compiles: number;
   dryRunsAcrossFit: number;
@@ -93,7 +94,7 @@ type Patchable = Record<'compile' | 'tick' | 'isReady' | 'previewContext', (...a
 
 async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Promise<T>): Promise<T> {
   const b: Backlog = {
-    ticks: 0, fitAt: Infinity, readyAt: Infinity, fit: false,
+    ticks: 0, fitAt: Infinity, readyAt: Infinity, fit: false, refused: false,
     alwaysPending: false, stalled: false, previewless: false, refuseCompiles: 0,
     previews: 0, dryRuns: 0, dryRunsRunning: 0, mostDryRunsRunning: 0, compiles: 0,
     dryRunsAcrossFit: 0, noProgress: false, bindings: { compile: [], dryRun: [], preview: [] },
@@ -123,9 +124,13 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     b.bindings.compile.push((args[2] as { thinkingBinding?: unknown } | undefined)?.thinkingBinding);
     if (b.slowCompile?.nth === b.compiles) await new Promise((r) => setTimeout(r, b.slowCompile!.ms));
     if (b.compileGate?.nth === b.compiles) await b.compileGate.until;
-    if (!fits(b)) throw overBudget();
+    if (!fits(b)) {
+      b.refused = true;
+      throw overBudget();
+    }
     if (b.refuseCompiles > 0) {
       b.refuseCompiles--;
+      b.refused = true;
       throw overBudget(49_000);
     }
     return original.compile.apply(this, args);
@@ -145,7 +150,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     if (!fits(b) && refusalName !== 'OverBudgetError') throw overBudget();
     return { fits: fits(b) };
   };
-  proto.tick = async function () { b.ticks++; };
+  proto.tick = async function () { if (b.refused) b.ticks++; };
   proto.isReady = function () { return !pending(b); };
   if (!b.noProgress) {
     passthrough.getProgressSnapshot = function () {
@@ -388,6 +393,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => fits(backlog), 10_000), 'compression should catch up');
         const answered = await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000);
         assert.ok(answered, 'the refused turn should run once the context fits, with no new message to wake it');
+        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 5_000), 'and completes');
         assert.equal(t.membrane.calls.length, 1, 'one provider call: the fresh compile after the hold, never a refused one');
 
         const held = t.of('inference:held');
@@ -496,7 +502,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           author: { id: 'U1', name: 'owner' }, content: [{ type: 'text', text: 'Are you there?' }],
           timestamp: new Date().toISOString(), metadata: {}, triggerInference: true,
         });
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 10_000));
+        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 10_000));
         assert.equal(t.of('inference:held').length, 1);
         assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the released compile carried the note');
         const rows = (t.framework.getAgent('prime')!.getContextManager().queryMessages({}).messages as unknown as Array<{ metadata?: Record<string, unknown> }>)
