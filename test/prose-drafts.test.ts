@@ -774,6 +774,23 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("hybrid mode: a private turn's envelope that names a channel that does not resolve, beside a send to a known place, keeps its words private, with no draft", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([text('>>>#nowhere lost words'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('Done.')]),
+        createMockResponse([]),
+      ], 'scout', 'private');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the explicit send went out');
+      assert.deepEqual(h.drafts(), [], 'nothing holds the words to resend');
+      const notice = h.texts().find((t) => t.startsWith('[prose-routing]') && t.includes('was not delivered'));
+      assert.ok(notice?.includes('It was kept private') && !notice.includes('{{unsent}}'), `the resident is told the words were kept private: ${notice}`);
+    } finally {
+      await h.close();
+    }
+  });
+
   it("a private turn's words beside a send whose place the framework can't read, and after it, are held as drafts, as any turn's are", async () => {
     for (const proseRouting of ['locus', 'hybrid'] as const) {
       const h = await harness({ agents: [{ name: 'scout', proseRouting }], sendTool: true });
