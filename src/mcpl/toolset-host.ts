@@ -73,6 +73,10 @@ export interface ToolsetHostDeps {
    *  where it isn't published. RFC §4.2: until its move applies, a tool
    *  keeps working where it is. */
   published?(serverId: string, tool: string): Presence | undefined;
+  /** The host's own toolsets an agent has open (the built-in one, server
+   *  tabs): each one's marker and reminder, for RFC §8.3 reminders beside the
+   *  servers' toolsets. */
+  hostOpen?(agentName: string): Array<{ marker: string; reminder: string }>;
 }
 
 /** One server's RFC-014 state and traffic. Lives as long as the server's
@@ -681,7 +685,7 @@ export class ToolsetHub {
    * reminder due.
    */
   observeCompile(agentName: string, messages: readonly unknown[]): void {
-    const open = this.openMarkers();
+    const open = [...this.openMarkers(), ...(this.deps.hostOpen?.(agentName) ?? []).map((h) => h.marker)];
     if (open.length === 0) {
       this.seen.delete(agentName);
       this.due.delete(agentName);
@@ -705,7 +709,10 @@ export class ToolsetHub {
   /** The reminder due for `agentName`, or null when none is. */
   reminderFor(agentName: string): string | null {
     if (!this.due.has(agentName)) return null;
-    const parts = this.presenting().filter((c) => this.deps.canNotify(c.serverId)).map((c) => c.presence.reminder()).filter((r): r is string => !!r);
+    const parts = [
+      ...(this.deps.hostOpen?.(agentName) ?? []).map((h) => h.reminder),
+      ...this.presenting().filter((c) => this.deps.canNotify(c.serverId)).map((c) => c.presence.reminder()).filter((r): r is string => !!r),
+    ];
     if (parts.length === 0) return null;
     return `Open toolsets (a reminder: their earlier announcements have left your context):\n${parts.join('\n')}`;
   }

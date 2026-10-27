@@ -116,7 +116,8 @@ test('toolHints off: the advertisement, tool list and traffic are as before', as
       .map((x) => ({ name: x.name, description: x.description, inputSchema: x.inputSchema }));
     assert.deepEqual(arcTools, TOOLS.map((x) => ({ name: `arc--${String(x.name)}`, description: x.description, inputSchema: x.inputSchema })),
       'every tool listed whole, in the server\'s order, as before');
-    assert.ok(!t.fw.framework.getAllTools().some((x) => x.name.startsWith('toolsets--')), 'no meta-tools');
+    // The meta-tools are every agent's now (the host's built-in toolset), whatever a server's hints.
+    assert.ok(t.fw.framework.getAllTools().some((x) => x.name === 'toolsets--open'), 'the host\'s meta-tools');
     assert.ok(!t.methods().some((m) => String(m).startsWith('toolsets/')), 'no toolsets/* request of any kind');
     // A tools/hints request is a method this host doesn't handle, as before.
     const answer = await t.server.peer.request('tools/hints', { rev: 1, tools: [{ name: 'peek', visible: true }] });

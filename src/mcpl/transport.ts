@@ -849,6 +849,13 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
     if (setting === 'inheritEnv' && dialsNetwork(config)) continue;
     assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
   }
+  // Not a boolean, but read the same way: a value that isn't one of the
+  // three would otherwise be taken for the default.
+  const presentation = (config as { presentation?: unknown }).presentation;
+  if (presentation !== undefined && presentation !== null && presentation !== 'full' && presentation !== 'tab' && presentation !== 'closed-tab') {
+    const kind = typeof presentation === 'string' ? 'another string' : Array.isArray(presentation) ? 'a list' : typeof presentation;
+    throw new Error(`MCPL server "${config.id}" presentation must be "full", "tab" or "closed-tab" (or left out for full), not ${kind}`);
+  }
 }
 
 /**

@@ -523,6 +523,20 @@ export interface McplServerConfig {
    * `toolPrefix` is it); `true` reserves that name.
    */
   toolHints?: boolean;
+
+  /**
+   * How this server is presented to agents at first (the host's own
+   * toolsets, src/host-presentation.ts): `'full'` (the default) puts its
+   * tools in the tool list, as before; `'tab'` keeps it connected, its events
+   * still arriving, with none of its tools in the tool list until an agent
+   * opens its tab (`toolsets--open {server}`) and calls them through
+   * `toolsets--act`; `'closed-tab'` leaves it disconnected until an agent
+   * opens it. Each agent can switch it later (`toolsets--close {server}`,
+   * with `disconnect: true` for a closed tab; `toolsets--open {server,
+   * full: true}` back into the tool list), and that choice is kept across
+   * restarts beside the store, over this default.
+   */
+  presentation?: 'full' | 'tab' | 'closed-tab';
 }
 
 // ============================================================================

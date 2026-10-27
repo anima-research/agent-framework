@@ -779,10 +779,9 @@ async function judgeFramework(t: { after: (fn: () => Promise<void>) => void }, j
     const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
     return round![0]!;
   };
-  const toolNamed = (name: string) => {
-    const tools = membrane.calls.at(-1)!.tools ?? [];
-    return tools.find((tool) => tool.name === name)!;
-  };
+  // The definition the agent reads: wake rules are in the host's built-in
+  // toolset, out of the request's tool list, so it's read where they're listed.
+  const toolNamed = (name: string) => framework.getAllTools().find((tool) => tool.name === name)!;
   const wakeAddRule = () => toolNamed('wake_add_rule');
   return { framework, membrane, configPath, call, wakeAddRule, toolNamed };
 }
