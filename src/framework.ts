@@ -5433,7 +5433,7 @@ export class AgentFramework {
     for (const agentName of targets) {
       this.pendingRequests.push({
         agentName, reason: wake.kind, source: 'heartbeat', timestamp: Date.now(),
-        ...this.readsDeferredFor(placement, agentName),
+        ...this.readsWriteFor(placement, agentName),
       });
     }
   }
