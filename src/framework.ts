@@ -3379,8 +3379,8 @@ export class AgentFramework {
    *  only so tests can shorten it. */
   private budgetHoldRecheckMs = DEFAULT_MAINTENANCE_INTERVAL_MS;
   /** Messages added, edited or removed in each held agent's store, counted
-   *  from the hold's first look, but for a hold's own note
-   *  (budgetHoldSignature). */
+   *  from the hold's first look, but for a stored context injection's
+   *  arrival (budgetHoldSignature). */
   private readonly storeChanges = new WeakMap<ContextManager, { count: number }>();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
@@ -5597,10 +5597,7 @@ export class AgentFramework {
     }
     const budgetHold = this.budgetHolds?.get(agentName);
     if (budgetHold?.state === 'holding') {
-      wakes.push({
-        certain: true,
-        what: `a turn held for its context budget, once its context fits, by ${new Date(budgetHold.until).toISOString()} at the latest`,
-      });
+      wakes.push({ at: budgetHold.until, certain: true, what: 'a turn held for its context budget, which runs once its context fits, and by then at the latest' });
     }
     // The heartbeat's ticks and reminders, which the agent's rules decide as
     // they decide a heartbeat push: one the rules would hold back is listed
@@ -6301,15 +6298,16 @@ export class AgentFramework {
   /**
    * What can make a held turn's context fit: compression's progress and
    * whether it still has compression pending, the agent's store (a message
-   * added, edited or removed, by any path, other than a hold's own note:
-   * a released turn's start stores one, and its refused compile would
-   * otherwise release it again on that alone), the agent's runtime settings
-   * (its budget, and the tail and pace that shape the plan). A verdict isn't
-   * taken again until one of them changes. Pending sits beside the strategy's
-   * progress snapshot, which needn't cover what its readiness reads, and
-   * alone for a strategy that reports no progress, or none it can read (as
-   * while it waits to reinitialize for a new branch).
-   * Undefined, so that the check runs, when anything else can't be read.
+   * added, edited or removed, by any path, other than a stored context
+   * injection's arrival: a released turn's start stores its note and any
+   * injection whose content changed, and its refused compile would
+   * otherwise release it again on those alone), the agent's runtime
+   * settings (its budget, and the tail and pace that shape the plan). A
+   * verdict isn't taken again until one of them changes. Pending sits beside
+   * the strategy's progress snapshot, which needn't cover what its readiness
+   * reads, and alone for a strategy that reports no progress, or none it can
+   * read (as while it waits to reinitialize for a new branch). Undefined, so
+   * that the check runs, when anything else can't be read.
    */
   private budgetHoldSignature(agent: Agent, pending = this.compressionPending(agent)): string | undefined {
     try {
@@ -6333,7 +6331,7 @@ export class AgentFramework {
     if (!changes) {
       const counted = { count: 0 };
       cm.onMessage((event) => {
-        if (event.type === 'add' && storedInjectionMarkOf(event.message.metadata)?.namespace === BUDGET_HOLD_NOTE_NAMESPACE) return;
+        if (event.type === 'add' && storedInjectionMarkOf(event.message.metadata) !== undefined) return;
         counted.count++;
       });
       this.storeChanges.set(cm, counted);
