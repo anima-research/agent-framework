@@ -5595,6 +5595,13 @@ export class AgentFramework {
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
+    const budgetHold = this.budgetHolds?.get(agentName);
+    if (budgetHold?.state === 'holding') {
+      wakes.push({
+        certain: true,
+        what: `a turn held for its context budget, once its context fits, by ${new Date(budgetHold.until).toISOString()} at the latest`,
+      });
+    }
     // The heartbeat's ticks and reminders, which the agent's rules decide as
     // they decide a heartbeat push: one the rules would hold back is listed
     // as only a "maybe".
