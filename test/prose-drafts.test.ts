@@ -3444,6 +3444,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           assert.deepEqual(notices(h), ['[speech-not-posted] Nothing you wrote before your tool calls in the rounds just above was posted. If any of it should go out, send it again.']);
           assert.equal(markers(h).length, 1);
           assert.match(markers(h)[0]!, AFTER_ROUNDS);
+          assert.ok(!markers(h)[0]!.includes(CUT_OFF), markers(h)[0]);
         } finally {
           await h.close();
         }
@@ -3850,6 +3851,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           assert.equal(markers(h).length, 1);
           assert.match(markers(h)[0]!, AFTER_ROUNDS);
           assert.ok(markers(h)[0]!.includes(HANDED_ON), markers(h)[0]);
+          assert.ok(!markers(h)[0]!.includes(CUT_OFF), markers(h)[0]);
           assert.equal(receipts(h).length, 0);
           assert.equal(notices(h).length, 0);
         } finally {
@@ -4008,6 +4010,23 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       });
     }
 
+    it("locus mode: a user's Stop while the delivery is still being routed says it may yet be posted, and nothing of handing on", async () => {
+      const h = await harness({});
+      try {
+        h.command({ op: 'publish-mode', mode: 'hang' });
+        breakAfterToolRound(h.membrane, 'stop');
+        await startTurn(h);
+        assert.equal(h.framework.abortInference('scout', 'operator stop'), true);
+        await turnEnded(h);
+        const notes = h.texts().filter((t) => t.startsWith('[turn-interrupted]'));
+        assert.equal(notes.length, 1);
+        assert.ok(notes[0]!.includes(STILL_ROUTING), notes[0]);
+        assert.ok(!notes[0]!.includes(HANDED_ON), notes[0]);
+      } finally {
+        await h.close();
+      }
+    });
+
     it('hybrid mode: a failure after a >>> envelope whose delivery was refused adds neither sentence', async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], retries: 0 });
       try {
@@ -4129,6 +4148,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           const notes = h.texts().filter((t) => t.startsWith('[turn-interrupted]'));
           assert.equal(notes.length, 1);
           assert.ok(notes[0]!.includes(HANDED_ON), notes[0]);
+          assert.ok(!notes[0]!.includes(CUT_OFF), notes[0]);
           assert.equal(receipts(h).length, 0);
         } finally {
           await h.close();
