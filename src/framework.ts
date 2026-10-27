@@ -1364,10 +1364,11 @@ interface TurnRouting {
    * for a re-inference, flushed at the end of a stream that didn't settle
    * the turn, or stored by the start that continues it. So is one a boundary
    * drained but couldn't re-pin for, being over budget or without a live
-   * stream. A message stored for another ordinary resident is one whenever
-   * it lands, since residents read one message slot and a boundary weighs
-   * only the messages drained for its own agent (noteForOtherResidents). A
-   * message tune-out diverted isn't one, since a resident's compiled view
+   * stream. A message stored for another ordinary resident is one when it
+   * lands, since residents read one message slot and a boundary weighs only
+   * the messages drained for its own agent (noteForOtherResidents). A message
+   * the agent's own view leaves out, such as one tune-out diverted or another
+   * agent's stored context injection, isn't one, since its compiled view
    * leaves it out. A boundary that re-pins clears them, since what it injects
    * is newer. The turn's next start clears them all, and in locus or hybrid
    * mode first re-pins to the newest one still in the agent's store, as a
@@ -3715,6 +3716,7 @@ export class AgentFramework {
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
   private readonly openManagerRefs = new WeakMap<ContextManager, WeakRef<ContextManager>>();
+  private readonly storeSees = new WeakMap<ContextManager, (metadata: unknown) => boolean>();
   private readonly collectedManagers = new FinalizationRegistry<WeakRef<ContextManager>>((ref) => this.openManagers.delete(ref));
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -13437,6 +13439,9 @@ export class AgentFramework {
   }
 
   private async createAgent(config: AgentConfig): Promise<Agent> {
+    const sees = (metadata: unknown): boolean =>
+      !(metadata as { tuneOut?: unknown } | undefined)?.tuneOut
+      && !isAnotherAgentsInjection(metadata, config.name);
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -13457,10 +13462,10 @@ export class AgentFramework {
       // Another agent's stored context injections (stored-injections.ts) are
       // that agent's context, not conversation: they stay out of this view,
       // and so out of its folds, as the residents share this slot.
-      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut
-        && !isAnotherAgentsInjection(message.metadata, config.name),
+      viewFilter: (message) => sees(message.metadata),
     });
     this.trackManager(contextManager);
+    this.storeSees.set(contextManager, sees);
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
@@ -13528,6 +13533,7 @@ export class AgentFramework {
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
+    const sees = (metadata: unknown): boolean => !isAnotherAgentsInjection(metadata, name);
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,
@@ -13538,12 +13544,13 @@ export class AgentFramework {
       // residents' stored context injections (stored-injections.ts): their
       // context, which this agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
-      viewFilter: (message) => !isAnotherAgentsInjection(message.metadata, name),
+      viewFilter: (message) => sees(message.metadata),
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
     this.trackManager(contextManager);
+    this.storeSees.set(contextManager, sees);
 
     // Inherit the principal's inference settings wholesale (fork-template
     // idiom): reasoning effort (thinking), provider params, token ceilings,
@@ -13871,11 +13878,12 @@ export class AgentFramework {
           // with everything queued behind it — the queue keeps its order —
           // for the turn-end flush, where no reply follows it in this stream.
           //
-          // A message a tune-out holds from the residents is drained and
-          // stored like any other, but not injected: every resident's
-          // viewFilter leaves it out of the next compile as well, so the
-          // window's compiled prefix and the live request still match without
-          // it (#232 gap 5).
+          // A message the agent's own view filter leaves out, such as one a
+          // tune-out holds from the residents or another agent's stored
+          // context injection, is drained and stored like any other, but not
+          // injected: the next compile leaves it out as well, so the window's
+          // compiled prefix and the live request still match without it
+          // (#232 gap 5).
           //
           // A stream that declares it can't carry injected messages
           // (supportsInjectedMessages false: membrane's XML prefill path,
@@ -13911,11 +13919,7 @@ export class AgentFramework {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
-              // A message a tune-out holds from the residents is stored (the
-              // subconscious reads it) and left out of every resident's
-              // compiled view; injecting it here would put in the live turn
-              // what the next compile hides (#232 gap 5).
-              if ((msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) continue;
+              if (!this.agentSees(agent, msg.metadata)) continue;
               heard.push({ msg, id, content });
             }
             // Rendered in one call: a render prepares as a compile does, so
@@ -13927,10 +13931,12 @@ export class AgentFramework {
             const rendered = this.renderForInjection(agent, [...(clock ? [clock.id] : []), ...heard.map((h) => h.id)]);
             const first = clock ? 1 : 0;
             // A null is a message the render places before its window. Under
-            // the memory strategy that's one before its recent window, when
-            // what this boundary stored is bigger than it, or any message
-            // while a head window a topic change reset hasn't filled yet. The
-            // next compile still sends it, raw and in order, after the tool
+            // context-manager 0.23.0's memory strategy that's one before its
+            // recent window, when what this boundary stored is bigger than it,
+            // or any message while a head window a topic change reset hasn't
+            // filled yet; from 0.23.1 that strategy gives no null for a
+            // message its view holds. The next compile still sends such a
+            // message, raw and in order, after the tool
             // result, so leaving it out would change the prefix as surely as
             // any form, and the agent wouldn't hear it (context-manager#275's
             // review, R1-1). It goes in as stored, which is the form the next
@@ -13941,13 +13947,12 @@ export class AgentFramework {
             // cap reaches it. And a body the strategy stored in parts goes in
             // whole, joined as the store reads it back, where the next
             // compile sends it in more than one piece.
-            // That rests on two things. The only view filter this framework
-            // gives a store is the tune-out stamp (createAgent's; the other
-            // stores it opens have none), and a stamped message is skipped
-            // above, so no null here means a message the view hides. And the
-            // store and the render run with nothing between them, so nothing
-            // can put a summary in place of what this flush stored, or move
-            // windowed passthrough's anchor past it, before the render. A
+            // That rests on two things. A message the agent's own view filter
+            // leaves out is skipped above, by that filter, so no null here
+            // means a message the view hides. And the store and the render
+            // run with nothing between them, so nothing can put a summary in
+            // place of what this flush stored, or move windowed passthrough's
+            // anchor past it, before the render. A
             // write found here that landed at an earlier flush
             // (writeDrainedInOrder) is the exception: by now a summary may
             // stand in for it, or the anchor be past it, and then it goes in
@@ -16204,19 +16209,13 @@ export class AgentFramework {
     // Every agent that can read this message must not have compiled past it.
     // Residents share one message slot, so a message one of them read is
     // history for all of them (the never-rewrite rule is about the message,
-    // not the agent that happened to be asked). A tune-out-diverted message
-    // never enters a resident's compiled view; only the subconscious reads
-    // it through its merged view — no subconscious, nobody reads it.
-    let readers: Agent[];
-    if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
-      const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
-      if (!subconscious) return true;
-      readers = [subconscious];
-    } else {
-      readers = this.sharedSlotAgents.has(agent)
-        ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
-        : [agent];
-    }
+    // not the agent that happened to be asked). A reader is one whose view
+    // filter keeps the message: a tune-out-diverted message never enters a
+    // resident's compiled view, and only the subconscious reads it through
+    // its merged view — no subconscious, nobody reads it.
+    const readers = (this.sharedSlotAgents.has(agent)
+      ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
+      : [agent]).filter((a) => this.agentSees(a, message.metadata));
     const branch = cm.currentBranch().name;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
     for (const reader of readers) {
@@ -18466,17 +18465,23 @@ export class AgentFramework {
     return { newestRowAt, lastClockAt: undefined };
   }
 
+  private agentSees(agent: Agent, metadata: unknown): boolean {
+    const sees = this.storeSees.get(agent.getContextManager());
+    return !sees || sees(metadata);
+  }
+
   /**
    * Weigh a message that no tool boundary of the agent's open logical turn
    * will weigh: one that would re-pin the locus becomes one of the turn's
-   * arrivals (TurnRouting.arrivals). A message tune-out diverted
-   * (metadata.tuneOut) never enters a resident's compiled view, so the agent
-   * won't see it, and it moves nothing.
+   * arrivals (TurnRouting.arrivals). A message the agent's own view leaves
+   * out, such as one a tune-out diverted (metadata.tuneOut), never enters
+   * its compiled view, so the agent won't see it, and it moves nothing.
    */
   private noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void {
     const open = this.openLogical.get(agentName);
     if (!open) return;
-    if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
+    const agent = this.agents.get(agentName);
+    if (agent && !this.agentSees(agent, metadata)) return;
     if (isConversationalInjection(metadata)) (open.heard ??= new Map()).set(messageId, ++lastHeardAt);
     const channel = this.repinChannel(metadata, open);
     if (channel) open.arrivals.push({ messageId, channel });
@@ -26185,7 +26190,7 @@ export class AgentFramework {
     // messages flush at the next turn's START (before its compile — riding
     // their own wake), at the agent's next tool boundary (where they are
     // ALSO injected into the live stream — hear-while-acting — all but a
-    // message a tune-out holds from the residents), or in driveStream's
+    // message the agent's own view leaves out), or in driveStream's
     // finally when the turn ends.
     // Quiesce (issue #122): the window exists to run compression/refold
     // against a FROZEN context — module events and api message.send must not
@@ -26373,18 +26378,20 @@ export class AgentFramework {
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
-   *  clock rows and stored context injections after it aside: a channel
-   *  message by its server, channel and message id, a push event by its
-   *  server and event id, and never one a tune-out holds. Past
+   *  clock rows, stored context injections and rows the agent's own view
+   *  leaves out after it aside: a channel message by its server, channel and
+   *  message id, a push event by its server and event id, and never one the
+   *  agent's view leaves out, such as one a tune-out holds. Past
    *  NEWEST_SCAN_ROWS such rows, it answers no. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
     // A clock row the framework wrote after it (a turn start's, an event's),
     // or a stored context injection (any agent's, a start's), isn't a
     // message a reply could be meant for, so it doesn't count.
     const newest = agent.getContextManager().queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages
-      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata));
+      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata)
+        && this.agentSees(agent, m.metadata));
     const md = newest?.metadata as Record<string, unknown> | undefined;
-    if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
+    if (!md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
     if (entry.eventType === 'mcpl:channel-incoming') {
       return entry.messageId !== undefined && md.messageId === entry.messageId && md.channelId === entry.channelId;
     }
@@ -33635,9 +33642,10 @@ export class AgentFramework {
           for (let i = messages.length - 1; i >= 0 && collecting(); i--) {
             const content = messages[i]?.content;
             if (!Array.isArray(content)) continue;
-            // Another agent's stored context injection isn't in this agent's
-            // view (stored-injections.ts), so its images aren't either.
-            if (isAnotherAgentsInjection(messages[i]?.metadata, agentName)) continue;
+            // A row the agent's own view leaves out, such as another agent's
+            // stored context injection (stored-injections.ts), isn't in its
+            // window, so its images aren't either.
+            if (!this.agentSees(agent, messages[i]?.metadata)) continue;
             const messagesBack = total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {
