@@ -3329,6 +3329,7 @@ export class AgentFramework {
   private overBudgetDrainAfter: Map<string, Array<() => void>> = new Map();
   private budgetHoldRecheckMs = DEFAULT_MAINTENANCE_INTERVAL_MS;
   private readonly storeChanges = new WeakMap<ContextManager, { count: number }>();
+  private readonly recordedCheckpoints = new WeakMap<Agent, RecordedTurnCheckpoint>();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
@@ -5539,10 +5540,6 @@ export class AgentFramework {
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
       wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
     }
-    const budgetHold = this.budgetHolds?.get(agentName);
-    if (budgetHold?.state === 'holding') {
-      wakes.push({ at: budgetHold.until, certain: true, what: 'a turn held for its context budget, which runs once its context fits, and by then at the latest' });
-    }
     // The heartbeat's ticks and reminders, which the agent's rules decide as
     // they decide a heartbeat push: one the rules would hold back is listed
     // as only a "maybe".
@@ -6005,7 +6002,6 @@ export class AgentFramework {
     agent: Agent,
     error: Error,
     trigger: InferenceRequest | undefined,
-    checkpoint: RecordedTurnCheckpoint | undefined,
     endStart: () => void,
   ): boolean {
     const { errorType } = this.classifyInferenceError(error);
@@ -6018,12 +6014,12 @@ export class AgentFramework {
       ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() });
     if (existing?.state === 'holding') {
       this.holdRequest(existing.heldRequests, own);
-      if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
+      this.dropRecordedCheckpoint(agent);
       endStart();
       return true;
     }
     if (!this.compressionPending(agent)) return false;
-    if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
+    this.dropRecordedCheckpoint(agent);
     const now = Date.now();
     const figures = error as Error & { budget?: unknown; actual?: unknown };
     const hold: BudgetHold = existing ?? {
@@ -6055,6 +6051,7 @@ export class AgentFramework {
       until: hold.until,
       heldRequests: hold.heldRequests.length,
     });
+    if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
     const deadline = new Date(hold.until).toISOString();
     console.error(`[budget-hold] agent=${agent.name} compile refused (${errorType}): ${hold.reason} \u2014 ` +
       `turn held until ${deadline} while compression catches up`);
@@ -6137,8 +6134,7 @@ export class AgentFramework {
 
   private async budgetHoldDryRun(agent: Agent): Promise<'fit' | 'refused' | 'check_failed'> {
     try {
-      const thinkingBinding = agent.thinkingBindingOption();
-      await agent.compileWithInjections(undefined, undefined, { dryRun: true, ...(thinkingBinding ? { thinkingBinding } : {}) });
+      await this.previewActivation(agent.name);
       return 'fit';
     } catch (error) {
       return this.budgetHoldThrownVerdict(error);
@@ -6160,6 +6156,7 @@ export class AgentFramework {
         pending,
         this.storeChangeCount(cm),
         agent.getRuntimeSettings(),
+        agent.nextCompileBudget(),
       ]);
     } catch {
       return undefined;
@@ -6171,7 +6168,8 @@ export class AgentFramework {
     if (!changes) {
       const counted = { count: 0 };
       cm.onMessage((event) => {
-        if (event.type === 'add' && storedInjectionMarkOf(event.message.metadata) !== undefined) return;
+        if (event.type === 'add'
+          && (storedInjectionMarkOf(event.message.metadata) !== undefined || clockStampOf(event.message.metadata) !== undefined)) return;
         counted.count++;
       });
       this.storeChanges.set(cm, counted);
@@ -6194,23 +6192,24 @@ export class AgentFramework {
     if (hold?.state !== 'holding') return;
     this.clearBudgetHoldTimers(hold);
     const waitedMs = Date.now() - hold.startedAt;
-    this.emitTrace({
-      type: 'inference:hold_ended',
-      agentName,
-      outcome,
-      waitedMs,
-      heldRequests: hold.heldRequests.length,
-    });
-    console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms; ` +
-      `${hold.heldRequests.length} held request(s) queued for one fresh compile`);
+    const released = hold.heldRequests;
     if (outcome === 'fit' || outcome === 'check_failed') {
       hold.state = 'released';
     } else {
       hold.state = 'spent';
       hold.ended = { outcome };
     }
-    this.pendingRequests.push(...hold.heldRequests);
     hold.heldRequests = [];
+    this.pendingRequests.push(...released);
+    console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms; ` +
+      `${released.length} held request(s) queued for one fresh compile`);
+    this.emitTrace({
+      type: 'inference:hold_ended',
+      agentName,
+      outcome,
+      waitedMs,
+      heldRequests: released.length,
+    });
   }
 
   private budgetHoldNote(hold: BudgetHold): string {
@@ -6269,10 +6268,8 @@ export class AgentFramework {
     const why = hold.ended.outcome === 'deadline'
       ? `the hold's ${describeWait(this.budgetHoldMs)} bound passed`
       : 'compression had nothing left to do';
-    const held = new Error(`${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ${why} and it still didn't fit)`);
-    held.name = error.name;
-    if (error.stack !== undefined) held.stack = error.stack;
-    return held;
+    error.message = `${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ${why} and it still didn't fit)`;
+    return error;
   }
 
   private kickOverBudgetDrain(
@@ -13701,6 +13698,13 @@ export class AgentFramework {
     this.turnCounters.set(agentName, recorded.turnIndex);
   }
 
+  private dropRecordedCheckpoint(agent: Agent): void {
+    const recorded = this.recordedCheckpoints?.get(agent);
+    if (recorded === undefined) return;
+    this.recordedCheckpoints.delete(agent);
+    this.dropTurnCheckpoint(agent.name, recorded);
+  }
+
   /**
    * Checkpoints live in one Tree state (TURN_CHECKPOINTS_TREE_ID) keyed by agent
    * name, each key pointing at a JSON blob of that agent's ≤MAX_TURN_CHECKPOINTS
@@ -21117,9 +21121,9 @@ export class AgentFramework {
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
-    let checkpoint: RecordedTurnCheckpoint | undefined;
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
-      checkpoint = this.recordTurnCheckpoint(agent.name);
+      const recorded = this.recordTurnCheckpoint(agent.name);
+      this.recordedCheckpoints?.set(agent, recorded);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 
@@ -21607,7 +21611,7 @@ export class AgentFramework {
       }
 
       const retry = trigger && withTurnCarry(trigger, carry);
-      if (this.holdForBudgetRefusal(agent, err, retry, checkpoint,
+      if (this.holdForBudgetRefusal(agent, err, retry,
         () => this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing))) {
         return false;
       }
