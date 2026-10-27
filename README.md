@@ -444,14 +444,15 @@ so. `toolHints: true` reserves the name, so a prefix that takes it is refused.
 With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
 enter it, since every change to the list rebuilds the prompt cache. The
-framework registers a `toolsets` module with four constant tools, at startup or
-at the first runtime connect of a server whose hints aren't off, whether or not
-that server presents anything, so the tool list doesn't change when one starts
-to:
+framework registers a `toolsets` module with four constant tools at creation,
+for every agent (the host's own toolsets need them too, below), so the tool
+list doesn't change when a server starts to present:
 
-- `toolsets--open {server?, toolset?, instance?, options?}` opens a toolset (or
-  a named instance of one), and answers with what the server shows on opening
-  and the tools usable now;
+- `toolsets--open {server?, toolset?, instance?, options?, full?}` opens a
+  server's toolset (`server` and `toolset`), or a named instance of one, and
+  answers with what the server shows on opening and the tools usable now;
+  `server` alone opens the server's tab and `toolset: "settings"` alone the
+  host's built-in toolset (below);
 - `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool down
   the same path as a direct call of it (the agent's `allowedTools`, the
   server's tool policy, the state exchange, the reading of its result, RFC-007
@@ -468,7 +469,9 @@ to:
   couldn't; what that changed
   is in the answer when look restates everything, and otherwise told as a
   notice;
-- `toolsets--close {server?, toolset?, instance?}` closes it.
+- `toolsets--close {server?, toolset?, instance?, disconnect?}` closes it;
+  `server` alone moves the server to a tab or hides its open tab, and with
+  `disconnect: true` makes it a closed tab (below).
 
 ### The host's own toolsets
 
@@ -486,7 +489,7 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   module's tools it places there (`Module.toolPlacement` answering
   `'builtin'`). None is in the tool list. `toolsets--open {toolset:"settings"}`
   announces them, `toolsets--act {tool, args}` calls one while it's open, under
-  its own name and permissions, `toolsets--close {toolset:"settings"}` closes
+  its own name and permissions, its `args` checked against the definition first, `toolsets--close {toolset:"settings"}` closes
   it, and `toolsets--look {toolset:"settings"}` lists them either way.
 - **Server tabs.** Each MCPL server is presented to each agent one of three
   ways: `full` (its tools in the tool list, the default), a `tab` (connected,
@@ -501,7 +504,9 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   server's configured `presentation` (`'full' | 'tab' | 'closed-tab'`) is where
   each agent starts; what an agent chose is kept across restarts. A
   connection is the host's, so a closed tab is disconnected for every agent of
-  the host.
+  the host, and `disconnect` is refused while another resident agent has the
+  server in its tool list or its tab open. An operator's own connect of a
+  closed tab ends it, and an operator's disconnect forgets the server's tab.
 - **Hidden tools.** A tool an agent hides with `set_tool_visibility` leaves its
   tool list for the built-in toolset, or its server's tab, and comes back when
   shown. The `toolsets--` tools can't be hidden.

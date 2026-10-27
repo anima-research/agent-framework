@@ -292,7 +292,7 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
       assert.equal(opened.success, true, opened.error);
       const result = await call(framework, { tool: 'probe--rare_op', args: { mood: 'x' } }, 'toolsets--act');
       assert.match(String(result.error),
-        /^Nothing was done: probe--rare_op needs "mode" \(a string\), and this call gave none; "mood" isn't one of its parameters\./);
+        /^Invalid arguments for probe--rare_op: args\.mode: required; "mood" isn't one of its parameters\. Nothing was sent/);
       assert.equal(probe.calls.length, 0);
     });
   });

@@ -57,6 +57,9 @@ async function makeFramework(opts: {
   modules?: Module[];
   servers?: McplServerConfig[];
   toolPresentation?: boolean;
+  /** Overrides for the agent, or more agents beside it. */
+  agent?: Record<string, unknown>;
+  others?: string[];
 } = {}) {
   const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'host-toolsets-'));
   const membrane = new MockMembrane();
@@ -66,7 +69,8 @@ async function makeFramework(opts: {
     agents: [{
       name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', strategy: strategy(),
       ...(opts.toolPresentation ? { toolPresentation: { path: join(dir, 'tools.json'), cataloguePath: 'board/tools.md' } } : {}),
-    }],
+      ...opts.agent,
+    }, ...(opts.others ?? []).map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, strategy: strategy() }))],
     modules: opts.modules ?? [new StubModule()],
     ...(opts.servers ? { mcplServers: opts.servers } : {}),
   });
@@ -80,12 +84,12 @@ async function makeFramework(opts: {
   };
 }
 
-const call = (framework: AgentFramework, name: string, input: Json = {}): Promise<ToolResult> =>
-  framework.executeToolCall({ id: `c-${Math.random().toString(36).slice(2, 10)}`, name, input, callerAgentName: 'scout' } as never);
+const call = (framework: AgentFramework, name: string, input: Json = {}, agent = 'scout'): Promise<ToolResult> =>
+  framework.executeToolCall({ id: `c-${Math.random().toString(36).slice(2, 10)}`, name, input, callerAgentName: agent } as never);
 
-const header = async (framework: AgentFramework): Promise<ToolDefinition[]> =>
-  (await framework.previewActivation('scout')).tools ?? [];
-const headerNames = async (framework: AgentFramework) => (await header(framework)).map((t) => t.name);
+const header = async (framework: AgentFramework, agent = 'scout'): Promise<ToolDefinition[]> =>
+  (await framework.previewActivation(agent)).tools ?? [];
+const headerNames = async (framework: AgentFramework, agent = 'scout') => (await header(framework, agent)).map((t) => t.name);
 
 describe('the built-in toolset', () => {
   it('holds the host\'s rarely-used tools and module utilities; the tool list keeps the rest and the meta-tools', async () => {
@@ -158,6 +162,48 @@ describe('the built-in toolset', () => {
     } finally { await h.stop(); }
   });
 
+  it('checks act\'s arguments against the tool\'s definition before calling it', async () => {
+    const stub = new StubModule();
+    const h = await makeFramework({ modules: [stub] });
+    try {
+      await call(h.framework, 'toolsets--open', { toolset: 'settings' });
+      const wrong = await call(h.framework, 'toolsets--act', { tool: 'stub--rare_op', args: { mode: 'loud' } });
+      assert.ok(wrong.isError);
+      assert.match(String(wrong.error), /Invalid arguments for stub--rare_op: .*Nothing was sent/s);
+      const missing = await call(h.framework, 'toolsets--act', { tool: 'stub--rare_op', args: {} });
+      assert.ok(missing.isError && /Invalid arguments for stub--rare_op/.test(String(missing.error)));
+      assert.equal(stub.calls.length, 0, 'nothing ran');
+    } finally { await h.stop(); }
+  });
+
+  it('keeps utilities out of the tool list of an agent that may not use the meta-tools, whose other tools all stay', async () => {
+    const h = await makeFramework({ agent: { allowedTools: ['stub--frontline', 'stub--adminish', 'stub--rare_op', 'agent_settings'] } });
+    try {
+      const names = await headerNames(h.framework);
+      for (const kept of ['stub--frontline', 'stub--adminish', 'agent_settings']) assert.ok(names.includes(kept), `${kept} stays`);
+      assert.ok(!names.includes('stub--rare_op'), 'a utility is never a tool-list tool');
+      assert.ok(!names.some((n) => n.startsWith('toolsets--')));
+    } finally { await h.stop(); }
+  });
+
+  it('moves an unreadable state file aside rather than writing over it', async () => {
+    const { writeFileSync, readdirSync, readFileSync } = await import('node:fs');
+    const first = await makeFramework();
+    await call(first.framework, 'toolsets--open', { toolset: 'settings' });
+    await first.stop(true);
+    const dir = first.dir;
+    writeFileSync(join(dir, 'store', 'config', 'toolsets.json'), 'not json at all');
+    const h = await makeFramework({ dir });
+    try {
+      await call(h.framework, 'toolsets--open', { toolset: 'settings' });
+      const files = readdirSync(join(dir, 'store', 'config'));
+      const aside = files.find((f) => f.startsWith('toolsets.json.unreadable-'));
+      assert.ok(aside, files.join(', '));
+      assert.equal(readFileSync(join(dir, 'store', 'config', aside!), 'utf8'), 'not json at all', 'kept as it was');
+      assert.equal(JSON.parse(readFileSync(join(dir, 'store', 'config', 'toolsets.json'), 'utf8')).version, 1);
+    } finally { await h.stop(); }
+  });
+
   it('stays open across a restart', async () => {
     const stub = new StubModule();
     const first = await makeFramework({ modules: [stub] });
@@ -188,6 +234,20 @@ describe('reminders', () => {
       hub.observeCompile('scout', [message('later talk')]);
       assert.equal(hub.reminderFor('scout'), null, 'nothing to remind of once it is closed');
     } finally { await h.stop(); }
+  });
+});
+
+describe('reminders across a restart', () => {
+  it('reminds of a toolset left open across a restart whose announcement the context no longer carries', async () => {
+    const first = await makeFramework();
+    await call(first.framework, 'toolsets--open', { toolset: 'settings' });
+    await first.stop(true);
+    const second = await makeFramework({ dir: first.dir });
+    try {
+      const hub = (second.framework as unknown as { toolsetHub: { observeCompile(a: string, m: unknown[]): void; reminderFor(a: string): string | null } }).toolsetHub;
+      hub.observeCompile('scout', [{ participant: 'scout', content: [{ type: 'text', text: 'after the restart' }] }]);
+      assert.match(hub.reminderFor('scout') ?? '', /\[settings\] open: .*agent_settings/s);
+    } finally { await second.stop(); }
   });
 });
 
@@ -381,6 +441,72 @@ describe('server tabs', () => {
       await h.framework.start();
       await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
       assert.ok(!(await headerNames(h.framework)).includes('srv--ping'));
+    } finally { await h.stop(); await server.close(); }
+  });
+
+  it('puts a hidden tool of a full server into its tab', async () => {
+    const { server, calls } = await pingServer();
+    const dir = mkdtempSync(join(tmpdir(), 'host-toolsets-hide-mcpl-'));
+    const workspace = new WorkspaceModule({ mounts: [{ name: 'board', path: dir, mode: 'read-write', watch: 'never' }] });
+    const h = await makeFramework({ dir, modules: [workspace], toolPresentation: true, servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
+    try {
+      await h.framework.start();
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
+      await call(h.framework, 'toolsets--open', { toolset: 'settings' });
+      const hid = await call(h.framework, 'toolsets--act', { tool: 'set_tool_visibility', args: { name: 'srv--ping', visible: false } });
+      assert.ok(hid.success, hid.error);
+      assert.ok(!(await headerNames(h.framework)).includes('srv--ping'), 'out of the tool list');
+      assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look', { toolset: 'settings' })), /srv--ping/, 'not in the built-in toolset');
+      assert.match(resultText(await call(h.framework, 'toolsets--open', { server: 'srv' })), /\[tab srv\] open[\s\S]*srv--ping\(\)/, 'in its server\'s tab');
+      const acted = await call(h.framework, 'toolsets--act', { tool: 'srv--ping', args: {} });
+      assert.ok(acted.success, acted.error);
+      assert.equal(calls.length, 1);
+    } finally { await h.stop(); await server.close(); }
+  });
+
+  it('is per agent; a disconnect is refused while another resident agent uses the server', async () => {
+    const { server } = await pingServer();
+    const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }], others: ['other'] });
+    try {
+      await h.framework.start();
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
+      await call(h.framework, 'toolsets--close', { server: 'srv' });
+      assert.ok(!(await headerNames(h.framework)).includes('srv--ping'), 'a tab for scout');
+      assert.ok((await headerNames(h.framework, 'other')).includes('srv--ping'), 'still full for the other agent');
+      const refused = resultText(await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true }));
+      assert.match(refused, /wasn't disconnected: other has it/);
+      assert.ok(isOpenSocket(server.peer.ws), 'still connected');
+      await call(h.framework, 'toolsets--close', { server: 'srv' }, 'other');
+      assert.match(resultText(await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true })), /disconnected/);
+    } finally { await h.stop(); await server.close(); }
+  });
+
+  it('makes one connect for two opens of a closed tab at once', async () => {
+    const { server } = await pingServer();
+    const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
+    try {
+      await h.framework.start();
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
+      await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true });
+      const before = server.peers.length;
+      const [a, b] = await Promise.all([call(h.framework, 'toolsets--open', { server: 'srv' }), call(h.framework, 'toolsets--open', { server: 'srv' })]);
+      assert.ok(a.success && b.success, `${a.error ?? ''} ${b.error ?? ''}`);
+      assert.equal(server.peers.length, before + 1, 'one new connection');
+    } finally { await h.stop(); await server.close(); }
+  });
+
+  it('ends a closed tab when its operator connects the server, and forgets it when its operator disconnects it', async () => {
+    const { server } = await pingServer();
+    const config: McplServerConfig = { id: 'srv', url: server.url, toolPrefix: 'srv' };
+    const h = await makeFramework({ servers: [config] });
+    try {
+      await h.framework.start();
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
+      await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true });
+      await h.framework.connectMcplServer(config);
+      assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look')), /closed tab/, 'not a closed tab once connected');
+      await h.framework.disconnectMcplServer('srv');
+      assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look')), /\[tab srv\]/, 'forgotten once removed');
     } finally { await h.stop(); await server.close(); }
   });
 

@@ -29,7 +29,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { ToolDefinition } from './types/events.js';
-import { firstSentence, renderToolDefinition, signature } from './mcpl/tool-signature.js';
+import { checkArgs, firstSentence, renderToolDefinition, signature } from './mcpl/tool-signature.js';
 import { META_TOOL_NAMES } from './mcpl/toolset-host.js';
 
 /** The built-in toolset's name, as agents address it (`toolsets--open {toolset: "settings"}`). */
@@ -68,6 +68,10 @@ export interface HostPresentationDeps {
   reconnect(serverId: string): Promise<void>;
   /** Where a change of the tool list is said: logs. */
   log(line: string): void;
+  /** Whether a host tool is a module utility: never in the tool list, whatever else. */
+  isUtility(toolName: string): boolean;
+  /** The resident agents of this host (no forks, ephemeral runs or the subconscious). */
+  residents(): string[];
 }
 
 interface AgentState {
@@ -124,13 +128,30 @@ export class HostPresentation {
       try {
         this.doc = parseDoc(readFileSync(statePath, 'utf8'));
       } catch (error) {
-        deps.log(`[toolsets] ${statePath} can't be read (${error instanceof Error ? error.message : String(error)}); starting from the configured presentation`);
+        // Kept, not written over: moved aside, so what an agent chose can be
+        // read back by whoever runs the host.
+        const aside = `${statePath}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        let moved = false;
+        try { renameSync(statePath, aside); moved = true; } catch { /* left where it is */ }
+        deps.log(`[toolsets] ${statePath} can't be read (${error instanceof Error ? error.message : String(error)}); `
+          + (moved ? `moved aside to ${aside}; ` : 'left as it is, and not written to; ')
+          + 'starting from the configured presentation');
+        if (!moved) this.unwritable = true;
       }
     }
   }
 
+  /** An unreadable state file that couldn't be moved aside is never written over. */
+  private unwritable = false;
+  /** Reconnects of closed tabs under way, so two opens make one connect. */
+  private reconnecting = new Map<string, Promise<void>>();
+
   private save(): void {
-    if (!this.statePath) return;
+    if (!this.statePath || this.unwritable) return;
+    // An agent with nothing open and nothing chosen has no state to keep.
+    for (const [name, a] of Object.entries(this.doc.agents)) {
+      if (a.open.length === 0 && Object.keys(a.servers).length === 0) delete this.doc.agents[name];
+    }
     try {
       mkdirSync(dirname(this.statePath), { recursive: true });
       const tmp = `${this.statePath}.tmp`;
@@ -201,12 +222,16 @@ export class HostPresentation {
 
   /** The tool list an agent is shown: what it may call, less the built-in toolset and its tabs. */
   header(agentName: string, tools: ToolDefinition[]): ToolDefinition[] {
-    if (!this.active(agentName)) return tools;
+    // Without the meta-tools nothing is presented out of the tool list, but a
+    // utility still isn't in it: it was never a tool-list tool.
+    if (!this.active(agentName)) return tools.filter((t) => isMetaTool(t.name) || !this.deps.isUtility(t.name));
     return tools.filter((t) => !this.outOfHeader(agentName, t.name));
   }
 
   private outOfHeader(agentName: string, name: string): boolean {
     if (isMetaTool(name)) return false;
+    // A utility is never a tool-list tool, presented here or not.
+    if (this.deps.isUtility(name)) return true;
     const server = this.deps.serverOf(name);
     if (server) return this.presentation(agentName, server) !== 'full';
     return this.deps.placedInBuiltin(name);
@@ -323,6 +348,19 @@ export class HostPresentation {
     return this.server(serverId) !== undefined;
   }
 
+  /** Connect a closed tab again: one connect, whoever else asks meanwhile. */
+  private async reconnect(serverId: string): Promise<void> {
+    let pending = this.reconnecting.get(serverId);
+    if (!pending) {
+      pending = (async () => {
+        await this.deps.reconnect(serverId);
+        this.doc.closed[serverId] = false;
+      })().finally(() => this.reconnecting.delete(serverId));
+      this.reconnecting.set(serverId, pending);
+    }
+    await pending;
+  }
+
   /**
    * `toolsets--open {server}`: a closed tab is connected again; a tab's tools
    * are shown and callable through act; with `full`, the server goes back
@@ -330,72 +368,111 @@ export class HostPresentation {
    */
   async openServer(agentName: string, serverId: string, opts: { full?: boolean } = {}): Promise<string> {
     const said: string[] = [];
-    if (this.isClosedTab(serverId)) {
-      await this.deps.reconnect(serverId);
-      this.doc.closed[serverId] = false;
-      this.save();
+    if (this.isClosedTab(serverId) || this.reconnecting.has(serverId)) {
+      await this.reconnect(serverId);
       said.push(`${serverId} connected.`);
     }
     const a = this.agent(agentName);
-    if (opts.full) {
-      const was = this.presentation(agentName, serverId);
-      a.servers[serverId] = 'full';
-      this.setOpen(agentName, tabKey(serverId), false);
-      said.push(was === 'full'
-        ? `${serverId} is in your tool list already.`
-        : `${serverId}'s tools are back in your tool list from your next request (your tool list changed, so that request writes its prompt cache again).`);
-      return said.join('\n');
-    }
-    if (this.presentation(agentName, serverId) === 'full') {
-      const hidden = this.tabTools(agentName, serverId);
-      if (!hidden.length) {
+    try {
+      if (opts.full) {
+        const was = this.presentation(agentName, serverId);
+        a.servers[serverId] = 'full';
+        a.open = a.open.filter((k) => k !== tabKey(serverId));
+        said.push(was === 'full'
+          ? `${serverId} is in your tool list already.`
+          : `${serverId}'s tools are back in your tool list from your next request (your tool list changed, so that request writes its prompt cache again).`);
+        return said.join('\n');
+      }
+      if (this.presentation(agentName, serverId) === 'full' && !this.tabTools(agentName, serverId).length) {
         said.push(`${serverId}'s tools are in your tool list: call them by name. ${META_TOOL_NAMES.close} {server:"${serverId}"} moves it to a tab.`);
         return said.join('\n');
       }
+      if (!a.open.includes(tabKey(serverId))) a.open.push(tabKey(serverId));
+      said.push(this.announce(this.tabLabel(serverId), this.tabTools(agentName, serverId), `${META_TOOL_NAMES.close} {server:"${serverId}"}`));
+      return said.join('\n');
+    } finally {
+      this.save();
     }
-    this.setOpen(agentName, tabKey(serverId), true);
-    said.push(this.announce(this.tabLabel(serverId), this.tabTools(agentName, serverId), `${META_TOOL_NAMES.close} {server:"${serverId}"}`));
-    return said.join('\n');
+  }
+
+  /**
+   * The other resident agents a server's disconnect would take it from: those
+   * that have it in their tool list or its tab open. A connection is the
+   * host's, so one agent's closed tab is every agent's.
+   */
+  private otherUsers(agentName: string, serverId: string): string[] {
+    return this.deps.residents().filter((other) => other !== agentName && this.active(other)
+      && (this.presentation(other, serverId) === 'full' || this.isOpen(other, tabKey(serverId))));
   }
 
   /**
    * `toolsets--close {server}`: a server in the tool list moves to a tab (one
    * change of the tool list); an open tab is hidden; with `disconnect`, the
-   * server is disconnected as a closed tab until it's opened again.
+   * server is disconnected as a closed tab until it's opened again, unless
+   * another resident agent still uses it.
    */
   async closeServer(agentName: string, serverId: string, opts: { disconnect?: boolean } = {}): Promise<string> {
-    const said: string[] = [];
-    const a = this.agent(agentName);
-    const was = this.presentation(agentName, serverId);
-    if (was === 'full') {
-      a.servers[serverId] = 'tab';
-      said.push(`${serverId}'s tools leave your tool list from your next request (your tool list changed, so that request writes its prompt cache again); its tab: ${META_TOOL_NAMES.open} {server:"${serverId}"}.`);
-    } else if (this.isOpen(agentName, tabKey(serverId))) {
-      said.push(`${this.tabLabel(serverId)} hidden; it stays connected.`);
-    }
-    this.setOpen(agentName, tabKey(serverId), false);
-    if (opts.disconnect) {
-      if (this.isClosedTab(serverId)) said.push(`${serverId} is disconnected already.`);
-      else {
-        await this.deps.disconnect(serverId);
-        this.doc.closed[serverId] = true;
-        this.save();
-        said.push(`${serverId} disconnected: none of its events reach you until ${META_TOOL_NAMES.open} {server:"${serverId}"} connects it again.`);
+    if (opts.disconnect && !this.isClosedTab(serverId)) {
+      const users = this.otherUsers(agentName, serverId);
+      if (users.length) {
+        return `${serverId} wasn't disconnected: ${users.join(', ')} ${users.length === 1 ? 'has' : 'have'} it in ${users.length === 1 ? 'its' : 'their'} tool list or ${users.length === 1 ? 'its' : 'their'} tab open, and a connection is the host's, every agent's. ` +
+          `Nothing was changed. ${META_TOOL_NAMES.close} {server:"${serverId}"} without disconnect moves it out of your own tool list.`;
       }
     }
-    this.save();
+    const said: string[] = [];
+    const a = this.agent(agentName);
+    try {
+      const was = this.presentation(agentName, serverId);
+      if (was === 'full') {
+        a.servers[serverId] = 'tab';
+        said.push(`${serverId}'s tools leave your tool list from your next request (your tool list changed, so that request writes its prompt cache again); its tab: ${META_TOOL_NAMES.open} {server:"${serverId}"}.`);
+      } else if (this.isOpen(agentName, tabKey(serverId))) {
+        said.push(`${this.tabLabel(serverId)} hidden; it stays connected.`);
+      }
+      a.open = a.open.filter((k) => k !== tabKey(serverId));
+      if (opts.disconnect) {
+        if (this.isClosedTab(serverId)) said.push(`${serverId} is disconnected already.`);
+        else {
+          await this.deps.disconnect(serverId);
+          this.doc.closed[serverId] = true;
+          said.push(`${serverId} disconnected: none of its events reach you until ${META_TOOL_NAMES.open} {server:"${serverId}"} connects it again.`);
+        }
+      }
+    } finally {
+      this.save();
+    }
     if (!said.length) said.push(`${this.tabLabel(serverId)} is hidden already.`);
     return said.join('\n');
+  }
+
+  /** A server connected by other means (an operator's connect, a deploy): no longer a closed tab. */
+  noteConnected(serverId: string): void {
+    if (this.doc.closed[serverId] === true) {
+      this.doc.closed[serverId] = false;
+      this.save();
+    }
+  }
+
+  /** A server removed for good (an operator's disconnect): nothing of its tab is kept. */
+  noteRemoved(serverId: string): void {
+    let changed = false;
+    if (serverId in this.doc.closed) { delete this.doc.closed[serverId]; changed = true; }
+    for (const a of Object.values(this.doc.agents)) {
+      if (serverId in a.servers) { delete a.servers[serverId]; changed = true; }
+      const open = a.open.filter((k) => k !== tabKey(serverId));
+      if (open.length !== a.open.length) { a.open = open; changed = true; }
+    }
+    if (changed) this.save();
   }
 
   // ── act ──
 
   /**
    * `toolsets--act` for a host toolset's tool: the call it makes, under the
-   * tool's own name; a refusal when its toolset isn't open; null when no
-   * host toolset has the tool (an RFC-014 dynamic tool's call goes on to the
-   * server's toolsets). A server's tool may be named in full, or bare with
-   * `server`.
+   * tool's own name; a refusal when its toolset isn't open or its arguments
+   * don't fit its definition; null when no host toolset has the tool (an
+   * RFC-014 dynamic tool's call goes on to the server's toolsets). A
+   * server's tool may be named in full, or bare with `server`.
    */
   resolveAct(agentName: string, input: unknown): HostActTarget | null {
     if (!this.active(agentName)) return null;
@@ -411,7 +488,7 @@ export class HostPresentation {
     // A host toolset's tool the agent may not call isn't listed to it; its
     // call still goes on, by name, for dispatch to refuse as it would a
     // direct call, rather than reading as no such tool.
-    const def: { name: string } | undefined = listed
+    const def: { name: string; inputSchema?: unknown } | undefined = listed
       ?? (!server && this.deps.serverOf(tool) === null && this.deps.placedInBuiltin(tool) ? { name: tool } : undefined);
     if (!def) {
       if (server && this.isClosedTab(server)) return { kind: 'refused', error: `${server} is a closed tab, disconnected: ${META_TOOL_NAMES.open} {server:"${server}"} connects it. Nothing was sent.` };
@@ -424,24 +501,53 @@ export class HostPresentation {
       const opener = home ? `${META_TOOL_NAMES.open} {server:"${home}"}` : `${META_TOOL_NAMES.open} {toolset:"${BUILTIN_TOOLSET}"}`;
       return { kind: 'refused', error: `${def.name} is in ${home ? this.tabLabel(home) : this.builtinLabel}, which isn't open: ${opener} opens it. Nothing was sent.` };
     }
-    return { kind: 'call', name: def.name, args: (args.args ?? {}) as Record<string, unknown> };
+    const callArgs = (args.args ?? {}) as Record<string, unknown>;
+    // As a server's dynamic tool is checked before it's sent (RFC §6.1): the
+    // arguments against the definition the agent was shown.
+    if (def.inputSchema !== undefined) {
+      const problem = checkArgs(def.inputSchema, callArgs);
+      if (problem) {
+        // A key the definition doesn't have is named too, since it's often
+        // the cause of a missing one (a misspelling).
+        const props = isObj(def.inputSchema) && isObj((def.inputSchema as Record<string, unknown>).properties)
+          ? Object.keys((def.inputSchema as Record<string, unknown>).properties as Record<string, unknown>) : null;
+        const unknown = props ? Object.keys(callArgs).filter((k) => !props.includes(k)) : [];
+        const extra = unknown.length
+          ? `; ${unknown.map((k) => JSON.stringify(k)).join(', ')} ${unknown.length === 1 ? "isn't one of its parameters" : "aren't among its parameters"}`
+          : '';
+        return { kind: 'refused', error: `Invalid arguments for ${def.name}: ${problem}${extra}. Nothing was sent; ${META_TOOL_NAMES.look} {tool:"${def.name}"} shows its definition.` };
+      }
+    }
+    return { kind: 'call', name: def.name, args: callArgs };
   }
 
   // ── reminders (RFC-014 §8.3) ──
 
-  /** The open host toolsets' markers and reminders for an agent. */
-  openMarkers(agentName: string): Array<{ marker: string; reminder: string }> {
+  /**
+   * The open host toolsets of an agent: each one's marker (its announcement's
+   * first words, which a reminder repeats) and its reminder, worked out only
+   * when one is due. `dueWhenAbsent`: such a toolset is due whenever a
+   * request doesn't carry its marker, even one never seen since the host
+   * started (open across a restart).
+   */
+  openMarkers(agentName: string): Array<{ marker: string; reminder: () => string; dueWhenAbsent: true }> {
     if (!this.active(agentName)) return [];
-    const out: Array<{ marker: string; reminder: string }> = [];
+    const out: Array<{ marker: string; reminder: () => string; dueWhenAbsent: true }> = [];
     for (const key of this.doc.agents[agentName]?.open ?? []) {
       if (key === BUILTIN_TOOLSET) {
-        const names = this.builtinTools(agentName).map((t) => t.name);
-        out.push({ marker: this.builtinLabel, reminder: `${this.builtinLabel} open: ${names.join(', ') || '(none)'} — through ${META_TOOL_NAMES.act}; ${META_TOOL_NAMES.close} {toolset:"${BUILTIN_TOOLSET}"} closes it.` });
+        out.push({
+          marker: `${this.builtinLabel} open`,
+          dueWhenAbsent: true,
+          reminder: () => `${this.builtinLabel} open: ${this.builtinTools(agentName).map((t) => t.name).join(', ') || '(none)'} — through ${META_TOOL_NAMES.act}; ${META_TOOL_NAMES.close} {toolset:"${BUILTIN_TOOLSET}"} closes it.`,
+        });
       } else if (key.startsWith('server:')) {
         const id = key.slice('server:'.length);
         if (!this.knows(id) || this.isClosedTab(id)) continue;
-        const names = this.tabTools(agentName, id).map((t) => t.name);
-        out.push({ marker: this.tabLabel(id), reminder: `${this.tabLabel(id)} open: ${names.join(', ') || '(none)'} — through ${META_TOOL_NAMES.act}; ${META_TOOL_NAMES.close} {server:"${id}"} hides it.` });
+        out.push({
+          marker: `${this.tabLabel(id)} open`,
+          dueWhenAbsent: true,
+          reminder: () => `${this.tabLabel(id)} open: ${this.tabTools(agentName, id).map((t) => t.name).join(', ') || '(none)'} — through ${META_TOOL_NAMES.act}; ${META_TOOL_NAMES.close} {server:"${id}"} hides it.`,
+        });
       }
     }
     return out;

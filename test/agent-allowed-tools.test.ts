@@ -503,6 +503,14 @@ for (const route of ['model', 'public', 'script'] as const) {
       if (route === 'model') {
         const [result] = await h.turn([{ id: 'utility-denied', name: 'toolsets--act', input }]);
         assert.equal(result.isError, true); assert.match(result.content, /not permitted.*allowedTools/);
+        // Refused at dispatch as a direct call of the utility is: traced as
+        // that tool's failure, and never opened, so no RFC-007 event.
+        const terminals = h.traces.filter(event => event.callId === 'utility-denied' &&
+          ['tool:failed', 'tool:completed'].includes(event.type as string));
+        assert.deepEqual(terminals.map(event => [event.type, event.tool]), [['tool:failed', 'probe--denied_util']]);
+        assert.deepEqual(h.lifecycle, []);
+        assert.equal(h.emitter.openCount, 0);
+        assert.equal((h.emitter as unknown as { calls: Map<string, unknown> }).calls.size, 0);
         assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
       } else if (route === 'public') {
         const result = await h.framework.executeToolCall({ id: 'utility-denied', name: 'toolsets--act', input, callerAgentName: 'assistant' });
@@ -714,11 +722,14 @@ test('module utilities are callable tools out of the tool list, and utils is gon
   } finally { await h.close(); }
 });
 
-test('an agent that may not call the meta-tools keeps every tool it may call in its list', async () => {
-  const h = await harness({ allowedTools: ['probe--allowed_util', 'agent_settings'] });
+test('an agent that may not call the meta-tools keeps every tool it may call in its list, a utility aside', async () => {
+  const h = await harness({ allowedTools: ['probe--allowed', 'probe--allowed_util', 'agent_settings'] });
   try {
     const surface = ((await h.framework.previewActivation('assistant')).tools ?? []).map(tool => tool.name);
-    assert.ok(surface.includes('probe--allowed_util') && surface.includes('agent_settings'));
+    assert.ok(surface.includes('probe--allowed') && surface.includes('agent_settings'), 'its tools, built-in ones included, stay');
+    assert.ok(!surface.includes('probe--allowed_util'), 'a utility is never a tool-list tool; it can still be called by name');
+    const called = await h.framework.executeToolCall({ id: 'by-name', name: 'probe--allowed_util', input: {}, callerAgentName: 'assistant' });
+    assert.equal(called.success, true, called.error);
   } finally { await h.close(); }
 });
 

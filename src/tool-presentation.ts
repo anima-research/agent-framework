@@ -357,7 +357,7 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
     '# Tool catalogue — generated from currently available tools', '',
     `Revision: ${snapshot.revision}`, '',
     `${snapshot.entries.length} tools: ${visible} visible, ${snapshot.entries.length-visible} hidden.`,
-    'Visible = supplied in new requests. Hidden = in the host\'s "settings" toolset, or its MCPL server\'s tab: toolsets--look shows it, toolsets--act calls it once that toolset is open.',
+    'Visible = not hidden by you: in your tool list, unless the host keeps it in its "settings" toolset or a server\'s tab (toolsets--look shows those). Hidden = moved into the "settings" toolset, or its MCPL server\'s tab: toolsets--look shows it, toolsets--act calls it once that toolset is open.',
     'These are your visibility choices, not fixed primary/secondary rankings.',
     'Copy exact names from the index; similar-sounding names may not exist.',
     'Show a hidden tool: set_tool_visibility {"name":"EXACT_NAME","visible":true}.',
