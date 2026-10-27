@@ -2796,7 +2796,6 @@ const JUDGE_PARAMETER: ToolParameter = {
     'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
     'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
     'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
-    'A message its server marks as addressed to you (a mention, a reply or a DM) wakes you as an "always" rule would, without asking the judge. ' +
     'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {
@@ -3851,9 +3850,11 @@ export class AgentFramework {
           : './data/gate.json');
       // The reply judge `judge` rules ask (gate/reply-judge.ts): a small model
       // reading the agent's context as a dry-run preview, on this host's
-      // membrane. Only a host that sets GateOptions.judge has one.
-      const judgeOptions = config.gate.judge;
-      const judge = judgeOptions == null || judgeOptions.enabled === false ? undefined : new ReplyJudge({
+      // membrane. Unless the host turns it off, every gate has one, so a judge
+      // rule an agent adds works where its host never configured one; it runs
+      // only for judge rules, so a gate without them makes no judge calls.
+      const judgeOptions = config.gate.judge ?? undefined;
+      const judge = judgeOptions?.enabled === false ? undefined : new ReplyJudge({
         membraneFor: (agentName) => framework.judgeMembraneFor(agentName),
         options: judgeOptions,
         recordUsage: (agentName, usage) => {
@@ -9918,7 +9919,8 @@ export class AgentFramework {
           '• Let a small model decide: `judge` batches like debounceMs, then a cheap reply judge reads your context ' +
           '(its newest part) with your `instructions` and wakes you when now looks like a good time to reply, e.g. ' +
           '`{ name: "ambient-judged", match: { tagsAny: ["chat:ambient"] }, judge: { debounceMs: 20000, maxWaitMs: 120000, ' +
-          'instructions: "Wake me when someone asks me something or the talk turns to the garden; let banter between others go by." } }`.',
+          'instructions: "Wake me when someone asks me something or the talk turns to the garden; let banter between others go by." } }`. ' +
+          'Rules are read in order: keep your DM/mention rules ahead of it with `always` if those should never wait on the judge.',
         inputSchema: { ...tool.inputSchema, properties: judged },
       };
     });

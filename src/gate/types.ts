@@ -64,9 +64,9 @@ export interface PassiveSampleConfig {
  * and answers reply or wait. On reply the
  * batch is delivered as a debounce's is; on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
- * judged afresh. Where a judge is wired, an event addressed to the agent
- * (`chat:addressed`) wakes it as an `always` rule does, without the judge, and
- * joins no batch. A judge that fails or times out wakes the agent (fail open),
+ * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
+ * of a judge rule wakes the agent without the judge. A judge that fails or
+ * times out wakes the agent (fail open),
  * unless the host set its `onError` to `"skip"`.
  */
 export interface JudgeConfig {
@@ -219,9 +219,10 @@ export interface GateOptions {
    * missing, no one bypasses sleep.
    */
   privilegedUsersPath?: string;
-  /** The reply judge that `judge` rules ask (see JudgeConfig). Left out, the
-   *  host wires none. */
-  judge?: ReplyJudgeOptions;
+  /** The reply judge that `judge` rules ask (see JudgeConfig). Left out (or
+   *  null), the judge is wired with its defaults; it runs only for `judge`
+   *  rules, so a gate with none makes no judge calls. */
+  judge?: ReplyJudgeOptions | null;
 }
 
 /**
@@ -231,14 +232,22 @@ export interface GateOptions {
  * say.
  */
 export interface ReplyJudgeOptions {
-  /** False leaves the judge unwired, as leaving `GateOptions.judge` out does:
-   *  `wake_add_rule` then offers no `judge`, and a `judge` rule in gate.json
-   *  wakes the agent as a debounce of its `debounceMs` would, which
-   *  gate_status says. Default true. */
+  /** False leaves the judge unwired: `wake_add_rule` then offers no `judge`,
+   *  and a `judge` rule in gate.json wakes the agent as a debounce of its
+   *  `debounceMs` would, which gate_status says. Default true. */
   enabled?: boolean;
   /** The model the judge runs on, as the host's membrane names it. Default
    *  `claude-haiku-5-5`. */
   model?: string;
+  /**
+   * The most input tokens one judge request may carry, its instructions and
+   * the batch included; the context document is cut from its oldest end to
+   * fit. Default 90,000: Claude Haiku 5.5 costs five times as much past
+   * 100,000 input tokens, and the margin covers the estimate's error. The
+   * least is 4,000, a short tail of the conversation: cheaper and quicker,
+   * with less of the room's history to weigh.
+   */
+  maxInputTokens?: number;
   /** The longest (ms) a judge request may take before the batch is decided by
    *  `onError`. Default 20,000. */
   timeoutMs?: number;
@@ -250,6 +259,10 @@ export interface ReplyJudgeOptions {
    *  verdict, quickly. `"none"` sends no effort, for a provider that doesn't
    *  take Anthropic's `output_config`. */
   effort?: 'low' | 'medium' | 'high' | 'none';
+  /** The prompt cache's lifetime for the judge's context document. `"5m"`
+   *  (the default) suits judge rules that fire minutes apart; `"1h"` costs
+   *  more to write and suits ones that fire less often. */
+  cacheTtl?: '5m' | '1h';
 }
 
 /** One event of a batch, as the reply judge is shown it. */

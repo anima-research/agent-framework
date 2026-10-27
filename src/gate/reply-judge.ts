@@ -4,12 +4,23 @@
  *
  * Per batch it takes the request the agent WOULD send if woken now (the
  * framework's previewActivation, a dry run that commits nothing), renders it
- * as one plain-text document (the newest of the agent's conversation, oldest
- * first, then its system prompt, abridged), and asks the model, with the
- * agent's own instructions and the batch, for one line: `REPLY: <reason>` or
- * `WAIT: <reason>`. The conversation shown, the system prompt and the batch's
- * listing each have a fixed size in characters, a few thousand tokens in all;
- * the newest message and the newest event are shown even past it.
+ * as one plain-text document (the agent's system prompt, abridged, then its
+ * conversation, oldest first), keeps the newest part of that document that
+ * fits the judge's input budget, and asks the model, with the agent's own
+ * instructions and the batch, for one line: `REPLY: <reason>` or
+ * `WAIT: <reason>`.
+ *
+ * Cost and latency. The budget (`maxInputTokens`, default 90,000) keeps every
+ * request under the 100,000-token line past which Claude Haiku 5.5 costs five
+ * times as much. Tokens are estimated from characters, at a ratio the judge
+ * corrects from every response's reported input, so the estimate tracks the
+ * model's tokenizer and the context's mix of prose and code. The document is
+ * sent as a run of chunks that start at an anchor, the first message shown,
+ * which stays put while the window grows into its budget: the chunks before
+ * the newest stay byte-identical from one request to the next, and a cache
+ * breakpoint after the last full one lets every later request read them from
+ * the prompt cache. Only when the window outgrows its budget does the anchor
+ * move, to leave the window a share of the budget to grow into again.
  *
  * The judge reads; it never writes into the agent's context and never speaks.
  */
@@ -20,9 +31,28 @@ import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudge
 
 /** The judge's model when the host names none. */
 export const DEFAULT_JUDGE_MODEL = 'claude-haiku-5-5';
-const CONVERSATION_CHARS = 6_700;
-const SYSTEM_CHARS = 850;
-const EVENTS_CHARS = 2_160;
+/** The judge's input budget when the host names none: under Haiku 5.5's 100K price line, with margin. */
+export const DEFAULT_JUDGE_MAX_INPUT_TOKENS = 90_000;
+/** The smallest input budget the judge takes: its instructions, the batch and a little context. A
+ *  host that wants only the newest few messages read (a short tail, cheaper and quicker, with less
+ *  of the room's history to weigh) sets a budget near it. */
+export const MIN_JUDGE_INPUT_TOKENS = 4_000;
+
+/** Characters per token the judge assumes before any response has told it better. Low, so a first estimate overshoots. */
+const INITIAL_CHARS_PER_TOKEN = 3;
+/** The share of each measured ratio the running estimate takes: more when the
+ *  text proved denser than estimated (more tokens a character), which is the
+ *  side that overruns the budget, less when sparser. */
+const CALIBRATION_WEIGHT_DENSER = 0.6;
+const CALIBRATION_WEIGHT_SPARSER = 0.2;
+/** The share of the budget the system prompt (the agent's, abridged) may fill. */
+const SYSTEM_SHARE = 0.08;
+/** The share of the document budget a fresh window starts at, leaving the rest to grow into before the anchor moves. */
+const FRESH_WINDOW_SHARE = 0.65;
+/** Estimated tokens per cached chunk of the document: above every model's minimum cacheable prefix. */
+const CHUNK_TOKENS = 6_000;
+/** Tokens held back for the judge's own instructions, the batch and the question. */
+const FIXED_TOKENS_RESERVE = 3_000;
 /** Longest text block (characters) a message renders whole; a longer one keeps its head and tail. */
 const MAX_TEXT_CHARS = 6_000;
 /** Longest message (characters) rendered, all its blocks together. */
@@ -33,6 +63,8 @@ const MAX_TOOL_CHARS = 600;
  *  that thinking at the model's default effort doesn't crowd out the line.
  *  Only what's generated is billed. */
 const VERDICT_MAX_TOKENS = 4_096;
+/** The share of the budget the batch's listing may fill; past it the oldest events are counted, not listed. */
+const EVENTS_SHARE = 0.1;
 /** The participant the judge's request names as the assistant: none of its messages is one. */
 const JUDGE_PARTICIPANT = 'reply-judge';
 
@@ -53,6 +85,18 @@ export interface ReplyJudgeDeps {
    *  timers the request carries: wakes the framework has queued or holds. A
    *  provider that throws counts as knowing of none. */
   upcomingWakes?: (agentName: string) => UpcomingWake[] | Promise<UpcomingWake[]>;
+}
+
+/** One message of the agent's context, rendered. */
+interface Entry {
+  text: string;
+  key: string;
+}
+
+/** Where the last request's window started, per agent. */
+interface Anchor {
+  /** The keys of the window's first few entries, to find it again. */
+  keys: string[];
 }
 
 /** A message as the document shows it: its participant, and each block as text. Thinking is the agent's own, and isn't shown. */
@@ -106,6 +150,16 @@ export function cut(text: string, max: number): string {
   if (text.length <= max) return text;
   const keep = Math.floor((max - 40) / 2);
   return `${text.slice(0, keep)} […${text.length - 2 * keep} characters cut…] ${text.slice(-keep)}`;
+}
+
+/** A cheap, stable key for an entry (FNV-1a over its text, with its length). */
+function keyOf(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${(h >>> 0).toString(36)}:${text.length}`;
 }
 
 /** The text of a system prompt, as membrane's request may hold it. */
@@ -167,7 +221,7 @@ export function parseVerdict(text: string): { reply: boolean; reason: string } |
   return { reply: last[1] === 'REPLY', reason: last[2]!.trim().replace(/^[*_`]+|[*_`]+$/g, '').trim() };
 }
 
-/** The judge's own system prompt, the same for every request about one agent. */
+/** The judge's own system prompt: stable per agent, so it caches. */
 export function judgeSystemPrompt(agentName: string): string {
   return [
     `You are the reply judge for an AI agent named ${agentName}. The agent isn't woken for every message: when new`,
@@ -192,11 +246,7 @@ export function judgeSystemPrompt(agentName: string): string {
   ].join('\n');
 }
 
-/**
- * The closing message: the batch, the agent's instructions, the question.
- * A server may not mark its mentions (`chat:addressed`); its mentions then
- * reach the judge, and the line's second sentence covers them.
- */
+/** The closing message: the batch, the agent's instructions, the question. */
 export function judgeQuestion(
   request: Pick<JudgeRequest, 'events' | 'instructions' | 'upcomingWakes'>, agentName: string, now: number, maxEventChars = Infinity,
 ): string {
@@ -221,11 +271,6 @@ export function judgeQuestion(
     ...(i > 0 ? [`- (${i} earlier ${i === 1 ? 'event' : 'events'} in this batch not listed)`] : []),
     ...lines,
     '</new_events>',
-    ...(request.events.some((e) => e.addressed) ? [] : [
-      '',
-      `None of these events is a mention, a reply or a DM to ${agentName}: those wake it without asking you. `
-        + 'A message can still ask it something by name.',
-    ]),
   ];
   parts.push('', ifYouWait(request.upcomingWakes ?? [], agentName, now));
   if (request.instructions && request.instructions.trim()) {
@@ -237,16 +282,36 @@ export function judgeQuestion(
 
 export class ReplyJudge {
   private readonly membraneFor: ReplyJudgeDeps['membraneFor'];
+  private readonly cacheTtl: '5m' | '1h';
   private readonly model: string;
+  private readonly maxInputTokens: number;
   private readonly effort: 'low' | 'medium' | 'high' | 'none';
   private readonly chooseAgent: ReplyJudgeDeps['chooseAgent'];
   private readonly preview: ReplyJudgeDeps['preview'];
   private readonly recordUsage: ReplyJudgeDeps['recordUsage'];
   private readonly extraWakes: ReplyJudgeDeps['upcomingWakes'];
+  /** Characters per token, corrected from each response's reported input. */
+  private charsPerToken = INITIAL_CHARS_PER_TOKEN;
+  private readonly anchors = new Map<string, Anchor>();
 
   constructor(deps: ReplyJudgeDeps) {
     this.membraneFor = deps.membraneFor;
+    this.cacheTtl = deps.options?.cacheTtl === '1h' ? '1h' : '5m';
     this.model = deps.options?.model || DEFAULT_JUDGE_MODEL;
+    const max = deps.options?.maxInputTokens;
+    if (max === undefined) {
+      this.maxInputTokens = DEFAULT_JUDGE_MAX_INPUT_TOKENS;
+    } else if (typeof max !== 'number' || !Number.isFinite(max)) {
+      this.maxInputTokens = DEFAULT_JUDGE_MAX_INPUT_TOKENS;
+      console.error(`[gate] the reply judge's maxInputTokens isn't a number, so it's read as ${DEFAULT_JUDGE_MAX_INPUT_TOKENS}`);
+    } else if (max < MIN_JUDGE_INPUT_TOKENS) {
+      // At its nearest bound, as the gate reads a value out of range: a small
+      // budget set to save money stays small.
+      this.maxInputTokens = MIN_JUDGE_INPUT_TOKENS;
+      console.error(`[gate] the reply judge's maxInputTokens is ${max}, under the ${MIN_JUDGE_INPUT_TOKENS} minimum, so it's read as ${MIN_JUDGE_INPUT_TOKENS}`);
+    } else {
+      this.maxInputTokens = Math.floor(max);
+    }
     this.effort = deps.options?.effort ?? 'low';
     this.chooseAgent = deps.chooseAgent;
     this.preview = deps.preview;
@@ -257,8 +322,17 @@ export class ReplyJudge {
   /** The gate's judge function. */
   readonly judge: JudgeFn = async (request) => this.decide(request);
 
-  /** Build the judge's request for one batch: the system prompt, the newest of the conversation, the agent's system prompt, the question. */
-  async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string }> {
+  /** The ratio the judge estimates tokens by now (for tests and status). */
+  estimateRatio(): number {
+    return this.charsPerToken;
+  }
+
+  private tokens(chars: number): number {
+    return Math.ceil(chars / this.charsPerToken);
+  }
+
+  /** Build the judge's request for one batch: the system prompt, the document in chunks, the question. */
+  async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string; chars: number }> {
     const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
     const preview = await this.preview(agentName);
@@ -273,38 +347,130 @@ export class ReplyJudge {
     const upcoming = [...(request.upcomingWakes ?? []), ...extra];
 
     const system = judgeSystemPrompt(agentName);
-    const question = judgeQuestion({ ...request, upcomingWakes: upcoming }, agentName, now, EVENTS_CHARS);
+    const question = judgeQuestion(
+      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken),
+    );
+    const fixedChars = system.length + question.length;
+
+    // The budget the document may fill, in characters at the current ratio.
+    const docTokens = Math.max(1_000, this.maxInputTokens - FIXED_TOKENS_RESERVE - this.tokens(fixedChars));
+    const docChars = Math.floor(docTokens * this.charsPerToken);
+
+    // The agent's system prompt comes after the conversation, just before the
+    // question: a system prompt that changes between requests (a host that
+    // writes the time or a status into it) then costs only its own tokens,
+    // not the cached conversation before it.
     const agentSystem = systemText(preview.system);
+    const systemChars = Math.floor(docChars * SYSTEM_SHARE);
     const about = [
-      `## ${agentName}'s system prompt${agentSystem.length > SYSTEM_CHARS ? ' (abridged)' : ''}`,
+      `## ${agentName}'s system prompt${agentSystem.length > systemChars ? ' (abridged)' : ''}`,
       '',
-      agentSystem ? cut(agentSystem, SYSTEM_CHARS) : '(none)',
+      agentSystem ? cut(agentSystem, systemChars) : '(none)',
     ].join('\n');
-
-    const rendered = preview.messages.map(renderMessage).filter((text) => text.length > 0);
-    let start = rendered.length;
-    let used = 0;
-    while (start > 0 && used + rendered[start - 1]!.length + 2 <= CONVERSATION_CHARS) {
-      used += rendered[start - 1]!.length + 2;
-      start--;
-    }
-    // The newest message is shown even when it alone is over the size (it's cut to MAX_MESSAGE_CHARS already).
-    start = Math.min(start, Math.max(0, rendered.length - 1));
     const header = `# ${agentName}'s context\n\n## Conversation (oldest shown first)`;
-    const document = (start > 0 ? `${header}\n[…earlier messages not shown…]\n\n` : `${header}\n\n`)
-      + rendered.slice(start).map((text) => `${text}\n\n`).join('');
 
+    const entries: Entry[] = [];
+    for (const message of preview.messages) {
+      const text = renderMessage(message);
+      if (text) entries.push({ text, key: keyOf(text) });
+    }
+
+    const windowChars = Math.max(0, docChars - header.length - about.length);
+    const start = this.windowStart(agentName, entries, windowChars);
+    const shown = entries.slice(start);
+    if (shown.length > 0) {
+      this.anchors.set(agentName, { keys: shown.slice(0, 3).map((e) => e.key) });
+    }
+
+    // Chunks of whole messages from the anchor, each closed at CHUNK_TOKENS:
+    // the same entries from the same anchor make the same chunks, so every
+    // chunk before the open one is the same bytes as last time.
+    const chunkChars = CHUNK_TOKENS * INITIAL_CHARS_PER_TOKEN;
+    const chunks: string[] = [];
+    let current = start > 0 ? `${header}\n[…earlier messages not shown…]\n\n` : `${header}\n\n`;
+    for (const entry of shown) {
+      if (current.length + entry.text.length > chunkChars && current.length > 0) {
+        chunks.push(current);
+        current = '';
+      }
+      current += `${entry.text}\n\n`;
+    }
+    const open = current;
+
+    const messages: NormalizedMessage[] = chunks.map((text, i) => ({
+      participant: 'user',
+      content: [{ type: 'text', text }],
+      // After the last closed chunk: the prefix every later request shares.
+      ...(i === chunks.length - 1 ? { cacheBreakpoint: true } : {}),
+    }));
+    if (open) messages.push({ participant: 'user', content: [{ type: 'text', text: open }] });
+    messages.push({ participant: 'user', content: [{ type: 'text', text: about }] });
+    messages.push({ participant: 'user', content: [{ type: 'text', text: question }] });
+
+    const chars = system.length + messages.reduce((n, m) => n + (m.content[0] as { text: string }).text.length, 0);
     return {
       agentName,
+      chars,
       request: {
         system,
-        messages: [document, about, question].map((text): NormalizedMessage => ({ participant: 'user', content: [{ type: 'text', text }] })),
+        messages,
         config: { model: this.model, maxTokens: VERDICT_MAX_TOKENS },
         assistantParticipant: JUDGE_PARTICIPANT,
-        promptCaching: false,
+        promptCaching: true,
+        cacheTtl: this.cacheTtl,
         ...(this.effort !== 'none' ? { providerParams: { output_config: { effort: this.effort } } } : {}),
       },
     };
+  }
+
+  /**
+   * Where the window starts: at last request's anchor, while the window from
+   * there fits; otherwise where the newest messages fill FRESH_WINDOW_SHARE
+   * of the budget, leaving room to grow before it moves again.
+   */
+  private windowStart(agentName: string, entries: Entry[], windowChars: number): number {
+    const tailFrom = (budget: number): number => {
+      let used = 0;
+      let i = entries.length;
+      while (i > 0 && used + entries[i - 1]!.text.length + 2 <= budget) {
+        used += entries[i - 1]!.text.length + 2;
+        i--;
+      }
+      // The newest message is shown even when it alone is over budget (it's cut to MAX_MESSAGE_CHARS already).
+      return Math.min(i, Math.max(0, entries.length - 1));
+    };
+    const anchor = this.anchors.get(agentName);
+    if (anchor && anchor.keys.length > 0) {
+      const at = this.findAnchor(entries, anchor.keys);
+      if (at !== undefined) {
+        let size = 0;
+        for (let i = at; i < entries.length; i++) size += entries[i]!.text.length + 2;
+        if (size <= windowChars) return at;
+      }
+    }
+    return tailFrom(Math.floor(windowChars * FRESH_WINDOW_SHARE));
+  }
+
+  private findAnchor(entries: Entry[], keys: string[]): number | undefined {
+    for (let i = 0; i + keys.length <= entries.length; i++) {
+      let all = true;
+      for (let k = 0; k < keys.length; k++) {
+        if (entries[i + k]!.key !== keys[k]) { all = false; break; }
+      }
+      if (all) return i;
+    }
+    return undefined;
+  }
+
+  /** Learn the tokenizer's ratio from one response, leaning conservative after an overshoot. */
+  private calibrate(chars: number, inputTokens: number): void {
+    if (!(inputTokens > 0) || !(chars > 0)) return;
+    const measured = chars / inputTokens;
+    const weight = measured < this.charsPerToken ? CALIBRATION_WEIGHT_DENSER : CALIBRATION_WEIGHT_SPARSER;
+    const next = this.charsPerToken * (1 - weight) + measured * weight;
+    // Over budget: take the measured ratio at once, with a margin, rather than drift toward it.
+    this.charsPerToken = inputTokens > this.maxInputTokens ? Math.min(next, measured * 0.9) : next;
+    this.charsPerToken = Math.min(6, Math.max(1, this.charsPerToken));
   }
 
   private async decide(request: JudgeRequest): Promise<JudgeVerdict> {
@@ -319,6 +485,13 @@ export class ReplyJudge {
     const usage = (response as NormalizedResponse).details?.usage;
     if (usage) this.recordUsage?.(built.agentName, usage);
     const inputTokens = (response.usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheCreationTokens ?? 0);
+    this.calibrate(built.chars, inputTokens);
+    if (inputTokens > this.maxInputTokens) {
+      console.error(
+        `[gate] the reply judge's request carried ${inputTokens} input tokens, over its ${this.maxInputTokens} budget; `
+        + `its estimate is now ${this.charsPerToken.toFixed(2)} characters a token`,
+      );
+    }
     const text = response.content
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)

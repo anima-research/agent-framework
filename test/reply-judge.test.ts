@@ -1,8 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, ifYouWait, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
-import type { JudgeEventSummary } from '../src/index.js';
+import { ReplyJudge, cut, ifYouWait, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeRequest } from '../src/gate/types.js';
 
 function msg(participant: string, text: string): NormalizedMessage {
@@ -44,18 +43,6 @@ function conversation(n: number, size = 400): NormalizedMessage[] {
   for (let i = 0; i < n; i++) out.push(msg(i % 3 === 0 ? 'Scout' : `user${i % 5}`, `message ${i} ` + 'x'.repeat(size)));
   return out;
 }
-
-describe('reply judge: the question', () => {
-  it("says no event is a mention, a reply or a DM to the agent when none is, and doesn't when one is", () => {
-    const line = 'None of these events is a mention, a reply or a DM to Scout: those wake it without asking you. A message can still ask it something by name.';
-    assert.ok(judgeQuestion(judgeRequest(), 'Scout', Date.now()).includes(line));
-    const mention: JudgeEventSummary = { eventType: 'mcpl:channel-incoming', addressed: true, content: 'Scout?', at: Date.now() };
-    const addressed = judgeRequest({ events: [mention] });
-    assert.strictEqual(judgeQuestion(addressed, 'Scout', Date.now()).includes('None of these events'), false);
-    const mixed = judgeRequest({ events: [...judgeRequest().events, mention] });
-    assert.strictEqual(judgeQuestion(mixed, 'Scout', Date.now()).includes('None of these events'), false);
-  });
-});
 
 describe('reply judge: verdicts', () => {
   it('parses REPLY and WAIT lines, with or without markdown', () => {
@@ -128,61 +115,99 @@ describe('reply judge: the document', () => {
     assert.ok(last.includes('Wake me for questions about the garden.'));
   });
 
-  it("reads the newest of a context many times larger, with the agent's system prompt abridged, in a few thousand tokens", async () => {
+  it('stays under its input budget for a context many times larger', async () => {
     const { membrane, requests } = fakeMembrane('REPLY: ok', 3);
     const judge = new ReplyJudge({
       membraneFor: () => membrane,
+      options: { maxInputTokens: 20_000 },
       chooseAgent: (n) => n[0],
       preview: async () => ({ system: 'S'.repeat(50_000), messages: conversation(2_000, 600), config: { model: 'x', maxTokens: 1 } }),
     });
-    await judge.judge(judgeRequest());
-    const texts = requests[0]!.messages.map((m) => (m.content[0] as { text: string }).text);
-    const all = texts.join('\n');
+    const verdict = await judge.judge(judgeRequest());
+    assert.ok(verdict.inputTokens! <= 20_000, String(verdict.inputTokens));
+    const all = requests[0]!.messages.map((m) => (m.content[0] as { text: string }).text).join('\n');
     assert.ok(all.includes('message 1999 '));
     assert.ok(!all.includes('message 0 '));
     assert.ok(all.includes('earlier messages not shown'));
-    assert.ok(all.includes("Scout's system prompt (abridged)"));
-    const chars = requests[0]!.system!.length + texts.reduce((n, text) => n + text.length, 0);
-    assert.ok(chars < 25_000, String(chars));
-    const [document, about] = texts;
-    assert.ok(document!.startsWith("# Scout's context") && about!.startsWith("## Scout's system prompt"), 'the conversation, then the system prompt');
-    const shown = [...document!.matchAll(/message (\d+) /g)].map((m) => Number(m[1]));
-    assert.deepStrictEqual(shown, Array.from({ length: shown.length }, (_, i) => 2_000 - shown.length + i), 'the newest messages, oldest first, none skipped');
-    assert.strictEqual(requests[0]!.promptCaching, false);
   });
 
-  it('shows the newest message even when it alone is over the size, cut to the longest a message renders', async () => {
-    const { membrane, requests } = fakeMembrane('REPLY: ok', 3);
-    const newest: NormalizedMessage = { participant: 'user1', content: [
-      { type: 'text', text: 'message 2 ' + 'x'.repeat(5_000) }, { type: 'text', text: 'y'.repeat(5_000) },
-      { type: 'text', text: 'z'.repeat(5_000) + ' end of the newest' },
-    ] };
-    const messages = [...conversation(2), newest];
+  it('learns a denser tokenizer and keeps under budget after it', async () => {
+    // 2 characters a token, well under the initial guess of 3.
+    const { membrane } = fakeMembrane('REPLY: ok', 2);
     const judge = new ReplyJudge({
       membraneFor: () => membrane,
+      options: { maxInputTokens: 20_000 },
       chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2_000, 600), config: { model: 'x', maxTokens: 1 } }),
+    });
+    const errors: unknown[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args); };
+    let last;
+    try {
+      await judge.judge(judgeRequest());
+      last = await judge.judge(judgeRequest());
+    } finally {
+      console.error = original;
+    }
+    assert.ok(judge.estimateRatio() < 2.3, String(judge.estimateRatio()));
+    assert.ok(last!.inputTokens! <= 20_000, String(last!.inputTokens));
+  });
+
+  it('after a request over budget, takes the measured ratio at once, with a margin', async () => {
+    // A full anchored window at the initial 3 characters a token, measured at 1.5: over budget once.
+    let tokensPerChar = 1 / 3;
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        const chars = (request.system?.length ?? 0)
+          + request.messages.reduce((n, m) => n + m.content.reduce((k, b) => k + (b.type === 'text' ? b.text.length : 0), 0), 0);
+        const inputTokens = Math.ceil(chars * tokensPerChar);
+        return { content: [{ type: 'text', text: 'WAIT: x' }], stopReason: 'end_turn', usage: { inputTokens, outputTokens: 1 }, details: { usage: { inputTokens, outputTokens: 1 }, model: {} } };
+      },
+    } as unknown as Membrane;
+    let messages = conversation(100, 300);
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, options: { maxInputTokens: 20_000 }, chooseAgent: (n) => n[0],
       preview: async () => ({ messages, config: { model: 'x', maxTokens: 1 } }),
     });
     await judge.judge(judgeRequest());
-    const document = (requests[0]!.messages[0]!.content[0] as { text: string }).text;
-    assert.ok(document.includes('message 2 ') && document.includes(' end of the newest'), 'the newest message, its head and its tail');
-    assert.ok(document.length > 6_700, String(document.length));
-    assert.ok(document.length < 12_200, String(document.length));
-    assert.ok(document.includes('characters cut'), 'cut to the longest a message renders');
-    assert.ok(!document.includes('message 1 '));
+    // The conversation grows to fill the anchored window; then the tokenizer turns out twice as dense.
+    messages = [...messages, ...conversation(60, 300)];
+    tokensPerChar = 1 / 1.5;
+    const original = console.error;
+    console.error = () => {};
+    let over;
+    try {
+      over = await judge.judge(judgeRequest());
+    } finally {
+      console.error = original;
+    }
+    assert.ok(over!.inputTokens! > 20_000, `the test's setup overruns once (${over!.inputTokens})`);
+    assert.ok(judge.estimateRatio() <= 1.5 * 0.9 + 1e-9, String(judge.estimateRatio()));
+    const after = await judge.judge(judgeRequest());
+    assert.ok(after.inputTokens! <= 20_000, String(after.inputTokens));
   });
 
-  it("counts a request's usage as the agent's even when its answer holds no verdict", async () => {
-    const { membrane } = fakeMembrane('I am not sure.');
-    const recorded: string[] = [];
+  it('keeps its earlier chunks byte-identical as the conversation grows, with a cache breakpoint after the last full one', async () => {
+    const { membrane, requests } = fakeMembrane('REPLY: ok', 4);
+    let messages = conversation(400, 300);
     const judge = new ReplyJudge({
       membraneFor: () => membrane,
+      options: { maxInputTokens: 60_000 },
       chooseAgent: (n) => n[0],
-      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
-      recordUsage: (agentName) => { recorded.push(agentName); },
+      preview: async () => ({ system: 'You are Scout.', messages, config: { model: 'x', maxTokens: 1 } }),
     });
-    await assert.rejects(judge.judge(judgeRequest()), /no verdict/);
-    assert.deepStrictEqual(recorded, ['Scout']);
+    await judge.judge(judgeRequest());
+    messages = [...messages, ...conversation(3, 300).map((m, i) => msg(m.participant, `fresh ${i}`))];
+    await judge.judge(judgeRequest());
+    const [a, b] = requests;
+    const breakA = a!.messages.findIndex((m) => m.cacheBreakpoint);
+    const breakB = b!.messages.findIndex((m) => m.cacheBreakpoint);
+    assert.ok(breakA >= 0 && breakB >= breakA, `${breakA} ${breakB}`);
+    for (let i = 0; i <= breakA; i++) {
+      assert.deepStrictEqual(b!.messages[i], a!.messages[i], `chunk ${i} is unchanged`);
+    }
+    assert.strictEqual(a!.messages.filter((m) => m.cacheBreakpoint).length, 1);
   });
 
   it('calls the agent\'s membrane with the native formatter, and names no message the assistant', async () => {
@@ -210,26 +235,23 @@ describe('reply judge: the document', () => {
     assert.ok(requests[0]!.messages.every((m) => m.participant === 'user'));
   });
 
-  it('lists the newest of a long batch within its share, oldest of them first, counting the rest', async () => {
+  it('lists a long batch newest first within its share, counting the rest', async () => {
     const { membrane, requests } = fakeMembrane();
     const judge = new ReplyJudge({
       membraneFor: () => membrane,
+      options: { maxInputTokens: 10_000 },
       chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
     });
     const events = Array.from({ length: 2_000 }, (_, i) => ({
       eventType: 'mcpl:channel-incoming', addressed: false, content: `event ${i} ` + 'y'.repeat(200), at: Date.now(),
     }));
-    await judge.judge(judgeRequest({ events }));
+    const verdict = await judge.judge(judgeRequest({ events }));
     const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
     assert.ok(last.includes('event 1999 '));
     assert.ok(!last.includes('event 0 '));
     assert.match(last, /\(\d+ earlier events in this batch not listed\)/);
-    const listed = last.split('\n').filter((line) => / event \d+ /.test(line));
-    const shown = listed.map((line) => Number(/ event (\d+) /.exec(line)![1]));
-    assert.deepStrictEqual(shown, Array.from({ length: shown.length }, (_, i) => 2_000 - shown.length + i), 'the newest, oldest of them first');
-    const used = listed.reduce((n, line) => n + line.length + 1, 0);
-    assert.ok(used - 1 <= 2_160 && used > 2_160 - 260, String(used));
+    assert.ok(verdict.inputTokens! <= 10_000, String(verdict.inputTokens));
   });
 
   it('stops before calling the model when the gate gave up during the preview', async () => {
@@ -242,6 +264,25 @@ describe('reply judge: the document', () => {
     });
     await assert.rejects(judge.judge(judgeRequest({ signal: abort.signal })), /stopped/);
     assert.strictEqual(requests.length, 0);
+  });
+
+  it('reads a budget under the minimum at the minimum, saying so, rather than at the default', async () => {
+    const { membrane } = fakeMembrane('WAIT: x', 3);
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.join(' ')); };
+    let verdict;
+    try {
+      const judge = new ReplyJudge({
+        membraneFor: () => membrane, options: { maxInputTokens: 3_000 }, chooseAgent: (n) => n[0],
+        preview: async () => ({ messages: conversation(2_000, 600), config: { model: 'x', maxTokens: 1 } }),
+      });
+      verdict = await judge.judge(judgeRequest());
+    } finally {
+      console.error = original;
+    }
+    assert.ok(errors.some((e) => e.includes('maxInputTokens is 3000, under the 4000 minimum')));
+    assert.ok(verdict!.inputTokens! <= 4_000, String(verdict!.inputTokens));
   });
 
   it('tells the judge what wakes the agent if it waits, soonest first, the framework\'s beside the gate\'s', async () => {

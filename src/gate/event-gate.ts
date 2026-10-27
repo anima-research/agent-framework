@@ -3155,10 +3155,6 @@ export class EventGate {
     }
 
     if (typeof policy.behavior === 'object') {
-      if ('judge' in policy.behavior && this.judgeFn && Array.isArray(info.tags) && info.tags.includes('chat:addressed')) {
-        this.applyResets(policy);
-        return { trigger: true, policyName: policy.name, behavior: policy.behavior };
-      }
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
         this.handleDebounce(policy, info);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
@@ -3311,7 +3307,6 @@ export class EventGate {
     if (b === 'always') return true;
     if (b === 'defer' || b === 'skip') return false;
     if (typeof b === 'object') {
-      if ('judge' in b && this.judgeFn && Array.isArray(info.tags) && info.tags.includes('chat:addressed')) return true;
       if ('debounce' in b || 'judge' in b) return false; // batches; never triggers inline
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
