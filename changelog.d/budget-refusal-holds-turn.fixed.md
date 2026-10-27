@@ -28,11 +28,17 @@
     changes.
   - **When it ends without a fit:** 30 minutes after the refusal that started
     it, or at once when compression has nothing pending. The turn then runs
-    if its context fits by then, and otherwise fails as a refused compile
-    did, its reason saying when it was first held. The 30 minutes also bound
-    a compression that is pending but doesn't move. The hold lives in
-    memory: a restart drops it, and the agent's next wake compiles afresh.
-  - **Undo:** one held turn is one undo step, which keeps the messages that
-    arrived while it waited. The refused start gives back the checkpoint it
-    recorded, with the oldest one it evicted at the limit of 20, and the redo
-    its new work invalidated stays invalidated, as at any turn's first start.
+    if its context fits by then, and otherwise its refusal takes the error
+    policy's path, as a refused compile did, its reason saying when it was
+    first held. The 30 minutes also bound a compression that is pending but
+    doesn't move. The hold lives in memory: a restart drops it, and the
+    agent's next wake compiles afresh.
+  - **Undo:** one held turn is one undo step. When the turn's first start is
+    the one refused, it gives back the checkpoint it recorded, with the oldest
+    one it evicted at the limit of 20, and the released start records the
+    turn's, so the undo keeps the messages that arrived while it waited. When
+    a retry is refused, an error policy's or a tool-result guard's, the turn
+    keeps the checkpoint its first start recorded, before what it had done,
+    and the undo takes the messages that arrived while it waited too. The
+    redo its new work invalidated stays invalidated, as at any turn's first
+    start.
