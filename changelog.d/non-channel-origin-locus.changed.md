@@ -18,19 +18,22 @@
   a private surface's message, removes its locus, its trigger channel and its
   sticky `>>` or `>>>` destination, and a `[routing]` notice says why,
   whatever destination the turn had, unless the turn is a silent heartbeat
-  tick, which has no speech to place. While a turn is private, a `>>>` or `>>`
-  envelope posts its own body where it names but sets no destination for the
-  turn's later speech. What a private turn causes is private too: its budget
-  restart, its tool results' re-inference, a ` !` continuation, its
+  tick, which has no speech to place. A heartbeat's turn that takes in private
+  input is private too: its plain speech is kept private rather than held as
+  drafts, as 0.29.0 holds a heartbeat turn's, and a turn private from its
+  start isn't told that its words are held. While a turn is private, a `>>>`
+  or `>>` envelope posts its own body where it names but sets no destination
+  for the turn's later speech. What a private turn causes is private too: its
+  budget restart, its tool results' re-inference, a ` !` continuation, its
   auto-continuation (`autoContinue`), a bounce's wake, a rewind's retry, its
   re-send after its retries ran out (`exhaustedTurnRearmMs`), a self-wake it
-  arms with `skip_reply`'s `wake_in_seconds`, a `sleep`'s wake,
-  the resident's turn after a tune-out cancel it asked for, and the wakes of a
-  script it started (`wake_agent()`, and a script left running reporting its
-  end). Each goes by the turn that caused it as that turn stands when its
-  start reads it, so a turn that took in private input after causing it
-  counts, even after the wake was queued. An operator's `nudge` or `unstick`,
-  or an `inference.request` through the API server or its MCP tool
+  arms with `skip_reply`'s `wake_in_seconds`, a `sleep`'s wake, the resident's
+  turn after a tune-out cancel it asked for, and the wakes of a script it
+  started (`wake_agent()`, and a script left running reporting its end). Each
+  goes by the turn that caused it as that turn stands when its start reads it,
+  so a turn that took in private input after causing it counts, even after the
+  wake was queued. An operator's `nudge` or `unstick`, or an
+  `inference.request` through the API server or its MCP tool
   (`agent_request_inference`), answers the agent's context as it stands, so it
   is private exactly when, as it starts, the agent's stored history holds
   private input: a private surface's message, or a script's wake message that
