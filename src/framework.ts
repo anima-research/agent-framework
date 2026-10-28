@@ -32229,6 +32229,9 @@ export class AgentFramework {
    */
   private makeHostPresentation(storePath: string | undefined): HostPresentation {
     return new HostPresentation({
+      // A derived agent showing its parent's tool list (toolSurfaceOwners) is
+      // shown its parent's presentation too, so the two blocks stay one.
+      ownerOf: (agentName) => this.toolSurfaceOwners.get(agentName) ?? agentName,
       // As the agent is shown them: its description overrides applied.
       available: (agentName) => (this.agents.has(agentName) ? this.compressionToolsForAgent(agentName) : this.getAllTools()),
       placedInBuiltin: (name) => this.placedInBuiltin(name),
