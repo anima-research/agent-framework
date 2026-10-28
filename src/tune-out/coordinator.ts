@@ -1052,20 +1052,25 @@ export class TuneOutCoordinator {
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
     const all = [...this.hooks.getStoredMessages().filter(ofEpoch), ...(this.hooks.getDeferredMessages?.() ?? []).filter(ofEpoch)];
-    const byChannel = new Map<string, Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>>();
+    const byChannel = new Map<string, { serverId: string; channelId: string; backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> }>();
     for (const m of all) {
-      const channelId = (m.metadata as { channelId?: string } | undefined)?.channelId ?? '(unknown channel)';
-      byChannel.set(channelId, [...(byChannel.get(channelId) ?? []), m]);
+      const meta = m.metadata as { channelId?: string; serverId?: string } | undefined;
+      const serverId = meta?.serverId ?? '';
+      const channelId = meta?.channelId ?? '(unknown channel)';
+      const k = this.key(serverId, channelId);
+      const entry = byChannel.get(k) ?? { serverId, channelId, backlog: [] };
+      entry.backlog.push(m);
+      byChannel.set(k, entry);
     }
     const historyTool = this.hooks.historyTool?.() ?? null;
-    const dumps = [...byChannel.entries()].map(([channelId, backlog]) => {
+    const dumps = [...byChannel.values()].map(({ serverId, channelId, backlog }) => {
       // Floored here too: a hold stored before entry floored its cap can hold
       // a fraction.
       const cap = Math.floor(backlogCap);
       const shown = cap > 0 ? backlog.slice(-cap) : [];
       const truncated = backlog.length - shown.length;
       const attrs = [
-        `channel=${quotedValue(channelId)}`,
+        `channel=${quotedValue(this.shown(serverId, channelId))}`,
         `messages=${backlog.length}`,
         ...(truncated > 0 ? [`truncated=${truncated} (oldest; ${historyTool ? `${historyTool} covers the rest` : 'not delivered'})`] : []),
       ];
@@ -1108,8 +1113,7 @@ export class TuneOutCoordinator {
       // still queued behind the resident's turn. That holds for a reader's
       // own release too: the reader that released read one channel's
       // messages, and every other channel's would otherwise reach no reader.
-      // A channel is its server and id here, as the readers' bookkeeping is,
-      // where the dump above groups by id.
+      // A channel is its server and id here, as the readers' bookkeeping is.
       const channels = new Map<string, ChannelRef>();
       for (const m of all) {
         const meta = m.metadata as { channelId?: string; serverId?: string } | undefined;
@@ -1153,7 +1157,7 @@ export class TuneOutCoordinator {
     let allExcept: TuneOutCheck['allExcept'] = null;
     if (scope) {
       const held: Record<string, number> = {};
-      for (const { channelId, count } of this.scopeHeldCounts(scope.params.epochId).values()) held[channelId] = count;
+      for (const { serverId, channelId, count } of this.scopeHeldCounts(scope.params.epochId).values()) held[this.shown(serverId, channelId)] = count;
       allExcept = { epochId: scope.params.epochId, except: scope.params.except, expiresAtMs: scope.params.expiresAtMs, wakeCount: scope.wakeCount, held };
     }
     const result: TuneOutCheck = { allExcept, channels };

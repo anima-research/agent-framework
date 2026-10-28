@@ -10,18 +10,21 @@ import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 
-function harness() {
+function harness(stored: Array<{ participant: string; content: Array<{ type: string; text?: string }>; metadata: Record<string, unknown> }> = []) {
   const state = new Map<string, unknown>();
   const wakes: string[] = [];
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
   const traces: string[] = [];
   const fail = { read: false, write: false, addMessage: false };
-  const stored: Array<{ participant: string; content: Array<{ type: string; text: string }>; metadata: Record<string, unknown> }> = [];
   const registry = {
     getTuneOutState: () => null,
-    // Each channel is shown by its id: no other server registers it.
-    nameShown: (ref: { channelId: string }) => ref.channelId,
-    listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: 'work' } }, { serverId: 'disc', descriptor: { id: 'noisy' } }],
+    // Each channel is shown by its id where no other server registers it,
+    // and with its server where two do (general, on disc and slack).
+    nameShown: (ref: { serverId: string; channelId: string }) => (ref.channelId === 'general' ? `${ref.channelId} (${ref.serverId})` : ref.channelId),
+    listChannelsRaw: () => [
+      { serverId: 'disc', descriptor: { id: 'work' } }, { serverId: 'disc', descriptor: { id: 'noisy' } },
+      { serverId: 'disc', descriptor: { id: 'general' } }, { serverId: 'slack', descriptor: { id: 'general' } },
+    ],
     readCoordinatorState: (id: string) => {
       if (fail.read) throw new Error('store unreadable');
       return state.get(id) ?? null;
@@ -67,6 +70,29 @@ describe('all-except scope on the coordinator', () => {
     assert.deepEqual(h.wakes, ['Subconscious'], 'the second is paused, not delivered');
     assert.ok(c.getAllExcept(), 'the scope is still in force');
     assert.ok(h.traces.includes('tune-out:wake-budget-paused'));
+    c.stop();
+  });
+
+  it("two servers' channels that share an id are counted and released apart", () => {
+    const stored: Parameters<typeof harness>[0] = [];
+    const h = harness(stored);
+    const c = h.make();
+    const r = c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 1 }, 'agent-tool');
+    assert.ok(r.ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    const held = (serverId: string, text: string) => stored.push({
+      participant: 'user', content: [{ type: 'text', text }],
+      metadata: { channelId: 'general', serverId, tuneOut: { epochId } },
+    });
+    held('disc', 'one on disc');
+    held('disc', 'two on disc');
+    held('slack', 'one on slack');
+    assert.deepEqual(c.check().allExcept!.held, { 'general (disc)': 2, 'general (slack)': 1 });
+    assert.ok(c.cancelAllExcept('agent-tool', 'test').ok);
+    const release = h.messages.find((m) => /released/.test(m.text))!.text;
+    assert.equal(release.split('<tuned-out-backlog ').length - 1, 2, release);
+    assert.ok(release.includes('two on disc') && release.includes('one on slack'), 'each channel keeps its own cap of one');
+    assert.ok(!release.includes('one on disc'), "disc's older message is past its cap");
     c.stop();
   });
 
