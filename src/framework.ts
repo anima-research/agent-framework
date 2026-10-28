@@ -1427,6 +1427,7 @@ interface TurnRouting {
    */
   arrivals: Arrival[];
   heard?: Map<MessageId, number>;
+  inputsPin?: { agent: Agent; id: string };
 }
 
 /** A message that would re-pin its turn's locus (TurnRouting.arrivals). */
@@ -1452,6 +1453,29 @@ function freshTurnRouting(): TurnRouting {
     wasIn: [],
     continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [], heard: new Map(),
   };
+}
+
+const TURN_INPUTS_SCAN = 64;
+
+function turnInputs(
+  cm: ContextManager, floor: number, agentName: string, sees: (metadata: unknown) => boolean,
+): { first: MessageId; last: MessageId } | undefined {
+  let first: MessageId | undefined;
+  let last: MessageId | undefined;
+  scan: for (let end = cm.getMessageCount(); end > 0; end -= TURN_INPUTS_SCAN) {
+    const { messages } = cm.getMessageWindow(Math.max(0, end - TURN_INPUTS_SCAN), Math.min(TURN_INPUTS_SCAN, end), { resolveBlobs: false });
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.sequence <= floor) break scan;
+      if (!sees(message.metadata)) continue;
+      if (message.participant === agentName) break scan;
+      last ??= message.id;
+      const answers = Array.isArray(message.content) && message.content.length > 0
+        && message.content.every((block) => block.type === 'tool_result');
+      if (!answers) first = message.id;
+    }
+  }
+  return first !== undefined && last !== undefined ? { first, last } : undefined;
 }
 
 /**
@@ -5164,6 +5188,7 @@ export class AgentFramework {
     // stop() waits for the stream itself (leftRunning). (A start() is refused
     // until this stop() settles, so no new lifecycle begins beside it.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
+    for (const agent of this.agents.values()) step(() => { agent.unpinTurnInputs(); });
 
     // Admission closed when stop() began. What admitted operations start now,
     // such as a surgery's config materialization, joins the set, so wait until
@@ -10317,7 +10342,34 @@ export class AgentFramework {
     // Its scripts take it as a settle's end of the turn: the start sent
     // nothing, so none of its own calls is waiting on a script.
     this.settledTurns.add(routing);
+    this.releaseTurnInputs(routing);
     this.codeExecution?.scripts.turnEnded(agentName, { id: routing.turnId, live: this.liveTurns(agentName, routing) }, false);
+  }
+
+  private pinTurnInputs(agent: Agent, routing: TurnRouting): void {
+    let range: { first: MessageId; last: MessageId } | undefined;
+    try {
+      const cm = agent.getContextManager();
+      const watermark = agent.getConsumedWatermark();
+      if (watermark && watermark.branch === cm.currentBranch().name) {
+        range = turnInputs(cm, watermark.sequence, agent.name, (metadata) => this.agentSees(agent, metadata));
+      }
+    } catch (error) {
+      console.error(`[turn-inputs] ${agent.name}: could not read the turn's inputs, so none is pinned:`, error);
+    }
+    if (!range) {
+      agent.unpinTurnInputs();
+      return;
+    }
+    const id = agent.pinTurnInputs(range.first, range.last);
+    if (id !== undefined) routing.inputsPin = { agent, id };
+  }
+
+  private releaseTurnInputs(routing: TurnRouting): void {
+    const pin = routing.inputsPin;
+    if (!pin) return;
+    routing.inputsPin = undefined;
+    pin.agent.unpinTurnInputs(pin.id);
   }
 
   /** A logical turn's end, for every agent: it closes the agent's open
@@ -10357,7 +10409,10 @@ export class AgentFramework {
     // or of the stream that now holds the agent, are left alone.
     if (stream) {
       // Ended, unless it's the logical turn this settle left open.
-      if (this.openLogical.get(agentName) !== stream) this.settledTurns.add(stream);
+      if (this.openLogical.get(agentName) !== stream) {
+        this.settledTurns.add(stream);
+        this.releaseTurnInputs(stream);
+      }
       this.codeExecution?.scripts.turnEnded(
         agentName,
         { id: stream.turnId, live: this.liveTurns(agentName, stream) },
@@ -21027,6 +21082,8 @@ export class AgentFramework {
     if (opensTurn) {
       const head = agent.branchHead();
       if (head) routing.start = head;
+      if (!routing.silent) this.pinTurnInputs(agent, routing);
+      else agent.unpinTurnInputs();
     }
     this.turnRouting.set(agent.name, routing);
     if (opensTurn) carry = undefined;
