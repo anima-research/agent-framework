@@ -18,7 +18,7 @@
 import { NOTICE_TAG } from '../notice-tags.js';
 import { cutToFit, quotedValue, suppliedValue } from '../supplied-text.js';
 import { randomUUID } from 'node:crypto';
-import { authorLine } from '../author-presentation.js';
+import { authorLine, authorNamed, beginsWithAuthorLine } from '../author-presentation.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRef, ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
@@ -49,11 +49,13 @@ const WAKE_COALESCE_MS = 2_000;
  * its notice openings marked (authorLine), as main's dump writes it.
  */
 export function renderHeldLine(m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string {
-  const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
+  const author = authorNamed(m.metadata) ?? m.participant;
   const parts = m.content.map((b: ContentBlock) =>
     b.type === 'text' ? (b as Extract<ContentBlock, { type: 'text' }>).text : `[${b.type}]`,
   );
-  return authorLine(author, parts.filter((p) => p.length > 0).join(' '));
+  const line = parts.filter((p) => p.length > 0).join(' ');
+  const firstText = m.content.find((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')?.text;
+  return firstText !== undefined && beginsWithAuthorLine(author, firstText) ? line : authorLine(author, line);
 }
 
 /** One reader invocation under `reader: 'forks'` (see SubconsciousConfig). */

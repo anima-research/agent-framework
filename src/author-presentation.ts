@@ -49,7 +49,7 @@ export function authorShown(author: string): string {
 
 /** Whether `text` begins with the author's line, as the author wrote their
  *  name or as the framework shows it (authorShown). */
-function beginsWithAuthorLine(author: string, text: string): boolean {
+export function beginsWithAuthorLine(author: string, text: string): boolean {
   return beginsWithAuthor(author, text) || beginsWithAuthor(authorShown(author), text);
 }
 
