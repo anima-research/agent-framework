@@ -2482,6 +2482,32 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("channel_open's word on where plain speech lands survives a result cut for its long backscroll", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Hello, observatory.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    const history = Array.from({ length: 400 }, (_, i) => ({ author: 'someone', text: `backscroll line ${i} `.padEnd(200, '.') }));
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
+      async () => ({ success: true, data: { channelId: 'discord:guild:observatory', serverId: 'discord', status: 'opened', history } });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assert.ok(results.includes('backscroll line 0'), 'control: the result reached the model');
+    assert.equal(results.includes('backscroll line 399'), false, 'control: the result was cut for its length');
+    assert.ok(results.includes('plain speech now lands in this channel'), 'the routing word survived the cut');
+
+    await framework.stop();
+  });
+
   for (const reported of [false, true]) {
   it(`a channel_open just before an empty final response doesn't start typing in the opened channel${reported ? ', when its result is reported as content (XML tool mode)' : ''}`, async () => {
     membrane.pushResponse(createMockResponse([

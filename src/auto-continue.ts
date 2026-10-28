@@ -5,6 +5,8 @@
  * row the next turn reads.
  */
 
+import { NOTICE_TAG } from './notice-tags.js';
+
 /** The reason on a continuation's wake (InferenceRequest.reason). */
 export const AUTO_CONTINUE_REASON = 'auto-continue';
 
@@ -36,7 +38,7 @@ export function autoContinueNotice(opts: {
   /** The run began with a heartbeat's turn, whose plain speech is held as drafts. */
   heartbeat?: boolean;
 }): string {
-  return `[continue] ${opts.agentName}, another turn starts now.` +
+  return `[${NOTICE_TAG.continue}] ${opts.agentName}, another turn starts now.` +
     (opts.heldAfterSend
       ? ' Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going.'
       : '') +

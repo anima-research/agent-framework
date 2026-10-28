@@ -5,6 +5,7 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
+import { NOTICE_TAG } from '../../notice-tags.js';
 import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats, Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
@@ -2299,13 +2300,13 @@ export class WorkspaceModule implements Module {
 
     let text: string;
     if (paths.length === 1) {
-      text = `[workspace event · ${op} · ${paths[0]}]`;
+      text = `[${NOTICE_TAG.workspaceEvent} · ${op} · ${paths[0]}]`;
     } else {
       const list = paths.map(p => `- ${p}`).join('\n');
-      text = `[workspace event · ${op} · ${paths.length} files in ${mountName}/]\n${list}`;
+      text = `[${NOTICE_TAG.workspaceEvent} · ${op} · ${paths.length} files in ${mountName}/]\n${list}`;
     }
     if (conflicts && conflicts.length > 0) {
-      text += `\n[conflicts with disk: ${conflicts.join(', ')}; reading each shows how to settle it]`;
+      text += `\n[${NOTICE_TAG.conflictsWithDisk}: ${conflicts.join(', ')}; reading each shows how to settle it]`;
     }
 
     return {
@@ -6993,7 +6994,7 @@ function remedyOfLost(lost: LostContents): string {
  */
 function headMoveText(mounts: readonly string[]): string {
   const one = mounts.length === 1;
-  return `[workspace] Writes to ${listed(mounts.map((name) => `\`${name}\``))} from turns the history no longer holds are still on disk. `
+  return `[${NOTICE_TAG.workspace}] Writes to ${listed(mounts.map((name) => `\`${name}\``))} from turns the history no longer holds are still on disk. `
     + `If ${one ? "it's a git checkout" : "they're git checkouts"}, \`git status\` and \`git diff\` show them; `
     + 'a `git checkout` of a file drops every unstaged change in it, including the ones the history still holds.';
 }

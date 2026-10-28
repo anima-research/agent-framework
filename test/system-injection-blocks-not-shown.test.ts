@@ -24,7 +24,8 @@ const PNG = 'iVBORw0KGgoAAAANSUhEUg==';
 const IMAGE = { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } };
 
 /** The line the agent reads in place of a block of `type`. */
-const notShown = (type: string): string => `[${type} block not shown: the system prompt carries text only.]`;
+const notShown = (type: 'image' | 'audio'): string =>
+  ({ image: '[block not shown: an image block; the system prompt carries text only.]', audio: '[block not shown: an audio block; the system prompt carries text only.]' })[type];
 
 /** A module that injects `injections` and asks for a turn of `agent` at every event. */
 class InjectionModule implements Module {
