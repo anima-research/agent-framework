@@ -576,6 +576,18 @@ describe('Dendrite lifecycle', () => {
     gates.release('g-oren');
   });
 
+  it('stopping a resident that put the gate to sleep ends the sleep', async () => {
+    const framework = await boot({ gate: { config: { default: 'always' } } } as Partial<Parameters<typeof AgentFramework.create>[0]>);
+    framework.start();
+    const gate = (framework as unknown as {
+      eventGate: { setSleep(seconds: number, note?: string, agentName?: string): unknown; getSleepState(): unknown };
+    }).eventGate;
+    gate.setSleep(600, 'resting', 'oren');
+    assert.ok(gate.getSleepState(), 'the gate sleeps for oren');
+    framework.stopAgent('oren', { by: 'mira' });
+    assert.equal(gate.getSleepState(), null, "oren's sleep ended with oren");
+  });
+
 });
 
 describe('Dendrite restart', () => {
