@@ -1513,6 +1513,43 @@ test('a close that lands while the coalescer holds a message stands', async () =
   assert.equal(f.isOpen(), false, 'the close receipt stands');
 });
 
+test("a coalesced message the coalescer admits after its channel was withdrawn sets no default, so another server's default stands", async () => {
+  let admit!: () => void;
+  const f = fixture(undefined, undefined, async (_serverId, held) => {
+    await new Promise<void>((resolve) => { admit = resolve; });
+    return { messageId: held.messageId, accepted: true };
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  (f.registry as unknown as { noteInbound(channel: { serverId: string; channelId: string }, messageId: string | null): void })
+    .noteInbound({ serverId: 'other', channelId: 'z' }, 'm-other');
+  const incoming = f.registry.handleIncoming('test', { messages: [{ ...message(), coalesce: { key: 'subject' } }] });
+  await tick();
+  await f.registry.handleChanged('test', { removed: ['x'] });
+  admit();
+  await incoming;
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), { serverId: 'other', channelId: 'z' }, "the other server's default stands");
+  assert.deepEqual(f.registry.incomingFor(), { channel: { serverId: 'other', channelId: 'z' }, messageId: 'm-other', threadId: undefined });
+});
+
+test("a coalesced message the coalescer admits after its channel was withdrawn and registered again sets no default, so another server's default stands", async () => {
+  let admit!: () => void;
+  const f = fixture(undefined, undefined, async (_serverId, held) => {
+    await new Promise<void>((resolve) => { admit = resolve; });
+    return { messageId: held.messageId, accepted: true };
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  (f.registry as unknown as { noteInbound(channel: { serverId: string; channelId: string }, messageId: string | null): void })
+    .noteInbound({ serverId: 'other', channelId: 'z' }, 'm-other');
+  const incoming = f.registry.handleIncoming('test', { messages: [{ ...message(), coalesce: { key: 'subject' } }] });
+  await tick();
+  await f.registry.handleChanged('test', { removed: ['x'] });
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  admit();
+  await incoming;
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), { serverId: 'other', channelId: 'z' }, "the other server's default stands");
+  assert.deepEqual(f.registry.incomingFor(), { channel: { serverId: 'other', channelId: 'z' }, messageId: 'm-other', threadId: undefined });
+});
+
 test("a coalesced message the coalescer admits after its server was removed sets no default, so another server's default stands", async () => {
   let admit!: () => void;
   const f = fixture(undefined, undefined, async (_serverId, held) => {
@@ -1521,11 +1558,8 @@ test("a coalesced message the coalescer admits after its server was removed sets
   });
   await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
   // Another server's message set the default before this one arrived.
-  const internal = f.registry as unknown as {
-    defaultPublishChannel: { serverId: string; channelId: string } | null; defaultPublishMessageId: string | null; defaultPublishThreadId?: string;
-  };
-  internal.defaultPublishChannel = { serverId: 'other', channelId: 'z' };
-  internal.defaultPublishMessageId = 'm-other';
+  (f.registry as unknown as { noteInbound(channel: { serverId: string; channelId: string }, messageId: string | null): void })
+    .noteInbound({ serverId: 'other', channelId: 'z' }, 'm-other');
   const incoming = f.registry.handleIncoming('test', { messages: [{ ...message(), coalesce: { key: 'subject' } }] });
   await tick();
   f.registry.removeServer('test');

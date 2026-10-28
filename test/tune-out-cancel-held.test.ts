@@ -34,6 +34,7 @@ function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; h
   const added: Added[] = [];
   const inferences: string[] = [];
   const registry = {
+    getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
     // Each channel's id is unique here, so it's shown by its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
     cancelTuneOut: () => ({

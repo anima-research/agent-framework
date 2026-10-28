@@ -210,7 +210,7 @@ test('routeSpeech reports each delivered publish as mcpl:speech-routed, with not
 
 test('routeSpeech routes a conversation fork to its HOME channel, not the global last-inbound (item 3)', async () => {
   // Two channels are live. chanA registered first; then a message arrives on
-  // chanB, flipping the process-global defaultPublishChannel to chanB. A fork
+  // chanB, flipping the process-global default channel to chanB. A fork
   // bound to chanA must still publish to chanA.
   const homes: Record<string, ChannelRef> = { 'conversation-chanA-g1': discord('chanA') };
   const { registry, publishCalls } = makeRegistry(
@@ -272,7 +272,7 @@ test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)',
 
 test('routeSpeech surfaces a failure when there is no locus at all', async () => {
   const { registry, failures, traces } = makeRegistry({ delivered: true });
-  // No handleIncoming → defaultPublishChannel is null.
+  // No handleIncoming → there's no default channel.
   const lines: string[] = [];
   const original = console.error;
   console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
@@ -299,7 +299,7 @@ test('routeSpeech surfaces a failure when there is no locus at all', async () =>
 test('routeSpeech routes a TRUNK agent to its ACTIVE triggering channel, not the global last-inbound (item-3 redux)', async () => {
   // The exact live repro: scout (a single trunk agent) is answering channel A
   // when a message arrives on channel B, flipping the process-global
-  // defaultPublishChannel to B. The reply must still land in A. Forks (home)
+  // default channel to B. The reply must still land in A. Forks (home)
   // don't exist here — connectome-host never spawns them — so the ONLY thing
   // keeping A's answer in A is the active-triggering-channel resolver.
   const active: Record<string, ChannelRef> = { scout: discord('chanA') };
@@ -359,7 +359,7 @@ test('buildChannelContext advertises the active triggering channel as defaultOut
 
 test('ensureChannelRegistered keeps a DM closed while making its one-shot reply routable', async () => {
   // A Discord DM arrives via push/event (channel closed), so it is never
-  // registered and never updates defaultPublishChannel — routeSpeech would drop
+  // registered and never updates the default channel — routeSpeech would drop
   // the reply. Registering it on inbound makes it a publishable locus; the
   // active resolver (the woken turn's DM) then targets it.
   const dm = 'discord:dm:42';
@@ -1068,7 +1068,7 @@ test('DM prose targets resolve people-first: @name, prefix-lenient names, and <@
 test('non-conversational markers do not retarget the default publish locus (#157)', async () => {
   // A reaction/edit/delete marker (RFC-001 tags) is ABOUT a message, not one
   // the agent replies to: arriving on chanB it must not flip the
-  // process-global defaultPublishChannel away from the real conversation on
+  // process-global default channel away from the real conversation on
   // chanA, and must not become context.incoming's reply anchor.
   const { registry, lookup } = makeRegistry(undefined);
   seedRegistered(registry, 'discord', 'chanA');

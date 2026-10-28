@@ -1,7 +1,8 @@
 /**
  * An ephemeral run (a subagent) takes no process-global fallback (#551). The
- * fallback is the channel of the most recent delivered inbound message: a
- * resident's turn with no channel of its own speaks there. A subagent's plain
+ * fallback is the default channel, the most recent accepted inbound message
+ * on a channel that isn't tuned out: a resident's turn with no channel of its
+ * own speaks there. A subagent's plain
  * prose is its caller's result, so that channel is never where it lands,
  * never its channel context's default outgoing channel or `incoming` message,
  * never `channel_publish`'s default, and never where its refusal is marked or

@@ -86,8 +86,8 @@ export interface TuneOutFrameworkHooks {
     metadata?: Record<string, unknown>,
     forAgent?: string,
   ) => string;
-  /** Queue an inference request for an agent. */
-  requestInference: (agentName: string, reason: string, source: string) => void;
+  /** Queue an inference request for an agent, woken for `channel` when it names one. */
+  requestInference: (agentName: string, reason: string, source: string, channel?: ChannelRef) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
   /** The primary resident's registry name. */
@@ -459,7 +459,8 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out',
+        this.channelRegistry.getDescriptor({ serverId, channelId }) ? { serverId, channelId } : undefined);
     }
     // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the dump left

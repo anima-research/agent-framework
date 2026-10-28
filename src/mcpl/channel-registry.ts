@@ -200,6 +200,8 @@ const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
 
 type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
 
+type LatestInbound = { channel: ChannelRef; messageId: string | null; threadId?: string; seq: number; gone?: true };
+
 /**
  * Parameters of an active tune-out (issue #77), carried on the
  * 'desired-state' record entering the tuned-out state and projected into
@@ -564,11 +566,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it. Reactions, reaction removals, deletions and edits don't set it, though an edit of a message you hadn't been shown can count as that message. A message pushed to you rather than posted on a channel never sets it. A subagent has neither default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message this host received on a channel that isn't tuned out, whether or not you've been shown it. Reactions, reaction removals, deletions, edits and notices such as a join don't set it, though an edit of a message you hadn't been shown can count as that message. A message pushed to you rather than posted on a channel never sets it. A subagent has neither default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it, other than a reaction, reaction removal, deletion or edit, though an edit of a message you hadn't been shown can count; a message pushed to you rather than posted on a channel never sets it; required of a subagent)" },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message this host received on a channel that isn't tuned out, whether or not you've been shown it, other than a reaction, reaction removal, deletion, edit or notice such as a join, though an edit of a message you hadn't been shown can count; a message pushed to you rather than posted on a channel never sets it; required of a subagent)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -1017,10 +1019,11 @@ interface ChannelRegistryOptions {
    * Resolve a conversation fork's HOME channel from its agent name. Conversation
    * forks are spawned bound to a single channel (the framework tracks this in
    * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
-   * plain-text speech must route THERE. The process-global `defaultPublishChannel`
-   * tracks only the most recent inbound message across ALL channels (reaction,
-   * reaction-removal, edit and deletion markers aside, apart from an edit the
-   * coalescer delivers on acceptance as the agent's first view), so with one
+   * plain-text speech must route THERE. The process-global default channel (`getDefaultPublishChannel`)
+   * tracks only the most recent inbound message across ALL channels that
+   * aren't tuned out (reaction, reaction-removal, edit and deletion markers
+   * and notices aside, apart from an edit the coalescer delivers on
+   * acceptance as the agent's first view), so with one
    * fork per channel running concurrently it misroutes a fork's reply to
    * whichever channel last spoke (item 3). Returns undefined for the trunk/primary agent, which has
    * no home and correctly falls back to the global locus (heartbeats, etc.).
@@ -1032,22 +1035,23 @@ interface ChannelRegistryOptions {
    * turn. This is the fix for single-TRUNK agents (the only mode
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
-   * process-global `defaultPublishChannel`, which tracks the most recent inbound
-   * message across ALL channels (markers aside) and misroutes a reply to
+   * process-global default channel (`getDefaultPublishChannel`), the most
+   * recent inbound message on any channel that isn't tuned out (markers
+   * aside), and misroutes a reply to
    * whichever channel last spoke under concurrency (item-3 redux). The
    * framework keeps both on the live turn's routing state and exposes them
    * here. For a heartbeat / no-trigger turn it resolves to undefined until the
    * turn's locus is resolved, so that
    * resolution takes the global fallback, which the turn then keeps.
    * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
-   * `defaultPublishChannel`. Null where the turn deliberately has no channel,
+   * the default channel. Null where the turn deliberately has no channel,
    * as one woken for a channel id two servers register, given without its
    * server: that takes no fallback either.
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   /**
-   * Whether a conversation takes the process-global fallback, the channel of
-   * the most recent delivered inbound message: as where its plain speech lands
+   * Whether a conversation takes the process-global fallback, the default
+   * channel (getDefaultPublishChannel): as where its plain speech lands
    * when it has no home and no channel of its own this turn, as its channel
    * context's `incoming` and default outgoing channel, and as
    * `channel_publish`'s target when it names none. False for an ephemeral run
@@ -1205,15 +1209,15 @@ export class ChannelRegistry {
    */
   private dmClassified = new Map<string, true>();
 
-  /** The channel of the most recent incoming message that isn't a reaction,
-   *  reaction removal, edit or deletion marker, apart from an edit the
-   *  coalescer delivers on acceptance as the agent's first view: used for
-   *  speech routing and the default publish. */
-  private defaultPublishChannel: ChannelRef | null = null;
-
-  /** The same message's id and thread, used for buildChannelContext. */
-  private defaultPublishMessageId: string | null = null;
-  private defaultPublishThreadId: string | undefined = undefined;
+  /** Each channel's most recent incoming message that isn't a reaction,
+   *  reaction removal, edit or deletion marker or a notice, apart from an
+   *  edit the coalescer delivers on acceptance as the agent's first view, by
+   *  lifecycleKey, in the order they were accepted (`seq`). The newest on a
+   *  channel that isn't tuned out is the default (defaultInbound): its
+   *  channel for speech routing and the default publish, its message and
+   *  thread for buildChannelContext. */
+  private latestInbound = new Map<string, LatestInbound>();
+  private inboundSeq = 0;
 
   /** Per-channel typing indicator timers, by destinationKey, with the
    *  channel each one types in. */
@@ -1645,14 +1649,17 @@ export class ChannelRegistry {
     // Process removed channels — itemized truthfully: removal of a channel
     // we never had is reported, not silently accepted.
     if (params.removed) {
+      const retired = new Set<string>();
       for (const channelId of params.removed) {
         // A server may name the channel by a number: it means the channel
         // whose id is that number as a string, as it always has.
         const ref = { serverId, channelId: String(channelId) };
         const existed = this.channels.delete(destinationKey(ref));
         this.stopTyping(ref);
+        if (existed) retired.add(ref.channelId);
         addedResults.push({ id: channelId, accepted: existed, reason: existed ? undefined : 'not registered' });
       }
+      if (retired.size > 0) this.retireInbound(serverId, retired, true);
     }
 
     // Process updated channels — validated itemwise exactly like added
@@ -1900,7 +1907,8 @@ export class ChannelRegistry {
         continue;
       }
 
-      // Track default publish channel (most recent ACCEPTED incoming) —
+      // Track each channel's most recent ACCEPTED incoming, which the default
+      // publish channel is worked out from (defaultInbound) —
       // deliberately after §14.5 validation: a rejected message from an
       // unregistered channel must not retarget outbound speech (the locus is
       // exactly the authority a self-attested channel would be stealing).
@@ -1914,13 +1922,13 @@ export class ChannelRegistry {
         // must not retarget the default publish locus or become
         // `context.incoming`'s reply anchor. An edit the coalescer delivered
         // as the agent's first view counts as the message it replaced.
-        // A message the coalescer admits after its server was removed sets no
-        // default: the removal cleared that server's message, and a server
-        // that's gone mustn't displace a live one's default.
-        if (!isMarkerTagged(message.tags, firstView) && (this.serverRemovals.get(serverId) ?? 0) === removalsAtArrival) {
-          this.defaultPublishChannel = { serverId, channelId: message.channelId };
-          this.defaultPublishMessageId = message.messageId;
-          this.defaultPublishThreadId = message.threadId;
+        // A message the coalescer admits after its server was removed, or its
+        // channel withdrawn or registered anew, sets no default: the removal
+        // cleared that server's message, and a channel that's gone mustn't
+        // displace a live one's default.
+        if (!isMarkerTagged(message.tags, firstView) && (this.serverRemovals.get(serverId) ?? 0) === removalsAtArrival &&
+          this.channels.get(incomingKey) === incomingEntry) {
+          this.noteInbound({ serverId, channelId: message.channelId }, message.messageId, message.threadId);
         }
         // Where the host directs this server's lifecycle, traffic shows the
         // transport open only for a channel still decided open or tuned out,
@@ -2260,12 +2268,40 @@ export class ChannelRegistry {
 
   /**
    * Get the default publish channel ID: the channel of the most recent
-   * incoming message that isn't a reaction, reaction removal, edit or
-   * deletion marker, apart from an edit the coalescer delivers on acceptance
-   * as the agent's first view.
+   * incoming message on a channel that isn't tuned out now, other than a
+   * reaction, reaction removal, edit or deletion marker or a notice, apart
+   * from an edit the coalescer delivers on acceptance as the agent's first
+   * view. A channel that was the default when it went is kept, gone, until
+   * the next message comes, and is the default while no newer message
+   * counts, with no message behind it when its server was removed
+   * (retireInbound).
    */
   getDefaultPublishChannel(): ChannelRef | null {
-    return this.defaultPublishChannel;
+    return this.defaultInbound()?.channel ?? null;
+  }
+
+  private noteInbound(channel: ChannelRef, messageId: string | null, threadId?: string): void {
+    for (const [key, latest] of this.latestInbound) if (latest.gone) this.latestInbound.delete(key);
+    this.latestInbound.set(this.lifecycleKey(channel.serverId, channel.channelId), { channel, messageId, threadId, seq: ++this.inboundSeq });
+  }
+
+  private retireInbound(serverId: string, channelIds: ReadonlySet<string> | undefined, keepMessage: boolean): void {
+    const current = this.defaultInbound();
+    for (const [key, latest] of this.latestInbound) {
+      if (latest.channel.serverId !== serverId || (channelIds !== undefined && !channelIds.has(latest.channel.channelId))) continue;
+      if (latest !== current) this.latestInbound.delete(key);
+      else this.latestInbound.set(key, keepMessage ? { ...latest, gone: true } : { channel: latest.channel, messageId: null, seq: latest.seq, gone: true });
+    }
+  }
+
+  private defaultInbound(): LatestInbound | undefined {
+    let newest: LatestInbound | undefined;
+    for (const latest of this.latestInbound.values()) {
+      if (newest && latest.seq < newest.seq) continue;
+      if (this.getTuneOutState(latest.channel.serverId, latest.channel.channelId) !== null) continue;
+      newest = latest;
+    }
+    return newest;
   }
 
   /**
@@ -2405,11 +2441,12 @@ export class ChannelRegistry {
 
   /**
    * The message the agent is replying to, with its channel: the most recent
-   * inbound message that isn't a reaction, reaction removal, edit or deletion
-   * marker, apart from an edit the coalescer delivers on acceptance as the
-   * agent's first view. Left process-global: per-channel inbound tracking
-   * (the right messageId for a fork's own channel) is a separate concern from
-   * the outbound routing fix. An ephemeral run has none (takesGlobalFallback),
+   * inbound message on a channel that isn't tuned out now, other than a
+   * reaction, reaction removal, edit or deletion marker or a notice, apart
+   * from an edit the coalescer delivers on acceptance as the agent's first
+   * view. It is the default's message for every turn, a fork's included:
+   * which of a fork's own channel's messages it replies to is a separate
+   * concern from the outbound routing fix. An ephemeral run has none (takesGlobalFallback),
    * so a subagent's refusal marks no one else's channel. Nor has a turn that
    * deliberately has no channel (activeChannelResolver's null): woken for a
    * channel id two servers register, it isn't replying to the latest inbound
@@ -2422,9 +2459,10 @@ export class ChannelRegistry {
     if (agentName !== undefined && this.activeChannelResolver?.(agentName) === null && !this.homeChannelResolver?.(agentName)) {
       return undefined;
     }
-    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.defaultPublishChannel;
-    if (!fallback || !this.defaultPublishMessageId) return undefined;
-    return { channel: fallback, messageId: this.defaultPublishMessageId, threadId: this.defaultPublishThreadId };
+    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.getDefaultPublishChannel();
+    const latest = this.defaultInbound();
+    if (!fallback || !latest?.messageId) return undefined;
+    return { channel: fallback, messageId: latest.messageId, threadId: latest.threadId };
   }
 
   /**
@@ -2452,7 +2490,7 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): neither
     // the latest inbound message's channel as its outgoing one, nor that
     // message as the one it is replying to.
-    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.defaultPublishChannel;
+    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.getDefaultPublishChannel();
     // A turn that deliberately has no channel (null) takes no fallback.
     const outgoing = home ?? (active !== undefined ? active : fallback);
 
@@ -2505,17 +2543,16 @@ export class ChannelRegistry {
       this.channels.delete(key);
       this.stopTyping(refOf(entry));
     }
-    // The default channel's ref stays, as a channels/changed removal leaves
-    // it: a call that would default to it is refused as the default gone,
-    // naming it, rather than told there's no default yet, and another
+    // The default's channel, if it was this server's, is kept as the
+    // default's ref until the next message is noted, and is the default while
+    // no newer message counts, as a channels/changed removal leaves it: a
+    // call that would default to it is refused as the default
+    // gone, naming it, rather than told there's no default yet, and another
     // server's channel with its id isn't taken for it. Its message and
     // thread go, as on main, so no message on a server that's gone is given
-    // as the one an agent replies to (incomingFor), to that server added
-    // back or to a refusal's reaction.
-    if (this.defaultPublishChannel?.serverId === serverId) {
-      this.defaultPublishMessageId = null;
-      this.defaultPublishThreadId = undefined;
-    }
+    // as the one an agent replies to (incomingFor), to that server added back
+    // or to a refusal's reaction.
+    this.retireInbound(serverId, undefined, false);
     // Desired state and migration markers deliberately survive disconnects.
   }
 
@@ -2571,9 +2608,7 @@ export class ChannelRegistry {
     this.channels.clear();
 
     // Reset default publish tracking
-    this.defaultPublishChannel = null;
-    this.defaultPublishMessageId = null;
-    this.defaultPublishThreadId = undefined;
+    this.latestInbound.clear();
   }
 
   // ==========================================================================
@@ -5603,7 +5638,7 @@ export class ChannelRegistry {
 
   /** The process-global fallback channel for this conversation, or null when it takes none (takesGlobalFallback). */
   private globalFallbackFor(conversationId: string): ChannelRef | null {
-    return this.takesGlobalFallback?.(conversationId) === false ? null : this.defaultPublishChannel;
+    return this.takesGlobalFallback?.(conversationId) === false ? null : this.getDefaultPublishChannel();
   }
 
   /**
@@ -6056,16 +6091,17 @@ export class ChannelRegistry {
       return { success: false, error: `Nothing was posted: channelId is empty. ${findIds}`, isError: true };
     }
     // Resolve channelId: default to the channel of the most recent incoming
-    // message that isn't a reaction, reaction removal, edit or deletion
-    // marker, apart from an edit the coalescer delivers on acceptance as the
-    // agent's first view. An ephemeral run never takes that default
+    // message on a channel that isn't tuned out now, other than a reaction,
+    // reaction removal, edit or deletion marker or a notice, apart from an
+    // edit the coalescer delivers on acceptance as the agent's first view.
+    // An ephemeral run never takes that default
     // (takesGlobalFallback), so it names one.
     // A channel named by a string means what it means to every channel tool
     // (entriesNamed): one channel, by its id or its server-qualified name,
     // and a name two servers' channels answer to is refused with them as
     // candidates, never sent to the first.
     const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
-    const fallback = caller !== undefined ? this.globalFallbackFor(caller) : this.defaultPublishChannel;
+    const fallback = caller !== undefined ? this.globalFallbackFor(caller) : this.getDefaultPublishChannel();
     if (!(input.channelId ?? fallback)) {
       return {
         success: false,

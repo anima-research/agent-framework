@@ -42,6 +42,7 @@ function cancelWith(opts: { backlogCap?: number; room?: number; source?: string;
   const added: Added[] = [];
   const inferences: string[] = [];
   const registry = {
+    getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
     cancelTuneOut: () => ({
       params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap ?? 20, maxWakes: 3, startedAtSequence: 0 },
       wakeCount: 0,

@@ -347,7 +347,8 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('never sends an ephemeral run\'s reply to the default channel, so nothing fails there', async (t) => {
-      (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
+      (internals(framework).channelRegistry as unknown as { noteInbound(channel: { serverId: string; channelId: string }, messageId: string | null): void })
+        .noteInbound({ serverId: 'nowhere', channelId: 'missing-channel' }, null);
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 

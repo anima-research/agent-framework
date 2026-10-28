@@ -130,14 +130,13 @@ for (const order of orders) {
   test(`removing a server stops its channel's typing and keeps the default's ref, whichever server's it was, and drops the default's message only when the default is that server's (${registered})`, () => {
     const f = fixture(both(order));
     const internal = f.registry as unknown as {
-      defaultPublishChannel: ChannelRef | null; defaultPublishMessageId: string | null; defaultPublishThreadId: string | undefined;
+      noteInbound(channel: ChannelRef, messageId: string | null, threadId?: string): void;
+      latestInbound: Map<string, { messageId: string | null; threadId?: string }>;
       channels: Map<string, unknown>;
     };
     f.registry.startTyping(a);
     f.registry.startTyping(b);
-    internal.defaultPublishChannel = b;
-    internal.defaultPublishMessageId = 'b-msg';
-    internal.defaultPublishThreadId = 'b-thread';
+    internal.noteInbound(b, 'b-msg', 'b-thread');
     f.take();
     f.registry.removeServer('a');
     assert.deepEqual(f.registry.getDefaultPublishChannel(), b, "b's channel stays the default");
@@ -151,7 +150,7 @@ for (const order of orders) {
     f.registry.removeServer('b');
     assert.deepEqual(f.registry.getDefaultPublishChannel(), b, "b's channel stays the default's ref, so a call that would default to it is refused as the default gone");
     assert.equal(f.registry.incomingFor(), undefined, "b's message went with its server, so none is given as the one replied to");
-    assert.deepEqual([internal.defaultPublishMessageId, internal.defaultPublishThreadId], [null, undefined]);
+    assert.deepEqual([...internal.latestInbound.values()].map((l) => [l.messageId, l.threadId]), [[null, undefined]]);
   });
 
   test(`channel_close stops typing in the channel it closes, and the other server's channel with its id goes on typing (${registered})`, async () => {
@@ -386,8 +385,7 @@ test("what a channel tool says of a channel names it as the agent can name it ba
   const target = f.registry.resolveProseTarget('b:general', { forSpeech: true });
   assert.match('error' in target ? target.error : '', /^b:general is inbound-only/);
   // A default channel whose server is gone, while another server registers its id.
-  const internal = f.registry as unknown as { defaultPublishChannel: ChannelRef | null };
-  internal.defaultPublishChannel = { serverId: 'c', channelId: 'general' };
+  (f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null, threadId?: string): void }).noteInbound({ serverId: 'c', channelId: 'general' }, null);
   const gone = await f.registry.handleChannelToolCall('channel_publish', { content: 'x' });
   assert.equal(gone.error, 'The channel this would default to, "c:general", isn\'t registered now, so nothing was posted.');
   assert.deepEqual(f.take().filter((c) => c.what === 'publish'), []);
@@ -494,7 +492,7 @@ test("a publish given a server its channel isn't on says where the id is, by the
   // A serverId given alone, which channel_publish's schema doesn't have,
   // names the default channel's id on that server, held to as one given
   // with a channelId is: b's general takes no posts, so nothing goes to a's.
-  (inbound.registry as unknown as { defaultPublishChannel: ChannelRef }).defaultPublishChannel = a;
+  (inbound.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null, threadId?: string): void }).noteInbound(a, null);
   const alone = await inbound.registry.handleChannelToolCall('channel_publish', { serverId: 'b', content: 'to b' });
   assert.equal(alone.success, false);
   assert.match(alone.error!, /^Channel b:general is inbound-only/);
@@ -613,13 +611,118 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
 
 test("a default channel whose server disconnected is refused as the default gone, naming it, and nothing goes to another server's channel with its id", async () => {
   const f = fixture(both(['a', 'b']));
-  const internal = f.registry as unknown as { defaultPublishChannel: ChannelRef | null };
-  internal.defaultPublishChannel = a;
+  (f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null, threadId?: string): void }).noteInbound(a, null);
   f.registry.removeServer('a');
-  assert.deepEqual(internal.defaultPublishChannel, a, "removeServer keeps the default's ref, as a withdrawal does");
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a, "removeServer keeps the default's ref, as a withdrawal does");
   const gone = await f.registry.handleChannelToolCall('channel_publish', { content: 'x' });
   assert.equal(gone.error, 'The channel this would default to, "a:general", isn\'t registered now, so nothing was posted.');
   assert.deepEqual(f.take().filter((c) => c.what === 'publish'), []);
+});
+
+test("none of a removed server's channels becomes the default again, even once every newer channel is tuned out", () => {
+  const f = fixture([['a', 'general'], ['a', 'side'], ['b', 'general']]);
+  const registry = f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null): void };
+  registry.noteInbound({ serverId: 'a', channelId: 'side' }, 'a-side');
+  registry.noteInbound(a, 'a-general');
+  f.registry.removeServer('a');
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a, "the default's ref stays until a newer message comes");
+  assert.equal(f.registry.incomingFor(), undefined, 'its message went with its server');
+  registry.noteInbound(b, 'b-general');
+  f.registry.enterTuneOut('b', 'general', { epochId: 'e', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  assert.equal(f.registry.getDefaultPublishChannel(), null);
+  assert.equal(f.registry.incomingFor(), undefined);
+});
+
+test("a removed server's channel that was the default when it went stays the gone default past a newer tuned-out channel, until that channel counts again", () => {
+  const f = fixture([['a', 'general'], ['b', 'general']]);
+  const registry = f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null): void };
+  const tuneOutB = (epochId: string) =>
+    f.registry.enterTuneOut('b', 'general', { epochId, cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  registry.noteInbound(a, 'a-general');
+  registry.noteInbound(b, 'b-general');
+  tuneOutB('e1');
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a);
+  f.registry.removeServer('a');
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a, 'the default that went stays it, gone');
+  assert.equal(f.registry.incomingFor(), undefined, 'its message went with its server');
+  f.registry.cancelTuneOut('b', 'general', 'open', 'agent-tool');
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), b);
+});
+
+test("a channel its server withdraws isn't the default once a newer channel is tuned out", async () => {
+  const f = fixture([['a', 'general'], ['a', 'side'], ['b', 'general']]);
+  const registry = f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null): void };
+  registry.noteInbound({ serverId: 'a', channelId: 'side' }, 'a-side');
+  registry.noteInbound(b, 'b-general');
+  await f.registry.handleChanged('a', { removed: ['side'] } as never);
+  f.registry.enterTuneOut('b', 'general', { epochId: 'e', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  assert.equal(f.registry.getDefaultPublishChannel(), null);
+  assert.equal(f.registry.incomingFor(), undefined);
+});
+
+test("a removed server's channel that was tuned out when it went doesn't become the default once its tune-out ends", () => {
+  const f = fixture([['a', 'general'], ['b', 'general']]);
+  const registry = f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null): void };
+  registry.noteInbound(a, 'a-general');
+  registry.noteInbound(b, 'b-general');
+  f.registry.enterTuneOut('b', 'general', { epochId: 'e', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  f.registry.removeServer('b');
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a);
+  assert.ok(f.registry.cancelTuneOut('b', 'general', 'open', 'agent-tool'), 'the tune-out ends after its server is gone');
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a);
+  assert.equal(f.registry.incomingFor()?.messageId, 'a-general');
+});
+
+test("a withdrawn channel that was tuned out when it went is neither the default nor the message replied to once its tune-out ends", async () => {
+  const f = fixture([['a', 'general'], ['b', 'general'], ['b', 'side']]);
+  const registry = f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null): void };
+  registry.noteInbound(a, 'a-general');
+  registry.noteInbound(b, 'b-general');
+  f.registry.enterTuneOut('b', 'general', { epochId: 'e', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  await f.registry.handleChanged('b', { removed: ['general'] } as never);
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a);
+  assert.ok(f.registry.cancelTuneOut('b', 'general', 'open', 'agent-tool'), 'the tune-out ends after its channel is withdrawn');
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a);
+  assert.equal(f.registry.incomingFor()?.messageId, 'a-general');
+});
+
+test("channels withdrawn together keep the default, gone, where it was whatever their order, though a newer message sits on a tuned-out one among them", async () => {
+  for (const order of [['general', 'side'], ['side', 'general']]) {
+    const f = fixture([['a', 'general'], ['b', 'general'], ['b', 'side']]);
+    const registry = f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null): void };
+    registry.noteInbound(a, 'a-general');
+    registry.noteInbound({ serverId: 'b', channelId: 'side' }, 'b-side');
+    registry.noteInbound(b, 'b-general');
+    f.registry.enterTuneOut('b', 'general', { epochId: 'e', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+    assert.deepEqual(f.registry.getDefaultPublishChannel(), { serverId: 'b', channelId: 'side' });
+    await f.registry.handleChanged('b', { removed: order } as never);
+    assert.deepEqual(f.registry.getDefaultPublishChannel(), { serverId: 'b', channelId: 'side' }, `withdrawn in the order ${order.join(', ')}`);
+    assert.equal(f.registry.incomingFor()?.messageId, 'b-side', 'a withdrawal keeps the message');
+    const publish = await f.registry.handleChannelToolCall('channel_publish', { content: 'x' });
+    assert.equal(publish.error, 'The channel this would default to, "side", isn\'t registered now, so nothing was posted.');
+  }
+});
+
+test("the wake when a tune-out ends names its channel while the registry holds it, a push's placeholder included, and no channel once its server is gone", async (t) => {
+  const f = fixture([['a', 'general'], ['b', 'general']]);
+  const wakes: unknown[] = [];
+  const coordinator = new TuneOutCoordinator(f.registry as never, { getServer: () => undefined } as never, {
+    subconsciousName: () => 'Subconscious', primaryName: () => 'scout', isForkBound: () => false, emitTrace: () => {},
+    addMessage: () => '', getStoredMessages: () => [], currentSequence: () => 1, setSubconsciousAnchor: () => {},
+    isPrivilegedAuthor: () => false, allowChannelSpeech: () => false,
+    requestInference: (agent: string, _reason: string, _source: string, channel?: unknown) => { if (agent === 'scout') wakes.push(channel); },
+  } as never);
+  t.after(() => coordinator.stop());
+  const params = { epochId: 'e', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 };
+  f.registry.ensureChannelRegistered('a', 'pushed');
+  for (const [serverId, channelId] of [['a', 'general'], ['a', 'pushed'], ['b', 'general']] as const) {
+    f.registry.enterTuneOut(serverId, channelId, { ...params, epochId: `${serverId}-${channelId}` }, 'agent-tool');
+  }
+  f.registry.removeServer('b');
+  for (const [serverId, channelId] of [['a', 'general'], ['a', 'pushed'], ['b', 'general']] as const) {
+    assert.ok(coordinator.cancel(serverId, channelId, 'subconscious', 'test').ok, `${serverId}:${channelId}'s tune-out ends`);
+  }
+  assert.deepEqual(wakes, [{ serverId: 'a', channelId: 'general' }, { serverId: 'a', channelId: 'pushed' }, undefined]);
 });
 
 test("a tool call takes the turn's channels only when it carries the turn's id", async (t) => {
@@ -981,9 +1084,8 @@ test("a fork's turn whose wake names no channel still has its home, so it's repl
   Object.assign(f.registry as unknown as Record<string, unknown>, {
     activeChannelResolver: () => null,
     homeChannelResolver: (name: string) => (name === 'fork' ? b : undefined),
-    defaultPublishChannel: a,
-    defaultPublishMessageId: 'm-latest',
   });
+  (f.registry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null, threadId?: string): void }).noteInbound(a, 'm-latest');
   assert.equal(f.registry.incomingFor('scout'), undefined, 'a turn with no channel at all has none');
   assert.deepEqual(f.registry.incomingFor('fork'), { channel: a, messageId: 'm-latest', threadId: undefined });
 });
@@ -1294,8 +1396,7 @@ for (const order of orders) {
   test(`a wake naming a shared id without its server gives the turn no channel, and takes no fallback (${registered})`, async (t) => {
     const f = await frameworkWith(t, order);
     // The last delivered message is on a's general, so a fallback would go there.
-    Object.assign(f.i.channelRegistry as unknown as { defaultPublishChannel: ChannelRef; defaultPublishMessageId: string },
-      { defaultPublishChannel: a, defaultPublishMessageId: 'm-latest' });
+    (f.i.channelRegistry as unknown as { noteInbound(channel: ChannelRef, messageId: string | null, threadId?: string): void }).noteInbound(a, 'm-latest');
     f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'for which general?' }]));
     f.i.pendingRequests.push({ agentName: 'scout', reason: 'host:nudge', source: 'host', timestamp: Date.now(), channelId: 'general' });
     await f.framework.runUntilIdle();

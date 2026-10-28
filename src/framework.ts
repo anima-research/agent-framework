@@ -4313,7 +4313,7 @@ export class AgentFramework {
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
-            // process-global most-recent-inbound channel, which an ambient
+            // process-global default channel, which an ambient
             // message elsewhere could retarget between the DM's arrival and
             // the debounce firing (2026-09-30). Ambient-only batches set no
             // locus and keep the legacy fallback.
@@ -4532,8 +4532,11 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+          requestInference: (agentName, reason, source, channel) => {
+            framework.pendingRequests.push({
+              agentName, reason, source, timestamp: Date.now(),
+              ...(channel ? { channelId: channel.channelId, channelServerId: channel.serverId } : {}),
+            });
           },
           subconsciousName: () => framework.subconsciousAgentName,
           primaryName: () => framework.primaryAgentName,
@@ -10872,8 +10875,8 @@ export class AgentFramework {
   /**
    * Mark an inference refusal visibly: react on the message that holds the
    * refused agent's conversational locus (the most recent incoming channel
-   * message that isn't a reaction, reaction removal, edit or deletion
-   * marker or a chat:system notice, apart from an edit the coalescer delivers on acceptance as the
+   * message on a channel that isn't tuned out now, other than a reaction,
+   * reaction removal, edit or deletion marker or a chat:system notice, apart from an edit the coalescer delivers on acceptance as the
    * agent's first view; an ephemeral run has none, so a subagent's refusal
    * marks no message) with a category-specific emoji. Best-effort —
    * failures are logged, never thrown, and non-Discord loci are silently
@@ -14712,7 +14715,7 @@ export class AgentFramework {
           source: event.serverId,
           timestamp: Date.now(),
           // Route this turn's auto-published speech back to THIS channel, not
-          // the global most-recent-inbound locus (item-3 redux, trunk agents).
+          // the global default channel (item-3 redux, trunk agents).
           channelId: event.channelId, channelServerId: event.serverId,
           counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
           // Addressed messages outrank ambient chatter when a batched wake
@@ -20824,7 +20827,7 @@ export class AgentFramework {
       // addressed message, a follow-up in a channel the turn engaged
       // (repinTurnLocus) or the agent's own channel_open moves it, between
       // rounds. The eager snapshot protects heartbeat turns from a moving
-      // defaultPublishChannel. Explicit mode uses a turn-scoped `>>` target
+      // default channel. Explicit mode uses a turn-scoped `>>` target
       // and disabled mode has no prose target, so neither resolves or
       // announces a locus. If the effective locus differs from the last one
       // announced, a durable `[routing]` notice goes into the window BEFORE
@@ -22710,8 +22713,8 @@ export class AgentFramework {
             // Host-owned output routing (see LOCUS-ROUTING-DESIGN). On a
             // text-only turn (no tool calls => speechContent populated),
             // publish the agent's speech to the conversational locus — the
-            // most recent incoming channel, tracked cross-surface in the
-            // ChannelRegistry. This replaces discord-mcpl's per-surface sticky
+            // turn's locus, else the default channel the ChannelRegistry
+            // keeps across surfaces. This replaces discord-mcpl's per-surface sticky
             // auto-post. Tool-call turns produce `thoughts`, not `speech`, so
             // they are never routed here — which is precisely how the `think`
             // tool (and any explicit send tool) yields a silent turn.
@@ -28616,9 +28619,9 @@ export class AgentFramework {
         },
         shouldTriggerInference: triggerFilter,
         // Route a conversation fork's plain-text speech to its HOME channel, not
-        // the process-global most-recent-inbound locus (item 3). The trunk agent
+        // the process-global default channel (item 3). The trunk agent
         // has no home entry, so this returns undefined and routeSpeech falls back
-        // to defaultPublishChannel. `conversationAgentHomes` is the permanent
+        // to the default channel. `conversationAgentHomes` is the permanent
         // spawn-time binding; `channelForAgent` is the router's live binding as a
         // belt-and-suspenders fallback.
         homeChannelResolver: (agentName) =>
@@ -28629,7 +28632,7 @@ export class AgentFramework {
         // included, else the channel that triggered the turn. connectome-host
         // runs every agent as a trunk (it never exposes conversation forks), so
         // without this a reply falls back to the process-global
-        // most-recent-inbound locus and a concurrent message in another
+        // default channel and a concurrent message in another
         // channel hijacks it. An opening start resolves the turn's locus from
         // it (the trigger channel then), and the channel context names it, so
         // a later start of the turn is told where its unprefixed speech lands

@@ -67,6 +67,7 @@ describe('duration expiry', () => {
     const cancels: string[] = [];
     const registry = {
       // Each channel's id is unique here, so it's shown by its id.
+      getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
       listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: '#a' } }],
       getTuneOutState: () => ({
@@ -101,6 +102,7 @@ describe('duration expiry', () => {
     const cancels: string[] = [];
     const registry = {
       // Each channel's id is unique here, so it's shown by its id.
+      getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
@@ -138,6 +140,7 @@ describe('duration expiry', () => {
     const entered: TuneOutParams[] = [];
     const registry = {
       // Each channel's id is unique here, so it's shown by its id.
+      getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
@@ -172,6 +175,7 @@ describe('dispositions injection', () => {
   function dispositionHarness() {
     const registry = {
       // Each channel's id is unique here, so it's shown by its id.
+      getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
       listChannelsRaw: () => [],
       getTuneOutState: () => null,

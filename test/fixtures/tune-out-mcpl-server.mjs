@@ -1,15 +1,17 @@
 // MCPL fixture for tune-out e2e tests (issue #77).
 //
-// Registers one channel (`disc:guild:noisy`, initiallyOpen) and then emits
-// channel traffic on command: the TEST appends lines to COMMAND_PATH
-// (`ambient <id> <text>` / `addressed <id> <text>`), the fixture polls the
+// Registers one channel (`disc:guild:noisy`, initiallyOpen), or one
+// `disc:guild:<label>` per label in CHANNELS (comma-separated, the first the
+// default), and then emits channel traffic on command: the TEST appends lines
+// to COMMAND_PATH (`ambient <id> <text>` / `addressed <id> <text>`, or
+// `ambient@<label> …` for another channel), the fixture polls the
 // file and sends a channels/incoming Request per line, once the line's
 // newline is written (writtenLines). Host-side
 // channels/acknowledge calls are recorded to STATUS_PATH as JSONL — the
 // test asserts the deterministic suppressed-mention reaction there. It keeps
-// its channel's lifecycle as a server does: channels/open and channels/close
-// are recorded there too, and while the host has the channel closed, a
-// commanded message isn't sent (recorded as withheld).
+// its channels' lifecycle as a server does: channels/open and channels/close
+// are recorded there too, and while the host has a channel closed, a
+// commanded message for it isn't sent (recorded as withheld).
 import { appendFileSync } from 'node:fs';
 import { writtenLines } from './command-lines.mjs';
 import { createInterface } from 'node:readline';
@@ -24,22 +26,25 @@ const log = (event, extra = {}) => {
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
 const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
 
-const CHANNEL_ID = 'disc:guild:noisy';
+const LABELS = (process.env.CHANNELS ?? 'noisy').split(',');
+const channelIdOf = (label) => `disc:guild:${label}`;
 let nextId = 500;
 let processedCommands = 0;
-// Registered initiallyOpen, so open until the host closes it.
-let open = true;
+// Registered initiallyOpen, so each is open until the host closes it.
+const closed = new Set();
 
 function pollCommands() {
   const lines = writtenLines(commandPath);
   for (const line of lines.slice(processedCommands)) {
     processedCommands++;
-    const [kind, messageId, ...rest] = line.split(' ');
+    const [kindAt, messageId, ...rest] = line.split(' ');
+    const [kind, label = LABELS[0]] = kindAt.split('@');
+    const channelId = channelIdOf(label);
     const text = rest.join(' ');
     const tags = kind === 'addressed'
       ? ['chat:mention', 'chat:from-human']
       : ['chat:ambient', 'chat:from-human'];
-    if (!open) {
+    if (closed.has(channelId)) {
       log('incoming-withheld', { kind, messageId });
       continue;
     }
@@ -50,7 +55,7 @@ function pollCommands() {
       method: 'channels/incoming',
       params: {
         messages: [{
-          channelId: CHANNEL_ID,
+          channelId,
           messageId,
           author: { id: 'U1', name: 'antra' },
           timestamp: new Date().toISOString(),
@@ -114,26 +119,26 @@ rl.on('line', (line) => {
       id: 400,
       method: 'channels/register',
       params: {
-        channels: [{
-          id: CHANNEL_ID,
+        channels: LABELS.map((label) => ({
+          id: channelIdOf(label),
           type: 'disc',
-          label: 'noisy',
+          label,
           direction: 'bidirectional',
           initiallyOpen: true,
-        }],
+        })),
       },
     });
     return;
   }
   if (msg.method === 'channels/open') {
     log('channel-opened', { channelId: msg.params?.channelId });
-    open = true;
+    closed.delete(msg.params?.channelId);
     reply(msg.id, { opened: true });
     return;
   }
   if (msg.method === 'channels/close') {
     log('channel-closed', { channelId: msg.params?.channelId });
-    open = false;
+    closed.add(msg.params?.channelId);
     reply(msg.id, { closed: true });
     return;
   }

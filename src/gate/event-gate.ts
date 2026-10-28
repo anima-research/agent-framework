@@ -176,7 +176,7 @@ export interface WakeProvenance {
    *  set ONLY when that event addressed the agent (mention / reply / DM) and
    *  the host resolved its registered channel. A batched wake used to carry
    *  no locus at all, so its reply fell back to the process-global
-   *  most-recent-inbound channel — which any ambient message elsewhere,
+   *  default channel — which any ambient message elsewhere,
    *  arriving a second after the DM that caused the wake, could retarget
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
@@ -306,7 +306,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
-    // skipping it would leave its wake on the most-recent-inbound fallback.
+    // skipping it would leave its wake on the default-channel fallback.
     // An ambient one stays out: the route is never reported for it, so as
     // the pick it would carry no telemetry at all and hide an earlier event
     // that names its channel and author.
