@@ -28314,15 +28314,20 @@ export class AgentFramework {
   }
 
   private agentToolPermissionFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
-    if (this.canAgentUseTool(agentName, call.name)) return undefined;
-    const why = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
-      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered`
-      : `Tool '${call.name}' is not permitted by this agent's allowedTools`;
+    // A tool refused at dispatch is refused on every path that runs the
+    // agent's call (a toolset's act, executeToolCall), not only the stream's.
+    const denied = this.agents.get(agentName)?.deniesAtDispatch(call.name) === true || this.readerRefuses(agentName, call.name);
+    if (!denied && this.canAgentUseTool(agentName, call.name)) return undefined;
+    const why = denied
+      ? `${call.name} is not available to ${agentName}`
+      : !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
+        ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered`
+        : `Tool '${call.name}' is not permitted by this agent's allowedTools`;
     // Off the dispatcher, nothing opened the call to refuse it in RFC-007's
     // lifecycle, so it's a failure, not a refusal (ToolResult.refused), whose
     // text says the call didn't run.
     if (!reportRefusal) return { success: false, error: `${why}, so the call didn't run.`, isError: true };
-    const error = `${why}.`;
+    const error = denied ? why : `${why}.`;
     const refusal = this.refusedResult(agentName, call.id, error);
     this.emitTrace({
       type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
@@ -28417,20 +28422,6 @@ export class AgentFramework {
       });
       return;
     }
-    const refusal = this.agentToolPermissionFailure(agentName, call) ?? this.markedInputFailure(agentName, call);
-    if (refusal) {
-      this.pushEvent({
-        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
-      });
-      return;
-    }
-
-    // Enrich call with caller identity so modules can resolve the calling agent,
-    // and with the turn it was made in. Here both are the framework's to set:
-    // a turn id the call arrives with never survives.
-    const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
-    if (turnId !== undefined) enrichedCall.callerTurnId = turnId;
-    else delete enrichedCall.callerTurnId;
     // Dispatch-time deny (AgentConfig.denyToolsAtDispatch): the tool stays
     // advertised so the agent's request prefix is unchanged; the call is
     // refused here, before anything runs.
@@ -28449,6 +28440,20 @@ export class AgentFramework {
       });
       return;
     }
+    const refusal = this.agentToolPermissionFailure(agentName, call) ?? this.markedInputFailure(agentName, call);
+    if (refusal) {
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
+      });
+      return;
+    }
+
+    // Enrich call with caller identity so modules can resolve the calling agent,
+    // and with the turn it was made in. Here both are the framework's to set:
+    // a turn id the call arrives with never survives.
+    const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
+    if (turnId !== undefined) enrichedCall.callerTurnId = turnId;
+    else delete enrichedCall.callerTurnId;
     if (isPresentationTool(call.name)) {
       const result = this.editToolPresentation(agentName, enrichedCall);
       this.pushEvent({type:'tool-result',callId:call.id,toolName:call.name,agentName,moduleName:'tool-presentation',result});
