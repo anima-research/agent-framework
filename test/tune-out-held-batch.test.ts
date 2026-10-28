@@ -28,6 +28,8 @@ test('a held deferred batch is stored under its hold, released in the dump, and 
     .filter((m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId);
   await eventually(() => held().some((m) => JSON.stringify(m.content).includes('document_diff')), 'the batch stored under the hold');
   assert.equal(f.renders.length, 1, 'rendered once, at its wake ask');
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 0, 'the hold woke nobody');
 
   const cancelled = coordinator.cancel('editor', 'chat', 'agent-tool', 'done');
@@ -37,7 +39,6 @@ test('a held deferred batch is stored under its hold, released in the dump, and 
   assert.equal(dump.length, 1);
   assert.match(JSON.stringify(dump[0]!.content), /document_diff/, 'the release dump includes the batch');
 
-  f.alwaysRespond();
   await f.framework.runUntilIdle();
   assert.equal(f.renders.length, 1, 'no second render');
   const request = f.lastRequest();
