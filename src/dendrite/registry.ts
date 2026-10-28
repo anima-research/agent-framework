@@ -551,9 +551,12 @@ export class AgentRegistry {
    * is written, once the host has told the recipients (settleInterrupted).
    * Held mail is kept for redelivery.
    *
-   * A record the ended history already holds, by name and incarnation, ended
-   * before the previous process could write the snapshot without it: it is
-   * dropped, not ended again.
+   * A bounded record the ended history already holds, by name and
+   * incarnation, ended before the previous process could write the snapshot
+   * without it: it is dropped, not ended again. A persistent record waits to
+   * be re-declared whatever that history says, since the end there may be one
+   * a stop left that failed and was put back (an append can't be taken
+   * back); configuration then declares it again or ends it.
    *
    * `endedHistory` is the tail of the ended-record log, oldest first.
    */
@@ -587,12 +590,12 @@ export class AgentRegistry {
     for (const raw of snapshot.records) {
       const record = clone(raw);
       if (record.ended) continue; // history lives in the ended log
-      if (endedKeys.has(`${record.name}#${record.incarnation}`)) {
-        dropped = true;
-        continue;
-      }
       if (record.lifetime.kind === 'persistent') {
         this.awaiting.set(record.name, record);
+        continue;
+      }
+      if (endedKeys.has(`${record.name}#${record.incarnation}`)) {
+        dropped = true;
         continue;
       }
       const asWas = clone(record);

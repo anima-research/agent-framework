@@ -11912,23 +11912,25 @@ export class AgentFramework {
    * caller was told failed. The branch-local snapshot needs no rewrite: it is
    * the last write a change makes, so a change that failed never reached it.
    * The branch-local ended log is append-only, so an end appended before the
-   * failure stays there; it is read at boot only where no ended recovery file
-   * exists, and the restore then reads that agent as ended, as a restart ends
-   * bounded work anyway. A rewrite that fails is reported, the next is still
-   * made, and the caller's own error goes on.
+   * failure stays there. It is read at boot only where no ended recovery
+   * file exists (or the rewrite of that file failed too); the restore then
+   * drops a bounded agent it lists as ended for the reason recorded, with no
+   * restart notice to its recipient, while a persistent agent waits to be
+   * re-declared as it would anyway. A rewrite that fails is reported, the
+   * next is still made, and the caller's own error goes on.
    */
   private rewriteAgentRegistryAfterRollback(): void {
-    const rewrites: Array<[string, () => void]> = [
-      ['the ended log recovery file', () => this.rewriteEndedRecovery(this.registry.endedHistory())],
+    const rewrites: Array<[string, string, () => void]> = [
+      ['the ended log recovery file', 'the next end written', () => this.rewriteEndedRecovery(this.registry.endedHistory())],
       ...(this.agentRegistryPath
-        ? [['the registry recovery file', () => this.writeRecoveryFile(this.agentRegistryPath!, this.registry.snapshot())] as [string, () => void]]
+        ? [['the registry recovery file', 'the next registry write', () => this.writeRecoveryFile(this.agentRegistryPath!, this.registry.snapshot())] as [string, string, () => void]]
         : []),
     ];
-    for (const [what, rewrite] of rewrites) {
+    for (const [what, next, rewrite] of rewrites) {
       try {
         rewrite();
       } catch (error) {
-        console.error(`[dendrite] after a registry change failed and was put back in memory, ${what} could not be rewritten to match; the next registry write rewrites it:`, error);
+        console.error(`[dendrite] after a registry change failed and was put back in memory, ${what} could not be rewritten to match; ${next} rewrites it:`, error);
       }
     }
   }

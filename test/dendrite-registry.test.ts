@@ -314,6 +314,21 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.deepEqual(jobs(), []);
   });
 
+  it('a persistent record whose end the ended history holds still waits to be re-declared', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(residentSpec('oren', { primary: false }));
+    // A stop of oren appended its end, then failed and was put back: the
+    // snapshot lists oren live, and the ended history holds its end.
+    const snapshot = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    const oren = snapshot.records.find((r) => r.name === 'oren')!;
+    const second = make();
+    second.restore(snapshot, [{ ...oren, ended: { at: 5, reason: 'stopped', by: 'mira' } }]);
+    second.register(residentSpec('mira', { primary: true }));
+    assert.deepEqual(second.reconcile().unconfigured.map((o) => o.ended.name), ['oren'], 'oren was awaiting re-declaration');
+  });
+
   it('settles two interrupted incarnations of one name as two ends', () => {
     const { state, make } = persisted();
     const first = make();
