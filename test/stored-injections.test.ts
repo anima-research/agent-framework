@@ -59,6 +59,7 @@ type Internals = {
   activeTurnTokens: Map<string, unknown>;
   isNewestIn(agent: Agent, entry: { eventType: string; serverId?: string; channelId?: string; messageId?: string }): boolean;
   shedNewestTurn(agent: Agent): { removedIds: string[] } | null;
+  isUnreadStoredMessage(agent: Agent, messageId: string): boolean;
   pendingRequests: Array<Record<string, unknown>>;
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
@@ -601,6 +602,28 @@ test('the subconscious keeps its own stored injection in view', async () => {
   internals(x.framework).storeInjections(sub, [injection('SUB-ONLY')]);
   const compiled = await sub.getContextManager().compile(undefined, undefined, { dryRun: true });
   assert.ok(compiled.messages.map(textOf).includes('SUB-ONLY'));
+});
+
+test("an agent's stored injection is unread while that agent hasn't read it, whatever a resident whose view leaves it out has read", async () => {
+  const x = await make({ agents: ['prime', 'helper'] });
+  const helper = x.framework.getAgent('helper')!;
+  internals(x.framework).storeInjections(helper, [injection('HELPER-ONLY')]);
+  const row = helper.getContextManager().getAllMessages().find((m) => textOf(m) === 'HELPER-ONLY')!;
+  assert.ok(row, 'the premise: it was stored');
+  x.framework.getAgent('prime')!.markContextConsumed();
+  assert.equal(internals(x.framework).isUnreadStoredMessage(helper, row.id), true);
+  helper.markContextConsumed();
+  assert.equal(internals(x.framework).isUnreadStoredMessage(helper, row.id), false);
+});
+
+test("a row a tune-out holds from the residents is unread while the subconscious hasn't read it, whatever a resident has read", async () => {
+  const x = await make({ subconscious: true });
+  const prime = x.framework.getAgent('prime')!;
+  const id = prime.getContextManager().addMessage('Antra', [text('DIVERTED')], { tuneOut: { epochId: 'e1' } } as never);
+  prime.markContextConsumed();
+  assert.equal(internals(x.framework).isUnreadStoredMessage(prime, id), true);
+  x.framework.getAgent('Subconscious')!.markContextConsumed();
+  assert.equal(internals(x.framework).isUnreadStoredMessage(prime, id), false);
 });
 
 test("a row whose mark isn't whole is no stored injection: every view keeps it", async () => {

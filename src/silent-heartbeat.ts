@@ -50,6 +50,7 @@
  * another reply's row and rewrite cached history. Exact matching for every
  * row would need the compile result to expose each message's source rows.
  */
+import { NOTICE_TAG } from './notice-tags.js';
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 
 /** Request-only separator a silent tick's request ends on. It carries the
@@ -59,15 +60,15 @@ import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
  * text their request rendered (`SilentHeartbeatStamp.separator`), so changing
  * this constant changes only ticks that open afterwards. */
 export const SILENT_HEARTBEAT_SEPARATOR =
-  '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
+  `[${NOTICE_TAG.silentHeartbeat}] Scheduled private self-check. Review pending matters privately. ` +
   'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.';
 
 /** The separator ticks rendered before their rows recorded its text: rows
  * stamped without `separator` still render it, byte for byte. */
-const LEGACY_SILENT_HEARTBEAT_SEPARATOR = '[heartbeat tick]';
+const LEGACY_SILENT_HEARTBEAT_SEPARATOR = `[${NOTICE_TAG.heartbeatTick}]`;
 
 /** Request-only turn a compile that ends on the agent's own message gets. */
-export const CONTINUE_ROW = '[Continue]';
+export const CONTINUE_ROW = `[${NOTICE_TAG.heartbeatContinue}]`;
 
 /** Identity of one authenticated silent heartbeat tick. */
 export interface SilentHeartbeatTick {

@@ -4,11 +4,13 @@
  * which ends with it, so nothing a script held stays after it.
  *
  * Every frame from the child is decoded and checked before the parent acts on
- * it, since the child is untrusted. A frame that breaks the protocol, a child
- * that exits without saying how the script ended, or one that doesn't stop
- * when asked, ends the run as crashed. A tool call goes to `onToolCall`, the
- * bridge to the framework's dispatcher, and its outcome goes into the run's
- * call record at dispatch, as running until it's answered.
+ * it, since the child is untrusted. A frame that breaks the protocol, or a
+ * child that exits without saying how the script ended when no stop was
+ * asked, ends the run as crashed. One that doesn't stop when asked is ended
+ * once the stop's grace has passed, and the run ends stopped, marked short.
+ * A tool call goes to `onToolCall`, the bridge to the framework's dispatcher,
+ * and its outcome goes into the run's call record at dispatch, as running
+ * until it's answered.
  *
  * What the host holds for a script is bounded: at most MAX_CALLS_IN_FLIGHT of
  * its calls wait for answers at once, and at most MAX_CALLS_IN_FLIGHT are out

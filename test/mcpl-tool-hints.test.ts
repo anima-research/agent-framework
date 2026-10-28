@@ -105,9 +105,9 @@ const push = (peer: ScriptedPeer, eventId: string, text: string, extra: Json = {
 });
 
 test('toolHints off: the advertisement, tool list and traffic are as before', async () => {
-  const t = await setup(() => false, { toolHints: undefined });
+  const t = await setup(() => false, { toolHints: false });
   const { toolHints: _hints, toolsets: _toolsets, surface: _surface, ...plainAdvert } = ADVERT;
-  const plain = await setup(() => false, { toolHints: undefined }, plainAdvert);
+  const plain = await setup(() => false, { toolHints: false }, plainAdvert);
   try {
     const offered = t.server.peer.hostCaps?.mcpl as Json;
     assert.ok(!('toolHints' in offered) && !('toolsets' in offered) && !('surface' in offered), 'nothing of RFC-014 offered');
@@ -116,7 +116,8 @@ test('toolHints off: the advertisement, tool list and traffic are as before', as
       .map((x) => ({ name: x.name, description: x.description, inputSchema: x.inputSchema }));
     assert.deepEqual(arcTools, TOOLS.map((x) => ({ name: `arc--${String(x.name)}`, description: x.description, inputSchema: x.inputSchema })),
       'every tool listed whole, in the server\'s order, as before');
-    assert.ok(!t.fw.framework.getAllTools().some((x) => x.name.startsWith('toolsets--')), 'no meta-tools');
+    // The meta-tools are every agent's now (the host's built-in toolset), whatever a server's hints.
+    assert.ok(t.fw.framework.getAllTools().some((x) => x.name === 'toolsets--open'), 'the host\'s meta-tools');
     assert.ok(!t.methods().some((m) => String(m).startsWith('toolsets/')), 'no toolsets/* request of any kind');
     // A tools/hints request is a method this host doesn't handle, as before.
     const answer = await t.server.peer.request('tools/hints', { rev: 1, tools: [{ name: 'peek', visible: true }] });
@@ -145,7 +146,7 @@ test('vector 3, 11: a push\'s hints apply on arrival whatever is decided about t
     // Refused (an undeclared feature set): applied all the same, and told on its own.
     const refused = await push(t.server.peer, 'p2', 'nobody hears this', { featureSet: 'arc.nope', hints: t.state.hint([{ name: 'peek', visible: false }]) });
     assert.ok(refused.error, 'the push was refused');
-    await waitFor(() => windowText(t.fw.framework).some((x) => x.includes('tool changes') && x.includes('now unavailable: peek')), 'the refused push\'s change applied, and told as a notice');
+    await waitFor(() => windowText(t.fw.framework).some((x) => x.startsWith('[toolsets] MCPL server "arc", tool changes:\n') && x.includes('now unavailable: peek')), 'the refused push\'s change applied, and told as a notice that opens with its tag');
     // The next change has the next rev and applies without any recovery.
     const lists = t.methods().filter((m) => m === 'tools/list').length;
     t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
@@ -473,12 +474,186 @@ test('reminders: an open toolset whose announcement left the context is restated
   } finally { await t.done(); }
 });
 
+for (const [label, toolHints] of [['left out', undefined], ['null', null]] as const) {
+  test(`toolHints ${label} is on: the hints are offered, the meta-tools registered, and the server's dynamic tools leave the list`, async () => {
+    const t = await setup(() => false, { toolHints: toolHints as unknown as boolean });
+    try {
+      const offered = t.server.peer.hostCaps?.mcpl as Json;
+      assert.equal(offered.toolHints, true, 'toolHints offered');
+      const names = t.fw.framework.getAllTools().map((x) => x.name);
+      for (const meta of ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close']) assert.ok(names.includes(meta), meta);
+      await waitFor(() => t.server.received.some((m) => m.method === 'toolsets/list'), 'toolsets/list after connecting');
+      await roundTrip(t);
+      await waitFor(() => !t.fw.framework.getAllTools().some((x) => x.name === 'arc--play'), 'a toolset tool leaves the list');
+      assert.ok(t.fw.framework.getAllTools().some((x) => x.name === 'arc--status'), 'a static tool stays');
+    } finally { await t.done(); }
+  });
+}
+
+test('toolHints left out, on a server that does not advertise them: the hints are offered, and its tools are listed whole as before, beside the meta-tools', async () => {
+  const { toolHints: _hints, toolsets: _toolsets, surface: _surface, ...plainAdvert } = ADVERT;
+  const t = await setup(() => false, { toolHints: undefined }, plainAdvert);
+  try {
+    assert.equal((t.server.peer.hostCaps?.mcpl as Json).toolHints, true, 'toolHints offered');
+    const arcTools = t.fw.framework.getAllTools().filter((x) => x.name.startsWith('arc--'))
+      .map((x) => ({ name: x.name, description: x.description, inputSchema: x.inputSchema }));
+    assert.deepEqual(arcTools, TOOLS.map((x) => ({ name: `arc--${String(x.name)}`, description: x.description, inputSchema: x.inputSchema })),
+      'every tool listed whole, in the server\'s order, as before');
+    assert.equal(t.fw.framework.getAllTools().filter((x) => x.name.startsWith('toolsets--')).length, 4, 'the four meta-tools');
+    await roundTrip(t);
+    assert.ok(!t.methods().some((m) => String(m).startsWith('toolsets/')), 'no toolsets/* request to a server without hints');
+  } finally { await t.done(); }
+});
+
+test('at startup a toolPrefix of toolsets is refused, with or without toolHints: the name is the framework\'s from creation', async () => {
+  // A configuration that loaded when hints were opt-in, with its prefix
+  // taking the name, would leave every agent without the meta-tools the
+  // host's built-in toolset needs; it's refused instead (only a module given
+  // to create() keeps the name, below).
+  const dead = { url: 'ws://127.0.0.1:9/mcpl', reconnect: false };
+  for (const [label, servers] of [
+    ['hints left out', [{ id: 'ts', toolPrefix: 'toolsets', ...dead }, { id: 'arc', toolPrefix: 'arc', ...dead }]],
+    ['hints off on it', [{ id: 'ts', toolPrefix: 'toolsets', toolHints: false, ...dead }]],
+    ['hints asked elsewhere', [{ id: 'ts', toolPrefix: 'toolsets', ...dead }, { id: 'arc', toolPrefix: 'arc', toolHints: true, ...dead }]],
+  ] as const) {
+    await assert.rejects(makeFramework(servers as unknown as McplServerConfig[]), /toolPrefix "toolsets" collides with module "toolsets"/, label);
+  }
+});
+
+/** A module that holds the name `toolsets` for itself (a host's own). */
+class HostToolsets {
+  readonly name = 'toolsets';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools() { return [{ name: 'mine', description: 'The host\'s own.', inputSchema: { type: 'object', properties: {} } }]; }
+  async handleToolCall() { return { success: true, data: 'mine' }; }
+  async onProcess() { return {}; }
+}
+
+/** The reference arc server with a fresh State, for a runtime connect. */
+async function arcServer() {
+  const state = new State();
+  return startScriptedServer({
+    advert: ADVERT, tools: TOOLS, listRev: () => state.rev,
+    on: (msg, peer) => {
+      if (msg.method === 'toolsets/list') { peer.reply(msg.id, state.listResult()); return; }
+      if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+}
+
+const META = ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close'];
+const metaTools = (fw: Awaited<ReturnType<typeof makeFramework>>) => fw.framework.getAllTools().filter((x) => META.includes(x.name)).map((x) => x.name);
+
+test('a runtime connect of a server that leaves toolHints out gets hints: offered, the meta-tools there from creation, its toolset tools out of the list', async () => {
+  const server = await arcServer();
+  const fw = await makeFramework([]);
+  try {
+    // The host's own toolsets (the built-in one) need them, MCPL or none.
+    assert.deepEqual(metaTools(fw).sort(), [...META].sort(), 'the meta-tools before any server');
+    await fw.framework.connectMcplServer({ id: 'arc', toolPrefix: 'arc', url: server.url });
+    assert.equal((server.peer.hostCaps?.mcpl as Json).toolHints, true, 'toolHints offered');
+    assert.deepEqual(metaTools(fw).sort(), [...META].sort(), 'the same meta-tools after the connect');
+    await waitFor(() => server.received.some((m) => m.method === 'toolsets/list'), 'toolsets/list after connecting');
+    await waitFor(() => !fw.framework.getAllTools().some((x) => x.name === 'arc--play'), 'a toolset tool leaves the list: the read tap is on');
+    assert.ok(fw.framework.getAllTools().some((x) => x.name === 'arc--status'), 'a static tool stays');
+  } finally { await fw.stop(); await server.close(); }
+});
+
+test('a module named toolsets at startup keeps the name: a server that leaves toolHints out loads without hints, and the line names the module', async () => {
+  const server = await arcServer();
+  const logged: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  let fw: Awaited<ReturnType<typeof makeFramework>> | undefined;
+  try {
+    fw = await makeFramework([{ id: 'arc', toolPrefix: 'arc', url: server.url }], { modules: [new HostToolsets() as never] });
+  } finally { console.error = realError; }
+  try {
+    await waitFor(() => fw!.framework.getAllTools().some((x) => x.name === 'arc--play'), 'every tool listed');
+    assert.ok(!('toolHints' in (server.peer.hostCaps?.mcpl as Json)), 'no hints offered');
+    assert.ok(fw.framework.getAllTools().some((x) => x.name === 'toolsets--mine'), 'the host\'s own module stays');
+    assert.deepEqual(metaTools(fw), []);
+    assert.ok(logged.some((l) => l.includes('tool hints (RFC-014) are off for arc') && l.includes('module "toolsets"')), logged.join(' | '));
+  } finally { await fw.stop(); await server.close(); }
+});
+
+test('at runtime the name toolsets is the framework\'s: a host module or a server prefix can\'t take it, and a restart\'s claim on it leaves a server that omits toolHints without hints', async () => {
+  // The framework's own toolsets module holds the name from creation (the
+  // host's built-in toolset needs it), so only a module registered at
+  // creation can keep the name, as the test above shows.
+  {
+    const fw = await makeFramework([]);
+    try {
+      await assert.rejects(fw.framework.addModule(new HostToolsets() as never), /already registered: toolsets/);
+    } finally { await fw.stop(); }
+  }
+  for (const [label, config] of [
+    ['another server\'s prefix', { id: 'ts', toolPrefix: 'toolsets', toolHints: false }],
+    ['its own prefix', { id: 'arc', toolPrefix: 'toolsets' }],
+  ] as const) {
+    const server = await arcServer();
+    const fw = await makeFramework([]);
+    try {
+      await assert.rejects(fw.framework.connectMcplServer({ url: server.url, ...config } as McplServerConfig), /collides with module "toolsets"/, label);
+    } finally { await fw.stop(); await server.close(); }
+  }
+  // A restart moving a server to the prefix holds the name as a claim, in
+  // the window between its disconnect and its connect.
+  const server = await arcServer();
+  const fw = await makeFramework([]);
+  try {
+    (fw.framework as unknown as { restartClaims(): { prefixes: Map<string, unknown> } }).restartClaims().prefixes.set('toolsets', { restarting: 'mover' });
+    await fw.framework.connectMcplServer({ id: 'arc', url: server.url, toolPrefix: 'arc' });
+    assert.ok(!('toolHints' in (server.peer.hostCaps?.mcpl as Json)), 'a restart\'s claim: no hints offered');
+  } finally { await fw.stop(); await server.close(); }
+});
+
+test('a modern server that leaves toolHints out has no hints: no controller at startup or at a runtime connect', async () => {
+  const modern = { url: 'http://127.0.0.1:9/mcp', reconnect: false };
+  const fw = await makeFramework([{ id: 'plain', toolPrefix: 'plain', ...modern }]);
+  const hub = () => (fw.framework as unknown as { toolsetHub: { get(id: string): unknown } | null }).toolsetHub;
+  try {
+    // The meta-tools are the host's own now; a modern server just has no hints.
+    assert.equal(hub()?.get('plain'), undefined, 'none at startup');
+    // A modern runtime connect takes no hints path at all; this pins that it stays so.
+    await fw.framework.connectMcplServer({ id: 'plain2', toolPrefix: 'plain2', ...modern }).catch(() => {});
+    assert.equal(hub()?.get('plain2'), undefined, 'none after a runtime connect');
+  } finally { await fw.stop(); }
+});
+
+test('a server that leaves toolHints out keeps its toolset state across a restart under the same configuration, as one with true does', async () => {
+  const t = await setup(() => false, { toolHints: undefined });
+  try {
+    await waitFor(() => t.server.received.some((m) => m.method === 'toolsets/list'), 'toolsets/list after connecting');
+    await roundTrip(t);
+    const hub = () => (t.fw.framework as unknown as { toolsetHub: { get(id: string): unknown } | null }).toolsetHub;
+    const before = hub()?.get('arc');
+    assert.ok(before, 'a controller for the server');
+    await t.fw.framework.restartMcplServer('arc', { id: 'arc', toolPrefix: 'arc', url: t.server.url });
+    assert.equal(hub()?.get('arc'), before, 'the same controller, kept across the restart');
+  } finally { await t.done(); }
+});
+
+test('a hinted server restarted into a modern configuration under its id leaves no toolset state behind', async () => {
+  const t = await setup();
+  try {
+    assert.match(await look(t.fw), /Game/, 'the toolsets are shown before the restart');
+    await t.fw.framework.restartMcplServer('arc', { id: 'arc', toolPrefix: 'arc', url: 'http://127.0.0.1:9/mcp', reconnect: false }).catch(() => {});
+    assert.doesNotMatch(await look(t.fw, {}), /Game|arc\/game/, 'nothing of the old server\'s toolsets is shown');
+    // Nor kept: a modern server never has a controller, so the old one's state (open toolsets, ended ids) is forgotten.
+    const hub = (t.fw.framework as unknown as { toolsetHub: { get(id: string): unknown } | null }).toolsetHub;
+    assert.equal(hub?.get('arc'), undefined, 'no controller kept for the id');
+  } finally { await t.done(); }
+});
+
 test('toolHints is a boolean, and only for an MCPL server', () => {
   assert.throws(() => assertServerConfigBooleans({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: 'false' as unknown as boolean }), /toolHints/);
   assert.doesNotThrow(() => assertServerConfigBooleans({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: null as unknown as boolean }));
   assert.ok(serverConfigProblems({ id: 's', url: 'https://example.invalid/mcp', toolHints: true }).some((p) => p.includes('"toolHints"')),
     'a modern server refuses it');
   assert.deepEqual(serverConfigProblems({ id: 's', url: 'https://example.invalid/mcp', toolHints: false }), []);
+  assert.deepEqual(serverConfigProblems({ id: 's', url: 'https://example.invalid/mcp' }), [], 'a modern server takes the default: it can\'t negotiate hints, so it is offered none');
   assert.deepEqual(serverConfigProblems({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: true }), []);
 });
 

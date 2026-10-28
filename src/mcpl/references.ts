@@ -26,6 +26,9 @@
  * the registry is what makes a future host-mediated fetcher and the
  * code-execution materialization hook possible.
  */
+import { cutToFit, suppliedValue } from '../supplied-text.js';
+import { NOTICE_TAG } from '../notice-tags.js';
+
 
 export const REFERENCE_LIMITS = { uri: 4096, mimeType: 255, name: 255, expiresAt: 64 } as const;
 export const DIGEST_PATTERN = /^sha256:[A-Za-z0-9_-]{43}$/;
@@ -210,7 +213,7 @@ export function isInlineContradiction(block: unknown): boolean {
 }
 
 export const INLINE_WITHHELD_TEXT =
-  '[Content not shown: its inline data arrived marked as a reference too, so this host withheld it.]';
+  `[${NOTICE_TAG.contentNotShown}: its inline data arrived marked as a reference too, so this host withheld it.]`;
 
 /*
  * What the model-visible lanes (push, channel, context injection and tool
@@ -220,28 +223,28 @@ export const INLINE_WITHHELD_TEXT =
  * agent to do about any of them. The text marker is NON_STRING_TEXT_PLACEHOLDER
  * (visible-content.ts).
  */
-export const IMAGE_NO_MEDIA_TYPE_TEXT = '[Image not shown: its data arrived without a media type.]';
-export const IMAGE_NO_DATA_TEXT = '[Image not shown: it arrived with no usable data or link.]';
-export const AUDIO_NO_MEDIA_TYPE_TEXT = '[Audio not shown: its data arrived without a media type.]';
+export const IMAGE_NO_MEDIA_TYPE_TEXT = `[${NOTICE_TAG.imageNotShown}: its data arrived without a media type.]`;
+export const IMAGE_NO_DATA_TEXT = `[${NOTICE_TAG.imageNotShown}: it arrived with no usable data or link.]`;
+export const AUDIO_NO_MEDIA_TYPE_TEXT = `[${NOTICE_TAG.audioNotShown}: its data arrived without a media type.]`;
 /** On the push, channel and context-injection lanes, audio shows only as
  *  inline data, so a plain link isn't enough either. (A tool result's audio
  *  with a link is a reference, as any block with one is there.) */
-export const AUDIO_NO_DATA_TEXT = '[Audio not shown: it arrived with no usable inline data.]';
+export const AUDIO_NO_DATA_TEXT = `[${NOTICE_TAG.audioNotShown}: it arrived with no usable inline data.]`;
 /** MCP's embedded resource whose contents are neither text nor a blob, or
  *  both. */
-export const EMBEDDED_RESOURCE_UNREADABLE_TEXT = '[Resource not shown: its contents arrived as neither text nor data, or as both.]';
+export const EMBEDDED_RESOURCE_UNREADABLE_TEXT = `[${NOTICE_TAG.resourceNotShown}: its contents arrived as neither text nor data, or as both.]`;
 /** MCP's embedded resource whose blob has no media type, so it can't be
  *  shown as an image or audio. */
-export const EMBEDDED_RESOURCE_NO_MEDIA_TYPE_TEXT = '[Resource not shown: its data arrived without a media type.]';
+export const EMBEDDED_RESOURCE_NO_MEDIA_TYPE_TEXT = `[${NOTICE_TAG.resourceNotShown}: its data arrived without a media type.]`;
 
 /** MCP's embedded resource whose blob is of a type no lane can show: what
  *  it was, by its type and size. Made well formed (a lone UTF-16 surrogate
  *  becomes U+FFFD), as a stub is (#695), since it names the block's media
- *  type, which sanitizeLabel leaves as it is: every lane then shows the same
- *  text. */
+ *  type, whose lone surrogates referenceTypeLabel leaves as they are: every
+ *  lane then shows the same text. */
 export function embeddedBinaryText(mimeType: string, blob: string): string {
   const what = [referenceTypeLabel(mimeType), formatSizeBytes(Math.floor(blob.length * 3 / 4))].filter(Boolean).join(', ');
-  return `[Resource not shown: this host can't display its data (${what}).]`.toWellFormed();
+  return `[${NOTICE_TAG.resourceNotShown}: this host can't display its data (${what}).]`.toWellFormed();
 }
 /**
  * What the converter (convertBlock, on every lane) shows for a text
@@ -250,10 +253,10 @@ export function embeddedBinaryText(mimeType: string, blob: string): string {
  * sender's, so it never makes content visible (isVisiblyEmptyConversion in
  * visible-content.ts, which re-exports it).
  */
-export const NON_STRING_TEXT_PLACEHOLDER = '[Text not shown: a text part arrived without readable text.]';
-export const REFERENCE_NO_LINK_TEXT = '[Reference not shown: it arrived without a link.]';
-export const REFERENCE_LINK_TOO_LONG_TEXT = '[Reference not shown: its link is longer than this host accepts.]';
-const UNREADABLE_BLOCK_TEXT = "[Content not shown: a part arrived in a form this host can't read.]";
+export const NON_STRING_TEXT_PLACEHOLDER = `[${NOTICE_TAG.textNotShown}: a text part arrived without readable text.]`;
+export const REFERENCE_NO_LINK_TEXT = `[${NOTICE_TAG.referenceNotShown}: it arrived without a link.]`;
+export const REFERENCE_LINK_TOO_LONG_TEXT = `[${NOTICE_TAG.referenceNotShown}: its link is longer than this host accepts.]`;
+const UNREADABLE_BLOCK_TEXT = `[${NOTICE_TAG.contentNotShown}: a part arrived in a form this host can't read.]`;
 
 /** A block of a type the host doesn't show, of no type at all, or no block.
  *  The type is the sender's word, so it's shown as a label is: bounded, with
@@ -261,10 +264,10 @@ const UNREADABLE_BLOCK_TEXT = "[Content not shown: a part arrived in a form this
  *  converted to one. */
 export function unknownBlockText(block: unknown): string {
   if (!isRecord(block)) return UNREADABLE_BLOCK_TEXT;
-  const label = typeof block.type === 'string' ? sanitizeLabel(block.type, STUB_FIELD_CHARS) : '';
+  const label = typeof block.type === 'string' ? suppliedLabel(block.type, STUB_FIELD_CHARS) : '';
   return label
-    ? `[Content not shown: this host can't display "${label}" content.]`
-    : '[Content not shown: a part arrived with no type.]';
+    ? `[${NOTICE_TAG.contentNotShown}: this host can't display "${label}" content.]`
+    : `[${NOTICE_TAG.contentNotShown}: a part arrived with no type.]`;
 }
 
 /**
@@ -654,6 +657,11 @@ export function sanitizeLabel(s: string, maxChars: number): string {
   return cut + '…';
 }
 
+function suppliedLabel(s: string, maxChars: number): string {
+  const shown = suppliedValue(s).replace(/[\p{Cc}\p{Bidi_Control}]/gu, '').trim();
+  return shown.length <= maxChars ? shown : `${cutToFit(shown, maxChars - 1)}…`;
+}
+
 export function formatSizeBytes(n: number): string {
   if (n < 1024) return `${n}B`;
   if (n < 1024 * 1024) return `~${Math.round(n / 1024)}KB`;
@@ -786,7 +794,7 @@ export class ReferenceRegistry {
         return existing;
       }
     }
-    const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 2 + REF_ID_SUFFIX_CHARS)}`;
+    const refId = `${NOTICE_TAG.referenceId}_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 2 + REF_ID_SUFFIX_CHARS)}`;
     const record: ReferenceRecord = { refId, serverIds: serverId === undefined ? [] : [serverId], testimony, receivedAt: Date.now() };
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
@@ -871,7 +879,7 @@ export interface ScriptLine {
 /** A reference's type as its stub shows one, or '' when nothing is left of
  *  it once sanitized (the stub then leaves it out). */
 export function referenceTypeLabel(mimeType: string | undefined): string {
-  return mimeType ? sanitizeLabel(mimeType, STUB_FIELD_CHARS) : '';
+  return mimeType ? suppliedLabel(mimeType, STUB_FIELD_CHARS) : '';
 }
 
 /**
@@ -886,7 +894,7 @@ export function referenceTypeLabel(mimeType: string | undefined): string {
  * stub, so it's no slot whatever its length.
  */
 export const REFERENCE_STUB_MAX_CHARS =
-  `[ref_${MAX_SAFE.toString(36)}_] `.length + REF_ID_SUFFIX_CHARS
+  `[${NOTICE_TAG.referenceId}_${MAX_SAFE.toString(36)}_] `.length + REF_ID_SUFFIX_CHARS
   + STUB_FIELD_CHARS
   + ' — '.length + STUB_FIELD_CHARS + ', '.length + `${formatSizeBytes(MAX_SAFE)} claimed`.length
   + ' — '.length + STUB_FIELD_CHARS
@@ -1099,7 +1107,7 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   const nowMs = Date.now();
   const parts: string[] = [];
   // A label is shown only when something is left of it once sanitized.
-  const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
+  const name = t.name ? suppliedLabel(t.name, STUB_FIELD_CHARS) : '';
   if (name) parts.push(name);
   const meta: string[] = [];
   const mimeType = referenceTypeLabel(t.mimeType);
@@ -1130,9 +1138,9 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
  * server's link shows (StubOptions.unfetchedLinkUri).
  */
 function unfetchedLinkText(t: ReferenceTestimony, uri: string): string {
-  const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
+  const name = t.name ? suppliedLabel(t.name, STUB_FIELD_CHARS) : '';
   const mimeType = referenceTypeLabel(t.mimeType);
-  return `[resource link${name ? ` "${name}"` : ''}: ${uri}${mimeType ? `, ${mimeType}` : ''}; not fetched]`;
+  return `[${NOTICE_TAG.resourceLink}${name ? ` "${name}"` : ''}: ${uri}${mimeType ? `, ${mimeType}` : ''}; not fetched]`;
 }
 
 /**

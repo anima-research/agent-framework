@@ -6,6 +6,7 @@
  */
 
 import { unknownToolMessage } from '../unknown-tool.js';
+import { outsideSenderName } from '../sender-name.js';
 import type {
   Module,
   ModuleContext,
@@ -62,12 +63,13 @@ export class ApiModule implements Module {
   }
 
   private handleMessage(event: ApiMessageEvent): EventResponse {
+    const carried = event.metadata?.author;
     const response: EventResponse = {
       addMessages: [
         {
-          participant: event.participant,
+          participant: outsideSenderName(event.participant, 'API'),
           content: [{ type: 'text', text: event.content }],
-          metadata: event.metadata,
+          metadata: { ...event.metadata, author: typeof carried === 'object' && carried !== null ? carried : { name: event.participant } },
         },
       ],
     };

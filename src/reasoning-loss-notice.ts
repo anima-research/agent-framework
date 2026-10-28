@@ -1,3 +1,5 @@
+import { NOTICE_TAG } from './notice-tags.js';
+import { oneLine, suppliedValue } from './supplied-text.js';
 import { safeSlice } from './safe-slice.js';
 
 export type ReasoningLossCause = 'tools' | 'system' | 'model';
@@ -45,12 +47,12 @@ export function reasoningLossNotice(input: ReasoningLossNoticeInput): string {
     lost = `Some of your earlier reasoning is no longer in your context: the reasoning behind ${replies}${first}${among}${because}.`;
     reread = named ? 'Re-read before relying on a decision made since then.' : 'Re-read before relying on an earlier decision.';
   }
-  return `[reasoning] ${input.agentName}: ${lost} Their words are still here. ${reread}`;
+  return `[${NOTICE_TAG.reasoning}] ${input.agentName}: ${lost} Their words are still here. ${reread}`;
 }
 
 function anchorWords(anchor: ReasoningLossAnchor): string | undefined {
-  if ('toolCall' in anchor) return anchor.toolCall ? `that called \`${anchor.toolCall}\`` : undefined;
-  const text = anchor.text.replace(/\s+/g, ' ').trim();
+  if ('toolCall' in anchor) return anchor.toolCall ? `that called \`${suppliedValue(anchor.toolCall)}\`` : undefined;
+  const text = oneLine(anchor.text).replace(/\s+/g, ' ').trim();
   if (!text) return undefined;
   const clipped = text.length > ANCHOR_CHARS ? `${safeSlice(text, 0, ANCHOR_CHARS).trimEnd()}…` : text;
   return `beginning "${clipped}"`;

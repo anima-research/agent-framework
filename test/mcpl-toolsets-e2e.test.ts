@@ -186,7 +186,7 @@ describe('RFC-014 against the reference ToolsetServer, toolHints off (vectors 26
 
   before(async () => {
     srv = await serveToolsetServer(arcadeSpec(calls), 'agent:plain');
-    fw = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url }]);
+    fw = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url, toolHints: false }]);
     await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arcade--scores'), 'tools listed');
   });
   after(async () => {
@@ -194,10 +194,11 @@ describe('RFC-014 against the reference ToolsetServer, toolHints off (vectors 26
     await srv?.close();
   });
 
-  it('every tool is static there, with the server\'s compat tools, and no meta-tools (36)', () => {
+  it('every tool is static there, with the server\'s compat tools; the meta-tools are the host\'s own (36)', () => {
     const names = fw.framework.getAllTools().map((t) => t.name);
     for (const n of ['scores', 'play', 'resign', 'place', 'toolset_open', 'toolset_close', 'toolset_use']) assert.ok(names.includes(`arcade--${n}`), n);
-    assert.ok(!names.some((n) => n.startsWith('toolsets--')));
+    // Registered for every agent (the host's built-in toolset), not for this server.
+    assert.ok(names.includes('toolsets--open'));
   });
 
   it('two instances: a call without a choice fails naming them; after choosing, each plays (26)', async () => {
@@ -212,7 +213,7 @@ describe('RFC-014 against the reference ToolsetServer, toolHints off (vectors 26
     await call('play', { point: 'E5' });
     assert.deepEqual(calls, ['p1:play:{"point":"D4"}', 'p2:play:{"point":"E5"}']);
     // A second connection of the principal has no current instance: it must choose.
-    const other = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url }]);
+    const other = await makeFramework([{ id: 'arcade', toolPrefix: 'arcade', url: srv.url, toolHints: false }]);
     try {
       await waitFor(() => other.framework.getAllTools().some((t) => t.name === 'arcade--play'), 'listed');
       const blind = await other.framework.executeToolCall({ id: 'blind', name: 'arcade--play', input: { point: 'F6' } } as never);

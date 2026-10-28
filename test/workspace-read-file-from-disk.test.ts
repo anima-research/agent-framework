@@ -283,7 +283,8 @@ test('an intermediate symlinked directory escaping the mount is rejected under n
   // which a mount that doesn't follow symlinks refuses as one, with the code
   // for where it leads.
   const err = await expectRefusal(workspace.readFileFromDisk('work/linkdir/secret.txt'), 'escape');
-  assert.equal(err.message, 'work/linkdir/secret.txt: "work/linkdir" is a symlink leading outside the mount, which this mount does not follow');
+  assert.equal(err.message, 'work/linkdir/secret.txt: "work/linkdir" is a symlink leading outside the mount, which this mount does not follow; '
+    + 'followed or not, nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it');
   assert.ok(!err.message.includes(root));
 });
 

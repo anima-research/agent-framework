@@ -178,11 +178,14 @@ if (how === 'reuse-timed-out-id') {
   });
   setInterval(() => {}, 60_000);
 } else if (how === 'wakes-after-stop') {
-  // Ready once its listener is on; at a stop, as many wakes as argv[3] says, each with an id of its own, none seen.
+  // Ready once its listener is on; at a stop, as many wakes as argv[3] says, each with an id of its own, none seen,
+  // and then it says it stopped and exits.
   writeSync(3, encodeFrame({ t: 'out', text: 'ready' }));
   parentFrames((frame) => {
     if (frame.t !== 'stop') return;
     for (let id = 1; id <= Number(process.argv[3]); id++) call(id, '(wake_agent)', '"after"');
+    writeSync(3, encodeFrame({ t: 'end', how: 'stopped', reason: 'agent' }));
+    process.exit(0);
   });
   setInterval(() => {}, 60_000);
 } else if (how === 'calls-then-exit-on-gate') {

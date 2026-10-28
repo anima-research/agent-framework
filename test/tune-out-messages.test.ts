@@ -30,6 +30,7 @@ function coordinator(opts: { tunedOut?: Array<{ channelId: string; expiresAtMs?:
     // Each channel's id is unique here, so it's shown by its id, and names
     // the one channel with it.
     nameShown: (channel: { channelId: string }) => channel.channelId,
+    quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
     channelsNamed: (name: string) => tunedOut.filter((t) => t.channelId === name).map((t) => ({ serverId: 'disc', channelId: t.channelId })),
     sharedNameRefusalFor: () => undefined,
     // No call here is made inside a turn, so none has own channels.

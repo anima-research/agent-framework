@@ -64,7 +64,7 @@ Chronicle's audit history.
   model: 'claude-opus-4-20250514',
   systemPrompt: '...',
   strategy: new AutobiographicalStrategy({ recentWindowTokens: 30000 }),
-  allowedTools: ['search--query', 'utils', 'files--archive'], // or 'all'
+  allowedTools: ['search--query', 'toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close', 'files--archive'], // or 'all'
   triggerSources: ['discord'],                   // or 'all'
   maxTokens: 8192,
   maxStreamTokens: 150_000,  // input token budget before stream restart
@@ -73,17 +73,13 @@ Chronicle's audit history.
 
 `allowedTools` is enforced at dispatch for registered agents. Omission or
 `'all'` permits all tools; an explicit list matches exact names, including
-`module--utility` names. Utilities aren't tools of their own: an agent's model
-and its scripts are offered them only through `utils`, whose `run` checks the
-utility's own name. An agent that should use a utility lists both `utils` and
-`module--utility`. The name alone passes the dispatch check for any call by
-that name, whether the host makes it with `executeToolCall` on the agent's
-behalf or the model or a script makes it without being offered it. The slot
-is hidden when the agent can use no registered utility. If utilities exist
-but none are permitted, `list` returns a failed `ToolResult` with the registered
-and permitted counts and migration advice, and a list containing `utils`
-logs one warning per Agent instance after registration.
-An empty registry still returns a successful empty list.
+`module--utility` names. A utility, like every tool of the host's built-in
+toolset (see "The host's own toolsets" below), is called through
+`toolsets--act`, and the dispatch check applies to the utility's own name: an
+agent that should use one lists `module--utility` and the `toolsets--` tools.
+An agent that can't use `toolsets--open` and `toolsets--act` gets no host
+toolsets: every tool it may call stays in its tool list, except module
+utilities, which are never in a tool list (it can still call one by name).
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.
@@ -136,6 +132,8 @@ return {
 - **DiscordModule** - Discord bot integration (messages, reactions, threads, typing indicators)
 - **ApiModule** - WebSocket API event processing
 - **WorkspaceModule** - Mountable filesystem abstraction with Chronicle tree state, filesystem watching, and materialization
+
+DiscordModule and ApiModule store a sender's name that comes from outside the framework in a form marked with its source: a Discord author's username as `<name> (Discord)`, and the name on every `api:message` event, from an ApiServer caller or a host's own, as `<name> (API)`. An `api:message` whose `participant` isn't text, which its type doesn't allow, isn't stored, and starts no turn. Such a name is stored on one line: each run of line breaks (U+2028 and U+2029 included) and other control characters becomes one space. The generic name `user`, in any capitalization, is stored as given. Unless a host gives one of its own agents the name `user`, in any capitalization, or a name ending in ` (Discord)` or ` (API)`, such a message never carries an agent's name, so the agent's request never takes it as the agent's own turn. Where an agent's request shows senders' names, the agent sees the marked form, and the unmarked one in rows stored by earlier versions. A host that pushes an `api:message` in an agent's name records a user turn, not that agent's, with the same exception, and the ApiServer's message list returns each message's participant as stored, so a caller sees its own messages under `<name> (API)`. The ApiServer refuses a `participant` that isn't text, as it refuses content that isn't. The bot's own messages that a Discord history sync stores keep the name of the framework's first agent, as before. For a sender from outside, both modules also store the name as sent in `metadata.author` (with the author's Discord id), unless an `api:message` event's metadata already carries an `author` object, which is kept. History's author filter matches a row's `metadata.author` when it has one, and its participant otherwise. Code that tells senders apart should read a row's `metadata.author` (its `name`, and `id` for Discord) when it has one, and its participant otherwise, as the filter does: rows these modules stored in earlier versions have none, unless a host's `api:message` carried one.
 
 ### Event Processing
 
@@ -349,7 +347,8 @@ three ways:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
   `toolLifecycle` `observe` or `inputs` block, a
   `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default,
-  and `toolHints: true`.
+  and `toolHints: true` (an MCPL server takes hints when the setting is left
+  out; a modern server ignores the default).
   A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
@@ -432,19 +431,28 @@ the `mcpl/coalescing` state (retry window 1 h); audit lines are
 
 #### Tool presence and toolsets (RFC-014)
 
-A server configured with `toolHints: true` (default false) is offered
-`experimental.mcpl.toolHints`, and its hints count only if it advertised
-`toolHints` too. Without it nothing changes: every tool is listed as before,
-and the host advertises and reads nothing new.
+Every MCPL server is offered `experimental.mcpl.toolHints` unless its
+configuration sets `toolHints: false`, and its hints count only if it
+advertised `toolHints` too. A server that doesn't advertise them lists every
+tool as before. With `toolHints: false` on a server, the host advertises and
+reads nothing new for it. The `toolsets` module below is registered at
+creation in any case, since the host's own toolsets use it. A modern (MCP)
+server never has hints. Only a module given to `create()` can hold the name
+`toolsets`: MCPL servers that leave the setting out then have none, and a line
+says so. A server `toolPrefix` of `toolsets` is refused.
 
-With it, the server's static tools stay in the tool list as before, and its
+With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
 enter it, since every change to the list rebuilds the prompt cache. The
-framework registers a `toolsets` module with four constant tools:
+framework registers a `toolsets` module with four constant tools at creation,
+for every agent (the host's own toolsets need them too, below), so the tool
+list doesn't change when a server starts to present:
 
-- `toolsets--open {server?, toolset?, instance?, options?}` opens a toolset (or
-  a named instance of one), and answers with what the server shows on opening
-  and the tools usable now;
+- `toolsets--open {server?, toolset?, instance?, options?, full?}` opens a
+  server's toolset (`server` and `toolset`), or a named instance of one, and
+  answers with what the server shows on opening and the tools usable now;
+  `server` alone opens the server's tab and `toolset: "settings"` alone the
+  host's built-in toolset (below);
 - `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool down
   the same path as a direct call of it (the agent's `allowedTools`, the
   server's tool policy, the state exchange, the reading of its result, RFC-007
@@ -461,7 +469,62 @@ framework registers a `toolsets` module with four constant tools:
   couldn't; what that changed
   is in the answer when look restates everything, and otherwise told as a
   notice;
-- `toolsets--close {server?, toolset?, instance?}` closes it.
+- `toolsets--close {server?, toolset?, instance?, disconnect?}` closes it;
+  `server` alone moves the server to a tab or hides its open tab, and with
+  `disconnect: true` makes it a closed tab (below).
+
+### The host's own toolsets
+
+Beside the toolsets servers declare, the host presents some tools out of the
+tool list itself (RFC-014 §8.5 host-made toolsets, §8.1 surface presentation;
+`src/host-presentation.ts`). It's host presentation, not an MCPL wire change,
+and works for every server, with or without RFC-014. The `toolsets--` tools
+are registered for every agent, MCPL or none, unless a module holds the name.
+
+- **The built-in toolset, `settings`.** The host tools an agent reaches for
+  rarely: `agent_settings`, `wake_add_rule`, `wake_remove_rule`,
+  `gate_status`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
+  `heartbeat--heartbeat_status`, `heartbeat--heartbeat_trigger`,
+  `workspace--status`, every module utility (`Module.getUtilities`), and a
+  module's tools it places there (`Module.toolPlacement` answering
+  `'builtin'`). None is in the tool list. `toolsets--open {toolset:"settings"}`
+  announces them, `toolsets--act {tool, args}` calls one while it's open, under
+  its own name and permissions, its `args` checked against the definition first, `toolsets--close {toolset:"settings"}` closes
+  it, and `toolsets--look {toolset:"settings"}` lists them either way. A
+  server's own toolset named `settings` is reached with its `server` named.
+- **Server tabs.** Each MCPL server is presented to each agent one of three
+  ways: `full` (its tools in the tool list, the default), a `tab` (connected,
+  its events still arriving, none of its tools in the tool list:
+  `toolsets--open {server}` announces them and lets `toolsets--act` call them,
+  named in full or bare with `server`; `toolsets--close {server}` hides them
+  again), or a `closed-tab` (disconnected until `toolsets--open {server}`
+  connects it again, with its configuration and credentials, an
+  `accessProvider` asked afresh). `toolsets--close {server}` moves a full
+  server to a tab, `toolsets--close {server, disconnect: true}` disconnects it,
+  and `toolsets--open {server, full: true}` puts it back in the tool list. A
+  server's configured `presentation` (`'full' | 'tab' | 'closed-tab'`) is where
+  each agent starts; what an agent chose is kept across restarts. A
+  connection is the host's, so a closed tab is disconnected for every agent of
+  the host, and `disconnect` is refused while another resident agent has the
+  server in its tool list or its tab open, or can't use the meta-tools (it
+  has every server in its list, and couldn't open a closed tab again). A
+  disconnect that fails changes nothing. An operator's own connect of a
+  closed tab ends it, and an operator's disconnect forgets the server's tab.
+- **Hidden tools.** A tool an agent hides with `set_tool_visibility` leaves its
+  tool list for the built-in toolset, or its server's tab, and comes back when
+  shown. The `toolsets--` tools can't be hidden.
+
+The tool list changes only when a server moves between full and a tab or a
+tool is hidden or shown, one prompt-cache write each; opening, acting in and
+closing a host toolset never change it. Which host toolsets an agent has open,
+and each server's presentation where the agent changed it, are kept in
+`<storePath>/config/toolsets.json`. An open host toolset whose announcement has
+left the context is reminded of, as a server's toolset is (§8.3). A call of a
+tool the agent may call by name still works by name; the tool list just
+doesn't carry it. `framework.presentedTools(agentName, tools, canUseMeta?)`
+applies this presentation to a tool list, so a host can tell a stream that
+isn't registered yet (a fork, before its run starts) what its first request
+will carry.
 
 `server` can be left out when only one server has the name. By our reading of
 the code, a server with no toolsets stops presenting them once its latest `tools/list` has no dynamic

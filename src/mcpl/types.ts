@@ -193,8 +193,8 @@ export interface McplHostCapabilities {
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
-  /** RFC-014 §6.3: this host presents tool hints. Sent only to a server
-   *  whose config sets `toolHints: true`. */
+  /** RFC-014 §6.3: this host presents tool hints. Sent to every server
+   *  with hints (McplServerConfig.toolHints: on unless false). */
   toolHints?: boolean;
 }
 
@@ -508,18 +508,35 @@ export interface McplServerConfig {
   toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
 
   /**
-   * MCPL RFC-014 (tool presence, toolsets and surfaces). Default false: the
-   * host advertises nothing and treats every tool as static, byte for byte as
-   * before. When true, the host advertises `experimental.mcpl.toolHints`, and
-   * honours hints only from a server that advertised `toolHints` too. Then
-   * the server's static tools stay in the tool list as before, and its
-   * dynamic tools (toolset tools, `mcpl/presence: "dynamic"`) leave it: they
-   * are announced in the conversation as they become visible and invisible,
-   * and called through the `toolsets` module's `toolsets--act`, opened with
-   * `toolsets--open`, inspected with `toolsets--look` and closed with
-   * `toolsets--close`. Only `true` turns it on, and null counts as not set.
+   * MCPL RFC-014 (tool presence, toolsets and surfaces). On unless set to
+   * `false`: the host advertises `experimental.mcpl.toolHints` and honours
+   * hints (through the `toolsets` meta-tools) only from a server that
+   * advertised `toolHints` too. Such a server's static tools stay in the tool
+   * list as before, and its dynamic tools (toolset tools, `mcpl/presence:
+   * "dynamic"`) leave it: they are announced in the conversation as they
+   * become visible and invisible, and called through `toolsets--act`, opened
+   * with `toolsets--open`, inspected with `toolsets--look` and closed with
+   * `toolsets--close`. A server that doesn't advertise `toolHints` lists every
+   * tool as before. `false` advertises nothing and treats every tool as
+   * static. Omitted and null are on unless a module given to `create()`
+   * holds the name `toolsets` (or a restart is moving a server to that
+   * prefix, which is refused); `true` with such a module is refused.
    */
   toolHints?: boolean;
+
+  /**
+   * How this server is presented to agents at first (the host's own
+   * toolsets, src/host-presentation.ts): `'full'` (the default) puts its
+   * tools in the tool list, as before; `'tab'` keeps it connected, its events
+   * still arriving, with none of its tools in the tool list until an agent
+   * opens its tab (`toolsets--open {server}`) and calls them through
+   * `toolsets--act`; `'closed-tab'` leaves it disconnected until an agent
+   * opens it. Each agent can switch it later (`toolsets--close {server}`,
+   * with `disconnect: true` for a closed tab; `toolsets--open {server,
+   * full: true}` back into the tool list), and that choice is kept across
+   * restarts beside the store, over this default.
+   */
+  presentation?: 'full' | 'tab' | 'closed-tab';
 }
 
 // ============================================================================

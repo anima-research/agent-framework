@@ -56,7 +56,7 @@ import type { BigIntStats } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { relative, sep } from 'node:path';
 import { refusedLanding } from './effects.js';
-import { ROOT_RECHECK, errnoWayOn, errnoWords, onlyTheHost, systemWords } from './answers.js';
+import { OUTSIDE_STEP, RESOLVED_OUTSIDE_STEP, ROOT_RECHECK, UNFOLLOWED_STEP, errnoWayOn, errnoWords, onlyTheHost, systemWords } from './answers.js';
 import {
   type CheckedDir,
   type MountView,
@@ -135,7 +135,7 @@ export class WriteRefused extends Error {
 
 const AFRESH = 'Calling again checks it afresh.';
 
-const NAME_ITS_OWN = "Calling again won't change that; if you know the file it leads to, name that file by its own path.";
+const NAME_ITS_OWN = `Calling again won't change that; ${UNFOLLOWED_STEP}.`;
 
 function rootWayOn(code: string | undefined): string {
   return code === 'ENOENT' || code === 'ENOTDIR' ? onlyTheHost("put the mount's directory back at its path") : errnoWayOn(code, ROOT_RECHECK, true);
@@ -145,7 +145,8 @@ function refusedWayOn(reason: string, code?: string, hostsName = false): string 
   if (reason === ROOT_UNAVAILABLE) return rootWayOn(code);
   if (code !== undefined) return errnoWayOn(code, undefined, hostsName);
   if (reason === NOT_FOLLOWED) return NAME_ITS_OWN;
-  if (reason === OUTSIDE_PARENT || reason === LEAVES_MOUNT) return "Calling again won't change that; the workspace writes only inside its mounts.";
+  if (reason === LEAVES_MOUNT) return `Calling again won't change that; ${OUTSIDE_STEP}.`;
+  if (reason === OUTSIDE_PARENT) return `Calling again won't change that; ${RESOLVED_OUTSIDE_STEP}.`;
   if (reason === NOT_A_DIRECTORY) return "Calling again won't change that while something other than a directory stands where the path needs one; another path, or removing what stands there, would.";
   return null;
 }

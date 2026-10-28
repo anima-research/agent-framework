@@ -1280,11 +1280,12 @@ test("a forced deletion over a directory says no push unlinks one", async (t) =>
   assert.equal(statSync(join(dir, 'gone.txt')).isDirectory(), true, 'the directory stays');
 });
 
-test("a write over a FIFO is told to fix it and materialize again, with no force", { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
+test("a write over a FIFO is told what's in the way and the ways past it, with no force", { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   assert.equal(spawnSync('mkfifo', [join(dir, 'p.txt')]).status, 0, 'mkfifo');
   assert.equal(errorOf(await call('write', { path: 'work/p.txt', content: 'x\n' })), 'The write of "work/p.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — fix it and materialize again.");
+    + "Its push to disk didn't complete: disk has a pipe, socket or device at this path, or a symlink to one, and no push writes a file over it, forced or not — "
+    + 'write the file under another path, or whoever runs this host can remove it, and materializing again then gets past it.');
   assert.equal(statSync(join(dir, 'p.txt')).isFIFO(), true, 'the FIFO stays');
 });
 
@@ -1292,12 +1293,13 @@ test("a write over a FIFO is told to fix it and materialize again, with no force
 // The fix round of the third review (af-ws-fix-r2)
 // ---------------------------------------------------------------------------
 
-test("a write over a symlink the mount doesn't follow is told to fix it, with no force", async (t) => {
+test("a write over a symlink the mount doesn't follow is told what's in the way and the ways past it, with no force", async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'target.txt'), 'target\n');
   symlinkSync('target.txt', join(dir, 'l.txt'));
   assert.equal(errorOf(await call('write', { path: 'work/l.txt', content: 'x\n' })), 'The write of "work/l.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (a symlink, which this mount does not follow) — fix it and materialize again.");
+    + "Its push to disk didn't complete: disk has a symlink at this path, which this mount does not follow, and no push writes through one, forced or not — "
+    + 'write the file under another path, or whoever runs this host can remove the link, and materializing again then gets past it.');
   assert.equal(lstatSync(join(dir, 'l.txt')).isSymbolicLink(), true, 'the link stays');
   assert.equal(readFileSync(join(dir, 'target.txt'), 'utf8'), 'target\n');
 });
@@ -1317,7 +1319,7 @@ test('a disk copy the workspace cannot read is offered force on the condition fo
   } catch { /* unreadable, as intended */ }
 
   const writeRefusal = (path: string): string => `The write of "work/${path}" is stored in the workspace, so don't send it again. `
-    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (permission denied)) — fix it and materialize again, "
+    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (permission denied)) — materializing again won't change that; whoever runs this host can change the permissions, and materializing again then gets past it, "
     + 'or, if disk lets the workspace write the file, materialize it with force to overwrite it.';
   assert.equal(errorOf(await call('write', { path: 'work/r.txt', content: 'v2\n' })), writeRefusal('r.txt'));
   assert.equal(errorOf(await call('write', { path: 'work/n.txt', content: 'v2\n' })), writeRefusal('n.txt'));
@@ -1325,7 +1327,7 @@ test('a disk copy the workspace cannot read is offered force on the condition fo
   // where it doesn't, which is why the offer carries its condition.
   const forced = await call('materialize', { force: true });
   assert.equal(forced.success, true, forced.error);
-  assert.match(JSON.stringify(forced.data), /n\.txt: not written: [^"]*EACCES/);
+  assert.match(JSON.stringify(forced.data), /n\.txt: not written: [^"]*permission denied/);
   chmodSync(join(dir, 'r.txt'), 0o600);
   chmodSync(join(dir, 'n.txt'), 0o600);
   assert.equal(readFileSync(join(dir, 'r.txt'), 'utf8'), 'v2\n');
@@ -1334,7 +1336,7 @@ test('a disk copy the workspace cannot read is offered force on the condition fo
   // A deletion's forced unlink needs its directory, not the file's own
   // permissions: this one unlinks it.
   assert.equal(errorOf(await call('delete', { path: 'work/s.txt' })), 'The deletion of "work/s.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (permission denied)) — fix it and materialize again with applyDeletions, "
+    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (permission denied)) — materializing again with applyDeletions won't change that; whoever runs this host can change the permissions, and materializing again with applyDeletions then gets past it, "
     + 'or, if disk lets the workspace unlink the file, materialize it with force and applyDeletions to delete it.');
   const unlinked = await call('materialize', { path: 'work/s.txt', force: true, applyDeletions: true });
   assert.equal(unlinked.success, true, unlinked.error);
@@ -1370,7 +1372,7 @@ test("a path whose branch intent can't be read is told to sync the path, which r
   // A sync asks for an adoption, which gets past the intent's check and stops
   // at the symlink, before anything is adopted: its note is the symlink's,
   // where a pass that adopts nothing answers the intent's.
-  assert.match(JSON.stringify(blind.data), /"path":"w\.txt","reason":"disk could not be checked: a symlink, which this mount does not follow"/);
+  assert.match(JSON.stringify(blind.data), /"path":"w\.txt","reason":"disk could not be checked: a symlink, which this mount does not follow — syncing this path again won't change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere"/);
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), unseen, "a sync that can't see disk's copy leaves the intent");
   rmSync(join(dir, 'w.txt'));
   // Absent is a copy a sync sees, so the reason names the sync alone, and

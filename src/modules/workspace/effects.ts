@@ -45,12 +45,16 @@ import { constants as fsConstants } from 'node:fs';
 import { lstat, open, realpath, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import {
+  type Cause,
   type CheckedDir,
   type MountView,
+  DIRECTORY,
   LEAVES_MOUNT,
+  LINK_TO_DIRECTORY,
   NONBLOCK,
   NOT_A_DIRECTORY,
   NOT_FOLLOWED,
+  NOT_REGULAR,
   OUTSIDE_PARENT,
   ROOT_REPLACED,
   contained,
@@ -63,6 +67,7 @@ import {
   nestedAtReal,
   parentOf,
 } from './observe.js';
+import { errnoCode, systemWords } from './answers.js';
 
 /** What a write or unlink may find at its path when it acts. */
 export type Expect =
@@ -79,10 +84,16 @@ export class EffectFailed extends Error {
   /** Whether the path's entry was touched before the failure. */
   readonly touched: boolean;
 
-  constructor(message: string, touched: boolean) {
+  constructor(message: string, touched: boolean, readonly detail: Cause = {}) {
     super(message);
     this.touched = touched;
   }
+}
+
+export function callFailed(what: string, err: unknown, touched: boolean, sep: 'paren' | 'colon' = 'paren'): EffectFailed {
+  const code = errnoCode(err);
+  const words = systemWords(code, err);
+  return new EffectFailed(sep === 'paren' ? `${what} (${words})` : `${what}: ${words}`, touched, code !== undefined ? { errno: code } : {});
 }
 
 const CHANGED = 'disk changed since it was checked';
@@ -115,10 +126,6 @@ const HARD_LINKED = 'a file with other hard links, which writing it in place wou
   + 'this; to write this path alone, give it a copy of its own first (copy it to a new name, then move that over it) '
   + 'and materialize again';
 
-function message(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 function noFollowFlag(view: MountView): number {
   return !view.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
 }
@@ -134,9 +141,9 @@ function noFollowFlag(view: MountView): number {
  */
 async function parentFor(view: MountView, rootReal: string, rel: string, create: boolean) {
   const root = await checkRoot(view, rootReal);
-  if ('reason' in root) throw new EffectFailed(root.reason, false);
+  if ('reason' in root) throw new EffectFailed(root.reason, false, root.errno !== undefined ? { errno: root.errno } : {});
   const checked = await checkDir(view, rootReal, parentOf(rel), { create });
-  if (checked.kind === 'unobserved') throw new EffectFailed(checked.outside ? OUTSIDE_PARENT : checked.reason, false);
+  if (checked.kind === 'unobserved') throw new EffectFailed(checked.outside ? OUTSIDE_PARENT : checked.reason, false, checked.errno !== undefined ? { errno: checked.errno } : {});
   return { ...checked, root: root.dir };
 }
 
@@ -171,11 +178,11 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
   try {
     handle = await open(target, fsConstants.O_RDONLY | NONBLOCK | flags);
   } catch (err) {
-    throw new EffectFailed(`cannot verify the disk copy (${errno(err) ?? message(err)})`, false);
+    throw callFailed('cannot verify the disk copy', err, false);
   }
   try {
     const info = await handle.stat({ bigint: true });
-    if (info.dev !== id.dev || info.ino !== id.ino) throw new EffectFailed(CHANGED, false);
+    if (info.dev !== id.dev || info.ino !== id.ino) throw new EffectFailed(CHANGED, false, { again: true });
     const hash = createHash('sha256');
     const chunk = Buffer.alloc(1 << 20);
     for (let offset = 0; ;) {
@@ -185,6 +192,9 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
       offset += bytesRead;
     }
     return hash.digest('hex');
+  } catch (err) {
+    if (err instanceof EffectFailed) throw err;
+    throw callFailed('cannot verify the disk copy', err, false);
   } finally {
     await handle.close();
   }
@@ -266,10 +276,10 @@ export async function writeContained(
         const leads = link ? await stat(target).then(() => 'somewhere', (e: unknown) => errno(e)) : null;
         throw new EffectFailed(leads === 'ENOENT' || leads === 'ENOTDIR'
           ? 'a symlink that leads nowhere is at this path, and a push makes a file only where nothing is, forced or not; '
-            + 'whoever runs this host can remove the link or make it lead to a file, and a materialize then writes it'
-          : 'something appeared at this path since it was checked', false);
+            + 'whoever runs this host can remove the link, and materializing again then gets past it'
+          : 'something appeared at this path since it was checked', false, leads === 'ENOENT' || leads === 'ENOTDIR' ? {} : { again: true });
       }
-      throw new EffectFailed(`cannot create the file (${errno(err) ?? message(err)})`, false);
+      throw callFailed('cannot create the file', err, false);
     }
   };
   let handle: FileHandle;
@@ -282,11 +292,11 @@ export async function writeContained(
     } catch (err) {
       const code = errno(err);
       if (code === 'ENOENT' && expect.kind === 'any') handle = await create();
-      else if (code === 'ENOENT') throw new EffectFailed('the file was removed since it was checked', false);
+      else if (code === 'ENOENT') throw new EffectFailed('the file was removed since it was checked', false, { again: true });
       else if (code === 'ELOOP' && !view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
-      else if (code === 'EISDIR') throw new EffectFailed('a directory', false);
-      else if (code === 'ENXIO') throw new EffectFailed('not a regular file', false); // a FIFO with no reader
-      else throw new EffectFailed(`cannot open the file (${code ?? message(err)})`, false);
+      else if (code === 'EISDIR') throw new EffectFailed((await lstat(target).catch(() => null))?.isSymbolicLink() === true ? LINK_TO_DIRECTORY : DIRECTORY, false);
+      else if (code === 'ENXIO') throw new EffectFailed(NOT_REGULAR, false); // a FIFO with no reader
+      else throw callFailed('cannot open the file', err, false);
     }
   }
 
@@ -379,7 +389,7 @@ export async function writeContained(
     return { perm: Number((await handle.stat({ bigint: true })).mode & 0o777n), widenRefused, modeKept };
   } catch (err) {
     if (err instanceof EffectFailed) throw err;
-    throw new EffectFailed(`could not ${stage}: ${message(err)}`, touched);
+    throw callFailed(`could not ${stage}`, err, touched, 'colon');
   } finally {
     await handle.close();
   }
@@ -429,30 +439,30 @@ async function checkOpened(
   touched: boolean,
 ): Promise<void> {
   const info = await handle.stat({ bigint: true });
-  if (!info.isFile()) throw new EffectFailed('not a regular file', touched);
+  if (!info.isFile()) throw new EffectFailed(NOT_REGULAR, touched);
   const located = async (): Promise<string> => {
     const real = await realpath(target).catch(() => null);
-    if (real === null) throw new EffectFailed(CHANGED, touched);
+    if (real === null) throw new EffectFailed(CHANGED, touched, { again: true });
     const refused = await refusedLanding(view, rootReal, rel, real);
     if (refused !== null) throw new EffectFailed(refused, touched);
     return real;
   };
   if (expect.kind === 'content') {
     await located();
-    if ((await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched);
+    if ((await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched, { again: true });
   }
   const real = await located();
   const named = await stat(real, { bigint: true }).catch(() => null);
-  if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
+  if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched, { again: true });
   if (!view.followSymlinks) {
     const entry = await lstat(target, { bigint: true }).catch(() => null);
     if (entry?.isSymbolicLink()) throw new EffectFailed(NOT_FOLLOWED, touched);
-    if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
+    if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) throw new EffectFailed(CHANGED, touched, { again: true });
   }
   if (info.nlink > 1n) throw new EffectFailed(HARD_LINKED, touched);
   const gone = await moved(root, parent);
-  if (gone !== null) throw new EffectFailed(gone, touched);
-  if (!unchanged(info, await handle.stat({ bigint: true }).catch(() => null))) throw new EffectFailed(CHANGED, touched);
+  if (gone !== null) throw new EffectFailed(gone, touched, gone === MOVED ? { again: true } : {});
+  if (!unchanged(info, await handle.stat({ bigint: true }).catch(() => null))) throw new EffectFailed(CHANGED, touched, { again: true });
 }
 
 /** The sticky bit, the one special bit the chmod before a write's bytes keeps. */
@@ -490,7 +500,7 @@ export async function chmodContained(
   view: MountView, rootReal: string, rel: string, mode: number, expect: Expect, from?: number,
 ): Promise<{ refused: boolean; narrowing: boolean }> {
   const checked = await parentFor(view, rootReal, rel, false);
-  if (checked.kind !== 'checked') throw new EffectFailed('the file was removed since it was checked', false);
+  if (checked.kind !== 'checked') throw new EffectFailed('the file was removed since it was checked', false, { again: true });
   const parent = checked.dir;
   const root = checked.root;
   const target = parent.at(nameOf(rel));
@@ -503,9 +513,9 @@ export async function chmodContained(
     handle = await open(target, fsConstants.O_RDONLY | NONBLOCK | noFollow);
   } catch (err) {
     const code = errno(err);
-    if (code === 'ENOENT') throw new EffectFailed('the file was removed since it was checked', false);
+    if (code === 'ENOENT') throw new EffectFailed('the file was removed since it was checked', false, { again: true });
     if (code === 'ELOOP' && !view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
-    throw new EffectFailed(`cannot open the file (${code ?? message(err)})`, false);
+    throw callFailed('cannot open the file', err, false);
   }
   let touched = false;
   let stage = 'set the file\'s mode';
@@ -526,7 +536,7 @@ export async function chmodContained(
     return { refused: false, narrowing };
   } catch (err) {
     if (err instanceof EffectFailed) throw err;
-    throw new EffectFailed(`could not ${stage}: ${message(err)}`, touched);
+    throw callFailed(`could not ${stage}`, err, touched, 'colon');
   } finally {
     await handle.close();
   }
@@ -559,16 +569,16 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
   } catch (err) {
     if (errno(err) === 'ENOENT') {
       const gone = await moved(root, parent);
-      if (gone !== null) throw new EffectFailed(gone, false);
+      if (gone !== null) throw new EffectFailed(gone, false, gone === MOVED ? { again: true } : {});
       return parent.rel;
     }
-    throw new EffectFailed(`cannot stat (${errno(err) ?? message(err)})`, false);
+    throw callFailed('cannot stat', err, false);
   }
   // Confirming an unlink that already happened never removes a file that
   // appeared since.
   if (expect.kind === 'absent') {
     const kind = info.isDirectory() ? 'a directory' : info.isSymbolicLink() ? 'a symlink' : info.isFile() ? 'a file' : 'a pipe, socket or device';
-    throw new EffectFailed(`${kind} appeared at this path since it was checked`, false);
+    throw new EffectFailed(`${kind} appeared at this path since it was checked`, false, { again: true });
   }
   let file = info;
   if (info.isSymbolicLink()) {
@@ -586,21 +596,21 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
       throw new EffectFailed(holder.names(directory) ? leadsInto(view.name, rel, holder) : LEAVES_MOUNT, false);
     }
     const through = await stat(real, { bigint: true }).catch(() => null);
-    if (through === null) throw new EffectFailed(CHANGED, false);
+    if (through === null) throw new EffectFailed(CHANGED, false, { again: true });
     // A followed link stands for the file it leads to, so it's removed only
     // for a regular one, as the file the workspace deleted. This refusal,
     // and the one below for what isn't a regular file at the path, use
     // observation's words for the path, so the push answers a forced unlink
     // and an unforced one alike (reconcile.ts inTheWay).
-    if (!through.isFile()) throw new EffectFailed(through.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file', false);
+    if (!through.isFile()) throw new EffectFailed(through.isDirectory() ? LINK_TO_DIRECTORY : NOT_REGULAR, false);
     // One leading to a file this mount's own include leaves out leaves the
     // mount too, and that file isn't read for a hash (coversLanding).
     if (!(await coversLanding(view, rootReal, real, rel))) throw new EffectFailed(LEAVES_MOUNT, false);
     file = through;
   } else if (info.isDirectory()) {
-    throw new EffectFailed('a directory', false);
+    throw new EffectFailed(DIRECTORY, false);
   } else if (!info.isFile()) {
-    throw new EffectFailed('not a regular file', false);
+    throw new EffectFailed(NOT_REGULAR, false);
   } else {
     // A regular file reached through a link among its directories lands
     // where the mount may not act: in a nested mount's directory, or on a
@@ -610,15 +620,15 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     const refused = await refusedLanding(view, rootReal, rel, target);
     if (refused !== null) throw new EffectFailed(refused, false);
   }
-  if (expect.kind === 'content' && (await hashAt(target, file, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
+  if (expect.kind === 'content' && (await hashAt(target, file, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false, { again: true });
   const gone = await moved(root, parent);
-  if (gone !== null) throw new EffectFailed(gone, false);
+  if (gone !== null) throw new EffectFailed(gone, false, gone === MOVED ? { again: true } : {});
   // The entry checked is still the one at the path, unwritten since it was
   // hashed, as close to the unlink as Node allows (see the header): a file
   // replaced or edited while it was hashed isn't removed.
   const again = await lstat(target, { bigint: true }).catch(() => null);
   const named = again?.isSymbolicLink() ? await stat(target, { bigint: true }).catch(() => null) : again;
-  if (!unchanged(file, named)) throw new EffectFailed(CHANGED, false);
+  if (!unchanged(file, named)) throw new EffectFailed(CHANGED, false, { again: true });
   try {
     await unlink(target);
   } catch (err) {
@@ -626,7 +636,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     // An unlink is all or nothing: one refused outright changed nothing, so
     // the path's evidence can go back as it was. Anything else may have
     // landed (a network filesystem's EIO, say): the next observation resolves it.
-    if (code !== 'ENOENT') throw new EffectFailed(`could not unlink the file: ${message(err)}`, !UNLINK_REFUSALS.has(code ?? ''));
+    if (code !== 'ENOENT') throw callFailed('could not unlink the file', err, !UNLINK_REFUSALS.has(code ?? ''), 'colon');
   }
   return parent.rel;
 }
@@ -661,7 +671,7 @@ export async function syncDirectories(view: MountView, rootReal: string, rels: I
       await checked.dir.sync();
       if (!(await root.dir.stillHere())) failed.set(rel, ROOT_REPLACED);
     } catch (err) {
-      failed.set(rel, message(err));
+      failed.set(rel, systemWords(errno(err), err));
     }
   }
   return failed;

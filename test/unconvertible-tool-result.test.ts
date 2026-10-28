@@ -101,12 +101,12 @@ class OddResults implements Module {
   getTools(): ToolDefinition[] {
     return Object.keys(RESULTS).map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
   }
-  /** Two tools also reached through the `utils` meta-tool. */
+  /** Two of the tools again as utilities (`u_` names), reached through toolsets--act. */
   getUtilities(): ToolDefinition[] {
-    return ['cyclic', 'datedata'].map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
+    return ['u_cyclic', 'u_datedata'].map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return RESULTS[call.name]!() as ToolResult;
+    return RESULTS[call.name.replace(/^u_/, '')]!() as ToolResult;
   }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
@@ -150,9 +150,10 @@ async function setUp(t: TestContext, tools: string[], extraModules: Module[] = [
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const membrane = new MockMembrane();
-  // `utils:NAME` runs the module's utility NAME through the utils meta-tool.
-  const toolUse = (tool: string) => tool.startsWith('utils:')
-    ? { type: 'tool_use' as const, id: `call-${tool}`, name: 'utils', input: { action: 'run', name: `odd--${tool.slice('utils:'.length)}`, args: {} } }
+  // `act:NAME` runs the module's utility NAME through toolsets--act, the
+  // host's built-in toolset being open.
+  const toolUse = (tool: string) => tool.startsWith('act:')
+    ? { type: 'tool_use' as const, id: `call-${tool}`, name: 'toolsets--act', input: { tool: `odd--${tool.slice('act:'.length)}`, args: {} } }
     : { type: 'tool_use' as const, id: `call-${tool}`, name: tool.includes('--') || tool === 'read_image' ? tool : `odd--${tool}`, input: tool === 'read_image' ? { path: 'board/x.png' } : {} };
   membrane.pushResponse(createMockResponse(tools.map(toolUse), 'tool_use'));
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Noted.' }]));
@@ -167,6 +168,8 @@ async function setUp(t: TestContext, tools: string[], extraModules: Module[] = [
   });
   // Bounded, so a turn that never settled can't keep the file from ending.
   t.after(() => within(framework.stop(), 5_000, 'stop() in cleanup').catch(() => {}));
+  // The host's built-in toolset, where module utilities are, open for act.
+  await framework.executeToolCall({ id: 'open-settings', name: 'toolsets--open', input: { toolset: 'settings' }, callerAgentName: 'assistant' });
   return { framework, membrane, logged, odd };
 }
 
@@ -371,9 +374,9 @@ test("a caller that uses the result in process gets the module's own result, as 
   // executeToolCall, ModuleContext.callTool, and a utility through either.
   assert.ok(at(await framework.executeToolCall({ id: 'direct-date', name: 'odd--datedata', input: {} })) instanceof Date);
   assert.ok(at(await odd.ctx!.callTool({ id: 'ctx-date', name: 'odd--datedata', input: {} })) instanceof Date);
-  const viaUtils = { name: 'utils', input: { action: 'run', name: 'odd--datedata', args: {} } };
-  assert.ok(at(await framework.executeToolCall({ id: 'utils-date', ...viaUtils })) instanceof Date);
-  assert.ok(at(await odd.ctx!.callTool({ id: 'ctx-utils-date', ...viaUtils })) instanceof Date);
+  const viaAct = { name: 'toolsets--act', input: { tool: 'odd--u_datedata', args: {} }, callerAgentName: 'assistant' };
+  assert.ok(at(await framework.executeToolCall({ id: 'act-date', ...viaAct })) instanceof Date);
+  assert.ok(at(await odd.ctx!.callTool({ id: 'ctx-utility-date', name: 'odd--u_datedata', input: {} })) instanceof Date);
   // Its flags as the module returned them, and its getters unread.
   assert.deepEqual(await framework.executeToolCall({ id: 'direct-flags', name: 'odd--flagsread', input: {} }),
     { success: 1, isError: 0, endTurn: 0, data: { ok: 1 } });
@@ -387,14 +390,14 @@ test("a caller that uses the result in process gets the module's own result, as 
   await within(framework.stop(), 10_000, 'stop()');
 });
 
-test("the model's call through the utils meta-tool takes the checked form", async (t) => {
-  const { framework, membrane } = await setUp(t, ['utils:cyclic']);
+test("the model's call through toolsets--act takes the checked form", async (t) => {
+  const { framework, membrane } = await setUp(t, ['act:u_cyclic']);
   framework.pushEvent({ type: 'external-message', source: 'test', content: 'Run it.', metadata: {} });
   await within(framework.runUntilIdle(), 10_000, 'the turn');
   assert.equal(framework.getAgent('assistant')!.state.status, 'idle', 'the turn settled');
   const sent = membrane.lastStream!.receivedToolResults[0] as Array<{ content: unknown; isError: boolean }>;
   assert.deepEqual(sent.map((r) => ({ content: r.content, isError: r.isError })),
-    [{ content: unconvertible('cyclic', 'Converting circular structure to JSON'), isError: true }]);
+    [{ content: unconvertible('u_cyclic', 'Converting circular structure to JSON'), isError: true }]);
   await within(framework.stop(), 10_000, 'stop()');
 });
 

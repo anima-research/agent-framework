@@ -224,10 +224,11 @@ test("read on a direct mount answers with the disk reader's refusals", async (t)
   assert.equal(await failure(m, 'read', { path: 'ref/missing.ts' }), `The read did nothing: there's no file at "ref/missing.ts". ls or glob lists the files that exist.`);
   assert.equal(await failure(m, 'read', { path: 'ref/src' }), `The read did nothing: "ref/src" is a directory, not a file; ls "ref/src" lists what's in it.`);
   assert.equal(await failure(m, 'read', { path: 'ref/link.ts' }),
-    `The read did nothing: "ref/link.ts" is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. Calling again won't change that; if you know the file it leads to, name that file by its own path.`);
+    `The read did nothing: "ref/link.ts" is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. Calling again won't change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere.`);
   assert.equal(
     await failure(m, 'read', { path: 'ref/srclink/a.ts' }),
-    'The read did nothing: ref/srclink/a.ts: "ref/srclink" is a symlink to "ref/src", which this mount does not follow; the mount\'s host can set followSymlinks: true.',
+    'The read did nothing: "ref/srclink/a.ts" can\'t be reached: "ref/srclink" is a symlink to "ref/src", which this mount does not follow; '
+      + 'use "ref/src" in place of "ref/srclink", or whoever runs this host can set followSymlinks: true on mount "ref".',
   );
   assert.match(await failure(m, 'read', { path: 'ref/../escape.txt' }), /^The read did nothing: "ref\/\.\.\/escape\.txt" climbs above the root of mount "ref"/);
 });
@@ -357,8 +358,8 @@ test("a direct mount's walks keep the cap, start where their pattern names, and 
   // cap would leave of a walk from above it.
   assert.deepEqual((await data<{ matches: unknown[] }>(m, 'glob', { pattern: 'node_modules/pkg/*.js' })).matches, [{ path: 'ref/node_modules/pkg/index.js', size: 2 }]);
   const capped = [
-    { path: 'node_modules/aaa', reason: 'the walk cap (2) was reached before everything here was taken' },
-    { path: 'node_modules/pkg', reason: 'not visited: the walk cap (2) was reached' },
+    { path: 'node_modules/aaa', reason: "the walk cap (2) was reached before everything here was taken; naming a path beneath it walks only that path, and whoever runs this host can raise the mount's walkCap" },
+    { path: 'node_modules/pkg', reason: "not visited: the walk cap (2) was reached; naming this path walks only it, and whoever runs this host can raise the mount's walkCap" },
   ];
   assert.deepEqual(await data(m, 'ls', { path: 'ref/node_modules', recursive: true }), {
     path: 'ref/node_modules',
@@ -383,7 +384,7 @@ test("a direct listing names a directory it couldn't list", { skip: IS_ROOT ? 'r
       path: 'ref',
       entries: [{ path: 'open/a.ts', size: 2 }],
       count: 1,
-      incomplete: [{ path: 'shut', reason: 'cannot list (EACCES)' }],
+      incomplete: [{ path: 'shut', reason: "cannot list (permission denied) — listing it won't change that; whoever runs this host can change the permissions, and the workspace then reaches it" }],
     });
   } finally {
     chmodSync(join(env.ref, 'shut'), 0o755);
@@ -1741,7 +1742,7 @@ test("a mount nested in a moved direct root is judged by its own include there, 
   const fromStart = await answers(started);
   // A place `work`'s include leaves out is no mount's, so the link leaves
   // `ref`; one it covers is `work`'s.
-  assert.equal(fromStart.outside, `The read did nothing: "ref/l.md" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; if a mount holds that file, name it by its path there.`);
+  assert.equal(fromStart.outside, `The read did nothing: "ref/l.md" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; whoever runs this host can mount it, or a directory that holds it.`);
   assert.match(fromStart.covered, /"ref\/k\.json" leads into mount "work", nested in mount "ref"/);
   assert.equal(fromStart.disk, 'escape');
   assert.deepEqual(await answers(moved), fromStart);
