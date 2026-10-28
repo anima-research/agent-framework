@@ -218,7 +218,7 @@ import { ReasoningLossTeller } from './reasoning-loss.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, coversByOrdinal, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
-import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
+import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -2806,6 +2806,7 @@ interface DerivingContextManager {
     solve?: 'reuse' | 'fresh';
     inherit?: { refusals?: boolean };
     atSequence?: number;
+    viewFilter?: (message: StoredMessage) => boolean;
     debugLogContext?: boolean;
   }): Promise<ContextManager>;
   getDerivation(): ContextDerivationRecord | null;
@@ -10891,10 +10892,11 @@ export class AgentFramework {
             '@animalabs/context-manager cannot reopen (ContextManager.reopenDerived)',
         );
       }
-      // A derived context keeps the view it was derived with, its parent's
-      // (context-manager's derive carries the parent's filter), back to the
-      // agent the chain of shared derivations started from.
-      const viewFilter = this.liveViewFilterOf(this.viewOwnerOf(record));
+      // A derived context sees what the chain of shared derivations it came
+      // from saw, back to the agent it started from, and its own stored
+      // injections at each step (derivedViewFilterOf) — as deriveSharedContext
+      // opened it (#291; Weft's eleventh note).
+      const viewFilter = this.derivedViewFilterOf(record);
       const reopened = await reopen.call(ContextManager, {
         store: this.store,
         derivation,
@@ -11000,6 +11002,29 @@ export class AgentFramework {
     return current;
   }
 
+  /**
+   * The view a context derived by shared inheritance was opened with
+   * (deriveSharedContext): what the agent its chain of derivations started
+   * from sees (liveViewFilterOf), and the stored injections of each agent in
+   * the chain, which carry that agent's name and would otherwise read as
+   * another's. Undefined when the owner's context has no filter.
+   */
+  private derivedViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
+    const owner = this.viewOwnerOf(record);
+    const ownerSees = this.liveViewFilterOf(owner);
+    if (!ownerSees) return undefined;
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (let current = record; current.name !== owner.name && !seen.has(current.name); ) {
+      seen.add(current.name); names.push(current.name);
+      const parent = current.inherit?.mode === 'shared' ? this.registry.inspect(current.inherit.from) : undefined;
+      if (!parent) break;
+      current = parent;
+    }
+    if (names.length === 0) return ownerSees;
+    return (message) => ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name));
+  }
+
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
   private async deriveSharedContext(
     config: AgentConfig,
@@ -11035,6 +11060,22 @@ export class AgentFramework {
     let ownBranch = `dendrite/${config.name}`;
     for (let n = 2; taken.has(ownBranch); n++) ownBranch = `dendrite/${config.name}~${n}`;
 
+    // The fork's view: what its source sees, and its own stored context
+    // injections. context-manager's derive would give it the source's filter
+    // alone, which is tied to the source's name (isAnotherAgentsInjection), so
+    // the fork's own injections were hidden from its compile while its
+    // parent's showed (#291; Weft's eleventh note, on the real compile path).
+    // The composed predicate goes to derive, so the first compile already
+    // reads through it, and is recorded beside the manager (storeSees), so
+    // main's checks of whether an agent sees a row (agentSees: a tool
+    // boundary's injection, an arrival, a reader of an unread message) ask
+    // what its compile shows. A source with no view recorded has no filter
+    // (an isolated run's): it sees every row, so its fork keeps none, and
+    // sees its own.
+    const sourceSees = this.storeSees.get(source);
+    const sees = sourceSees
+      ? (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name)
+      : undefined;
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -11044,14 +11085,10 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
+      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    // context-manager's derive keeps its source's view filter, so the derived
-    // manager holds what its source's view holds; main's checks of whether an
-    // agent sees a row (agentSees: a tool boundary's injection, an arrival,
-    // a reader of an unread message) ask that same predicate.
-    const sourceSees = this.storeSees.get(source);
-    if (sourceSees) this.storeSees.set(contextManager, sourceSees);
+    if (sees) this.storeSees.set(contextManager, sees);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
