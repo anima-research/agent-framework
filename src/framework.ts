@@ -2690,6 +2690,7 @@ interface DerivingContextManager {
     solve?: 'reuse' | 'fresh';
     inherit?: { refusals?: boolean };
     atSequence?: number;
+    viewFilter?: (message: StoredMessage) => boolean;
     debugLogContext?: boolean;
   }): Promise<ContextManager>;
   getDerivation(): ContextDerivationRecord | null;
@@ -11058,6 +11059,22 @@ export class AgentFramework {
     let ownBranch = `dendrite/${config.name}`;
     for (let n = 2; taken.has(ownBranch); n++) ownBranch = `dendrite/${config.name}~${n}`;
 
+    // The fork's view: what its source sees, and its own stored context
+    // injections. context-manager's derive would give it the source's filter
+    // alone, which is tied to the source's name (isAnotherAgentsInjection), so
+    // the fork's own injections were hidden from its compile while its
+    // parent's showed (#291; Weft's eleventh note, on the real compile path).
+    // The composed predicate goes to derive, so the first compile already
+    // reads through it, and is recorded beside the manager (storeSees), so
+    // main's checks of whether an agent sees a row (agentSees: a tool
+    // boundary's injection, an arrival, a reader of an unread message) ask
+    // what its compile shows. A source with no view recorded has no filter
+    // (an isolated run's): it sees every row, so its fork keeps none, and
+    // sees its own.
+    const sourceSees = this.storeSees.get(source);
+    const sees = sourceSees
+      ? (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name)
+      : undefined;
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -11067,30 +11084,10 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
+      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    // context-manager's derive gives the derived manager its source's view
-    // filter and takes no other (DeriveContextOptions has no viewFilter). The
-    // source's leaves out every stored injection but the source's own
-    // (isAnotherAgentsInjection), so a fork's own were hidden from its compile
-    // while its parent's showed (#291; Weft's eleventh note, on the real
-    // compile path). A fork continuing its source's context sees what its
-    // source sees and its own stored injections: that predicate replaces the
-    // derived manager's filter here (its `viewFilter` field, which only the
-    // constructor sets, so a context-manager whose derive takes a filter
-    // would let this go), before the fork has stored anything, and is
-    // recorded beside it (storeSees), so main's checks of whether an agent
-    // sees a row (agentSees: a tool boundary's injection, an arrival, a reader
-    // of an unread message) ask what its compile shows. A source with no view
-    // recorded has no filter (an isolated run's): it sees every row, so its
-    // fork keeps none, and sees its own.
-    const sourceSees = this.storeSees.get(source);
-    if (sourceSees) {
-      const sees = (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name);
-      (contextManager as unknown as { viewFilter?: (message: StoredMessage) => boolean })
-        .viewFilter = (message) => sees(message.metadata);
-      this.storeSees.set(contextManager, sees);
-    }
+    if (sees) this.storeSees.set(contextManager, sees);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
