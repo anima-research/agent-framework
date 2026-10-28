@@ -4,7 +4,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
-import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
@@ -1033,40 +1032,11 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(told.some((text) => text.includes(`A reply by ${first.name} `)), told.join('\n'));
     });
 
-    it('routes a message still queued at stop() to a new fork when the same instance starts again, since stop() unbinds the channel', async () => {
-      // start() after a settled stop() needs a store the host owns: an owned one is closed.
+    it("unbinds the channel of each fork stop() ends", async () => {
+      const fork = await spawnFork();
+      assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' })?.agentName, fork.name, 'the fork holds the channel');
       await framework.stop();
-      const store = JsStore.openOrCreate({ path: join(tempDir, 'host-owned.chronicle') });
-      try {
-        framework = await AgentFramework.create({
-          store,
-          membrane: membrane.asMembrane(),
-          agents: [{ name: 'primary', model: 'test-model', systemPrompt: 'Primary.', proseRouting: 'locus' }],
-          modules: [],
-          conversations: { templateAgent: 'primary' },
-        });
-        await internals(framework).initializeMcpl([]);
-        const fork = await spawnFork();
-        // After stop() the queue refuses new events, so only one already queued can reach the router.
-        framework.pushEvent(dm('incoming-2', 'LEFT QUEUED'));
-        await framework.stop();
-        assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' }), undefined, 'the channel unbinds with its fork');
-
-        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Reply from the next fork.' }]));
-        framework.start();
-        const deadline = Date.now() + 10_000;
-        let next: string | undefined;
-        while (Date.now() < deadline && !(next = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' })?.agentName)) {
-          await new Promise((resolve) => setTimeout(resolve, 20));
-        }
-        assert.ok(next && next !== fork.name, `a new generation binds the channel (bound: ${next})`);
-        await framework.stop();
-        const window = await ContextManager.open({ store, namespace: `conversations/${next}`, isolate: true, strategy: new PassthroughStrategy() });
-        assert.ok(window.getAllMessages().some((m) => JSON.stringify(m.content).includes('LEFT QUEUED')), 'the message lands in its window');
-      } finally {
-        await framework.stop().catch(() => {});
-        store.close();
-      }
+      assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' }), undefined, 'the channel unbinds with its fork');
     });
 
     it('fails a spawn whose fork stop() ends before the spawn binds it, so no binding names the fork, and the channel\'s next message spawns the next generation', async () => {

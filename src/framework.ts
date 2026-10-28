@@ -1654,11 +1654,6 @@ const LIVE_SPEECH_UNRECEIPTED = `Plain speech its rounds routed live was handed 
  *  and this says no retry follows it. */
 const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
 
-/** The reason on the inference:aborted that ends a turn whose start waited to
- *  retry a failed compile across a stop() and a start(): the retry would
- *  revive the earlier lifecycle's turn in the next one. */
-const RETRY_ACROSS_RESTART = 'a retry waiting while the framework was stopped and started again is dropped before it sends anything';
-
 /** The reason on the inference:aborted that ends a turn whose continuation
  *  was dropped before it started, other than by an abandon or a stop. */
 const CONTINUATION_DROPPED = "a turn's continuation was dropped before it started";
@@ -3288,9 +3283,10 @@ export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
   private stopPromise: Promise<void> | null = null;
-  private stopCompleted = false;
+  // Nothing sets it back to 'none': a stop ends its instance (#315).
+  private stopState: 'none' | 'stopping' | 'completed' | 'failed' = 'none';
+  private closedStopFailure: { error: unknown } | undefined;
   private ownedStoreClosed = false;
-  private ownedStoreManagersClosed = false;
   /** Whether the latest stop() got through its teardown with nothing failed:
    * every step and every wait up to and including the one on awareness
    * drains, whatever failed after that, in the storage work that finishes
@@ -3306,8 +3302,8 @@ export class AgentFramework {
    * promise: a stream it cancelled or an event loop still in a call; and a
    * stream whose cancel threw, which stop() doesn't wait for. A later
    * stop() waits for each again, beside what it finds, whatever has happened
-   * since to the entry it was found under (a run's end removes its stream's,
-   * a start() replaces the loop), so neither a budget nor a cancel that
+   * since to the entry it was found under (a run's end removes its stream's),
+   * so neither a budget nor a cancel that
    * threw lets the store close under work still running. Each leaves once it
    * settles. */
   private readonly leftRunning = new Map<Promise<unknown>, { label: string; kind: 'stream' | 'loop' }>();
@@ -3373,8 +3369,6 @@ export class AgentFramework {
   private retryWaitWakers = new Set<() => void>();
   private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   private providerAdmissionClosed = false;
-  /** Invalidates framework turns still assembling when stop begins. */
-  private lifecycleGeneration = 0;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -4703,9 +4697,7 @@ export class AgentFramework {
    * maintenance, event loop and operator operations, so a dump shows what
    * those waits are on, and before its modules and MCPL servers stop, so a
    * stop() whose teardown hangs, fails or times out doesn't keep it listed.
-   * With none in the set, one line says no framework is running. A framework
-   * started again after a completed stop() doesn't rejoin; whether that
-   * lifecycle is supported is #315.
+   * With none in the set, one line says no framework is running.
    *
    * One listener serves the process, installed by the first create() to
    * reach the join and kept: once a process's last SIGUSR2 listener is
@@ -4749,35 +4741,38 @@ export class AgentFramework {
 
   /**
    * Start the event loop. A start() on a running framework does nothing.
-   * Refused, with an error, from a stop() call until that stop() settles,
-   * since that stop would wait on the lifecycle a start() begins, or tear it
-   * down under it. What a start() after a settled stop() should do is #315's
-   * question.
+   * A stop ends its instance (#315): once a stop() is admitted, start() and
+   * addModule() are refused with an error, for good. While that stop() runs,
+   * the error says the framework is stopping. Once it has settled, the error
+   * says what to do: create a new AgentFramework on the store, and after a
+   * failed stop(), call stop() again first, until one resolves. When a
+   * failed stop() left its owned store closed, so that it can't be tried
+   * again, the error carries that failure as its cause.
+   *
+   * A new instance on the store keeps what the store holds. With the
+   * heartbeat on and the same heartbeat state file (heartbeat.statePath, or
+   * its default), it keeps the heartbeat's schedule as it reads it from that
+   * file: a tick or a reminder that fell due meanwhile fires once, shortly
+   * after it starts. What an instance holds only in memory is lost with it,
+   * as on a process restart: an agent's sleep and its wake, a self-wake, the
+   * inference requests still queued (a budget restart, a heartbeat's wake, a
+   * nudge), a re-armed turn's wait and count, and the redo stack. #627 is
+   * about keeping a sleep and a self-wake across a restart. To pause and
+   * resume one framework in place, use quiesce() and resume().
    */
   start(): void {
     // Before the running check: stop() claims its attempt before it clears
     // running, so a start() made in its first steps, such as from a trace
     // listener, is refused too.
-    this.resetCompletedStop('start()');
+    this.refuseOnceStopped('start()');
     if (this.running) {
       return;
     }
 
     this.running = true;
-    this.providerAdmissionClosed = false;
-    // A new lifecycle: a turn compiled before an earlier stop() never drives,
-    // and withheld spills, closed for the generation a stop ended, are open
-    // for this one.
-    this.lifecycleGeneration++;
-    // Its servers' addresses, which an earlier stop() took out of the
-    // reference registry, for its stubs.
     for (const config of this.mcplServerConfigs.values()) {
       referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
     }
-    // A sleep kept through a stop() wakes this lifecycle at its end, or now
-    // if it ended while stopped. Before the loop's first pass, so that a wake
-    // owed now joins the requests already pending in one turn.
-    this.eventGate?.resumeSleep();
     this.heartbeat?.start();
     this.loopPromise = this.runLoop();
 
@@ -4804,11 +4799,14 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. Until it settles, start() and addModule() are
-   * refused. Each step of the teardown runs whatever an earlier one did: one
-   * that throws, such as a host stream's cancel(), fails the stop() once the
-   * rest has run. When a step or a wait up to and including
-   * the wait on awareness drains fails or times out, storage stays open and
+   * Stop the event loop, and with it this framework, for good: once a stop()
+   * is admitted, start() and addModule() are refused, as start() says. A
+   * stop() whose budget is refused, which it rejects with a RangeError, is
+   * not admitted and changes nothing. Each step of the teardown runs
+   * whatever an earlier one did: one that throws, such as a host stream's
+   * cancel(), fails the stop() once the rest has run. When a step or a wait
+   * up to and including the wait on awareness drains fails or times out,
+   * storage stays open and
    * stop() can be called again; one that fails after it, in the storage work
    * that finishes the stop, fails the stop() without keeping storage open.
    * A timed-out wait lets teardown go on while what it waited for may still
@@ -4839,9 +4837,7 @@ export class AgentFramework {
    *   dropped, though a write the stream already had under way can still
    *   land in the run's namespace after them.
    * - an event loop still in a call, such as a module's onProcess, finishes
-   *   that call and the rest of its iteration, and then exits. A start()
-   *   made once that stop() has failed runs its own loop beside that last
-   *   iteration.
+   *   that call and the rest of its iteration, and then exits.
    * - a later stop() waits again, within its own budget, for any stream or
    *   loop this one left running, so the store never closes under it.
    *
@@ -4864,11 +4860,13 @@ export class AgentFramework {
     let settle!: { resolve: () => void; reject: (error: unknown) => void };
     const attempt = new Promise<void>((resolve, reject) => { settle = { resolve, reject }; });
     this.stopPromise = attempt;
-    void attempt.then(() => { this.stopCompleted = true; }, () => {});
-    // Failed cleanup can be retried while its original store is open. A
-    // terminal storage failure after successful close must remain a failure.
-    void attempt.catch(() => {
-      if (!this.ownedStoreClosed && this.stopPromise === attempt) this.stopPromise = null;
+    this.stopState = 'stopping';
+    void attempt.then(() => { this.stopState = 'completed'; }, (error: unknown) => {
+      this.stopState = 'failed';
+      // Failed cleanup can be retried while its original store is open. A
+      // terminal storage failure after successful close must remain a failure.
+      if (this.ownedStoreClosed) this.closedStopFailure = { error };
+      else if (this.stopPromise === attempt) this.stopPromise = null;
     });
     // The body still starts in this call, so its synchronous steps (closing
     // the queue among them) happen before stop() returns.
@@ -4876,22 +4874,28 @@ export class AgentFramework {
     return attempt;
   }
 
-  /** What start() and addModule() pass before either begins work of a
-   * lifecycle. A stop() still running refuses both, from the moment it
-   * claims its attempt until that attempt settles. A failed stop() has
-   * cleared its attempt, unless it closed an owned store, or the context
-   * managers it closes before that store, which are refused first. A
-   * completed stop() is cleared, and the call goes on as before;
-   * whether a lifecycle should begin after a stop() is #315's question. */
-  private resetCompletedStop(verb: 'start()' | 'addModule()'): void {
-    if (this.ownedStoreClosed) throw new Error('Cannot start a new lifecycle: owned store is closed');
-    if (this.ownedStoreManagersClosed) {
-      throw new Error('Cannot start a new lifecycle: stop() closed its context managers, and then failed to close its owned store');
-    }
-    if (this.stopPromise && !this.stopCompleted) throw new Error(`${verb} refused: the framework is stopping`);
-    if (this.stopCompleted) {
-      this.stopPromise = null;
-      this.stopCompleted = false;
+  private refuseOnceStopped(verb: 'start()' | 'addModule()'): void {
+    switch (this.stopState) {
+      case 'none':
+        return;
+      case 'stopping':
+        throw new Error(`${verb} refused: the framework is stopping`);
+      case 'completed':
+        throw new Error(`${verb} refused: this framework has stopped, and a stopped framework doesn't start again. ` +
+          'Create a new AgentFramework on its store to go on, with its storePath if it opened the store itself.');
+      case 'failed': {
+        const closed = this.closedStopFailure;
+        if (closed) {
+          throw new Error(`${verb} refused: this framework's stop() failed and its owned store is closed, so stop() can't be tried again: ` +
+            `it rejects with that same failure, this error's cause: ${shutdownErrorMessage(closed.error)}. ` +
+            "A stopped framework doesn't start again, and a new AgentFramework on its store doesn't finish what that stop() left unfinished.",
+          { cause: closed.error });
+        }
+        throw new Error(`${verb} refused: this framework's stop() failed, and a stopped framework doesn't start again. ` +
+          'A failed stop() may have left its cleanup or final persistence unfinished. ' +
+          "Call stop() again: once a stop() of this one resolves, they're done, and only then should a new " +
+          'AgentFramework use its store, or another instance use anything this one shares.');
+      }
     }
   }
 
@@ -5021,10 +5025,7 @@ export class AgentFramework {
     step(() => this.ackDeferredWrites());
     this.providerAdmissionClosed = true;
     for (const wake of [...this.retryWaitWakers]) step(wake);
-    this.lifecycleGeneration++;
-    // The generation this stop ends; withheld spills close for it alone, so a
-    // start() after this stop has settled reopens them for its own.
-    const stoppingGeneration = this.lifecycleGeneration;
+    this.guardSpillsClosed = false;
     step(() => this.queue.close());
     step(() => this.tuneOutCoordinator?.stop());
 
@@ -5040,9 +5041,8 @@ export class AgentFramework {
     this.toolImageLedgers.clear();
 
     // A turn whose continuation is still on its way ends with the stop, as
-    // a turn's start a stop reaches does: the continuation would start only
-    // after a start(), in a lifecycle where its logical turn is gone
-    // (openLogical, below). Before the holds and the parks go, so the
+    // a turn's start a stop reaches does: the continuation never starts.
+    // Before the holds and the parks go, so the
     // continuation leaves them with its turn. Each drop is a step of its
     // own, so one that throws leaves the next agent's turn to end all the
     // same, as stop()'s other loops do.
@@ -5053,11 +5053,7 @@ export class AgentFramework {
     });
     // A stopped host must never hang behind its own cooldown.
     step(() => this.cancelProviderAdmission());
-    // An open logical turn doesn't survive a stop: a start after a restart
-    // on this instance opens a new one rather than continuing the old turn's
-    // routing (openLogical). A resume still continues its turn, with its
-    // routing state (turnRouting), since it carries that turn's own request
-    // on: beginAgentTurn opens the turn again for it.
+    // An open logical turn doesn't survive a stop.
     this.openLogical.clear();
 
     // Cancel the stream of every agent whose state holds one: streaming,
@@ -5176,7 +5172,7 @@ export class AgentFramework {
     // its idle watchdog. Its end stores its queue, as at any run's end; that
     // stream's late events are dropped once the run has left, and a later
     // stop() waits for the stream itself (leftRunning). (A start() is refused
-    // until this stop() settles, so no new lifecycle begins beside it.)
+    // once a stop() is admitted, so no new lifecycle begins beside it.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
@@ -5207,11 +5203,9 @@ export class AgentFramework {
     // generation and nothing reads the old fork's window again. So each live
     // fork ends here as a closing fork's end disposes it, and its release
     // passes on what it left unread, as any release does. Its channel unbinds
-    // first, as the idle sweep's does: a start() after this stop() would
-    // otherwise route a message still queued for it to a name that's gone. A
-    // fork whose spawn is still waiting for its creation to return has no
-    // binding yet, and its spawn binds nothing once it has ended
-    // (spawnConversationAgent).
+    // first, as the idle sweep's does. A fork whose spawn is still waiting
+    // for its creation to return has no binding yet, and its spawn binds
+    // nothing once it has ended (spawnConversationAgent).
     // Each is a step of its own, and each fork ends whatever its stream or
     // turn is doing, as each run does above: its end settles a tool-result
     // batch its stream still held and removes the stream's entries
@@ -5299,7 +5293,7 @@ export class AgentFramework {
     // workspace: its stub names the audit record. A write that was past its
     // deadline isn't waited for here, but the workspace's own stop waits for
     // the mount turn it holds, bounded only by teardownTimeoutMs.
-    this.guardSpillsClosedFor = stoppingGeneration;
+    this.guardSpillsClosed = true;
 
     // Stop modules and both engines' MCP servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
@@ -5309,7 +5303,7 @@ export class AgentFramework {
     shutdownPromises.push(this.closeModernMcpConnections(teardownTimeoutMs));
     // A stopped framework's servers' addresses leave the reference registry,
     // so no other framework's stub reads them and the registry doesn't keep
-    // this one reachable. start() records them again.
+    // this one reachable.
     step(() => { for (const id of this.mcplServerConfigs.keys()) referenceRegistry.forgetServerAddress(id, this); });
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
@@ -5369,8 +5363,8 @@ export class AgentFramework {
     // No stream is left, unless its wait above ran out or its cancel threw:
     // from the start of stop() none registers and no agent turn starts
     // (providerAdmissionClosed, checked for every agent), and every stream
-    // registered before was cancelled and awaited above. (A start(), which
-    // would reopen admission, is refused until this stop() settles.)
+    // registered before was cancelled and awaited above. (A start() is
+    // refused once a stop() is admitted, so admission stays closed.)
     // What is still deferred (a message held for a turn's end whose flush
     // found the target busy again, or one deferred behind its target's own
     // state) would wait for a flush that may never come. Land each at its
@@ -5455,7 +5449,7 @@ export class AgentFramework {
     }
 
     if (this.ownsStore && teardownSucceeded) {
-      if (this.closeOpenManagers()) this.ownedStoreManagersClosed = true;
+      this.closeOpenManagers();
       try {
         this.store.close();
         this.ownedStoreClosed = true;
@@ -5886,10 +5880,9 @@ export class AgentFramework {
     }
     contextManager.close();
   }
-  private closeOpenManagers(): boolean {
+  private closeOpenManagers(): void {
     const alive = [...this.openManagers].flatMap((ref) => ref.deref() ?? []);
     for (const contextManager of alive) this.closeManager(contextManager);
-    return alive.length > 0;
   }
   /** The framework's membrane, with each complete() call passed through
    *  `admit` along with the model it names. */
@@ -6911,12 +6904,14 @@ export class AgentFramework {
   }
 
   /**
-   * Add a module at runtime. Refused, with a rejection, while a stop() is
-   * still running: a module added then would either be stopped by that stop
-   * or, once the stop has taken its list of modules to stop, stay started
-   * past it.
+   * Add a module at runtime. Refused, with a rejection, once a stop() has
+   * been admitted, before anything else is checked: while that stop() runs,
+   * a module added then would either be stopped by it or, once it has taken
+   * its list of modules to stop, stay started past it; once it has settled,
+   * the framework has stopped for good, as start() says.
    */
   async addModule(module: Module): Promise<void> {
+    this.refuseOnceStopped('addModule()');
     // A server's tool prefix and a module's name share one namespace, as
     // create() checks at startup: a module isn't added under a prefix a
     // server holds, or one a restart is moving its server to.
@@ -6934,7 +6929,6 @@ export class AgentFramework {
         throw new Error(`Module "${module.name}" collides with MCPL server "${id}"'s toolPrefix "${module.name}" (a closed tab)`);
       }
     }
-    this.resetCompletedStop('addModule()');
     await this.moduleRegistry.addModule(module);
     // The workspace judges whether an agent's history holds a message as the
     // framework judges its own notices, for its head-move notice
@@ -7778,15 +7772,11 @@ export class AgentFramework {
   private stallSkips = 0;
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
-  /** The lifecycle generation whose stop() has let the running annotations
-   *  finish: a withheld original is then no longer written to a workspace
-   *  that is stopping, and its stub names the audit record. A start() after
-   *  that stop() has finished has a generation of its own, so the spill gate
-   *  is open again for an instance kept with a store it doesn't own and that
-   *  is still open (start() doesn't restore stopped modules or MCPL
-   *  connections, and refuses an owned store that stop() closed). A start()
-   *  made while a stop() is still running is refused. */
-  private guardSpillsClosedFor: number | null = null;
+  /** Set once a stop() has let the running annotations finish, and cleared
+   *  as each stop() begins: while set, a withheld original is no longer
+   *  written to a workspace that is stopping, and its stub names the audit
+   *  record. */
+  private guardSpillsClosed = false;
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
    *  withheld originals are written to, and the set stop() waits on
@@ -10314,13 +10304,12 @@ export class AgentFramework {
 
   /**
    * A start dropped before its stream sends anything (its agent was replaced,
-   * or stop() closed admission or ended the lifecycle the start began in)
-   * ends the logical turn it was running. stop() ends every open turn
-   * (openLogical), but a fresh start that awaited its batches' assembly
-   * across a stop() reaches its routing after it and opens its turn. That
-   * turn would then stay open, and the agent's first start after a restart
-   * would continue the dropped turn's routing. The identity check leaves any
-   * other turn open.
+   * or stop() closed admission) ends the logical turn it was running. stop()
+   * ends every open turn (openLogical), but a fresh start that awaited its
+   * batches' assembly across a stop() reaches its routing after it and opens
+   * its turn. That turn would then stay open, and the next start of the
+   * agent's name would continue the dropped turn's routing. The identity
+   * check leaves any other turn open.
    */
   private endDroppedTurn(agentName: string, routing: TurnRouting): void {
     if (this.openLogical.get(agentName) === routing) this.openLogical.delete(agentName);
@@ -13826,13 +13815,7 @@ export class AgentFramework {
   }
 
   private async runLoop(): Promise<void> {
-    // A loop ends with its lifecycle. A stop() whose budget ran out while
-    // this loop was in a call (a module's onProcess) returns before the call
-    // does, and a start() after it begins a lifecycle with a loop of its own;
-    // this one finishes its iteration and exits, rather than running beside
-    // that loop for good.
-    const lifecycle = this.lifecycleGeneration;
-    while (this.running && this.lifecycleGeneration === lifecycle) {
+    while (this.running) {
       try {
         await this.processNextEvent();
       } catch (error) {
@@ -20618,9 +20601,8 @@ export class AgentFramework {
    * gets inference:aborted with `reason`, and lastInference records its end
    * as driveStream's would, when the record is still this turn's. Nothing of
    * the kind when another turn of this agent's name holds the turn token (one
-   * begun after a stop and start, or by a replacement agent object): the
-   * event and the record carry only the name, so this frame's would end that
-   * newer turn instead.
+   * begun by a replacement agent object): the event and the record carry only
+   * the name, so this frame's would end that newer turn instead.
    */
   private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number): void {
     const owner = this.activeTurnTokens.get(agentName);
@@ -20809,7 +20791,6 @@ export class AgentFramework {
      *  operator's abandon. */
     checkWindow: CheckWindow,
   ): Promise<boolean> {
-    const lifecycle = this.lifecycleGeneration;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
@@ -20994,7 +20975,7 @@ export class AgentFramework {
     // everything the turn has decided about where its speech goes.
     //  - A resume (a budget restart, a tool-result-guard retry) carries its
     //    turn's request on and keeps the turn's object as it is, and the
-    //    turn stays, or after a stop() becomes again, the agent's open turn.
+    //    turn stays, or becomes again, the agent's open turn.
     //  - A silent start routes no prose. It gets an object of its own, with
     //    no locus, so it neither takes nor disturbs an open turn's. Its
     //    object is the agent's live routing while it runs, and the open
@@ -21019,8 +21000,6 @@ export class AgentFramework {
     let opensTurn = false;
     if (resumesTurn) {
       routing = this.routingOf(agent.name);
-      // The turn a resume continues is open, unless a stop() ended every
-      // open turn since: it opens again, so its later starts continue it.
       if (!trigger?.suppressProse && !this.openLogical.has(agent.name)) this.openLogical.set(agent.name, routing);
     } else if (trigger?.suppressProse) {
       const continued = continuesTurn(trigger) ? this.turnRouting.get(agent.name) : undefined;
@@ -21146,8 +21125,7 @@ export class AgentFramework {
     });
     // A budget restart continues the same logical inference window. The
     // predecessor keeps EventGate liveness until its successor terminates,
-    // and the successor takes it again if it ended in between: at a stop()
-    // (a restart left queued, which a start() then takes up), or at a
+    // and the successor takes it again if it ended in between: at a
     // provider hold that kept the successor from starting (a stated wait at
     // its last admission check, or a cooldown after its own call failed),
     // whose end queues it again.
@@ -21238,13 +21216,11 @@ export class AgentFramework {
       // An ephemeral watchdog may dispose this Agent while hooks/compile await,
       // and stop() may close provider admission. Do not create a provider
       // stream after its generation lost ownership, or once admission closed,
-      // or once a stop() and a start() have begun another lifecycle, as after
-      // the compile: these come before a stop kept for the turn, which goes
-      // with it.
-      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+      // as after the compile: these come before a stop kept for the turn,
+      // which goes with it.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-          : this.providerAdmissionClosed ? 'the framework was stopping'
-            : 'the framework was stopped and started again';
+          : 'the framework was stopping';
         const reason = `a turn assembled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
@@ -21303,18 +21279,16 @@ export class AgentFramework {
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
       // The compile can wait for annotations (each batch has one spill
-      // deadline), so check ownership, admission, and the lifecycle again.
-      // A stop followed by start must not revive this earlier turn.
+      // deadline), so check ownership and admission again.
       // Membrane's yielding stream starts its request when it is first
       // iterated, so cancelling it here, before driveStream, sends nothing.
       // A turn that was mid-compile when stop() cancelled every stream would
       // otherwise register after that pass and outlive stop(). The caller's
       // finally releases the turn token.
       const stopping = this.providerAdmissionClosed;
-      if (this.agents.get(agent.name) !== agent || stopping || lifecycle !== this.lifecycleGeneration) {
+      if (this.agents.get(agent.name) !== agent || stopping) {
         const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-          : stopping ? 'the framework was stopping'
-            : 'the framework was stopped and started again';
+          : 'the framework was stopping';
         const reason = `a turn compiled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.cancelUnsentStream(agent, stream, `compiled while ${why}`);
@@ -21444,14 +21418,12 @@ export class AgentFramework {
       // catch never holds a compiled request.) As at the checks after the
       // hooks and after the compile, a replaced agent or a stopping framework
       // comes first: the turn is dropped as theirs, and the stop goes with
-      // it, and so does a framework stopped and started again, as after the
-      // compile. A failed start with no stop goes on below as before.
+      // it. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
       if (stopAtFailure) {
-        if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+        if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
           const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-            : this.providerAdmissionClosed ? 'the framework was stopping'
-              : 'the framework was stopped and started again';
+            : 'the framework was stopping';
           const reason = `a turn whose request couldn't be built while ${why} is dropped before it sends anything`;
           console.error(`[turn] ${agent.name}: ${reason}`);
           this.endDroppedTurn(agent.name, routing);
@@ -21485,19 +21457,16 @@ export class AgentFramework {
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow, agent);
-        if (this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+        if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
-          // it. A stop() and a start() since this start began cancel it too,
-          // as after the compile: the retry would revive the earlier
-          // lifecycle's turn in the next one, and a stop kept for the turn
-          // goes with it. The turn ends as one dropped before it sends
-          // anything does: a terminal event saying why, after the
-          // inference:failed above, and its record's end. Nothing is written
+          // it, and a stop kept for the turn goes with it. The turn ends as
+          // one dropped before it sends anything does: a terminal event
+          // saying why, after the inference:failed above, and its record's
+          // end. Nothing is written
           // but the [speech-not-posted] notice; this frame still owns its
           // token, since no retry frame replaced it.
           this.nameUnpostedSpeech(agent, routing);
-          this.abortDroppedTurn(agent.name, turnToken,
-            this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_ACROSS_RESTART, turnStartedAt);
+          this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
@@ -25011,7 +24980,7 @@ export class AgentFramework {
     // A batch with no finite deadline (a host whose deadline() threw) gets
     // this write's own, rather than a timer Node would cut to 1 ms.
     if (!Number.isFinite(deadline)) deadline = Date.now() + this.withheldSpillDeadlineMs;
-    if (this.guardSpillsClosedFor === this.lifecycleGeneration) return null;
+    if (this.guardSpillsClosed) return null;
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
     if (this.stalledSpills.size > 0) {
