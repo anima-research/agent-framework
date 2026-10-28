@@ -8,7 +8,9 @@
   host's own, under `<name> (API)`. An `api:message` whose `participant`
   isn't text, which its type doesn't allow, isn't stored, and starts no
   turn. Such a name is stored on one line: each run of line breaks (U+2028
-  and U+2029 included) and other control characters becomes one space. The
+  and U+2029 included) and other control characters becomes one space,
+  and each of the framework's notice openings in it is marked with a
+  backslash, as in the text a participant or a server supplies. The
   generic name `user`, in any capitalization, is stored as given. Where an
   agent's request shows senders' names, the agent sees the marked form,
   beside the form stored before this change in older rows. The `ApiServer`
@@ -18,7 +20,8 @@
   **Who needs to act:**
   - code that tells senders apart by a stored message's participant, such
     as an `ApiServer` client that recognises its own messages in the
-    message list, which now returns them under `<name> (API)`;
+    message list, which now returns them under their name's stored form,
+    `<name> (API)`;
   - a host that pushes an `api:message` in an agent's name to write that
     agent's turn, which now records a user turn, unless that name is one
     the marking can't cover (below);

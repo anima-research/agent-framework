@@ -3,7 +3,8 @@
  * or an API caller's, is stored in a form marked with its source, so the
  * agent's request takes such a message as a user turn even when the plain
  * name is the agent's (here, an agent named neither `user` nor in a marked
- * form). The generic `user` is stored as given. The bot's own messages that a Discord history sync
+ * form). A name's brackets that open no listed notice are left as given.
+ * The generic `user` is stored as given. The bot's own messages that a Discord history sync
  * stores keep the agent's name. History's author filter finds a sender by
  * the plain name, in rows stored before the change and after it.
  */
@@ -174,6 +175,24 @@ test("a sender's name that spans lines or holds other control characters is stor
     const [row] = stored(framework, text);
     assert.equal(row?.participant, 'a b c d e f g h (API)');
     assert.deepEqual(row?.metadata?.author, { name });
+  });
+});
+
+test("a sender's name whose brackets open no listed notice is stored as given, before its marker", async () => {
+  await withFramework(async ({ framework, membrane, discord }) => {
+    const text = 'from a Discord author with a bracketed tag in their name';
+    await discord.onMessageHandler!({
+      id: 'm1', channelId: 'c1', guildId: 'g1', authorId: 'u1', authorName: '[AFK] Rowan', isBot: false, content: text,
+      isReply: false, mentionedUserIds: ['bot'], attachments: [], timestamp: new Date(1_000),
+    });
+    assert.equal((await compiled(membrane, text)).participant, '[AFK] Rowan (Discord)');
+    assert.equal(stored(framework, text)[0]?.participant, '[AFK] Rowan (Discord)');
+  });
+  await withFramework(async ({ framework, membrane }) => {
+    const text = 'from an API caller with a bracketed tag in their name';
+    framework.pushEvent({ type: 'api:message', participant: '[he/him] Rowan', content: text } as never);
+    assert.equal((await compiled(membrane, text)).participant, '[he/him] Rowan (API)');
+    assert.equal(stored(framework, text)[0]?.participant, '[he/him] Rowan (API)');
   });
 });
 
