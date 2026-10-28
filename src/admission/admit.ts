@@ -12,9 +12,10 @@
  *   2. recipients — who is eligible (explicit targets, else the untargeted set)
  *   3. delivery   — a body in the recipients' view, or a hold
  *   4. wake       — may it start a turn
- *   5. locus      — may it count as "the latest delivered inbound" (the legacy
- *                   fallback locus; never under a hold, and only when the
- *                   host runs `speech.locus: 'latest-inbound'`)
+ *   5. locus      — may it count as "the latest delivered inbound" (never
+ *                   under a hold); the channel registry records it under
+ *                   either `speech.locus` setting, and makes it the fallback
+ *                   locus only under `'latest-inbound'`
  *
  * A hold is a policy epoch over a channel (today: tune-out). Residents share
  * one message slot, so a hold applies to the slot: every resident recipient

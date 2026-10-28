@@ -1007,11 +1007,10 @@ interface ChannelRegistryOptions {
    */
   latestInboundLocus?: boolean;
   /**
-   * A channel is being closed by tool: a tuned-out channel's epoch, or an
-   * all-except hold whose exception this is, ends through the cancel flow
-   * (release the backlog, record the end) before the lifecycle state flips
-   * to closed. Without this hook the close would discard the epoch and
-   * strand its held messages (issue #232 gap 9).
+   * A channel is being closed by tool: an all-except hold whose exception
+   * this is ends through the cancel flow (release the backlog, record the
+   * end) before the lifecycle state flips to closed (issue #232 gap 9). A
+   * tool close of a tuned-out channel is refused before this is called.
    */
   onToolClose?: (serverId: string, channelId: string) => void;
   /**

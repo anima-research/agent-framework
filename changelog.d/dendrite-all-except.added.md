@@ -7,7 +7,8 @@
   A per-channel epoch takes precedence; the reader may end the scope;
   exhausting the reader's wake budget pauses reader wakes rather than ending
   the hold (`tune-out:wake-budget-paused`); closing the excepted channel ends
-  it. Listed by `listPolicyEpochs()` as `{ kind: 'all-except', except }`.
+  it. Listed by `listPolicyEpochs()` as a tune-out epoch with
+  `scope: { kind: 'all-except', except }`.
   Entry and release are announced in the excepted channel as one bracketed
   line each under the resident's name (`tuneOut.announce`, default true;
   traced `tune-out:announced` / `tune-out:announce-failed`).

@@ -31365,10 +31365,10 @@ export class AgentFramework {
         },
         shouldTriggerInference: triggerFilter,
         latestInboundLocus: this.speechLocus === 'latest-inbound',
-        // A tool close ends the hold over or around the channel through the
-        // cancel flow (#232 gap 9): a tuned-out channel's epoch into the
-        // closed state; an all-except hold whose exception this is, since
-        // there is nothing left to speak into.
+        // A tool close of the channel an all-except hold excepts ends that
+        // hold through the cancel flow, since there is nothing left to speak
+        // into (#232 gap 9). A tool close of a tuned-out channel is refused
+        // before this hook is called (ChannelRegistry.tunedOutRefusal).
         onToolClose: (serverId, channelId) => {
           const coordinator = this.tuneOutCoordinator;
           if (!coordinator) return;
