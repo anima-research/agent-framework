@@ -2119,8 +2119,8 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
-  // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
-  // armed, though a turn a failed stop() left running can still ask for one.
+  // From dispose() on, no sleep or self-wake timer is armed, though a turn a
+  // failed stop() left running can still ask for one.
   private disposed = false;
 
   // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
@@ -4227,7 +4227,7 @@ export class EventGate {
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
     // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
-    // dispose(), after which only resumeSleep() arms it again.
+    // dispose(), after which nothing arms it.
     this.armSleepWake();
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
@@ -4242,24 +4242,10 @@ export class EventGate {
   }
 
   /**
-   * Arm timers again after dispose(), and the sleep's wake first: dispose()
-   * clears its timer and keeps the sleep. A sleep still ahead wakes the agent
-   * at its end; one that ended since wakes it now, since that wake is what
-   * the agent asked for. With no sleep, wakeFromSleep does nothing. The
-   * framework doesn't call it: a stopped framework doesn't start again
-   * (#315).
-   */
-  resumeSleep(): void {
-    this.disposed = false;
-    if (this.sleepUntil > this.now()) this.armSleepWake();
-    else this.wakeFromSleep('sleep-expired');
-  }
-
-  /**
    * Arm the sleep's wake for its end by the gate's own clock. One timer holds
    * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
    * and wakeFromSleep reads the clock as each one fires. Nothing is armed
-   * while the gate is disposed, until resumeSleep().
+   * once the gate is disposed.
    */
   private armSleepWake(): void {
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
@@ -4368,9 +4354,7 @@ export class EventGate {
    * fires early (Node's can, by a millisecond), or a clock set back.
    */
   private wakeFromSleep(reason: string): void {
-    // The timer that called it has fired; from resumeSleep(), for a sleep
-    // already over, one may still be armed, and it goes, so no stale step of
-    // it can fire later.
+    // The timer that called it has fired.
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     if (this.sleepUntil === 0) return;
     if (this.sleepUntil > this.now()) {
@@ -4634,9 +4618,9 @@ export class EventGate {
     this.selfWakeDue.clear();
     // The sleep stays, with its note and agent, and its timer goes: fired
     // after a stop(), its wake reached a framework that had stopped, and the
-    // timer held the process until the sleep's end. Only resumeSleep() arms
-    // it again; until then nothing arms one, nor a self-wake: a turn a
-    // failed stop() left running can still call sleep or skip_reply.
+    // timer held the process until the sleep's end. Nothing arms one after
+    // this, nor a self-wake: a turn a failed stop() left running can still
+    // call sleep or skip_reply.
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     this.disposed = true;
     this.rateLimitBuckets.clear();
