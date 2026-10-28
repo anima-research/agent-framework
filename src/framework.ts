@@ -3840,6 +3840,9 @@ export class AgentFramework {
   private agentRegistryEndedPath: string | undefined;
   /** The ended log as the recovery file keeps it: the newest records, bounded. */
   private endedRecovery: AgentRecord[] = [];
+  /** The branch-local ended log by name (its newest entry for each), and how far it is indexed (findEndedAgentRecord). */
+  private readonly endedLogIndex = new Map<string, number>();
+  private endedLogIndexed = 0;
   /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
    *  deferredWritesPath). Undefined → branch-local slot fallback. */
   private hostModePath: string | undefined;
@@ -4011,6 +4014,7 @@ export class AgentFramework {
     persist: (snapshot) => this.persistAgentRegistry(snapshot),
     appendEnded: (record) => this.appendEndedAgentRecord(record),
     onRollback: () => this.rewriteAgentRegistryAfterRollback(),
+    findEnded: (name) => this.findEndedAgentRecord(name),
   });
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
@@ -11849,6 +11853,42 @@ export class AgentFramework {
         console.error(`[dendrite] after a registry change failed and was put back in memory, ${what} could not be rewritten to match; the next registry write rewrites it:`, error);
       }
     }
+  }
+
+  /**
+   * An ended record past the registry's memory, from the branch-local ended
+   * log. A scan of the whole log takes tens of milliseconds at a few thousand
+   * ends, and a name nobody used (a tool call's typo) is a miss, so the log is
+   * indexed by name once, at the first lookup, and each later lookup indexes
+   * only what was appended since. A log that shrank, or an entry that no longer carries the
+   * name indexed for it (a branch switch), is indexed again.
+   */
+  private findEndedAgentRecord(name: string): AgentRecord | undefined {
+    const read = (index: number) => this.store.getStateItemJson(AGENT_REGISTRY_ENDED_ID, index) as AgentRecord | null;
+    let length: number;
+    try {
+      length = this.store.getStateLen(AGENT_REGISTRY_ENDED_ID) ?? 0;
+    } catch {
+      return undefined;
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (length < this.endedLogIndexed) {
+        this.endedLogIndex.clear();
+        this.endedLogIndexed = 0;
+      }
+      for (let index = this.endedLogIndexed; index < length; index++) {
+        const record = read(index);
+        if (record?.ended && typeof record.name === 'string') this.endedLogIndex.set(record.name, index);
+      }
+      this.endedLogIndexed = length;
+      const at = this.endedLogIndex.get(name);
+      if (at === undefined) return undefined;
+      const record = read(at);
+      if (record?.name === name && record.ended) return record;
+      this.endedLogIndex.clear();
+      this.endedLogIndexed = 0;
+    }
+    return undefined;
   }
 
   /** The ended log's recovery file, rewritten as the newest records (as many as a restart reads). */

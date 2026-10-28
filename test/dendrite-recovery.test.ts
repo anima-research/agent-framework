@@ -11,6 +11,7 @@
  * - an app-owned store names its recovery files, and is warned without them;
  * - a recovery file that holds null, or a registry without its counters, is
  *   refused rather than read as empty;
+ * - an agent that ended past the registry's memory is still found;
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -213,5 +214,25 @@ describe('the registry\'s recovery', () => {
       await boot(new GateModule(), { store });
     } finally { console.error = error; }
     assert.ok(said.some((line) => line.includes('[dendrite] no storePath / agentRegistryPath / agentRegistryEndedPath')), said.join('\n'));
+  });
+
+  it('an agent that ended past the registry\'s memory is found in the ended log', async () => {
+    const first = await boot();
+    await first.stop();
+    const store = JsStore.openOrCreate({ path: storePath() });
+    try {
+      for (let i = 0; i < 300; i++) {
+        store.appendToStateJson(ENDED, {
+          name: `old-${i}`, kind: 'worker', incarnation: 1, onParentEnd: 'orphan', readsSharedSlot: false,
+          roles: { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false },
+          lifetime: { kind: 'task', idleTimeoutMs: 1000 }, relationships: { observes: [], messagePeers: [] },
+          createdAt: i, ended: { at: i + 1, reason: 'completed' },
+        });
+      }
+      store.sync();
+    } finally { store.close(); }
+    const second = await boot();
+    assert.equal(second.getAgentRecord('old-0')?.ended?.reason, 'completed', 'the oldest is still found');
+    assert.equal(second.getAgentRecord('never-was'), null);
   });
 });

@@ -50,6 +50,12 @@ export interface AgentRegistryOptions {
   onRecordWriteFailed?: (what: string, error: unknown) => void;
   /** Told after a change that failed was put back in memory (a requested change, or a hold): the host rewrites what it wrote alongside to match. */
   onRollback?: () => void;
+  /**
+   * Asked for an ended record no longer in memory (past `endedRetention`):
+   * the host reads its durable ended log, so an agent that ended long ago
+   * can still be inspected, resumed and named.
+   */
+  findEnded?: (name: AgentName) => AgentRecord | undefined;
 }
 
 /** What a restore found that the previous process left unfinished. */
@@ -91,6 +97,7 @@ export class AgentRegistry {
   private readonly endedRetention: number;
   private readonly onRecordWriteFailed: (what: string, error: unknown) => void;
   private readonly onRollback?: () => void;
+  private readonly findEnded?: (name: AgentName) => AgentRecord | undefined;
   /** Above zero while a record of what happened is being written: its writes alert rather than throw. */
   private recordingDepth = 0;
 
@@ -99,6 +106,7 @@ export class AgentRegistry {
     this.persistFn = options.persist;
     this.appendEndedFn = options.appendEnded;
     this.onRollback = options.onRollback;
+    this.findEnded = options.findEnded;
     this.onRecordWriteFailed = options.onRecordWriteFailed
       ?? ((what, error) => console.error(`[dendrite] the registry could not record ${what}; it stays in memory and the next write carries it:`, error));
     this.endedRetention = options.endedRetention ?? DEFAULT_ENDED_RETENTION;
@@ -213,14 +221,14 @@ export class AgentRegistry {
     return this.live.has(name);
   }
 
-  /** The live record, else the most recent ended one with that name. */
+  /** The live record, else the most recent ended one with that name, from memory or the host's ended log. */
   inspect(name: AgentName): AgentRecord | undefined {
     const live = this.live.get(name);
     if (live) return live;
     for (let i = this.ended.length - 1; i >= 0; i--) {
       if (this.ended[i]!.name === name) return this.ended[i];
     }
-    return undefined;
+    return this.findEnded?.(name);
   }
 
   /** Flat list of agents — the discovery surface. Ended ones on request. */
