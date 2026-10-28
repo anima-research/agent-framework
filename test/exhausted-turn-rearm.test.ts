@@ -339,6 +339,16 @@ test('a failure that is not transient is not re-armed: one the provider refuses 
   assert.ok(!stderr.some((line) => line.includes('turn not re-armed')), 'a turn never re-armed promises the operator nothing to take back');
 });
 
+test("a turn that isn't a re-arm is never re-armed on a deadline membrane marks, even when the provider answered its earlier tries with server errors", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 2 ? serverError : () => stalled));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [50] });
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 1, 'the turn to end exhausted on the cut');
+  assert.equal(membrane.sends.length, 3, 'two server errors, then the cut');
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'nothing is kept to be sent again');
+});
+
 test("a re-armed turn's send is not retried, whatever its failure: an overload after a server error gets its one send, then the next delay", async (t) => {
   const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : overloaded));
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 200] });
