@@ -13,9 +13,9 @@
  * results, in the results of calls that changed them, in push events and in
  * notices) and called through `toolsets--act`, which this module only
  * resolves (resolveAct): the framework dispatches the call it resolves to
- * down the same path as a direct call of the server's tool. The module is registered when an MCPL
- * server has tool hints (`toolHints` not false; left out, where the name `toolsets` is free), at
- * startup or at its first runtime connect; its tools never change after that.
+ * down the same path as a direct call of the server's tool. The module is registered at create(),
+ * for every agent (the host's own toolsets use it too), unless a module given to create() holds
+ * the name; its tools never change after that.
  *
  * Its gatherContext publishes the RFC §8.3 reminder, as a stored `afterUser`
  * injection, when an agent's earlier announcements of an open toolset have
@@ -353,7 +353,8 @@ export class ToolsetsModule implements Module {
         if (args.disconnect !== undefined) fail('disconnect goes with server alone');
         return null;
       case 'look': {
-        if (tool && !server) {
+        // A host toolset's tool, with or without its server named (as act takes it).
+        if (tool && !toolset && !instance) {
           const shown = host.lookTool(agentName, tool);
           if (shown) return textResult(shown);
           return null;

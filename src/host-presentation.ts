@@ -145,6 +145,17 @@ export class HostPresentation {
   private unwritable = false;
   /** Reconnects of closed tabs under way, so two opens make one connect. */
   private reconnecting = new Map<string, Promise<void>>();
+  /** Each server's opens and closes, one at a time: a disconnect's guard holds until it's done. */
+  private serverOps = new Map<string, Promise<unknown>>();
+
+  private serially<T>(serverId: string, op: () => Promise<T>): Promise<T> {
+    const before = this.serverOps.get(serverId) ?? Promise.resolve();
+    const run = before.then(op, op);
+    const settled = run.catch(() => undefined);
+    this.serverOps.set(serverId, settled);
+    void settled.then(() => { if (this.serverOps.get(serverId) === settled) this.serverOps.delete(serverId); });
+    return run;
+  }
 
   private save(): void {
     if (!this.statePath || this.unwritable) return;
@@ -366,7 +377,11 @@ export class HostPresentation {
    * are shown and callable through act; with `full`, the server goes back
    * into the tool list (one change of the tool list).
    */
-  async openServer(agentName: string, serverId: string, opts: { full?: boolean } = {}): Promise<string> {
+  openServer(agentName: string, serverId: string, opts: { full?: boolean } = {}): Promise<string> {
+    return this.serially(serverId, () => this.runOpenServer(agentName, serverId, opts));
+  }
+
+  private async runOpenServer(agentName: string, serverId: string, opts: { full?: boolean }): Promise<string> {
     const said: string[] = [];
     if (this.isClosedTab(serverId) || this.reconnecting.has(serverId)) {
       await this.reconnect(serverId);
@@ -415,7 +430,11 @@ export class HostPresentation {
    * another resident agent still uses it. The disconnect comes first: one
    * that fails changes nothing.
    */
-  async closeServer(agentName: string, serverId: string, opts: { disconnect?: boolean } = {}): Promise<string> {
+  closeServer(agentName: string, serverId: string, opts: { disconnect?: boolean } = {}): Promise<string> {
+    return this.serially(serverId, () => this.runCloseServer(agentName, serverId, opts));
+  }
+
+  private async runCloseServer(agentName: string, serverId: string, opts: { disconnect?: boolean }): Promise<string> {
     const was = this.presentation(agentName, serverId);
     const wasOpen = this.isOpen(agentName, tabKey(serverId));
     let disconnected = false;

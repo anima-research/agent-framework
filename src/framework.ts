@@ -4547,7 +4547,13 @@ export class AgentFramework {
       if (framework.toolsetsNameHeldAtStart === null) await framework.ensureToolsetsModule();
       // A server kept as a closed tab (by its configured presentation, or as
       // an agent last left it) isn't connected until an agent opens it.
-      const closed = framework.hostPresentation.startClosed(config.mcplServers);
+      let closed = framework.hostPresentation.startClosed(config.mcplServers);
+      if (framework.toolsetsNameHeldAtStart !== null && closed.size > 0) {
+        // No agent could open a closed tab: the meta-tools aren't the framework's.
+        console.error(`[toolsets] ${[...closed].join(', ')} ${closed.size === 1 ? 'is' : 'are'} connected at startup though kept as a closed tab: ` +
+          `the name "${TOOLSETS_MODULE}" is ${framework.toolsetsNameHeldAtStart}, so no agent could open ${closed.size === 1 ? 'it' : 'them'}`);
+        closed = new Set();
+      }
       for (const serverConfig of config.mcplServers) {
         if (closed.has(serverConfig.id)) framework.closedTabConfigs().set(serverConfig.id, serverConfig);
       }
@@ -6761,6 +6767,12 @@ export class AgentFramework {
     const claimedBy = this.restartClaims().prefixes.get(module.name);
     if (claimedBy) {
       throw new Error(`Module "${module.name}" collides with the toolPrefix "${module.name}" the restart of "${claimedBy.restarting}" holds`);
+    }
+    // A closed tab keeps its prefix for the connect its next open makes.
+    for (const [id, config] of this.closedTabConfigs()) {
+      if ((config.toolPrefix ?? `mcpl--${id}`) === module.name) {
+        throw new Error(`Module "${module.name}" collides with MCPL server "${id}"'s toolPrefix "${module.name}" (a closed tab)`);
+      }
     }
     this.resetCompletedStop('addModule()');
     await this.moduleRegistry.addModule(module);
@@ -24003,7 +24015,7 @@ export class AgentFramework {
       return failure;
     };
     // utils was removed: said whatever the allowlist names (dispatchToolCall).
-    if (call.name === 'utils') return failed({ success: false, isError: true, error: UTILS_REMOVED });
+    if (call.name === 'utils') return failed({ success: false, isError: true, error: this.utilsRemoved(origin.kind === 'agent' ? origin.agentName : call.callerAgentName) });
     if (origin.kind === 'agent') {
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
       if (failure) return failed(failure);
@@ -25893,10 +25905,11 @@ export class AgentFramework {
     // utils was removed; its utilities are in the built-in toolset. Said
     // whatever the allowlist names, so an old call learns where they went.
     if (call.name === 'utils') {
-      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: UTILS_REMOVED });
+      const removed = this.utilsRemoved(agentName);
+      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: removed });
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework',
-        result: this.refusedResult(agentName, call.id, UTILS_REMOVED),
+        result: this.refusedResult(agentName, call.id, removed),
       });
       return;
     }
@@ -29637,7 +29650,8 @@ export class AgentFramework {
    */
   private makeHostPresentation(storePath: string | undefined): HostPresentation {
     return new HostPresentation({
-      available: (agentName) => (this.agents.has(agentName) ? this.availableToolsForPresentation(agentName) : this.getAllTools()),
+      // As the agent is shown them: its description overrides applied.
+      available: (agentName) => (this.agents.has(agentName) ? this.compressionToolsForAgent(agentName) : this.getAllTools()),
       placedInBuiltin: (name) => this.placedInBuiltin(name),
       hidden: (agentName) => {
         if (!this.agents.has(agentName)) return new Set<string>();
@@ -29693,6 +29707,22 @@ export class AgentFramework {
 
   /** Whether an agent has the host's own toolsets: the meta-tools registered, and
    *  usable by it (the subconscious keeps its own small surface). */
+  /**
+   * What a call of the removed `utils` is answered: where utilities went, as
+   * this agent can reach them. One that can't use the built-in toolset is
+   * told to call a utility by its own name and which ones it may call.
+   */
+  private utilsRemoved(agentName: string | undefined): string {
+    if (agentName === undefined || this.hostToolsetsFor(agentName)) return UTILS_REMOVED;
+    const agent = this.agents.get(agentName);
+    const why = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE) instanceof ToolsetsModule
+      ? `its allowedTools doesn't permit ${META_TOOL_NAMES.open} and ${META_TOOL_NAMES.act}`
+      : `this host's module named "${TOOLSETS_MODULE}" isn't the framework's`;
+    const mine = this.getAllTools().filter((t) => this.isModuleUtility(t.name) && (agent?.canUseTool(t.name) ?? true)).map((t) => t.name);
+    return `utils was removed: module utilities are in the host's built-in toolset now, which this agent can't use (${why}). ` +
+      `Call a utility by its own name instead${mine.length ? `; this agent may call ${mine.join(', ')}` : '; this agent may call none'}. Nothing was run.`;
+  }
+
   private hostToolsetsFor(agentName: string): boolean {
     if (agentName === this.subconsciousAgentName) return false;
     const module = this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE);
@@ -30682,8 +30712,12 @@ export class AgentFramework {
     // even one that finishes before the restart's connect begins.
     const claim = this.restartClaims().ids.get(id);
     if (claim) claim.endedBy = `MCP server "${id}" was disconnected, which ends the restart of "${claim.restarting}"`;
-    // A closed tab removed by its operator: there's nothing to connect it again with.
+    // A closed tab removed by its operator: there's nothing to connect it
+    // again with, and what its disconnect kept for that connect (checkpoint
+    // trees, RFC-014 state) goes, as any disconnect removes it.
     if (this.closedTabConfigs().delete(id) && !this.mcplServerConfigs.has(id)) {
+      this.checkpointManager?.removeServer(id);
+      this.toolsetHub?.forget(id);
       this.hostPresentation?.noteRemoved(id);
       return;
     }
@@ -30817,7 +30851,8 @@ export class AgentFramework {
     // A stop(), or a disconnect of the id it moves the server to, that
     // begins after these checks isn't held off: it ends the restart, as it
     // would end a connect.
-    const config = newConfig ?? this.mcplServerConfigs.get(id);
+    // A closed tab restarts from the configuration it's kept with.
+    const config = newConfig ?? this.mcplServerConfigs.get(id) ?? this.closedTabConfigs().get(id);
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
@@ -30860,6 +30895,8 @@ export class AgentFramework {
       await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && this.hintsFor(config) });
       try {
         await this.runConnectMcplServer(config, claim);
+        // Moved to another id: a closed tab under the old one is no more.
+        if (config.id !== id && this.closedTabConfigs().delete(id)) this.hostPresentation?.noteRemoved(id);
       } catch (error) {
         // The old server is gone, whatever ended the connect: a disconnect or
         // a stop() that began during the restart, or the new server's own
@@ -30970,6 +31007,14 @@ export class AgentFramework {
         return prefixesMeetError(config.id, prefix, otherId, other).message;
       }
     }
+    // A closed tab keeps its prefix (and the prefixes it would meet) for the
+    // connect its next open makes.
+    for (const [otherId, other] of this.closedTabConfigs()) {
+      if (otherId === config.id || otherId === leaving || this.mcplServerConfigs.has(otherId)) continue;
+      const otherPrefix = other.toolPrefix ?? `mcpl--${otherId}`;
+      if (otherPrefix === prefix) return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with server "${otherId}" (a closed tab)`;
+      if (prefixesMeet(prefix, otherPrefix)) return prefixesMeetError(config.id, prefix, otherId, otherPrefix).message;
+    }
     for (const [other, holder] of this.restartClaims().prefixes) {
       if (holder !== claim && other !== prefix && prefixesMeet(prefix, other)) {
         return `MCPL server "${config.id}" toolPrefix "${prefix}" meets the toolPrefix "${other}" the restart of ` +
@@ -31003,6 +31048,9 @@ export class AgentFramework {
   listMcplServers(): Array<{
     id: string;
     connected: boolean;
+    /** Kept disconnected as a closed tab (host-presentation.ts) until an
+     *  agent's toolsets--open, an operator's connect or a restart connects it. */
+    closedTab: boolean;
     retrying: boolean;
     /** Which engine serves it: `legacy` (MCP 2024-11-05 + MCPL) or `modern`
      *  (MCP 2026-07-28), as its configuration selects; null when the
@@ -31060,7 +31108,7 @@ export class AgentFramework {
     url?: string;
   }> {
     const result: Array<{
-      id: string; connected: boolean; retrying: boolean;
+      id: string; connected: boolean; closedTab: boolean; retrying: boolean;
       family: 'legacy' | 'modern' | null; protocolVersion: string | null;
       transport: 'stdio' | 'websocket' | 'http' | null; refused: string | null;
       toolPrefix: string; toolCount: number; policyEstablished: boolean | null;
@@ -31075,7 +31123,10 @@ export class AgentFramework {
       };
       command?: string; url?: string;
     }> = [];
-    for (const [id, config] of this.mcplServerConfigs) {
+    // Closed tabs too: configured, kept disconnected until an agent opens one.
+    const configured = [...this.mcplServerConfigs];
+    for (const [id, config] of this.closedTabConfigs()) if (!this.mcplServerConfigs.has(id)) configured.push([id, config]);
+    for (const [id, config] of configured) {
       const prefix = config.toolPrefix ?? `mcpl--${id}`;
       const modern = this.modernServers().get(id) ?? null;
       const connection = modern ? null : this.mcplServerRegistry?.getServer(id) ?? null;
@@ -31098,6 +31149,7 @@ export class AgentFramework {
       result.push({
         id,
         connected,
+        closedTab: this.closedTabConfigs().has(id),
         retrying: !connected && (modern?.willReconnect ?? connection?.willReconnect ?? false),
         family: binding?.family ?? null,
         protocolVersion: modern?.protocolVersion ?? connection?.protocolVersion ?? null,

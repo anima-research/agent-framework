@@ -78,7 +78,8 @@ toolset (see "The host's own toolsets" below), is called through
 `toolsets--act`, and the dispatch check applies to the utility's own name: an
 agent that should use one lists `module--utility` and the `toolsets--` tools.
 An agent that can't use `toolsets--open` and `toolsets--act` gets no host
-toolsets: every tool it may call stays in its tool list.
+toolsets: every tool it may call stays in its tool list, except module
+utilities, which are never in a tool list (it can still call one by name).
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.
@@ -434,12 +435,11 @@ Every MCPL server is offered `experimental.mcpl.toolHints` unless its
 configuration sets `toolHints: false`, and its hints count only if it
 advertised `toolHints` too. A server that doesn't advertise them lists every
 tool as before. With `toolHints: false` on a server, the host advertises and
-reads nothing new for it; with it on every server, the `toolsets` module
-below isn't registered either. A modern (MCP) server never has hints. An MCPL
-server that leaves the setting out has hints only where the name `toolsets` is
-free: if a module or a server's
-`toolPrefix` holds it at startup, those servers have none, and a line says
-so. `toolHints: true` reserves the name, so a prefix that takes it is refused.
+reads nothing new for it. The `toolsets` module below is registered at
+creation in any case, since the host's own toolsets use it. A modern (MCP)
+server never has hints. Only a module given to `create()` can hold the name
+`toolsets`: MCPL servers that leave the setting out then have none, and a line
+says so. A server `toolPrefix` of `toolsets` is refused.
 
 With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
