@@ -868,8 +868,14 @@ describe('a turn whose continuation is dropped ends there', () => {
     }
   });
 
-  it("a start parked behind an auxiliary call whose failure arms a host's hold is held with its turn alive and the gate's window closed, and runs once the hold releases", async () => {
-    const h = await restartTurn({ wait: false, auxiliaryDuringRestart: true, gate: true });
+  it("a start parked behind an auxiliary call whose failure arms a host's hold is held with its turn alive and the gate's window closed, and runs once the hold releases, taking the window again", async () => {
+    let framework: AgentFramework | undefined;
+    let windowAtContinuation: boolean | undefined;
+    const h = await restartTurn({
+      wait: false, auxiliaryDuringRestart: true, gate: true,
+      onStreamMade: (index) => { if (index === 1 && framework) windowAtContinuation = gateInferring(framework); },
+    });
+    framework = h.framework;
     const internal = internals(h.framework);
     const gate = internal.providerGate('prime');
     try {
@@ -886,6 +892,7 @@ describe('a turn whose continuation is dropped ends there', () => {
       assert.equal(gateInferring(h.framework), false, "the gate's window is closed while the hold keeps the turn from starting");
       spent = false;
       await waitFor('the continuation to run once the hold releases', () => h.membrane.calls.length === 2);
+      assert.equal(windowAtContinuation, true, "the continuation's start took the gate's window again");
       await waitFor('the turn to end', () => h.framework.getHostModeStatus().drained);
       assert.deepEqual(h.endLines(), [], 'nothing was dropped');
     } finally {
