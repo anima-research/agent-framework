@@ -11390,12 +11390,13 @@ export class AgentFramework {
 
   /**
    * Give an agent a new parent. Clears its orphan state; a result route
-   * whose recipient is gone follows the new parent, and results it already
-   * produced for the lost recipient are delivered to the new one.
+   * whose recipient is gone follows the new parent, and the mail it already
+   * produced for the lost recipient, results and messages, is delivered to
+   * the new one.
    */
   reparentAgent(name: string, newParent: string, options: { by?: string } = {}): AgentRecord {
     // An orphan that finished before it was adopted: its record stays as it
-    // ended, and the results it held for a recipient that is gone go to the
+    // ended, and the mail it held for a recipient that is gone goes to the
     // new parent.
     if (!this.registry.has(name) && this.registry.inspect(name)?.ended) {
       const ended = this.registry.readdressHeldMail(name, newParent);

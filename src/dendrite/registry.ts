@@ -450,8 +450,9 @@ export class AgentRegistry {
   }
 
   /**
-   * An ended agent's held results find a new recipient: mail it produced for
-   * a recipient that is gone is re-addressed to `newParent` and returned for
+   * An ended agent's held mail finds a new recipient: every item it produced
+   * for a recipient that is gone (a result or a message, as `reparent`
+   * moves for a live agent) is re-addressed to `newParent` and returned for
    * delivery. Its record stays as it ended, since history isn't reparented.
    */
   readdressHeldMail(name: AgentName, newParent: AgentName): { record: AgentRecord; deliverable: HeldMail[] } {
