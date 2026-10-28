@@ -24,6 +24,7 @@
  * which the toolsets module gathers at its next start as a stored
  * `afterUser` injection.
  */
+import { nameToTypeBack, quotedValue } from '../supplied-text.js';
 import { McplRequestError, type McplServerConnection, type HintRead } from './server-connection.js';
 import type { McplServerConfig } from './types.js';
 import { isToolAllowed } from './tool-policy.js';
@@ -73,6 +74,10 @@ export interface ToolsetHostDeps {
    *  where it isn't published. RFC §4.2: until its move applies, a tool
    *  keeps working where it is. */
   published?(serverId: string, tool: string): Presence | undefined;
+  /** The host's own toolsets an agent has open (the built-in one, server
+   *  tabs): each one's marker and reminder, for RFC §8.3 reminders beside the
+   *  servers' toolsets. */
+  hostOpen?(agentName: string): Array<{ marker: string; reminder: () => string; dueWhenAbsent?: boolean }>;
 }
 
 /** One server's RFC-014 state and traffic. Lives as long as the server's
@@ -381,8 +386,8 @@ export class ToolsetController {
    */
   dynamicCallRefusal(tool: string, calledAs: string): string | null {
     if (!this.presence.active || !this.presence.tool(tool) || this.presence.shownAs(tool, 'static')) return null;
-    return `There's no tool "${calledAs}" in your tool list, so nothing ran: ${tool} is a dynamic tool of ${this.serverId}, ` +
-      `called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${tool}", args}. ${this.presence.toolStatus(tool)}.`;
+    return `There's no tool "${calledAs}" in your tool list, so nothing ran: ${nameToTypeBack(tool)} is a dynamic tool of ${this.serverId}, ` +
+      `called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:${quotedValue(tool)}, args}. ${this.presence.toolStatus(tool)}.`;
   }
 
   /**
@@ -621,8 +626,8 @@ export class ToolsetController {
     if (!moved.length) return;
     const cs = emptyChange();
     cs.notes.push(...moved.map(({ name, to }) => to === 'dynamic'
-      ? `${name} left your tool list: it's announced when available, and called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${name}", args}.`
-      : `${name} is in your tool list now, as ${this.deps.listedName(this.serverId, name)}.`));
+      ? `${nameToTypeBack(name)} left your tool list: it's announced when available, and called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:${quotedValue(name)}, args}.`
+      : `${nameToTypeBack(name)} is in your tool list now, as ${nameToTypeBack(this.deps.listedName(this.serverId, name))}.`));
     this.deliver(cs);
   }
 }
@@ -681,8 +686,9 @@ export class ToolsetHub {
    * reminder due.
    */
   observeCompile(agentName: string, messages: readonly unknown[]): void {
+    const host = this.deps.hostOpen?.(agentName) ?? [];
     const open = this.openMarkers();
-    if (open.length === 0) {
+    if (open.length === 0 && host.length === 0) {
       this.seen.delete(agentName);
       this.due.delete(agentName);
       return;
@@ -696,6 +702,9 @@ export class ToolsetHub {
     }
     for (const marker of [...seen]) if (!open.includes(marker)) seen.delete(marker);
     this.seen.set(agentName, seen);
+    // A host toolset open across a restart was never seen here: it's due
+    // whenever a request doesn't carry its marker.
+    for (const h of host) if (h.dueWhenAbsent && !text.includes(h.marker)) missing = true;
     // Due until a request carries every marker the agent has seen again: a
     // gather that doesn't send (a preview) leaves it due for the next start.
     if (missing) this.due.add(agentName);
@@ -705,7 +714,10 @@ export class ToolsetHub {
   /** The reminder due for `agentName`, or null when none is. */
   reminderFor(agentName: string): string | null {
     if (!this.due.has(agentName)) return null;
-    const parts = this.presenting().filter((c) => this.deps.canNotify(c.serverId)).map((c) => c.presence.reminder()).filter((r): r is string => !!r);
+    const parts = [
+      ...(this.deps.hostOpen?.(agentName) ?? []).map((h) => h.reminder()),
+      ...this.presenting().filter((c) => this.deps.canNotify(c.serverId)).map((c) => c.presence.reminder()).filter((r): r is string => !!r),
+    ];
     if (parts.length === 0) return null;
     return `Open toolsets (a reminder: their earlier announcements have left your context):\n${parts.join('\n')}`;
   }

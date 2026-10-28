@@ -20,6 +20,7 @@ import {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
   checkServerConfig,
+  logDroppedLine,
   redactServerText,
   redactedData,
   serverTextRedactor,
@@ -1330,13 +1331,8 @@ export class McplServerConnection extends EventEmitter {
           reject(closedWhileConnecting());
         };
         const onLine = (line: string) => {
-          let msg: JsonRpcResponse;
-          try {
-            msg = JSON.parse(line) as JsonRpcResponse;
-          } catch {
-            return; // Ignore non-JSON lines (e.g. logback output from Java servers)
-          }
-          if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
+          const msg = messageFromLine(config.id, line, transport) as JsonRpcResponse | undefined;
+          if (!msg) return;
           // A request or a notification from the server is never the
           // initialize response, whatever its id: a server's own ids can start
           // at 0, this handshake's. MCP lets a server ping before
@@ -2376,17 +2372,8 @@ export class McplServerConnection extends EventEmitter {
     // passed is the dead process's (afterBoundary).
     const epoch = this.transportEpoch;
     transport.on('line', (line: string) => {
-      let msg: JsonRpcRequest | JsonRpcResponse;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        // Ignore non-JSON lines
-        return;
-      }
-
-      // JSON-RPC messages must be objects. Ignore unrelated stdout/log values
-      // before property access, just as malformed JSON lines are ignored.
-      if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
+      const msg = messageFromLine(this.id, line, transport) as JsonRpcRequest | JsonRpcResponse | undefined;
+      if (!msg) return;
       try {
         this.dispatchMessage(msg, epoch);
       } catch (error) {
@@ -2828,4 +2815,19 @@ export class McplServerConnection extends EventEmitter {
       this.emit('reconnect-failed', { error: this.unreapedFailure(), attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     });
   }
+}
+
+function messageFromLine(serverId: string, line: string, transport: McplTransport): object | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    logDroppedLine(serverId, line, 'unparsed', transport);
+    return undefined;
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    logDroppedLine(serverId, line, 'not-object', transport);
+    return undefined;
+  }
+  return value;
 }

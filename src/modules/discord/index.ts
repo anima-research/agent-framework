@@ -7,6 +7,8 @@
  * - Tools for explicit Discord operations (send, DM, react, etc.)
  */
 
+import { NOTICE_TAG } from '../../notice-tags.js';
+import { markedText, suppliedValue } from '../../supplied-text.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { continuesBody, type StoredMessage } from '@animalabs/context-manager';
 import type {
@@ -120,10 +122,11 @@ const NOT_RUNNING = "Speech handling wasn't changed: the Discord module hasn't s
 /** What the agent reads for a text attachment whose contents couldn't be
  *  fetched: by an error, or by an answer that wasn't OK. */
 function attachmentNotFetched(filename: string): { type: 'text'; text: string } {
-  return {
-    type: 'text',
-    text: `[Attachment: ${filename} couldn't be fetched, so its text isn't in your context. If you need it, ask the sender in the channel to paste it.]`,
-  };
+  return { type: 'text', text: notFetchedText(suppliedValue(filename)) };
+}
+
+function notFetchedText(filename: string): string {
+  return `[${NOTICE_TAG.attachment}: ${filename} couldn't be fetched, so its text isn't in your context. If you need it, ask the sender in the channel to paste it.]`;
 }
 
 /**
@@ -166,7 +169,7 @@ function seconds(n: number): string {
 
 /** What a stored message reads when it has no text of its own and nothing the
  *  host added, so the agent still sees that a message was there. */
-const EMPTY_MESSAGE = '[Empty message]';
+const EMPTY_MESSAGE = `[${NOTICE_TAG.emptyMessage}]`;
 
 /**
  * Metadata on a stored Discord message whose first block is its own text,
@@ -185,6 +188,14 @@ function ownText(content: string): string {
   return content.trim() ? content : '';
 }
 
+function storedOwnText(content: string): string {
+  return markedText(ownText(content));
+}
+
+function holdsOwnText(text: string, own: string): boolean {
+  return text === own || text === markedText(own);
+}
+
 const isEmptyMarker = (block: ContentBlock): boolean => block.type === 'text' && block.text === EMPTY_MESSAGE;
 const isBlankText = (block: ContentBlock): boolean => block.type === 'text' && !block.text.trim();
 
@@ -199,7 +210,7 @@ function textFirst(text: string, after: ContentBlock[] = []): ContentBlock[] {
 /** A text-first row's content with `text` as the message's own text, in
  *  place of its first block, keeping what the host added after it. */
 function withOwnText(content: ContentBlock[], text: string): ContentBlock[] {
-  return textFirst(ownText(text), content.slice(1).filter((block) => !isEmptyMarker(block)));
+  return textFirst(storedOwnText(text), content.slice(1).filter((block) => !isEmptyMarker(block)));
 }
 
 /**
@@ -222,11 +233,11 @@ function contentForText(stored: StoredMessage, discordText: string): ContentBloc
   const text = ownText(discordText);
   const [first, ...rest] = stored.content;
   if (stored.metadata?.[TEXT_FIRST] === true) {
-    if (first?.type === 'text' && first.text === text) return null;
+    if (first?.type === 'text' && holdsOwnText(first.text, text)) return null;
     return withOwnText(stored.content, text);
   }
-  if (!text || (first?.type === 'text' && first.text === discordText)) return null;
-  return [{ type: 'text', text: discordText }, ...(first?.type === 'text' ? rest : stored.content).filter((block) => !isEmptyMarker(block))];
+  if (!text || (first?.type === 'text' && holdsOwnText(first.text, discordText))) return null;
+  return [{ type: 'text', text: markedText(discordText) }, ...(first?.type === 'text' ? rest : stored.content).filter((block) => !isEmptyMarker(block))];
 }
 
 /**
@@ -256,7 +267,7 @@ function needsRebuild(stored: StoredMessage, message: HistoryMessage): boolean {
   const [first, ...rest] = stored.content;
   if (!own && first?.type === 'text' && !isBlankText(first) && !isEmptyMarker(first)) return true;
   const expected = (own ? 1 : 0) + attachments;
-  const counted = own && first?.type === 'text' && first.text === own ? 1 + held(rest) : held(stored.content);
+  const counted = own && first?.type === 'text' && holdsOwnText(first.text, own) ? 1 + held(rest) : held(stored.content);
   return counted !== expected || (expected === 0 && !stored.content.some(isEmptyMarker));
 }
 
@@ -269,14 +280,14 @@ function needsRebuild(stored: StoredMessage, message: HistoryMessage): boolean {
 function holdsOtherText(stored: StoredMessage, message: HistoryMessage): boolean {
   const own = ownText(message.content);
   const [first, ...rest] = stored.content;
-  const others = own && first?.type === 'text' && first.text === own ? rest : stored.content;
+  const others = own && first?.type === 'text' && holdsOwnText(first.text, own) ? rest : stored.content;
   return others.some((block) => block.type === 'text' && !isBlankText(block) && !isEmptyMarker(block));
 }
 
 /** Whether a message's conversion holds, after the message's own text, the
  *  note for an attachment of its whose text wasn't fetched. */
 function holdsNotFetched(content: ContentBlock[], message: HistoryMessage): boolean {
-  const notes = new Set((message.attachments ?? []).map((attachment) => attachmentNotFetched(attachment.filename).text));
+  const notes = new Set((message.attachments ?? []).flatMap((attachment) => [attachmentNotFetched(attachment.filename).text, notFetchedText(attachment.filename)]));
   return content.slice(1).some((block) => block.type === 'text' && notes.has(block.text));
 }
 
@@ -303,9 +314,10 @@ function forGoneAttachment(block: ContentBlock, attachments: readonly DiscordAtt
   if (block.type !== 'text') return false;
   const { text } = block;
   const opening = text.startsWith('\n--- File: ') ? (filename: string) => `\n--- File: ${filename} ---\n`
-    : text.startsWith('[Attachment: ') ? (filename: string) => `[Attachment: ${filename} `
+    : text.startsWith(`[${NOTICE_TAG.attachment}: `) ? (filename: string) => `[${NOTICE_TAG.attachment}: ${filename} `
     : null;
-  return opening !== null && !attachments.some((attachment) => text.startsWith(opening(attachment.filename)));
+  return opening !== null && !attachments.some((attachment) =>
+    text.startsWith(opening(suppliedValue(attachment.filename))) || text.startsWith(opening(attachment.filename)));
 }
 
 /**
@@ -819,7 +831,7 @@ export class DiscordModule implements Module {
 
       // Built from the message and its attachments, or from its text alone
       // when an event carries no blocks; text first, as TEXT_FIRST marks.
-      const contentBlocks = msg.contentBlocks ?? textFirst(ownText(msg.content));
+      const contentBlocks = msg.contentBlocks ?? textFirst(storedOwnText(msg.content));
       this.noteLive(msg.discordMessageId);
 
       // A message a history sync wrote first, stored or held, keeps that row:
@@ -1371,7 +1383,7 @@ export class DiscordModule implements Module {
       if (isTextFile && attachment.size >= TEXT_FILE_LIMIT_BYTES) {
         blocks.push({
           type: 'text',
-          text: `[Attachment: ${attachment.filename} (${attachment.size.toLocaleString('en-US')} bytes): this host reads text files under ${TEXT_FILE_LIMIT_BYTES.toLocaleString('en-US')} bytes into your context, so its text isn't here. If you need it, ask the sender to paste the part that matters.]`,
+          text: `[${NOTICE_TAG.attachment}: ${suppliedValue(attachment.filename)} (${attachment.size.toLocaleString('en-US')} bytes): this host reads text files under ${TEXT_FILE_LIMIT_BYTES.toLocaleString('en-US')} bytes into your context, so its text isn't here. If you need it, ask the sender to paste the part that matters.]`,
         });
         continue;
       }
@@ -1383,7 +1395,7 @@ export class DiscordModule implements Module {
             const textContent = await response.text();
             blocks.push({
               type: 'text',
-              text: `\n--- File: ${attachment.filename} ---\n${textContent}\n--- End of ${attachment.filename} ---\n`,
+              text: `\n--- File: ${suppliedValue(attachment.filename)} ---\n${markedText(textContent)}\n--- End of ${suppliedValue(attachment.filename)} ---\n`,
             });
           } else {
             // An answer whose body is never read holds its connection.
@@ -1401,11 +1413,11 @@ export class DiscordModule implements Module {
       // For unsupported attachments, add a note
       blocks.push({
         type: 'text',
-        text: `[Attachment: ${attachment.filename} (${contentType || 'unknown type'}): this host didn't read its contents in, so they aren't in your context. If you need them, ask the sender for them in a form you can read, such as pasted text.]`,
+        text: `[${NOTICE_TAG.attachment}: ${suppliedValue(attachment.filename)} (${contentType ? suppliedValue(contentType) : 'unknown type'}): this host didn't read its contents in, so they aren't in your context. If you need them, ask the sender for them in a form you can read, such as pasted text.]`,
       });
     }
 
-    return textFirst(ownText(message.content), blocks);
+    return textFirst(storedOwnText(message.content), blocks);
   }
 
   /**
