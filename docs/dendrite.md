@@ -159,7 +159,7 @@ With shared inheritance, neither side can change what the other reads. The paren
 
 Shared inheritance is refused with a clear error when the installed packages cannot provide it. It is never silently replaced by a copy.
 
-The child's writes go to a Chronicle branch of its own (`dendrite/<name>`). That branch outlives the child. The store's branch cursor does not move.
+The child's writes go to a Chronicle branch of its own, which its record names as `inherit.ownBranch`: `dendrite/<name>`, or `dendrite/<name>~2`, `~3` and so on when the store already has a branch by that name, as one an earlier process's child of the same name left. That branch outlives the child. The store's branch cursor does not move.
 
 ### The refusal ledger
 
@@ -225,10 +225,10 @@ Each cadence tick, each coalesced wake and the cancel derive one fork at the res
 ```ts
 deriveAgent({
   name: 'reader/scout/<epoch>/<n>',
-  from: 'scout', kind: 'subconscious-fork', model,
+  from: 'scout', kind: 'subconscious-fork',
   inheritRefusals: true, onParentEnd: 'end',
   resultTo: { to: 'scout', as: 'message' },
-  config: { proseRouting: 'disabled' },
+  config: { model, proseRouting: 'disabled' },
   framing: [/* the notice, the reader's voice block, the dispositions, the held traffic */],
 })
 ```
