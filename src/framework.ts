@@ -5013,6 +5013,13 @@ export class AgentFramework {
     // holding the wait for operator operations below until its handshake's
     // deadline.
     step(() => this.endConnectsInFlight());
+    // Nor does a server lost before or during the stop launch or dial again
+    // on its own: a retry already scheduled starts nothing, and none is
+    // scheduled after.
+    step(() => {
+      for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) connection.stopReconnecting();
+      for (const connection of this.modernServers().values()) connection.stopReconnecting();
+    });
     step(() => this.pushCoalescer?.suspend());
     step(() => this.flushCoalescingSnapshot());
     this.running = false;

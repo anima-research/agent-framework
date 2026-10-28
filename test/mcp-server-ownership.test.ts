@@ -586,7 +586,7 @@ test("stop()'s teardown budget bounds a modern server's close too, and the serve
   });
   let release!: () => void;
   const released = new Promise<void>((resolve) => { release = resolve; });
-  const pending = { close: async () => { await released; } };
+  const pending = { stopReconnecting() {}, close: async () => { await released; } };
   const modernServers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
   modernServers.set('m', pending);
   await assert.rejects(framework.stop(50), (error) =>
