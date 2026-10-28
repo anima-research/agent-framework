@@ -194,10 +194,11 @@ describe('RFC-014 against the reference ToolsetServer, toolHints off (vectors 26
     await srv?.close();
   });
 
-  it('every tool is static there, with the server\'s compat tools, and no meta-tools (36)', () => {
+  it('every tool is static there, with the server\'s compat tools; the meta-tools are the host\'s own (36)', () => {
     const names = fw.framework.getAllTools().map((t) => t.name);
     for (const n of ['scores', 'play', 'resign', 'place', 'toolset_open', 'toolset_close', 'toolset_use']) assert.ok(names.includes(`arcade--${n}`), n);
-    assert.ok(!names.some((n) => n.startsWith('toolsets--')));
+    // Registered for every agent (the host's built-in toolset), not for this server.
+    assert.ok(names.includes('toolsets--open'));
   });
 
   it('two instances: a call without a choice fails naming them; after choosing, each plays (26)', async () => {

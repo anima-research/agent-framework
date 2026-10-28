@@ -4,6 +4,7 @@
  * about a malformed block holds on all three.
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
   AUDIO_NO_DATA_TEXT,
@@ -18,6 +19,7 @@ import {
 } from './references.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
 import type { McplContentBlock } from './types.js';
+import { markNoticeOpenings } from '../supplied-text.js';
 
 /**
  * Convert a single MCPL wire-format content block to a membrane ContentBlock.
@@ -50,7 +52,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // is a claim, one the reference rejects included, as classifyBlock
         // and isInlineContradiction read it: a falsy one such as 0, false
         // or '' stubs too, rather than sending the URI as the image's source.
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -76,7 +78,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // RFC-005 uri-form media with a disposition claim, a falsy one
         // included, as for an image (above): stub, do not hand the URI to
         // the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -95,14 +97,14 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       }
       // RFC-005: reference blocks become bounded stubs — never raw URIs
       // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+      return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
     }
 
     default: {
       // MCP's link to a resource isn't one of MCPL's own blocks, but a server
       // can send one, and RFC-005 §8.1 makes it a reference, shown as one.
       if ((block as { type?: unknown }).type === 'resource_link') {
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
       }
       // Unknown wire block types previously fell off the exhaustive switch
       // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
@@ -111,6 +113,17 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       return { type: 'text', text: unknownBlockText(block) };
     }
   }
+}
+
+export function convertBlocks(blocks: readonly McplContentBlock[], provenance: string, serverId: string): ContentBlock[] {
+  const converted = blocks.map((block) => convertBlock(block, provenance, serverId));
+  return markNoticeOpenings(converted, (index) => sendersText(blocks[index]));
+}
+
+function sendersText(block: McplContentBlock | undefined): boolean {
+  if (block?.type === 'text') return typeof block.text === 'string';
+  const c = classifyBlock(block);
+  return c.kind === 'embedded' && c.contents.kind === 'block' && c.contents.block.type === 'text';
 }
 
 /** A string with something in it: the only data, mimeType or uri a block's

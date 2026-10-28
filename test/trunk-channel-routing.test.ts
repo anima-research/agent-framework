@@ -104,12 +104,12 @@ describe('Trunk channel routing (item-3 redux)', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function makeFramework() {
+  async function makeFramework(proseRouting?: 'explicit') {
     // NO `conversations` — this is connectome-host's single-trunk mode.
     return AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', ...(proseRouting ? { proseRouting } : {}) }],
       modules: [],
     });
   }
@@ -158,7 +158,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
   });
 
   it('adds an actionable invitation when addressed in a closed channel', async () => {
-    const framework = await makeFramework();
+    const framework = await makeFramework('explicit');
     const i = internals(framework);
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
@@ -168,6 +168,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
 
@@ -232,6 +233,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
 
@@ -290,7 +292,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     });
 
     // The registry knows the channel: its round-trip target is used.
-    const framework = await makeFramework();
+    const framework = await makeFramework('explicit');
     const i = internals(framework);
     const asked: string[] = [];
     i.channelRegistry = {
@@ -302,6 +304,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (c: { serverId: string; channelId: string }) => { asked.push(`${c.serverId}/${c.channelId}`); return '@_reim0n'; },
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i.handleMcplPushEvent(dmEvent('m3'));
@@ -313,7 +316,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
 
     // The registry finds no safe token (shared id, whitespace): no prefix is offered at all.
-    const fw2 = await makeFramework();
+    const fw2 = await makeFramework('explicit');
     const i2 = internals(fw2);
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
@@ -324,6 +327,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i2.handleMcplPushEvent(dmEvent('m4'));
@@ -336,7 +340,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await fw2.stop();
 
     // A registry stand-in without proseTargetFor: a whitespace-free guess, never the spaced label.
-    const fw3 = await makeFramework();
+    const fw3 = await makeFramework('explicit');
     const i3 = internals(fw3);
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
@@ -346,6 +350,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i3.handleMcplPushEvent(dmEvent('m5'));
@@ -372,7 +377,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       triggerInference: false,
     });
     for (const target of ['#portables', undefined]) {
-      const framework = await makeFramework();
+      const framework = await makeFramework('explicit');
       const asked: string[] = [];
       internals(framework).channelRegistry = {
         ensureChannelRegistered: () => {},
@@ -384,6 +389,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
         getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
         proseTargetFor: () => target,
         inboundOnlyServer: () => undefined,
+        nameShown: (c: { channelId: string }) => c.channelId,
         stopAll: () => {},
       };
       internals(framework).handleMcplPushEvent(mention(`m-${target ?? 'none'}`));
@@ -414,6 +420,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => '@_reim0n',
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i.handleMcplPushEvent({
@@ -453,6 +460,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => 'Body · ears',
       proseTargetFor: () => '#ears',
       inboundOnlyServer: (channel: { channelId: string }) => (channel.channelId === 'body:ears' ? 'pocket-body' : undefined),
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     i.handleMcplPushEvent({
@@ -485,7 +493,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
   it('the invitation adds a # only where the channel\'s name lacks one, and names an unlabelled channel by its id', async () => {
     // #406's run: slack-mcpl registers "#general (acme)" and its push carries no
     // channelName, so the invitation named the place "##general (acme)".
-    const framework = await makeFramework();
+    const framework = await makeFramework('explicit');
     const i = internals(framework);
     const labels: Record<string, string> = {
       'slack:C1': '#general (acme)',
@@ -501,6 +509,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getDescriptor: (c: { channelId: string }) => ({ label: labels[c.channelId] }),
       getChannelLabel: (_serverId: string, id: string) => labels[id],
       inboundOnlyServer: () => undefined,
+      nameShown: (c: { channelId: string }) => c.channelId,
       stopAll: () => {},
     };
     const textOf = () =>

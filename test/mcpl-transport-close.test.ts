@@ -314,8 +314,7 @@ test("a read error on a child's stderr reaches the transport's 'error' listener 
 test("a read error on a child's stdout that arrives while close() runs is not thrown", { timeout: 10_000 }, async (t) => {
   const transport = await spawnDeafChild(t, 'pipes-closing');
   const child = (transport as unknown as { child: ChildProcess }).child;
-  // destroy() emits the error on the next tick, after close() has closed
-  // readline, which takes readline's own listener off the stream.
+  // destroy() emits the error on the next tick, so it arrives while close() runs.
   child.stdout!.destroy(new Error('injected stdout read failure'));
   const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
   await transport.close();

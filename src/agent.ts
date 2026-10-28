@@ -1,3 +1,4 @@
+import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
@@ -2398,7 +2399,9 @@ export class Agent {
     }
 
     const injectedText = systemInjections.map((block) =>
-      block.type === 'text' ? block.text : `[${block.type} block not shown: the system prompt carries text only.]`);
+      block.type === 'text'
+        ? block.text
+        : `[${NOTICE_TAG.blockNotShown}: ${/^[aeiou]/i.test(block.type) ? 'an' : 'a'} ${block.type} block; the system prompt carries text only.]`);
 
     return this.systemPrompt + '\n' + injectedText.join('\n');
   }

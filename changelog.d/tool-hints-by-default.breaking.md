@@ -9,21 +9,18 @@
   opt-out. A server added any way, including at runtime by a deploy tool
   that doesn't name the setting, gets toolsets.
   - **Migration:** to keep a server's whole tool list as 0.28.0 gave it, set
-    `toolHints: false` on it; on every server, it also keeps 0.28.0's tool
-    list byte for byte.
-  - **Who else notices:** an agent with an MCPL server whose hints aren't off
-    sees the `toolsets` module's four meta-tools (`toolsets--open`, `--act`,
-    `--look`, `--close`), registered at startup or at that server's first
-    runtime connect, and its first request after the update writes its prompt
-    cache in full.
+    `toolHints: false` on it. (The agent's tool list as a whole changes in
+    this release anyway: see the host's own toolsets, below.)
+  - **Who else notices:** the `toolsets` module's four meta-tools
+    (`toolsets--open`, `--act`, `--look`, `--close`) are in every agent's tool
+    list from creation, with or without MCPL, since the host's own toolsets
+    use them too; the first request after the update writes its prompt cache
+    in full.
   - **Unchanged:** a server that doesn't advertise hints lists every tool as
     before. A modern (MCP) server can't negotiate hints, so it has none, and
-    `toolHints: true` on one is still refused. A configuration that loaded on
-    0.28.0 still loads: where the name `toolsets` is held at startup, by a
-    module or by a server's `toolPrefix`, MCPL servers that leave the setting
-    out have no hints, and a line names them; `toolHints: true` reserves the
-    name as before. At runtime, while the meta-tools are registered, a server
-    whose `toolPrefix` is `toolsets` is refused, and so is a host's own
-    `addModule()` of a module named `toolsets`, as both were in 0.28.0 while
-    any server had `toolHints: true`; a host that adds such a module at runtime
-    sets `toolHints: false` on its MCPL servers.
+    `toolHints: true` on one is still refused. Where a module given to
+    `create()` holds the name `toolsets`, MCPL servers that leave the setting
+    out have no hints, and a line names them. A server whose `toolPrefix` is
+    `toolsets` is refused, at startup and at runtime, and so is a host's own
+    `addModule()` of a module named `toolsets`: the name is the framework's
+    from creation.
