@@ -96,6 +96,7 @@ function isolated(): Record<string, string> {
  *  isn't killed with it, and, as with the script's own npm pack, the call
  *  waits on any of that still holding npm's output open. */
 const PACK_LIMIT_MS = 120_000;
+const NEVER_FIRES_IN_A_TEST_MS = 120_000;
 
 /** Packs the package in `dir` into `tarballs`, offline, starting the npm
  *  `path` names as the script does, and returns the tarball's path. */
@@ -474,29 +475,29 @@ test("npm pack or npm install that outlives its limit fails at the limit even wh
   // ended before then would have ended at SIGTERM too, so each case asserts
   // the note, under a limit that leaves the npm room to start on a loaded
   // host. npm pack runs under the install's limit too, so the install's case
-  // leaves the real npm pack room as well.
+  // answers npm pack itself.
   const notes = mkdtempSync(join(tmpdir(), "pack-installs-alone-ready-"));
   made.push(notes);
   const hangOn = (command: string) =>
-    npmShim(
-      `if (args[0] === ${JSON.stringify(command)}) { process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(join(notes, command))}, ""); setTimeout(() => {}, 60_000); }\nelse pass();`,
-    );
-  let start = Date.now();
-  const install = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${hangOn("install")}:`, {
-    PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "10000",
-  });
-  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+    `if (args[0] === ${JSON.stringify(command)}) { process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(join(notes, command))}, ""); setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(join(notes, `${command}-outlived`))}, ""), ${NEVER_FIRES_IN_A_TEST_MS}); }`;
+  const packed = JSON.stringify([
+    { filename: "zz-fixture-1.0.0.tgz", files: [{ path: "package.json" }, { path: "dist/index.js" }, { path: "dist/extra.js" }] },
+  ]);
+  const install = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN,
+    `${npmShim(`${hangOn("install")}\nelse if (args[0] === "pack") process.stdout.write(${JSON.stringify(packed)});\nelse pass();`)}:`, {
+      PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "10000",
+    });
   assert.equal(install.code, 1);
   assert.match(install.stderr, /pack-installs-alone: zz-fixture-1\.0\.0\.tgz didn't install on its own into an empty directory: it didn't finish within 10 s\.\n$/);
   assert.ok(existsSync(join(notes, "install")), "npm install was ignoring SIGTERM when the limit came");
-  start = Date.now();
-  const pack = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${hangOn("pack")}:`, {
+  assert.ok(!existsSync(join(notes, "install-outlived")), "npm install, ignoring SIGTERM, outlived the limit");
+  const pack = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${npmShim(`${hangOn("pack")}\nelse pass();`)}:`, {
     PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "5000",
   });
-  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
   assert.equal(pack.code, 1);
   assert.match(pack.stderr, /pack-installs-alone: npm pack didn't finish within 5 s\.\n$/);
   assert.ok(existsSync(join(notes, "pack")), "npm pack was ignoring SIGTERM when the limit came");
+  assert.ok(!existsSync(join(notes, "pack-outlived")), "npm pack, ignoring SIGTERM, outlived the limit");
 });
 
 test("check() runs the script's npm under the tests' npm limit, short of the runner's own timeout", async () => {
