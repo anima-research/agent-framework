@@ -11959,12 +11959,9 @@ export class AgentFramework {
     };
     const read = (index: number) => this.store.getStateItemJson(AGENT_REGISTRY_ENDED_ID, index) as AgentRecord | null;
     const mark = (record: AgentRecord | null) => (record ? `${record.name}#${record.incarnation}@${record.ended?.at}` : '');
-    let length: number;
-    try {
-      length = this.store.getStateLen(AGENT_REGISTRY_ENDED_ID) ?? 0;
-    } catch {
-      return undefined;
-    }
+    // A store that can't be read fails the lookup rather than answering
+    // "never ended", which would let a namespace check pass.
+    const length = this.store.getStateLen(AGENT_REGISTRY_ENDED_ID) ?? 0;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (length < this.endedLogIndexed
         || (this.endedLogIndexed > 0 && mark(read(this.endedLogIndexed - 1)) !== this.endedLogTail)) {

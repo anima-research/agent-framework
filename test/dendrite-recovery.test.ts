@@ -338,6 +338,24 @@ describe('the registry\'s recovery', () => {
     assert.equal(second.getAgentRecord('never-was'), null);
   });
 
+  it('an ended log that can\'t be read fails the lookup and the namespace check, rather than reading as empty', async () => {
+    const first = await boot();
+    first.start();
+    const live = first.getStore() as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const len = live.getStateLen!.bind(live);
+    Object.defineProperty(live, 'getStateLen', {
+      configurable: true, writable: true,
+      value: (id: string) => { if (id === ENDED) throw new Error('EIO: the ended log'); return len(id); },
+    });
+    try {
+      assert.throws(() => first.getAgentRecord('nobody'), /EIO: the ended log/);
+      await assert.rejects(
+        first.createEphemeralAgent({ name: 'w', model: 'test-model', systemPrompt: 'x' }, workerSpec('w', { namespace: 'jobs/w' })),
+        /EIO: the ended log/,
+      );
+    } finally { delete live.getStateLen; }
+  });
+
   it('the ended log\'s index follows a log that changed under it, as long or shorter', async () => {
     const first = await boot();
     await first.stop();
