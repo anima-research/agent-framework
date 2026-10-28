@@ -872,7 +872,7 @@ import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-pr
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
 import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
+import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import { boundedForLog, describeCause } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
@@ -12075,13 +12075,21 @@ export class AgentFramework {
 
     // A task lifetime's wall-clock deadline: the identity must end, however
     // lively its stream is.
+    // A timer holds at most MAX_TIMER_MS, so a longer deadline waits in
+    // steps, each re-armed until the deadline is due.
     const deadline = new Promise<never>((_, reject) => {
       if (lifetime.kind !== 'task' || lifetime.deadlineMs === undefined) return;
-      deadlineWatchdog = setTimeout(() => {
-        run.endReason = 'deadline';
-        reject(new AgentStoppedError(agent.name, 'deadline', undefined, `${lifetime.deadlineMs}ms elapsed`));
-      }, lifetime.deadlineMs);
-      deadlineWatchdog.unref?.();
+      const deadlineMs = lifetime.deadlineMs;
+      const dueAt = Date.now() + deadlineMs;
+      const arm = (): void => {
+        deadlineWatchdog = setTimeout(() => {
+          if (Date.now() < dueAt) return arm();
+          run.endReason = 'deadline';
+          reject(new AgentStoppedError(agent.name, 'deadline', undefined, `${deadlineMs}ms elapsed`));
+        }, Math.max(0, Math.min(dueAt - Date.now(), MAX_TIMER_MS)));
+        deadlineWatchdog.unref?.();
+      };
+      arm();
     });
     // Whether the completion watchdog ended the run as stalled, for a
     // tool-result batch the run leaves behind (see the finally).

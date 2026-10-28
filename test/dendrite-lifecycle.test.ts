@@ -243,6 +243,24 @@ describe('Dendrite lifecycle', () => {
     assert.equal(framework.getAgent('worker-1'), null);
   });
 
+  it('a task deadline past the longest timer waits it out rather than ending the job at once', async () => {
+    const framework = await boot();
+    framework.start();
+    const deadlineMs = 2 ** 31; // one past the longest wait a timer holds
+    const worker = await startBlocked(
+      framework,
+      'worker-1',
+      'g1',
+      { ...workerSpec('worker-1'), lifetime: { kind: 'task', deadlineMs } },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(framework.getAgentRecord('worker-1')?.ended, undefined, 'the job is still running');
+    framework.stopAgent('worker-1');
+    const result = await worker.settled;
+    assert.equal(framework.getAgentRecord('worker-1')?.ended?.reason, 'stopped');
+    assert.ok(!result.ok);
+  });
+
   it('delivers a result as attributed mail in the child\'s own name and wakes the recipient', async () => {
     const framework = await boot();
     framework.start();
