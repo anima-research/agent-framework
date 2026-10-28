@@ -19052,14 +19052,14 @@ export class AgentFramework {
       const ref = this.channelNamed(c.channelId, c.serverId);
       const key = ref ? destinationKey(ref) : JSON.stringify([c.serverId ?? null, c.channelId]);
       if (named.has(key) || fresh.some((f) => f.key === key)) continue;
-      fresh.push({ key, shown: ref ? this.channelShown(ref) : c.channelId });
+      fresh.push({ key, shown: ref ? this.channelShown(ref) : suppliedValue(c.channelId) });
     }
     if (fresh.length === 0) return undefined;
     const shown = fresh.map((f) => f.shown);
     const list = shown.length === 1 ? shown[0]! : `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]!}`;
     const content: ContentBlock[] = [{
       type: 'text',
-      text: `[routing] This private turn also holds a message from ${list}, and your plain speech won't reach ` +
+      text: `[${NOTICE_TAG.routing}] This private turn also holds a message from ${list}, and your plain speech won't reach ` +
         `${shown.length === 1 ? 'it' : 'them'}. If one needs an answer there, use ${privateTurnReach(agent)}.`,
     }];
     const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
@@ -19081,7 +19081,7 @@ export class AgentFramework {
     const reach = privateTurnReach(agent);
     const content: ContentBlock[] = [{
       type: 'text',
-      text: '[routing] Private input came into this turn: an operator\'s message from a private surface, or what a ' +
+      text: `[${NOTICE_TAG.routing}] Private input came into this turn: an operator's message from a private surface, or what a ` +
         `private turn's work brought back. For the rest of this turn your plain speech goes to no channel. Use ${reach} ` +
         'to reach a channel.',
     }];
@@ -20351,7 +20351,7 @@ export class AgentFramework {
 
   private keepPrivateTurnProse(agent: Agent, text: string): void {
     const notice =
-      `[prose-routing] Your text (${text.length} chars) was kept private — this turn holds private input, so its ` +
+      `[${NOTICE_TAG.proseRouting}] Your text (${text.length} chars) was kept private — this turn holds private input, so its ` +
       `plain speech goes to no channel, and it isn't held as a draft. To publish, use ${privateTurnReach(agent)}.` +
       this.unsentStillNames(agent.name);
     console.error(`[prose] ${agent.name}: ${text.length} chars kept private (private turn)`);
