@@ -81,26 +81,73 @@ test("watchdog aborts a wedged process (action: 'abort' → SIGABRT) and writes 
   }
 });
 
+const HEALTHY_WINDOW_MS = 1_500;
+
 test('watchdog does NOT kill a healthy (heartbeating) process', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wd-ok-'));
   const script = join(dir, 'ok.mjs');
+  const checksPath = join(dir, 'checks.json');
   writeFileSync(
     script,
     `
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
+    import { writeFileSync } from 'node:fs';
+    import { pathToFileURL } from 'node:url';
     import { LivenessWatchdog } from ${JSON.stringify(WATCHDOG)};
+    const workerThreads = createRequire(import.meta.url)('node:worker_threads');
+    const seen = { caught: false, checks: 0, lastCheckMs: null, exited: false };
+    const report = () => writeFileSync(${JSON.stringify(checksPath)}, JSON.stringify(seen));
+    let watchdog;
+    let firstAt;
+    let done;
+    const ended = new Promise((resolve) => { done = resolve; });
+    workerThreads.Worker = class extends workerThreads.Worker {
+      constructor(filename, options) {
+        if (!String(filename).includes('liveness-watchdog-worker')) { super(filename, options); return; }
+        const href = pathToFileURL(String(filename)).href;
+        super([
+          "const { parentPort } = require('node:worker_threads');",
+          'const realSetTimeout = globalThis.setTimeout;',
+          'globalThis.setTimeout = (fn, ms, ...args) => realSetTimeout(() => { const at = Date.now(); fn(...args); parentPort.postMessage(at); }, ms);',
+          'import(' + JSON.stringify(href) + ');',
+        ].join('\\n'), { ...options, eval: true });
+        watchdog = this;
+        seen.caught = true;
+        this.on('message', (at) => {
+          seen.checks++;
+          firstAt ??= at;
+          seen.lastCheckMs = at - firstAt;
+          if (at - firstAt >= ${HEALTHY_WINDOW_MS}) done();
+        });
+        this.once('exit', () => { seen.exited = true; done(); });
+      }
+    };
+    syncBuiltinESMExports();
     const w = new LivenessWatchdog({ enabled: true, thresholdMs: 400, heartbeatMs: 100, action: 'exit' });
     w.start();
-    // stay alive and responsive for ~1.5s, never wedging, then exit cleanly
-    setTimeout(() => { w.stop(); process.exit(0); }, 1500);
+    if (!watchdog) { report(); process.exit(1); }
+    watchdog.ref();
+    await ended;
+    report();
+    process.exit(0);
     `,
   );
   try {
-    const result = await new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+    const { code, signal, gaveUp } = await new Promise<{ code: number | null; signal: string | null; gaveUp: boolean }>((resolve) => {
       const child = spawn(process.execPath, [script], { stdio: 'ignore' });
-      child.on('exit', (code, signal) => resolve({ code, signal }));
+      let gaveUp = false;
+      const giveUp = setTimeout(() => { gaveUp = true; child.kill('SIGKILL'); }, LONGER_THAN_ANY_START_MS);
+      child.on('exit', (code, signal) => { clearTimeout(giveUp); resolve({ code, signal, gaveUp }); });
     });
-    assert.strictEqual(result.signal, null, 'healthy process should not be signalled');
-    assert.strictEqual(result.code, 0, 'healthy process should exit cleanly');
+    assert.ok(!gaveUp, `the healthy child hadn't ended by ${LONGER_THAN_ANY_START_MS} ms, so the test ended it`);
+    assert.strictEqual(signal, null, `healthy process should not be signalled; it got ${signal}`);
+    assert.ok(existsSync(checksPath), `the healthy child ended with code ${code} before it recorded what it saw`);
+    const seen: { caught: boolean; checks: number; lastCheckMs: number | null; exited: boolean } =
+      JSON.parse(readFileSync(checksPath, 'utf8'));
+    assert.ok(seen.caught, "the child saw the watchdog's worker start: it watches for a worker whose file names liveness-watchdog-worker");
+    assert.ok(!seen.exited, `the watchdog's worker exited after ${seen.checks} checks` +
+      (seen.lastCheckMs === null ? '' : `, the last ${seen.lastCheckMs} ms after its first`));
+    assert.strictEqual(code, 0, `healthy process should exit cleanly; it exited ${code}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
