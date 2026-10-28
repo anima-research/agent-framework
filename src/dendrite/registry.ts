@@ -123,9 +123,11 @@ export class AgentRegistry {
    *
    * `resume` admits a new incarnation of an identity that ended: where its
    * context came from is then history, so the context source no longer has
-   * to be live. Who it reports to still does. `after` is the incarnation a
-   * resumption continues from: the new one is past it, since the counter of
-   * a name that aged out of memory isn't kept.
+   * to be live. Who it reports to still does. A spawner that has ended, and
+   * a result route to it, are admitted: the agent registers as that
+   * spawner's orphan, as if it had been live when the spawner ended.
+   * `after` is the incarnation a resumption continues from: the new one is
+   * past it, since the counter of a name that aged out of memory isn't kept.
    */
   register(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
     return this.requested(() => this.registerUnguarded(spec, options));
