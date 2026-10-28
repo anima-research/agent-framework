@@ -400,10 +400,11 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
  * a deferred write, `external` a module's own row for an outside message,
  * `openaiResponsesItems` membrane's mark of an imported Responses
  * history, `contextInjection` an agent's stored context injection
- * (stored-injections.ts), which every other agent's view leaves out, and
+ * (stored-injections.ts), which every other agent's view leaves out,
  * `primaryIfUnread` a module's write for an ephemeral run or a
  * conversation fork, which goes to the primary if its target never read it
- * (passesToPrimary). A
+ * (passesToPrimary), and `dendrite` the stamp of delivered agent mail, whose
+ * `mailId` releases that held mail once the row lands (releaseLandedMail). A
  * server's metadata, a channel message's `metadata` or a
  * push event's `origin`, is stored without them, and the host writes its own
  * after it: MCPL SPEC §16.6 makes metadata the producer's untrusted claims,
@@ -414,7 +415,7 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
  */
 const HOST_METADATA_KEYS = [
   'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView',
-  'deferredWriteId', 'external', 'openaiResponsesItems', STORED_INJECTION_KEY, PRIMARY_IF_UNREAD_KEY,
+  'deferredWriteId', 'external', 'openaiResponsesItems', STORED_INJECTION_KEY, PRIMARY_IF_UNREAD_KEY, 'dendrite',
 ] as const;
 
 /**
