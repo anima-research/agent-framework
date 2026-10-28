@@ -6137,7 +6137,7 @@ export class AgentFramework {
     const delayMs = this.turnRearmMs[done]!;
     const rearm = { number: done + 1, of: this.turnRearmMs.length };
     this.turnRearms.set(agent.name, rearm.number);
-    const request: MarkedRequest = { ...trigger, [REARMED]: true };
+    const request: MarkedRequest = { ...trigger, ...continuesTurns(...callerTurnsOf(trigger), routing?.turnId), [REARMED]: true };
     delete request[TURN_RETRY];
     delete request[MERGED_BATCH];
     if (continuation) {

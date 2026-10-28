@@ -22,8 +22,9 @@
   envelope posts its own body where it names but sets no destination for the
   turn's later speech. What a private turn causes is private too: its budget
   restart, its tool results' re-inference, a ` !` continuation, its
-  auto-continuation (`autoContinue`), a bounce's wake, a rewind's retry, a
-  self-wake it arms with `skip_reply`'s `wake_in_seconds`, a `sleep`'s wake,
+  auto-continuation (`autoContinue`), a bounce's wake, a rewind's retry, its
+  re-send after its retries ran out (`exhaustedTurnRearmMs`), a self-wake it
+  arms with `skip_reply`'s `wake_in_seconds`, a `sleep`'s wake,
   the resident's turn after a tune-out cancel it asked for, and the wakes of a
   script it started (`wake_agent()`, and a script left running reporting its
   end). Each goes by the turn that caused it as that turn stands when its

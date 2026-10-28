@@ -15,6 +15,7 @@ import { AgentFramework, ApiModule, readInboundSource } from '../src/index.js';
 import { isNonChannelSurfaceEvent } from '../src/framework.js';
 import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MembraneError, type StreamEvent, type YieldingStream } from '@animalabs/membrane';
 
 class SurfaceModule implements Module {
   readonly name = 'surface';
@@ -299,12 +300,34 @@ const ref = (channelId: string): Ref => ({ serverId: 'discord', channelId });
 const tuiMessage = (content = 'private question') =>
   ({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true }) as never;
 
+/** A turn's stream that makes one tool call, then fails with a retryable
+ *  server error, as a provider outage ends a turn. */
+class ToolRoundThenServerError implements YieldingStream {
+  isCancelled = false;
+  toolDepth = 0;
+  private waiting = true;
+  private resume?: () => void;
+  get isWaitingForTools() { return this.waiting; }
+  get pendingToolCallIds() { return this.waiting ? ['m1'] : []; }
+  provideToolResults(): void { this.waiting = false; this.toolDepth = 1; this.resume?.(); }
+  cancel(): void { this.isCancelled = true; this.waiting = false; this.resume?.(); }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    const call = { id: 'm1', name: 'robot--move', input: {} };
+    yield { type: 'tool-calls', calls: [call], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '',
+      roundContent: [{ type: 'tool_use', ...call }] } } as StreamEvent;
+    if (this.waiting) await new Promise<void>((resolve) => { this.resume = resolve; });
+    if (this.isCancelled) return;
+    yield { type: 'error', error: new MembraneError({ type: 'server', retryable: true, message: 'server failure', httpStatus: 502, rawError: undefined } as never) } as StreamEvent;
+  }
+}
+
 async function surfaceRig(opts: {
   gate?: unknown; maxStreamTokens?: number; modules?: Module[]; agent?: Record<string, unknown>;
   storeDir?: string;
   quietSources?: string[];
   unstoredSources?: string[];
   codeExecution?: Record<string, unknown>;
+  create?: Record<string, unknown>;
   otherAgents?: string[];
 } = {}) {
   const tempDir = opts.storeDir ?? mkdtempSync(join(tmpdir(), 'surface-edges-test-'));
@@ -329,6 +352,7 @@ async function surfaceRig(opts: {
     modules: [new SurfaceModule(opts.quietSources, opts.unstoredSources), ...(opts.modules ?? [])],
     ...(opts.gate ? { gate: opts.gate } : {}),
     ...(opts.codeExecution ? { codeExecution: { enabled: true, ...opts.codeExecution } } : {}),
+    ...opts.create,
   } as never);
   const routed: Array<{ text: string; locus: string | null }> = [];
   const typing: string[] = [];
@@ -547,6 +571,66 @@ describe('private wins, one way', () => {
         } else {
           assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM, ROOM], `the restart and the wake's own turn each speak in the channel: ${JSON.stringify(rig.routed)}`);
         }
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  for (const how of ['private at a tool boundary by an operator message that wakes nothing', 'private at a tool boundary by an operator message that wakes it',
+    'opened by a private surface', 'a channel turn'] as const) {
+    it(`a turn ${how === 'a channel turn' ? 'of a channel' : how} whose retries run out is sent again ${how === 'a channel turn' ? 'in its channel, as on main' : 'in no channel'}`, async () => {
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => {
+        if (how === 'private at a tool boundary by an operator message that wakes it') framework!.pushEvent(tuiMessage('for your eyes only'));
+        if (how === 'private at a tool boundary by an operator message that wakes nothing') {
+          framework!.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+        }
+      });
+      const rig = await surfaceRig({
+        modules: [tool], quietSources: ['console'],
+        create: { errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) }, exhaustedTurnRearmMs: [50] },
+      });
+      framework = rig.framework;
+      const base = rig.membrane.streamYielding.bind(rig.membrane);
+      let streams = 0;
+      rig.membrane.streamYielding = ((request: never, options: never) => (++streams === 1 ? new ToolRoundThenServerError() : base(request, options))) as never;
+      try {
+        if (how === 'opened by a private surface') rig.framework.pushEvent(tuiMessage()); else rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => streams >= 2 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn, and its re-arm');
+        await rig.framework.runUntilIdle();
+        assert.equal(streams, 2, 'control: the turn failed once, and was sent again once');
+        assert.deepEqual(rig.routed, how === 'a channel turn' ? [{ text: 'reply 1', locus: ROOM }] : [], JSON.stringify(rig.routed));
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  for (const turn of ['private', 'channel'] as const) {
+    it(`a room message that comes while a ${turn} turn waits to be sent again starts it at once, ${turn === 'private' ? 'and gets no reply in the room' : 'and is answered in the room, as on main'}`, async () => {
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => {
+        if (turn === 'private') framework!.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+      });
+      const rig = await surfaceRig({
+        modules: [tool], quietSources: ['console'],
+        create: { errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) }, exhaustedTurnRearmMs: [60_000] },
+      });
+      framework = rig.framework;
+      const held = () => (rig.framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { heldRequests: number } }> })
+        .agents.find((a) => a.name === 'scout')!.providerAdmission.heldRequests;
+      const base = rig.membrane.streamYielding.bind(rig.membrane);
+      let streams = 0;
+      rig.membrane.streamYielding = ((request: never, options: never) => (++streams === 1 ? new ToolRoundThenServerError() : base(request, options))) as never;
+      try {
+        rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => held() === 1, 'the turn to run out of retries, held to be sent again');
+        rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => streams >= 2 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the room message to start the held turn');
+        await rig.framework.runUntilIdle();
+        assert.equal(held(), 0, 'control: the held turn went with the room message, before its own delay');
+        assert.deepEqual(rig.routed, turn === 'channel' ? [{ text: 'reply 1', locus: ROOM }] : [], JSON.stringify(rig.routed));
       } finally {
         await rig.close();
       }
