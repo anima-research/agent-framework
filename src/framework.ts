@@ -20350,6 +20350,7 @@ export class AgentFramework {
           }
           if (this.providerAccelerationCooldowns.has(agent.name)) {
             this.releasePrimaryProviderGate(agent.name);
+            this.eventGate?.onInferenceEnded(agent.name);
             this.pendingRequests.push(trigger ?? {
               agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
             });

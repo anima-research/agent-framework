@@ -803,20 +803,26 @@ test("a start parked behind an auxiliary call whose failure arms a host's hold m
       await waitFor(fw, () => fw.getHostModeStatus().parkedAdmissions === 1, 'the start parked behind the auxiliary call');
       failAuxiliary(rateLimited(undefined));
       await auxiliary;
-      await waitFor(fw, () => fw.getHostModeStatus().gatedRequests === 1 || membrane.primary > 0, 'the parked start held, or its call');
+      const kept = () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0;
+      await waitFor(fw, () => kept() === 1 || membrane.primary > 0, 'the hold to keep the parked start, or its call');
       assert.equal(membrane.primary, 0, 'no turn call while the hold stands');
       assert.equal(fw.getHostModeStatus().parkedAdmissions, 0, 'held as a wake, not parked');
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during', metadata: {} });
+      await waitFor(fw, () => kept() === 2 || membrane.primary > 0, 'the hold to keep a wake that came meanwhile, or a call');
+      assert.equal(membrane.primary, 0, 'still no call');
       spent = false;
       await waitFor(fw, () => membrane.primary === 1, "the turn's call once the hold releases");
       await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold has ended');
       assert.match(texts(membrane.calls[0]!), /zz-parked/);
-      assert.equal(membrane.primary, 1, 'one call, which answers');
+      assert.match(texts(membrane.calls[0]!), /zz-during/);
+      assert.equal(membrane.primary, 1, 'one call for both, which answers');
       assert.equal(fw.getHostModeStatus().gatedRequests, 0);
     } finally { await fw.stop(); log.restore(); }
   });
 });
 
-test("holdRequest's merge rule, pinned in a state no public path reaches (a host's hold an auxiliary call armed, with nothing held, beside a running turn): a duplicate of the turn's wake that the hold keeps is marked when the turn fails into the hold, so the turn stays alive", async () => {
+test("holdRequest's merge rule, pinned in a state no public path reaches (a host's hold an auxiliary call armed, with nothing held, beside a turn whose call is in flight): a duplicate of the turn's wake that the hold keeps is marked when the turn fails into the hold, so the turn stays alive", async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     let open!: () => void;

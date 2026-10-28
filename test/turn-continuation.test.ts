@@ -868,6 +868,31 @@ describe('a turn whose continuation is dropped ends there', () => {
     }
   });
 
+  it("a start parked behind an auxiliary call whose failure arms a host's hold is held with its turn alive and the gate's window closed, and runs once the hold releases", async () => {
+    const h = await restartTurn({ wait: false, auxiliaryDuringRestart: true, gate: true });
+    const internal = internals(h.framework);
+    const gate = internal.providerGate('prime');
+    try {
+      await waitFor('the continuation to park, its frame gone', () => gate.idleWaiters.length > 0 && frameLetGo(h.framework));
+      let spent = true;
+      internal.providerHoldHook = () => (spent ? { holdMs: 1_000, reason: 'the host says wait' } : undefined);
+      internal.holdProviderAcceleration(h.framework.getAgent('prime'), new Error('compression failed'), undefined, true);
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor('the hold to keep the continuation', () =>
+        internal.providerAccelerationCooldowns.get('prime')?.heldRequests.some((r) => r.reason === 'context_budget_restart') ?? false);
+      assert.equal(h.membrane.calls.length, 1, 'no call while the hold stands');
+      assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, ['prime'], 'the held continuation keeps the turn alive');
+      assert.equal(gateInferring(h.framework), false, "the gate's window is closed while the hold keeps the turn from starting");
+      spent = false;
+      await waitFor('the continuation to run once the hold releases', () => h.membrane.calls.length === 2);
+      await waitFor('the turn to end', () => h.framework.getHostModeStatus().drained);
+      assert.deepEqual(h.endLines(), [], 'nothing was dropped');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("abortInference() while a provider wait holds the continuation ends the turn: the continuation is dropped, with one inference:aborted carrying the stop's reason", async () => {
     const h = await restartTurn({ wait: true });
     try {
