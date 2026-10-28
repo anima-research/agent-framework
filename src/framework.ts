@@ -17089,16 +17089,19 @@ export class AgentFramework {
       // The loop's next pass reads the queue again (runLoop's backoff), so
       // the requests go back as a busy agent's do, with no timer of their
       // own. A batch holding any other wake starts now (quietHoldRemaining).
+      // The set is read as surgeryHold is: a prototype-built harness leaves
+      // both slots undefined, which reads as "not held".
       const quietLeft = quietHoldRemaining(requests, now, this.quietPeriod);
       if (quietLeft > 0) {
-        if (!this.quietHeldAgents.has(agentName)) {
-          this.quietHeldAgents.add(agentName);
+        const held = (this.quietHeldAgents ??= new Set());
+        if (!held.has(agentName)) {
+          held.add(agentName);
           console.error(`[quiet-period] agent=${agentName}: holding the turn for a message burst (${requests.length} wake(s) so far)`);
         }
         this.pendingRequests.push(...requests);
         continue;
       }
-      this.quietHeldAgents.delete(agentName);
+      this.quietHeldAgents?.delete(agentName);
 
       // A wake whose sole cause was a write deferred for this agent
       // (readsDeferredWrite), or a message stored for it as it arrived
