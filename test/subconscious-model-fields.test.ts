@@ -91,8 +91,8 @@ describe('the subconscious and the resident\'s model fields', () => {
     }
   });
 
-  it('a subconscious thinkingBinding that isn\'t an object or holds a switch that isn\'t true or false is refused before anything opens', async () => {
-    for (const thinkingBinding of ['yes', { binds: 'true' }]) {
+  it('an enabled subconscious\'s thinkingBinding that isn\'t an object or holds a switch that isn\'t true or false is refused before anything opens, and a disabled one\'s is left unchecked', async () => {
+    for (const thinkingBinding of ['yes', { binds: 'true' }, { binds: true, dropBlock: 'true' }]) {
       const dir = mkdtempSync(join(tmpdir(), 'subconscious-model-fields-'));
       dirs.push(dir);
       await assert.rejects(
@@ -107,6 +107,8 @@ describe('the subconscious and the resident\'s model fields', () => {
       );
       assert.deepEqual(readdirSync(dir), [], JSON.stringify(thinkingBinding));
     }
+    const { framework } = await withSubconscious({}, { enabled: false, thinkingBinding: 'yes' } as unknown as Partial<SubconsciousConfig>);
+    await framework.stop();
   });
 
   it('on another model, it still carries every other field of the resident\'s config that the copy doesn\'t override', async () => {

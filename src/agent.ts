@@ -163,11 +163,6 @@ const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
-/**
- * Refuse a thinking binding that is anything but an object, null or false
- * (holdsSettings), or whose `dropBlock` or `binds` holds anything but true or
- * false (assertBooleanSetting). An agent's and a subconscious's are read alike.
- */
 export function assertThinkingBinding(setting: string, value: AgentConfig['thinkingBinding']): void {
   if (holdsSettings(setting, value, '{ binds: true, dropBlock: true }')) {
     assertBooleanSetting(

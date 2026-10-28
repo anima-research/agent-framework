@@ -13803,7 +13803,7 @@ export class AgentFramework {
     const agentConfig: AgentConfig = {
       ...inherited,
       ...(cfg.physicalWindowTokens != null ? { physicalWindowTokens: cfg.physicalWindowTokens } : {}),
-      ...(holdsSettings('subconscious.thinkingBinding', cfg.thinkingBinding, '{ binds: true }') ? { thinkingBinding: cfg.thinkingBinding } : {}),
+      ...(holdsSettings('subconscious.thinkingBinding', cfg.thinkingBinding, '{ binds: true, dropBlock: true }') ? { thinkingBinding: cfg.thinkingBinding } : {}),
       name,
       model,
       systemPrompt: cfg.systemPrompt,

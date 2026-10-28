@@ -6,5 +6,5 @@
   it otherwise runs without. Left out, nothing changes: on the resident's
   model it inherits the resident's two fields, and on another it has neither.
   `null` counts as left out, and so does `false` for the binding, as in an
-  agent's config. A malformed subconscious binding is refused before
-  anything opens, as an agent's is.
+  agent's config. An enabled subconscious's malformed binding is refused
+  before anything opens, as an agent's is.
