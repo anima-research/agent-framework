@@ -9,6 +9,7 @@ import { fresh, toolRef, type CallSummary, type NamedCall } from './calls.js';
 import type { Ending } from './runner.js';
 import type { ScriptListing, ScriptReturn } from './scripts.js';
 import { renderOutput } from './output.js';
+import { suppliedValue } from '../../supplied-text.js';
 
 /**
  * The most of a script's return value, or of a failure's message or stack,
@@ -67,18 +68,18 @@ function endingLine(id: string, ending: Ending, lifetimeMs: number): string {
       return `Script ${id} finished.`;
     case 'failed':
       // The run keeps the message cut to VALUE_CHARS, with room for the cut's marker.
-      return `Script ${id} failed: ${ending.error.name ? `${ending.error.name}: ` : ''}${ending.error.message}`;
+      return `Script ${id} failed: ${ending.error.name ? `${suppliedValue(ending.error.name)}: ` : ''}${suppliedValue(ending.error.message)}`;
     case 'stopped': {
       const why = ending.reason === 'agent'
         ? `Script ${id} was stopped, as you asked.`
         : ending.why
-          ? `Script ${id} was stopped: ${ending.why}.`
+          ? `Script ${id} was stopped: ${suppliedValue(glimpse(ending.why, 300))}.`
           : `Script ${id} was stopped at its limit of ${formatMs(lifetimeMs)}.`;
       return ending.short ? `${why} Its process didn't stop by itself and was ended, so its output may be short.` : why;
     }
     case 'crashed':
       // The detail is the host's account; what it means for the agent follows.
-      return `Script ${id} crashed: ${ending.detail}. A crash is the script's process failing, not an error its code threw: a fault in the host or its runtime, or something the script's own data asked of the runtime that it couldn't do, such as reading values nested thousands deep, or code nested hundreds deep. Running it again may work; if the same script crashes again, change what it does with its data or its code.`;
+      return `Script ${id} crashed: ${suppliedValue(ending.detail)}. A crash is the script's process failing, not an error its code threw: a fault in the host or its runtime, or something the script's own data asked of the runtime that it couldn't do, such as reading values nested thousands deep, or code nested hundreds deep. Running it again may work; if the same script crashes again, change what it does with its data or its code.`;
   }
 }
 
@@ -208,11 +209,11 @@ function listingState(s: ScriptListing, now: number): string {
     case 'finished':
       return `finished${when}`;
     case 'failed':
-      return `failed${when}: ${e.error.name ? `${e.error.name}: ` : ''}${glimpse(e.error.message, 300)}`;
+      return `failed${when}: ${e.error.name ? `${suppliedValue(e.error.name)}: ` : ''}${suppliedValue(glimpse(e.error.message, 300))}`;
     case 'crashed':
       return `crashed${when}`;
     case 'stopped':
-      return e.reason === 'agent' ? `stopped by you${when}` : e.why ? `stopped${when}: ${e.why}` : `stopped at its limit${when}`;
+      return e.reason === 'agent' ? `stopped by you${when}` : e.why ? `stopped${when}: ${suppliedValue(glimpse(e.why, 300))}` : `stopped at its limit${when}`;
     default:
       return 'ended';
   }

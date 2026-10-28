@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { bounded, formatMs, glimpse, renderList, renderReturn, VALUE_CHARS } from '../src/code-execution/isolate/render.js';
 import type { CallSummary } from '../src/code-execution/isolate/calls.js';
-import type { ScriptReturn } from '../src/code-execution/isolate/scripts.js';
+import type { ScriptListing, ScriptReturn } from '../src/code-execution/isolate/scripts.js';
 import { renderOutput } from '../src/code-execution/isolate/output.js';
 
 const noCalls: CallSummary = { made: 0, answered: 0, failed: 0, refused: 0, unsent: 0, running: 0, waiting: 0, named: [], more: {} };
@@ -65,14 +65,14 @@ test('a crash says what it means for the agent, and a failure gives its stack af
   // The ending's stack is the script's frames alone (GuestError.stack): they follow the ending's line.
   const failed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'TypeError', message: 'boom', stack: '    at anonymous (script:2:1)' } } }), options);
   assert.match(failed, /^Script s1-test failed: TypeError: boom\n    at anonymous \(script:2:1\)\nIt made no tool calls\./);
-  // A message of several lines is given once, by the ending's line.
+  // A message of several lines is given once, on the ending's one line.
   const multi = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Error', message: 'first\nsecond', stack: '    at f (script:3:5)' } } }), options);
   assert.equal(multi.split('second').length - 1, 1, multi);
-  assert.match(multi, /^Script s1-test failed: Error: first\nsecond\n    at f \(script:3:5\)\n/);
-  // A message line that reads like a frame is the message's, given once.
+  assert.match(multi, /^Script s1-test failed: Error: first second\n    at f \(script:3:5\)\n/);
+  // A message line that reads like a frame is the message's, given once, and stays on the ending's line.
   const framed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Error', message: 'first\n    at note', stack: '    at f (script:3:5)' } } }), options);
   assert.equal(framed.split('at note').length - 1, 1, framed);
-  assert.match(framed, /^Script s1-test failed: Error: first\n    at note\n    at f \(script:3:5\)\n/);
+  assert.match(framed, /^Script s1-test failed: Error: first {5}at note\n    at f \(script:3:5\)\n/);
   // No frames, no stack: the ending's line alone.
   const bare = renderReturn(ret({ ending: { how: 'failed', error: { name: 'InternalError', message: 'out of memory' } } }), options);
   assert.match(bare, /^Script s1-test failed: InternalError: out of memory\nIt made no tool calls\./);
@@ -131,6 +131,29 @@ test('durations at their sites are said exactly: a yield, a lifetime', () => {
   assert.match(running, /is still running after 1\.5 s\./);
   const limit = renderReturn(ret({ ending: { how: 'stopped', reason: 'limit' } }), { boundMs: 30_000, lifetimeMs: 1_500 });
   assert.match(limit, /was stopped at its limit of 1\.5 s\./);
+});
+
+test("a script's ending reads on one line in a wait's and a list's result, a stop's reason cut as a failure's message is", () => {
+  const LINE_BREAK = /[\r\n\u000b\u000c\u0085\u2028\u2029]/;
+  const why = `its turn ended before the script returned (rate\nlimited ${'x'.repeat(400)})`;
+  const stopped = renderReturn(ret({ ending: { how: 'stopped', reason: 'limit', why } }), options);
+  const stoppedLine = stopped.split('\n').find((line) => line.includes('was stopped:'))!;
+  assert.ok(stoppedLine.startsWith('Script s1-test was stopped: its turn ended before the script returned (rate limited xxx'), stoppedLine);
+  assert.ok(stoppedLine.endsWith('….'), stoppedLine);
+  const failed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } } }), options);
+  assert.match(failed, /^Script s1-test failed: Bad Name: broke here$/m);
+  const crashed = renderReturn(ret({ ending: { how: 'crashed', detail: 'its process exited before the script ended: first\nsecond' } }), options);
+  assert.match(crashed, /^Script s1-test crashed: its process exited before the script ended: first second\. A crash/m);
+  const listing = (ending: ScriptListing['ending']): string =>
+    renderList([{ scriptId: 's1-test', running: false, startedAt: 0, endedAt: 0, ending, wakes: 0 }], 60_000);
+  for (const text of [
+    listing({ how: 'stopped', reason: 'limit', why }),
+    listing({ how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } }),
+  ]) {
+    assert.ok(!text.split('\n').some((line) => line.includes('ago:') && LINE_BREAK.test(line)), text);
+  }
+  assert.match(listing({ how: 'stopped', reason: 'limit', why }), /stopped 1 min ago: its turn ended before the script returned \(rate limited x+…/);
+  assert.match(listing({ how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } }), /failed 1 min ago: Bad Name: broke here/);
 });
 
 test('calls waiting their turn in the host are among those a yield counts', () => {

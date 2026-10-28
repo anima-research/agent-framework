@@ -385,6 +385,26 @@ test('a left script that crashes wakes its agent', { timeout: 60_000 }, async ()
   await scripts.dispose();
 });
 
+test("a left script's ending notice gives its error's name and message, and a crash's account, on one line", { timeout: 60_000 }, async () => {
+  const { scripts, wakes, release } = setup();
+  await scripts.run('alice', `await tools.slow({}); const e = new Error('broke\\nhere'); e.name = 'Bad\\u2028Name'; throw e;`);
+  await release();
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && wakes.length === 0;) await new Promise((res) => setTimeout(res, 10));
+  assert.equal(wakes.length, 1);
+  assert.ok(!/[\r\n\u2028]/.test(wakes[0]![1]), JSON.stringify(wakes[0]![1]));
+  assert.match(wakes[0]![1], /Your script failed: Bad Name: broke here\./);
+  await scripts.dispose();
+
+  let woke!: (text: string) => void;
+  const wake = new Promise<string>((resolve) => (woke = resolve));
+  const crashing = setup({ host: { wake: async (_agent, _scriptId, text) => woke(text) } });
+  await crashing.scripts.run('alice', `await tools.echo({}); __crash('first line\\nsecond line');`, 0);
+  const text = await wake;
+  assert.ok(!/[\r\n]/.test(text), JSON.stringify(text));
+  assert.match(text, /Your script crashed: .*first line second line/);
+  await crashing.scripts.dispose();
+});
+
 test('a left script that reaches its limit wakes its agent', { timeout: 60_000 }, async () => {
   let woke!: (text: string) => void;
   const wake = new Promise<string>((resolve) => (woke = resolve));

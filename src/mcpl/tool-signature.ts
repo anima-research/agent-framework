@@ -153,9 +153,13 @@ export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { descr
     const d = toolDigest(t);
     const describe = opts.describeAll || !shown.has(d);
     shown.add(d);
-    const sentence = describe ? firstSentence(t.description) : '';
-    return `${indent}${signature(t)}${sentence ? ` — ${suppliedValue(sentence)}` : ''}`;
+    return toolLine(t, describe, indent);
   });
+}
+
+export function toolLine(tool: HintedTool, describe = true, indent = '  '): string {
+  const sentence = describe ? firstSentence(tool.description) : '';
+  return `${indent}${signature(tool)}${sentence ? ` — ${suppliedValue(sentence)}` : ''}`;
 }
 
 /** A server's value as JSON, or a note where it's nested too deeply, or too long, to show. */

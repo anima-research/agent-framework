@@ -1,0 +1,3 @@
+- The workspace wake notice writes a changed or conflicting path that doesn't show as itself as one line of JSON, which parses back to the path. A path that shows as itself is written as before.
+- A script's ending gives a failure's name and message, and a crash's detail, on one line, with any of the framework's openings in them marked, in the notice sent when a script the agent left running ends and in the code-execution tool's own results. Those results do the same with a stop's reason and cut it to 300 characters, as the script list already cut a failure's message.
+- The built-in toolset's and a tab's tool listings give each tool's first sentence as a toolset's listing does: on one line, with any of the framework's openings marked.
