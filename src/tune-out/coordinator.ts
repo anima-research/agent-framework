@@ -1714,6 +1714,18 @@ export class TuneOutCoordinator {
       + `first wake past its wake budget, and its backlog goes to ${backlogTo} then.`;
   }
 
+  /**
+   * The reader ended, not the framework: its turns stop (cadence and
+   * coalescing wakes), and every hold keeps its end time, which releases it
+   * to the resident with no reader.
+   */
+  stopReader(): void {
+    for (const timer of this.cadenceTimers.values()) clearTimeout(timer);
+    this.cadenceTimers.clear();
+    for (const { timer } of this.pendingWakes.values()) clearTimeout(timer);
+    this.pendingWakes.clear();
+  }
+
   /** Stop all timers (framework shutdown). */
   stop(): void {
     for (const timer of this.cadenceTimers.values()) clearTimeout(timer);

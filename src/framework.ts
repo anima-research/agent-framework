@@ -11662,7 +11662,7 @@ export class AgentFramework {
     this.exhaustedTurns.delete(name);
     this.endStatedWaitRun(name);
     if (name === this.subconsciousAgentName) {
-      this.tuneOutCoordinator?.stop();
+      this.tuneOutCoordinator?.stopReader();
       this.subconsciousAgentName = null;
     }
   }
