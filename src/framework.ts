@@ -1147,8 +1147,8 @@ function resumesLogicalTurn(reason: string | undefined): boolean {
  */
 const TURN_RETRY: unique symbol = Symbol('turn-retry');
 /**
- * The batch a start that carries a turn on (continuesTurn) was merged from,
- * when the scheduler merged wakes that aren't the turn's into it: every
+ * The batch a start was merged from, when the scheduler merged more than
+ * one request into it and any of them isn't the turn's: every
  * request it took in, as each was. Until the start takes its turn token it
  * stands for them all. A scheduler pass that takes it back puts the batch in
  * its place, each request with its own identity and flags; a quiesce at the
@@ -2115,7 +2115,7 @@ export interface HostModeStatus {
    * gate while quiesced, or, while serving, until the scheduler's next pass
    * takes them), in a scheduler pass's hands, or held by a provider hold (an
    * acceleration or host hold, or a provider's stated wait). There, a start
-   * that carries a turn on counts as the wakes merged into it. A start parked
+   * merged from several requests counts as those it took in. A start parked
    * on provider admission behind an auxiliary call counts once in
    * `parkedAdmissions` instead, however many wakes are merged into it.
    * Continuations of a turn (budget restart, tool results) and a held turn's
@@ -2370,9 +2370,10 @@ interface ProviderAccelerationCooldown {
   /** Armed by an auxiliary (compression) failure with no primary involved:
    *  release reopens auxiliary admission without synthesising an inference. */
   auxiliaryOrigin?: boolean;
-  /** Its held requests were taken out by dropContinuations: release reopens
-   *  admission without synthesising an inference in their place. */
-  emptiedByDrop?: boolean;
+  /** Its held requests were all taken out, by dropContinuations ('drop') or
+   *  by a withdrawal of their coalescing subject ('withdrawal'): release
+   *  reopens admission without synthesising an inference in their place. */
+  emptiedBy?: 'drop' | 'withdrawal';
   rearm?: { number: number; of: number };
   /** Set when this hold is a provider wait (a stated retry-after) for the
    *  agent's primary model: it holds primary turns only. Auxiliary calls are
@@ -6025,7 +6026,7 @@ export class AgentFramework {
       // length: an operator release of it returns the hold to AF's own pacing.
       ...(pacing?.stated ? { statedWait: { model: agent.model, ownUntil: now + pacing.ownMs } } : {}),
       ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}),
-      ...(existing?.emptiedByDrop && held.length === 0 ? { emptiedByDrop: true } : {}) });
+      ...(existing?.emptiedBy && held.length === 0 ? { emptiedBy: existing.emptiedBy } : {}) });
     if (auxiliary && !existing) {
       console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
         `holding primary/auxiliary for ${delayMs}ms`);
@@ -6184,12 +6185,15 @@ export class AgentFramework {
           ? `no longer holds primary turns: the primary model is now ${model} (the wait stays recorded)`
           : `primary hold ended after ${Date.now() - cooldown.startedAt}ms`));
     }
-    if ((cooldown.auxiliaryOrigin || cooldown.emptiedByDrop) && cooldown.heldRequests.length === 0) {
+    if ((cooldown.auxiliaryOrigin || cooldown.emptiedBy) && cooldown.heldRequests.length === 0) {
       // Nobody asked for an inference while parked, or what was held was a
-      // continuation since dropped with its turn: just reopen the gate. A
-      // primary the hold left pending won't run, so its recovery ends.
-      console.error(`[provider-cooldown] agent=${agentName} ${cooldown.auxiliaryOrigin ? 'auxiliary hold' : 'hold, its held continuation dropped,'} released after ${Date.now() - cooldown.startedAt}ms`);
-      if (cooldown.emptiedByDrop) this.endPendingPrimary(agentName);
+      // continuation since dropped with its turn, or wakes since withdrawn:
+      // just reopen the gate. A primary the hold left pending won't run, so
+      // its recovery ends.
+      const which = cooldown.auxiliaryOrigin ? 'auxiliary hold'
+        : cooldown.emptiedBy === 'drop' ? 'hold, its held continuation dropped,' : 'hold, its held wakes withdrawn,';
+      console.error(`[provider-cooldown] agent=${agentName} ${which} released after ${Date.now() - cooldown.startedAt}ms`);
+      if (cooldown.emptiedBy) this.endPendingPrimary(agentName);
       this.flushAuxiliaryAdmission(agentName);
       return;
     }
@@ -16396,9 +16400,11 @@ export class AgentFramework {
   private cancelCoalescedWakes(subject: string): void {
     this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      const held = cooldown.heldRequests.length;
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
+      if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedBy = 'withdrawal';
     }
-    // A wake of the subject's merged into a start that carries a turn on
+    // A wake of the subject's merged into a start
     // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
     // it back and no pass unpacks it.
     const unrecord = (r: InferenceRequest): void => {
@@ -16861,7 +16867,7 @@ export class AgentFramework {
         if (recovery) recovery.releasedAt = now;
         requests = [...providerCooldown.heldRequests, ...requests];
       }
-      // A start that carries a turn on and came back before it took its
+      // A start that came back before it took its
       // token stands for the batch it was merged from (MERGED_BATCH),
       // including one a hold released just now. The batch takes its place,
       // each request as it was, judged one by one from here: a wait holds
@@ -16869,7 +16875,17 @@ export class AgentFramework {
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
+        const emptied = requests.filter((r) => mergedBatch(r)?.length === 0);
         requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
+        if (requests.length === 0) {
+          const subjects = [...new Set(emptied.filter((r) => r.coalescingBatch).flatMap((r) => r.coalescingBatchSubjects ?? []))];
+          if (subjects.length > 0) {
+            console.error(`[coalescing] ${agentName}: its deferred batches were withdrawn while its wake waited; turn not started (no wake cause left)`);
+            this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName, subjects });
+          }
+          this.endPendingPrimary(agentName);
+          continue;
+        }
       }
 
       // A provider's stated wait on this agent's primary model, including one
@@ -17255,10 +17271,10 @@ export class AgentFramework {
       else delete start[TURN_CARRY];
       if (requests.every(isRearmed)) start[REARMED] = true;
       else delete start[REARMED];
-      // A start that carries a turn on and took in wakes that don't records
-      // the batch it was merged from (MERGED_BATCH): until it takes its
-      // token it stands for them all.
-      if (continuesTurn(start) && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
+      // A start merged from more than one request, any of them not the
+      // turn's, records the batch it was merged from (MERGED_BATCH): until
+      // it takes its token it stands for them all.
+      if (requests.length > 1 && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
       await this.startAgentStream(agent, start);
     }
@@ -20505,7 +20521,7 @@ export class AgentFramework {
     if (hold) {
       const held = hold.heldRequests.length;
       hold.heldRequests = take(hold.heldRequests);
-      if (held > 0 && hold.heldRequests.length === 0) hold.emptiedByDrop = true;
+      if (held > 0 && hold.heldRequests.length === 0) hold.emptiedBy = 'drop';
     }
     for (const parked of [...this.parkedContinuations]) {
       if (!isContinuation(parked)) continue;
