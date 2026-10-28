@@ -260,19 +260,31 @@ export interface AgentSettingsExtension {
 /**
  * Context provided to modules for interacting with the framework.
  *
- * Once the module's `stop()` has settled, through `removeModule()` or the
- * framework's `stop()`, its context has no effect on the framework: each
- * push is dropped with a log line, as a push after the framework's `stop()`
- * is; `setState`, `registerLogState` and the log-state writes,
- * `editMessage`, `removeMessage`, `notifyOps` and the speech-handler calls
- * do nothing; `addMessage` returns `''` and adds nothing; `callTool`
- * resolves with an error result and runs nothing; `getModule` returns
- * `null`; `onTrace` subscribes nothing, and the subscriptions made through
- * it end; and `findMessageByExternalId` answers without updating its
- * mapping. None of these throws. Apart from pushes, the first such call of
- * each method logs one line naming the module and the method. Reads are
- * unchanged. A module whose `stop()` fails stays registered, and its context
- * keeps working.
+ * Once the module's `stop()` has completed, through `removeModule()` or the
+ * framework's `stop()`, its context has no effect on the framework:
+ * - each push is dropped with a log line, as a push after the framework's
+ *   `stop()` is;
+ * - `setState`, `registerLogState`, `appendToLog`, `editLogItem`,
+ *   `editMessage`, `removeMessage`, `notifyOps`, `registerSpeechHandler` and
+ *   `unregisterSpeechHandler` do nothing; `addMessage` returns `''` and adds
+ *   nothing; `callTool` resolves with an error result and runs nothing;
+ *   `getModule` returns `null`; and `onTrace` subscribes nothing, while the
+ *   subscriptions made through the context end. None of these throws, and
+ *   the first such call of each method logs one line naming the module and
+ *   the method;
+ * - `findMessageByExternalId` answers without updating its mapping, and logs
+ *   nothing.
+ *
+ * Its reads (`getState`, `getLog`, `getLogLength`, `getMessage`,
+ * `queryMessages`, `getAgents`, `getActiveTools`, `findMessageByExternalId`)
+ * answer, and fail, as before; one that meets a held write may record that
+ * the write has landed, as any reader's does. The framework calls neither
+ * the module's `onProcess` nor its `onAgentSpeech` again, and drops whole a
+ * response of its that hadn't been applied by then, with a line naming what
+ * the response asked for. A module whose `stop()` fails stays registered,
+ * and its context keeps working.
+ * References the module already holds, to other modules or to its own
+ * timers, aren't the context's, and stay as they are.
  */
 export interface ModuleContext {
   /**

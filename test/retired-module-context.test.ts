@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import { AgentFramework, ShutdownTimeoutError, type Module, type ModuleContext, type ProcessEvent, type ToolCall } from '../src/index.js';
+import { AgentFramework, ModuleRegistry, ShutdownTimeoutError, type EventResponse, type Module, type ModuleContext, type ProcessEvent, type ToolCall } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t }];
@@ -20,7 +20,15 @@ interface Probe {
   calls: string[];
 }
 
-function probe(name: string, opts: { onStart?: (ctx: ModuleContext) => void; stop?: () => Promise<void>; tool?: boolean } = {}): Probe {
+interface ProbeOptions {
+  onStart?: (ctx: ModuleContext) => void;
+  stop?: () => Promise<void>;
+  tool?: boolean;
+  answer?: (event: ProcessEvent) => EventResponse | Promise<EventResponse>;
+  speak?: () => Promise<void>;
+}
+
+function probe(name: string, opts: ProbeOptions = {}): Probe {
   let ctx: ModuleContext | undefined;
   const seen: string[] = [];
   const spoke: string[] = [];
@@ -29,8 +37,8 @@ function probe(name: string, opts: { onStart?: (ctx: ModuleContext) => void; sto
     name,
     async start(given) { ctx = given; opts.onStart?.(given); },
     stop: opts.stop ?? (async () => {}),
-    async onProcess(event) { seen.push(said(event)); return {}; },
-    async onAgentSpeech(agentName) { spoke.push(agentName); },
+    async onProcess(event) { seen.push(said(event)); return (await opts.answer?.(event)) ?? {}; },
+    async onAgentSpeech(agentName) { spoke.push(agentName); await opts.speak?.(); },
     getTools: () => (opts.tool ? [{ name: 'echo', description: 'Answers.', inputSchema: { type: 'object', properties: {} } }] : []),
     async handleToolCall(call: ToolCall) { calls.push(call.id); return { success: true, data: 'echoed' }; },
   };
@@ -72,6 +80,17 @@ async function retiredLines<T>(run: () => T | Promise<T>, pattern = /has stopped
   }
 }
 
+const refusal = (module: string, method: string): string =>
+  `[framework] module "${module}" has stopped, so its ${method}() call had no effect; later ${method}() calls from it aren't logged`;
+
+function gate(): { open: () => void; opened: Promise<void>; entered: Promise<void>; enter: () => void } {
+  let open!: () => void;
+  let enter!: () => void;
+  const opened = new Promise<void>((resolve) => { open = resolve; });
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  return { open, opened, entered, enter };
+}
+
 async function waitFor(description: string, predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -92,14 +111,14 @@ test("a removed module's pushes, through pushEvent() and its queue handle, reach
     const namesake = probe('gone');
     await framework.addModule(namesake.module);
     const old = gone.ctx();
-    const result = (callId: string): ProcessEvent => ({
-      type: 'tool-result', callId, toolName: 'fetch', agentName: 'assistant', moduleName: 'gone', result: { success: true },
+    const result = (callId: string, moduleName: string): ProcessEvent => ({
+      type: 'tool-result', callId, toolName: 'fetch', agentName: 'assistant', moduleName, result: { success: true },
     }) as ProcessEvent;
     const { lines } = await retiredLines(() => {
       old.pushEvent(external('late-1'));
       old.queue.push(external('late-2'));
-      old.pushEvent(result('c1'));
-      old.queue.push(result('c2'));
+      old.pushEvent(result('c1', 'gone'));
+      old.queue.push(result('c2', 'provider'));
     }, /arrived after/);
     framework.pushEvent(external('marker'));
     await waitFor('the marker pushed after them', () => stays.seen.includes('external-message:marker') && namesake.seen.includes('external-message:marker'));
@@ -108,8 +127,8 @@ test("a removed module's pushes, through pushEvent() and its queue handle, reach
     assert.deepEqual(lines, [
       "[framework] a 'external-message' event from module gone arrived after that module stopped — dropped",
       "[framework] a 'external-message' event from module gone arrived after that module stopped — dropped",
-      '[framework] assistant: result of tool call c1 (fetch, gone) arrived after its module stopped — dropped; the tool succeeded',
-      '[framework] assistant: result of tool call c2 (fetch, gone) arrived after its module stopped — dropped; the tool succeeded',
+      '[framework] assistant: result of tool call c1 (fetch, gone) arrived after module gone stopped — dropped; the tool succeeded',
+      '[framework] assistant: result of tool call c2 (fetch, provider) arrived after module gone stopped — dropped; the tool succeeded',
     ]);
   });
 });
@@ -140,7 +159,7 @@ test("a removed module's state and log-state writes change nothing a later modul
     assert.deepEqual(namesake.ctx().getLog('events'), logBefore);
     assert.deepEqual(old.getState(), stateBefore, 'its own state still reads');
     assert.deepEqual(old.getLog('events'), [{ n: 1 }], 'its own log still reads');
-    assert.deepEqual(lines.map((line) => line.match(/its (\S+)\(\) call/)?.[1]), ['setState', 'registerLogState', 'appendToLog', 'editLogItem']);
+    assert.deepEqual(lines, ['setState', 'registerLogState', 'appendToLog', 'editLogItem'].map((method) => refusal('gone', method)));
   });
 });
 
@@ -163,7 +182,7 @@ test("a removed module's addMessage() answers '' and adds nothing, its editMessa
     assert.deepEqual(old.getMessage(kept)?.content, text('kept'));
     assert.deepEqual(old.queryMessages({ source: 'probe' }).messages.map((m) => m.id), [kept]);
     assert.equal(old.findMessageByExternalId('probe', 'k1'), kept);
-    assert.deepEqual(lines.map((line) => line.match(/its (\S+)\(\) call/)?.[1]), ['addMessage', 'editMessage', 'removeMessage']);
+    assert.deepEqual(lines, ['addMessage', 'editMessage', 'removeMessage'].map((method) => refusal('gone', method)));
   });
 });
 
@@ -182,7 +201,7 @@ test("a removed module's callTool() resolves with an error result and runs no to
     assert.match(String(value.result.error), /module "gone" has stopped, so its call of stays--echo wasn't made/);
     assert.deepEqual(stays.calls, []);
     assert.equal(value.found, null);
-    assert.deepEqual(lines.map((line) => line.match(/its (\S+)\(\) call/)?.[1]), ['callTool', 'getModule']);
+    assert.deepEqual(lines, ['callTool', 'getModule'].map((method) => refusal('gone', method)));
   });
 });
 
@@ -205,26 +224,26 @@ test("a removed module's trace subscriptions end, one it asks for afterwards get
     assert.equal(fromStart, atRemoval, 'the subscription from start() ended at the removal');
     assert.equal(later, 0);
     assert.ok(!alerts.includes('late-alert'), alerts.join(', '));
-    assert.deepEqual(lines.map((line) => line.match(/its (\S+)\(\) call/)?.[1]), ['notifyOps', 'onTrace']);
+    assert.deepEqual(lines, ['notifyOps', 'onTrace'].map((method) => refusal('gone', method)));
   });
 });
 
 test("a removed module's speech-handler calls neither add a handler nor remove a later module's of its name", async () => {
-  const gone = probe('gone', { onStart: (ctx) => ctx.registerSpeechHandler('*') });
+  const gone = probe('gone', { onStart: (ctx) => ctx.registerSpeechHandler(['assistant']) });
   await withFramework([gone.module], async (framework) => {
     await framework.removeModule('gone');
-    const namesake = probe('gone', { onStart: (ctx) => ctx.registerSpeechHandler('*') });
+    const namesake = probe('gone', { onStart: (ctx) => ctx.registerSpeechHandler(['assistant']) });
     await framework.addModule(namesake.module);
     const old = gone.ctx();
     const { lines } = await retiredLines(() => {
-      old.registerSpeechHandler('*');
+      old.registerSpeechHandler(['someone-else']);
       old.unregisterSpeechHandler();
     });
     const registry = (framework as unknown as { moduleRegistry: { dispatchSpeech(agent: string, content: ContentBlock[], context: never): Promise<void> } }).moduleRegistry;
     await registry.dispatchSpeech('assistant', text('spoken'), {} as never);
     assert.deepEqual(namesake.spoke, ['assistant'], 'one handler, the later module\'s');
     assert.deepEqual(gone.spoke, []);
-    assert.deepEqual(lines.map((line) => line.match(/its (\S+)\(\) call/)?.[1]), ['registerSpeechHandler', 'unregisterSpeechHandler']);
+    assert.deepEqual(lines, ['registerSpeechHandler', 'unregisterSpeechHandler'].map((method) => refusal('gone', method)));
   });
 });
 
@@ -260,12 +279,14 @@ test("a framework's completed stop() retires every module's context", async () =
     const old = gone.ctx();
     const { value, lines } = await retiredLines(async () => {
       old.setState({ v: 2 });
+      stays.ctx().setState({ w: 2 });
       return old.callTool({ id: 'after-stop', name: 'stays--echo', input: {} });
     });
     assert.deepEqual(moduleState(framework, 'gone'), { v: 1, externalIdMap: {} });
+    assert.equal(moduleState(framework, 'stays'), null, "the other module's context is retired too");
     assert.equal(value.success, false);
     assert.deepEqual(stays.calls, []);
-    assert.deepEqual(lines.map((line) => line.match(/its (\S+)\(\) call/)?.[1]), ['setState', 'callTool']);
+    assert.deepEqual(lines, [refusal('gone', 'setState'), refusal('stays', 'setState'), refusal('gone', 'callTool')]);
   });
 });
 
@@ -282,7 +303,7 @@ test("a module whose stop() outlasts stop()'s budget keeps a working context unt
   });
   await withFramework([gone.module], async (framework) => {
     framework.start();
-    await assert.rejects(framework.stop(100), (error: unknown) => error instanceof ShutdownTimeoutError);
+    await assert.rejects(framework.stop(100), (error: unknown) => error instanceof ShutdownTimeoutError && /module:gone/.test(error.message));
     ctx.setState({ meanwhile: true });
     assert.equal(moduleState(framework, 'gone')!.meanwhile, true, 'not retired while its stop() runs');
     release();
@@ -290,7 +311,7 @@ test("a module whose stop() outlasts stop()'s budget keeps a working context unt
     assert.equal(moduleState(framework, 'gone')!.flushed, true, 'its write from inside stop() landed');
     const { lines } = await retiredLines(() => ctx.setState({ late: true }));
     assert.equal(moduleState(framework, 'gone')!.late, undefined);
-    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.deepEqual(lines, [refusal('gone', 'setState')]);
   });
 });
 
@@ -307,6 +328,129 @@ test('a module whose stop() fails keeps a working context, and a retry that succ
     await framework.removeModule('gone');
     const { lines } = await retiredLines(() => old.setState({ after: 'retried' }));
     assert.equal(moduleState(framework, 'gone')!.after, 'failed stop');
-    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.deepEqual(lines, [refusal('gone', 'setState')]);
   });
+});
+
+test("an event being dispatched when a module's removal completes doesn't call that module, though a module of its name has been added", async () => {
+  const held = gate();
+  const first = probe('first', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
+  const gone = probe('gone');
+  await withFramework([first.module, gone.module], async (framework) => {
+    let completed = false;
+    framework.onTrace((event) => {
+      if (event.type === 'process:completed' && said((event as { processEvent: ProcessEvent }).processEvent) === 'external-message:hold') completed = true;
+    });
+    framework.start();
+    const { lines } = await retiredLines(async () => {
+      framework.pushEvent(external('hold'));
+      await held.entered;
+      await framework.removeModule('gone');
+      await framework.addModule(probe('gone').module);
+      held.open();
+      await waitFor('the event to finish', () => completed);
+    }, /error handling process event/);
+    assert.deepEqual(gone.seen, []);
+    assert.deepEqual(lines, []);
+  });
+});
+
+test("a response whose module's removal completes before it's applied is dropped whole, with a line naming what it asked for", async () => {
+  const held = gate();
+  const gone = probe('gone', {
+    answer: (event) => (said(event) === 'external-message:hold'
+      ? { addMessages: [{ participant: 'user', content: text('from the removed module') }], stateUpdate: { v: 'late' } }
+      : {}),
+  });
+  const last = probe('last', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
+  await withFramework([gone.module, last.module], async (framework) => {
+    let completed = false;
+    framework.onTrace((event) => {
+      if (event.type === 'process:completed' && said((event as { processEvent: ProcessEvent }).processEvent) === 'external-message:hold') completed = true;
+    });
+    framework.start();
+    const namesake = probe('gone');
+    const { lines } = await retiredLines(async () => {
+      framework.pushEvent(external('hold'));
+      await held.entered;
+      await framework.removeModule('gone');
+      await framework.addModule(namesake.module);
+      held.open();
+      await waitFor('the event to finish', () => completed);
+    }, /^\[process\]/);
+    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).flatMap((b) => ((b as { type: string }).type === 'text' ? [(b as { text: string }).text] : []));
+    assert.ok(!texts.includes('from the removed module'), texts.join('\n'));
+    assert.equal(namesake.ctx().getState(), null, "the later module's state is untouched");
+    assert.deepEqual(lines, ['[process] module gone stopped before its response to external-message was applied, so none of it was: 1 message(s) to add, a state update']);
+  });
+});
+
+test("speech being dispatched when a module's removal completes doesn't reach a module of its name added since", async () => {
+  const held = gate();
+  const first = probe('first', { onStart: (ctx) => ctx.registerSpeechHandler('*'), speak: async () => { held.enter(); await held.opened; } });
+  const gone = probe('gone', { onStart: (ctx) => ctx.registerSpeechHandler('*') });
+  await withFramework([first.module, gone.module], async (framework) => {
+    const registry = (framework as unknown as { moduleRegistry: { dispatchSpeech(agent: string, content: ContentBlock[], context: never): Promise<void> } }).moduleRegistry;
+    const speaking = registry.dispatchSpeech('assistant', text('spoken'), {} as never);
+    await held.entered;
+    await framework.removeModule('gone');
+    const namesake = probe('gone');
+    await framework.addModule(namesake.module);
+    held.open();
+    await speaking;
+    assert.deepEqual(first.spoke, ['assistant']);
+    assert.deepEqual(gone.spoke, []);
+    assert.deepEqual(namesake.spoke, [], 'it registered no handler');
+  });
+});
+
+test('a ModuleRegistry built without dropRetiredPush drops a stopped module\'s pushes with its own lines, ends its trace subscriptions once, and survives one that throws', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'retired-module-context-registry-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
+  const queued: string[] = [];
+  const pushed: string[] = [];
+  const unsubscribed: string[] = [];
+  const registry = new ModuleRegistry(store, { push: (event) => { queued.push(event.type); } }, {
+    getAgents: () => [],
+    addMessage: () => { throw new Error('not expected'); },
+    editMessage: () => {},
+    removeMessage: () => {},
+    getMessage: () => null,
+    queryMessages: () => ({ messages: [], totalCount: 0 }),
+    pushEvent: (event) => { pushed.push(event.type); },
+    onTrace: (listener) => () => {
+      unsubscribed.push(String(listener.name));
+      if (listener.name === 'throwing') throw new Error('injected unsubscribe failure');
+    },
+    callTool: async () => ({ success: true }),
+  });
+  let kept!: () => void;
+  const gone = probe('gone', {
+    onStart: (ctx) => {
+      kept = ctx.onTrace(function kept() {});
+      ctx.onTrace(function throwing() {});
+      const live = ctx.onTrace(function live() {});
+      live();
+      live();
+    },
+  });
+  await registry.addModule(gone.module);
+  assert.deepEqual(unsubscribed, ['live'], 'a live unsubscribe ends its subscription once, however often it is called');
+  const { lines } = await retiredLines(async () => {
+    await registry.removeModule('gone');
+    kept();
+    const old = gone.ctx();
+    old.pushEvent(external('late'));
+    old.queue.push({ type: 'tool-result', callId: 'c9', toolName: 'fetch', agentName: 'assistant', moduleName: 'gone', result: { success: false, isError: true, error: 'boom' } } as ProcessEvent);
+  }, /\[framework\]/);
+  assert.equal(registry.getModule('gone'), null, 'removed despite the throwing unsubscribe');
+  assert.deepEqual(unsubscribed.slice(1).sort(), ['kept', 'throwing'], 'each ended once at the removal, and not again by its own unsubscribe');
+  assert.deepEqual([queued, pushed], [[], []]);
+  assert.deepEqual(lines, [
+    '[framework] module "gone" has stopped, and ending one of its trace subscriptions threw: Error: injected unsubscribe failure',
+    "[framework] a 'external-message' event from module gone arrived after that module stopped — dropped",
+    '[framework] assistant: result of tool call c9 (fetch, gone) arrived after module gone stopped — dropped; the tool failed: boom',
+  ]);
 });

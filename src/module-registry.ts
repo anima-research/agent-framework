@@ -19,12 +19,14 @@ import type {
   SpeechContext,
   SpeechHandlerOptions,
   ProcessEvent,
+  ToolResultEvent,
   TraceEventListener,
   ModuleMessage,
   ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
 import { heldWriteId } from './held-writes.js';
+import { boundedErrorMessage } from './error-message.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
@@ -37,6 +39,19 @@ export interface ModuleQueue {
 }
 
 const MODULE_STATE_PREFIX = 'modules/';
+
+export function droppedToolResultLine(event: ToolResultEvent, when: string): string {
+  const outcome = event.result.success && !event.result.isError
+    ? 'succeeded'
+    : `failed${event.result.error ? `: ${boundedErrorMessage(event.result.error)}` : ''}`;
+  return `[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived ${when} — dropped; the tool ${outcome}`;
+}
+
+export function retiredPushLine(event: ProcessEvent, moduleName: string): string {
+  return event.type === 'tool-result'
+    ? droppedToolResultLine(event, `after module ${moduleName} stopped`)
+    : `[framework] a '${event.type}' event from module ${moduleName} arrived after that module stopped — dropped`;
+}
 
 /**
  * True when a registerState failure means "this state id already exists" —
@@ -120,8 +135,7 @@ export class ModuleRegistry {
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
-  /** Logs a retired context's dropped push (see the constructor's options).
-   *  Readonly-public for ModuleContextImpl, as notifyOpsFn is. */
+  /** The constructor's `dropRetiredPush` option. */
   readonly dropRetiredPushFn?: (event: ProcessEvent, moduleName: string) => void;
   /** Framework ops-alert channel, surfaced to modules via
    *  ModuleContext.notifyOps. Readonly-public so ModuleContextImpl can
@@ -406,10 +420,13 @@ export class ModuleRegistry {
     if (existing) return existing;
     const attempt = Promise.resolve().then(() => module.stop()).then(() => {
       if (this.modules.get(module.name) === module) {
-        this.moduleContexts.get(module.name)?.retire();
+        const context = this.moduleContexts.get(module.name);
         this.modules.delete(module.name);
         this.moduleContexts.delete(module.name);
         this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
+        this.stopping.delete(module);
+        context?.retire();
+        return;
       }
       this.stopping.delete(module);
     }, error => {
@@ -635,6 +652,7 @@ export class ModuleRegistry {
 
     // Call each handler
     for (const handler of handlers) {
+      if (!this.speechHandlers.includes(handler)) continue;
       const module = this.modules.get(handler.moduleName);
       if (module?.onAgentSpeech) {
         try {
@@ -729,8 +747,15 @@ class ModuleContextImpl implements ModuleContext {
 
   retire(): void {
     this.retired = true;
-    for (const unsubscribe of this.traceSubscriptions) unsubscribe();
+    const subscriptions = [...this.traceSubscriptions];
     this.traceSubscriptions.clear();
+    for (const unsubscribe of subscriptions) {
+      try {
+        unsubscribe();
+      } catch (error) {
+        console.error(`[framework] module ${JSON.stringify(this.moduleName)} has stopped, and ending one of its trace subscriptions threw:`, error);
+      }
+    }
   }
 
   private refused(method: string): boolean {
@@ -833,8 +858,7 @@ class ModuleContextImpl implements ModuleContext {
     const unsubscribe = this.onTraceFn(listener);
     this.traceSubscriptions.add(unsubscribe);
     return () => {
-      this.traceSubscriptions.delete(unsubscribe);
-      unsubscribe();
+      if (this.traceSubscriptions.delete(unsubscribe)) unsubscribe();
     };
   }
 
@@ -907,15 +931,16 @@ class ModuleContextImpl implements ModuleContext {
     const entry = this.externalIdMap.get(key);
     if (entry === undefined) return null;
     // A stored id answers while the store holds its row, and once the row is
-    // gone the entry goes, as removeMessage drops it. The '' a held write
-    // keeps here (addMessage) names no row, so the message is looked up in
-    // the store by its external id, held rows included, and the first row
-    // found is taken, as context-manager's findByExternalId takes it: a held
-    // row answers by its handle and leaves the entry as it is, and a stored
-    // row's id becomes the entry. With nothing found, '' stays, as earlier
-    // releases kept it: in a module's start(), the writes the last process
-    // held don't show yet, since create() restores them after the modules
-    // start, and a write that shows later finds its entry.
+    // gone the entry goes, as removeMessage drops it, except from a context
+    // whose module has stopped, which keeps its mapping as it was. The '' a held
+    // write keeps here (addMessage) names no row, so the message is looked up in
+    // the store by its external id, held rows included, and the first row found
+    // is taken, as context-manager's findByExternalId takes it: a held row
+    // answers by its handle and leaves the entry as it is, and a stored row's id
+    // becomes the entry. With nothing found, '' stays, as earlier releases kept
+    // it: in a module's start(), the writes the last process held don't show
+    // yet, since create() restores them after the modules start, and a write
+    // that shows later finds its entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
       if (!this.retired) {
@@ -970,7 +995,7 @@ class ModuleContextImpl implements ModuleContext {
 
   private dropPush(event: ProcessEvent): void {
     if (this.registry.dropRetiredPushFn) this.registry.dropRetiredPushFn(event, this.moduleName);
-    else console.error(`[framework] a '${event.type}' event from module ${this.moduleName} arrived after that module stopped — dropped`);
+    else console.error(retiredPushLine(event, this.moduleName));
   }
 
   private persistExternalIdMap(): void {
