@@ -135,7 +135,10 @@ export class ModuleRegistry {
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
-  /** The constructor's `dropRetiredPush` option. */
+  /**
+   * The constructor's `dropRetiredPush` option.
+   * @internal For the framework's drop lines; not a host API.
+   */
   readonly dropRetiredPushFn?: (event: ProcessEvent, moduleName: string) => void;
   /** Framework ops-alert channel, surfaced to modules via
    *  ModuleContext.notifyOps. Readonly-public so ModuleContextImpl can
@@ -159,8 +162,9 @@ export class ModuleRegistry {
       queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
-      /** Logs a push a module made after its stop() settled, which is dropped,
-       *  not queued. Without it, the registry logs a line of its own. */
+      /** Logs a push a module made after its stop() completed, which is
+       *  dropped, not queued. Without it, the registry logs a line of its own.
+       *  @internal For the framework's drop lines; not a host API. */
       dropRetiredPush?: (event: ProcessEvent, moduleName: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
@@ -255,6 +259,7 @@ export class ModuleRegistry {
    * changes each time a module of that name is added, the same module object
    * included, and that stays the same until its stop() completes;
    * `undefined` while none is registered.
+   * @internal For the framework's registration checks; not a host API.
    */
   registrationOf(moduleName: string): object | undefined {
     return this.moduleContexts.get(moduleName);

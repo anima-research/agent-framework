@@ -52,10 +52,7 @@
 - **A module may still write from inside its own `stop()`,** and a module
   whose `stop()` fails stays registered with a working context, for the
   retry.
-- **`ModuleRegistry` takes a new optional `dropRetiredPush` option,** which
-  the framework passes so that a push dropped after the framework's
-  `stop()` keeps today's line. A registry built without it, such as one a
-  host's tests build, logs a line of its own for each dropped push, and
-  doesn't queue it either. Its new `registrationOf(name)` gives the current
-  registration of the module of that name, which changes each time a module
-  of that name is added.
+- **A push dropped after the framework's `stop()` keeps today's line.** A
+  `ModuleRegistry` a host builds itself, such as one its tests build, drops
+  a stopped module's pushes too, with a line of its own for each, and
+  doesn't queue them.
