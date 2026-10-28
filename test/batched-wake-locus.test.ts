@@ -296,8 +296,9 @@ describe('batched wake routing with conversation forks', () => {
     assert.equal(byAgent.get('fork-room')?.channelId, ROOM, 'the fork that owns the channel takes the route');
     assert.equal(byAgent.get('fork-room')?.channelServerId, 'discord', "with the route's server");
     assert.equal(byAgent.get('fork-room')?.addressed, true);
-    assert.equal(byAgent.get('fork-other')?.channelId, undefined, 'a fork bound elsewhere gets no locus');
-    assert.equal(byAgent.get('trunk')?.channelId, undefined, 'the trunk never takes a fork-bound channel');
+    assert.equal(byAgent.get('fork-other')!.channelId, undefined, 'a fork bound elsewhere gets no locus');
+    assert.ok(byAgent.has('trunk'), 'the trunk is woken too');
+    assert.equal(byAgent.get('trunk')!.channelId, undefined, 'the trunk never takes a fork-bound channel');
     // Telemetry provenance still reaches every agent.
     assert.equal(byAgent.get('fork-other')?.counterparty, 'discord:user:5');
   });

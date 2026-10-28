@@ -173,6 +173,10 @@ describe('author presentation', () => {
       const m = stored('user', [{ type: 'text', text: 'hi' }], { author: { id: '1', name: 'Alice' } });
       assert.deepEqual(presentAuthor(m).content, [{ type: 'text', text: 'Alice: hi' }]);
       assert.deepEqual(m.content, [{ type: 'text', text: 'hi' }], 'the input is not mutated');
+      // The first text block only, wherever it is: not the first block, and not every text block.
+      const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AA==' } } as unknown as ContentBlock;
+      const mixed = stored('user', [image, { type: 'text', text: 'hi' }, { type: 'text', text: 'and more' }], { author: { id: '1', name: 'Alice' } });
+      assert.deepEqual(presentAuthor(mixed).content, [image, { type: 'text', text: 'Alice: hi' }, { type: 'text', text: 'and more' }]);
     });
 
     it('is idempotent: text already beginning with the author\'s name is left alone', () => {

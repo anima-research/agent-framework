@@ -1914,7 +1914,8 @@ describe('present while acting', () => {
         { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
       ] as ContentBlock[], 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }] as ContentBlock[]));
-      const framework = await createFramework();
+      // A re-pin is the legacy rule's; the default announces an arrival instead.
+      const framework = await createFramework(notice === 'The conversation moved to' ? LEGACY : {});
       stubChannelRegistry(framework);
       module.toolDelayMs = 25;
       if (notice === 'The conversation moved to') {
@@ -1926,8 +1927,9 @@ describe('present while acting', () => {
         addMessage(participant: string, content: ContentBlock[], metadata?: unknown): string;
       };
       const add = cm.addMessage.bind(cm);
+      let refused = 0;
       cm.addMessage = (participant, content, metadata) => {
-        if ((content[0] as { text?: string })?.text?.includes(notice)) throw new Error('store refused');
+        if ((content[0] as { text?: string })?.text?.includes(notice)) { refused++; throw new Error('store refused'); }
         return add(participant, content, metadata);
       };
       const baseline = (framework as unknown as { lastAnnouncedLocus: Map<string, Ref | null> }).lastAnnouncedLocus;
@@ -1935,6 +1937,7 @@ describe('present while acting', () => {
       trigger(framework);
       await framework.runUntilIdle();
 
+      assert.ok(refused > 0, `the premise: ${label}'s notice was written, and refused`);
       if (notice === 'The conversation moved to') {
         assert.deepEqual(baseline.get('assistant'), stub('chan-live-1'), 'the agent was last told of the locus the turn opened at');
       } else {
