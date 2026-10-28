@@ -251,6 +251,16 @@ export class ModuleRegistry {
   }
 
   /**
+   * The current registration of the module of this name: a value that
+   * changes each time a module of that name is added, the same module object
+   * included, and that stays the same until its stop() completes;
+   * `undefined` while none is registered.
+   */
+  registrationOf(moduleName: string): object | undefined {
+    return this.moduleContexts.get(moduleName);
+  }
+
+  /**
    * Set state for a module by name.
    * Used by the framework to apply stateUpdate from EventResponse after its
    * message changes.
@@ -478,7 +488,10 @@ export class ModuleRegistry {
    * something that isn't an array of objects, or with a `system` entry whose
    * content isn't an array of objects, every block of which the agent's
    * buildSystemPrompt reads, and one that answers after its timeout adds
-   * nothing. An array returned without a promise is taken as the module's
+   * nothing. Nor does a module whose stop() has completed by the time every
+   * answer is in, its own registration ended even if a module of its name
+   * has been added since; a line says so if it answered with injections. An
+   * array returned without a promise is taken as the module's
    * answer. An entry's other fields are the module's to get right. Each
    * module's budget starts once its call returns, after its own synchronous
    * work and every earlier module's; a later module's synchronous work still
@@ -498,6 +511,7 @@ export class ModuleRegistry {
     // that answers after its timeout adds nothing (it's skipped, fail-open).
     const results: ModuleContextInjection[][] = [];
     const promises: Promise<void>[] = [];
+    const asked: { slot: number; moduleName: string; registration: object | undefined }[] = [];
 
     for (const module of this.modules.values()) {
       const gather = module.gatherContext;
@@ -516,6 +530,7 @@ export class ModuleRegistry {
       let timedOut = false;
       const slot = results.length;
       results.push([]);
+      asked.push({ slot, moduleName: module.name, registration: this.moduleContexts.get(module.name) });
       // Called here, before its timer is set, so its budget starts after its
       // synchronous work; a call that throws is skipped as a rejection is.
       let call: Promise<ModuleContextInjection[]>;
@@ -561,6 +576,16 @@ export class ModuleRegistry {
     }
 
     await Promise.all(promises);
+    for (const { slot, moduleName, registration } of asked) {
+      if (this.moduleContexts.get(moduleName) === registration) continue;
+      if (results[slot].length > 0) {
+        console.error(
+          `[framework] module ${moduleName} stopped before its gatherContext answer for ${agentName} was used, ` +
+          `so its ${results[slot].length} injection(s) were left out`,
+        );
+      }
+      results[slot] = [];
+    }
     return results.flat();
   }
 
@@ -753,7 +778,7 @@ class ModuleContextImpl implements ModuleContext {
       try {
         unsubscribe();
       } catch (error) {
-        console.error(`[framework] module ${JSON.stringify(this.moduleName)} has stopped, and ending one of its trace subscriptions threw:`, error);
+        console.error(`[framework] module ${JSON.stringify(this.moduleName)} has stopped, and ending one of its trace subscriptions threw: ${boundedErrorMessage(error)}`);
       }
     }
   }
@@ -855,7 +880,9 @@ class ModuleContextImpl implements ModuleContext {
 
   onTrace(listener: TraceEventListener): () => void {
     if (this.refused('onTrace')) return () => {};
-    const unsubscribe = this.onTraceFn(listener);
+    const unsubscribe = this.onTraceFn((event) => {
+      if (!this.retired) listener(event);
+    });
     this.traceSubscriptions.add(unsubscribe);
     return () => {
       if (this.traceSubscriptions.delete(unsubscribe)) unsubscribe();

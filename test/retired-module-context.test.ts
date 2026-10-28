@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import { AgentFramework, ModuleRegistry, ShutdownTimeoutError, type EventResponse, type Module, type ModuleContext, type ProcessEvent, type ToolCall } from '../src/index.js';
+import { AgentFramework, ModuleRegistry, ShutdownTimeoutError, type EventResponse, type Module, type ModuleContext, type ModuleContextInjection, type ProcessEvent, type ToolCall } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t }];
@@ -83,12 +83,11 @@ async function retiredLines<T>(run: () => T | Promise<T>, pattern = /has stopped
 const refusal = (module: string, method: string): string =>
   `[framework] module "${module}" has stopped, so its ${method}() call had no effect; later ${method}() calls from it aren't logged`;
 
-function gate(): { open: () => void; opened: Promise<void>; entered: Promise<void>; enter: () => void } {
+function gate(): { open: () => void; opened: Promise<void>; enter: () => void; entered: (what: string) => Promise<void> } {
   let open!: () => void;
-  let enter!: () => void;
+  let isEntered = false;
   const opened = new Promise<void>((resolve) => { open = resolve; });
-  const entered = new Promise<void>((resolve) => { enter = resolve; });
-  return { open, opened, entered, enter };
+  return { open, opened, enter: () => { isEntered = true; }, entered: (what) => waitFor(what, () => isEntered) };
 }
 
 async function waitFor(description: string, predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
@@ -332,57 +331,88 @@ test('a module whose stop() fails keeps a working context, and a retry that succ
   });
 });
 
-test("an event being dispatched when a module's removal completes doesn't call that module, though a module of its name has been added", async () => {
-  const held = gate();
-  const first = probe('first', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
-  const gone = probe('gone');
-  await withFramework([first.module, gone.module], async (framework) => {
-    let completed = false;
-    framework.onTrace((event) => {
-      if (event.type === 'process:completed' && said((event as { processEvent: ProcessEvent }).processEvent) === 'external-message:hold') completed = true;
-    });
-    framework.start();
-    const { lines } = await retiredLines(async () => {
-      framework.pushEvent(external('hold'));
-      await held.entered;
-      await framework.removeModule('gone');
-      await framework.addModule(probe('gone').module);
-      held.open();
-      await waitFor('the event to finish', () => completed);
-    }, /error handling process event/);
-    assert.deepEqual(gone.seen, []);
-    assert.deepEqual(lines, []);
-  });
-});
+const laterOfItsName: [string, (gone: Probe) => Probe][] = [
+  ['a new module of its name', () => probe('gone')],
+  ['the same module object', (gone) => gone],
+];
 
-test("a response whose module's removal completes before it's applied is dropped whole, with a line naming what it asked for", async () => {
-  const held = gate();
-  const gone = probe('gone', {
-    answer: (event) => (said(event) === 'external-message:hold'
-      ? { addMessages: [{ participant: 'user', content: text('from the removed module') }], stateUpdate: { v: 'late' } }
-      : {}),
+const completion = (framework: AgentFramework, content: string): { done: () => boolean; responders: () => string[] } => {
+  let responders: string[] | undefined;
+  framework.onTrace((event) => {
+    if (event.type !== 'process:completed') return;
+    const { processEvent, responses } = event as unknown as { processEvent: ProcessEvent; responses: { moduleName: string }[] };
+    if (said(processEvent) === `external-message:${content}`) responders = responses.map((r) => r.moduleName);
   });
-  const last = probe('last', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
-  await withFramework([gone.module, last.module], async (framework) => {
-    let completed = false;
-    framework.onTrace((event) => {
-      if (event.type === 'process:completed' && said((event as { processEvent: ProcessEvent }).processEvent) === 'external-message:hold') completed = true;
+  return { done: () => responders !== undefined, responders: () => responders ?? [] };
+};
+
+for (const [kind, later] of laterOfItsName) {
+  test(`an event being dispatched when a module's removal completes doesn't call that module, once ${kind} has been added`, async () => {
+    const held = gate();
+    const first = probe('first', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
+    const gone = probe('gone');
+    await withFramework([first.module, gone.module], async (framework) => {
+      const completed = completion(framework, 'hold');
+      framework.start();
+      const { lines } = await retiredLines(async () => {
+        framework.pushEvent(external('hold'));
+        await held.entered('the event to reach the first module');
+        await framework.removeModule('gone');
+        await framework.addModule(later(gone).module);
+        held.open();
+        await waitFor('the event to finish', completed.done);
+      }, /error handling process event/);
+      assert.ok(!gone.seen.includes('external-message:hold'), gone.seen.join('\n'));
+      assert.deepEqual(lines, []);
     });
+  });
+
+  test(`a response whose module's removal completes before it's applied is dropped whole, with a line naming what it asked for, once ${kind} has been added`, async () => {
+    const held = gate();
+    const gone = probe('gone', {
+      answer: (event) => (said(event) === 'external-message:hold'
+        ? {
+          addMessages: [{ participant: 'user', content: text('from the removed module') }],
+          editMessages: [{ messageId: 'some-message', content: text('edited by the removed module') }],
+          removeMessages: ['another-message'],
+          stateUpdate: { v: 'late' },
+          requestInference: true,
+          toolsChanged: true,
+        }
+        : {}),
+    });
+    const last = probe('last', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
+    await withFramework([gone.module, last.module], async (framework) => {
+      const completed = completion(framework, 'hold');
+      framework.start();
+      const namesake = later(gone);
+      const { lines } = await retiredLines(async () => {
+        framework.pushEvent(external('hold'));
+        await held.entered('the event to reach the last module');
+        await framework.removeModule('gone');
+        await framework.addModule(namesake.module);
+        held.open();
+        await waitFor('the event to finish', completed.done);
+      }, /^\[process\]/);
+      const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content).flatMap((b) => ((b as { type: string }).type === 'text' ? [(b as { text: string }).text] : []));
+      assert.ok(!texts.includes('from the removed module'), texts.join('\n'));
+      assert.equal(namesake.ctx().getState(), null, "the later registration's state is untouched");
+      assert.ok(!completed.responders().includes('gone'), `process:completed lists ${completed.responders().join(', ')}`);
+      assert.ok(completed.responders().includes('last'), `process:completed lists ${completed.responders().join(', ')}`);
+      assert.deepEqual(lines, ['[process] module gone stopped before its response to external-message was applied, so none of it was: 1 message(s) to add, 1 edit(s), 1 removal(s), a state update, an inference request, a tools change']);
+    });
+  });
+}
+
+test("a push a module made while it was registered still reaches the other modules after its removal completes", async () => {
+  const gone = probe('gone');
+  const stays = probe('stays');
+  await withFramework([gone.module, stays.module], async (framework) => {
+    gone.ctx().pushEvent(external('made while registered'));
+    await framework.removeModule('gone');
     framework.start();
-    const namesake = probe('gone');
-    const { lines } = await retiredLines(async () => {
-      framework.pushEvent(external('hold'));
-      await held.entered;
-      await framework.removeModule('gone');
-      await framework.addModule(namesake.module);
-      held.open();
-      await waitFor('the event to finish', () => completed);
-    }, /^\[process\]/);
-    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
-      .flatMap((m) => m.content).flatMap((b) => ((b as { type: string }).type === 'text' ? [(b as { text: string }).text] : []));
-    assert.ok(!texts.includes('from the removed module'), texts.join('\n'));
-    assert.equal(namesake.ctx().getState(), null, "the later module's state is untouched");
-    assert.deepEqual(lines, ['[process] module gone stopped before its response to external-message was applied, so none of it was: 1 message(s) to add, a state update']);
+    await waitFor('the push to reach the other module', () => stays.seen.includes('external-message:made while registered'));
   });
 });
 
@@ -393,7 +423,7 @@ test("speech being dispatched when a module's removal completes doesn't reach a 
   await withFramework([first.module, gone.module], async (framework) => {
     const registry = (framework as unknown as { moduleRegistry: { dispatchSpeech(agent: string, content: ContentBlock[], context: never): Promise<void> } }).moduleRegistry;
     const speaking = registry.dispatchSpeech('assistant', text('spoken'), {} as never);
-    await held.entered;
+    await held.entered('the speech to reach the first module');
     await framework.removeModule('gone');
     const namesake = probe('gone');
     await framework.addModule(namesake.module);
@@ -405,13 +435,20 @@ test("speech being dispatched when a module's removal completes doesn't reach a 
   });
 });
 
-test('a ModuleRegistry built without dropRetiredPush drops a stopped module\'s pushes with its own lines, ends its trace subscriptions once, and survives one that throws', async (t) => {
+interface BareRegistry {
+  registry: ModuleRegistry;
+  queued: string[];
+  pushed: string[];
+  listeners: { label: string; listener: (event: never) => void; active: boolean }[];
+}
+
+function bareRegistry(t: { after: (fn: () => void) => void }, throwingUnsubscribe?: string): BareRegistry {
   const dir = mkdtempSync(join(tmpdir(), 'retired-module-context-registry-'));
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
   t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
   const queued: string[] = [];
   const pushed: string[] = [];
-  const unsubscribed: string[] = [];
+  const listeners: BareRegistry['listeners'] = [];
   const registry = new ModuleRegistry(store, { push: (event) => { queued.push(event.type); } }, {
     getAgents: () => [],
     addMessage: () => { throw new Error('not expected'); },
@@ -420,24 +457,34 @@ test('a ModuleRegistry built without dropRetiredPush drops a stopped module\'s p
     getMessage: () => null,
     queryMessages: () => ({ messages: [], totalCount: 0 }),
     pushEvent: (event) => { pushed.push(event.type); },
-    onTrace: (listener) => () => {
-      unsubscribed.push(String(listener.name));
-      if (listener.name === 'throwing') throw new Error('injected unsubscribe failure');
+    onTrace: (listener) => {
+      const entry = { label: `subscription ${listeners.length + 1}`, listener: listener as (event: never) => void, active: true };
+      listeners.push(entry);
+      return () => {
+        if (entry.label === throwingUnsubscribe) throw new Error('injected unsubscribe failure');
+        entry.active = false;
+      };
     },
     callTool: async () => ({ success: true }),
   });
+  return { registry, queued, pushed, listeners };
+}
+
+test("a ModuleRegistry built without dropRetiredPush drops a stopped module's pushes with its own lines, and its trace listeners hear nothing once it has stopped, even where the unsubscribe throws", async (t) => {
+  const { registry, queued, pushed, listeners } = bareRegistry(t, 'subscription 2');
+  const heard: string[] = [];
   let kept!: () => void;
   const gone = probe('gone', {
     onStart: (ctx) => {
-      kept = ctx.onTrace(function kept() {});
-      ctx.onTrace(function throwing() {});
-      const live = ctx.onTrace(function live() {});
+      kept = ctx.onTrace(() => heard.push('kept'));
+      ctx.onTrace(() => heard.push('throwing'));
+      const live = ctx.onTrace(() => heard.push('live'));
       live();
       live();
     },
   });
   await registry.addModule(gone.module);
-  assert.deepEqual(unsubscribed, ['live'], 'a live unsubscribe ends its subscription once, however often it is called');
+  assert.deepEqual(listeners.map((l) => l.active), [true, true, false], 'a live unsubscribe ends its own subscription');
   const { lines } = await retiredLines(async () => {
     await registry.removeModule('gone');
     kept();
@@ -446,11 +493,43 @@ test('a ModuleRegistry built without dropRetiredPush drops a stopped module\'s p
     old.queue.push({ type: 'tool-result', callId: 'c9', toolName: 'fetch', agentName: 'assistant', moduleName: 'gone', result: { success: false, isError: true, error: 'boom' } } as ProcessEvent);
   }, /\[framework\]/);
   assert.equal(registry.getModule('gone'), null, 'removed despite the throwing unsubscribe');
-  assert.deepEqual(unsubscribed.slice(1).sort(), ['kept', 'throwing'], 'each ended once at the removal, and not again by its own unsubscribe');
+  assert.deepEqual(listeners.map((l) => l.active), [false, true, false], 'the throwing one stays subscribed in the registry it came from');
+  for (const { listener } of listeners) listener({ type: 'probe' } as never);
+  assert.deepEqual(heard, [], 'no listener of a stopped module hears a trace');
   assert.deepEqual([queued, pushed], [[], []]);
   assert.deepEqual(lines, [
-    '[framework] module "gone" has stopped, and ending one of its trace subscriptions threw: Error: injected unsubscribe failure',
+    '[framework] module "gone" has stopped, and ending one of its trace subscriptions threw: injected unsubscribe failure',
     "[framework] a 'external-message' event from module gone arrived after that module stopped — dropped",
     '[framework] assistant: result of tool call c9 (fetch, gone) arrived after module gone stopped — dropped; the tool failed: boom',
   ]);
+});
+
+test("a gatherContext answer from a module whose stop() completes before every answer is in is left out of the turn, with a line, the same module object added again included", async (t) => {
+  const { registry } = bareRegistry(t);
+  const held = gate();
+  const injecting = (name: string, wait: boolean): Module => ({
+    name,
+    async start() {},
+    async stop() {},
+    async onProcess() { return {}; },
+    getTools: () => [],
+    async handleToolCall() { return { success: true }; },
+    async gatherContext(): Promise<ModuleContextInjection[]> {
+      if (wait) { held.enter(); await held.opened; }
+      return [{ namespace: name, position: 'system', content: text(`from ${name}`) }];
+    },
+  });
+  const gone = injecting('gone', true);
+  await registry.addModule(gone);
+  await registry.addModule(injecting('stays', false));
+  const { value, lines } = await retiredLines(async () => {
+    const gathering = registry.gatherContext('assistant');
+    await held.entered("the removed module's gatherContext to be called");
+    await registry.removeModule('gone');
+    await registry.addModule(gone);
+    held.open();
+    return gathering;
+  }, /gatherContext/);
+  assert.deepEqual(value.map((injection) => injection.namespace), ['stays']);
+  assert.deepEqual(lines, ['[framework] module gone stopped before its gatherContext answer for assistant was used, so its 1 injection(s) were left out']);
 });

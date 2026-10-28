@@ -279,10 +279,12 @@ export interface AgentSettingsExtension {
  * `queryMessages`, `getAgents`, `getActiveTools`, `findMessageByExternalId`)
  * answer, and fail, as before; one that meets a held write may record that
  * the write has landed, as any reader's does. The framework calls neither
- * the module's `onProcess` nor its `onAgentSpeech` again, and drops whole a
+ * the module's `onProcess` nor its `onAgentSpeech` again; it drops whole a
  * response of its that hadn't been applied by then, with a line naming what
- * the response asked for. A module whose `stop()` fails stays registered,
- * and its context keeps working.
+ * the response asked for if it asked for anything; and it leaves its
+ * `gatherContext` answer out of a turn whose modules' answers weren't all
+ * in by then, with a line if it held injections. A module whose `stop()`
+ * fails stays registered, and its context keeps working.
  * References the module already holds, to other modules or to its own
  * timers, aren't the context's, and stay as they are.
  */

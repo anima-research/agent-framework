@@ -14570,20 +14570,22 @@ export class AgentFramework {
   private async dispatchProcessEventToModules(event: ProcessEvent, startTime = Date.now()): Promise<void> {
     // Dispatch to all modules, tracking responses with module names
     const responses: ModuleProcessResponse[] = [];
-    const producedBy = new Map<ModuleProcessResponse, Module>();
+    const registrations = new Map<ModuleProcessResponse, object | undefined>();
     const stillRegistered = (entry: ModuleProcessResponse): boolean =>
-      this.moduleRegistry.getModule(entry.moduleName) === producedBy.get(entry);
-    for (const module of this.moduleRegistry.getAllModules()) {
+      this.moduleRegistry.registrationOf(entry.moduleName) === registrations.get(entry);
+    const dispatched = this.moduleRegistry.getAllModules()
+      .map((module) => ({ module, registration: this.moduleRegistry.registrationOf(module.name) }));
+    for (const { module, registration } of dispatched) {
       // The framework's own toolsets module answers no event; every agent has
       // it now, so it isn't listed beside the modules that do.
       if (module instanceof ToolsetsModule) continue;
-      if (this.moduleRegistry.getModule(module.name) !== module) continue;
+      if (this.moduleRegistry.registrationOf(module.name) !== registration) continue;
       try {
         const processState = this.moduleRegistry.createProcessState(module.name);
         const response = await module.onProcess(event, processState);
         const entry = { moduleName: module.name, response };
         responses.push(entry);
-        producedBy.set(entry, module);
+        registrations.set(entry, registration);
       } catch (error) {
         console.error(`Module ${module.name} error handling process event:`, error);
       }
@@ -14595,9 +14597,7 @@ export class AgentFramework {
     // request included, so no turn runs for content that was never stored,
     // and it doesn't count as accepting a surface's input. A line and a
     // trace name the module and where, and the other modules' responses
-    // apply. A response whose module stopped before it's applied is dropped
-    // whole, with a line naming what it asked for, and isn't listed either.
-    // process:completed and the process log list the responses that
+    // apply. process:completed and the process log list the responses that
     // passed that check, so a view built on them doesn't show a refused
     // response's messages as the event's. A response that throws as it
     // applies, such as at an edit of a held write while its store can't be
@@ -14640,14 +14640,11 @@ export class AgentFramework {
     if (surface && applying.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
       this.noteInboundAccepted(surface);
     }
-    const applied: ModuleProcessResponse[] = [];
     for (const entry of applying) {
-      if (dropUnregistered(entry)) continue;
-      applied.push(entry);
       const { moduleName, response } = entry;
       const step = { at: 'its start' };
       try {
-        await this.applyProcessResponse(response, event, moduleName, surface, step);
+        this.applyProcessResponse(response, event, moduleName, surface, step);
       } catch (error) {
         entry.threw = { at: step.at, error: error instanceof Error ? error.message : String(error) };
         console.error(
@@ -14667,15 +14664,15 @@ export class AgentFramework {
     const durationMs = Date.now() - startTime;
 
     // Always emit trace for observability (UI needs this)
-    this.emitTrace({ type: 'process:completed', processEvent: event, responses: applied, durationMs });
+    this.emitTrace({ type: 'process:completed', processEvent: event, responses: applying, durationMs });
 
     // Log to Chronicle (if enabled)
     if (this.processLoggingPersist) {
-      this.logProcessEvent(event, applied);
+      this.logProcessEvent(event, applying);
     }
   }
 
-  private async applyProcessResponse(
+  private applyProcessResponse(
     response: EventResponse,
     event: ProcessEvent,
     moduleName: string,
@@ -14683,7 +14680,7 @@ export class AgentFramework {
     surface: InboundSource | undefined,
     /** Names the operation under way, for the line when one throws. */
     step: { at: string },
-  ): Promise<void> {
+  ): void {
     // Add messages. Only the framework writes the inbound envelope: one a
     // module's metadata carries (echoed from a server's event, say) is
     // dropped, and a surface event's messages carry the framework's own.
