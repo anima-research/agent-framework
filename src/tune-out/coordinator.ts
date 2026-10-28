@@ -273,22 +273,25 @@ export class TuneOutCoordinator {
   private divertedSinceInvocation = new Map<string, number>();
   /**
    * `reader: 'forks'`: the highest sequence of a held message already
-   * handed to a reader fork, per channel key. Each held message is
-   * delivered to exactly one fork. In-memory: after a restart the first
-   * fork of an epoch is handed everything the epoch has held, which is
-   * the right side to err on.
+   * handed to a reader fork, per epoch and channel (handOffKey). Each held
+   * message is delivered to exactly one fork. A channel the all-except hold
+   * holds can be taken by a tune-out of its own and given back, and each
+   * epoch's readers read that epoch's messages, so what one epoch's readers
+   * were handed never moves or clears the other's. In-memory: after a
+   * restart the first fork of an epoch is handed everything the epoch has
+   * held, which is the right side to err on.
    */
   private readerCursor = new Map<string, number>();
   /**
    * `reader: 'forks'`: the deferred writes handed to a reader fork while
-   * still queued, per channel key. Each lands in the store later as a row
+   * still queued, per epoch and channel. Each lands in the store later as a row
    * stamped with the same id (`metadata.deferredWriteId`), past the cursor;
    * that row is not handed again. Cleared with the cursor.
    */
   private readerHandedWrites = new Map<string, Set<string>>();
   /**
    * `reader: 'forks'`: held messages a reader fork was handed but never read,
-   * per channel key: its derive failed, or its run threw before it reported
+   * per epoch and channel: its derive failed, or its run threw before it reported
    * (readerFailed). The next invocation is handed them again, cursor or no:
    * stored rows by id, and by write id those that were queued when handed
    * (stored or still queued now). Cleared with the cursor.
@@ -307,6 +310,18 @@ export class TuneOutCoordinator {
 
   private key(serverId: string, channelId: string): string {
     return `${serverId}\0${channelId}`;
+  }
+
+  /** The readers' hand-off bookkeeping's key: one epoch's reading of one channel. */
+  private handOffKey(epochId: string, serverId: string, channelId: string): string {
+    return `${epochId}\0${serverId}\0${channelId}`;
+  }
+
+  /** An ended epoch's hand-off bookkeeping goes with it, every channel's. */
+  private dropHandOffs(epochId: string): void {
+    for (const map of [this.readerCursor, this.readerHandedWrites, this.readerReturned]) {
+      for (const key of map.keys()) if (key.startsWith(`${epochId}\0`)) map.delete(key);
+    }
   }
 
   /** A reader exists: the persistent subconscious, or forks on demand. */
@@ -742,7 +757,7 @@ export class TuneOutCoordinator {
       // handed, so a fork follows only when messages arrived after that.
       const stored = this.hooks.getStoredMessages().filter(ofEpoch);
       const queued = this.queuedHeld(ofEpoch);
-      const rest = this.unhandedBacklog(this.key(serverId, channelId), stored, queued);
+      const rest = this.unhandedBacklog(this.handOffKey(epochId, serverId, channelId), stored, queued);
       const unread = rest.backlog.length + rest.queued.length;
       if (!selfCancel || unread > 0) {
         const truncNote = truncated > 0
@@ -754,9 +769,7 @@ export class TuneOutCoordinator {
         this.invokeReaderFork(serverId, channelId, epochId, 'cancel', `[${NOTICE_TAG.tuneOutCancelled}: ${name} — ${reason}.${truncNote}${lateNote}]`, stored, queued);
       }
     }
-    this.readerCursor.delete(this.key(serverId, channelId));
-    this.readerHandedWrites.delete(this.key(serverId, channelId));
-    this.readerReturned.delete(this.key(serverId, channelId));
+    this.dropHandOffs(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
   }
@@ -1069,21 +1082,17 @@ export class TuneOutCoordinator {
         const inChannel = (m: Pick<StoredMessage, 'metadata'>): boolean => ofEpoch(m) && ofChannel(m);
         const stored = this.hooks.getStoredMessages().filter(inChannel);
         const queued = this.queuedHeld(inChannel);
-        const rest = this.unhandedBacklog(this.key(serverId, channelId), stored, queued);
+        const rest = this.unhandedBacklog(this.handOffKey(epochId, serverId, channelId), stored, queued);
         if (rest.backlog.length + rest.queued.length > 0) {
           this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, stored, queued);
         }
       }
     }
-    for (const key of [...this.divertedSinceInvocation.keys(), ...this.readerCursor.keys(), ...this.readerHandedWrites.keys(), ...this.readerReturned.keys()]) {
+    for (const key of this.divertedSinceInvocation.keys()) {
       const [serverId, channelId] = key.split('\0') as [string, string];
-      if (!this.channelRegistry.getTuneOutState(serverId, channelId)) {
-        this.divertedSinceInvocation.delete(key);
-        this.readerCursor.delete(key);
-        this.readerHandedWrites.delete(key);
-        this.readerReturned.delete(key);
-      }
+      if (!this.channelRegistry.getTuneOutState(serverId, channelId)) this.divertedSinceInvocation.delete(key);
     }
+    this.dropHandOffs(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
     this.announce(except, epochId, 'released', `[${NOTICE_TAG.focus}: ${primary ?? 'the resident'} released — ${reason}.]`);
     return { ok: true };
@@ -1376,7 +1385,7 @@ export class TuneOutCoordinator {
     epochQueued: QueuedHeldMessage[] = [],
   ): boolean {
     if (!this.hooks.invokeReader) return false;
-    const key = this.key(serverId, channelId);
+    const key = this.handOffKey(epochId, serverId, channelId);
     const { backlog, queued } = this.unhandedBacklog(key, epochBacklog, epochQueued);
     if (trigger === 'cadence' && backlog.length === 0 && queued.length === 0) return false;
     // The cursor only moves forward: a returned row handed again can be
@@ -1419,7 +1428,7 @@ export class TuneOutCoordinator {
 
   /**
    * What no reader fork has read yet, of the given held messages: the stored
-   * ones past the channel's cursor, less those a fork was handed while they
+   * ones past the epoch's cursor for the channel, less those a fork was handed while they
    * were still queued, plus those a failed fork returned, oldest first; then
    * the queued ones no fork was handed, or a failed fork returned.
    */
@@ -1454,7 +1463,7 @@ export class TuneOutCoordinator {
   readerFailed(invocation: Pick<ReaderInvocation, 'serverId' | 'channelId' | 'epochId' | 'backlog' | 'queued'>): number {
     const { serverId, channelId, epochId } = invocation;
     if (this.holdFor(serverId, channelId)?.epochId !== epochId) return 0;
-    const key = this.key(serverId, channelId);
+    const key = this.handOffKey(epochId, serverId, channelId);
     const returned = this.readerReturned.get(key) ?? { ids: new Set<string>(), writeIds: new Set<string>() };
     for (const m of invocation.backlog) returned.ids.add(m.id);
     for (const m of invocation.queued) returned.writeIds.add(m.writeId);

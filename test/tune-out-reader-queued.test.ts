@@ -187,7 +187,7 @@ describe('reader forks and messages queued behind the resident turn', () => {
     w.tuneOut();
     w.queue('ann', 'Q-1', 'w1');
     w.wake();
-    const handed = () => w.internals.readerHandedWrites.get(`${SERVER}\0${NOISY}`);
+    const handed = () => w.internals.readerHandedWrites.get(`${EPOCH}\0${SERVER}\0${NOISY}`);
     assert.deepEqual([...(handed() ?? [])], ['w1'], 'kept while it could still be handed by sequence');
     w.land();
     w.store('bo', 'S-2 after it');
@@ -351,6 +351,53 @@ describe('reader forks and messages queued behind the resident turn', () => {
     assert.equal(w.invocations.length, 2, "one more fork: for slack's general, whose message no reader had");
     assert.equal(w.invocations[1]!.serverId, 'slack');
     assert.deepEqual(bodies(w.invocations[1]!), { stored: [], queued: ['B-1 on slack'] });
+    w.coordinator.stop();
+  });
+});
+
+describe("a channel held in turn by the all-except hold and by its own tune-out", () => {
+  // A per-channel tune-out takes a channel the scope holds; its messages are
+  // its own epoch's. What readers were handed is each epoch's, so neither
+  // epoch's reading moves or clears the other's.
+  const scoped = (w: ReturnType<typeof world>): string => {
+    assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600 }, 'agent-tool').ok);
+    return w.coordinator.getAllExcept()!.params.epochId;
+  };
+
+  it("the channel's own tune-out ending leaves what the scope's readers were handed as it was", () => {
+    const w = world();
+    const scope = scoped(w);
+    w.store('ann', 'S-1 under the scope', { epochId: scope });
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[0]!), { stored: ['S-1 under the scope'], queued: [] });
+    w.tuneOut();
+    w.store('bo', 'P-2 under its own tune-out');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[1]!), { stored: ['P-2 under its own tune-out'], queued: [] });
+    assert.deepEqual(w.coordinator.cancel(SERVER, NOISY, 'agent-tool', 'resident cancelled'), { ok: true });
+    w.store('cy', 'S-3 under the scope again', { epochId: scope });
+    w.wake();
+    const next = w.invocations.at(-1)!;
+    assert.equal(next.epochId, scope, 'the scope holds the channel again');
+    assert.deepEqual(bodies(next), { stored: ['S-3 under the scope again'], queued: [] }, 'S-1 was read under the scope, so it is not handed again');
+    w.coordinator.stop();
+  });
+
+  it("the scope's release hands its reader the scope's unread messages, whatever the channel's own tune-out's readers were handed", () => {
+    const w = world();
+    const scope = scoped(w);
+    w.store('ann', 'S-1 under the scope, unread', { epochId: scope });
+    w.tuneOut();
+    w.store('bo', 'P-2 under its own tune-out');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[0]!), { stored: ['P-2 under its own tune-out'], queued: [] });
+    assert.deepEqual(w.coordinator.cancelAllExcept('agent-tool', 'resident released'), { ok: true });
+    const last = w.invocations.slice(1).filter((inv) => inv.epochId === scope);
+    assert.deepEqual(last.map(bodies), [{ stored: ['S-1 under the scope, unread'], queued: [] }], 'one last fork, handed S-1');
+    w.store('cy', 'P-3 still under its own tune-out');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations.at(-1)!), { stored: ['P-3 still under its own tune-out'], queued: [] },
+      "and the channel's own tune-out's readers go on from where they were");
     w.coordinator.stop();
   });
 });
