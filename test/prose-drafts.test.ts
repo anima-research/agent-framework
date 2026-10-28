@@ -426,6 +426,8 @@ async function harness(opts: {
   serverConfig?: Record<string, unknown>;
   channels?: Array<{ id: string; label: string; direction?: 'inbound' | 'outbound' | 'bidirectional' }>;
   modules?: Module[];
+  /** FrameworkConfig.heartbeat: the framework's own heartbeat. */
+  heartbeat?: boolean | Record<string, unknown>;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -467,6 +469,7 @@ async function harness(opts: {
         ...(opts.requestTimeoutMs !== undefined ? { requestTimeoutMs: opts.requestTimeoutMs } : {}),
       }],
       modules: opts.modules ?? [],
+      ...(opts.heartbeat !== undefined ? { heartbeat: opts.heartbeat as never } : {}),
       ...(opts.codeExecution ? { codeExecution: { enabled: true } } : {}),
       ...(opts.retries !== undefined ? {
         errorPolicy: {
@@ -513,7 +516,7 @@ async function harness(opts: {
       : [],
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
-    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' = 'incoming') => {
+    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'heartbeat' = 'incoming') => {
       for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
       if (via === 'incoming') {
@@ -521,8 +524,11 @@ async function harness(opts: {
       } else {
         // 'silent': a control-plane wake whose plain prose stays private, as
         // a silent heartbeat's does.
+        // 'heartbeat': a heartbeat tick's wake, as the framework's heartbeat
+        // (or a heartbeat-mcpl push) makes it, with no channel.
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
-          agentName, reason: 'test', source: 'test', timestamp: Date.now(),
+          agentName, timestamp: Date.now(),
+          ...(via === 'heartbeat' ? { reason: 'heartbeat', source: 'heartbeat' } : { reason: 'test', source: 'test' }),
           ...(via === 'silent' ? { suppressProse: true } : {}),
         });
       }
@@ -4236,6 +4242,235 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         await h.close();
       }
     });
+  });
+});
+
+describe('a heartbeat turn holds its plain speech as drafts', () => {
+  /** Calls the membrane gets for one turn and anything it wakes, once the framework is idle again. */
+  const callsFor = async (h: Awaited<ReturnType<typeof harness>>, run: () => Promise<void>): Promise<number> => {
+    const before = h.membrane.calls.length;
+    await run();
+    await new Promise((r) => setTimeout(r, 200));
+    await h.framework.runUntilIdle();
+    return h.membrane.calls.length - before;
+  };
+
+  it('locus mode: nothing is posted where the latest message came from; the words are held, named in the receipt, and resendable', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room'], 'the room is the latest inbound channel now');
+      await h.turn([createMockResponse([text('Still here, thinking of you.')])], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room'], 'the heartbeat turn posted nothing');
+      const [held] = h.drafts();
+      assert.equal(held?.text, 'Still here, thinking of you.');
+      assert.equal(held?.reason, 'no-destination');
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1) ?? '';
+      assert.ok(receipt.startsWith('[delivered] nothing') && receipt.includes(held!.id), receipt);
+      assert.equal(h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).length, 1,
+        'the heartbeat turn was told up front that its plain speech is held');
+      const announced = h.texts().filter((t) => t.startsWith('[routing] Your plain speech now lands in')).length;
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'resend', draftIds: [held!.id], destination: ROOM })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'Still here, thinking of you.'], 'sent when the agent chose to');
+      assert.equal(h.texts().filter((t) => t.startsWith('[routing] Your plain speech now lands in')).length, announced,
+        'the next channel turn did not announce its channel again');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("locus mode: a heartbeat turn's mid-turn and closing prose are both held, and the mid-turn notice says why", async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      await h.turn([
+        createMockResponse([text('a first thought'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('closing words')]),
+      ], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+      assert.deepEqual(h.drafts().map((d) => d.text).reverse(), ['a first thought', 'closing words']);
+      assert.ok(h.drafts().every((d) => d.reason === 'no-destination'));
+      assert.ok(h.texts().some((t) => t.startsWith('[drafts]') && t.includes('this turn came from your heartbeat, not from a channel')),
+        JSON.stringify(h.texts().filter((t) => t.startsWith('[drafts]'))));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a tick from the framework's own heartbeat opens such a turn", async () => {
+    const h = await harness({ heartbeat: true });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      h.membrane.pushResponse(createMockResponse([text('words from a real tick')]));
+      const before = h.membrane.calls.length;
+      const fired = (h.framework as unknown as { heartbeat: { handleToolCall(name: string, input: unknown): { isError?: boolean } } })
+        .heartbeat.handleToolCall('heartbeat--heartbeat_trigger', {});
+      assert.notEqual(fired.isError, true, JSON.stringify(fired));
+      await h.until(() => h.membrane.calls.length > before, 'the tick\'s turn');
+      await h.framework.runUntilIdle();
+      await h.until(() => h.drafts().length === 1, 'the held words');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+      assert.equal(h.drafts()[0]?.text, 'words from a real tick');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a heartbeat batched behind another channel-less wake is still a heartbeat\'s turn', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      h.membrane.pushResponse(createMockResponse([text('words from a batched tick')]));
+      const before = h.membrane.calls.length;
+      const pending = (h.framework as unknown as { pendingRequests: unknown[] }).pendingRequests;
+      const t = Date.now();
+      pending.push(
+        { agentName: 'scout', reason: 'test', source: 'test', timestamp: t },
+        { agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: t + 1 },
+      );
+      await h.until(() => h.membrane.calls.length > before, 'the batch\'s turn');
+      await h.framework.runUntilIdle();
+      await h.until(() => h.drafts().length === 1, 'the held words');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room'], 'the batch order does not decide');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: the resend wake after a heartbeat turn's failed >>> target is a heartbeat's turn too", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      onSecondStream(h.membrane, createMockResponse([text('unprefixed words on the resend turn')]));
+      await h.turn([createMockResponse([text('>>>#nowhere words meant for someone')])], 'scout', 'heartbeat');
+      await h.until(() => h.drafts().some((d) => d.text === 'unprefixed words on the resend turn'), 'the resend turn\'s words held');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a quiesce parks a heartbeat's wake apart from a later channel-less wake, so neither absorbs the other", async () => {
+    const h = await harness();
+    const internals = h.framework as unknown as {
+      pendingRequests: Array<{ agentName: string; source: string }>;
+      processInferenceRequests(): Promise<void>;
+      quiesced: boolean;
+    };
+    try {
+      const t = Date.now();
+      internals.quiesced = true;
+      internals.pendingRequests.push(
+        { agentName: 'scout', reason: 'mcpl:push-event', source: 'heartbeat', timestamp: t } as never,
+        { agentName: 'scout', reason: 'mcpl:push-event', source: 'other', timestamp: t + 1 } as never,
+      );
+      await internals.processInferenceRequests();
+      assert.deepEqual(internals.pendingRequests.filter((r) => r.agentName === 'scout').map((r) => r.source).sort(), ['heartbeat', 'other'],
+        'both wait for the resume, where they make a heartbeat\'s batch');
+    } finally {
+      internals.quiesced = false;
+      internals.pendingRequests.length = 0;
+      await h.close();
+    }
+  });
+
+  it('an explicit send from a heartbeat turn still posts', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      await h.turn([createMockResponse([explicitSend('s1')], 'tool_use'), createMockResponse([])], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'an explicit note']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a channel-less wake that is not the heartbeat still takes the latest inbound channel, as before', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      await h.turn([createMockResponse([text('words from a timer')])], 'scout', 'request');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'words from a timer']);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('hybrid mode: unprefixed heartbeat prose is held, and a >>> envelope still delivers', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+      await h.turn([
+        createMockResponse([text('unprefixed heartbeat words'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text(`>>>${ROOM} chosen words`)]),
+      ], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'chosen words']);
+      const [held] = h.drafts();
+      assert.equal(held?.text, 'unprefixed heartbeat words');
+      assert.equal(held?.reason, 'no-destination');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("an autoContinue continuation of a heartbeat turn holds its plain speech too", async () => {
+    const h = await harness({ agents: [{ name: 'scout', autoContinue: true }] });
+    try {
+      // No channel turn first: its own run's wakes would merge with the
+      // continuation and give it their channel, as a message arriving mid-run
+      // rightly does. Without the mark the continuation's words fail to route
+      // rather than being held.
+      // Each stream takes every queued response, so the continuation's
+      // answer is queued as its stream opens.
+      onSecondStream(h.membrane, createMockResponse([text('continued heartbeat words')]));
+      await h.turn([createMockResponse([text('first heartbeat words')])], 'scout', 'heartbeat');
+      await h.until(() => h.drafts().length >= 2, 'the continuation');
+      await h.framework.runUntilIdle();
+      assert.deepEqual(h.publishes(), [], 'neither the turn nor its continuation posted');
+      assert.deepEqual(h.drafts().map((d) => d.text).reverse(), ['first heartbeat words', 'continued heartbeat words']);
+      assert.equal(h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).length, 1,
+        'the continuation is not told again');
+      assert.ok(h.texts().some((t) => t.startsWith('[continue]') && t.includes('are held as drafts, as on the heartbeat')),
+        'its [continue] row says its words are held');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('explicit mode: a heartbeat turn whose deliberate >> target fails still wakes the agent', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      const calls = await callsFor(h, () => h.turn([createMockResponse([text('>>#nowhere words meant for someone')])], 'scout', 'heartbeat'));
+      assert.ok(calls >= 2, `the failed send's bounce wakes the agent to resend (${calls} calls)`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("explicit mode: a heartbeat turn's bounce is held and noticed without waking the agent", async () => {
+    const control = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      const calls = await callsFor(control, () => control.turn([createMockResponse([text('words with nowhere to go')])], 'scout', 'request'));
+      assert.ok(calls >= 2, `another channel-less turn's bounce wakes the agent to resend (${calls} calls)`);
+    } finally {
+      await control.close();
+    }
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      const calls = await callsFor(h, () => h.turn([createMockResponse([text('heartbeat words with nowhere to go')])], 'scout', 'heartbeat'));
+      assert.equal(calls, 1, 'the heartbeat turn alone: no bounce wake');
+      const [bounced] = h.drafts();
+      assert.equal(bounced?.reason, 'bounced');
+      assert.ok(h.texts().some((t) => t.includes(`It is held as draft ${bounced!.id}`)), 'the bounce is noticed');
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
   });
 });
 
