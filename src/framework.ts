@@ -3843,6 +3843,8 @@ export class AgentFramework {
   /** The branch-local ended log by name (its newest entry for each), and how far it is indexed (findEndedAgentRecord). */
   private readonly endedLogIndex = new Map<string, number>();
   private endedLogIndexed = 0;
+  /** The last indexed entry's mark, so a log that changed under the index is seen. */
+  private endedLogTail = '';
   /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
    *  deferredWritesPath). Undefined → branch-local slot fallback. */
   private hostModePath: string | undefined;
@@ -11892,11 +11894,14 @@ export class AgentFramework {
    * log. A scan of the whole log takes tens of milliseconds at a few thousand
    * ends, and a name nobody used (a tool call's typo) is a miss, so the log is
    * indexed by name once, at the first lookup, and each later lookup indexes
-   * only what was appended since. A log that shrank, or an entry that no longer carries the
-   * name indexed for it (a branch switch), is indexed again.
+   * only what was appended since. A log that changed under the index (a
+   * branch switch) is indexed again: one that shrank, one whose last indexed
+   * entry is no longer the one indexed, or one whose entry no longer carries
+   * the name indexed for it.
    */
   private findEndedAgentRecord(name: string): AgentRecord | undefined {
     const read = (index: number) => this.store.getStateItemJson(AGENT_REGISTRY_ENDED_ID, index) as AgentRecord | null;
+    const mark = (record: AgentRecord | null) => (record ? `${record.name}#${record.incarnation}@${record.ended?.at}` : '');
     let length: number;
     try {
       length = this.store.getStateLen(AGENT_REGISTRY_ENDED_ID) ?? 0;
@@ -11904,7 +11909,8 @@ export class AgentFramework {
       return undefined;
     }
     for (let attempt = 0; attempt < 2; attempt++) {
-      if (length < this.endedLogIndexed) {
+      if (length < this.endedLogIndexed
+        || (this.endedLogIndexed > 0 && mark(read(this.endedLogIndexed - 1)) !== this.endedLogTail)) {
         this.endedLogIndex.clear();
         this.endedLogIndexed = 0;
       }
@@ -11913,6 +11919,7 @@ export class AgentFramework {
         if (record?.ended && typeof record.name === 'string') this.endedLogIndex.set(record.name, index);
       }
       this.endedLogIndexed = length;
+      this.endedLogTail = length > 0 ? mark(read(length - 1)) : '';
       const at = this.endedLogIndex.get(name);
       if (at === undefined) return undefined;
       const record = read(at);

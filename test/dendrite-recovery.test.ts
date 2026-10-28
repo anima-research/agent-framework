@@ -255,6 +255,36 @@ describe('the registry\'s recovery', () => {
     assert.equal(second.getAgentRecord('never-was'), null);
   });
 
+  it('the ended log\'s index follows a log that changed under it, as long or shorter', async () => {
+    const first = await boot();
+    await first.stop();
+    const ended = (name: string, i: number) => ({
+      name, kind: 'worker', incarnation: 1, onParentEnd: 'orphan', readsSharedSlot: false,
+      roles: { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false },
+      lifetime: { kind: 'task', idleTimeoutMs: 1000 }, relationships: { observes: [], messagePeers: [] },
+      createdAt: i, ended: { at: i + 1, reason: 'completed' },
+    });
+    const store = JsStore.openOrCreate({ path: storePath() });
+    try {
+      for (let i = 0; i < 300; i++) store.appendToStateJson(ENDED, ended(`old-${i}`, i));
+      store.sync();
+    } finally { store.close(); }
+    const second = await boot();
+    assert.equal(second.getAgentRecord('old-0')?.ended?.reason, 'completed', 'the index is built');
+    // A branch switch puts another ended log in its place: as long, then shorter.
+    const live = second.getStore() as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const len = live.getStateLen!.bind(live);
+    const item = live.getStateItemJson!.bind(live);
+    for (const [prefix, count] of [['other', 300], ['short', 100]] as const) {
+      const log = Array.from({ length: count }, (_, i) => ended(`${prefix}-${i}`, 1000 + i));
+      Object.defineProperty(live, 'getStateLen', { configurable: true, writable: true, value: (id: string) => (id === ENDED ? log.length : len(id)) });
+      Object.defineProperty(live, 'getStateItemJson', { configurable: true, writable: true, value: (id: string, i: number) => (id === ENDED ? log[i] ?? null : item(id, i)) });
+      assert.equal(second.getAgentRecord(`${prefix}-5`)?.ended?.reason, 'completed', `a name only on the ${prefix} log is found`);
+    }
+    delete live.getStateLen;
+    delete live.getStateItemJson;
+  });
+
   it('a finished orphan\'s held result is told of, and adopting the ended orphan delivers it', async () => {
     const gates = new GateModule();
     const first = await boot(gates);
