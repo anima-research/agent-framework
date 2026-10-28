@@ -24,7 +24,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DISK_AGREEMENT_RECORD_TYPE, DiskAgreement, onlyDeviceDiffers, sameRootIdentity } from '../src/modules/workspace/disk-agreement.js';
 import { RecordJournal } from '../src/record-journal.js';
-import { ROOT_ON_ANOTHER_DEVICE, ROOT_REPLACED, confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
+import { ROOT_ON_ANOTHER_DEVICE, ROOT_REPLACED, confirmAbsent, filesystemKeepsBirthTime, fingerprintVouches, filesystemTrustsCtime, fsTypeKeepsBirthTime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
@@ -229,7 +229,7 @@ async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promis
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
-async function withFsPromises<T>(name: 'readdir' | 'lstat' | 'open' | 'realpath', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+async function withFsPromises<T>(name: 'readdir' | 'lstat' | 'open' | 'realpath' | 'statfs', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
   const original = fsp[name]!;
   fsp[name] = make(original);
@@ -4739,6 +4739,20 @@ describe('fingerprints', () => {
     assert.equal(await filesystemTrustsCtime(env.dir), expected);
   });
 
+  test('a filesystem keeps a birth time fixed only where it is listed, and only on Linux', async (t) => {
+    for (const fixed of [0xef53, 0x58465342, 0x9123683e, 0x01021994, 0xf2f52010, 0x2fc12fc1]) {
+      assert.equal(fsTypeKeepsBirthTime(fixed), true, fixed.toString(16));
+    }
+    // overlayfs gives a directory copied up from a lower layer a later birth time; NFS, FUSE, SMB2 and 9p report what their server or backing gives.
+    for (const unfixed of [0x794c7630, 0x6969, 0x65735546, 0xfe534d42, 0x01021997]) {
+      assert.equal(fsTypeKeepsBirthTime(unfixed), false, unfixed.toString(16));
+    }
+    assert.equal(fsTypeKeepsBirthTime(BigInt(0xef53)), true, 'a bigint f_type reads the same');
+    const env = new Env(t);
+    const expected = process.platform === 'linux' && fsTypeKeepsBirthTime((await statfs(env.dir)).type);
+    assert.equal(await filesystemKeepsBirthTime(env.dir), expected);
+  });
+
   // The racy window itself is pinned by fingerprintVouches' unit assertions
   // above: reaching it here would take a write that leaves mtime and ctime
   // unchanged, which no restore can do, since ctime can't be set.
@@ -8284,18 +8298,22 @@ describe('the mount root', () => {
   });
 
   test('identities on different devices with another inode, another birth time, or no birth time to compare are different directories', () => {
-    assert.equal(sameRootIdentity({ dev: '1', ino: '2', born: '5' }, { dev: '3', ino: '4', born: '5' }), false, 'another inode');
-    assert.equal(sameRootIdentity({ dev: '1', ino: '2', born: '5' }, { dev: '3', ino: '2', born: '6' }), false, 'another birth time');
-    assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '3', ino: '2' }), false);
-    assert.equal(sameRootIdentity({ dev: '1', ino: '2', born: '5' }, { dev: '3', ino: '2' }), false);
-    assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '3', ino: '2', born: '5' }), false);
+    for (const bornFixed of [true, false]) {
+      assert.equal(sameRootIdentity({ dev: '1', ino: '2', born: '5' }, { dev: '3', ino: '4', born: '5' }, bornFixed), false, 'another inode');
+      assert.equal(sameRootIdentity({ dev: '1', ino: '2', born: '5' }, { dev: '3', ino: '2', born: '6' }, bornFixed), false, 'another birth time');
+      assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '3', ino: '2' }, bornFixed), false);
+      assert.equal(sameRootIdentity({ dev: '1', ino: '2', born: '5' }, { dev: '3', ino: '2' }, bornFixed), false);
+      assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '3', ino: '2', born: '5' }, bornFixed), false);
+    }
   });
 
   test('two volume roots on different devices born in the same whole second are different directories', () => {
     // As two ext4 filesystems an installer made in one second show them: inode 2, and a birth time in whole seconds.
     const second = '1792560071000000000';
-    assert.equal(sameRootIdentity({ dev: '65028', ino: '2', born: second }, { dev: '65027', ino: '2', born: second }), false);
-    assert.equal(sameRootIdentity({ dev: '65028', ino: '2', born: second }, { dev: '65028', ino: '2', born: second }), true, 'on one device, as before');
+    for (const bornFixed of [true, false]) {
+      assert.equal(sameRootIdentity({ dev: '65028', ino: '2', born: second }, { dev: '65027', ino: '2', born: second }, bornFixed), false);
+      assert.equal(sameRootIdentity({ dev: '65028', ino: '2', born: second }, { dev: '65028', ino: '2', born: second }, bornFixed), true, 'on one device, as before');
+    }
   });
 
   test('a root recorded without its birth time gains it at the next pass, which keeps it across a restart', async (t) => {
@@ -8359,19 +8377,55 @@ describe('the mount root', () => {
     ['nothing', (env: Env) => { renameSync(env.dir, `${env.dir}-away`); }, false],
     ['a file', (env: Env) => { renameSync(env.dir, `${env.dir}-away`); writeFileSync(env.dir, 'not a directory'); }, false],
   ] as const) {
-    test(`status names a mount with ${what} at its root's path in the words sync lists, beside the identity recorded and the one there now, asked for every mount or that one`, async (t) => {
+    test(`status names a mount with ${what} at its root's path in the words sync lists: for that mount from disk, beside the identity recorded and the one there now; for every mount as its last pass found it, and when`, async (t) => {
       const env = new Env(t);
       const m = await env.open();
       const recorded = identityOf(env.dir);
       await seedSynced(env, m, 'a.txt', 'A');
       change(env);
 
-      const root = (await call(m, 'status', {})).work.root;
-      assert.deepEqual(root, shown({ recorded, now: directoryThere ? identityOf(env.dir) : null, unavailable: rootRegion(await call(m, 'sync', {})) }));
-      assert.equal(typeof root.unavailable, 'string');
-      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, root);
+      assert.equal((await call(m, 'status', {})).work.root, undefined, 'every mount: the last pass, before the change, could use the root');
+      const one = (await call(m, 'status', { mount: 'work' })).work;
+      const before = new Date().toISOString();
+      const listed = rootRegion(await call(m, 'sync', {}));
+      assert.equal(typeof listed, 'string');
+      assert.deepEqual(one.root, shown({ recorded, now: directoryThere ? identityOf(env.dir) : null, unavailable: listed }), 'that mount: as disk shows it now');
+      assert.equal(one.canMaterialize, false);
+      const every = (await call(m, 'status', {})).work;
+      assert.deepEqual(Object.keys(every.root).sort(), ['lastPassAt', 'unavailable']);
+      assert.equal(every.root.unavailable, listed, 'every mount: the last pass\'s words');
+      assert.ok(every.root.lastPassAt >= before && every.root.lastPassAt <= new Date().toISOString(), 'and when it ran');
+      assert.equal(every.canMaterialize, false);
     });
   }
+
+  test('status for every mount reads no root from disk', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const rootReal = realpathSync(env.dir);
+    let reads = 0;
+    const counting = (name: 'lstat' | 'realpath' | 'statfs') => (fn: () => Promise<unknown>) => withFsPromises(name, (original) => async (path: string, ...rest: unknown[]) => {
+      if (String(path) === rootReal || String(path) === env.dir) reads++;
+      return original(path, ...rest);
+    }, fn);
+    await counting('lstat')(() => counting('realpath')(() => counting('statfs')(() => call(m, 'status', {}))));
+    assert.equal(reads, 0);
+    await counting('lstat')(() => call(m, 'status', { mount: 'work' }));
+    assert.ok(reads > 0, 'status for that mount does read it');
+  });
+
+  test('status for every mount shows the root as the last pass found it, where that pass decided nothing too', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    unmount(env);
+    const mount = (m as any).mounts.get('work');
+    const pass = await (m as any).withMount(mount, () => (m as any).passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { branchId: 'a branch the pass is not on' }));
+    assert.equal(typeof pass.undecided, 'string', 'the pass decided nothing');
+    const every = (await call(m, 'status', {})).work.root;
+    assert.equal(every.unavailable, rootRegion(await call(m, 'sync', {})));
+  });
 
   test('status shows a root a pass can use only when asked for that mount: as recorded, or renumbered with its birth time', async (t) => {
     const env = new Env(t);
@@ -8400,9 +8454,11 @@ describe('the mount root', () => {
 
     assert.equal(ROOT_REPLACED, 'the mount root is not the directory disk last agreed with (an unmounted drive, a directory moved aside, or a replaced one); whoever runs this host can say which: a drive they can reconnect, a directory moved aside they can put back, and a replaced directory a sync of the mount with acceptRoot takes as it is now');
     assert.equal(ROOT_ON_ANOTHER_DEVICE, 'the mount root has the inode disk last agreed with, but another device number: a reboot can renumber a volume, and another volume mounted at the same place can have a root with the same inode; whoever runs this host can say which, and if it is the same directory, a sync of the mount with acceptRoot takes it as it is now; if not, they can mount the right volume');
-    assert.deepEqual((await call(m, 'status', {})).work.root, shown({ recorded, now, unavailable: ROOT_ON_ANOTHER_DEVICE }));
-    assert.equal((await call(m, 'status', {})).work.canMaterialize, true, 'canMaterialize keeps its meaning: the branch guard lets it');
+    const one = (await call(m, 'status', { mount: 'work' })).work;
+    assert.deepEqual(one.root, shown({ recorded, now, unavailable: ROOT_ON_ANOTHER_DEVICE }));
+    assert.equal(one.canMaterialize, false, 'canMaterialize says what materialize will do');
     assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE);
+    assert.equal((await call(m, 'status', {})).work.root.unavailable, ROOT_ON_ANOTHER_DEVICE, 'every mount: as the last pass found it');
     assert.equal(rootRegion(await call(m, 'ls', { path: 'work' })), ROOT_ON_ANOTHER_DEVICE);
     const materialized = await call(m, 'materialize', {});
     assert.deepEqual(materialized.skipped, [{ mount: 'work', reason: `c.txt: ${ROOT_ON_ANOTHER_DEVICE}` }]);
@@ -8415,6 +8471,7 @@ describe('the mount root', () => {
     const accepted = await call(m, 'sync', { mount: 'work', acceptRoot: true });
     assert.deepEqual(accepted.rootsAccepted, ['work']);
     assert.equal((await call(m, 'status', {})).work.root, undefined);
+    assert.equal((await call(m, 'status', {})).work.canMaterialize, true);
     assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: now, now }), 'the root as it is now is the one recorded');
     await call(m, 'materialize', {});
     assert.equal(env.readDisk('c.txt'), 'C, a draft', 'the draft went out');
@@ -8428,48 +8485,93 @@ describe('the mount root', () => {
     }, fn);
   }
 
+  const EXT4 = 0xef53;
+  const OVERLAYFS = 0x794c7630;
+  /** Run `fn` with statfs giving the root's filesystem as `type`. */
+  async function withRootFsType<T>(env: Env, type: number, fn: () => Promise<T>): Promise<T> {
+    const rootReal = realpathSync(env.dir);
+    return withFsPromises('statfs', (statfs) => async (path: string, ...rest: unknown[]) => {
+      const info = await statfs(path, ...rest);
+      return String(path) === rootReal ? Object.assign(Object.create(Object.getPrototypeOf(info)), info, { type }) : info;
+    }, fn);
+  }
+
   test('a root with the recorded inode on another device is named as that where its birth time is the recorded one in whole seconds, or earlier, and as another directory where it is later', async (t) => {
+    if (process.platform !== 'linux') {
+      t.skip('the born-later rule applies only where Linux names a filesystem that keeps a birth time fixed');
+      return;
+    }
     const env = new Env(t);
-    let m = await env.open();
-    await seedSynced(env, m, 'a.txt', 'A');
-    const now = rootWithBirthTime(t, env);
-    if (!now) return;
-    const second = String((BigInt(now.born) / 1_000_000_000n - 1n) * 1_000_000_000n);
-    m = await recordedAs(env, m, { dev: bumped(now.dev), ino: now.ino, born: second });
-    assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED, 'a whole second against a birth time below it');
-    await withRootBorn(env, BigInt(second), async () => {
-      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'the same whole second tells nothing');
-      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'and still nothing on a second look');
+    await withRootFsType(env, EXT4, async () => {
+      let m = await env.open();
+      await seedSynced(env, m, 'a.txt', 'A');
+      const now = rootWithBirthTime(t, env);
+      if (!now) return;
+      const second = String((BigInt(now.born) / 1_000_000_000n - 1n) * 1_000_000_000n);
+      m = await recordedAs(env, m, { dev: bumped(now.dev), ino: now.ino, born: second });
+      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED, 'a whole second against a birth time below it');
+      await withRootBorn(env, BigInt(second), async () => {
+        assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'the same whole second tells nothing');
+        assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'and still nothing on a second look');
+      });
+      await withRootBorn(env, BigInt(second) + 1_000_000_000n, async () => {
+        assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED, 'a whole second later');
+      });
+      await withRootBorn(env, BigInt(second) - 1_000_000_000n, async () => {
+        assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'a whole second earlier, as utimes can move it');
+      });
+      m = await recordedAs(env, m, { dev: bumped(now.dev), ino: now.ino, born: earlier(now.born) });
+      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED, 'born below the second, after the recorded one');
+      m = await recordedAs(env, m, { dev: bumped(now.dev), ino: now.ino, born: bumped(now.born) });
+      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'born below the second, before the recorded one');
     });
-    await withRootBorn(env, BigInt(second) + 1_000_000_000n, async () => {
-      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED, 'a whole second later');
-    });
-    await withRootBorn(env, BigInt(second) - 1_000_000_000n, async () => {
-      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'a whole second earlier, as utimes can move it');
-    });
-    m = await recordedAs(env, m, { dev: bumped(now.dev), ino: now.ino, born: earlier(now.born) });
-    assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED, 'born below the second, after the recorded one');
-    m = await recordedAs(env, m, { dev: bumped(now.dev), ino: now.ino, born: bumped(now.born) });
-    assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_ON_ANOTHER_DEVICE, 'born below the second, before the recorded one');
   });
 
-  test('a root with the recorded inode on its own device, born after the recorded one, is another directory, as where a directory is made again in a removed one\'s place; one born before it is the same', async (t) => {
+  test('a root with the recorded inode on its own device, born after the recorded one, is another directory where its filesystem keeps a birth time fixed, as ext4 does for a directory made again in a removed one\'s place; one born before it is the same', async (t) => {
+    if (process.platform !== 'linux') {
+      t.skip('the born-later rule applies only where Linux names a filesystem that keeps a birth time fixed');
+      return;
+    }
     const env = new Env(t);
-    let m = await env.open();
-    await seedSynced(env, m, 'a.txt', 'A');
-    const now = rootWithBirthTime(t, env);
-    if (!now) return;
-    const recorded = { dev: now.dev, ino: now.ino, born: earlier(now.born) };
-    m = await recordedAs(env, m, recorded);
-    assert.deepEqual((await call(m, 'status', {})).work.root, shown({ recorded, now, unavailable: ROOT_REPLACED }));
-    assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED);
-    assert.deepEqual((await call(m, 'sync', { mount: 'work', acceptRoot: true })).rootsAccepted, ['work']);
-    assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: now, now }));
+    await withRootFsType(env, EXT4, async () => {
+      let m = await env.open();
+      await seedSynced(env, m, 'a.txt', 'A');
+      const now = rootWithBirthTime(t, env);
+      if (!now) return;
+      const recorded = { dev: now.dev, ino: now.ino, born: earlier(now.born) };
+      m = await recordedAs(env, m, recorded);
+      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded, now, unavailable: ROOT_REPLACED }));
+      assert.equal(rootRegion(await call(m, 'sync', {})), ROOT_REPLACED);
+      assert.deepEqual((await call(m, 'sync', { mount: 'work', acceptRoot: true })).rootsAccepted, ['work']);
+      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: now, now }));
 
-    const later = { dev: now.dev, ino: now.ino, born: bumped(now.born) };
-    m = await recordedAs(env, m, later);
-    assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: later, now }), 'a birth time moved earlier, as macOS moves it for an earlier time utimes sets');
-    assert.equal(rootRegion(await call(m, 'sync', {})), undefined);
+      const later = { dev: now.dev, ino: now.ino, born: bumped(now.born) };
+      m = await recordedAs(env, m, later);
+      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: later, now }), 'a birth time earlier than the recorded one');
+      assert.equal(rootRegion(await call(m, 'sync', {})), undefined);
+    });
+  });
+
+  test('a root with the recorded inode born after the recorded one is the recorded root where its filesystem doesn\'t keep a birth time fixed, as overlayfs gives a directory it copies up a later one, and on another device it is named as device-only', async (t) => {
+    const env = new Env(t);
+    const unfixed = <T>(fn: () => Promise<T>) => (process.platform === 'linux' ? withRootFsType(env, OVERLAYFS, fn) : fn());
+    await unfixed(async () => {
+      let m = await env.open();
+      await seedSynced(env, m, 'a.txt', 'A');
+      const now = rootWithBirthTime(t, env);
+      if (!now) return;
+      const recorded = { dev: now.dev, ino: now.ino, born: earlier(now.born) };
+      m = await recordedAs(env, m, recorded);
+      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded, now }));
+      env.writeDisk('b.txt', 'B');
+      const synced = await call(m, 'sync', {});
+      assert.equal(rootRegion(synced), undefined, 'a sync uses it');
+      assert.ok(synced.results.some((r: any) => r.synced?.includes('b.txt')), 'and takes in its file');
+      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded, now: identityOf(env.dir) }), 'the record keeps its birth time');
+
+      m = await recordedAs(env, m, { ...recorded, dev: bumped(now.dev) });
+      assert.equal((await call(m, 'status', { mount: 'work' })).work.root.unavailable, ROOT_ON_ANOTHER_DEVICE, 'another device');
+    });
   });
 
   test('a birth time equal to the ctime, as where statx is unavailable and the ctime stands in, is no birth time: on its own device the root is the one recorded, and on another it is named as device-only', async (t) => {
@@ -8486,11 +8588,11 @@ describe('the mount root', () => {
     });
     m = await recordedAs(env, m, { dev: bumped(dev), ino, born: then });
     await withRootBorn(env, ctime, async () => {
-      assert.deepEqual((await call(m, 'status', {})).work.root, shown({ recorded: { dev: bumped(dev), ino, born: then }, now: { dev, ino }, unavailable: ROOT_ON_ANOTHER_DEVICE }), 'another device');
+      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: { dev: bumped(dev), ino, born: then }, now: { dev, ino }, unavailable: ROOT_ON_ANOTHER_DEVICE }), 'another device');
     });
   });
 
-  test('identities: the same directory, and where only the device tells them apart, for every pair of birth times recorded and now', () => {
+  test('identities: the same directory, and where only the device tells them apart, for every pair of birth times recorded and now, where the filesystem keeps a birth time fixed and where it doesn\'t', () => {
     const second = '1792560071000000000';
     const nextSecond = '1792560072000000000';
     const frac = '1792560071123456789';
@@ -8512,13 +8614,19 @@ describe('the mount root', () => {
     ];
     const withBorn = (dev: string, born: string | undefined) => ({ dev, ino: '2', ...(born !== undefined ? { born } : {}) });
     for (const [label, recorded, now, sameDevice, otherDevice, deviceOnly] of cases) {
-      assert.equal(sameRootIdentity(withBorn('1', recorded), withBorn('1', now)), sameDevice, `${label}: one device`);
-      assert.equal(onlyDeviceDiffers(withBorn('1', recorded), withBorn('1', now)), false, `${label}: one device is never device-only`);
-      assert.equal(sameRootIdentity(withBorn('1', recorded), withBorn('3', now)), otherDevice, `${label}: another device, same directory`);
-      assert.equal(onlyDeviceDiffers(withBorn('1', recorded), withBorn('3', now)), deviceOnly, `${label}: another device, device-only`);
+      assert.equal(sameRootIdentity(withBorn('1', recorded), withBorn('1', now), true), sameDevice, `${label}: one device`);
+      assert.equal(onlyDeviceDiffers(withBorn('1', recorded), withBorn('1', now), true), false, `${label}: one device is never device-only`);
+      assert.equal(sameRootIdentity(withBorn('1', recorded), withBorn('3', now), true), otherDevice, `${label}: another device, same directory`);
+      assert.equal(onlyDeviceDiffers(withBorn('1', recorded), withBorn('3', now), true), deviceOnly, `${label}: another device, device-only`);
+      assert.equal(sameRootIdentity(withBorn('1', recorded), withBorn('1', now), false), true, `${label}, not fixed: one device`);
+      assert.equal(onlyDeviceDiffers(withBorn('1', recorded), withBorn('1', now), false), false, `${label}, not fixed: one device is never device-only`);
+      assert.equal(sameRootIdentity(withBorn('1', recorded), withBorn('3', now), false), otherDevice, `${label}, not fixed: another device, same directory`);
+      assert.equal(onlyDeviceDiffers(withBorn('1', recorded), withBorn('3', now), false), !otherDevice, `${label}, not fixed: another device, device-only`);
     }
-    assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '1', ino: '4' }), false, 'another inode');
-    assert.equal(onlyDeviceDiffers({ dev: '1', ino: '2' }, { dev: '3', ino: '4' }), false, 'another inode, another device');
+    for (const bornFixed of [true, false]) {
+      assert.equal(sameRootIdentity({ dev: '1', ino: '2' }, { dev: '1', ino: '4' }, bornFixed), false, 'another inode');
+      assert.equal(onlyDeviceDiffers({ dev: '1', ino: '2' }, { dev: '3', ino: '4' }, bornFixed), false, 'another inode, another device');
+    }
   });
 
   test('status for a mount with nothing in it answers while the store\'s record of disk can\'t be read back, its root unavailable with the step that reopens it, and one with files refuses as before', async (t) => {
@@ -8623,13 +8731,26 @@ describe('the mount root', () => {
         assert.equal(env.readDisk('a.txt'), 'A');
       }
       const after = identityOf(env.dir);
-      const expected = first === 'sync' || after.born === undefined ? { recorded: first === 'sync' ? after : now, now: after }
+      const fixed = process.platform === 'linux';
+      const expected = first === 'sync' || after.born === undefined || !fixed ? { recorded: first === 'sync' ? after : now, now: after }
         : { recorded: now, now: after, note: 'no birth time is recorded of this root yet, so a directory made again in its place with the same inode can\'t be told from it; the next sync or ls of this mount records it' };
-      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown(expected), `${first}: recorded`);
+      const root = fixed ? await withRootFsType(env, EXT4, async () => (await call(m, 'status', { mount: 'work' })).work.root) : (await call(m, 'status', { mount: 'work' })).work.root;
+      assert.deepEqual(root, shown(expected), `${first}: recorded`);
     }
   });
 
-  test('status for one mount says no birth time is recorded of a root recorded without one, and the next ls or sync records it', async (t) => {
+  test('status for a read-only mount with nothing recorded names only the sync that records its root', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ mode: 'read-only' });
+    const now = identityOf(env.dir);
+    assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: null, now, note: 'nothing is recorded of this root yet, so any directory at its path is taken as it; the first sync that takes in a file records it' }));
+    env.writeDisk('a.txt', 'A');
+    await call(m, 'sync', {});
+    const after = identityOf(env.dir);
+    assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: after, now: after }), 'the sync recorded it');
+  });
+
+  test('status for one mount says no birth time is recorded of a root recorded without one, where its filesystem keeps a birth time fixed, and the next ls or sync records it; elsewhere it gives no note', async (t) => {
     const unrecorded = 'no birth time is recorded of this root yet, so a directory made again in its place with the same inode can\'t be told from it; the next sync or ls of this mount records it';
     for (const next of ['ls', 'sync'] as const) {
       const env = new Env(t);
@@ -8640,7 +8761,16 @@ describe('the mount root', () => {
       const recorded = { dev: now.dev, ino: now.ino };
       m = await recordedAs(env, m, recorded);
       assert.equal((await call(m, 'status', {})).work.root, undefined, `${next}: every mount`);
-      assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded, now, note: unrecorded }), `${next}: that mount`);
+      if (process.platform === 'linux') {
+        await withRootFsType(env, OVERLAYFS, async () => {
+          assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded, now }), `${next}: no note where birth times aren't fixed`);
+        });
+        await withRootFsType(env, EXT4, async () => {
+          assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded, now, note: unrecorded }), `${next}: that mount`);
+        });
+      } else {
+        assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded, now }), `${next}: no note off Linux`);
+      }
       await call(m, next, next === 'ls' ? { path: 'work' } : {});
       assert.deepEqual((await call(m, 'status', { mount: 'work' })).work.root, shown({ recorded: now, now }), `${next}: recorded`);
     }

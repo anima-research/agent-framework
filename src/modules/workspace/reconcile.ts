@@ -169,6 +169,8 @@ export interface PassResult {
   branchId?: string;
   /** Why it decided nothing, where it didn't. */
   undecided?: string;
+  /** The words it listed for a root it couldn't use, or null where it used it, from its last look at the root. */
+  rootListed?: string | null;
 }
 
 export interface MountRuntime {
@@ -942,6 +944,7 @@ interface Gathered {
   branchId: string;
   /** The root the facts were gathered under, when it was available. */
   rootIdentity: RootIdentity | null;
+  rootListed: string | null;
   walk: Walk | null;
   facts: Map<string, DiskFact>;
   dirs: string[];
@@ -951,7 +954,7 @@ interface Gathered {
 /** How often a pass gathers again when the branch changes under it. */
 const GATHER_ATTEMPTS = 3;
 
-export async function passRoot(mount: Pick<MountRuntime, 'view' | 'rootReal'>): Promise<{ identity: RootIdentity } | { unavailable: string; cause: Cause; listed: string }> {
+export async function passRoot(mount: Pick<MountRuntime, 'view' | 'rootReal'>): Promise<{ identity: RootIdentity; bornFixed: boolean } | { unavailable: string; cause: Cause; listed: string }> {
   const root = await locateRoot(mount.view, mount.rootReal);
   if ('identity' in root) return root;
   const cause: Cause = root.errno !== undefined ? { errno: root.errno } : {};
@@ -976,6 +979,7 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   const gathered: Gathered = {
     branchId,
     rootIdentity: 'identity' in root ? root.identity : null,
+    rootListed,
     walk: null,
     facts: new Map(),
     dirs: [],
@@ -1090,14 +1094,15 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // now, nothing observed counts and nothing is decided from it.
   if (gathered.rootIdentity !== null) {
     const after = await locateRoot(mount.view, mount.rootReal);
-    if (!('identity' in after) || !sameRootIdentity(gathered.rootIdentity, after.identity)) {
+    if (!('identity' in after) || !sameRootIdentity(gathered.rootIdentity, after.identity, after.bornFixed)) {
       const reason = 'reason' in after ? after.reason : ROOT_REPLACED;
       const errno = 'errno' in after ? after.errno : undefined;
       for (const path of gathered.facts.keys()) gathered.facts.set(path, { kind: 'unobserved', reason, ...(errno !== undefined ? { errno } : {}) });
       gathered.rootIdentity = null;
+      gathered.rootListed = explained(reason, errno !== undefined ? { errno } : {}, 'list');
       gathered.walk = null;
       gathered.dirs = [];
-      gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: explained(reason, errno !== undefined ? { errno } : {}, 'list') });
+      gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: gathered.rootListed });
     }
   }
   return gathered;
@@ -1128,6 +1133,7 @@ export async function reconcilePass(
   let gathered: Gathered | null = null;
   for (let attempt = 0; attempt < GATHER_ATTEMPTS; attempt++) {
     const next = await gather(store, agreement, mount, scope, opts);
+    result.rootListed = next.rootListed;
     if (store.currentBranch().id === next.branchId) {
       gathered = next;
       break;
@@ -1477,7 +1483,7 @@ export async function pushPaths(
   // replaced meanwhile they describe the replacement, so, as a pass does,
   // nothing is decided or recorded from them.
   const after = await locateRoot(mount.view, mount.rootReal);
-  if (!('identity' in after) || !sameRootIdentity(root.identity, after.identity)) {
+  if (!('identity' in after) || !sameRootIdentity(root.identity, after.identity, after.bornFixed)) {
     const reason = 'reason' in after ? explained(after.reason, after.errno !== undefined ? { errno: after.errno } : {}, 'write') : ROOT_REPLACED;
     for (const path of paths) result.skipped.push({ path, reason });
     return result;

@@ -1032,6 +1032,8 @@ export class CheckedDir {
     private readonly dev: bigint,
     private readonly ino: bigint,
     private readonly born: bigint,
+    /** For the root: whether its filesystem keeps a birth time fixed (filesystemKeepsBirthTime). */
+    readonly bornFixed = false,
   ) {}
 
   /** Which directory it is. */
@@ -1100,7 +1102,7 @@ export async function rootAbsence(root: string): Promise<string | undefined> {
 async function checkedAt(view: MountView, rel: string, real: string): Promise<CheckedDir | null> {
   const info = await lstat(real, { bigint: true }).catch(() => null);
   if (!info?.isDirectory()) return null;
-  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, bornOf(info));
+  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, bornOf(info), rel === '' && await filesystemKeepsBirthTime(real));
 }
 
 function bornOf(info: BigIntStats): bigint {
@@ -1152,8 +1154,8 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     // A root that isn't the directory disk last agreed under proves nothing
     // about the files that agreed: an empty mountpoint where a drive was
     // would otherwise read as every file deleted.
-    if (rel === '' && view.rootIdentity && !sameRootIdentity(view.rootIdentity, checked.identity())) {
-      return { kind: 'unobserved', reason: onlyDeviceDiffers(view.rootIdentity, checked.identity()) ? ROOT_ON_ANOTHER_DEVICE : ROOT_REPLACED };
+    if (rel === '' && view.rootIdentity && !sameRootIdentity(view.rootIdentity, checked.identity(), checked.bornFixed)) {
+      return { kind: 'unobserved', reason: onlyDeviceDiffers(view.rootIdentity, checked.identity(), checked.bornFixed) ? ROOT_ON_ANOTHER_DEVICE : ROOT_REPLACED };
     }
     return { kind: 'checked', dir: checked };
   }
@@ -1164,9 +1166,9 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
  * The mount root as it is now: its identity if it is available (a directory,
  * the one the pass was given, and the one disk last agreed under), else why not.
  */
-export async function locateRoot(view: MountView, rootReal: string): Promise<{ identity: RootIdentity } | { reason: string; errno?: string }> {
+export async function locateRoot(view: MountView, rootReal: string): Promise<{ identity: RootIdentity; bornFixed: boolean } | { reason: string; errno?: string }> {
   const found = await checkRoot(view, rootReal);
-  return 'dir' in found ? { identity: found.dir.identity() } : found;
+  return 'dir' in found ? { identity: found.dir.identity(), bornFixed: found.dir.bornFixed } : found;
 }
 
 /** The mount root as locateRoot finds it, checked, so a caller can ask later whether it's still there. */
@@ -1366,6 +1368,34 @@ export async function filesystemTrustsCtime(root: string): Promise<boolean> {
   if (process.platform !== 'linux') return false;
   try {
     return fsTypeTrustsCtime((await statfs(root)).type);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Linux filesystems that give a directory its birth time when it is made and
+ * have no call that changes it (statfs f_type). Overlayfs isn't one: copying a
+ * directory up from a lower layer gives it the copy's birth time under the
+ * same device and inode.
+ */
+const BIRTH_FIXED_FS_TYPES = new Set<number>([
+  0xef53, // ext2/ext3/ext4
+  0x58465342, // xfs
+  0x9123683e, // btrfs
+  0x01021994, // tmpfs
+  0xf2f52010, // f2fs
+  0x2fc12fc1, // zfs
+]);
+
+export function fsTypeKeepsBirthTime(type: number | bigint): boolean {
+  return BIRTH_FIXED_FS_TYPES.has(Number(type) >>> 0);
+}
+
+export async function filesystemKeepsBirthTime(dir: string): Promise<boolean> {
+  if (process.platform !== 'linux') return false;
+  try {
+    return fsTypeKeepsBirthTime((await statfs(dir)).type);
   } catch {
     return false;
   }

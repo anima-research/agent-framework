@@ -122,7 +122,9 @@ const DIRECT_SYNC_SKIPPED = "a direct mount: its tools read disk as it is, so th
 /** Why materialize passes over a writable direct mount, as its result's `skipped` says. */
 const DIRECT_MATERIALIZE_SKIPPED = "a direct mount: its writes are on disk as they're made, so there's nothing to write";
 
-const NOTHING_RECORDED = 'nothing is recorded of this root yet, so any directory at its path is taken as it; the first sync that takes in a file, or materialize that writes one, records it';
+const NOTHING_RECORDED_YET = 'nothing is recorded of this root yet, so any directory at its path is taken as it';
+const NOTHING_RECORDED = `${NOTHING_RECORDED_YET}; the first sync that takes in a file, or materialize that writes one, records it`;
+const NOTHING_RECORDED_READ_ONLY = `${NOTHING_RECORDED_YET}; the first sync that takes in a file records it`;
 
 const BORN_UNRECORDED = 'no birth time is recorded of this root yet, so a directory made again in its place with the same inode can\'t be told from it; the next sync or ls of this mount records it';
 
@@ -1398,6 +1400,7 @@ export class WorkspaceModule implements Module {
   /** One disk→store pass; the caller holds the mount's turn. Emits its events. */
   private async passUnlocked(mount: MountState, scope: Scope, opts: PassOptions = {}): Promise<PassResult> {
     const result = await reconcilePass(this.getStore(), this.agreementOrThrow(), await this.runtime(mount), scope, opts);
+    if (result.rootListed !== undefined) mount.lastPassRoot = { at: new Date().toISOString(), listed: result.rootListed };
     if (scope.kind === 'dir' && scope.dir === '' && scope.recursive) mount.initialSyncDone = true;
     // What a pass says is another mount's directory names that mount and
     // the path to use there, as the file operations' refusal does: a copy's
@@ -5850,7 +5853,7 @@ export class WorkspaceModule implements Module {
     if (input.mount !== undefined && !this.mounts.has(input.mount)) {
       return { success: false, error: didNothing('status', this.noSuchMountField(input.mount, 'covers every mount')), isError: true };
     }
-    const asked = [...this.mounts].filter(([name, mount]) => !mount.direct && (input.mount === undefined || name === input.mount));
+    const asked = input.mount === undefined ? [] : [...this.mounts].filter(([name, mount]) => !mount.direct && name === input.mount);
     const roots = new Map(await Promise.all(asked.map(async ([name, mount]) => [name, await this.rootState(mount)] as const)));
 
     for (const [name, mount] of this.mounts) {
@@ -5871,7 +5874,8 @@ export class WorkspaceModule implements Module {
       const pending = new Set([...conflictPaths, ...deletionPaths, ...owed]);
 
       const currentBranch = store.currentBranch();
-      const root = roots.get(name)!;
+      const root = input.mount !== undefined ? roots.get(name)!
+        : mount.lastPassRoot?.listed ? { unavailable: mount.lastPassRoot.listed, lastPassAt: mount.lastPassRoot.at } : undefined;
       status[name] = {
         path: mount.config.path,
         mode: mount.config.backend === 'direct' ? mount.config.mode ?? 'read-write' : mount.config.mode,
@@ -5889,9 +5893,9 @@ export class WorkspaceModule implements Module {
         initialSyncDone: mount.initialSyncDone,
         currentBranch: currentBranch.name,
         lastMaterializedBranch: mount.lastMaterializedBranchId,
-        canMaterialize: this.mountMaterializeBlockReason(store, mount) === null,
+        canMaterialize: this.mountMaterializeBlockReason(store, mount) === null && root?.unavailable === undefined,
         ...(mount.lastAgentActionScan ? { lastAgentActionScan: mount.lastAgentActionScan } : {}),
-        ...(input.mount !== undefined || root.unavailable !== undefined ? { root } : {}),
+        ...(root !== undefined ? { root } : {}),
       };
     }
 
@@ -5922,8 +5926,8 @@ export class WorkspaceModule implements Module {
       return { recorded: asShown(recorded), now: asShown('identity' in there ? there.identity : null), unavailable: found.listed };
     }
     const note = this.agreementOrThrow().awaitsReopen ? undefined
-      : recorded === null ? NOTHING_RECORDED
-        : recorded.born === undefined && found.identity.born !== undefined ? BORN_UNRECORDED : undefined;
+      : recorded === null ? mount.config.mode === 'read-only' ? NOTHING_RECORDED_READ_ONLY : NOTHING_RECORDED
+        : recorded.born === undefined && found.identity.born !== undefined && found.bornFixed ? BORN_UNRECORDED : undefined;
     return { recorded: asShown(recorded), now: asShown(found.identity), ...(note !== undefined ? { note } : {}) };
   }
 
@@ -6446,7 +6450,7 @@ export class WorkspaceModule implements Module {
     if ('reason' in found) return false; // still missing: the pass says so
     const agreement = this.agreementOrThrow();
     const recorded = agreement.rootIdentity(mount.config.name);
-    if (recorded && sameRootIdentity(recorded, found.identity)) return false;
+    if (recorded && sameRootIdentity(recorded, found.identity, found.bornFixed)) return false;
     if (recorded) agreement.acceptRoot(mount.config.name, found.identity);
     else agreement.recordRootIdentity(mount.config.name, found.identity);
     agreement.barrier();

@@ -129,23 +129,24 @@ function sameRootPath(a: string, b: string): boolean {
 }
 
 /**
- * Whether the directory seen `now` is the one `recorded`: the same inode, not
- * born after the recorded one, since ext4 gives a directory made where one
- * was removed its inode again, and utimes moves a birth time only earlier (on
- * macOS); and the same device, or the same birth time on another device,
- * since macOS can give a volume another device number after a reboot. A
- * birth time in whole seconds doesn't count across devices: filesystems made
- * in the same second can give their roots one inode (2 on ext4) and one birth
- * time.
+ * Whether the directory seen `now` is the one `recorded`: the same inode, and
+ * not born after the recorded one where `now`'s filesystem keeps a birth time
+ * fixed (`bornFixed`), since ext4 gives a directory made where one was removed
+ * its inode again, while overlayfs gives a directory copied up from a lower
+ * layer a later birth time under the same inode; and the same device, or the
+ * same birth time on another device, since macOS can give a volume another
+ * device number after a reboot. A birth time in whole seconds doesn't count
+ * across devices: filesystems made in the same second can give their roots
+ * one inode (2 on ext4) and one birth time.
  */
-export function sameRootIdentity(recorded: RootIdentity, now: RootIdentity): boolean {
-  if (recorded.ino !== now.ino || bornLater(recorded, now)) return false;
+export function sameRootIdentity(recorded: RootIdentity, now: RootIdentity, bornFixed: boolean): boolean {
+  if (recorded.ino !== now.ino || (bornFixed && bornLater(recorded, now))) return false;
   if (recorded.dev === now.dev) return true;
   return fractional(recorded.born) && recorded.born === now.born;
 }
 
-export function onlyDeviceDiffers(recorded: RootIdentity, now: RootIdentity): boolean {
-  return !sameRootIdentity(recorded, now) && recorded.ino === now.ino && recorded.dev !== now.dev && !bornLater(recorded, now);
+export function onlyDeviceDiffers(recorded: RootIdentity, now: RootIdentity, bornFixed: boolean): boolean {
+  return !sameRootIdentity(recorded, now, bornFixed) && recorded.ino === now.ino && recorded.dev !== now.dev && !(bornFixed && bornLater(recorded, now));
 }
 
 function bornLater(recorded: RootIdentity, now: RootIdentity): boolean {
@@ -368,7 +369,7 @@ export class DiskAgreement {
   recordRootIdentity(mount: string, identity: RootIdentity): void {
     const recorded = this.rootIdentity(mount);
     if (recorded !== undefined) {
-      if (!sameRootIdentity(recorded, identity)) return;
+      if (!sameRootIdentity(recorded, identity, false)) return;
       const renumbered = recorded.dev !== identity.dev;
       const bornLearned = recorded.born === undefined && identity.born !== undefined;
       if (!renumbered && !bornLearned) return;
