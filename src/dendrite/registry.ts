@@ -125,16 +125,20 @@ export class AgentRegistry {
    * context came from is then history, so the context source no longer has
    * to be live. Who it reports to still does.
    */
-  register(spec: AgentSpec, options: { resume?: boolean } = {}): AgentRecord {
+  /**
+   * `after`: the incarnation a resumption continues from. The new one is past
+   * it, since the counter of a name that aged out of memory isn't kept.
+   */
+  register(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
     return this.requested(() => this.registerUnguarded(spec, options));
   }
 
-  private registerUnguarded(spec: AgentSpec, options: { resume?: boolean } = {}): AgentRecord {
+  private registerUnguarded(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
     this.validate(spec, options.resume === true);
     const previous = this.awaiting.get(spec.name);
     this.awaiting.delete(spec.name);
 
-    const incarnation = (this.incarnations.get(spec.name) ?? 0) + 1;
+    const incarnation = Math.max(this.incarnations.get(spec.name) ?? 0, options.after ?? 0) + 1;
     this.incarnations.set(spec.name, incarnation);
 
     const record: AgentRecord = {

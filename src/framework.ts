@@ -3710,6 +3710,8 @@ export class AgentFramework {
     spec: AgentSpec;
     /** A new incarnation of an identity that ended (see resumeAgent). */
     resume?: boolean;
+    /** The incarnation it resumes: the new one is past it, though the registry's counter for an aged-out name is gone. */
+    after?: number;
   }> = new WeakMap();
   /**
    * Derived agent → the agent whose tool presentation it shows. A derived
@@ -11057,7 +11059,7 @@ export class AgentFramework {
 
     this.usedEphemeralAgentNames.set(name, 'run'); // a resumed job is an ephemeral run: no global fallback (takesGlobalFallback)
     this.ephemeralAgents.add(agent); // and its usage counts in the shared ephemeral entry (#558)
-    this.ephemeralCandidates.set(agent, { contextManager, config: fullConfig, resume: true, spec });
+    this.ephemeralCandidates.set(agent, { contextManager, config: fullConfig, resume: true, after: record.incarnation, spec });
     this.managerReleases.set(agent, release);
     this.resumesPending.set(name, agent);
     const cleanup = () => {
@@ -12342,7 +12344,7 @@ export class AgentFramework {
     // Admit it to the registry first: a spec the registry refuses (spawner
     // or result recipient gone since creation) must not leave a live agent.
     this.announceAgentCreated(
-      this.registry.register(candidate.spec, { resume: candidate.resume === true }),
+      this.registry.register(candidate.spec, { resume: candidate.resume === true, after: candidate.after }),
     );
     // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);

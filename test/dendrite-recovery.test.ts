@@ -338,6 +338,29 @@ describe('the registry\'s recovery', () => {
     assert.equal(second.getAgentRecord('never-was'), null);
   });
 
+  it('a job resumed from the ended log alone registers past the incarnation it resumes', async () => {
+    const first = await boot();
+    await first.stop();
+    const store = JsStore.openOrCreate({ path: storePath() });
+    try {
+      // Aged out of memory: its counter is no longer in the snapshot.
+      store.appendToStateJson(ENDED, {
+        name: 'old-job', kind: 'worker', incarnation: 3, onParentEnd: 'orphan', readsSharedSlot: false, namespace: 'subagent/old-job',
+        roles: { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false },
+        lifetime: { kind: 'task', idleTimeoutMs: 60_000 }, relationships: { observes: [], messagePeers: [] },
+        createdAt: 1, ended: { at: 2, reason: 'stopped' },
+      });
+      store.sync();
+    } finally { store.close(); }
+    const second = await boot();
+    second.start();
+    membrane.script('old-job', say('done again'));
+    const resumed = await second.resumeAgent('old-job', { model: 'test-model', systemPrompt: 'x' });
+    resumed.contextManager.addMessage('user', [{ type: 'text', text: 'Go on.' }]);
+    await second.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+    assert.equal(second.getAgentRecord('old-job')?.incarnation, 4);
+  });
+
   it('an ended log that can\'t be read fails the lookup and the namespace check, rather than reading as empty', async () => {
     const first = await boot();
     first.start();
