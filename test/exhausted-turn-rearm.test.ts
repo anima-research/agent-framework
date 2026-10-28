@@ -378,17 +378,54 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
   });
 }
 
-test("a re-armed turn that got partway counts each deadline cut its error policy retried, so a cut that then exhausts it ends the re-arming", async (t) => {
+test("a re-armed turn that got partway gets the error policy's retry for its first deadline cut and none for its second, which ends the re-arming", async (t) => {
   const stalled = await stalledByMembrane(t);
   const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : n === 4 ? { toolRoundThen: stalled } : () => stalled));
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
   stderr.length = 0;
   r.say('zz-question');
   await waitFor(() => r.count('inference:exhausted') === 2, 'the re-armed turn to end exhausted');
-  assert.equal(membrane.sends.length, 6, "the window, then the re-armed turn's send and the error policy's two retries of its cuts");
-  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'its cut is not the chain\'s first, so nothing is re-armed');
+  assert.equal(membrane.sends.length, 5, "the window, then the re-armed turn's send and the error policy's one retry: its second cut gets none");
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'its second cut ends the re-arming');
   assert.ok(stderr.some((line) => line.startsWith("[inference-rearm] agent=resident turn not re-armed: its failure isn't transient (timeout)")),
     'the operator is told why no re-send is coming');
+});
+
+test("a cut the error policy retried in a re-armed turn that got partway counts, so the chain's next cut ends the re-arming", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 3 || n === 5 || n === 6 ? serverError : n === 4 ? { toolRoundThen: stalled } : () => stalled));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the re-armed turn, cut once and then failing with server errors, to end exhausted');
+  assert.equal(r.admission().providerAdmission.heldRequests, 1, 'its last failure was transient, so it is re-armed');
+  await waitFor(() => r.count('inference:exhausted') === 3, 'the next re-armed send to end exhausted, cut');
+  assert.equal(membrane.sends.length, 7);
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'that cut is the chain\'s second, so the re-arming ends');
+});
+
+test("a re-armed turn that got partway and ends on its chain's first deadline cut is re-armed, and writes the marker a partway turn does", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 3 || n === 5 ? serverError : n === 4 ? 'tool round, then a server error' : () => stalled));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the re-armed turn to end exhausted on its first cut');
+  assert.equal(membrane.sends.length, 6, "the window, then the re-armed turn's send and the error policy's two retries");
+  assert.equal(r.admission().providerAdmission.heldRequests, 1, "its first cut is taken as a transient failure, so it is re-armed");
+  assert.equal(r.markers(), 2, "the window's marker, and the one a re-armed turn that got partway writes");
+});
+
+test("a deadline cut a host's provider hold takes in a re-armed turn counts, so the held send's next cut ends the re-arming", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled));
+  let held = false;
+  const providerHold = (error: Error) => (error === stalled && !held ? (held = true, { holdMs: 100, reason: 'zz host hold' }) : undefined);
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100], providerHold });
+  stderr.length = 0;
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the held send, cut again, to end exhausted');
+  assert.equal(membrane.sends.length, 5, 'the window, the re-armed send the host held, and that send again');
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'the held cut was the chain\'s first, so this one ends the re-arming');
+  assert.ok(stderr.some((line) => line.startsWith("[inference-rearm] agent=resident turn not re-armed: its failure isn't transient (timeout)")));
 });
 
 for (const failsAt of ['setup', 'event'] as const) {
@@ -454,6 +491,28 @@ for (const [clears, script] of [
     await stepping(r.fw.stop(), 'the framework to stop before its store closes');
   });
 }
+
+test("a re-armed send cut at its start once stop() has begun leaves no cut for the next lifecycle", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  let stopping: Promise<void> | undefined;
+  let fw: AgentFramework | undefined;
+  const membrane = new ScriptedMembrane((n) => (n <= 3 || (n >= 5 && n <= 7) ? serverError
+    : n === 4 ? () => { stopping = fw!.stop(); return stalled; } : () => stalled), 'setup');
+  const storeDir = mkdtempSync(join(tmpdir(), 'turn-rearm-store-'));
+  const store = JsStore.openOrCreate({ path: join(storeDir, 'store') });
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100], store });
+  fw = r.fw;
+  t.after(() => { store.close(); rmSync(storeDir, { recursive: true, force: true }); });
+  r.say('zz-question');
+  await waitFor(() => stopping !== undefined, 'the re-armed send to start, and stop() to begin as its start fails');
+  await stepping(stopping!, 'the framework to stop');
+  const before = r.count('inference:exhausted');
+  r.fw.start();
+  queue(r, { reason: 'zz-wake' });
+  await waitFor(() => r.count('inference:exhausted') === before + 2, "the next lifecycle's window and its first re-armed send to end exhausted");
+  assert.equal(r.admission().providerAdmission.heldRequests, 1, "that cut is the new lifecycle's first, so it is re-armed");
+  await stepping(r.fw.stop(), 'the framework to stop before its store closes');
+});
 
 test("a stated wait on a re-armed turn's send holds it as it holds any turn, and what follows is still that re-arm's one send", async (t) => {
   const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : n === 4 ? statedWait(250) : n === 5 ? serverError : undefined));

@@ -243,22 +243,24 @@ export interface FrameworkConfig {
    * failure gets no retries from the error policy: on another transient
    * failure the next delay follows, until the list runs out, and a failure of
    * any other kind ends the re-arming. The one exception is a re-armed turn's
-   * send cut by a deadline membrane marks, as when a stream stalls: that
-   * counts as a transient failure once until a turn completes or a message is
-   * said to the agent, and a second such cut before then ends the re-arming.
-   * Every such cut counts, the error policy's retries of a re-armed turn that
-   * got partway included. A deadline the host sets still ends it. A wake for
-   * the agent while it waits starts its turn at once, with the re-armed
-   * trigger merged in. That turn is the wake's: the error policy retries its
-   * failures. A completed turn starts the count again, and so does a message
-   * said to the agent: not a system message or notice; not an edit, reaction
-   * or deletion, unless an edit is the first version of a message the agent
-   * sees; not a message its own view leaves out, such as one a tune-out holds
-   * from it; and not the agent's own schedule, the heartbeat's tick or
-   * reminder, a self-wake timer it set, or a script's wake. A notice a module
-   * or an MCPL server stores as a message counts. A message in the residents'
-   * shared slot counts for each resident that reads it. Any other wake leaves
-   * the count going on. A re-armed turn's transient failure writes no
+   * send cut by a deadline membrane marks, as when a stream stalls: the first
+   * such cut since a turn last completed or a message was last said to the
+   * agent counts as a transient failure, so a turn that ends on it is re-armed
+   * at the next delay, and a second such cut ends the re-arming, with no retry
+   * from the error policy even in a re-armed turn that got partway. Every such
+   * cut counts, including one the error policy retries or a host's provider
+   * hold takes. A deadline the host sets still ends it. A wake for the agent
+   * while it waits starts its turn at once, with the re-armed trigger merged
+   * in. That turn is the wake's: the error policy retries its failures. A
+   * completed turn starts the count again, and so does a message said to the
+   * agent: not a system message or notice; not an edit, reaction or deletion,
+   * unless an edit is the first version of a message the agent sees; not a
+   * message its own view leaves out, such as one a tune-out holds from it; and
+   * not the agent's own schedule, the heartbeat's tick or reminder, a
+   * self-wake timer it set, or a script's wake. A notice a module or an MCPL
+   * server stores as a message counts. A message in the residents' shared slot
+   * counts for each resident that reads it. Any other wake leaves the count
+   * going on. A re-armed turn's transient failure writes no
    * `[inference-failed]` marker unless a round of it ran or had its tool calls
    * cut off; any other failure of it writes one. Each counts toward the
    * hard-down streak. Ephemeral runs and conversation forks are never

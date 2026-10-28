@@ -6049,7 +6049,7 @@ export class AgentFramework {
     if (isTransientFailure(error)) return true;
     if (!isRearmed(trigger) || !isDeadlineExpiry(error)) return false;
     const first = !this.rearmDeadlineCuts.has(agentName);
-    this.rearmDeadlineCuts.add(agentName);
+    if (!this.providerAdmissionClosed) this.rearmDeadlineCuts.add(agentName);
     return first;
   }
 
@@ -21477,6 +21477,7 @@ export class AgentFramework {
       }
 
       const retry = trigger && withTurnCarry(trigger, carry);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
@@ -21493,10 +21494,9 @@ export class AgentFramework {
         return false;
       }
 
-      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(routing))
+      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(routing) || (isDeadlineExpiry(err) && !asTransient)))
         ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
-        this.takeAsTransient(agent.name, err, trigger);
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow, agent);
         if (this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
@@ -21555,7 +21555,6 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
-        const asTransient = this.takeAsTransient(agent.name, err, trigger);
         if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
@@ -23324,6 +23323,7 @@ export class AgentFramework {
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
             const retry = retryOf(trigger);
+            const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
@@ -23339,10 +23339,9 @@ export class AgentFramework {
               break;
             }
 
-            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(streamRouting))
+            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
               ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
-              this.takeAsTransient(agent.name, err, trigger);
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
               // does. Until then, that check is ahead, in a window of its own
@@ -23398,7 +23397,6 @@ export class AgentFramework {
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              const asTransient = this.takeAsTransient(agent.name, err, trigger);
               if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
@@ -23752,6 +23750,7 @@ export class AgentFramework {
       agent.reset();
       this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
       const retry = retryOf(trigger);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
@@ -23783,7 +23782,6 @@ export class AgentFramework {
         speech: '',
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
-      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
