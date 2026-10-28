@@ -896,3 +896,23 @@ test("tokenTransport is refused unless it is 'query' or 'header', on a ws(s):// 
     );
   }
 });
+
+test('a frame the host sends over WebSocket carries U+2028 and U+2029 escaped, and parses back to the same message', async () => {
+  const frames: string[] = [];
+  const wss = startMockMcplWsServer((ws) => ws.on('message', (data) => frames.push(String(data))));
+  await waitListening(wss);
+  const conn = await McplServerConnection.connect({ id: 'separators', url: wsUrl(wss) }, HOST_CAPS);
+  try {
+    conn.ready();
+    const text = 'one\u2028two\u2029three';
+    const result = await conn.sendToolsCall('echo', { text });
+    assert.equal((result.content as Array<{ text?: string }>)[0].text, text);
+    const call = frames.find((frame) => frame.includes('"tools/call"'));
+    assert.ok(call, frames.join(' | '));
+    assert.equal(frames.some((frame) => /[\u2028\u2029]/.test(frame)), false);
+    assert.equal(JSON.parse(call).params.arguments.text, text);
+  } finally {
+    await conn.close();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  }
+});

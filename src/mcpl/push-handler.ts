@@ -8,7 +8,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { convertBlock } from './convert-block.js';
+import { convertBlocks } from './convert-block.js';
 
 import type {
   PushEventParams,
@@ -204,7 +204,7 @@ export class PushHandler {
 
     // 2. Convert content blocks, and refuse content with nothing visible in
     // it — before dedup, so a refused eventId is not burned for a retry.
-    const content: ContentBlock[] = params.payload.content.map((block) => convertBlock(block, 'attachment on push event', serverId));
+    const content: ContentBlock[] = convertBlocks(params.payload.content, 'attachment on push event', serverId);
     if (!emptyAllowed && isVisiblyEmptyConversion(params.payload.content, content)) {
       const err = new EmptyContentError();
       this.traceEmptyRejection(serverId, params);
