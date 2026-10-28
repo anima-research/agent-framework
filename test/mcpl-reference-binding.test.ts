@@ -231,6 +231,7 @@ async function puppetCall(answer: unknown, fetcher: unknown): Promise<{ result: 
   const fw = framework as unknown as Record<string, unknown>;
   Object.assign(fw, {
     agents: new Map([['princess', agent]]),
+    registry: { get: () => undefined },
     toolImageLedgers: new Map(),
     activeTurnTokens: new Map(),
     nextTurnToken: 1,
