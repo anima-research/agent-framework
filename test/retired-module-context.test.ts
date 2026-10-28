@@ -351,6 +351,7 @@ for (const [kind, later] of laterOfItsName) {
     const held = gate();
     const first = probe('first', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
     const gone = probe('gone');
+    const namesake = later(gone);
     await withFramework([first.module, gone.module], async (framework) => {
       const completed = completion(framework, 'hold');
       framework.start();
@@ -358,23 +359,25 @@ for (const [kind, later] of laterOfItsName) {
         framework.pushEvent(external('hold'));
         await held.entered('the event to reach the first module');
         await framework.removeModule('gone');
-        await framework.addModule(later(gone).module);
+        await framework.addModule(namesake.module);
         held.open();
         await waitFor('the event to finish', completed.done);
       }, /error handling process event/);
       assert.ok(!gone.seen.includes('external-message:hold'), gone.seen.join('\n'));
+      assert.ok(!namesake.seen.includes('external-message:hold'), "a module added during the dispatch isn't called for it either");
       assert.deepEqual(lines, []);
     });
   });
 
   test(`a response whose module's removal completes before it's applied is dropped whole, with a line naming what it asked for, once ${kind} has been added`, async () => {
     const held = gate();
+    const ids = { edited: '', removed: '' };
     const gone = probe('gone', {
       answer: (event) => (said(event) === 'external-message:hold'
         ? {
           addMessages: [{ participant: 'user', content: text('from the removed module') }],
-          editMessages: [{ messageId: 'some-message', content: text('edited by the removed module') }],
-          removeMessages: ['another-message'],
+          editMessages: [{ messageId: ids.edited, content: text('edited by the removed module') }],
+          removeMessages: [ids.removed],
           stateUpdate: { v: 'late' },
           requestInference: true,
           toolsChanged: true,
@@ -384,6 +387,8 @@ for (const [kind, later] of laterOfItsName) {
     const last = probe('last', { answer: async (event) => { if (said(event) === 'external-message:hold') { held.enter(); await held.opened; } return {}; } });
     await withFramework([gone.module, last.module], async (framework) => {
       const completed = completion(framework, 'hold');
+      ids.edited = last.ctx().addMessage('user', text('to be edited'));
+      ids.removed = last.ctx().addMessage('user', text('to be removed'));
       framework.start();
       const namesake = later(gone);
       const { lines } = await retiredLines(async () => {
@@ -397,6 +402,8 @@ for (const [kind, later] of laterOfItsName) {
       const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
         .flatMap((m) => m.content).flatMap((b) => ((b as { type: string }).type === 'text' ? [(b as { text: string }).text] : []));
       assert.ok(!texts.includes('from the removed module'), texts.join('\n'));
+      assert.ok(texts.includes('to be edited') && !texts.includes('edited by the removed module'), texts.join('\n'));
+      assert.ok(texts.includes('to be removed'), texts.join('\n'));
       assert.equal(namesake.ctx().getState(), null, "the later registration's state is untouched");
       assert.ok(!completed.responders().includes('gone'), `process:completed lists ${completed.responders().join(', ')}`);
       assert.ok(completed.responders().includes('last'), `process:completed lists ${completed.responders().join(', ')}`);
@@ -439,7 +446,7 @@ interface BareRegistry {
   registry: ModuleRegistry;
   queued: string[];
   pushed: string[];
-  listeners: { label: string; listener: (event: never) => void; active: boolean }[];
+  listeners: { label: string; listener: (event: never) => void; active: boolean; unsubscribed: number }[];
 }
 
 function bareRegistry(t: { after: (fn: () => void) => void }, throwingUnsubscribe?: string): BareRegistry {
@@ -458,9 +465,10 @@ function bareRegistry(t: { after: (fn: () => void) => void }, throwingUnsubscrib
     queryMessages: () => ({ messages: [], totalCount: 0 }),
     pushEvent: (event) => { pushed.push(event.type); },
     onTrace: (listener) => {
-      const entry = { label: `subscription ${listeners.length + 1}`, listener: listener as (event: never) => void, active: true };
+      const entry = { label: `subscription ${listeners.length + 1}`, listener: listener as (event: never) => void, active: true, unsubscribed: 0 };
       listeners.push(entry);
       return () => {
+        entry.unsubscribed++;
         if (entry.label === throwingUnsubscribe) throw new Error('injected unsubscribe failure');
         entry.active = false;
       };
@@ -484,7 +492,9 @@ test("a ModuleRegistry built without dropRetiredPush drops a stopped module's pu
     },
   });
   await registry.addModule(gone.module);
-  assert.deepEqual(listeners.map((l) => l.active), [true, true, false], 'a live unsubscribe ends its own subscription');
+  assert.deepEqual(listeners.map((l) => l.unsubscribed), [0, 0, 1], 'a live unsubscribe ends its own subscription once, however often it is called');
+  for (const { listener, active } of listeners) if (active) listener({ type: 'probe' } as never);
+  assert.deepEqual(heard.splice(0), ['kept', 'throwing'], 'a running module hears traces');
   const { lines } = await retiredLines(async () => {
     await registry.removeModule('gone');
     kept();
@@ -493,6 +503,7 @@ test("a ModuleRegistry built without dropRetiredPush drops a stopped module's pu
     old.queue.push({ type: 'tool-result', callId: 'c9', toolName: 'fetch', agentName: 'assistant', moduleName: 'gone', result: { success: false, isError: true, error: 'boom' } } as ProcessEvent);
   }, /\[framework\]/);
   assert.equal(registry.getModule('gone'), null, 'removed despite the throwing unsubscribe');
+  assert.deepEqual(listeners.map((l) => l.unsubscribed), [1, 1, 1], 'each ended once at the removal, and not again by its own unsubscribe');
   assert.deepEqual(listeners.map((l) => l.active), [false, true, false], 'the throwing one stays subscribed in the registry it came from');
   for (const { listener } of listeners) listener({ type: 'probe' } as never);
   assert.deepEqual(heard, [], 'no listener of a stopped module hears a trace');
@@ -504,10 +515,10 @@ test("a ModuleRegistry built without dropRetiredPush drops a stopped module's pu
   ]);
 });
 
-test("a gatherContext answer from a module whose stop() completes before every answer is in is left out of the turn, with a line, the same module object added again included", async (t) => {
+test("a gatherContext answer from a module whose stop() completes before the answers are merged is left out of the turn, with a line only if it held injections, the same module object added again included", async (t) => {
   const { registry } = bareRegistry(t);
   const held = gate();
-  const injecting = (name: string, wait: boolean): Module => ({
+  const injecting = (name: string, answer: ModuleContextInjection[], wait = false): Module => ({
     name,
     async start() {},
     async stop() {},
@@ -516,20 +527,47 @@ test("a gatherContext answer from a module whose stop() completes before every a
     async handleToolCall() { return { success: true }; },
     async gatherContext(): Promise<ModuleContextInjection[]> {
       if (wait) { held.enter(); await held.opened; }
-      return [{ namespace: name, position: 'system', content: text(`from ${name}`) }];
+      return answer;
     },
   });
-  const gone = injecting('gone', true);
+  const notText = [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AA==' } }] as unknown as ContentBlock[];
+  const gone = injecting('gone', [{ namespace: 'gone', position: 'system', content: notText }]);
   await registry.addModule(gone);
-  await registry.addModule(injecting('stays', false));
+  await registry.addModule(injecting('empty', []));
+  await registry.addModule(injecting('slow', [{ namespace: 'slow', position: 'system', content: text('from slow') }], true));
   const { value, lines } = await retiredLines(async () => {
     const gathering = registry.gatherContext('assistant');
-    await held.entered("the removed module's gatherContext to be called");
+    await held.entered("the slow module's gatherContext to be called");
     await registry.removeModule('gone');
+    await registry.removeModule('empty');
     await registry.addModule(gone);
     held.open();
     return gathering;
   }, /gatherContext/);
-  assert.deepEqual(value.map((injection) => injection.namespace), ['stays']);
+  assert.deepEqual(value.map((injection) => injection.namespace), ['slow']);
   assert.deepEqual(lines, ['[framework] module gone stopped before its gatherContext answer for assistant was used, so its 1 injection(s) were left out']);
+});
+
+test("a module added under a stopped module's name has its onToolBatchComplete called while the stopped one's hook still runs past its bound", async (t) => {
+  const { registry } = bareRegistry(t);
+  const called: string[] = [];
+  const batching = (label: string, wedged: boolean): Module => ({
+    name: 'batcher',
+    async start() {},
+    async stop() {},
+    async onProcess() { return {}; },
+    getTools: () => [],
+    async handleToolCall() { return { success: true }; },
+    async onToolBatchComplete() {
+      called.push(label);
+      if (wedged) await new Promise(() => {});
+    },
+  });
+  await registry.addModule(batching('stopped', true));
+  const first = await retiredLines(() => registry.notifyToolBatchComplete('assistant', 20), /onToolBatchComplete/);
+  assert.deepEqual(first.value.map((f) => f.module), ['batcher']);
+  await registry.removeModule('batcher');
+  await registry.addModule(batching('later', false));
+  assert.deepEqual(await registry.notifyToolBatchComplete('assistant', 20), []);
+  assert.deepEqual(called, ['stopped', 'later']);
 });

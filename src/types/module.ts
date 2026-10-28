@@ -282,8 +282,8 @@ export interface AgentSettingsExtension {
  * the module's `onProcess` nor its `onAgentSpeech` again; it drops whole a
  * response of its that hadn't been applied by then, with a line naming what
  * the response asked for if it asked for anything; and it leaves its
- * `gatherContext` answer out of a turn whose modules' answers weren't all
- * in by then, with a line if it held injections. A module whose `stop()`
+ * `gatherContext` answer out of a turn whose answers it hadn't merged by
+ * then, with a line if it held injections. A module whose `stop()`
  * fails stays registered, and its context keeps working.
  * References the module already holds, to other modules or to its own
  * timers, aren't the context's, and stay as they are.

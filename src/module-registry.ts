@@ -434,6 +434,7 @@ export class ModuleRegistry {
         this.modules.delete(module.name);
         this.moduleContexts.delete(module.name);
         this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
+        this.batchHooksRunning.delete(module.name);
         this.stopping.delete(module);
         context?.retire();
         return;
@@ -488,10 +489,12 @@ export class ModuleRegistry {
    * something that isn't an array of objects, or with a `system` entry whose
    * content isn't an array of objects, every block of which the agent's
    * buildSystemPrompt reads, and one that answers after its timeout adds
-   * nothing. Nor does a module whose stop() has completed by the time every
-   * answer is in, its own registration ended even if a module of its name
-   * has been added since; a line says so if it answered with injections. An
-   * array returned without a promise is taken as the module's
+   * nothing. Once every answer is in, the answers are merged, and an answer
+   * from a module whose registration has ended by then (its stop()
+   * completed, whether or not a module of its name has been added since) is
+   * left out, with a line if it held injections; a stop that completes after
+   * the merge doesn't change what this returned. An array returned without a
+   * promise is taken as the module's
    * answer. An entry's other fields are the module's to get right. Each
    * module's budget starts once its call returns, after its own synchronous
    * work and every earlier module's; a later module's synchronous work still
@@ -556,7 +559,6 @@ export class ModuleRegistry {
           if (unreadable) {
             throw new TypeError(`gatherContext answered with a system injection in namespace ${logValue(unreadable.namespace)} whose content isn't an array of objects`);
           }
-          this.noteBlocksNotShown(module.name, r);
           results[slot] = [...r];
         }),
         new Promise<void>((_, rej) => {
@@ -577,7 +579,10 @@ export class ModuleRegistry {
 
     await Promise.all(promises);
     for (const { slot, moduleName, registration } of asked) {
-      if (this.moduleContexts.get(moduleName) === registration) continue;
+      if (this.moduleContexts.get(moduleName) === registration) {
+        this.noteBlocksNotShown(moduleName, results[slot]);
+        continue;
+      }
       if (results[slot].length > 0) {
         console.error(
           `[framework] module ${moduleName} stopped before its gatherContext answer for ${agentName} was used, ` +

@@ -32,12 +32,15 @@
     of its that hadn't been applied is dropped whole, with a line naming
     what it asked for if it asked for anything. A push it made while
     registered still runs, since a push is its message to the others, made
-    while it was there, while a response is applied on its behalf after
-    it's gone;
-  - its `gatherContext` answer is left out of a turn whose modules' answers
-    weren't all in when its `stop()` completed, with a line if it held
-    injections. Once they're all in and merged, until the turn's request is
-    sent, the turn counts as already made.
+    while it was there, whereas applying a response would act on its behalf
+    after it's gone;
+  - its `gatherContext` answer is left out of a turn whose answers the
+    registry hadn't merged when its `stop()` completed, with a line if it
+    held injections; a stop that completes after the merge leaves that
+    turn's context as it was;
+  - a module added later under its name has its `onToolBatchComplete`
+    called, even while the stopped module's own hook is still running past
+    its bound.
 - **A module may still write from inside its own `stop()`,** and a module
   whose `stop()` fails stays registered with a working context, for the
   retry.
