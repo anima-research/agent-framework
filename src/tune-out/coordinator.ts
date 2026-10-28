@@ -1583,13 +1583,18 @@ export class TuneOutCoordinator {
   /**
    * A reader fork that never read what it was handed: its derive failed, or
    * its run threw before it reported. While the epoch that held the
-   * messages still holds the channel, they go back to its backlog, and the
-   * next invocation for the channel is handed them. Returns how many went
-   * back (0 once the epoch has ended: its cancel had its own last fork).
+   * messages is still active, they go back to that epoch's backlog for the
+   * channel, and its next invocation for the channel is handed them: the
+   * scope's while the scope is active, though the channel's own tune-out
+   * has taken the channel meanwhile, and a channel's own tune-out's while it
+   * holds the channel. Returns how many went back (0 once the epoch has
+   * ended: its cancel had its own last fork).
    */
   readerFailed(invocation: Pick<ReaderInvocation, 'serverId' | 'channelId' | 'epochId' | 'backlog' | 'queued'>): number {
     const { serverId, channelId, epochId } = invocation;
-    if (this.holdFor(serverId, channelId)?.epochId !== epochId) return 0;
+    const active = this.getAllExcept()?.params.epochId === epochId
+      || this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId === epochId;
+    if (!active) return 0;
     const key = this.handOffKey(epochId, serverId, channelId);
     const returned = this.readerReturned.get(key) ?? { ids: new Set<string>(), writeIds: new Set<string>() };
     for (const m of invocation.backlog) returned.ids.add(m.id);
@@ -1597,9 +1602,14 @@ export class TuneOutCoordinator {
     const count = invocation.backlog.length + invocation.queued.length;
     if (count > 0) {
       this.readerReturned.set(key, returned);
-      // They count again toward the next cadence look, which hands them back.
+      // They count again toward the next cadence look of the epoch holding
+      // the channel, which hands them back. Where another epoch holds it
+      // now, they're counted again when the channel comes back to theirs
+      // (rebuildTally), and its release hands them in any case.
       const tally = this.key(serverId, channelId);
-      this.divertedSinceInvocation.set(tally, (this.divertedSinceInvocation.get(tally) ?? 0) + count);
+      if (this.holdFor(serverId, channelId)?.epochId === epochId) {
+        this.divertedSinceInvocation.set(tally, (this.divertedSinceInvocation.get(tally) ?? 0) + count);
+      }
     }
     return count;
   }

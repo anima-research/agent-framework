@@ -414,6 +414,32 @@ describe("a channel held in turn by the all-except hold and by its own tune-out"
       "and the channel's own tune-out's readers go on from where they were");
     w.coordinator.stop();
   });
+
+  it("a scope's fork that fails once the channel's own tune-out holds the channel gives its messages back to the scope", () => {
+    const w = world();
+    const scope = scoped(w);
+    w.store('ann', 'S-1 under the scope', { epochId: scope });
+    w.wake(); // the scope's fork for noisy is handed S-1, and is still running...
+    const running = w.invocations[0]!;
+    assert.deepEqual(bodies(running), { stored: ['S-1 under the scope'], queued: [] });
+    w.tuneOut(); // ...when the resident tunes noisy out on its own
+    assert.equal(w.coordinator.readerFailed(running), 1, 'its one message goes back to the scope');
+    assert.deepEqual(w.coordinator.cancelAllExcept('agent-tool', 'resident released'), { ok: true });
+    const last = w.invocations.slice(1).filter((inv) => inv.epochId === scope);
+    assert.deepEqual(last.map(bodies), [{ stored: ['S-1 under the scope'], queued: [] }], "the scope's last fork is handed S-1");
+    w.coordinator.stop();
+  });
+
+  it('a fork that fails after its epoch ended gives nothing back', () => {
+    const w = world();
+    w.tuneOut();
+    w.store('ann', 'P-1 under its own tune-out');
+    w.wake();
+    const running = w.invocations[0]!;
+    assert.deepEqual(w.coordinator.cancel(SERVER, NOISY, 'agent-tool', 'resident cancelled'), { ok: true });
+    assert.equal(w.coordinator.readerFailed(running), 0, "the cancel's own last fork covered the epoch");
+    w.coordinator.stop();
+  });
 });
 
 describe('a cadence look for held messages no reader has looked at, though nothing new arrives', () => {
