@@ -233,6 +233,38 @@ describe('the registry\'s recovery', () => {
     assert.ok(!(JSON.parse(readFileSync(paths.agentRegistryPath, 'utf8')) as { records: Array<{ name: string }> }).records.some((r) => r.name === 'w'), 'and the registry no longer lists it');
   });
 
+  it('a recipient told of two interrupted jobs isn\'t told again of the one whose end failed to be written', async () => {
+    const store = JsStore.openOrCreate({ path: storePath() });
+    stores.push(store);
+    const paths = { agentRegistryPath: join(tempDir, 'registry.json'), agentRegistryEndedPath: join(tempDir, 'ended.json') };
+    const gates = new GateModule();
+    const first = await boot(gates, { store, ...paths });
+    first.start();
+    for (const name of ['w1', 'w2']) {
+      await startBlocked(first, gates, name, `g-${name}`, workerSpec(name, { spawnedBy: 'oren', resultTo: { to: 'oren', as: 'message' } }));
+    }
+    // The process dies with both live. The next boot tells oren of both, and
+    // w2's end fails to be written, so w2 stays in the registry.
+    const proto = AgentFramework.prototype as unknown as { writeRecoveryFile: (path: string, document: unknown) => void };
+    const write = proto.writeRecoveryFile;
+    proto.writeRecoveryFile = function (this: unknown, path: string, document: unknown) {
+      const ended = (document as { ended?: Array<{ name: string }> }).ended;
+      if (path === paths.agentRegistryEndedPath && ended?.some((r) => r.name === 'w2')) throw new Error('EIO: w2\'s end');
+      write.call(this, path, document);
+    };
+    let second: AgentFramework;
+    try {
+      second = await boot(new GateModule(), { store, ...paths });
+    } finally { proto.writeRecoveryFile = write; }
+    assert.equal(rowsWith(second, 'oren', 'the host restarted while "w1", "w2"').length, 1, 'oren is told of both');
+    // The next boot finds w2 still interrupted, and oren already told of it.
+    const third = await boot(new GateModule(), { store, ...paths });
+    assert.equal(rowsWith(third, 'oren', 'the host restarted while').length, 1, 'oren is told once');
+    assert.equal(third.getAgentRecord('w2')?.ended?.reason, 'host-restart');
+    assert.ok(!(JSON.parse(readFileSync(paths.agentRegistryPath, 'utf8')) as { records: Array<{ name: string }> }).records.some((r) => r.name === 'w2'),
+      'and w2\'s end is written now');
+  });
+
   it('an app-owned store with neither a storePath nor the recovery paths is warned at create', async () => {
     const store = JsStore.openOrCreate({ path: storePath() });
     stores.push(store);

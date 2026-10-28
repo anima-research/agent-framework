@@ -12099,19 +12099,25 @@ export class AgentFramework {
       if (this.registry.listMail({ from: record.name }).some((mail) => mail.kind === 'result')) continue;
       byRecipient.set(route.to, [...(byRecipient.get(route.to) ?? []), record]);
     }
-    for (const [recipient, records] of byRecipient) {
+    for (const [recipient, all] of byRecipient) {
       // The interrupted records stay in the snapshot until this notice is
-      // durable (settleInterrupted below), so a crash after it landed and
-      // before their ends were written comes here again: the key, the same
-      // set of name and incarnation, finds the notice already told, in the
-      // recipient's store or the restored deferred queue.
+      // durable and their ends are written (settleInterrupted below), so a
+      // crash after it landed, or an end whose write failed, comes here
+      // again: a record an earlier interrupted notice to this recipient names
+      // (its key lists each name and incarnation), in the recipient's store
+      // or the restored deferred queue, has been told, however many of that
+      // notice's records have ended since.
+      const toldKeys = new Set<string>();
+      const noteTold = (metadata: unknown) => {
+        const key = (metadata as { dendrite?: { noticeKey?: unknown } } | undefined)?.dendrite?.noticeKey;
+        if (typeof key === 'string') for (const one of key.split(',')) toldKeys.add(one);
+      };
+      for (const message of this.agents.get(recipient)!.getContextManager()
+        .queryMessages({ metadata: { 'dendrite.event': 'interrupted' } }).messages) noteTold(message.metadata);
+      for (const message of this.deferredMessages) noteTold(message.metadata);
+      const records = all.filter((record) => !toldKeys.has(`${record.name}#${record.incarnation}`));
+      if (records.length === 0) continue;
       const noticeKey = records.map((record) => `${record.name}#${record.incarnation}`).sort().join(',');
-      const told = this.agents.get(recipient)!.getContextManager()
-        .queryMessages({ metadata: { 'dendrite.noticeKey': noticeKey } }).messages.length > 0
-        || this.deferredMessages.some(
-          (m) => (m.metadata as { dendrite?: { noticeKey?: unknown } } | undefined)?.dendrite?.noticeKey === noticeKey,
-        );
-      if (told) continue;
       const names = records.map((record) => `"${record.name}"`).join(', ');
       this.lifecycleNotice(
         recipient,
