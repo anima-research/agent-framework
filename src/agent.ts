@@ -2105,7 +2105,7 @@ export class Agent {
     try {
       const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
       if (this.requestOnlyIndex?.source === stored) return this.requestOnlyIndex.index;
-      const index = indexRequestOnlyRows(stored, this.name);
+      const index = indexRequestOnlyRows(stored, this.ownParticipants);
       this.requestOnlyIndex = { source: stored, index };
       return index;
     } catch (error) {
