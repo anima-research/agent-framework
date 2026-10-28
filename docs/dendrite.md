@@ -14,7 +14,7 @@ Three things are kept apart:
 
 ### Roles
 
-The framework never asks what kind of agent something is. It asks what the agent's spec declares.
+These roles, not `kind`, decide where a message with no named recipient goes, which agents untargeted traffic and the host-wide gate wake, and who holds the provider gate. `kind` selects behaviour for two of its values, and derivation notices are counted per kind, below.
 
 | Role | Meaning |
 |---|---|
@@ -23,7 +23,7 @@ The framework never asks what kind of agent something is. It asks what the agent
 | `receivesGateWakes` | Woken by the host-wide gate (debounce batches, sleep expiry). |
 | `ownsProviderScheduling` | Holds the provider gate and owns rate-limit cooldowns. |
 
-`kind` (`resident`, `subconscious`, `conversation-fork`, `task-fork`, `worker`, or any string) is a label for discovery only.
+`kind` (`resident`, `subconscious`, `subconscious-fork`, `conversation-fork`, `task-fork`, `worker`, or any string) labels an agent for discovery, and the framework also selects by two of its values. An agent registered as `subconscious-fork` is a reader fork, which may call only its reader's tools (`deliver_summary`, `cancel_tuneout`, `note_disposition`), and `speak_in_channel` where `subconscious.allowChannelSpeech` allows it, whatever its `allowedTools` says. The agents registered as `conversation-fork` are the ones `stop()` unbinds from their home channels and disposes, and the ones the cleanup after a context manager reinitializes disposes when their context is left empty. Whatever its value, `kind` also groups derivation notices for collapsing ("The source is told", below).
 
 ### Lifetime
 
