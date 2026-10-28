@@ -6190,8 +6190,8 @@ export class AgentFramework {
       // continuation since dropped with its turn, or wakes since withdrawn:
       // just reopen the gate. A primary the hold left pending won't run, so
       // its recovery ends.
-      const which = cooldown.auxiliaryOrigin ? 'auxiliary hold'
-        : cooldown.emptiedBy === 'drop' ? 'hold, its held continuation dropped,' : 'hold, its held wakes withdrawn,';
+      const which = cooldown.emptiedBy === 'drop' ? 'hold, its held continuation dropped,'
+        : cooldown.emptiedBy === 'withdrawal' ? 'hold, its held wakes withdrawn,' : 'auxiliary hold';
       console.error(`[provider-cooldown] agent=${agentName} ${which} released after ${Date.now() - cooldown.startedAt}ms`);
       if (cooldown.emptiedBy) this.endPendingPrimary(agentName);
       this.flushAuxiliaryAdmission(agentName);
@@ -16396,27 +16396,45 @@ export class AgentFramework {
     }
   }
 
-  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). */
+  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2), and
+   *  a merged start whose every request is withdrawn. */
   private cancelCoalescedWakes(subject: string): void {
-    this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
-    for (const cooldown of this.providerAccelerationCooldowns.values()) {
-      const held = cooldown.heldRequests.length;
-      cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
-      if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedBy = 'withdrawal';
-    }
     // A wake of the subject's merged into a start
     // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
     // it back and no pass unpacks it.
+    const emptied = new Set<InferenceRequest>();
     const unrecord = (r: InferenceRequest): void => {
       const batch = mergedBatch(r);
       if (batch?.some((w) => w.coalescingSubject === subject)) {
-        (r as MarkedRequest)[MERGED_BATCH] = batch.filter((w) => w.coalescingSubject !== subject);
+        const left = batch.filter((w) => w.coalescingSubject !== subject);
+        (r as MarkedRequest)[MERGED_BATCH] = left;
+        if (left.length === 0) emptied.add(r);
       }
     };
     for (const r of this.pendingRequests) unrecord(r);
     for (const cooldown of this.providerAccelerationCooldowns.values()) cooldown.heldRequests.forEach(unrecord);
     for (const r of this.parkedContinuations ?? []) unrecord(r);
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
+    const withdrawn = (r: InferenceRequest): boolean => r.coalescingSubject === subject || emptied.has(r);
+    this.pendingRequests = this.pendingRequests.filter((r) => !withdrawn(r));
+    for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      const held = cooldown.heldRequests.length;
+      cooldown.heldRequests = cooldown.heldRequests.filter((r) => !withdrawn(r));
+      if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedBy = 'withdrawal';
+    }
+    for (const pass of this.passRequests ?? []) {
+      for (const requests of pass.values()) {
+        if (!requests.some((r) => emptied.has(r))) continue;
+        const left = requests.filter((r) => !emptied.has(r));
+        requests.length = 0;
+        requests.push(...left);
+      }
+    }
+    for (const start of emptied) {
+      if (!start.coalescingBatch || start.coalescingSubject !== undefined) continue;
+      console.error(`[coalescing] ${start.agentName}: its deferred batches were withdrawn while its wake waited; turn not started (no wake cause left)`);
+      this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: start.agentName, subjects: start.coalescingBatchSubjects ?? [] });
+    }
   }
 
   /**
@@ -16875,17 +16893,7 @@ export class AgentFramework {
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
-        const emptied = requests.filter((r) => mergedBatch(r)?.length === 0);
         requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
-        if (requests.length === 0) {
-          const subjects = [...new Set(emptied.filter((r) => r.coalescingBatch).flatMap((r) => r.coalescingBatchSubjects ?? []))];
-          if (subjects.length > 0) {
-            console.error(`[coalescing] ${agentName}: its deferred batches were withdrawn while its wake waited; turn not started (no wake cause left)`);
-            this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName, subjects });
-          }
-          this.endPendingPrimary(agentName);
-          continue;
-        }
       }
 
       // A provider's stated wait on this agent's primary model, including one

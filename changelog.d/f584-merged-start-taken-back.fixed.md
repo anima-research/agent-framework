@@ -12,11 +12,13 @@
   - It kept its first wake's time, so merged with a later-queued wake for an
     older message, such as a gate's batched wake, it gave the turn that
     message's channel instead of the newer addressed message's it stood for.
-- A merged wake whose every wake is withdrawn while it waits starts no turn.
-  If it is still waiting whole when the last of them goes and they were
-  deferred batches, it traces `turn-withdrawn` naming them, with the stderr
-  line `[coalescing] <agent>: its deferred batches were withdrawn while its
-  wake waited; turn not started (no wake cause left)`.
+- A merged wake whose every wake is withdrawn while it waits in the queue, in
+  a provider hold or in a scheduler pass is withdrawn with them, and starts
+  no turn. If it still waits as one wake, not yet taken back apart by a
+  scheduler pass, and its wakes were deferred batches of more than one
+  subject, it traces `turn-withdrawn` naming them as the last goes, with the
+  stderr line `[coalescing] <agent>: its deferred batches were withdrawn
+  while its wake waited; turn not started (no wake cause left)`.
   `HostModeStatus.gatedRequests` counts a merged wake as the wakes it took in.
 - A provider hold whose kept wakes are all withdrawn while it holds them, as
   a deferred batch's wake is when the batch is retracted, now releases
