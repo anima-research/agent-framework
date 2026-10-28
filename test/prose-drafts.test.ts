@@ -428,6 +428,8 @@ async function harness(opts: {
   modules?: Module[];
   /** FrameworkConfig.heartbeat: the framework's own heartbeat. */
   heartbeat?: boolean | Record<string, unknown>;
+  /** FrameworkConfig.speech: where a turn's plain speech lands when nothing names a destination. */
+  speech?: { locus: 'delivery' | 'latest-inbound' };
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -470,6 +472,7 @@ async function harness(opts: {
       }],
       modules: opts.modules ?? [],
       ...(opts.heartbeat !== undefined ? { heartbeat: opts.heartbeat as never } : {}),
+      ...(opts.speech ? { speech: opts.speech } : {}),
       ...(opts.codeExecution ? { codeExecution: { enabled: true } } : {}),
       ...(opts.retries !== undefined ? {
         errorPolicy: {
@@ -4396,7 +4399,8 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
   });
 
   it('a channel-less wake that is not the heartbeat still takes the latest inbound channel, as before', async () => {
-    const h = await harness();
+    // The latest inbound channel is a fallback only under 'latest-inbound'.
+    const h = await harness({ speech: { locus: 'latest-inbound' } });
     try {
       await h.turn([createMockResponse([text('a reply in the room')])]);
       await h.turn([createMockResponse([text('words from a timer')])], 'scout', 'request');
