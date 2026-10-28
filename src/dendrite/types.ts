@@ -25,9 +25,12 @@
 export type AgentName = string;
 
 /**
- * Preset label, for discovery and telemetry ONLY. Framework behaviour is
- * decided by {@link AgentRoles}, {@link AgentLifetime} and the relationship
- * fields — never by comparing this string.
+ * Preset label, for discovery and telemetry. {@link AgentRoles},
+ * {@link AgentLifetime} and the relationship fields decide the framework's
+ * general behaviour. It also compares two values: 'subconscious-fork'
+ * decides a reader fork's tool calls, and 'conversation-fork' picks the
+ * agents that stop() and the cleanup after a context manager reinitializes
+ * dispose. And it counts derivation notices per kind, for collapsing them.
  */
 export type AgentKind =
   | 'resident'
@@ -314,6 +317,8 @@ export type AgentEndReason =
   | 'host-restart'
   | 'not-configured'
   | 'failed'
+  | 'host-stop'
+  | 'context-emptied'
   | (string & {});
 
 /** Provenance stamp for anything one agent hands another. */

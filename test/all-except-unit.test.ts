@@ -15,29 +15,43 @@ type Held = { participant: string; content: Array<{ type: string; text?: string 
 
 /** `stored`: the primary's stored messages; `kept`: the writes a surgery's hold keeps in memory. */
 function harness(held: { stored?: Held[]; kept?: Held[] } = {}) {
+  const stored = held.stored ?? [];
+  const kept = held.kept ?? [];
   const state = new Map<string, unknown>();
   const wakes: string[] = [];
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
   const traces: string[] = [];
+  const fail = { read: false, write: false, addMessage: false };
   const registry = {
     getTuneOutState: () => null,
-    // Each channel is shown by its id: no other server registers it.
-    nameShown: (ref: { channelId: string }) => ref.channelId,
-    listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: 'work' } }, { serverId: 'disc', descriptor: { id: 'noisy' } }],
-    readCoordinatorState: (id: string) => state.get(id) ?? null,
-    writeCoordinatorState: (id: string, value: unknown) => { state.set(id, value); },
+    // Each channel is shown by its id where no other server registers it,
+    // and with its server where two do (general, on disc and slack).
+    nameShown: (ref: { serverId: string; channelId: string }) => (ref.channelId === 'general' ? `${ref.channelId} (${ref.serverId})` : ref.channelId),
+    listChannelsRaw: () => [
+      { serverId: 'disc', descriptor: { id: 'work' } }, { serverId: 'disc', descriptor: { id: 'noisy' } },
+      { serverId: 'disc', descriptor: { id: 'general' } }, { serverId: 'slack', descriptor: { id: 'general' } },
+    ],
+    readCoordinatorState: (id: string) => {
+      if (fail.read) throw new Error('store unreadable');
+      return state.get(id) ?? null;
+    },
+    writeCoordinatorState: (id: string, value: unknown) => {
+      if (fail.write) throw new Error('store write failed');
+      state.set(id, value);
+    },
   } as unknown as ChannelRegistry;
   const servers = { getServer: () => undefined } as unknown as McplServerRegistry;
   const hooks = {
     addMessage: (participant: string, content: Array<{ type: string; text?: string }>, _m: unknown, forAgent?: string) => {
+      if (fail.addMessage) throw new Error('context write failed');
       messages.push({ participant, text: content.map((b) => b.text ?? '').join(''), forAgent });
       return 'id';
     },
     requestInference: (agentName: string) => { wakes.push(agentName); },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
-    getStoredMessages: () => held.stored ?? [],
-    getSurgeryHeldMessages: () => held.kept ?? [],
+    getStoredMessages: () => stored,
+    getSurgeryHeldMessages: () => kept,
     currentSequence: () => 1,
     setSubconsciousAnchor: () => {},
     isForkBound: () => false,
@@ -46,7 +60,7 @@ function harness(held: { stored?: Held[]; kept?: Held[] } = {}) {
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
-  return { make, state, wakes, messages, traces };
+  return { make, state, wakes, messages, traces, fail, stored };
 }
 
 describe('all-except scope on the coordinator', () => {
@@ -63,6 +77,29 @@ describe('all-except scope on the coordinator', () => {
     assert.deepEqual(h.wakes, ['Subconscious'], 'the second is paused, not delivered');
     assert.ok(c.getAllExcept(), 'the scope is still in force');
     assert.ok(h.traces.includes('tune-out:wake-budget-paused'));
+    c.stop();
+  });
+
+  it("two servers' channels that share an id are counted and released apart", () => {
+    const stored: Held[] = [];
+    const h = harness({ stored });
+    const c = h.make();
+    const r = c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 1 }, 'agent-tool');
+    assert.ok(r.ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    const held = (serverId: string, text: string) => stored.push({
+      participant: 'user', content: [{ type: 'text', text }],
+      metadata: { channelId: 'general', serverId, tuneOut: { epochId } },
+    });
+    held('disc', 'one on disc');
+    held('disc', 'two on disc');
+    held('slack', 'one on slack');
+    assert.deepEqual(c.check().allExcept!.held, { 'general (disc)': 2, 'general (slack)': 1 });
+    assert.ok(c.cancelAllExcept('agent-tool', 'test').ok);
+    const release = h.messages.find((m) => /released/.test(m.text))!.text;
+    assert.equal(release.split('<tuned-out-backlog ').length - 1, 2, release);
+    assert.ok(release.includes('two on disc') && release.includes('one on slack'), 'each channel keeps its own cap of one');
+    assert.ok(!release.includes('one on disc'), "disc's older message is past its cap");
     c.stop();
   });
 
@@ -106,5 +143,98 @@ describe('all-except scope on the coordinator', () => {
     assert.match(release, /2 messages held in 1 channel/, 'the release counts it');
     assert.match(release, /messages=2>\nantra: N1 stored\nantra: N2 kept by the hold/, 'and lists it, after the stored one');
     c.stop();
+  });
+
+  it('a stored hold that can\'t be read is not taken for no hold, and the next read tries again', () => {
+    const h = harness();
+    const first = h.make();
+    assert.ok(first.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    first.stop();
+    h.fail.read = true;
+    const second = h.make();
+    assert.throws(() => second.resumeActiveEpochs(), /store unreadable/, 'resume refuses rather than resume with no hold');
+    h.fail.read = false;
+    assert.equal(second.getAllExcept()?.params.except.channelId, 'work', 'the failure was not remembered as no hold');
+    assert.ok(second.holdFor('disc', 'noisy'), 'and the hold holds');
+    second.stop();
+  });
+
+  it('a stored record that isn\'t a hold\'s is refused, not read as no hold', () => {
+    const h = harness();
+    const c = h.make();
+    h.state.set('tune-out/scout/all-except', { params: { except: 'not a hold' } });
+    assert.throws(() => c.getAllExcept(), /is not a hold's record/);
+    assert.ok(h.state.has('tune-out/scout/all-except'), 'left as it is');
+    c.stop();
+  });
+
+  it('an entry whose write fails leaves no hold in memory', () => {
+    const h = harness();
+    const c = h.make();
+    h.fail.write = true;
+    assert.throws(() => c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool'), /store write failed/);
+    h.fail.write = false;
+    assert.equal(c.getAllExcept(), null, 'memory agrees with the store');
+    assert.equal(c.holdFor('disc', 'noisy'), null);
+    c.stop();
+  });
+
+  it('a release that fails to be recorded leaves the hold in force, to release again', () => {
+    const h = harness();
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    h.fail.addMessage = true;
+    assert.throws(() => c.cancelAllExcept('agent-tool', 'done'), /context write failed/);
+    h.fail.addMessage = false;
+    assert.ok(c.getAllExcept(), 'the hold is still in force');
+    assert.ok([...h.state.values()].some((v) => v !== null), 'and still stored');
+    const again = c.cancelAllExcept('agent-tool', 'done');
+    assert.ok(again.ok);
+    assert.equal(c.getAllExcept(), null);
+    assert.ok(h.messages.some((m) => /all channels except work released — done/.test(m.text)), 'the release reached the resident');
+    c.stop();
+  });
+
+  it('a release whose hold fails to clear is delivered once, however often the clear is retried', () => {
+    const h = harness();
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    h.fail.write = true;
+    assert.throws(() => c.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
+    assert.throws(() => c.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
+    assert.ok(c.getAllExcept(), 'the hold is still in force while its end is not recorded');
+    h.fail.write = false;
+    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
+    assert.equal(c.getAllExcept(), null);
+    const releases = h.messages.filter((m) => /all channels except work released/.test(m.text));
+    assert.equal(releases.length, 1, 'the resident got the release once');
+    c.stop();
+  });
+
+  it('a fractional backlog cap counts whole messages, as a channel\'s does: below one shows none', () => {
+    const h = harness();
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 0.5 }, 'agent-tool').ok);
+    assert.equal(c.getAllExcept()!.params.backlogCap, 0);
+    c.stop();
+  });
+
+  it('a hold stored with a fractional cap, before entry floored it, still releases whole messages', () => {
+    const h = harness();
+    const first = h.make();
+    assert.ok(first.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    first.stop();
+    const id = [...h.state.keys()].find((k) => k.endsWith('/all-except'))!;
+    const record = h.state.get(id) as { params: { backlogCap: number; epochId: string } };
+    record.params.backlogCap = 0.5;
+    for (const text of ['held one', 'held two']) {
+      h.stored.push({ participant: 'u', content: [{ type: 'text', text }], metadata: { channelId: 'noisy', serverId: 'disc', tuneOut: { epochId: record.params.epochId } } });
+    }
+    const second = h.make();
+    assert.ok(second.cancelAllExcept('agent-tool', 'done').ok);
+    const release = h.messages.find((m) => /released — done/.test(m.text))!;
+    assert.match(release.text, /messages=2/);
+    assert.doesNotMatch(release.text, /held one|held two/, 'a cap below one shows no message');
+    second.stop();
   });
 });

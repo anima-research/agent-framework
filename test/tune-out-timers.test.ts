@@ -436,6 +436,49 @@ it("a cadence turn that throws stays in its timer, is reported, and the next per
   assert.match(h.notices.at(-1) ?? '', /— 1 diverted message since your last look\]$/);
 });
 
+it('an all-except release that throws at its end time stays in its timer, is reported, and is tried again', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enterAllExcept({ serverId: 'disc', channelId: '#a' }, { durationSeconds: 120 }, 'agent-tool').ok, true);
+  h.failNext('addMessage');
+  assert.doesNotThrow(() => t.mock.timers.tick(120_000), "the release's error stays in the timer");
+  assert.deepEqual(h.timerFailures(), [failure('expiry')]);
+  assert.ok(h.coordinator.getAllExcept(), 'the hold is still in force, its release owed');
+  t.mock.timers.tick(60_000);
+  assert.equal(h.coordinator.getAllExcept(), null, 'released on the retry');
+  assert.deepEqual(h.releases(), ['tune-out cancelled (duration elapsed)']);
+});
+
+it('an all-except cadence turn that throws stays in its timer and the next period comes', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enterAllExcept({ serverId: 'disc', channelId: '#a' }, { durationSeconds: 3600, cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  assert.ok(h.coordinator.onIncoming('disc', '#b', 'm1', undefined), 'a message in another channel is held');
+  h.failNext('addMessage');
+  assert.doesNotThrow(() => t.mock.timers.tick(60_000), "the turn's error stays in the timer");
+  assert.deepEqual(h.timerFailures(), [failure('cadence')]);
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #b'], "the next period's turn comes");
+});
+
+it("a channel's tune-out outlives its reader: once the reader stops, its end time still releases it", (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120, cadenceSeconds: 60 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', undefined);
+  h.coordinator.stopReader();
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(h.cadenceTurns(), [], 'no reader turns after the reader stopped');
+  t.mock.timers.tick(60_000);
+  assert.equal(h.active(), false, 'ended at its end time');
+});
+
+it('an all-except hold outlives its reader: once the reader stops, its end time still releases it', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enterAllExcept({ serverId: 'disc', channelId: '#a' }, { durationSeconds: 120 }, 'agent-tool').ok, true);
+  h.coordinator.stopReader();
+  t.mock.timers.tick(120_000);
+  assert.equal(h.coordinator.getAllExcept(), null, 'released at its end time');
+  assert.deepEqual(h.releases(), ['tune-out cancelled (duration elapsed)']);
+});
+
 it('a timer failure is written to stderr with the error', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 60 }, 'agent-tool').ok, true);

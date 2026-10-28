@@ -208,10 +208,12 @@ async function createDraining(framework: AgentFramework, name = 'worker') {
   });
 }
 
-function addBacklog(contextManager: { addMessage: Awaited<ReturnType<typeof createDraining>>['contextManager']['addMessage'] }, count: number, from = 0): void {
+function addBacklog(contextManager: { addMessage: Awaited<ReturnType<typeof createDraining>>['contextManager']['addMessage'] }, count: number, from = 0): string[] {
+  const ids: string[] = [];
   for (let i = from; i < from + count; i++) {
-    contextManager.addMessage(i % 2 === 0 ? 'user' : 'worker', [{ type: 'text', text: `message ${i}: ` + 'word '.repeat(30) }]);
+    ids.push(contextManager.addMessage(i % 2 === 0 ? 'user' : 'worker', [{ type: 'text', text: `message ${i}: ` + 'word '.repeat(30) }]));
   }
+  return ids;
 }
 
 describe('a context manager the framework is done with makes no further provider call (#550)', () => {
@@ -277,6 +279,43 @@ describe('a context manager the framework is done with makes no further provider
         (error: unknown) => error instanceof CompressionWithdrawn,
         'a reset with no text is withdrawn');
       assert.equal(membrane.compressions.length, sent, 'and reached no provider');
+      assert.deepEqual(drainLines(errors.lines), []);
+    } finally {
+      errors.restore();
+      await settle(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a resumed job after cleanup(): the call its manager has out is aborted, and it makes no call', { timeout: 60_000 }, async () => {
+    const membrane = new CompressionMembrane(100);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const { dir, framework } = await setup('af-done-resumed-', membrane);
+    const errors = captureErrors();
+    try {
+      const first = await framework.createEphemeralAgent({ name: 'job', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      first.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const run = framework.runEphemeralToCompletion(first.agent, first.contextManager);
+      framework.start();
+      await run;
+      const resumed = await framework.resumeAgent('job', {
+        model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: drainingStrategy(),
+      });
+      // Read onto #291: the job's first run wrote its window down, so the
+      // context its resume reopens is in presented mode and compresses its
+      // window, which a row written past the framework enters only when
+      // presented (main compressed the record). The resumed job isn't
+      // registered, so no presentation point of the framework's takes the
+      // backlog on; it is presented to the reopened manager directly, as the
+      // resumed run's adoption would, and the strategy drains from there.
+      resumed.contextManager.presentRows(addBacklog(resumed.contextManager, 30) as never[]);
+      await until(() => membrane.compressions.length >= 1 && membrane.inFlight > 0);
+      resumed.cleanup();
+      const sent = membrane.compressions.length;
+      await sleep(800);
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after cleanup()');
+      assert.ok(membrane.aborted.length >= 1, 'the call it had out was aborted');
       assert.deepEqual(drainLines(errors.lines), []);
     } finally {
       errors.restore();

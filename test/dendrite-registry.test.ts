@@ -122,7 +122,11 @@ describe('AgentRegistry spec validation', () => {
       () => registry.register(workerSpec('w', { resultTo: { to: 'ghost', as: 'message' } })),
       /result recipient "ghost"/,
     );
-    assert.throws(() => registry.register(taskForkSpec('w', { parent: 'ghost' })), /"ghost" is not a registered agent/);
+    // Spawned by mira, so only the context source names nobody.
+    assert.throws(
+      () => registry.register(taskForkSpec('w', { parent: 'ghost', spawnedBy: 'mira' })),
+      /context source "ghost" is not a registered agent/,
+    );
     assert.throws(
       () => registry.register({ ...workerSpec('w'), observes: [{ agent: 'ghost' }] }),
       /observed agent "ghost"/,
@@ -268,7 +272,94 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.deepEqual(second.listMail().map((m) => [m.id, m.from.agent, m.from.incarnation, m.to]), [
       [held.id, 'job', 1, 'mira'],
     ]);
+    // Until the host has told the recipients, the interrupted records stay in
+    // the snapshot as they were and their ends aren't written, so a crash here
+    // owes the same notices at the next boot.
+    assert.equal(state.ended.length, 0, 'no end is written before the recipients are told');
+    assert.deepEqual(state.snapshot!.records.filter((r) => !r.ended).map((r) => r.name).sort(), ['Subconscious', 'job', 'mira', 'mira-c1']);
+    second.settleInterrupted();
     assert.deepEqual(state.ended.map((r) => r.name).sort(), ['job', 'mira-c1']);
+    assert.deepEqual(state.snapshot!.records.map((r) => r.name).sort(), ['Subconscious', 'mira'], 'and the snapshot no longer lists them');
+  });
+
+  it('settles every interrupted end, more than memory keeps, and keeps one whose write fails pending', () => {
+    const state = { snapshot: null as RegistrySnapshot | null, ended: [] as AgentRecord[] };
+    let failFor: string | undefined;
+    const failed: string[] = [];
+    let clock = 1_000;
+    const make = () => new AgentRegistry({
+      now: () => ++clock,
+      endedRetention: 2,
+      persist: (snapshot) => { state.snapshot = JSON.parse(JSON.stringify(snapshot)); },
+      appendEnded: (record) => {
+        if (record.name === failFor) throw new Error('EIO: the ended log');
+        state.ended.push(JSON.parse(JSON.stringify(record)));
+      },
+      onRecordWriteFailed: (what) => { failed.push(what); },
+    });
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    for (const name of ['j1', 'j2', 'j3', 'j4']) first.register(workerSpec(name, { spawnedBy: 'mira' }));
+    // The process dies with four jobs live; memory keeps two ended records.
+    const second = make();
+    assert.equal(second.restore(state.snapshot, state.ended).interrupted.length, 4);
+    assert.deepEqual(second.endedHistory(), [], 'an end not yet written is no history a put-back could write');
+    failFor = 'j3';
+    second.settleInterrupted();
+    assert.deepEqual(state.ended.map((r) => r.name), ['j1', 'j2', 'j4'], 'every end is written but the one that failed');
+    assert.deepEqual(failed, ['the end of j3']);
+    const jobs = () => state.snapshot!.records.filter((r) => r.name.startsWith('j')).map((r) => r.name);
+    assert.deepEqual(jobs(), ['j3'], 'which stays in the snapshot');
+    assert.equal(second.inspect('j3')?.ended?.reason, 'host-restart');
+    failFor = undefined;
+    second.settleInterrupted();
+    assert.deepEqual(state.ended.map((r) => r.name), ['j1', 'j2', 'j4', 'j3'], 'and the next settlement writes it');
+    assert.deepEqual(jobs(), []);
+  });
+
+  it('a persistent record whose end the ended history holds still waits to be re-declared', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(residentSpec('oren', { primary: false }));
+    // A stop of oren appended its end, then failed and was put back: the
+    // snapshot lists oren live, and the ended history holds its end.
+    const snapshot = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    const oren = snapshot.records.find((r) => r.name === 'oren')!;
+    const second = make();
+    second.restore(snapshot, [{ ...oren, ended: { at: 5, reason: 'stopped', by: 'mira' } }]);
+    second.register(residentSpec('mira', { primary: true }));
+    assert.deepEqual(second.reconcile().unconfigured.map((o) => o.ended.name), ['oren'], 'oren was awaiting re-declaration');
+  });
+
+  it('inspects the newest of two pending incarnations once memory has let both go', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(workerSpec('j', { spawnedBy: 'mira' }));
+    first.register(workerSpec('k', { spawnedBy: 'mira' }));
+    const snapshot = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    const j = snapshot.records.find((r) => r.name === 'j')!;
+    snapshot.records.splice(snapshot.records.indexOf(j) + 1, 0, { ...j, incarnation: 2 });
+    snapshot.incarnations.j = 2;
+    const second = new AgentRegistry({ endedRetention: 1, persist: () => {}, appendEnded: () => {} });
+    second.restore(snapshot, []);
+    assert.equal(second.inspect('j')?.incarnation, 2);
+  });
+
+  it('settles two interrupted incarnations of one name as two ends', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(workerSpec('j', { spawnedBy: 'mira' }));
+    const snapshot = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    const older = snapshot.records.find((r) => r.name === 'j')!;
+    snapshot.records.push({ ...older, incarnation: 2 });
+    snapshot.incarnations.j = 2;
+    const second = make();
+    assert.equal(second.restore(snapshot, []).interrupted.length, 2);
+    second.settleInterrupted();
+    assert.deepEqual(state.ended.filter((r) => r.name === 'j').map((r) => r.incarnation).sort(), [1, 2]);
   });
 
   it('restores a snapshot whose fork keeps its home as a bare id, as one written before homes carried their server', () => {
@@ -309,6 +400,38 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     registry.end('job', 'completed');
     assert.equal(registry.register(workerSpec('job')).incarnation, 2);
     assert.equal(registry.list({ includeEnded: true }).filter((r) => r.name === 'job').length, 2);
+  });
+
+  it('names the agent whose own context a namespace holds; a shared fork holds none', () => {
+    const registry = new AgentRegistry();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(workerSpec('w', { spawnedBy: 'mira', namespace: 'jobs/w' }));
+    registry.register({ ...workerSpec('fork', { spawnedBy: 'mira' }), namespace: 'jobs/p', inherit: { from: 'mira', mode: 'shared' } });
+    assert.equal(registry.namespaceHolder('agents/mira', 'x'), 'mira');
+    assert.equal(registry.namespaceHolder('jobs/w', 'x'), 'w');
+    assert.equal(registry.namespaceHolder('jobs/w', 'w'), undefined, 'not its own');
+    assert.equal(registry.namespaceHolder('jobs/p', 'x'), undefined, 'a shared fork owns a branch, not the namespace');
+    registry.end('w', 'stopped', 'mira');
+    assert.equal(registry.namespaceHolder('jobs/w', 'x'), 'w', 'an ended agent\'s');
+  });
+
+  it('refuses a version-1 snapshot without its map of incarnations', () => {
+    assert.throws(
+      () => new AgentRegistry().restore({ version: 1, records: [], mail: [] } as unknown as RegistrySnapshot),
+      /reads as version 1 but has no map of incarnations; nothing was restored/,
+    );
+  });
+
+  it('a put-back that throws is reported, and the change\'s own error is what the caller hears', () => {
+    const said: string[] = [];
+    const registry = new AgentRegistry({
+      persist: () => { throw new Error('EIO: the change'); },
+      onRollback: () => { throw new Error('EIO: the put-back'); },
+      onRecordWriteFailed: (what) => { said.push(what); },
+    });
+    assert.throws(() => registry.register(residentSpec('mira', { primary: true })), /EIO: the change/);
+    assert.equal(registry.has('mira'), false, 'and the change is put back');
+    assert.deepEqual(said, ['the put-back of a change that failed']);
   });
 
   it('tolerates a missing snapshot, and refuses one in a version it does not read', () => {

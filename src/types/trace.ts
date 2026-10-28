@@ -966,6 +966,14 @@ export type TraceEvent =
       incarnation: number;
       reason: string;
       by?: string;
+      /** The agent that spawned it, when its record names one. */
+      spawnedBy?: string;
+    })
+  | (TraceEventBase & {
+      /** The last event a replay of create()'s traces delivers when the
+       *  buffer kept only their first 1,000: how many came after. */
+      type: 'dendrite:early-traces-dropped';
+      dropped: number;
     })
   | (TraceEventBase & {
       type: 'dendrite:agent-orphaned';

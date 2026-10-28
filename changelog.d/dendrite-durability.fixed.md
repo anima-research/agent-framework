@@ -20,9 +20,13 @@
   reaches the primary, and a write queued for it lands in its window.
 - The second round of the same review: a change a caller asks for — a
   registration, an end, a reparent, a hold — is put back when its write
-  fails, so the call fails and changes nothing and a retry does it once (a
-  stop whose write failed had left the agent recorded as stopped while it
-  ran). A write that records something that has already happened — a
+  fails, so the call fails and a retry does it once (a stop whose write
+  failed had left the agent recorded as stopped while it ran). The put-back
+  rewrites the registry's recovery files to match memory (the branch-local
+  snapshot, written last, never holds the change); only an end already
+  appended to the branch-local ended log stays, and a boot reads that log
+  only where no ended recovery file exists.
+  A write that records something that has already happened — a
   release, a held mark, a message path — is not failed: it alerts, stays in
   memory, and the next write carries it. A result's hold is durable as it is
   written, so no store sync decides the delivery; the release is written

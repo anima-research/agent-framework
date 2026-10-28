@@ -154,6 +154,12 @@ describe('the registry\'s durable state (findings 1 to 4)', () => {
     // The stop that failed changed nothing: boss is live, and the next stop ends it once.
     assert.equal(first.getAgentRecord('boss')?.ended, undefined);
     first.stopAgent('boss', { by: 'mira' });
+    assert.equal(first.getAgentRecord('boss')?.ended?.by, 'mira', 'the retry ended boss');
+    const bossEnds = (records: Array<{ name: string }>) => records.filter((r) => r.name === 'boss').length;
+    assert.equal(bossEnds((JSON.parse(readFileSync(endedFile(), 'utf8')) as { ended: Array<{ name: string }> }).ended), 1,
+      "once in the ended log's recovery file");
+    const tail = store.getStateTail(ENDED, 100);
+    assert.equal(bossEnds(tail ? JSON.parse(tail.toString('utf8')) as Array<{ name: string }> : []), 1, 'once in the branch-local log');
     gates.release('g-job');
     assert.ok((await job.settled).ok);
     undo = failOn(store, 'setStateJson', REGISTRY);
@@ -468,6 +474,12 @@ describe('5: stopAgent releases the window as the idle reap does', () => {
     assert.equal(framework.getAgent(fork.name), null, 'gone');
     assert.equal(framework.getAgentRecord(fork.name)?.ended?.reason, 'idle-ttl', 'ended in the registry');
     assert.ok(errors.some((e) => /could not record a change already made/.test(e)), 'alerted');
+  });
+
+  it("a fork the host's stop ends is recorded as ended by that stop, not as idle", async () => {
+    const fork = await spawnFork();
+    await framework.stop();
+    assert.equal(framework.getAgentRecord(fork.name)?.ended?.reason, 'host-stop');
   });
 
   for (const how of ['reap', 'stopAgent'] as const) {

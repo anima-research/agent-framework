@@ -194,4 +194,69 @@ describe("reader forks: the framework hands on what a tune-out held while the re
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('a fork still running when its tune-out ends, which then fails, gets one late fork through the framework, and a late fork that fails gets none', { timeout: 120_000 }, async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'tune-out-reader-late-'));
+    const commandPath = join(tempDir, 'commands.txt');
+    writeFileSync(commandPath, '');
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: new ResidentMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      subconscious: { enabled: true, reader: 'forks', model: 'test-model', voice: 'Read for scout.' },
+      mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: join(tempDir, 'status.jsonl'), COMMAND_PATH: commandPath } }],
+      modules: [],
+    });
+    const failures: TraceEvent[] = [];
+    framework.onTrace((e) => { if (e.type === 'tune-out:reader-fork-failed') failures.push(e); });
+    const derives: DeriveCall[] = [];
+    // The first fork's derive waits for the test, then fails, as a fork still
+    // running at the cancel would; every later one fails at once. Past ten,
+    // derives succeed, so a chain of late forks ends and the test can say so.
+    let letFirstFail: () => void = () => {};
+    const firstFails = new Promise<void>((resolve) => { letFirstFail = resolve; });
+    const stubbed = framework as unknown as {
+      deriveAgent: (options: DeriveCall) => Promise<unknown>;
+      runEphemeralToCompletion: () => Promise<{ speech: string }>;
+      tuneOutCoordinator: TuneOutCoordinator;
+      channelRegistry: { listChannelsRaw(): unknown[] };
+    };
+    stubbed.deriveAgent = async (options) => {
+      derives.push(options);
+      if (derives.length === 1) await firstFails;
+      if (derives.length > 10) return { agent: { name: options.name }, contextManager: {} };
+      throw new Error('derive failed (test)');
+    };
+    stubbed.runEphemeralToCompletion = async () => ({ speech: '' });
+    const orig = console.error;
+    console.error = () => {};
+    try {
+      await framework.start();
+      await waitFor('channel registration', () => stubbed.channelRegistry.listChannelsRaw().length > 0);
+      assert.ok(stubbed.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 200, maxWakes: 5 }, 'agent-tool').ok);
+      appendFileSync(commandPath, 'addressed x1 ADDR-1 are you there\n');
+      await waitFor('the first fork is deriving', () => derives.length === 1);
+      assert.ok(stubbed.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test').ok, 'the tune-out ends while that fork runs');
+      await waitFor("the cancel's own last fork", () => derives.length === 2);
+      // The cancel's last fork is handed nothing, since the first fork was
+      // handed ADDR-1. It fails too, and with nothing to give back it derives
+      // no late fork: the late fork below is the first fork's alone.
+      assert.ok(!textOf(derives[1]!.framing[0]!.content as never).includes('ADDR-1'), "premise: the cancel's last fork isn't handed ADDR-1");
+      letFirstFail();
+      await waitFor('the late fork', () => derives.length >= 3);
+      const late = textOf(derives[2]!.framing[0]!.content as never);
+      assert.ok(late.includes('ADDR-1 are you there'), late);
+      assert.ok(late.includes('handed to a reader that failed after the tune-out ended'), late);
+      // Its failure is handled once its trace is out, and a fork derived from
+      // that handling would be derived before it: invokeReaderFork reaches
+      // deriveAgent without an await, inside readerFailed.
+      await waitFor("the late fork's failure is handled", () => failures.length >= 3);
+      assert.equal(derives.length, 3, 'the late fork failed too, and no other fork was derived');
+    } finally {
+      letFirstFail();
+      console.error = orig;
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });

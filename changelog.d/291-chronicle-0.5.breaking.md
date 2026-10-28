@@ -1,10 +1,12 @@
 - **Hosts and packages that install agent-framework:** it now depends on `@animalabs/chronicle` `^0.5.0` (was
-  `^0.4.0`) and `@animalabs/context-manager` `^0.24.0` (was `^0.23.0`): the chronicle release that carries the
+  `^0.4.0`) and `@animalabs/context-manager` `^0.24.0` (was `^0.23.1`): the chronicle release that carries the
   identity-stamped batched append (`appendManyToStateJsonWithIdentity`), and the context-manager release that keeps
   each agent's window (`windowStatusOf`, `presentRows`, `retractRows`, `getPresentedMessages`) and writes a window
   write as one record with it (context-manager's 291-chronicle-0.5 and 291-window-batches entries). The range starts
-  at 0.24.0, not 0.23.0: context-manager 0.23.0 was published without the window APIs, so `^0.23.0` would install it,
-  and `AgentFramework.create()` refuses a context-manager without `presentRows`. Every agent's window is written down
+  at 0.24.0, not 0.23.1: context-manager 0.23.0 and 0.23.1 were published without the window APIs, so `^0.23.1`
+  would install 0.23.1, and `AgentFramework.create()` refuses a context-manager without `presentRows`. 0.24.0
+  carries 0.23.1's changes, so what 0.29.0's entry for `^0.23.1` says of the runtime-settings preview holds under it
+  too. Every agent's window is written down
   at its registration (#291), and without the batched form context-manager writes it one record per row: about 23
   seconds and 63 MB of log for a 200,000-row namespace, against a quarter of a second as one record, on one synthetic
   store, and a presentation of several rows that fails partway leaves the rows before it presented. The new ranges

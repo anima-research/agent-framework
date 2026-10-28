@@ -33,6 +33,9 @@ function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; k
   const added: Added[] = [];
   const inferences: string[] = [];
   const registry = {
+    // No other tune-out or all-except hold, and nothing else stored.
+    getTuneOutState: () => null,
+    readCoordinatorState: () => null,
     // Each channel's id is unique here, so it's shown by its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
     quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),

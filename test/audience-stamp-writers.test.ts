@@ -323,6 +323,10 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   // read onto this branch as an own row: its frames hold the agent, but a
   // dropped start's agent may have been replaced, so it holds its row back.
   'framework.ts AgentFramework.nameUnpostedSpeech': { count: 1, when: 'held-back', what: "main's [speech-not-posted] notice, held back after a dropped start" },
+  // main's heartbeat-turn [routing] notice (0.29.0), stored past addMessage
+  // there, read onto this branch as an own row: written where the locus
+  // announcement is, at a heartbeat's start before its compile.
+  'framework.ts AgentFramework.noticeHeartbeatTurn': { count: 1, when: 'turn', what: "a heartbeat's start's routing notice" },
 };
 
 it("every writer of an agent's own rows is classified by when it writes, and one that may write into another turn holds its row back", () => {

@@ -13,7 +13,7 @@ import { createMockResponse } from './helpers/mock-membrane.js';
 describe('reader forks with channel speech off', { skip }, () => {
   const r = rig('speech-off', false);
 
-  it("the resident's tools stay in the fork's block and are refused at dispatch; the fork's own three are not; nothing is published", async () => {
+  it("the resident's tools stay in the fork's block and are refused at dispatch; nothing is published", async () => {
     const before = await r.tuneOut();
     // The fork tries the resident's publish tool, then speak_in_channel, then reports.
     r.state.membrane.push('reader', publishCall('c1'), speakCall('c2'), createMockResponse([{ type: 'text', text: 'nothing urgent' }]));
@@ -23,11 +23,6 @@ describe('reader forks with channel speech off', { skip }, () => {
     await r.waitFor(() => r.forkTraces().length >= 1, 'a reader fork is derived');
     const fork = r.forkTraces()[0]!.agentName;
     await r.waitFor(() => r.refusals().length >= 2, 'both calls are refused at dispatch');
-    assert.deepEqual(
-      r.state.denies.get(fork),
-      { deliver_summary: false, cancel_tuneout: false, note_disposition: false, speak_in_channel: true, channel_publish: true },
-      "the fork's own three are its; the resident's tools and speech (off) are refused at dispatch",
-    );
     assert.deepEqual(
       r.refusals().map((t) => [t.tool, t.error]),
       [['channel_publish', `channel_publish is not available to ${fork}`], ['speak_in_channel', `speak_in_channel is not available to ${fork}`]],

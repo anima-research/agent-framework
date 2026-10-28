@@ -130,22 +130,23 @@ export interface FrameworkConfig {
      */
     announceOrphans?: boolean;
     /**
-     * Every derivation tells the agent it was made from, in one host-framed
-     * line. After this many derivations of one kind from one agent, that
-     * agent hears a count line every so many instead of a line per fork, so
-     * a reader loop that forks a hundred times a session doesn't fill its
-     * source's context with stamps; the registry and traces keep every
-     * record. Default 10; 0 never collapses.
+     * By default every derivation tells the agent it was made from, in one
+     * host-framed line. After this many derivations of one kind from one
+     * agent, that agent hears a count line every so many instead of a line
+     * per fork, so a reader loop that forks a hundred times a session doesn't
+     * fill its source's context with stamps; every derivation still emits its
+     * `dendrite:agent-created` trace. Default 10; 0 never collapses.
      */
     collapseDerivationNoticesAfter?: number;
     /**
-     * A host's say over every derivation and spawn, before the agent exists:
-     * the spec as it will be registered (name, kind, spawner, route,
-     * inheritance, metadata). Return nothing to allow, or `{ refuse }` with
-     * the reason, which the caller gets as the error. The framework attaches
-     * no meaning to the decision — consent, budget, hours, a mind's standing
-     * instruction, a use not yet imagined are all the host's (architecture
-     * channel, 2026-10-19: semantics live outside the platform).
+     * A host's say over each derivation, ephemeral spawn and resume, before the
+     * agent or its new incarnation exists, given the spec of what is about to
+     * exist (name, kind, spawner, route, inheritance, metadata). A shared
+     * derivation's record then adds the child's branch, and names the
+     * parent's namespace as its own. Return nothing to allow, or `{ refuse }`
+     * with the reason, which the caller gets as the error. The framework
+     * attaches no meaning to the decision: consent, budget, hours, a mind's
+     * standing instruction, a use not yet imagined are all the host's.
      */
     beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
     /**
@@ -246,6 +247,26 @@ export interface FrameworkConfig {
    * the next release.
    */
   deferredWritesPath?: string;
+
+  /**
+   * The Dendrite agent registry's recovery file: its live records and the
+   * results it holds for delivery, written atomically and fsynced, and read
+   * first at boot. Defaults to `<storePath>/recovery/dendrite-registry.json`.
+   * Outside the chronicle for the reason `hostModePath` is: a branch switch
+   * or historical rollback would otherwise take back held results. Set
+   * explicitly when providing an app-owned `store` without `storePath`;
+   * without either, the registry persists only in the branch-local store,
+   * with a warning at create.
+   */
+  agentRegistryPath?: string;
+
+  /**
+   * The registry's ended-record log recovery file (its newest records, as
+   * many as a restart reads). Defaults to
+   * `<storePath>/recovery/dendrite-ended.json`; same rationale and fallback
+   * as `agentRegistryPath`.
+   */
+  agentRegistryEndedPath?: string;
 
   /** Emoji used for branch-awareness markers (default: 💤). */
   discordAwarenessEmoji?: string;

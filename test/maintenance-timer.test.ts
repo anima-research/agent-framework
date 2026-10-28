@@ -659,9 +659,10 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => strategy.ticks >= 2);
-      // Module tool + synthesized agent_settings are both supplied to
-      // maintenance/compression requests.
-      assert.deepEqual(strategy.toolCounts, [2, 2]);
+      // Module tool, synthesized agent_settings and the four toolsets
+      // meta-tools are all supplied to maintenance/compression requests:
+      // compression declares every tool its history may hold, folded or not.
+      assert.deepEqual(strategy.toolCounts, [6, 6]);
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length === 1);
       const snapshot = framework.getContextMaintenanceSnapshot();
       assert.equal(snapshot.current, null);

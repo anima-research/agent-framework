@@ -144,15 +144,26 @@ export interface Module {
 
   /**
    * Utilities: agent-invocable operations that deliberately do NOT get a
-   * first-class tool slot. Every tool schema taxes every inference; a
-   * capability used twice a month shouldn't. Utilities are listed, described,
-   * and invoked through the framework's single `utils` tool instead — same
-   * ToolDefinition shape, same un-prefixed names, and dispatch arrives at the
-   * SAME handleToolCall as getTools() output, so a tool migrates between
-   * surfaces by moving its definition from one list to the other and nothing
-   * else. Optional; omitting it means the module contributes no utilities.
+   * slot in the tool list. Every tool schema taxes every inference; a
+   * capability used twice a month shouldn't. Utilities belong to the host's
+   * built-in toolset ("settings"): an agent sees them with
+   * `toolsets--look {toolset:"settings"}` and calls them with
+   * `toolsets--act` once it has opened it. Same ToolDefinition shape, same
+   * un-prefixed names, and dispatch arrives at the SAME handleToolCall as
+   * getTools() output. Optional; omitting it means the module contributes no
+   * utilities.
    */
   getUtilities?(): ToolDefinition[];
+
+  /**
+   * Where one of this module's tools (a getTools() name, unprefixed) is
+   * presented: in the agent's tool list (`'header'`, the default), or in the
+   * host's built-in toolset (`'builtin'`), out of the tool list, opened with
+   * `toolsets--open {toolset:"settings"}` and called with `toolsets--act`.
+   * For tools an agent uses rarely: settings, administration, status reads.
+   * Optional; omitting it keeps every tool in the tool list.
+   */
+  toolPlacement?(toolName: string): 'header' | 'builtin' | undefined;
 
   /**
    * Handle a tool call.

@@ -51,8 +51,14 @@ export interface AgentRegistryOptions {
    * failure is logged.
    */
   onRecordWriteFailed?: (what: string, error: unknown) => void;
-  /** Told after a requested change was put back: the host puts back what it wrote alongside (its ended log). */
+  /** Told after a change that failed was put back in memory (a requested change, or a hold): the host rewrites what it wrote alongside to match. */
   onRollback?: () => void;
+  /**
+   * Asked for an ended record no longer in memory (past `endedRetention`):
+   * the host reads its durable ended log, so an agent that ended long ago
+   * can still be inspected, resumed and named.
+   */
+  findEnded?: (name: AgentName) => AgentRecord | undefined;
 }
 
 /** What a restore found that the previous process left unfinished. */
@@ -175,6 +181,13 @@ export class AgentRegistry {
   private ended: AgentRecord[] = [];
   /** Persistent records from the previous process, not yet re-declared. */
   private readonly awaiting = new Map<AgentName, AgentRecord>();
+  /**
+   * Bounded work the previous process left live, ended by this restart in
+   * memory but kept in the snapshot as it was until the host has told each
+   * recipient (settleInterrupted), so a crash before then owes the same
+   * notices at the next boot rather than none.
+   */
+  private readonly interruptedPending = new Map<string, { asWas: AgentRecord; ended: AgentRecord }>();
   private readonly incarnations = new Map<AgentName, number>();
   private mail: HeldMail[] = [];
   private readonly now: () => number;
@@ -183,6 +196,7 @@ export class AgentRegistry {
   private readonly endedRetention: number;
   private readonly onRecordWriteFailed: (what: string, error: unknown) => void;
   private readonly onRollback?: () => void;
+  private readonly findEnded?: (name: AgentName) => AgentRecord | undefined;
   /** Above zero while a record of what happened is being written: its writes alert rather than throw. */
   private recordingDepth = 0;
 
@@ -191,6 +205,7 @@ export class AgentRegistry {
     this.persistFn = options.persist;
     this.appendEndedFn = options.appendEnded;
     this.onRollback = options.onRollback;
+    this.findEnded = options.findEnded;
     this.onRecordWriteFailed = options.onRecordWriteFailed
       ?? ((what, error) => console.error(`[dendrite] the registry could not record ${what}; it stays in memory and the next write carries it:`, error));
     this.endedRetention = options.endedRetention ?? DEFAULT_ENDED_RETENTION;
@@ -207,18 +222,22 @@ export class AgentRegistry {
    *
    * `resume` admits a new incarnation of an identity that ended: where its
    * context came from is then history, so the context source no longer has
-   * to be live. Who it reports to still does.
+   * to be live. Who it reports to still does. A spawner that has ended, and
+   * a result route to it, are admitted: the agent registers as that
+   * spawner's orphan, as if it had been live when the spawner ended.
+   * `after` is the incarnation a resumption continues from: the new one is
+   * past it, since the counter of a name that aged out of memory isn't kept.
    */
-  register(spec: AgentSpec, options: { resume?: boolean } = {}): AgentRecord {
+  register(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
     return this.requested(() => this.registerUnguarded(spec, options));
   }
 
-  private registerUnguarded(spec: AgentSpec, options: { resume?: boolean } = {}): AgentRecord {
+  private registerUnguarded(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
     this.validate(spec, options.resume === true);
     const previous = this.awaiting.get(spec.name);
     this.awaiting.delete(spec.name);
 
-    const incarnation = (this.incarnations.get(spec.name) ?? 0) + 1;
+    const incarnation = Math.max(this.incarnations.get(spec.name) ?? 0, options.after ?? 0) + 1;
     this.incarnations.set(spec.name, incarnation);
 
     const observes = (spec.observes ?? []).map((edge) => ({ ...edge }));
@@ -250,6 +269,20 @@ export class AgentRegistry {
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
       createdAt: previous?.createdAt ?? this.now(),
     };
+    const spawner = record.relationships.spawnedBy;
+    if (spawner !== undefined && !this.live.has(spawner)) {
+      const former = this.inspect(spawner)!;
+      const above = former.relationships.spawnedBy;
+      const candidates = above !== undefined && this.live.has(above) ? [above, ...this.ancestors(above)] : [];
+      const primary = this.primary();
+      if (primary && primary !== record.name && !candidates.includes(primary)) candidates.push(primary);
+      record.orphaned = {
+        since: this.now(),
+        formerParent: { agent: former.name, incarnation: former.incarnation },
+        reason: former.ended?.reason ?? 'stopped',
+        candidates,
+      };
+    }
     this.live.set(spec.name, record);
     this.persist();
     return record;
@@ -277,13 +310,26 @@ export class AgentRegistry {
       if (!(lifetime.idleTtlMs > 0)) fail('an idle lifetime needs a positive idleTtlMs');
     }
 
+    // A spawner that ended before its child registered (between creating the
+    // child and running it): the child is its orphan from the start, as one
+    // live when the spawner ended would be, with its route to the spawner
+    // held; one that ends with its parent would have ended with it.
+    const endedSpawner = spec.spawnedBy !== undefined && !this.live.has(spec.spawnedBy)
+      ? this.inspect(spec.spawnedBy)
+      : undefined;
     if (spec.spawnedBy !== undefined) {
       if (spec.spawnedBy === spec.name) fail('cannot be spawned by itself');
-      if (!this.live.has(spec.spawnedBy)) fail(`spawner "${spec.spawnedBy}" is not a registered agent`);
+      if (!this.live.has(spec.spawnedBy)) {
+        if (!endedSpawner?.ended) fail(`spawner "${spec.spawnedBy}" is not a registered agent`);
+        if (spec.onParentEnd === 'end') {
+          fail(`spawner "${spec.spawnedBy}" has ended, and an agent that ends with its parent would have ended with it`);
+        }
+      }
     } else if (spec.onParentEnd === 'end') {
       fail('onParentEnd "end" needs a spawnedBy relationship');
     }
-    if (spec.resultTo && !this.live.has(spec.resultTo.to)) {
+    if (spec.resultTo && !this.live.has(spec.resultTo.to)
+      && !(endedSpawner?.ended && spec.resultTo.to === spec.spawnedBy)) {
       fail(`result recipient "${spec.resultTo.to}" is not a registered agent`);
     }
     if (spec.inherit && !resume && !this.live.has(spec.inherit.from)) {
@@ -309,20 +355,40 @@ export class AgentRegistry {
     return this.live.has(name);
   }
 
-  /** The live record, else the most recent ended one with that name. */
+  /** The live record, else the most recent ended one with that name, from memory or the host's ended log. */
   inspect(name: AgentName): AgentRecord | undefined {
     const live = this.live.get(name);
     if (live) return live;
     for (let i = this.ended.length - 1; i >= 0; i--) {
       if (this.ended[i]!.name === name) return this.ended[i];
     }
-    return undefined;
+    // An interrupted record trimmed from memory before its end is written:
+    // the newest incarnation, where two of one name are pending.
+    let newest: AgentRecord | undefined;
+    for (const { ended } of this.interruptedPending.values()) {
+      if (ended.name === name && (!newest || ended.incarnation > newest.incarnation)) newest = ended;
+    }
+    return newest ?? this.findEnded?.(name);
   }
 
   /** Flat list of agents — the discovery surface. Ended ones on request. */
   list(options: { includeEnded?: boolean } = {}): AgentRecord[] {
     const live = [...this.live.values()];
     return options.includeEnded ? [...this.ended, ...live] : live;
+  }
+
+  /**
+   * An agent other than `except` whose own context a namespace holds, among
+   * the records in memory: live, awaiting re-declaration, or ended. A shared
+   * fork's record names its parent's namespace, where it owns only a branch,
+   * so it holds none.
+   */
+  namespaceHolder(namespace: string, except: AgentName): AgentName | undefined {
+    const pending = [...this.interruptedPending.values()].map((entry) => entry.asWas);
+    for (const record of [...this.live.values(), ...this.awaiting.values(), ...pending, ...this.ended]) {
+      if (record.name !== except && record.namespace === namespace && record.inherit?.mode !== 'shared') return record.name;
+    }
+    return undefined;
   }
 
   /** Provenance stamp for a live agent (or its last incarnation). */
@@ -567,6 +633,30 @@ export class AgentRegistry {
     return { record, deliverable };
   }
 
+  /**
+   * An ended agent's held mail finds a new recipient: every item it produced
+   * for a recipient that is gone (a result or a message, as `reparent`
+   * moves for a live agent) is re-addressed to `newParent` and returned for
+   * delivery. Its record stays as it ended, since history isn't reparented.
+   */
+  readdressHeldMail(name: AgentName, newParent: AgentName): { record: AgentRecord; deliverable: HeldMail[] } {
+    return this.requested(() => {
+      const record = this.inspect(name);
+      if (!record?.ended) throw new AgentSpecError(name, 'is not an ended agent');
+      if (!this.live.has(newParent)) throw new AgentSpecError(name, `new parent "${newParent}" is not a registered agent`);
+      const deliverable: HeldMail[] = [];
+      for (const item of this.mail) {
+        if (item.from.agent === name && !this.live.has(item.to)) {
+          item.to = newParent;
+          item.heldBecause = 'undelivered';
+          deliverable.push(item);
+        }
+      }
+      if (deliverable.length > 0) this.persist();
+      return { record, deliverable };
+    });
+  }
+
   // ==========================================================================
   // Held mail
   // ==========================================================================
@@ -581,11 +671,13 @@ export class AgentRegistry {
     };
     this.mail.push(item);
     // A hold that isn't durable isn't held: the persist's failure fails this
-    // call, and the item leaves memory too, so a retry holds it once.
+    // call, and the item leaves memory and every copy written before the
+    // failure too, so a retry holds it once.
     try {
       this.persist();
     } catch (error) {
       this.mail.pop();
+      this.putBack();
       throw error;
     }
     return item;
@@ -619,13 +711,15 @@ export class AgentRegistry {
   // ==========================================================================
 
   snapshot(): RegistrySnapshot {
-    const records = [...this.awaiting.values(), ...this.live.values()].map((record) => clone(record));
+    const pending = [...this.interruptedPending.values()].map((entry) => entry.asWas);
+    const records = [...this.awaiting.values(), ...pending, ...this.live.values()].map((record) => clone(record));
     // Counters are kept for identities that can still be referred to: live
     // agents, persistent agents awaiting re-declaration, and ended agents
     // still in retention. A single-use name that has aged out restarts at 1.
     const referable = new Set<AgentName>([
       ...this.live.keys(),
       ...this.awaiting.keys(),
+      ...pending.map((record) => record.name),
       ...this.ended.map((record) => record.name),
     ]);
     const incarnations: Record<AgentName, number> = {};
@@ -637,8 +731,17 @@ export class AgentRegistry {
    * Load what the previous process persisted. Restart behaviour follows
    * from lifetime: a persistent agent waits to be re-declared by
    * configuration (see {@link reconcile}); every other agent that was live
-   * is ended here as interrupted, and returned so its result recipient can
-   * be told. Held mail is kept for redelivery.
+   * is ended here as interrupted, in memory, and returned so its result
+   * recipient can be told. It stays in the snapshot as it was, and its end
+   * is written, once the host has told the recipients (settleInterrupted).
+   * Held mail is kept for redelivery.
+   *
+   * A bounded record the ended history already holds, by name and
+   * incarnation, ended before the previous process could write the snapshot
+   * without it: it is dropped, not ended again. A persistent record waits to
+   * be re-declared whatever that history says, since the end there may be one
+   * a stop left that failed and was put back (an append can't be taken
+   * back); configuration then declares it again or ends it.
    *
    * `endedHistory` is the tail of the ended-record log, oldest first.
    */
@@ -652,16 +755,23 @@ export class AgentRegistry {
       throw new Error(`the agent registry reads as version ${JSON.stringify(snapshot.version)}, which this code doesn't read; nothing was restored`);
     }
 
-    for (const [name, value] of Object.entries(snapshot.incarnations ?? {})) {
-      if (typeof value === 'number') this.incarnations.set(name, value);
-    }
     // Damaged in its content rather than its version: refused the same way,
-    // since taken as empty it would be overwritten.
+    // since taken as empty it would be overwritten, and without its counters
+    // every identity it names would start again at incarnation 1.
     if (!Array.isArray(snapshot.mail) || !Array.isArray(snapshot.records)) {
       throw new Error('the agent registry reads as version 1 but its records or mail are not lists; nothing was restored');
     }
+    const counters: unknown = snapshot.incarnations;
+    if (counters === null || typeof counters !== 'object' || Array.isArray(counters)) {
+      throw new Error('the agent registry reads as version 1 but has no map of incarnations; nothing was restored');
+    }
+    for (const [name, value] of Object.entries(counters)) {
+      if (typeof value === 'number') this.incarnations.set(name, value);
+    }
     this.mail = clone(snapshot.mail);
 
+    const endedKeys = new Set(this.ended.map((record) => `${record.name}#${record.incarnation}`));
+    let dropped = false;
     for (const raw of snapshot.records) {
       const record = withOwnSlot(clone(raw));
       if (record.ended) continue; // history lives in the ended log
@@ -669,11 +779,39 @@ export class AgentRegistry {
         this.awaiting.set(record.name, record);
         continue;
       }
-      this.recordEnded(record, 'host-restart');
+      if (endedKeys.has(`${record.name}#${record.incarnation}`)) {
+        dropped = true;
+        continue;
+      }
+      const asWas = clone(record);
+      this.pushEnded(record, 'host-restart');
+      this.interruptedPending.set(`${record.name}#${record.incarnation}`, { asWas, ended: clone(record) });
       interrupted.push(record);
     }
-    if (interrupted.length > 0) this.persist();
+    if (dropped) this.persist();
     return { interrupted };
+  }
+
+  /**
+   * The host has told each interrupted job's recipient (restore's
+   * `interrupted`): their ends are written now, and the snapshot no longer
+   * lists them. Each pending entry carries its own end, as memory keeps only
+   * the newest `endedRetention`. An end whose write fails is reported and
+   * stays pending, so the snapshot still lists it and a later settlement (the
+   * next boot's) writes it; a failed snapshot write is reported too.
+   */
+  settleInterrupted(): void {
+    if (this.interruptedPending.size === 0) return;
+    for (const [key, { ended }] of [...this.interruptedPending]) {
+      try {
+        this.appendEndedFn?.(clone(ended));
+      } catch (error) {
+        this.onRecordWriteFailed(`the end of ${ended.name}`, error);
+        continue;
+      }
+      this.interruptedPending.delete(key);
+    }
+    this.recording(() => this.persist());
   }
 
   /**
@@ -702,11 +840,21 @@ export class AgentRegistry {
   }
 
   private recordEnded(record: AgentRecord, reason: AgentEndReason, by?: string): void {
+    this.pushEnded(record, reason, by);
+    this.appendEndedRecord(record);
+  }
+
+  /** Mark a record ended and keep it in memory, without writing the end. */
+  private pushEnded(record: AgentRecord, reason: AgentEndReason, by?: string): void {
     record.ended = { at: this.now(), reason, ...(by ? { by } : {}) };
     this.ended.push(record);
     if (this.ended.length > this.endedRetention) {
       this.ended.splice(0, this.ended.length - this.endedRetention);
     }
+  }
+
+  /** Write an ended record through the host's append hook. */
+  private appendEndedRecord(record: AgentRecord): void {
     if (!this.appendEndedFn) return;
     // A failed append fails the end that made it, as a failed persist does —
     // unless the end records a run that has ended, when it alerts instead.
@@ -744,8 +892,18 @@ export class AgentRegistry {
       this.awaiting.clear(); for (const [k, v] of saved.awaiting) this.awaiting.set(k, v);
       this.incarnations.clear(); for (const [k, v] of saved.incarnations) this.incarnations.set(k, v);
       this.mail = saved.mail;
-      this.onRollback?.();
+      this.putBack();
       throw error;
+    }
+  }
+
+  /** Memory is as it was before a change that failed: the host rewrites its copies to match. The caller hears why
+   *  its change failed, not why the put-back did. */
+  private putBack(): void {
+    try {
+      this.onRollback?.();
+    } catch (rollbackError) {
+      this.onRecordWriteFailed('the put-back of a change that failed', rollbackError);
     }
   }
 
@@ -761,7 +919,12 @@ export class AgentRegistry {
 
   /** The ended records in memory, newest last. */
   endedHistory(): AgentRecord[] {
-    return this.ended.map(clone);
+    // An interrupted end not yet written isn't history yet: written into the
+    // ended file early, it would let a crash drop the record before its
+    // recipient is told (restore drops what the ended history holds).
+    return this.ended
+      .filter((record) => !this.interruptedPending.has(`${record.name}#${record.incarnation}`))
+      .map(clone);
   }
 
   /** Persist a record of something that has already happened: a failure

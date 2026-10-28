@@ -5,8 +5,10 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture } from './helpers/coalescing-fixture.js';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import { createMockResponse, HeldStream } from './helpers/mock-membrane.js';
 import {
   SUB, internals, textOf, stored, held, has, find, MENTION,
   incoming, dm, registerOpen, enter, settle, channellessTurnLocus,
@@ -51,6 +53,7 @@ describe('tune-out, all-except scope', () => {
       const epochs = f.framework.listPolicyEpochs();
       const listed = epochs.find((e) => e.id === scope.epochId);
       assert.ok(listed, 'the scope is a policy epoch');
+      assert.equal(listed!.kind, 'tune-out', 'of the tune-out kind');
       assert.deepEqual(listed!.scope, { kind: 'all-except', except: { serverId: 'editor', channelId: 'work' } });
       assert.equal(typeof listed!.expiresAtMs, 'number', 'bounded');
     } finally { await f.close(); }
@@ -70,6 +73,124 @@ describe('tune-out, all-except scope', () => {
     } finally { await f.close(); }
   });
 
+  it('focus entered during a turn with no channel of its own gives that turn the excepted channel: its plain speech lands there', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'fx', name: 'focus', input: { channelId: 'work', durationSeconds: 120 } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-here for a while' }] as ContentBlock[]));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'test', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-here for a while')), 'the speech went out');
+      assert.equal(f.published.find((p) => JSON.stringify(p).includes('zz-here for a while'))!.channelId, 'work');
+    } finally { await f.close(); }
+  });
+
+  it("a turn woken in one channel that focuses on another is told its speech stays where the turn began, and it does", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'fx', name: 'focus', input: { channelId: 'noisy', durationSeconds: 120 } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-still in work' }] as ContentBlock[]));
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-still in work')), 'the speech went out');
+      assert.equal(f.published.find((p) => JSON.stringify(p).includes('zz-still in work'))!.channelId, 'work');
+      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's."));
+      assert.ok(told, "the focus result says this turn's speech stays in work");
+    } finally { await f.close(); }
+  });
+
+  it("a focus whose call no open turn made, as a script's left from an earlier turn, leaves the open turn's speech where it was", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      f.membrane.responses.length = 0;
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-mine alone' }] as ContentBlock[]));
+      const m = f.membrane as unknown as { responses: unknown[]; responseIndex: number; calls: unknown[]; lastStream: unknown };
+      let outside: Promise<{ success: boolean; error?: string }> | undefined;
+      // While the turn is open, a call naming the agent that carries no turn.
+      f.membrane.streamYielding = ((request: unknown) => {
+        m.calls.push(request);
+        const remaining = m.responses.slice(m.responseIndex);
+        m.responseIndex = m.responses.length;
+        outside ??= f.framework.executeToolCall({ id: 'fz', name: 'focus', input: { channelId: 'work', durationSeconds: 120 }, callerAgentName: 'agent' } as never) as never;
+        const stream = new HeldStream(outside.then(() => undefined), remaining as never);
+        m.lastStream = stream;
+        return stream;
+      }) as never;
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'test', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      assert.ok(outside, 'premise: the call was made while the turn was open');
+      const entered = await outside;
+      assert.ok(entered.success, entered.error);
+      assert.ok(internals(f).tuneOutCoordinator!.getAllExcept(), 'premise: the focus holds');
+      await eventually(() => stored(f).some((x) => textOf(x).includes('zz-mine alone')), 'the turn spoke');
+      const routing = (f.framework as unknown as { routingOf(agentName: string): { locus?: { channelId: string } | null } }).routingOf('agent');
+      assert.equal(routing.locus ?? null, null, "the open turn's locus didn't move");
+      await new Promise((r) => setTimeout(r, 100));
+      assert.ok(!f.published.some((p) => JSON.stringify(p).includes('zz-mine alone')), 'its speech went to no channel');
+    } finally { await f.close(); }
+  });
+
+  it("a turn that has no channel by design publishes nowhere when channel_publish names none, though a focus holds, as its plain speech goes nowhere", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enterAllExcept(f, 'work');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content: 'zz-nowhere' } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]));
+      // A wake naming a channel no server registers: the turn has no channel by design (noChannel).
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'test', source: 'test', channelId: 'ghost', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      await eventually(() => stored(f).some((m) => JSON.stringify(m.content).includes('zz-nowhere')), 'the call was made');
+      const refused = stored(f).some((m) => JSON.stringify(m.content).includes('name the channel with channelId. This turn has no channel of its own'));
+      assert.ok(refused, "the call was refused for the turn's having no channel");
+      assert.ok(!f.published.some((p) => JSON.stringify(p).includes('zz-nowhere')), 'nothing was posted');
+    } finally { await f.close(); }
+  });
+
+  it("under the legacy latest-inbound rule too, a heartbeat turn's channel_publish naming no channel is refused, as its plain speech has no channel", async () => {
+    const f = await fixture({ framework: { subconscious: SUB, speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work');
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.turn();
+      assert.equal((internals(f).channelRegistry.getDefaultPublishChannel() as unknown as { channelId: string } | null)?.channelId, 'work', 'premise: work is the latest inbound channel');
+      f.membrane.responses.length = 0;
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'pb', name: 'channel_publish', input: { content: 'zz-beat' } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'beat done' }] as ContentBlock[]));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      await eventually(() => stored(f).some((m) => JSON.stringify(m.content).includes('This turn has no channel of its own')) || f.published.some((p) => JSON.stringify(p).includes('zz-beat')), 'the publish was answered');
+      assert.ok(!f.published.some((p) => JSON.stringify(p).includes('zz-beat')), 'nothing was posted');
+    } finally { await f.close(); }
+  });
+
   it('check reports held counts per channel and peeks one channel without releasing', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
@@ -84,6 +205,11 @@ describe('tune-out, all-except scope', () => {
       assert.equal(report.allExcept!.epochId, scope.epochId);
       assert.deepEqual(report.allExcept!.held, { noisy: 2, other: 1 });
       assert.deepEqual(report.peek, ['antra: noise two'], 'peek shows the newest held line, capped');
+      const viaTool = await internals(f).handleTuneOutTool('agent', { mode: 'check', peek: 'noisy', peekLimit: '1' });
+      assert.deepEqual((viaTool.data as { peek?: string[] }).peek, ['antra: noise two'], "the tool reads peekLimit's numeric string as its number");
+      const refused = await internals(f).handleTuneOutTool('agent', { mode: 'check', peek: 'noisy', peekLimit: 'many' });
+      assert.equal(refused.success, false);
+      assert.match(refused.error ?? '', /peekLimit must be a finite number of lines, and it was the string "many"/);
       assert.ok(internals(f).tuneOutCoordinator!.getAllExcept(), 'still active');
       assert.equal(stored(f).filter(held).length, 3, 'nothing released');
       assert.ok(!has(f, '<tuned-out-backlog'), 'no release notice');
@@ -140,6 +266,49 @@ describe('tune-out, all-except scope', () => {
     } finally { await f.close(); }
   });
 
+  it("the subconscious's cancel_tuneout naming the scope ends the scope, though channelId names a channel tuned out on its own", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy');
+      enterAllExcept(f, 'work');
+      const coordinator = internals(f).tuneOutCoordinator!;
+      f.alwaysRespond(); // the scope's release wakes the resident and the reader
+      const cancelled = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except' });
+      assert.ok(cancelled.success, cancelled.error);
+      assert.equal(coordinator.getAllExcept(), null, 'the scope named outright ended');
+      assert.ok(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), "the channel's own tune-out stays");
+
+      // With no scope to end, naming it ends nothing, rather than the channel the call names.
+      const noScope = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except' });
+      assert.equal(noScope.success, false, 'there was no scope to end');
+      assert.match(noScope.error ?? '', /no all-except hold/);
+      assert.ok(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), "the channel's own tune-out still stays");
+      await f.framework.runUntilIdle();
+    } finally { await f.close(); }
+  });
+
+  it("the subconscious's cancel_tuneout naming the scope \"channel\" ends only a channel's own tune-out, never the all-except hold", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy', 'other');
+      enter(f, 'noisy');
+      enterAllExcept(f, 'work');
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const heldByScope = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'other', scope: 'channel' });
+      assert.equal(heldByScope.success, false, 'a channel only the scope holds has no tune-out of its own to end');
+      assert.match(heldByScope.error ?? '', /isn't tuned out on its own/);
+      assert.notEqual(coordinator.getAllExcept(), null, 'the scope still holds');
+
+      f.alwaysRespond(); // the channel's release wakes the resident and the reader
+      const own = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'channel' });
+      assert.ok(own.success, own.error);
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), null, "the channel's own tune-out ended");
+      assert.notEqual(coordinator.getAllExcept(), null, 'and the scope still holds');
+      await f.framework.runUntilIdle();
+    } finally { await f.close(); }
+  });
+
   it('the duration is mandatory, and a second scope is refused', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
@@ -151,6 +320,21 @@ describe('tune-out, all-except scope', () => {
       const second = internals(f).tuneOutCoordinator!.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool');
       assert.equal(second.ok, false);
       assert.match((second as { error: string }).error, /already/);
+    } finally { await f.close(); }
+  });
+
+  it("the tool reads a numeric string as its number and refuses a value that gives none, naming it, as the coordinator does", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const i = internals(f);
+      const soon = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 'soon' });
+      assert.equal(soon.success, false);
+      assert.match(soon.error ?? '', /durationSeconds must be a finite number of seconds, and it was the string "soon"/);
+      assert.equal(i.tuneOutCoordinator!.getAllExcept(), null, 'nothing changed');
+      const entered = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: '120', backlogCap: '7' });
+      assert.ok(entered.success, entered.error);
+      assert.equal(i.tuneOutCoordinator!.getAllExcept()!.params.backlogCap, 7);
     } finally { await f.close(); }
   });
 
@@ -194,6 +378,39 @@ describe('tune-out, all-except scope', () => {
       assert.ok(result.success, result.error);
       assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'nothing left to speak into: the scope ended');
       assert.match(textOf(find(f, 'all channels except')), /antra: held/);
+    } finally { await f.close(); }
+  });
+
+  it("a close of the excepted channel that can't be recorded still says the focus ended, since it did", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enterAllExcept(f, 'work');
+      const registry = internals(f).channelRegistry as unknown as { setDesiredState(...args: unknown[]): void };
+      const record = registry.setDesiredState.bind(registry);
+      registry.setDesiredState = (...args: unknown[]) => {
+        if (args[2] === 'closed') throw new Error('the log refused it');
+        return record(...args);
+      };
+      const result = await f.framework.executeToolCall({ id: 'c1', name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never);
+      assert.equal(result.success, false);
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'the scope ended');
+      assert.match(result.error ?? '', /The focus on it ended all the same/);
+    } finally { await f.close(); }
+  });
+
+  it('closing the excepted channel ends the scope when the channel was closed already', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const close = (id: string) => f.framework.executeToolCall({ id, name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never);
+      assert.ok((await close('c0')).success);
+      await eventually(() => internals(f).channelRegistry.getDesiredState('editor', 'work') === 'closed', 'work closed');
+      enterAllExcept(f, 'work');
+      const result = await close('c1');
+      assert.ok(result.success, result.error);
+      assert.equal((result.data as { status?: string }).status, 'already closed');
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'the scope ended');
     } finally { await f.close(); }
   });
 

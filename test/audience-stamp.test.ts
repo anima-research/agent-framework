@@ -322,7 +322,11 @@ describe('the audience stamp (#291)', () => {
     const rows = fork.contextManager.getAllMessages() as unknown as Row[];
     const mail = rows.find((r) => textOf(r).includes('from your parent'))!;
     assert.ok(mail, 'the mail reached the fork');
-    assert.equal(mail.participant, 'mira', 'stored in its sender\'s name');
+    // The house's rule (6b7d2c28): mail from a sender the recipient counts as
+    // its own voice is stored as `<sender> (mail)`, so no request presents it
+    // as the fork's own turn; on this branch it is also for the fork and not
+    // its own row, as below.
+    assert.equal(mail.participant, 'mira (mail)', 'stored in its sender\'s name, marked as mail');
     assert.deepEqual(mail.metadata?.audience, ['fork-1'], 'for the fork');
     assert.equal(mail.metadata?.ownRowOf, undefined, 'and not the fork\'s own row: own goes by who stored it, not by name');
     assert.equal((mail.metadata?.dendrite as { to?: unknown }).to, 'fork-1');

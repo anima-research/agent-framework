@@ -26,7 +26,7 @@ import type { ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { renderHeldLine } from '../src/tune-out/coordinator.js';
 import { defaultReaderFraming } from '../src/tune-out/tools.js';
-import { presentAuthor, authorLine } from '../src/author-presentation.js';
+import { presentAuthor, authorLine, ANONYMOUS_PARTICIPANT } from '../src/author-presentation.js';
 
 const CHANNEL = 'probe:guild:alpha';
 
@@ -173,6 +173,10 @@ describe('author presentation', () => {
       const m = stored('user', [{ type: 'text', text: 'hi' }], { author: { id: '1', name: 'Alice' } });
       assert.deepEqual(presentAuthor(m).content, [{ type: 'text', text: 'Alice: hi' }]);
       assert.deepEqual(m.content, [{ type: 'text', text: 'hi' }], 'the input is not mutated');
+      // The first text block only, wherever it is: not the first block, and not every text block.
+      const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AA==' } } as unknown as ContentBlock;
+      const mixed = stored('user', [image, { type: 'text', text: 'hi' }, { type: 'text', text: 'and more' }], { author: { id: '1', name: 'Alice' } });
+      assert.deepEqual(presentAuthor(mixed).content, [image, { type: 'text', text: 'Alice: hi' }, { type: 'text', text: 'and more' }]);
     });
 
     it('is idempotent: text already beginning with the author\'s name is left alone', () => {
@@ -215,6 +219,26 @@ describe('author presentation', () => {
     it('a release line names the author once, whichever shape the server sent', () => {
       assert.equal(renderHeldLine(held('hello?')), 'Zinnia-Probe: hello?');
       assert.equal(renderHeldLine(held('Zinnia-Probe: hello?')), 'Zinnia-Probe: hello?');
+    });
+
+    it('a release line names the author once when media comes before the text, as presentAuthor stores it', () => {
+      const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AA==' } } as unknown as ContentBlock;
+      const stored = presentAuthor({
+        participant: ANONYMOUS_PARTICIPANT,
+        content: [image, { type: 'text', text: 'hello?' } as ContentBlock],
+        metadata: { author: { id: 'Z1', name: 'Zinnia-Probe' } },
+      });
+      const line = renderHeldLine(stored);
+      assert.equal(line.split('Zinnia-Probe:').length - 1, 1, line);
+      assert.ok(line.includes('[image]') && line.includes('hello?'), line);
+    });
+
+    it('a release line reads a blank author name as no author, as presentAuthor does', () => {
+      const content = [{ type: 'text', text: 'hello?' }] as ContentBlock[];
+      assert.equal(
+        renderHeldLine({ participant: 'user', content, metadata: { author: { id: 'Z1', name: '' } } }),
+        renderHeldLine({ participant: 'user', content, metadata: {} }),
+      );
     });
 
     it('the reader framing names the author once, whichever shape the server sent', () => {

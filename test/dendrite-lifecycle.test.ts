@@ -169,7 +169,8 @@ describe('Dendrite lifecycle', () => {
     gates.release('g1');
     assert.ok((await worker.settled).ok);
     await framework.runUntilIdle();
-    // The job made exactly its own two rounds' worth of requests: one stream.
+    // One stream, which held both of the job's own rounds: the broadcast
+    // started no turn of its own for the job.
     assert.equal(membrane.callsFor('worker-1').length, 1);
     assert.ok(membrane.calls.length >= before + 2);
   });
@@ -231,16 +232,59 @@ describe('Dendrite lifecycle', () => {
   it('enforces a task deadline however lively the run is', async () => {
     const framework = await boot();
     framework.start();
-    const worker = await startBlocked(
-      framework,
-      'worker-1',
-      'g1',
+    // The outcome alone is awaited: on a loaded machine the 60 ms deadline can
+    // pass before the job reaches its gate, and either way the job must end
+    // at its deadline, so nothing here waits on the gate first.
+    membrane.script('worker-1', waitCall('g1'), say('worker-1 done'));
+    const { agent, contextManager } = await framework.createEphemeralAgent(
+      { name: 'worker-1', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' },
       { ...workerSpec('worker-1'), lifetime: { kind: 'task', deadlineMs: 60 } },
     );
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    const worker = {
+      settled: framework.runEphemeralToCompletion(agent, contextManager).then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      ),
+    };
     const result = await worker.settled;
     assert.ok(!result.ok && result.error instanceof AgentStoppedError);
     assert.equal(framework.getAgentRecord('worker-1')?.ended?.reason, 'deadline');
     assert.equal(framework.getAgent('worker-1'), null);
+  });
+
+  it('a task deadline past the longest timer waits it out rather than ending the job at once', async () => {
+    const framework = await boot();
+    framework.start();
+    const deadlineMs = 2 ** 31; // one past the longest wait a timer holds
+    const worker = await startBlocked(
+      framework,
+      'worker-1',
+      'g1',
+      { ...workerSpec('worker-1'), lifetime: { kind: 'task', deadlineMs } },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(framework.getAgentRecord('worker-1')?.ended, undefined, 'the job is still running');
+    framework.stopAgent('worker-1');
+    const result = await worker.settled;
+    assert.equal(framework.getAgentRecord('worker-1')?.ended?.reason, 'stopped');
+    assert.ok(!result.ok);
+  });
+
+  it('a replay of create()\'s traces keeps the first 1,000 and ends by naming how many it dropped', async () => {
+    const framework = await boot();
+    const emit = (framework as unknown as { emitTrace(event: unknown): void }).emitTrace.bind(framework);
+    for (let i = 0; i < 1005; i++) emit({ type: 'dendrite:test-early', seq: i });
+    const replayed: Array<{ type: string; seq?: number; dropped?: number }> = [];
+    framework.onTrace((event) => replayed.push(event as never), { replay: true });
+    assert.equal(replayed.length, 1001, 'the first 1,000, then one event naming the rest');
+    const ours = replayed.filter((e) => e.type === 'dendrite:test-early').map((e) => e.seq);
+    assert.equal(ours[0], 0, 'the start of the stream is kept');
+    assert.deepEqual(ours, [...ours].sort((a, b) => a! - b!), 'in order');
+    assert.ok(!ours.includes(1004), 'the newest are the ones dropped');
+    const last = replayed.at(-1)!;
+    assert.equal(last.type, 'dendrite:early-traces-dropped');
+    assert.equal(last.dropped, 1005 - ours.length);
   });
 
   it('delivers a result as attributed mail in the child\'s own name and wakes the recipient', async () => {
@@ -291,6 +335,31 @@ describe('Dendrite lifecycle', () => {
     assert.equal(membrane.callsFor('mira').length, 0, 'the primary is not woken for a result routed elsewhere');
   });
 
+  it('refuses to deliver a result whose route is a tool result: the caller awaiting the run already has it', async () => {
+    const framework = await boot();
+    framework.start();
+    const job = await startBlocked(
+      framework,
+      'inline-1',
+      'g1',
+      workerSpec('inline-1', { spawnedBy: 'oren', resultTo: { to: 'oren', as: 'tool-result' } }),
+      'the inline answer',
+    );
+    gates.release('g1');
+    assert.ok((await job.settled).ok);
+    assert.throws(
+      () => framework.deliverAgentResult('inline-1', [{ type: 'text', text: 'the inline answer' }]),
+      /deliverAgentResult: "inline-1" returns its result as a tool-result; the caller awaiting the run delivers it/,
+    );
+    assert.deepEqual(framework.listHeldMail({ from: 'inline-1' }), [], 'nothing is held for delivery');
+    await framework.runUntilIdle();
+    assert.equal(
+      textsIn(framework, 'oren').filter((m) => m.metadata.kind === 'agent-result').length,
+      0,
+      "no second copy lands in the caller's context",
+    );
+  });
+
   it('a derivation tells the agent it was made from — name, kind, weights, inheritance, route, lifetime — and not the fork (#270)', async () => {
     const framework = await boot();
     framework.start();
@@ -304,14 +373,16 @@ describe('Dendrite lifecycle', () => {
     assert.equal(told().length, 1, 'the source hears of the derivation once, as a host-framed lifecycle line');
     const line = told()[0]!;
     assert.equal(line.participant, 'user', 'host-framed, voiced as nobody');
-    for (const fact of ['fork-1', 'task-fork', 'your weights', 'copy of your context', 'returns to you', 'orphaned']) {
+    for (const fact of ['fork-1', 'task-fork', 'your weights', 'copy of your context', 'returns to you', 'it ends when its task does (idle 10 min)', 'orphaned']) {
       assert.ok(line.text.includes(fact), `the notice names ${JSON.stringify(fact)}: ${line.text}`);
     }
     // A lifecycle notice's detail names who it is for (`to`, #291), as mail's does.
-    assert.deepEqual(
-      { ...(line.metadata.dendrite as Record<string, unknown>), lifetime: undefined, inherit: undefined },
-      { event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model', resultTo: { to: 'oren', as: 'message' }, lifetime: undefined, inherit: undefined, to: 'oren' },
-    );
+    assert.deepEqual(line.metadata.dendrite, {
+      event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model',
+      inherit: { from: 'oren', mode: 'copy' }, resultTo: { to: 'oren', as: 'message' },
+      lifetime: { kind: 'task', idleTimeoutMs: 600_000 },
+      to: 'oren',
+    });
     assert.ok(
       !fork.contextManager.getAllMessages().some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle'),
       'the fork never inherits the notice about itself',
@@ -502,6 +573,170 @@ describe('Dendrite lifecycle', () => {
     assert.deepEqual(framework.getAgentRecord('mira')!.relationships.messagePeers, [], 'a path is directional');
     assert.throws(() => framework.sendAgentMessage('ghost', 'mira', []), /sender "ghost" is not a known agent/);
   });
+
+  it("stopping a resident whose stream's cancel throws still leaves nothing running under its ended record", async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('oren', waitCall('g-oren'), say('oren done'));
+    framework.sendAgentMessage('mira', 'oren', [{ type: 'text', text: 'look at this' }]);
+    await until(() => gates.entered.has('g-oren'), 'oren to block on g-oren');
+    framework.getAgent('oren')!.cancelStream = () => { throw new Error('the stream refused to cancel'); };
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      assert.equal(framework.stopAgent('oren', { by: 'mira' }).ended.ended?.reason, 'stopped');
+    } finally { console.error = consoleError; }
+    assert.equal(framework.getAgent('oren'), null, 'no agent runs under the ended record');
+    assert.ok(logged.some((line) => line.includes('the stream refused to cancel')), logged.join('\n'));
+    gates.release('g-oren');
+  });
+
+  it('stopping a resident that put the gate to sleep ends the sleep', async () => {
+    const framework = await boot({ gate: { config: { default: 'always' } } } as Partial<Parameters<typeof AgentFramework.create>[0]>);
+    framework.start();
+    const gate = (framework as unknown as {
+      eventGate: { setSleep(seconds: number, note?: string, agentName?: string): unknown; getSleepState(): unknown };
+    }).eventGate;
+    gate.setSleep(600, 'resting', 'oren');
+    assert.ok(gate.getSleepState(), 'the gate sleeps for oren');
+    framework.stopAgent('oren', { by: 'mira' });
+    assert.equal(gate.getSleepState(), null, "oren's sleep ended with oren");
+  });
+
+  it('a derivation that fails after its child is made closes the manager it opened, and its name stays used', async () => {
+    const framework = await boot();
+    const openManagers = () => (framework as unknown as { openManagers: Set<WeakRef<object>> }).openManagers.size;
+    const before = openManagers();
+    const source = framework.getAgent('mira')!.getContextManager();
+    const compile = source.compile.bind(source);
+    let failNext = true;
+    source.compile = ((...args: Parameters<typeof compile>) => {
+      if (failNext) { failNext = false; return Promise.reject(new Error('the source would not compile')); }
+      return compile(...args);
+    }) as typeof source.compile;
+    await assert.rejects(framework.deriveAgent({ name: 'fork-c', from: 'mira', mode: 'copy' }), /the source would not compile/);
+    assert.equal(framework.getAgentRecord('fork-c'), null, 'nothing registered');
+    assert.equal(openManagers(), before, "the child's manager is closed");
+    await assert.rejects(framework.deriveAgent({ name: 'fork-c', from: 'mira', mode: 'copy' }), /has been used in this framework/,
+      'what was written under the name stays its own');
+  });
+
+  it("a derivation whose notice to its source can't be written still runs to its end", async () => {
+    const framework = await boot({
+      dendrite: { derivationNotice: () => { throw new Error('the notice hook failed'); } },
+    } as Partial<Parameters<typeof AgentFramework.create>[0]>);
+    framework.start();
+    membrane.script('fork-n', say('fork-n done'));
+    const fork = await framework.deriveAgent({ name: 'fork-n', from: 'mira', mode: 'copy' });
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let result: Awaited<ReturnType<typeof framework.runEphemeralToCompletion>>;
+    try {
+      result = await framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+    } finally { console.error = consoleError; }
+    assert.equal(result.speech, 'fork-n done');
+    assert.equal(framework.getAgentRecord('fork-n')?.ended?.reason, 'completed');
+    assert.ok(logged.some((line) => line.includes('the notice hook failed')), logged.join('\n'));
+  });
+
+  it("mail from an agent the recipient counts as its own voice arrives as '<sender> (mail)', not as its own words", async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('fork-m', waitCall('g-fork-m'), say('fork-m done'));
+    const fork = await framework.deriveAgent({ name: 'fork-m', from: 'mira', mode: 'copy', config: { selfParticipants: ['mira'] } });
+    fork.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    const run = framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+    await until(() => gates.entered.has('g-fork-m'), 'fork-m to block on g-fork-m');
+    framework.sendAgentMessage('mira', 'fork-m', [{ type: 'text', text: 'also check the docs' }], { wake: false });
+    gates.release('g-fork-m');
+    await run;
+    const mail = fork.contextManager.getAllMessages().find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-message');
+    assert.equal(mail?.participant, 'mira (mail)');
+    assert.deepEqual((mail!.metadata as { dendrite: { from: unknown } }).dendrite.from, { agent: 'mira', incarnation: 1 });
+    assert.ok(!membrane.callsFor('fork-m').some((call) => call.messages.some((m) =>
+      m.participant === 'fork-m' && JSON.stringify(m.content).includes('also check the docs'))), 'never presented as its own turn');
+  });
+
+  it('a copy derivation that asks for what only a shared one inherits is refused before anything is made', async () => {
+    const framework = await boot();
+    await assert.rejects(framework.deriveAgent({ name: 'fork-r', from: 'mira', mode: 'copy', inheritRefusals: true }), /inheritRefusals is for mode 'shared'/);
+    await assert.rejects(framework.deriveAgent({ name: 'fork-s', from: 'mira', mode: 'copy', solve: 'fresh' }), /solve is for mode 'shared'/);
+    assert.equal(framework.getAgentRecord('fork-r'), null);
+    const made = await framework.deriveAgent({ name: 'fork-r', from: 'mira', mode: 'copy' });
+    made.cleanup();
+  });
+
+  it('of two overlapping resumes of one ended job, one resumes it and the other is refused', async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('job-r', say('job-r done'));
+    const made = await framework.createEphemeralAgent(
+      { name: 'job-r', model: 'test-model', systemPrompt: 'Do the task.' },
+      workerSpec('job-r', { spawnedBy: 'mira' }),
+    );
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await framework.runEphemeralToCompletion(made.agent, made.contextManager);
+    const config = { model: 'test-model', systemPrompt: 'Do the task.' };
+    const outcomes = await Promise.allSettled([framework.resumeAgent('job-r', config), framework.resumeAgent('job-r', config)]);
+    assert.deepEqual(outcomes.map((o) => o.status).sort(), ['fulfilled', 'rejected']);
+    assert.match(String((outcomes.find((o) => o.status === 'rejected') as PromiseRejectedResult).reason), /"job-r" is already being resumed/);
+    const resumed = (outcomes.find((o) => o.status === 'fulfilled') as PromiseFulfilledResult<Awaited<ReturnType<typeof framework.resumeAgent>>>).value;
+    membrane.script('job-r', say('job-r again'));
+    assert.equal((await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager)).speech, 'job-r again');
+    assert.equal(framework.getAgentRecord('job-r')?.incarnation, 2);
+  });
+
+  it('a resume refused for its configuration leaves the job free to resume', async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('job-v', say('job-v done'));
+    const made = await framework.createEphemeralAgent(
+      { name: 'job-v', model: 'test-model', systemPrompt: 'Do the task.' },
+      workerSpec('job-v', { spawnedBy: 'mira' }),
+    );
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await framework.runEphemeralToCompletion(made.agent, made.contextManager);
+    await assert.rejects(
+      framework.resumeAgent('job-v', { model: 'test-model', systemPrompt: 'Do the task.', promptCaching: 'yes' as unknown as boolean }),
+      /promptCaching/,
+    );
+    const resumed = await framework.resumeAgent('job-v', { model: 'test-model', systemPrompt: 'Do the task.' });
+    resumed.cleanup();
+  });
+
+  it("an earlier resume's cleanup, called again, leaves a later resume's hold on the name", async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('job-c', say('job-c done'));
+    const made = await framework.createEphemeralAgent(
+      { name: 'job-c', model: 'test-model', systemPrompt: 'Do the task.' },
+      workerSpec('job-c', { spawnedBy: 'mira' }),
+    );
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await framework.runEphemeralToCompletion(made.agent, made.contextManager);
+    const config = { model: 'test-model', systemPrompt: 'Do the task.' };
+    const first = await framework.resumeAgent('job-c', config);
+    first.cleanup();
+    const second = await framework.resumeAgent('job-c', config);
+    first.cleanup();
+    await assert.rejects(framework.resumeAgent('job-c', config), /"job-c" is already being resumed/);
+    second.cleanup();
+  });
+
+  it("an ended spawned agent's agent-ended trace names its spawner", async () => {
+    const framework = await boot();
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    framework.start();
+    const worker = await startBlocked(framework, 'worker-s', 'g-s', workerSpec('worker-s', { spawnedBy: 'oren' }));
+    framework.stopAgent('worker-s', { by: 'mira' });
+    await worker.settled;
+    const ended = traces.find((t) => t.type === 'dendrite:agent-ended' && t.agentName === 'worker-s') as { spawnedBy?: string } | undefined;
+    assert.equal(ended?.spawnedBy, 'oren');
+    gates.release('g-s');
+  });
 });
 
 describe('Dendrite restart', () => {
@@ -627,6 +862,18 @@ describe('Dendrite restart', () => {
     const third = await process(new GateModule());
     assert.equal(third.getAgentRecord('mira')!.incarnation, 3);
     assert.equal(textsIn(third, 'mira').filter((m) => m.metadata.kind === 'agent-lifecycle').length, 1);
+  });
+
+  it("a job a restart interrupted is ended in a trace that names its spawner", async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    await blockedJob(first, gates1, 'job-t', workerSpec('job-t', { spawnedBy: 'mira' }));
+    const second = await process(new GateModule());
+    const traces: TraceEvent[] = [];
+    second.onTrace((event) => traces.push(event), { replay: true });
+    const ended = traces.find((t) => t.type === 'dendrite:agent-ended' && t.agentName === 'job-t') as { reason?: string; spawnedBy?: string } | undefined;
+    assert.deepEqual([ended?.reason, ended?.spawnedBy], ['host-restart', 'mira']);
   });
 
   it('a job interrupted by a restart resumes on its own context and still returns its result', async () => {

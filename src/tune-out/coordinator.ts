@@ -18,7 +18,7 @@
 import { NOTICE_TAG } from '../notice-tags.js';
 import { cutToFit, quotedValue, suppliedValue } from '../supplied-text.js';
 import { randomUUID } from 'node:crypto';
-import { authorLine } from '../author-presentation.js';
+import { authorLine, authorNamed, beginsWithAuthorLine } from '../author-presentation.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRef, ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
@@ -49,11 +49,13 @@ const WAKE_COALESCE_MS = 2_000;
  * its notice openings marked (authorLine), as main's dump writes it.
  */
 export function renderHeldLine(m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string {
-  const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
+  const author = authorNamed(m.metadata) ?? m.participant;
   const parts = m.content.map((b: ContentBlock) =>
     b.type === 'text' ? (b as Extract<ContentBlock, { type: 'text' }>).text : `[${b.type}]`,
   );
-  return authorLine(author, parts.filter((p) => p.length > 0).join(' '));
+  const line = parts.filter((p) => p.length > 0).join(' ');
+  const firstText = m.content.find((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')?.text;
+  return firstText !== undefined && beginsWithAuthorLine(author, firstText) ? line : authorLine(author, line);
 }
 
 /** One reader invocation under `reader: 'forks'` (see SubconsciousConfig). */
@@ -310,25 +312,50 @@ export class TuneOutCoordinator {
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
-  /** Diverted-message tallies since the last subconscious invocation, per channel key. */
+  /**
+   * Held messages the channel's reader hasn't looked at, per channel key:
+   * what makes a cadence period worth a look. Counted up as messages are
+   * held and back to zero at each look; rebuilt from the held rows where
+   * memory can't know it (rebuildTally): after a restart, and when a
+   * channel's own tune-out ends while the all-except hold still holds it.
+   * A failed reader fork's messages count again (readerFailed).
+   */
   private divertedSinceInvocation = new Map<string, number>();
   /**
+   * The persistent subconscious's last look at each held channel, per epoch:
+   * the store's sequence when the look was asked for. Durable, so that after
+   * a restart its next look counts only what was held since (rebuildTally).
+   * Reader forks need none: what they were handed is in memory, and after a
+   * restart the first fork of an epoch is handed all it has held.
+   */
+  private lastLooksCache: Record<string, Record<string, number>> | undefined;
+  /**
    * `reader: 'forks'`: the highest sequence of a held message already
-   * handed to a reader fork, per channel key. Each held message is
-   * delivered to exactly one fork. In-memory: after a restart the first
-   * fork of an epoch is handed everything the epoch has held, which is
-   * the right side to err on.
+   * handed to a reader fork, per epoch and channel (handOffKey). Each held
+   * message is delivered to exactly one fork. A channel the all-except hold
+   * holds can be taken by a tune-out of its own and given back, and each
+   * epoch's readers read that epoch's messages, so what one epoch's readers
+   * were handed never moves or clears the other's. In-memory: after a
+   * restart the first fork of an epoch is handed everything the epoch has
+   * held, which is the right side to err on.
    */
   private readerCursor = new Map<string, number>();
   /**
    * `reader: 'forks'`: held messages a reader fork was handed but never read,
-   * per channel key, by id: its derive failed, or its run threw before it
-   * reported (readerFailed). The next invocation is handed them again,
+   * per epoch and channel, by id: its derive failed, or its run threw before
+   * it reported (readerFailed). The next invocation is handed them again,
    * cursor or no. Cleared with the cursor.
    */
   private readerReturned = new Map<string, Set<string>>();
+  /**
+   * `reader: 'forks'`: the late forks derived for an ended epoch's messages
+   * (readerFailed), so that a late fork's own failure derives no other.
+   */
+  private lateForks = new WeakSet<object>();
   /** The all-except scope's durable record, cached (undefined = not read yet). */
   private scopeCache: AllExceptState | null | undefined;
+  /** The epoch whose release this process delivered and whose hold is not yet recorded as cleared. */
+  private scopeReleased: string | undefined;
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -340,6 +367,18 @@ export class TuneOutCoordinator {
 
   private key(serverId: string, channelId: string): string {
     return `${serverId}\0${channelId}`;
+  }
+
+  /** The readers' hand-off bookkeeping's key: one epoch's reading of one channel. */
+  private handOffKey(epochId: string, serverId: string, channelId: string): string {
+    return `${epochId}\0${serverId}\0${channelId}`;
+  }
+
+  /** An ended epoch's hand-off bookkeeping goes with it, every channel's. */
+  private dropHandOffs(epochId: string): void {
+    for (const map of [this.readerCursor, this.readerReturned]) {
+      for (const key of map.keys()) if (key.startsWith(`${epochId}\0`)) map.delete(key);
+    }
   }
 
   /** A reader exists: the persistent subconscious, or forks on demand. */
@@ -409,6 +448,24 @@ export class TuneOutCoordinator {
     // down, its cancel's own forget not written, goes now.
     this.pruneWindowStarts();
     this.anchorSubconscious('resume');
+    // What each held channel's reader hasn't looked at was counted in
+    // memory, so it is counted again from the held rows: without it, a
+    // channel held across the restart gets no cadence look until something
+    // new arrives. Every held message is stored as it arrives (#291), so the
+    // stored rows are all of them.
+    const held = new Set<string>();
+    for (const m of this.hooks.getStoredMessages()) {
+      const meta = m.metadata as { tuneOut?: { epochId?: string }; serverId?: string; channelId?: string } | undefined;
+      const epochId = meta?.tuneOut?.epochId;
+      if (!meta || !epochId || !meta.channelId) continue;
+      const key = this.key(meta.serverId ?? '', meta.channelId);
+      if (!held.has(key) && this.holdFor(meta.serverId ?? '', meta.channelId)?.epochId === epochId) held.add(key);
+    }
+    for (const key of held) {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      this.rebuildTally(serverId, channelId);
+    }
+    this.pruneLooks();
   }
 
   /** The tune-outs active now, a channel's and the all-except hold, with where each started in the record. */
@@ -680,7 +737,7 @@ export class TuneOutCoordinator {
   enter(
     serverId: string,
     channelId: string,
-    opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
+    opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string; alreadyTunedOut?: true } {
     // No reader (issue #232 §3.3): a silent hold, where the host opted into
@@ -920,7 +977,7 @@ export class TuneOutCoordinator {
       // the dump. On a reader's own cancel, the reader has read what it was
       // handed, so a fork follows only when messages arrived after that.
       const stored = this.hooks.getStoredMessages().filter(ofEpoch);
-      const unread = this.unhandedBacklog(this.key(serverId, channelId), stored).length;
+      const unread = this.unhandedBacklog(this.handOffKey(epochId, serverId, channelId), stored).length;
       if (!selfCancel || unread > 0) {
         const truncNote = truncated > 0
           ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
@@ -931,9 +988,13 @@ export class TuneOutCoordinator {
         this.invokeReaderFork(serverId, channelId, epochId, 'cancel', `[${NOTICE_TAG.tuneOutCancelled}: ${name} — ${reason}.${truncNote}${lateNote}]`, stored);
       }
     }
-    this.readerCursor.delete(this.key(serverId, channelId));
-    this.readerReturned.delete(this.key(serverId, channelId));
+    this.dropHandOffs(epochId);
+    this.dropLooks(epochId);
     this.forgetWindowStart(epochId);
+    // Where the all-except hold still holds the channel, its own messages
+    // there that its reader hasn't looked at are counted again, as the
+    // channel's own tune-out's count stood in for theirs.
+    this.rebuildTally(serverId, channelId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
   }
@@ -1003,23 +1064,27 @@ export class TuneOutCoordinator {
 
   getAllExcept(): AllExceptState | null {
     if (this.scopeCache !== undefined) return this.scopeCache;
-    try {
-      const raw = this.channelRegistry.readCoordinatorState(this.scopeStateId) as AllExceptState | null;
-      this.scopeCache = raw && typeof raw === 'object' && raw.params && typeof raw.params.epochId === 'string' ? raw : null;
-    } catch {
-      this.scopeCache = null;
+    // A record that can't be read, or isn't a hold's, is not taken for no
+    // hold: the error goes to the caller and nothing is cached, so the next
+    // read tries again. At create() that refuses the start, as an
+    // unreadable registry does.
+    const raw = this.channelRegistry.readCoordinatorState(this.scopeStateId) as AllExceptState | null;
+    if (raw !== null && raw !== undefined && !(typeof raw === 'object' && raw.params && typeof raw.params.epochId === 'string')) {
+      throw new Error(`the all-except hold's stored record (${this.scopeStateId}) is not a hold's record; it was left as it is`);
     }
+    this.scopeCache = raw ?? null;
     return this.scopeCache;
   }
 
   private writeScope(state: AllExceptState | null): void {
-    this.scopeCache = state;
+    // Durable first: a write that fails leaves memory as the store has it.
     this.channelRegistry.writeCoordinatorState(this.scopeStateId, state);
+    this.scopeCache = state;
   }
 
   enterAllExcept(
     except: { serverId: string; channelId: string },
-    opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
+    opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: AllExceptParams } | { ok: false; error: string } {
     const read = this.readOptions(opts, {
@@ -1046,7 +1111,9 @@ export class TuneOutCoordinator {
       epochId: randomUUID(),
       except,
       cadenceSeconds: Math.max(30, given.cadenceSeconds ?? TUNE_OUT_DEFAULTS.cadenceSeconds),
-      backlogCap: Math.max(0, given.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap),
+      // Whole messages, as a channel's cap is counted: a cap below one shows
+      // none, where slice(-0.5) would take them all.
+      backlogCap: Math.max(0, Math.floor(given.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap)),
       maxWakes: Math.max(1, given.maxWakes ?? TUNE_OUT_DEFAULTS.maxWakes),
       startedAtSequence: this.hooks.currentSequence(),
       startedAtMs: read.now,
@@ -1099,25 +1166,38 @@ export class TuneOutCoordinator {
     const key = TuneOutCoordinator.SCOPE_KEY;
     const expiry = this.expiryTimers.get(key);
     if (expiry) clearTimeout(expiry);
-    armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
-      this.expiryTimers.delete(key);
-      this.cancelAllExcept('duration', 'duration elapsed');
-    });
+    // As a channel's timers: the next turn is armed before this one's work,
+    // and a throw is reported (timerFailed) rather than left to end the host.
+    const { serverId: exceptServer, channelId: exceptChannel } = params.except;
+    const holdExpiry = (timer: ReturnType<typeof setTimeout>): void => { this.expiryTimers.set(key, timer); };
+    const end = (): void => {
+      try {
+        holdExpiry(setTimeout(end, EXPIRY_RETRY_MS));
+        if (!this.cancelAllExcept('duration', 'duration elapsed').ok) this.clearScopeTimers();
+      } catch (err) {
+        this.timerFailed('expiry', exceptServer, exceptChannel, err);
+      }
+    };
+    armAt(params.expiresAtMs, holdExpiry, end);
     if (!this.readerAvailable()) return;
     const cadence = this.cadenceTimers.get(key);
     if (cadence) clearTimeout(cadence);
     const hold = (timer: ReturnType<typeof setTimeout>): void => { this.cadenceTimers.set(key, timer); };
     const tick = () => {
-      const scope = this.getAllExcept();
-      if (!scope) return;
-      // One look per held channel with new traffic since the last look.
-      for (const [channelKey, diverted] of this.divertedSinceInvocation) {
-        if (diverted <= 0) continue;
-        const [serverId, channelId] = channelKey.split('\0') as [string, string];
-        if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue; // a per-channel epoch's own cadence
-        this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+      try {
+        const scope = this.getAllExcept();
+        if (!scope) return;
+        armAfter(params.cadenceSeconds * 1000, hold, tick);
+        // One look per held channel with new traffic since the last look.
+        for (const [channelKey, diverted] of this.divertedSinceInvocation) {
+          if (diverted <= 0) continue;
+          const [serverId, channelId] = channelKey.split('\0') as [string, string];
+          if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue; // a per-channel epoch's own cadence
+          this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+        }
+      } catch (err) {
+        this.timerFailed('cadence', exceptServer, exceptChannel, err);
       }
-      armAfter(params.cadenceSeconds * 1000, hold, tick);
     };
     armAfter(params.cadenceSeconds * 1000, hold, tick);
   }
@@ -1161,31 +1241,31 @@ export class TuneOutCoordinator {
   ): { ok: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
-    this.writeScope(null);
-    this.clearScopeTimers();
     const { epochId, except, backlogCap } = scope.params;
-    for (const [key, pending] of this.pendingWakes) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
-      if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
-      clearTimeout(pending.timer);
-      this.pendingWakes.delete(key);
-    }
 
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
     // Stored, and kept by a surgery's hold until its release (residentMessages).
     const all = this.residentMessages().filter(ofEpoch);
-    const byChannel = new Map<string, Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>>();
+    const byChannel = new Map<string, { serverId: string; channelId: string; backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> }>();
     for (const m of all) {
-      const channelId = (m.metadata as { channelId?: string } | undefined)?.channelId ?? '(unknown channel)';
-      byChannel.set(channelId, [...(byChannel.get(channelId) ?? []), m]);
+      const meta = m.metadata as { channelId?: string; serverId?: string } | undefined;
+      const serverId = meta?.serverId ?? '';
+      const channelId = meta?.channelId ?? '(unknown channel)';
+      const k = this.key(serverId, channelId);
+      const entry = byChannel.get(k) ?? { serverId, channelId, backlog: [] };
+      entry.backlog.push(m);
+      byChannel.set(k, entry);
     }
     const historyTool = this.hooks.historyTool?.() ?? null;
-    const dumps = [...byChannel.entries()].map(([channelId, backlog]) => {
-      const shown = backlogCap > 0 ? backlog.slice(-backlogCap) : [];
+    const dumps = [...byChannel.values()].map(({ serverId, channelId, backlog }) => {
+      // Floored here too: a hold stored before entry floored its cap can hold
+      // a fraction.
+      const cap = Math.floor(backlogCap);
+      const shown = cap > 0 ? backlog.slice(-cap) : [];
       const truncated = backlog.length - shown.length;
       const attrs = [
-        `channel=${quotedValue(channelId)}`,
+        `channel=${quotedValue(this.shown(serverId, channelId))}`,
         `messages=${backlog.length}`,
         ...(truncated > 0 ? [`truncated=${truncated} (oldest; ${historyTool ? `${historyTool} covers the rest` : 'not delivered'})`] : []),
       ];
@@ -1194,12 +1274,28 @@ export class TuneOutCoordinator {
     const summary = byChannel.size === 0
       ? 'Nothing was held.'
       : `${all.length} message${all.length === 1 ? '' : 's'} held in ${byChannel.size} channel${byChannel.size === 1 ? '' : 's'}.`;
-    this.hooks.addMessage(
-      'user',
-      [{ type: 'text', text: `[${NOTICE_TAG.tuneOut}: all channels except ${this.shown(except.serverId, except.channelId)} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
-      { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
-    );
-    this.hooks.commitDeliveries?.();
+    if (this.scopeReleased !== epochId) {
+      this.hooks.addMessage(
+        'user',
+        [{ type: 'text', text: `[${NOTICE_TAG.tuneOut}: all channels except ${this.shown(except.serverId, except.channelId)} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
+      );
+      this.hooks.commitDeliveries?.();
+      this.scopeReleased = epochId;
+    }
+    // The release is recorded before the hold is: a failure past this point
+    // leaves the hold in force with its release already delivered. A retry in
+    // this process records only the hold's end; a restart between the two
+    // delivers the release again, where the other order lost it outright.
+    this.writeScope(null);
+    this.scopeReleased = undefined;
+    this.clearScopeTimers();
+    for (const [key, pending] of this.pendingWakes) {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
+      clearTimeout(pending.timer);
+      this.pendingWakes.delete(key);
+    }
     const subName = this.hooks.subconsciousName();
     if (note && subName) {
       this.hooks.addMessage(subName, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });
@@ -1216,8 +1312,7 @@ export class TuneOutCoordinator {
       // One last look per channel with messages no fork was handed. That
       // holds for a reader's own release too: the reader that released read one channel's
       // messages, and every other channel's would otherwise reach no reader.
-      // A channel is its server and id here, as the readers' bookkeeping is,
-      // where the dump above groups by id.
+      // A channel is its server and id here, as the readers' bookkeeping is.
       const channels = new Map<string, ChannelRef>();
       for (const m of all) {
         const meta = m.metadata as { channelId?: string; serverId?: string } | undefined;
@@ -1228,19 +1323,17 @@ export class TuneOutCoordinator {
         const ofChannel = inChannelOf(serverId, channelId);
         const inChannel = (m: Pick<StoredMessage, 'metadata'>): boolean => ofEpoch(m) && ofChannel(m);
         const stored = this.hooks.getStoredMessages().filter(inChannel);
-        if (this.unhandedBacklog(this.key(serverId, channelId), stored).length > 0) {
+        if (this.unhandedBacklog(this.handOffKey(epochId, serverId, channelId), stored).length > 0) {
           this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, stored);
         }
       }
     }
-    for (const key of [...this.divertedSinceInvocation.keys(), ...this.readerCursor.keys(), ...this.readerReturned.keys()]) {
+    for (const key of this.divertedSinceInvocation.keys()) {
       const [serverId, channelId] = key.split('\0') as [string, string];
-      if (!this.channelRegistry.getTuneOutState(serverId, channelId)) {
-        this.divertedSinceInvocation.delete(key);
-        this.readerCursor.delete(key);
-        this.readerReturned.delete(key);
-      }
+      if (!this.channelRegistry.getTuneOutState(serverId, channelId)) this.divertedSinceInvocation.delete(key);
     }
+    this.dropHandOffs(epochId);
+    this.dropLooks(epochId);
     this.forgetWindowStart(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
     this.announce(except, epochId, 'released', `[${NOTICE_TAG.focus}: ${primary ?? 'the resident'} released — ${reason}.]`);
@@ -1262,7 +1355,7 @@ export class TuneOutCoordinator {
     let allExcept: TuneOutCheck['allExcept'] = null;
     if (scope) {
       const held: Record<string, number> = {};
-      for (const { channelId, count } of this.scopeHeldCounts(scope.params.epochId).values()) held[channelId] = count;
+      for (const { serverId, channelId, count } of this.scopeHeldCounts(scope.params.epochId).values()) held[this.shown(serverId, channelId)] = count;
       allExcept = { epochId: scope.params.epochId, except: scope.params.except, expiresAtMs: scope.params.expiresAtMs, wakeCount: scope.wakeCount, held };
     }
     const result: TuneOutCheck = { allExcept, channels };
@@ -1517,6 +1610,105 @@ export class TuneOutCoordinator {
     // Counted from here only once the turn has been asked for, so a turn that
     // throws leaves its messages for the next period's turn.
     this.divertedSinceInvocation.set(key, 0);
+    const epochId = this.holdFor(serverId, channelId)?.epochId;
+    if (epochId) this.markLook(epochId, serverId, channelId);
+  }
+
+  /**
+   * Count again, from the held messages (all stored, #291), those the reader
+   * of the epoch holding this channel now hasn't looked at: for reader
+   * forks, those no fork was handed; for the persistent subconscious, those
+   * held since its last look (lastLooks). Nothing holding the channel leaves
+   * no count.
+   */
+  private rebuildTally(serverId: string, channelId: string): void {
+    const key = this.key(serverId, channelId);
+    const hold = this.holdFor(serverId, channelId);
+    if (!hold || !this.readerAvailable()) {
+      this.divertedSinceInvocation.delete(key);
+      return;
+    }
+    const ofChannel = inChannelOf(serverId, channelId);
+    const inEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === hold.epochId && ofChannel(m);
+    const rows = this.hooks.getStoredMessages().filter(inEpoch);
+    let count: number;
+    if (this.forkReader) {
+      count = this.unhandedBacklog(this.handOffKey(hold.epochId, serverId, channelId), rows).length;
+    } else {
+      const mark = this.lastLooks()?.[hold.epochId]?.[key];
+      count = mark === undefined ? rows.length : rows.filter((m) => m.sequence > mark).length;
+    }
+    this.divertedSinceInvocation.set(key, count);
+  }
+
+  private get lastLooksStateId(): string {
+    return `tune-out/${this.hooks.primaryName() ?? 'default'}/last-looks`;
+  }
+
+  /**
+   * The stored last looks. Where they can't be read, none: every held row
+   * counts, and nothing is cached, so the next read tries again. Nor is
+   * anything written back over the stored record then (markLook, dropLooks,
+   * pruneLooks), which would erase the other epochs' and channels' looks.
+   */
+  private lastLooks(): Record<string, Record<string, number>> | undefined {
+    if (this.lastLooksCache !== undefined) return this.lastLooksCache;
+    let raw: unknown;
+    try {
+      raw = this.channelRegistry.readCoordinatorState(this.lastLooksStateId);
+    } catch (error) {
+      console.error(`[tune-out] the subconscious's last looks (${this.lastLooksStateId}) could not be read:`, error);
+      return undefined;
+    }
+    const looks: Record<string, Record<string, number>> = {};
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const [epochId, channels] of Object.entries(raw as Record<string, unknown>)) {
+        if (!channels || typeof channels !== 'object' || Array.isArray(channels)) continue;
+        const marks = Object.entries(channels as Record<string, unknown>).filter((e): e is [string, number] => typeof e[1] === 'number');
+        if (marks.length > 0) looks[epochId] = Object.fromEntries(marks);
+      }
+    }
+    this.lastLooksCache = looks;
+    return looks;
+  }
+
+  private writeLooks(looks: Record<string, Record<string, number>>): void {
+    this.lastLooksCache = looks;
+    try {
+      this.channelRegistry.writeCoordinatorState(this.lastLooksStateId, looks);
+    } catch (error) {
+      // The look itself stands. After a restart, this look's messages would
+      // count as unseen at the next one.
+      console.error(`[tune-out] the subconscious's last looks (${this.lastLooksStateId}) could not be stored:`, error);
+    }
+  }
+
+  private markLook(epochId: string, serverId: string, channelId: string): void {
+    const looks = this.lastLooks();
+    if (!looks) return;
+    this.writeLooks({ ...looks, [epochId]: { ...looks[epochId], [this.key(serverId, channelId)]: this.hooks.currentSequence() } });
+  }
+
+  /** An ended epoch's last looks go with it. */
+  private dropLooks(epochId: string): void {
+    if (this.hooks.subconsciousName() == null) return;
+    const looks = this.lastLooks();
+    if (!looks || !(epochId in looks)) return;
+    const { [epochId]: _ended, ...rest } = looks;
+    this.writeLooks(rest);
+  }
+
+  /** At boot: the last looks of epochs no longer active go. */
+  private pruneLooks(): void {
+    if (this.hooks.subconsciousName() == null) return;
+    const looks = this.lastLooks();
+    if (!looks) return;
+    const active = new Set(this.listActive().map((e) => e.params.epochId));
+    const scope = this.getAllExcept();
+    if (scope) active.add(scope.params.epochId);
+    const kept = Object.fromEntries(Object.entries(looks).filter(([epochId]) => active.has(epochId)));
+    if (Object.keys(kept).length !== Object.keys(looks).length) this.writeLooks(kept);
   }
 
   /**
@@ -1534,7 +1726,7 @@ export class TuneOutCoordinator {
     epochBacklog: StoredMessage[],
   ): boolean {
     if (!this.hooks.invokeReader) return false;
-    const key = this.key(serverId, channelId);
+    const key = this.handOffKey(epochId, serverId, channelId);
     const backlog = this.unhandedBacklog(key, epochBacklog);
     if (trigger === 'cadence' && backlog.length === 0) return false;
     // The cursor only moves forward: a returned row handed again can be
@@ -1561,8 +1753,8 @@ export class TuneOutCoordinator {
 
   /**
    * What no reader fork has read yet, of the given held messages, oldest
-   * first: those past the channel's cursor, plus those a failed fork
-   * returned.
+   * first: those past the epoch's cursor for the channel, plus those a
+   * failed fork returned.
    */
   private unhandedBacklog(key: string, stored: StoredMessage[]): StoredMessage[] {
     const cursor = this.readerCursor.get(key) ?? -1;
@@ -1575,18 +1767,67 @@ export class TuneOutCoordinator {
   /**
    * A reader fork that never read what it was handed: its derive failed, or
    * its run threw before it reported. While the epoch that held the
-   * messages still holds the channel, they go back to its backlog, and the
-   * next invocation for the channel is handed them. Returns how many went
-   * back (0 once the epoch has ended: its cancel had its own last fork).
+   * messages is still active, they go back to that epoch's backlog for the
+   * channel, and its next invocation for the channel is handed them: the
+   * scope's while the scope is active, though the channel's own tune-out
+   * has taken the channel meanwhile, and a channel's own tune-out's while it
+   * holds the channel. Once the epoch has ended, its cancel's last fork was
+   * handed only what no fork had been, so a fork still running then is the
+   * only reader its messages had: one late fork is handed them instead
+   * (lateFork). Returns how many went back or to the late fork.
    */
   readerFailed(invocation: Pick<ReaderInvocation, 'serverId' | 'channelId' | 'epochId' | 'backlog'>): number {
     const { serverId, channelId, epochId } = invocation;
-    if (this.holdFor(serverId, channelId)?.epochId !== epochId) return 0;
-    const key = this.key(serverId, channelId);
+    const active = this.getAllExcept()?.params.epochId === epochId
+      || this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId === epochId;
+    if (!active) return this.lateFork(invocation);
+    const key = this.handOffKey(epochId, serverId, channelId);
     const returned = this.readerReturned.get(key) ?? new Set<string>();
     for (const m of invocation.backlog) returned.add(m.id);
     const count = invocation.backlog.length;
-    if (count > 0) this.readerReturned.set(key, returned);
+    if (count > 0) {
+      this.readerReturned.set(key, returned);
+      // They count again toward the next cadence look of the epoch holding
+      // the channel, which hands them back. Where another epoch holds it
+      // now, they're counted again when the channel comes back to theirs
+      // (rebuildTally), and its release hands them in any case.
+      const tally = this.key(serverId, channelId);
+      if (this.holdFor(serverId, channelId)?.epochId === epochId) {
+        this.divertedSinceInvocation.set(tally, (this.divertedSinceInvocation.get(tally) ?? 0) + count);
+      }
+    }
+    return count;
+  }
+
+  /**
+   * A fork that failed after its epoch ended: one late fork is handed what it
+   * was, with a notice saying a reader handed them failed after the tune-out
+   * ended. Every held message is stored as it arrives (#291), so what it was
+   * handed is what the late fork is. A late fork's own failure derives no
+   * other, so a reader that keeps failing costs one more fork, not a chain
+   * of them. Returns how many the late fork was handed.
+   */
+  private lateFork(invocation: Pick<ReaderInvocation, 'serverId' | 'channelId' | 'epochId' | 'backlog'>): number {
+    if (!this.hooks.invokeReader || this.lateForks.has(invocation)) return 0;
+    const { serverId, channelId, epochId } = invocation;
+    const backlog = [...invocation.backlog].sort((a, b) => a.sequence - b.sequence);
+    const count = backlog.length;
+    if (count === 0) return 0;
+    const these = count === 1 ? 'This message was' : `These ${count} messages were`;
+    const notice = `[${NOTICE_TAG.tuneOutCancelled}: ${this.shown(serverId, channelId)} — ${these} handed to a reader that `
+      + `failed after the tune-out ended, so no reader has read ${count === 1 ? 'it' : 'them'} yet.]`;
+    const entries = Object.entries(this.readDispositions());
+    const late: ReaderInvocation = {
+      serverId,
+      channelId,
+      epochId,
+      trigger: 'cancel',
+      notice,
+      backlog,
+      dispositions: entries.length > 0 ? entries.map(([k, v]) => `- ${k}: ${v}`).join('\n') : null,
+    };
+    this.lateForks.add(late);
+    this.hooks.invokeReader(late);
     return count;
   }
 
@@ -1670,6 +1911,9 @@ export class TuneOutCoordinator {
     own: readonly ChannelRef[] = [],
     /** The calling agent: the persistent subconscious, or a reader fork. */
     caller?: string,
+    /** A reader fork, with the epoch it was derived to read, if any: it ends and posts only through that epoch's
+     *  hold (forkRefusal). The persistent subconscious, which reads every epoch, passes none. */
+    fork?: { epochId?: string },
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     switch (name) {
       case 'deliver_summary': {
@@ -1723,6 +1967,23 @@ export class TuneOutCoordinator {
       }
       case 'cancel_tuneout': {
         const name = String(input.channelId ?? '');
+        const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
+        const endScope = (): { success: boolean; data?: unknown; error?: string; isError?: boolean } => {
+          const scope = this.getAllExcept();
+          const refused = fork && scope
+            ? this.forkRefusal(fork, { epochId: scope.params.epochId }, 'cancel', "the all-except hold isn't the hold you were started to read")
+            : undefined;
+          if (refused) return { success: false, error: refused, isError: true };
+          const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
+          return result.ok
+            ? { success: true, data: { cancelled: true, scope: 'all-except' } }
+            : { success: false, error: result.error, isError: true };
+        };
+        // A call naming the all-except scope ends that hold outright, as the
+        // tool describes it and as the resident's tune_out cancel does: the
+        // channel it names, tuned out on its own or not, doesn't turn it
+        // into that channel's cancel, and with no hold it ends nothing.
+        if (input.scope === 'all-except') return endScope();
         const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
         // The name means what it means to every channel tool, the
         // resident's tune_out included: with a serverId, that server's
@@ -1740,19 +2001,31 @@ export class TuneOutCoordinator {
         const named = serverId ? [{ serverId, channelId: name }]
           : mine && 'channel' in mine ? [mine.channel] : this.channelRegistry.channelsNamed(name);
         const channel = refusal ? undefined : named[0];
-        const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
         if (!channel || !this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)) {
           // The reader keeps its latitude over the all-except hold too: a
-          // channel it holds (or the scope named outright) ends the scope.
+          // channel it holds (or the scope named as the channel) ends the
+          // scope. A call naming the scope "channel" ends only a channel's
+          // own tune-out, so on a channel only the scope holds it ends
+          // nothing.
           const scope = this.getAllExcept();
-          const heldByScope = scope && (input.scope === 'all-except' || name === 'all-except'
+          const heldByScope = scope && (name === 'all-except'
             || (channel !== undefined && this.holdFor(channel.serverId, channel.channelId)?.epochId === scope.params.epochId));
           if (!heldByScope) return { success: false, error: refusal ?? this.notTunedOut(JSON.stringify(name), 'the resident'), isError: true };
-          const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
-          return result.ok
-            ? { success: true, data: { cancelled: true, scope: 'all-except' } }
-            : { success: false, error: result.error, isError: false };
+          if (input.scope === 'channel') {
+            const shown = channel ? this.quotedShown(channel.serverId, channel.channelId) : JSON.stringify(name);
+            return {
+              success: false,
+              error: `Nothing was cancelled: ${shown} isn't tuned out on its own, and scope "channel" ends only a channel's own `
+                + 'tune-out. The all-except hold holds it, and calling cancel_tuneout with scope "all-except" ends that hold.',
+              isError: true,
+            };
+          }
+          return endScope();
         }
+        const held = this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)!;
+        const refused = fork && this.forkRefusal(fork, { epochId: held.params.epochId }, 'cancel',
+          `the tune-out on ${this.quotedShown(channel.serverId, channel.channelId)} isn't the hold you were started to read`);
+        if (refused) return { success: false, error: refused, isError: true };
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
         return result.ok
           ? { success: true, data: { cancelled: true } }
@@ -1807,11 +2080,45 @@ export class TuneOutCoordinator {
         // means that channel, as for every channel tool (ownChannelFor).
         const mine = this.channelRegistry.ownChannelFor(channelId, own, 'publish');
         if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        if (fork) {
+          const named = mine ? [mine.channel] : this.channelRegistry.channelsNamed(channelId);
+          const at = named.length === 1 ? named[0] : undefined;
+          const hold = at ? this.holdFor(at.serverId, at.channelId) : null;
+          const shown = at ? this.quotedShown(at.serverId, at.channelId) : JSON.stringify(channelId);
+          const refused = (at || fork.epochId === undefined) && this.forkRefusal(fork, hold, 'speech', hold
+            ? `${shown} is held by a hold other than the one you were started to read`
+            : `${shown} isn't held now`);
+          if (refused) return { success: false, error: refused, isError: true };
+        }
         return this.channelRegistry.publishForAgent(mine ? mine.channel : channelId, text, this.hooks.subconsciousName() ?? caller ?? 'Subconscious');
       }
       default:
         return { success: false, error: `unknown subconscious tool: ${name}`, isError: true };
     }
+  }
+
+  /**
+   * Why a reader fork may not act through `hold` (the epoch holding what its
+   * call names, or null): a fork ends and posts only through the hold of the
+   * epoch it was derived to read, and one derived for none acts through no
+   * hold. Undefined where the hold is its own. `why` says, for the fork, how
+   * what its call names isn't its own hold; its reports stay open to it.
+   */
+  private forkRefusal(
+    fork: { epochId?: string },
+    hold: { epochId: string } | null,
+    act: 'cancel' | 'speech',
+    why: string,
+  ): string | undefined {
+    if (fork.epochId !== undefined && hold?.epochId === fork.epochId) return undefined;
+    const nothing = act === 'cancel' ? 'Nothing was cancelled' : 'Nothing was posted';
+    const report = `Your report can say what you would ${act === 'cancel' ? 'judge of it' : 'have posted'}, and the resident reads it.`;
+    if (fork.epochId === undefined) {
+      return `${nothing}: you weren't started to read a tune-out, so there's no hold you can `
+        + `${act === 'cancel' ? 'end' : 'post through'}. ${report}`;
+    }
+    const rule = act === 'cancel' ? 'a reader ends only its own' : 'a reader posts only into a channel its own hold holds';
+    return `${nothing}: ${why}, and ${rule}. ${report}`;
   }
 
   /**
@@ -1833,6 +2140,18 @@ export class TuneOutCoordinator {
         + `${active.join(', ')}.`;
     return `Nothing was cancelled: ${opening} A tune-out also ends by itself when its duration runs out, or at the `
       + `first wake past its wake budget, and its backlog goes to ${backlogTo} then.`;
+  }
+
+  /**
+   * The reader ended, not the framework: its turns stop (cadence and
+   * coalescing wakes), and every hold keeps its end time, which releases it
+   * to the resident with no reader.
+   */
+  stopReader(): void {
+    for (const timer of this.cadenceTimers.values()) clearTimeout(timer);
+    this.cadenceTimers.clear();
+    for (const { timer } of this.pendingWakes.values()) clearTimeout(timer);
+    this.pendingWakes.clear();
   }
 
   /** Stop all timers (framework shutdown). */

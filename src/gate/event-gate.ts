@@ -3703,12 +3703,16 @@ export class EventGate {
     // Delivery-time re-check: a channel tuned out after its events were
     // batched is held now, and "already shown above at arrival" would be
     // untrue of them. They are dropped; the hold's own reader has them.
-    const events = batched.filter((e) => !(e.channelId && this.isHeldFn(e.serverId, e.channelId)));
+    const heldAt = (e: PendingEvent): string | undefined => e.routeChannelId ?? e.channelId;
+    const events = batched.filter((e) => {
+      const channel = heldAt(e);
+      return !(channel && this.isHeldFn(e.serverId, channel));
+    });
     if (events.length < batched.length) {
       this.emitTrace({
         type: 'gate:held-dropped',
         dropped: batched.length - events.length,
-        channels: [...new Set(batched.filter((e) => !events.includes(e)).map((e) => e.channelId))],
+        channels: [...new Set(batched.filter((e) => !events.includes(e)).map(heldAt))],
         timestamp: this.now(),
       });
     }
@@ -4293,10 +4297,9 @@ export class EventGate {
   }
 
   /**
-   * `agentName` is gone, as a conversation fork's end or an ephemeral run's
-   * removes one: its pending self-wake is cancelled, rather than wake a name
-   * that no longer exists. It holds no sleep: neither can set one (the
-   * framework refuses their `sleep`).
+   * `agentName` is gone, as an agent's end removes one: its pending
+   * self-wake is cancelled, and a sleep it set ends, rather than go on
+   * quieting every agent and then wake a name that no longer exists.
    */
   agentGone(agentName: string): void {
     const selfWake = this.selfWakeTimers.get(agentName);
@@ -4304,6 +4307,7 @@ export class EventGate {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
+    if (this.sleepAgent === agentName) this.clearSleep();
   }
 
   // =========================================================================

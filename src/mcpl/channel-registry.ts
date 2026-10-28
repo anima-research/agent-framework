@@ -566,11 +566,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it. Reactions, reaction removals, deletions and edits don't set it, though an edit of a message you hadn't been shown can count as that message. A message pushed to you rather than posted on a channel never sets it. A subagent has neither default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it, other than a reaction, reaction removal, deletion or edit, though an edit of a message you hadn't been shown can count; a message pushed to you rather than posted on a channel never sets it; required of a subagent)" },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to where your plain speech goes this turn, as the tool's description says; required of a subagent)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -1007,13 +1007,14 @@ interface ChannelRegistryOptions {
    */
   latestInboundLocus?: boolean;
   /**
-   * A channel is being closed by tool: a tuned-out channel's epoch, or an
-   * all-except hold whose exception this is, ends through the cancel flow
-   * (release the backlog, record the end) before the lifecycle state flips
-   * to closed. Without this hook the close would discard the epoch and
-   * strand its held messages (issue #232 gap 9).
+   * A channel is being closed by tool: an all-except hold whose exception
+   * this is ends through the cancel flow (release the backlog, record the
+   * end) before the lifecycle state flips to closed. A
+   * tuned-out channel's close is refused before this (its cancel ends it).
+   * Returns what it ended, in a sentence the close's answer adds when the
+   * close itself isn't recorded.
    */
-  onToolClose?: (serverId: string, channelId: string) => void;
+  onToolClose?: (serverId: string, channelId: string) => string | undefined;
   /**
    * The channel unprefixed speech lands in while an all-except hold is
    * active (its exception), else null. Consulted after a fork's home and
@@ -1146,6 +1147,10 @@ export type ChannelToolOrigin =
      *  wake due before it, when there is one, which its confirmation names
      *  (skipReplyNote). */
     earlierWake?: SkipReplyEarlierWake;
+    /** Made inside one of the agent's turns (the framework's callingTurnOf):
+     *  a channel_publish naming no channel arrives with that turn's default
+     *  already applied, so it takes no other. */
+    inTurn?: boolean;
   };
 
 /** The machine decision sources a module-origin channel_close may record.
@@ -1181,7 +1186,7 @@ export class ChannelRegistry {
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private readonly latestInboundLocus: boolean;
-  private onToolClose?: (serverId: string, channelId: string) => void;
+  private onToolClose?: (serverId: string, channelId: string) => string | undefined;
   private focusChannelResolver?: () => ChannelRef | null;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
@@ -2542,7 +2547,8 @@ export class ChannelRegistry {
     // declared it inbound-only, since speech isn't posted there): a conversation
     // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
-    // (heartbeats). Without this, a fork
+    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none).
+    // Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
     // Each lookup is keyed on whether a name was given, not its truthiness:
@@ -5227,12 +5233,13 @@ export class ChannelRegistry {
       // Closed already, perhaps only by default: the agent's close is still
       // its decision, and is recorded as one (setDesiredState), so a later
       // registration's lift of a default leaves the channel closed.
+      const ended = this.onToolClose?.(entry.serverId, input.channelId);
       try {
         this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
       } catch (err) {
         return {
           success: false,
-          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}`,
+          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended}` : ''}`,
           isError: true,
         };
       }
@@ -5278,13 +5285,15 @@ export class ChannelRegistry {
     // A hold around this channel — the all-except scope it is the excepted
     // channel of — ends through the cancel flow: backlog released, end
     // recorded, never by overwriting state (#232 gap 9).
-    this.onToolClose?.(entry.serverId, input.channelId);
+    const ended = this.onToolClose?.(entry.serverId, input.channelId);
 
-    // A decision the log refused changed nothing, and the answer says so.
+    // A decision the log refused changed nothing for the channel, and the
+    // answer says so, and what the hook ended all the same.
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     } catch (err) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, unrecordedDecision(err)), isError: true };
+      const text = this.lifecycleFailureText('close', entry, unrecordedDecision(err));
+      return { success: false, error: ended ? `${text} ${ended}` : text, isError: true };
     }
     // This channel's typing, not every channel with its id (stopTyping's
     // fan-out of a bare name).
@@ -6235,17 +6244,20 @@ export class ChannelRegistry {
     if (input.channelId === '' && tool === 'channel_publish') {
       return { success: false, error: `Nothing was posted: channelId is empty. ${findIds}`, isError: true };
     }
-    // Resolve channelId: default to what the caller falls back to — the
-    // all-except hold's channel, else the latest delivered inbound channel
-    // under the legacy locus rule (a marker — reaction, edit, deletion — is
-    // never that channel) — which an ephemeral run never takes
+    // Resolve channelId: a call made inside the agent's turn (inTurn) has
+    // the turn's default applied already, where its plain speech goes, and
+    // takes none here. Any other defaults to what the caller falls back to:
+    // the all-except hold's channel, else the latest delivered inbound
+    // channel under the legacy locus rule (a marker — reaction, edit,
+    // deletion — is never that channel), which an ephemeral run never takes
     // (takesGlobalFallback), so it names one.
     // A channel named by a string means what it means to every channel tool
     // (entriesNamed): one channel, by its id or its server-qualified name,
     // and a name two servers' channels answer to is refused with them as
     // candidates, never sent to the first.
     const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
-    const fallback = caller !== undefined ? this.globalFallbackFor(caller) : this.sharedFallback();
+    const inTurn = origin?.kind === 'agent' && origin.inTurn === true;
+    const fallback = caller === undefined ? this.sharedFallback() : inTurn ? null : this.globalFallbackFor(caller);
     if (!(input.channelId ?? fallback)) {
       return {
         success: false,
@@ -6254,7 +6266,10 @@ export class ChannelRegistry {
           : caller !== undefined && this.takesGlobalFallback?.(caller) === false
             ? 'Nothing was posted: name the channel with channelId. A subagent has no default channel, since its plain '
               + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
-            : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
+            : caller !== undefined && inTurn && this.activeChannelResolver?.(caller) === null
+              ? `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
+                + `goes to none and channel_publish sends only to a channel it names. ${findIds}`
+              : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
         isError: true,
       };
     }

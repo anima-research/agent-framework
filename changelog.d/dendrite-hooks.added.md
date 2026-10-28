@@ -1,6 +1,8 @@
 - Two hooks a host decides derivations with, free of semantics:
-  `dendrite.beforeDerive(spec)` says yes or no, with a reason, to every
-  derivation and spawn before the agent exists; `dendrite.derivationNotice(
+  `dendrite.beforeDerive(spec)` says yes or no, with a reason, to each agent
+  `createEphemeralAgent` makes, derivations included, before the agent
+  exists, and to each `resumeAgent` before its new incarnation exists;
+  `dendrite.derivationNotice(
   record, from, defaultText)` decides what, if anything, the source is told.
   Consent, budgets, a mind's standing instructions, or uses not yet
   imagined are a host's or a module's to build on them, with a record's

@@ -65,8 +65,8 @@ function providerFormat(request: NormalizedRequest) {
     cacheTtl: request.cacheTtl,
   } as never) as unknown as {
     messages: Array<{ role: string; content: Array<Record<string, unknown>> | string }>;
-    system?: unknown;
-    tools?: unknown;
+    systemContent?: unknown;
+    nativeTools?: unknown[];
   };
   return built;
 }
@@ -229,8 +229,10 @@ describe('Dendrite deriveAgent', () => {
 
     const parent = providerFormat(parentRequest);
     const fork = providerFormat(forkRequest);
-    assert.equal(JSON.stringify(fork.system), JSON.stringify(parent.system));
-    assert.equal(JSON.stringify(fork.tools), JSON.stringify(parent.tools));
+    assert.ok(parent.systemContent !== undefined, 'the premise: the formatter gives a system block to compare');
+    assert.ok((parent.nativeTools?.length ?? 0) > 0, 'the premise: and a tool block');
+    assert.equal(JSON.stringify(fork.systemContent), JSON.stringify(parent.systemContent));
+    assert.equal(JSON.stringify(fork.nativeTools), JSON.stringify(parent.nativeTools));
 
     // Up to the boundary: every provider message of the parent's request,
     // and within the last one every block, appears unchanged in the fork's.
@@ -487,6 +489,25 @@ describe('Dendrite deriveAgent', () => {
       .flatMap((m) => m.content)
       .find((block) => block.type === 'tool_result' && (block as { toolUseId: string }).toolUseId === 'call-denied');
     assert.ok(toolResult && JSON.stringify(toolResult).includes('not available to fork-1'));
+  });
+
+  it('a tool denied at dispatch is refused on every path that runs the agent\'s call, executeToolCall included', async () => {
+    await miraMidTurn();
+    membrane.script('fork-1', waitCall('g-fork'), say('done'));
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: 'mira',
+      mode: 'copy',
+      config: { denyToolsAtDispatch: ['agent_settings'] },
+      framing: [{ participant: 'user', content: [{ type: 'text', text: FRAMING }] }],
+    });
+    const run = framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+    await until(() => gates.entered.has('g-fork'), 'the fork to block mid-turn');
+    const result = await framework.executeToolCall({ id: 'call-x', name: 'agent_settings', input: {}, callerAgentName: 'fork-1' });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /agent_settings is not available to fork-1/);
+    gates.release('g-fork');
+    await run;
   });
 
   it('a stopped fork resumes on the context it left, as a new incarnation', { skip }, async () => {

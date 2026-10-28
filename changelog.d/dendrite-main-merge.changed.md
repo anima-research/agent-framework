@@ -83,11 +83,14 @@
   whose server no longer registers its channel sets none. A
   `channel_publish` naming no channel takes the turn's locus only when the
   call is made inside the turn; outside it, a conversation fork's goes to
-  its home, and anyone else's takes the registry's default. So main's
+  its home, an ephemeral agent's to none, and anyone else's takes the
+  registry's default. So main's
   shared-channel-ids entry, which says such a publish posts to the latest
   message's channel, holds here only under `speech.locus:
-  'latest-inbound'`, for a call made outside a turn or in a turn with
-  neither a locus nor a trigger channel. Every way a live non-ephemeral agent ends drops a continuation
+  'latest-inbound'`, while no all-except tune-out is open, for a call by
+  an agent that is neither ephemeral nor a conversation fork, made
+  outside a turn or in a turn with neither a locus nor a trigger channel
+  that isn't a heartbeat's or a `noChannel` turn. Every way a live non-ephemeral agent ends drops a continuation
   of its turn that is on its way (#722), and a conversation agent stopped by
   a listener of the failure its hold after the compile reports is held by
   nothing.
