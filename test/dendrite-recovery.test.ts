@@ -11,6 +11,7 @@
  * - an app-owned store names its recovery files, and is warned without them;
  * - a recovery file that holds null, or a registry without its counters, is
  *   refused rather than read as empty;
+ * - a worker's namespace is where its context opens;
  * - an agent that ended past the registry's memory is still found;
  * - a finished orphan's held result is told of and can be adopted;
  */
@@ -215,6 +216,22 @@ describe('the registry\'s recovery', () => {
       await boot(new GateModule(), { store });
     } finally { console.error = error; }
     assert.ok(said.some((line) => line.includes('[dendrite] no storePath / agentRegistryPath / agentRegistryEndedPath')), said.join('\n'));
+  });
+
+  it('a worker\'s named namespace is where its context opens, so inspection reads what it wrote', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    membrane.script('w', say('done'));
+    const { agent, contextManager } = await first.createEphemeralAgent(
+      { name: 'w', model: 'test-model', systemPrompt: 'Do the task.' },
+      workerSpec('w', { namespace: 'jobs/w' }),
+    );
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go. NS-MARK' }]);
+    await first.runEphemeralToCompletion(agent, contextManager);
+    assert.equal(first.getAgentRecord('w')?.namespace, 'jobs/w');
+    const inspected = await first.inspectAgentContext('w');
+    assert.ok(inspected.getAllMessages().some((m) => textOf(m.content).includes('NS-MARK')), 'the inspected context is the one it ran in');
   });
 
   it('an agent that ended past the registry\'s memory is found in the ended log', async () => {

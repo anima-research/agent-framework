@@ -10646,7 +10646,9 @@ export class AgentFramework {
     this.usedEphemeralAgentNames.set(config.name, 'run');
     const release: ManagerRelease = { released: false, calls: new Set() };
     try {
-      let namespace = `subagent/${config.name}`;
+      // A namespace the spec names is where the context opens, as it is what
+      // the record says and what inspection and resumption open later.
+      let namespace = spec?.namespace ?? `subagent/${config.name}`;
       let contextManager: ContextManager;
       // The host's say, on the spec as it will be registered.
       if (this.beforeDerive) {
