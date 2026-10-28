@@ -100,7 +100,7 @@ function unreapable(graceMs?: number): { active: boolean; stuck: Array<{ pid: nu
   return state;
 }
 
-const SHORT_GRACE_MS = 500;
+const SHORT_GRACE_MS = 50;
 
 async function killAndWait(stuck: { pid: number; kill: () => void }): Promise<void> {
   stuck.kill();
@@ -119,7 +119,7 @@ test('a connect during a disconnect is refused; once the teardown is done, the n
     await disconnecting;
     assert.equal(status(framework, 'm'), undefined);
 
-    await framework.connectMcplServer(config);
+    await framework.connectMcplServer(modern('m', '', log));
     assert.equal(status(framework, 'm')?.connected, true, 'listed: its routing was not erased');
     assert.ok(toolsOf(framework, 'm').includes('mcpl--m--plain'));
     assert.deepEqual((await framework.executeToolCall(call('mcpl--m--plain'))).data, [{ type: 'text', text: 'plain' }]);
@@ -138,7 +138,7 @@ test('two simultaneous disconnects both settle, in order, and leave the id free'
     assert.deepEqual(order, ['first', 'second']);
     assert.equal(status(framework, 'm'), undefined);
     assert.equal(alive(launches(log)[0]!), false);
-    await framework.connectMcplServer(config);
+    await framework.connectMcplServer(modern('m', '', log));
     assert.equal(status(framework, 'm')?.connected, true);
   });
 });
