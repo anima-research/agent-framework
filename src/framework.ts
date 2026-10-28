@@ -2107,9 +2107,10 @@ export interface HostModeStatus {
   activeTurnAgents: string[];
   /** Wakes that own provider admission while waiting for an in-flight
    * auxiliary call — no turn token yet, but a turn is one settle away. The
-   * admission continuation rechecks quiesce and requeues them; `drained`
-   * is false until it has. A parked continuation of a turn is counted here
-   * and, as a turn alive, in `activeTurns` and `activeTurnAgents`. */
+   * admission continuation rechecks quiesce and provider holds, and requeues
+   * a wake either keeps from starting; `drained` is false until it has. A
+   * parked continuation of a turn is counted here and, as a turn alive, in
+   * `activeTurns` and `activeTurnAgents`. */
   parkedAdmissions: number;
   /** Inference requests waiting to start: queued (parked by the quiesce wake
    * gate while quiesced, or, while serving, until the scheduler's next pass
@@ -20345,6 +20346,14 @@ export class AgentFramework {
             this.releasePrimaryProviderGate(agent.name);
             this.pendingRequests.push(...batch);
             console.error(`[provider-admission] ${agent.name}: host quiesced while parked — the merged start goes back as its ${batch.length} requests`);
+            return;
+          }
+          if (this.providerAccelerationCooldowns.has(agent.name)) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: a provider hold stands — parked wake requeued for the scheduler, not started`);
             return;
           }
           await this.startAgentStream(agent, trigger, attempt, true);
