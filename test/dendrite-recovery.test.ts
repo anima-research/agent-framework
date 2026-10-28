@@ -324,6 +324,21 @@ describe('the registry\'s recovery', () => {
     assert.equal(rowsWith(first, 'oren', 'RESULT-1').length, 1, 'and the result reaches oren');
   });
 
+  it('an orphan that ends with a result it delivered while it ran still held tells its first candidate', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const job = await startBlocked(first, gates, 'job', 'g-job', workerSpec('job', { spawnedBy: 'boss', resultTo: { to: 'boss', as: 'message' } }), 'job result');
+    first.stopAgent('boss', { by: 'mira' });
+    first.deliverAgentResult('job', [{ type: 'text', text: 'RESULT-1' }]);
+    assert.deepEqual(first.listHeldMail().map((m) => [m.to, m.heldBecause]), [['boss', 'recipient-gone']]);
+    assert.equal(rowsWith(first, 'oren', 'reparenting "job" to you delivers it').length, 0, 'not while it runs: the adoption offer covers that');
+    gates.release('g-job');
+    assert.ok((await job.settled).ok);
+    assert.equal(rowsWith(first, 'oren', 'reparenting "job" to you delivers it').length, 1, 'told once it has ended');
+  });
+
   it('a job cancelled with its stream in flight rejects with AgentStoppedError naming who and why', async () => {
     const gates = new GateModule();
     const first = await boot(gates);

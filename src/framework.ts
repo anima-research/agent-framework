@@ -11488,21 +11488,10 @@ export class AgentFramework {
     if (!recipient) {
       const newlyHeld = mail.heldBecause !== 'recipient-gone';
       this.registry.markMailHeld(mail.id, 'recipient-gone');
-      // A result whose sender has ended, held for a recipient that is gone:
-      // the first adoption candidate is told it exists and how it arrives,
-      // since nothing else would surface it (reparentAgent delivers it).
+      // A result its sender delivered after it had ended (one delivered while
+      // it ran is told of when it ends, settleEndedAgent).
       const sender = this.registry.inspect(mail.from.agent);
-      const candidate = sender?.orphaned?.candidates[0];
-      if (newlyHeld && mail.kind === 'result' && sender?.ended && candidate && this.announceOrphans) {
-        this.lifecycleNotice(
-          candidate,
-          `[${NOTICE_TAG.agentLifecycle}: "${sender.name}" finished after ${sender.orphaned!.formerParent.agent} had ended, ` +
-            `so its result has nowhere to go. The result is held; reparenting "${sender.name}" to you delivers it.]`,
-          // `heldMailId`, not `mailId`: a row carrying dendrite.mailId is read
-          // as that mail having landed, which would release it.
-          { event: 'result-held', agent: sender.name, heldMailId: mail.id, formerParent: sender.orphaned!.formerParent },
-        );
-      }
+      if (newlyHeld && mail.kind === 'result' && sender?.ended) this.tellResultHeld(sender, mail.id);
       this.emitTrace({
         type: 'dendrite:mail-held',
         mailId: mail.id,
@@ -11556,6 +11545,24 @@ export class AgentFramework {
       });
     }
     return true;
+  }
+
+  /**
+   * An ended orphan's result held for a recipient that is gone: its first
+   * adoption candidate is told it exists and how it arrives, since nothing
+   * else would surface it (reparentAgent delivers it).
+   */
+  private tellResultHeld(sender: AgentRecord, mailId: string): void {
+    const candidate = sender.orphaned?.candidates[0];
+    if (!candidate || !this.announceOrphans) return;
+    this.lifecycleNotice(
+      candidate,
+      `[${NOTICE_TAG.agentLifecycle}: "${sender.name}" has ended after ${sender.orphaned!.formerParent.agent} did, ` +
+        `so its result has nowhere to go. The result is held; reparenting "${sender.name}" to you delivers it.]`,
+      // `heldMailId`, not `mailId`: a row carrying dendrite.mailId is read
+      // as that mail having landed, which would release it.
+      { event: 'result-held', agent: sender.name, heldMailId: mailId, formerParent: sender.orphaned!.formerParent },
+    );
   }
 
   /** A host-framed lifecycle fact in an agent's context. Never voiced as anyone. */
@@ -11818,6 +11825,14 @@ export class AgentFramework {
       });
     }
     for (const record of outcome.cascaded) this.teardownEndedAgent(record);
+    // An orphan that ends with a result it delivered while it ran still held
+    // for a recipient that is gone: its first candidate hears of it now.
+    for (const record of [...outcome.cascaded, outcome.ended]) {
+      if (!record.orphaned) continue;
+      const held = this.registry.listMail({ from: record.name })
+        .find((mail) => mail.kind === 'result' && mail.heldBecause === 'recipient-gone');
+      if (held) this.tellResultHeld(record, held.id);
+    }
 
     const parent = outcome.ended;
     for (const { record, candidates } of outcome.orphaned) {
