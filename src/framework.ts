@@ -3876,6 +3876,7 @@ export class AgentFramework {
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
   private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
   private readonly streamCarried = new WeakMap<YieldingStream, Set<MessageId>>();
+  private readonly streamsHandedChange = new WeakSet<YieldingStream>();
   /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
@@ -13842,7 +13843,8 @@ export class AgentFramework {
 
   /**
    * The fail-safe's trigger (system-changes.ts): a request that carried a
-   * system change, refused with membrane's `systemChangeRefused` (its
+   * system change, the stream's first or a later round given one at a tool
+   * boundary (`carriedChange`), refused with membrane's `systemChangeRefused` (its
    * recognised wordings, or its own refusal before sending) or with any
    * other 400. A refusal in wording membrane doesn't know left the change
    * stored, and every later request carrying it failed the same way, so a
@@ -13854,8 +13856,8 @@ export class AgentFramework {
    * retries the turn at once (attempt + 1, so it continues the same turn:
    * no second undo checkpoint, the turn's tool-call count kept).
    */
-  private keepToHeadAfterRefusal(agent: Agent, error: Error, request: NormalizedRequest | undefined): boolean {
-    if (!agent.declaresEntries() || !request?.messages.some(isSystemChangeMessage)) return false;
+  private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean): boolean {
+    if (!agent.declaresEntries() || !carriedChange) return false;
     const recognised = isMembraneError(error) && error.systemChangeRefused === true;
     const refused = isMembraneError(error) && error.httpStatus === 400;
     if (!recognised && !refused) return false;
@@ -14691,6 +14693,7 @@ export class AgentFramework {
               const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.map((injection) => injection.id) : [];
               for (const id of [replyId, resultsId, ...injected]) if (id !== undefined) carried.add(id);
             }
+            if (midTurnInjections.some(isSystemChangeMessage)) this.streamsHandedChange.add(currentState.stream);
             currentState.stream.provideToolResults(
               submitted,
               midTurnInjections.length > 0 ? { injectedMessages } : undefined,
@@ -23558,7 +23561,8 @@ export class AgentFramework {
             // which it keeps to until it's built again. The refusal never
             // reaches the error policy (a 400 is terminal there); the resend
             // is a retry of the same turn. Bounded: it carries no change.
-            const onHead = this.keepToHeadAfterRefusal(agent, err, compiledRequest);
+            const onHead = this.keepToHeadAfterRefusal(agent, err,
+              compiledRequest?.messages.some(isSystemChangeMessage) === true || this.streamsHandedChange.has(stream));
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
             if (!onHead && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {

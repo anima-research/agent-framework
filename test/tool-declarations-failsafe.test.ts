@@ -11,9 +11,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MembraneError } from '@animalabs/membrane';
-import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
-import { AgentFramework, type EventResponse, type Module, type ProcessEvent, type ToolCall, type TraceEvent } from '../src/index.js';
+import { AgentFramework, type EventResponse, type Module, type ModuleContext, type ProcessEvent, type ToolCall, type TraceEvent } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Tools the test can change between turns. */
@@ -41,6 +41,46 @@ class RefusedStream implements YieldingStream {
   cancel(): void { this.isCancelled = true; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+/** A host that stores a system change, without metadata, while the agent's tool runs: the turn is alive, so it waits
+ *  for the tool boundary, which hands it to the live stream's next round. */
+class HostChangeAtTool implements Module {
+  readonly name = 'host';
+  private ctx: ModuleContext | null = null;
+  async start(ctx: ModuleContext) { this.ctx = ctx; }
+  async stop() { this.ctx = null; }
+  async onProcess() { return {}; }
+  getTools() { return [{ name: 'look', description: 'looks around', inputSchema: { type: 'object' as const, properties: {} } }]; }
+  async handleToolCall(_call: ToolCall) {
+    this.ctx!.addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZCHANGE', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock]);
+    return { success: true, data: {} };
+  }
+}
+
+/** A stream whose round after its tool calls ends in `error` when that round was handed a system change, as the
+ *  provider refusing it would. */
+class RefusedAfterChange extends MockYieldingStream {
+  handedChange = false;
+  constructor(responses: NormalizedResponse[], private readonly error: Error) {
+    super(responses, true);
+  }
+
+  override provideToolResults(results: unknown[], options?: { injectedMessages?: Array<{ participant?: string; content: unknown[] }> }): void {
+    this.handedChange = (options?.injectedMessages ?? []).some((m) => m.content.some((b) => (b as { type?: string }).type === 'system_change'));
+    super.provideToolResults(results, options);
+  }
+
+  override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+    const inner = super[Symbol.asyncIterator]();
+    for (let next = await inner.next(); !next.done; next = await inner.next()) {
+      if (this.handedChange && next.value.type === 'complete') {
+        yield { type: 'error', error: this.error } as StreamEvent;
+        return;
+      }
+      yield next.value;
+    }
   }
 }
 
@@ -304,5 +344,51 @@ describe("toolDeclarations' fail-safe in a re-armed turn", () => {
     assert.equal(resends(run.traces), 1);
     assert.deepEqual(run.policyCalls, [0], 'the policy never saw the re-armed turn\'s refusals');
     assert.equal(run.held, 0, 'a refusal is no transient failure, so nothing is re-armed');
+  });
+
+  it("resends at once on the head when the refused request is a later round, given a host's change at a tool boundary", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
+    const membrane = new MockMembrane();
+    let refusedRound: RefusedAfterChange | undefined;
+    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+      const n = membrane.calls.push(request) - 1;
+      if (n !== 1) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
+      refusedRound = new RefusedAfterChange([
+        createMockResponse([{ type: 'tool_use', id: 'look-1', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }]),
+      ], refusal(true));
+      return refusedRound;
+    };
+    const policyCalls: number[] = [];
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled',
+        toolDeclarations: 'entries',
+      }],
+      modules: [new Input(), new HostChangeAtTool()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      errorPolicy: { maxRetries: 0, onInferenceError: (_e: Error, _name: string, attempt: number) => { policyCalls.push(attempt); return { retry: false }; } },
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => { traces.push(event); });
+    framework.start();
+    const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted').length;
+    try {
+      for (const [text, n] of [['first', 1], ['second', 2]] as const) {
+        framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
+        assert.ok(await pollUntil(() => ended() === n), `turn ${n} ended`);
+      }
+      assert.equal(carriesChange(membrane.calls[1]!), false, "the turn's first request carried no change");
+      assert.equal(refusedRound?.handedChange, true, 'its next round was handed the change, and refused');
+      assert.equal(membrane.calls.length, 3, 'the adopting turn, the refused stream, its resend');
+      assert.equal(carriesChange(membrane.calls[2]!), false, 'the resend went out on the head');
+      assert.equal(resends(traces), 1);
+      assert.deepEqual(policyCalls, [], 'the refusal never reached the error policy');
+      assert.equal(traces.filter((t) => t.type === 'inference:completed').length, 2, 'and the turn the resend continued ended well');
+      assert.equal(framework.getAgent('resident')!.declaresEntries(), false, 'the agent keeps to its head');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
