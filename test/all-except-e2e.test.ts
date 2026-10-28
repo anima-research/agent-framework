@@ -92,6 +92,25 @@ describe('tune-out, all-except scope', () => {
     } finally { await f.close(); }
   });
 
+  it("a turn woken in one channel that focuses on another is told its speech stays where the turn began, and it does", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'fx', name: 'focus', input: { channelId: 'noisy', durationSeconds: 120 } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-still in work' }] as ContentBlock[]));
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-still in work')), 'the speech went out');
+      assert.equal(f.published.find((p) => JSON.stringify(p).includes('zz-still in work'))!.channelId, 'work');
+      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work"));
+      assert.ok(told, "the focus result says this turn's speech stays in work");
+    } finally { await f.close(); }
+  });
+
   it("a focus whose call no open turn made, as a script's left from an earlier turn, leaves the open turn's speech where it was", async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {

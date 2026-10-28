@@ -36441,12 +36441,21 @@ export class AgentFramework {
       }, 'agent-tool');
       if (!r.ok) return { success: false, error: r.error, isError: true };
       const speaker = this.agents.get(agentName);
-      if (turn && this.openLogical.get(agentName) === turn && turn.locus == null && !turn.noChannel && !turn.heartbeat && !this.homeOf(agentName)
+      const home = this.homeOf(agentName);
+      const open = turn && this.openLogical.get(agentName) === turn ? turn : undefined;
+      if (open && open.locus == null && !open.noChannel && !open.heartbeat && !home
         && (speaker?.proseRouting === 'locus' || speaker?.proseRouting === 'hybrid')) {
-        turn.locus = resolved;
-        noteTurnChannel(turn, resolved);
+        open.locus = resolved;
+        noteTurnChannel(open, resolved);
         this.rememberAnnouncedLocus(agentName, resolved);
       }
+      const speech = home
+        ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
+        : open?.locus && !sameChannel(open.locus, resolved)
+          ? `This turn's plain speech still lands in ${this.channelShown(open.locus)}; from your next turn it lands in the excepted channel while this holds.`
+          : open && (open.noChannel || open.heartbeat)
+            ? 'This turn has no channel, so its plain speech goes to none; from your next turn it lands in the excepted channel while this holds.'
+            : 'Your plain speech lands in the excepted channel while this holds.';
       return {
         success: true,
         data: {
@@ -36458,8 +36467,8 @@ export class AgentFramework {
           backlogCap: r.params.backlogCap,
           maxWakes: r.params.maxWakes,
           note: coordinator.hasReader()
-            ? 'Your plain speech lands in the excepted channel while this holds. Reader wakes pause, not cancel, when the budget is spent.'
-            : 'No subconscious is configured: this is a silent hold. Your plain speech lands in the excepted channel; the backlog is delivered per channel when you cancel or the duration ends.',
+            ? `${speech} Reader wakes pause, not cancel, when the budget is spent.`
+            : `No subconscious is configured: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
         },
       };
     }
