@@ -242,6 +242,26 @@ export interface FrameworkConfig {
    */
   deferredWritesPath?: string;
 
+  /**
+   * The Dendrite agent registry's recovery file: its live records and the
+   * results it holds for delivery, written atomically and fsynced, and read
+   * first at boot. Defaults to `<storePath>/recovery/dendrite-registry.json`.
+   * Outside the chronicle for the reason `hostModePath` is: a branch switch
+   * or historical rollback would otherwise take back held results. Set
+   * explicitly when providing an app-owned `store` without `storePath`;
+   * without either, the registry persists only in the branch-local store,
+   * with a warning at create.
+   */
+  agentRegistryPath?: string;
+
+  /**
+   * The registry's ended-record log recovery file (its newest records, as
+   * many as a restart reads). Defaults to
+   * `<storePath>/recovery/dendrite-ended.json`; same rationale and fallback
+   * as `agentRegistryPath`.
+   */
+  agentRegistryEndedPath?: string;
+
   /** Emoji used for branch-awareness markers (default: 💤). */
   discordAwarenessEmoji?: string;
 

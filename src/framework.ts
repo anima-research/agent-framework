@@ -4552,8 +4552,21 @@ export class AgentFramework {
     // agent is declared so a restored persistent agent becomes a new
     // incarnation of the same identity rather than a stranger. The registry
     // lives in recovery files beside the store (see agentRegistryPath).
-    framework.agentRegistryPath = config.storePath ? join(config.storePath, 'recovery', 'dendrite-registry.json') : undefined;
-    framework.agentRegistryEndedPath = config.storePath ? join(config.storePath, 'recovery', 'dendrite-ended.json') : undefined;
+    framework.agentRegistryPath = config.agentRegistryPath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'dendrite-registry.json') : undefined);
+    framework.agentRegistryEndedPath = config.agentRegistryEndedPath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'dendrite-ended.json') : undefined);
+    if (!framework.agentRegistryPath || !framework.agentRegistryEndedPath) {
+      const missing = [
+        ...(framework.agentRegistryPath ? [] : ['agentRegistryPath']),
+        ...(framework.agentRegistryEndedPath ? [] : ['agentRegistryEndedPath']),
+      ];
+      console.error(
+        `[dendrite] no storePath / ${missing.join(' / ')}: the agent registry's ${framework.agentRegistryPath ? 'ended log' : 'records and held results'} ` +
+        'persist only in the branch-local store, where a branch switch or historical rollback can erase them and a crash ' +
+        'can lose what wasn\'t synced; configure the recovery paths',
+      );
+    }
     const interruptedAgents = framework.restoreAgentRegistry();
 
     // Create agents

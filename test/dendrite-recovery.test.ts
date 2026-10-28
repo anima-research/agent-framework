@@ -5,6 +5,7 @@
  *   holding it, and a put-back that fails too doesn't hide the change's error;
  * - an agent whose end was written before the snapshot let go of it ends once
  *   at the next boot, and its recipient isn't told of a restart it didn't meet;
+ * - an app-owned store names its recovery files, and is warned without them;
  * - a recovery file that holds null, or a registry without its counters, is
  *   refused rather than read as empty;
  */
@@ -165,5 +166,17 @@ describe('the registry\'s recovery', () => {
     const records = second.listAgents({ includeEnded: true }).filter((r) => r.name === 'w');
     assert.deepEqual(records.map((r) => r.ended?.reason), ['completed'], 'w ended once, as it did');
     assert.deepEqual(rowsWith(second, 'oren', 'the host restarted while'), [], 'and oren is told of no restart');
+  });
+
+  it('an app-owned store with neither a storePath nor the recovery paths is warned at create', async () => {
+    const store = JsStore.openOrCreate({ path: storePath() });
+    stores.push(store);
+    const said: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { said.push(args.map(String).join(' ')); };
+    try {
+      await boot(new GateModule(), { store });
+    } finally { console.error = error; }
+    assert.ok(said.some((line) => line.includes('[dendrite] no storePath / agentRegistryPath / agentRegistryEndedPath')), said.join('\n'));
   });
 });
