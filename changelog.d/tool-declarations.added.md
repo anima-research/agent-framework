@@ -14,7 +14,8 @@
   doesn't (what relies on the declaration, the context manager's record,
   takes `true` alone). Under `'entries'`, the digests a compile with
   `binds: true` is told are the recorded head's, so a declared change keeps
-  them and a move of the head changes them. Past a fifth of the input, or when a
+  them, and a move of the head changes them wherever it changes what the
+  request carries ahead of its messages. Past a fifth of the input, or when a
   compile is refused over budget with changes kept, it happens anyway,
   raising an operator line (`head-consolidated`). The default,
   `'head'`, sends requests as before, leaving any system changes out. New

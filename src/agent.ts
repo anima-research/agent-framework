@@ -2135,7 +2135,8 @@ export class Agent {
    * its messages, so a changed one can stand for a first difference where the context manager keeps a
    * thinking-binding record. The system text and the tools are `head`'s, the head the request will carry (under
    * `toolDeclarations: 'entries'` its recorded head, whatever the agent advertises now, so a declared change leaves
-   * them as they were and a move of the head changes them), as the kv-unified prefix hash takes it: the system text
+   * them as they were and a move of the head changes them wherever it changes what the request carries ahead of its
+   * messages), as the kv-unified prefix hash takes it: the system text
    * as sent, its system-position injections included, and the tools in their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
    * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
    * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.

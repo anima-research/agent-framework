@@ -286,8 +286,9 @@ export interface AgentConfig {
      *     `maxTokens`, `providerParams` and `prefillUserMessage`). Under
      *     `toolDeclarations: 'entries'` these are the recorded head's, which
      *     the request carries, so a declared change leaves them as they were,
-     *     and a move of the head changes them, so the compile for the new
-     *     head leaves out every thinking block;
+     *     and a move of the head changes them wherever it changes what the
+     *     request carries ahead of its messages, and then the compile for
+     *     the new head leaves out every thinking block;
      *   - each framework stream tells the context manager which stored rows
      *     its later rounds and its last reply carried as stored
      *     (`noteRequestSent`), naming the compile it was built from, so their
