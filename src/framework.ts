@@ -13799,6 +13799,8 @@ export class AgentFramework {
     }
     const agentConfig: AgentConfig = {
       ...inherited,
+      ...(cfg.physicalWindowTokens != null ? { physicalWindowTokens: cfg.physicalWindowTokens } : {}),
+      ...(cfg.thinkingBinding != null ? { thinkingBinding: cfg.thinkingBinding } : {}),
       name,
       model,
       systemPrompt: cfg.systemPrompt,

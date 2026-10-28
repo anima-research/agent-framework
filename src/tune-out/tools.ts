@@ -11,7 +11,7 @@
  * never leak bare prose to the default locus.
  */
 
-import type { ToolDefinition } from '../types/index.js';
+import type { AgentConfig, ToolDefinition } from '../types/index.js';
 
 export const SUBCONSCIOUS_TOOL_NAMES = [
   'deliver_summary',
@@ -116,8 +116,14 @@ export interface SubconsciousConfig {
   /** Model id; defaults to the primary agent's (same-model side-process).
    *  Another id, compared exactly, makes the subconscious leave out the
    *  fields that describe the primary's model, its window and its thinking
-   *  binding (SUBCONSCIOUS_MODEL_FIELDS); nothing here sets its own. */
+   *  binding (SUBCONSCIOUS_MODEL_FIELDS); the two below set its own. */
   model?: string;
+  /** Its model's context window, as AgentConfig.physicalWindowTokens, in
+   *  place of the primary's. */
+  physicalWindowTokens?: AgentConfig['physicalWindowTokens'];
+  /** Its model's thinking binding, as AgentConfig.thinkingBinding, in place
+   *  of the primary's. */
+  thinkingBinding?: AgentConfig['thinkingBinding'];
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the
    * resident (it is an aspect of their attention). Report-shaped, second

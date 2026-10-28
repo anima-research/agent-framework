@@ -58,6 +58,27 @@ describe('the subconscious and the resident\'s model fields', () => {
     }
   });
 
+  it('on another model, it carries the window and binding set for it, and the resident\'s config keeps its own', async () => {
+    const { framework, residentConfig } = await withSubconscious(resident, {
+      model: 'model-b', physicalWindowTokens: 200_000, thinkingBinding: { binds: true, dropBlock: false },
+    });
+    try {
+      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: 200_000, thinkingBinds: true, thinkingDropBlock: false });
+      assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true });
+      for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
+        assert.equal(config?.physicalWindowTokens, 1_000_000);
+        assert.deepEqual(config?.thinkingBinding, { binds: true, dropBlock: true });
+      }
+    } finally { await framework.stop(); }
+  });
+
+  it('on the resident\'s model, the window and binding set for it take the place of the resident\'s', async () => {
+    const { framework } = await withSubconscious(resident, { physicalWindowTokens: 500_000, thinkingBinding: { binds: false } });
+    try {
+      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-a', physicalWindowTokens: 500_000, thinkingBinds: false, thinkingDropBlock: false });
+    } finally { await framework.stop(); }
+  });
+
   it('on another model, it still carries every other field of the resident\'s config that the copy doesn\'t override', async () => {
     const settings = {
       thinking: { enabled: true, budgetTokens: 2_048 },
