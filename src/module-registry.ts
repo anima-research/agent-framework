@@ -120,6 +120,9 @@ export class ModuleRegistry {
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
+  /** Logs a retired context's dropped push (see the constructor's options).
+   *  Readonly-public for ModuleContextImpl, as notifyOpsFn is. */
+  readonly dropRetiredPushFn?: (event: ProcessEvent, moduleName: string) => void;
   /** Framework ops-alert channel, surfaced to modules via
    *  ModuleContext.notifyOps. Readonly-public so ModuleContextImpl can
    *  delegate without another positional constructor parameter. */
@@ -142,6 +145,9 @@ export class ModuleRegistry {
       queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
+      /** Logs a push a module made after its stop() settled, which is dropped,
+       *  not queued. Without it, the registry logs a line of its own. */
+      dropRetiredPush?: (event: ProcessEvent, moduleName: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
       notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
@@ -159,6 +165,7 @@ export class ModuleRegistry {
     this.onTraceFn = options.onTrace;
     this.callToolFn = options.callTool;
     this.notifyOpsFn = options.notifyOps;
+    this.dropRetiredPushFn = options.dropRetiredPush;
   }
 
   /**
@@ -399,6 +406,7 @@ export class ModuleRegistry {
     if (existing) return existing;
     const attempt = Promise.resolve().then(() => module.stop()).then(() => {
       if (this.modules.get(module.name) === module) {
+        this.moduleContexts.get(module.name)?.retire();
         this.modules.delete(module.name);
         this.moduleContexts.delete(module.name);
         this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
@@ -669,6 +677,10 @@ class ModuleContextImpl implements ModuleContext {
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
 
+  private retired = false;
+  private readonly saidRetired = new Set<string>();
+  private readonly traceSubscriptions = new Set<() => void>();
+
   constructor(
     moduleName: string,
     store: JsStore,
@@ -690,7 +702,12 @@ class ModuleContextImpl implements ModuleContext {
     this.store = store;
     this.stateId = stateId;
     // The deprecated handle: a push names this module, as pushEvent() does.
-    this.queue = { push: (event) => queue.push(event, moduleName) };
+    this.queue = {
+      push: (event) => {
+        if (this.retired) this.dropPush(event);
+        else queue.push(event, moduleName);
+      },
+    };
     this.registry = registry;
     this.isRestart = isRestart;
     this.getAgentsFn = getAgents;
@@ -710,12 +727,31 @@ class ModuleContextImpl implements ModuleContext {
     }
   }
 
+  retire(): void {
+    this.retired = true;
+    for (const unsubscribe of this.traceSubscriptions) unsubscribe();
+    this.traceSubscriptions.clear();
+  }
+
+  private refused(method: string): boolean {
+    if (!this.retired) return false;
+    if (!this.saidRetired.has(method)) {
+      this.saidRetired.add(method);
+      console.error(
+        `[framework] module ${JSON.stringify(this.moduleName)} has stopped, so its ${method}() call had no effect; ` +
+        `later ${method}() calls from it aren't logged`,
+      );
+    }
+    return true;
+  }
+
   getState<T>(): T | null {
     const state = this.store.getStateJson(this.stateId);
     return state as T | null;
   }
 
   setState<T>(state: T): void {
+    if (this.refused('setState')) return;
     // Merge external ID map into state
     const fullState = {
       ...(state as object),
@@ -758,6 +794,7 @@ class ModuleContextImpl implements ModuleContext {
     name: string,
     opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
   ): void {
+    if (this.refused('registerLogState')) return;
     ensureStateRegistered(this.store, {
       id: this.logStateId(name),
       strategy: 'append_log',
@@ -768,10 +805,12 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   appendToLog<T>(name: string, item: T): void {
+    if (this.refused('appendToLog')) return;
     this.store.appendToStateJson(this.registeredLogStateId(name), item);
   }
 
   editLogItem<T>(name: string, index: number, item: T): void {
+    if (this.refused('editLogItem')) return;
     this.store.editStateItem(this.registeredLogStateId(name), index, Buffer.from(JSON.stringify(item)));
   }
 
@@ -785,18 +824,33 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   getModule<T extends Module>(name: string): T | null {
+    if (this.refused('getModule')) return null;
     return this.registry.getModule<T>(name);
   }
 
   onTrace(listener: TraceEventListener): () => void {
-    return this.onTraceFn(listener);
+    if (this.refused('onTrace')) return () => {};
+    const unsubscribe = this.onTraceFn(listener);
+    this.traceSubscriptions.add(unsubscribe);
+    return () => {
+      this.traceSubscriptions.delete(unsubscribe);
+      unsubscribe();
+    };
   }
 
   callTool(call: ToolCall): Promise<ToolResult> {
+    if (this.refused('callTool')) {
+      return Promise.resolve({
+        success: false,
+        isError: true,
+        error: `module ${JSON.stringify(this.moduleName)} has stopped, so its call of ${call.name} wasn't made`,
+      });
+    }
     return this.callToolFn(call);
   }
 
   notifyOps(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void {
+    if (this.refused('notifyOps')) return;
     this.registry.notifyOpsFn?.(kind, agentName, message, data);
   }
 
@@ -806,6 +860,7 @@ class ModuleContextImpl implements ModuleContext {
     metadata?: MessageMetadata & { external?: ExternalIdRef },
     opts?: { forAgent?: string },
   ): MessageId {
+    if (this.refused('addMessage')) return '';
     // The external id map is read in the primary's store
     // (findMessageByExternalId), so a mapping into another window would
     // answer wrong.
@@ -830,10 +885,12 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   editMessage(id: MessageId, content: ContentBlock[]): void {
+    if (this.refused('editMessage')) return;
     this.editMessageFn(id, content);
   }
 
   removeMessage(id: MessageId): void {
+    if (this.refused('removeMessage')) return;
     this.removeMessageFn(id);
     // Clean up external ID mapping
     for (const [key, msgId] of this.externalIdMap) {
@@ -861,15 +918,19 @@ class ModuleContextImpl implements ModuleContext {
     // start, and a write that shows later finds its entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
-      this.externalIdMap.delete(key);
-      this.persistExternalIdMap();
+      if (!this.retired) {
+        this.externalIdMap.delete(key);
+        this.persistExternalIdMap();
+      }
       return null;
     }
     const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
     if (row?.held) return row.id;
     if (!row) return null;
-    this.externalIdMap.set(key, row.id);
-    this.persistExternalIdMap();
+    if (!this.retired) {
+      this.externalIdMap.set(key, row.id);
+      this.persistExternalIdMap();
+    }
     return row.id;
   }
 
@@ -893,15 +954,23 @@ class ModuleContextImpl implements ModuleContext {
     agents: '*' | string[],
     options?: SpeechHandlerOptions
   ): void {
+    if (this.refused('registerSpeechHandler')) return;
     this.registry.registerSpeechHandler(this.moduleName, agents, options);
   }
 
   unregisterSpeechHandler(): void {
+    if (this.refused('unregisterSpeechHandler')) return;
     this.registry.unregisterSpeechHandler(this.moduleName);
   }
 
   pushEvent(event: ProcessEvent): void {
-    this.pushEventFn(event, this.moduleName);
+    if (this.retired) this.dropPush(event);
+    else this.pushEventFn(event, this.moduleName);
+  }
+
+  private dropPush(event: ProcessEvent): void {
+    if (this.registry.dropRetiredPushFn) this.registry.dropRetiredPushFn(event, this.moduleName);
+    else console.error(`[framework] a '${event.type}' event from module ${this.moduleName} arrived after that module stopped — dropped`);
   }
 
   private persistExternalIdMap(): void {

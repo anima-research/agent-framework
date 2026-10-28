@@ -259,6 +259,20 @@ export interface AgentSettingsExtension {
 
 /**
  * Context provided to modules for interacting with the framework.
+ *
+ * Once the module's `stop()` has settled, through `removeModule()` or the
+ * framework's `stop()`, its context has no effect on the framework: each
+ * push is dropped with a log line, as a push after the framework's `stop()`
+ * is; `setState`, `registerLogState` and the log-state writes,
+ * `editMessage`, `removeMessage`, `notifyOps` and the speech-handler calls
+ * do nothing; `addMessage` returns `''` and adds nothing; `callTool`
+ * resolves with an error result and runs nothing; `getModule` returns
+ * `null`; `onTrace` subscribes nothing, and the subscriptions made through
+ * it end; and `findMessageByExternalId` answers without updating its
+ * mapping. None of these throws. Apart from pushes, the first such call of
+ * each method logs one line naming the module and the method. Reads are
+ * unchanged. A module whose `stop()` fails stays registered, and its context
+ * keeps working.
  */
 export interface ModuleContext {
   /**

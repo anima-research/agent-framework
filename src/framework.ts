@@ -57,6 +57,7 @@ import type {
   ToolCall,
   ToolCallEvent,
   ToolResult,
+  ToolResultEvent,
   CompletedToolCall,
   AgentConfig,
   InferenceRequest,
@@ -183,6 +184,15 @@ import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedCo
  *  mcplServerConnectingText answers for one this host is connecting to: a
  *  legacy server, which isn't registered yet, or a modern connection, which
  *  is, until its first session is up. */
+function droppedToolResultLine(event: ToolResultEvent, when: string): string {
+  // What an operator reconciling a dropped result needs (the resident
+  // may run the tool again): which tool, and whether it succeeded.
+  const outcome = event.result.success && !event.result.isError
+    ? 'succeeded'
+    : `failed${event.result.error ? `: ${thrownText(event.result.error)}` : ''}`;
+  return `[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived ${when} — dropped; the tool ${outcome}`;
+}
+
 function mcplServerGoneText(serverId: string, toolName: string): string {
   return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
     "so the call didn't run. If you need it, ask whoever runs this host.";
@@ -4033,6 +4043,7 @@ export class AgentFramework {
       getMessage: (id) => this.getMessage(id),
       queryMessages: (filter, opts) => this.queryMessages(filter, opts),
       pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
+      dropRetiredPush: (event, moduleName) => this.dropRetiredModuleEvent(event, moduleName),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
@@ -6837,12 +6848,7 @@ export class AgentFramework {
    */
   pushEvent(event: ProcessEvent): void {
     if (event.type === 'tool-result' && this.queue?.isClosed) {
-      // What an operator reconciling a dropped result needs (the resident
-      // may run the tool again): which tool, and whether it succeeded.
-      const outcome = event.result.success && !event.result.isError
-        ? 'succeeded'
-        : `failed${event.result.error ? `: ${thrownText(event.result.error)}` : ''}`;
-      console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived after stop — dropped; the tool ${outcome}`);
+      console.error(droppedToolResultLine(event, 'after stop'));
       return;
     }
     this.queue.push(event);
@@ -6870,6 +6876,16 @@ export class AgentFramework {
     }
     if (traced) this.pushEvent(event);
     else this.queue.push(event);
+  }
+
+  private dropRetiredModuleEvent(event: ProcessEvent, moduleName: string): void {
+    if (this.queue.isClosed) {
+      this.pushModuleEvent(event, moduleName, true);
+      return;
+    }
+    console.error(event.type === 'tool-result'
+      ? droppedToolResultLine(event, 'after its module stopped')
+      : `[framework] a '${event.type}' event from module ${moduleName} arrived after that module stopped — dropped`);
   }
 
   /**
