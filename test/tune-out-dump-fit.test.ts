@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync, appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import { AgentFramework, AutobiographicalStrategy } from '../src/index.js';
-import type { AgentConfig } from '../src/index.js';
+import type { AgentConfig, Module } from '../src/index.js';
 import { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -302,7 +302,7 @@ const autobiographical = (maxMessageTokens: number) => new AutobiographicalStrat
 /** A framework with the given residents (the first is the primary) and a
  *  subconscious, the fixture's channel tuned out at backlogCap 10, six
  *  messages diverted, and then a cancel from the resident. `check` reads it. */
-async function cancelSix(agents: AgentConfig[], check: (x: { framework: AgentFramework; internals: Internals; membrane: MockMembrane; callsBefore: number }) => Promise<void>): Promise<void> {
+async function cancelSix(agents: AgentConfig[], check: (x: { framework: AgentFramework; internals: Internals; membrane: MockMembrane; callsBefore: number }) => Promise<void>, modules: Module[] = []): Promise<void> {
   const tempDir = mkdtempSync(join(tmpdir(), 'tune-out-dump-fit-'));
   const commandPath = join(tempDir, 'commands.txt');
   writeFileSync(commandPath, '');
@@ -318,7 +318,7 @@ async function cancelSix(agents: AgentConfig[], check: (x: { framework: AgentFra
       args: [FIXTURE],
       env: { STATUS_PATH: join(tempDir, 'status.jsonl'), COMMAND_PATH: commandPath },
     }],
-    modules: [],
+    modules,
   });
   try {
     await framework.start();
@@ -372,6 +372,27 @@ test("the resident is shown the newest backlog lines whole under its strategy's 
       assertNewestThreeWhole(dumpIn(membrane.calls.slice(callsBefore).find(isScout)!.messages, "the resident's request"), "the resident's request");
       assertNoticeCountsThree(internals);
     },
+  );
+});
+
+test('the note names the history tool the resident has (#232 gap 11)', async () => {
+  const history: Module = {
+    name: 'history',
+    async start() {},
+    async stop() {},
+    async onProcess() { return {}; },
+    getTools: () => [{ name: 'fetch_history', description: "reads a channel's history", inputSchema: { type: 'object', properties: {} } }],
+    async handleToolCall() { return { success: true, data: 'none' }; },
+  };
+  await cancelSix(
+    [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', strategy: autobiographical(170), allowedTools: 'all' }],
+    async ({ membrane, callsBefore }) => {
+      const isScout = (r: NormalizedRequest): boolean => (r.system ?? '').includes('You are scout.');
+      await waitFor("the resident's request after the cancel", () => membrane.calls.slice(callsBefore).some(isScout));
+      const dump = dumpIn(membrane.calls.slice(callsBefore).find(isScout)!.messages, "the resident's request");
+      assert.ok(dump.includes('messages=6 truncated=3 (oldest; history--fetch_history covers the rest)>'), dump.slice(0, 200));
+    },
+    [history],
   );
 });
 

@@ -51,6 +51,7 @@ describe('tune-out, all-except scope', () => {
       const epochs = f.framework.listPolicyEpochs();
       const listed = epochs.find((e) => e.id === scope.epochId);
       assert.ok(listed, 'the scope is a policy epoch');
+      assert.equal(listed!.kind, 'tune-out', 'of the tune-out kind');
       assert.deepEqual(listed!.scope, { kind: 'all-except', except: { serverId: 'editor', channelId: 'work' } });
       assert.equal(typeof listed!.expiresAtMs, 'number', 'bounded');
     } finally { await f.close(); }
