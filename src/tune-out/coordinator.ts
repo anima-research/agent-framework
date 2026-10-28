@@ -269,8 +269,23 @@ export class TuneOutCoordinator {
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
-  /** Diverted-message tallies since the last subconscious invocation, per channel key. */
+  /**
+   * Held messages the channel's reader hasn't looked at, per channel key:
+   * what makes a cadence period worth a look. Counted up as messages are
+   * held and back to zero at each look; rebuilt from the held rows where
+   * memory can't know it (rebuildTally): after a restart, and when a
+   * channel's own tune-out ends while the all-except hold still holds it.
+   * A failed reader fork's messages count again (readerFailed).
+   */
   private divertedSinceInvocation = new Map<string, number>();
+  /**
+   * The persistent subconscious's last look at each held channel, per epoch:
+   * the store's sequence when the look was asked for. Durable, so that after
+   * a restart its next look counts only what was held since (rebuildTally).
+   * Reader forks need none: what they were handed is in memory, and after a
+   * restart the first fork of an epoch is handed all it has held.
+   */
+  private lastLooksCache: Record<string, Record<string, number>> | undefined;
   /**
    * `reader: 'forks'`: the highest sequence of a held message already
    * handed to a reader fork, per epoch and channel (handOffKey). Each held
@@ -378,6 +393,23 @@ export class TuneOutCoordinator {
     if (oldestAnchor !== null) {
       this.hooks.setSubconsciousAnchor(oldestAnchor);
     }
+    // What each held channel's reader hasn't looked at was counted in
+    // memory, so it is counted again from the held rows: without it, a
+    // channel held across the restart gets no cadence look until something
+    // new arrives.
+    const held = new Set<string>();
+    for (const m of this.hooks.getStoredMessages()) {
+      const meta = m.metadata as { tuneOut?: { epochId?: string }; serverId?: string; channelId?: string } | undefined;
+      const epochId = meta?.tuneOut?.epochId;
+      if (!meta || !epochId || !meta.channelId) continue;
+      const key = this.key(meta.serverId ?? '', meta.channelId);
+      if (!held.has(key) && this.holdFor(meta.serverId ?? '', meta.channelId)?.epochId === epochId) held.add(key);
+    }
+    for (const key of held) {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      this.rebuildTally(serverId, channelId);
+    }
+    this.pruneLooks();
   }
 
   private armExpiry(serverId: string, channelId: string, params: TuneOutParams): void {
@@ -770,6 +802,11 @@ export class TuneOutCoordinator {
       }
     }
     this.dropHandOffs(epochId);
+    this.dropLooks(epochId);
+    // Where the all-except hold still holds the channel, its own messages
+    // there that its reader hasn't looked at are counted again, as the
+    // channel's own tune-out's count stood in for theirs.
+    this.rebuildTally(serverId, channelId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
   }
@@ -1093,6 +1130,7 @@ export class TuneOutCoordinator {
       if (!this.channelRegistry.getTuneOutState(serverId, channelId)) this.divertedSinceInvocation.delete(key);
     }
     this.dropHandOffs(epochId);
+    this.dropLooks(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
     this.announce(except, epochId, 'released', `[${NOTICE_TAG.focus}: ${primary ?? 'the resident'} released — ${reason}.]`);
     return { ok: true };
@@ -1366,6 +1404,95 @@ export class TuneOutCoordinator {
     // Counted from here only once the turn has been asked for, so a turn that
     // throws leaves its messages for the next period's turn.
     this.divertedSinceInvocation.set(key, 0);
+    const epochId = this.holdFor(serverId, channelId)?.epochId;
+    if (epochId) this.markLook(epochId, serverId, channelId);
+  }
+
+  /**
+   * Count again, from the held rows, the messages the reader of the epoch
+   * holding this channel now hasn't looked at: for reader forks, those no
+   * fork was handed; for the persistent subconscious, those held since its
+   * last look (lastLooks). Nothing holding the channel leaves no count.
+   */
+  private rebuildTally(serverId: string, channelId: string): void {
+    const key = this.key(serverId, channelId);
+    const hold = this.holdFor(serverId, channelId);
+    if (!hold || !this.readerAvailable()) {
+      this.divertedSinceInvocation.delete(key);
+      return;
+    }
+    const ofChannel = inChannelOf(serverId, channelId);
+    const rows = this.hooks.getStoredMessages().filter((m) =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === hold.epochId && ofChannel(m));
+    let count: number;
+    if (this.forkReader) {
+      count = this.unhandedBacklog(this.handOffKey(hold.epochId, serverId, channelId), rows, []).backlog.length;
+    } else {
+      const mark = this.lastLooks()[hold.epochId]?.[key];
+      count = mark === undefined ? rows.length : rows.filter((m) => m.sequence > mark).length;
+    }
+    this.divertedSinceInvocation.set(key, count);
+  }
+
+  private get lastLooksStateId(): string {
+    return `tune-out/${this.hooks.primaryName() ?? 'default'}/last-looks`;
+  }
+
+  /** The stored last looks; none where they can't be read, so every held row counts. */
+  private lastLooks(): Record<string, Record<string, number>> {
+    if (this.lastLooksCache !== undefined) return this.lastLooksCache;
+    let raw: unknown = null;
+    try {
+      raw = this.channelRegistry.readCoordinatorState(this.lastLooksStateId);
+    } catch (error) {
+      console.error(`[tune-out] the subconscious's last looks (${this.lastLooksStateId}) could not be read:`, error);
+    }
+    const looks: Record<string, Record<string, number>> = {};
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const [epochId, channels] of Object.entries(raw as Record<string, unknown>)) {
+        if (!channels || typeof channels !== 'object' || Array.isArray(channels)) continue;
+        const marks = Object.entries(channels as Record<string, unknown>).filter((e): e is [string, number] => typeof e[1] === 'number');
+        if (marks.length > 0) looks[epochId] = Object.fromEntries(marks);
+      }
+    }
+    this.lastLooksCache = looks;
+    return looks;
+  }
+
+  private writeLooks(looks: Record<string, Record<string, number>>): void {
+    this.lastLooksCache = looks;
+    try {
+      this.channelRegistry.writeCoordinatorState(this.lastLooksStateId, looks);
+    } catch (error) {
+      // The look itself stands. After a restart, this look's messages would
+      // count as unseen at the next one.
+      console.error(`[tune-out] the subconscious's last looks (${this.lastLooksStateId}) could not be stored:`, error);
+    }
+  }
+
+  private markLook(epochId: string, serverId: string, channelId: string): void {
+    const looks = this.lastLooks();
+    this.writeLooks({ ...looks, [epochId]: { ...looks[epochId], [this.key(serverId, channelId)]: this.hooks.currentSequence() } });
+  }
+
+  /** An ended epoch's last looks go with it. */
+  private dropLooks(epochId: string): void {
+    if (this.hooks.subconsciousName() == null) return;
+    const looks = this.lastLooks();
+    if (!(epochId in looks)) return;
+    const { [epochId]: _ended, ...rest } = looks;
+    this.writeLooks(rest);
+  }
+
+  /** At boot: the last looks of epochs no longer active go. */
+  private pruneLooks(): void {
+    if (this.hooks.subconsciousName() == null) return;
+    const looks = this.lastLooks();
+    const active = new Set(this.listActive().map((e) => e.params.epochId));
+    const scope = this.getAllExcept();
+    if (scope) active.add(scope.params.epochId);
+    const kept = Object.fromEntries(Object.entries(looks).filter(([epochId]) => active.has(epochId)));
+    if (Object.keys(kept).length !== Object.keys(looks).length) this.writeLooks(kept);
   }
 
   /**
@@ -1468,7 +1595,12 @@ export class TuneOutCoordinator {
     for (const m of invocation.backlog) returned.ids.add(m.id);
     for (const m of invocation.queued) returned.writeIds.add(m.writeId);
     const count = invocation.backlog.length + invocation.queued.length;
-    if (count > 0) this.readerReturned.set(key, returned);
+    if (count > 0) {
+      this.readerReturned.set(key, returned);
+      // They count again toward the next cadence look, which hands them back.
+      const tally = this.key(serverId, channelId);
+      this.divertedSinceInvocation.set(tally, (this.divertedSinceInvocation.get(tally) ?? 0) + count);
+    }
     return count;
   }
 

@@ -43,8 +43,10 @@ const meta = (author: string, where: Where = {}) => ({
   serverId: where.serverId ?? SERVER,
 });
 
-function world() {
+function world(opts: { subconscious?: boolean } = {}) {
   const stored: StoredMessage[] = [];
+  /** What the persistent subconscious is given, with `subconscious: true`. */
+  const looks: Array<{ text: string; kind: unknown }> = [];
   const deferred: Queued[] = [];
   const invocations: ReaderInvocation[] = [];
   const coordinatorState = new Map<string, unknown>();
@@ -68,32 +70,44 @@ function world() {
   } as unknown as ChannelRegistry;
   const servers = { getServer: () => undefined } as unknown as McplServerRegistry;
   const hooks = {
-    addMessage: () => {},
+    addMessage: (_participant: string, content: ContentBlock[], metadata: Record<string, unknown> | undefined, agent?: string) => {
+      if (agent === 'Subconscious') looks.push({ text: textOf(content), kind: metadata?.kind });
+    },
     requestInference: () => {},
-    subconsciousName: () => null,
+    subconsciousName: () => (opts.subconscious ? 'Subconscious' : null),
     invokeReader: (invocation: ReaderInvocation) => { invocations.push(invocation); },
     deliverFromReader: () => {},
     primaryName: () => 'scout',
     getStoredMessages: () => stored,
     getDeferredMessages: () => deferred,
-    currentSequence: () => nextSeq,
+    // The store's sequence: its newest row's, as chronicle's currentSequence.
+    currentSequence: () => nextSeq - 1,
     setSubconsciousAnchor: () => {},
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
     emitTrace: () => {},
   } as unknown as TuneOutFrameworkHooks;
-  const coordinator = new TuneOutCoordinator(registry, servers, hooks);
-  const internals = coordinator as unknown as {
+  type Internals = {
     invokeSubconscious(serverId: string, channelId: string, trigger: 'cadence' | 'wake', count: number): void;
     startCadence(serverId: string, channelId: string, cadenceSeconds: number): void;
     readerHandedWrites: Map<string, Set<string>>;
   };
+  let coordinator = new TuneOutCoordinator(registry, servers, hooks);
+  let internals = coordinator as unknown as Internals;
 
   return {
-    coordinator,
+    get coordinator() { return coordinator; },
+    get internals() { return internals; },
     invocations,
-    internals,
+    looks,
+    /** A host restart: a new coordinator over the same store and durable state, its timers armed again. */
+    restart(): void {
+      coordinator.stop();
+      coordinator = new TuneOutCoordinator(registry, servers, hooks);
+      internals = coordinator as unknown as Internals;
+      coordinator.resumeActiveEpochs();
+    },
     /** Hold a channel under an epoch, as a per-channel tune-out does. */
     tuneOut(backlogCap = 200, where: Where = {}) {
       active.set(`${where.serverId ?? SERVER}\0${where.channelId ?? NOISY}`, {
@@ -398,6 +412,96 @@ describe("a channel held in turn by the all-except hold and by its own tune-out"
     w.wake();
     assert.deepEqual(bodies(w.invocations.at(-1)!), { stored: ['P-3 still under its own tune-out'], queued: [] },
       "and the channel's own tune-out's readers go on from where they were");
+    w.coordinator.stop();
+  });
+});
+
+describe('a cadence look for held messages no reader has looked at, though nothing new arrives', () => {
+  const held = (w: ReturnType<typeof world>, author: string, body: string, where: Where = {}): void => {
+    const m = w.store(author, body, where);
+    w.coordinator.recordHeld(where.serverId ?? SERVER, where.channelId ?? NOISY, m.id, [], author, true);
+  };
+
+  it('after a restart, a channel held across it gets its cadence look', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world();
+    w.tuneOut();
+    held(w, 'ann', 'H-1 held before the restart');
+    held(w, 'bo', 'H-2 held before the restart');
+    w.restart();
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 1, 'the first period after the restart reads them');
+    assert.deepEqual(bodies(w.invocations[0]!), { stored: ['H-1 held before the restart', 'H-2 held before the restart'], queued: [] });
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 1, 'and a quiet period after it derives none');
+    w.coordinator.stop();
+  });
+
+  it('after a restart, each channel the all-except hold holds gets its cadence look', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world();
+    assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600, cadenceSeconds: 30 }, 'agent-tool').ok);
+    const epochId = w.coordinator.getAllExcept()!.params.epochId;
+    held(w, 'ann', 'N-1 in noisy', { epochId, channelId: NOISY });
+    held(w, 'bo', 'O-1 in other', { epochId, channelId: OTHER });
+    w.restart();
+    t.mock.timers.tick(30_000);
+    const byChannel = Object.fromEntries(w.invocations.map((inv) => [inv.channelId, bodies(inv)]));
+    assert.deepEqual(byChannel, {
+      [NOISY]: { stored: ['N-1 in noisy'], queued: [] },
+      [OTHER]: { stored: ['O-1 in other'], queued: [] },
+    });
+    w.coordinator.stop();
+  });
+
+  it("a failed fork's messages get the next cadence look", (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world();
+    w.tuneOut();
+    w.startCadence(30);
+    held(w, 'ann', 'F-1 read by a fork that failed');
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 1);
+    assert.equal(w.coordinator.readerFailed(w.invocations[0]!), 1);
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 2, 'the next period reads F-1 again');
+    assert.deepEqual(bodies(w.invocations[1]!), { stored: ['F-1 read by a fork that failed'], queued: [] });
+    w.coordinator.stop();
+  });
+
+  it("the channel's own tune-out ending gives the all-except hold's unread messages there their cadence look", (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world();
+    assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600, cadenceSeconds: 30 }, 'agent-tool').ok);
+    const scope = w.coordinator.getAllExcept()!.params.epochId;
+    held(w, 'ann', 'S-1 under the scope', { epochId: scope });
+    w.tuneOut();
+    assert.deepEqual(w.coordinator.cancel(SERVER, NOISY, 'agent-tool', 'resident cancelled'), { ok: true });
+    const before = w.invocations.length;
+    t.mock.timers.tick(30_000);
+    const looks = w.invocations.slice(before);
+    assert.deepEqual(looks.map((inv) => [inv.epochId, bodies(inv)]), [[scope, { stored: ['S-1 under the scope'], queued: [] }]],
+      "the scope's next period reads S-1");
+    w.coordinator.stop();
+  });
+
+  it("after a restart, the persistent subconscious's cadence look counts only what was held since its last look", (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world({ subconscious: true });
+    w.tuneOut();
+    w.startCadence(30);
+    held(w, 'ann', 'S-1');
+    held(w, 'bo', 'S-2');
+    t.mock.timers.tick(30_000);
+    assert.equal(w.looks.length, 1);
+    assert.match(w.looks[0]!.text, /— 2 diverted messages since your last look/);
+    held(w, 'cy', 'S-3 after its look');
+    w.restart();
+    t.mock.timers.tick(30_000);
+    assert.equal(w.looks.length, 2, 'the first period after the restart has a look');
+    assert.match(w.looks[1]!.text, /— 1 diverted message since your last look/, 'counting S-3 alone');
+    t.mock.timers.tick(30_000);
+    assert.equal(w.looks.length, 2, 'and a quiet period after it has none');
     w.coordinator.stop();
   });
 });
