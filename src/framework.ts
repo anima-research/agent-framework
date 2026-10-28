@@ -6046,7 +6046,10 @@ export class AgentFramework {
     return true;
   }
   private takeAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
-    if (isTransientFailure(error)) return true;
+    if (isTransientFailure(error)) {
+      if (isRearmed(trigger)) this.rearmDeadlineCuts.delete(agentName);
+      return true;
+    }
     if (!isRearmed(trigger) || !isDeadlineExpiry(error)) return false;
     const first = !this.rearmDeadlineCuts.has(agentName);
     if (!this.providerAdmissionClosed) this.rearmDeadlineCuts.add(agentName);
@@ -23508,6 +23511,7 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            if (isRearmed(trigger)) this.rearmDeadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
             // The stream's accumulated fresh input, which is what the
