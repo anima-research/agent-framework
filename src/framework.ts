@@ -12153,26 +12153,30 @@ export class AgentFramework {
       }
     }
 
-    for (const mail of this.registry.listMail()) {
-      const recipient = this.agents.get(mail.to);
-      if (recipient) {
-        // The message may have reached the store in the same sync that the
-        // release missed; never deliver it a second time.
-        const already = recipient.getContextManager().queryMessages({ metadata: { 'dendrite.mailId': mail.id } });
-        if (already.messages.length > 0) {
-          this.registry.releaseMail(mail.id);
-          continue;
-        }
+    for (const mail of this.registry.listMail()) this.deliverHeldMail(mail);
+  }
+
+  /**
+   * Deliver held mail that hasn't landed. Its copy may have reached the
+   * recipient's store in the same sync that the release missed, and then it
+   * is released instead; and a write the deferred queue still holds for it
+   * lands at the next flush and releases it then (releaseLandedMail). Either
+   * way a second delivery would put it in the window twice under one mail id.
+   */
+  private deliverHeldMail(mail: HeldMail, wake = true): void {
+    const recipient = this.agents.get(mail.to);
+    if (recipient) {
+      const already = recipient.getContextManager().queryMessages({ metadata: { 'dendrite.mailId': mail.id } });
+      if (already.messages.length > 0) {
+        this.registry.releaseMail(mail.id);
+        return;
       }
-      // A write the restored deferred queue still holds for this mail lands
-      // at the next flush and releases it then (releaseLandedMail); a second
-      // delivery here would put it in the window twice under one mail id.
-      const queued = this.deferredMessages.some(
-        (m) => (m.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === mail.id,
-      );
-      if (queued) continue;
-      this.attemptMailDelivery(mail);
     }
+    const queued = this.deferredMessages.some(
+      (m) => (m.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === mail.id,
+    );
+    if (queued) return;
+    this.attemptMailDelivery(mail, wake);
   }
 
   private createDeferred<T>(): Deferred<T> {
@@ -12374,7 +12378,7 @@ export class AgentFramework {
     // Mail held for this name (a resumed incarnation's, sent while it was
     // ended) reaches it now rather than at the next boot. Its run is
     // starting, so it wakes nothing.
-    for (const mail of this.registry.listMail({ to: agent.name })) this.attemptMailDelivery(mail, false);
+    for (const mail of this.registry.listMail({ to: agent.name })) this.deliverHeldMail(mail, false);
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
       inferenceStarted: false,

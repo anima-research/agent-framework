@@ -531,6 +531,28 @@ describe('the registry\'s recovery', () => {
     assert.ok(context.getAllMessages().some((m) => textOf(m.content).includes('C-RESULT')), 'and the result is in its context');
   });
 
+  it('held mail whose copy already reached the resumed job\'s context is released, not delivered twice', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'r', 'g-r', workerSpec('r', { spawnedBy: 'oren' }));
+    const child = await startBlocked(first, gates, 'c', 'g-c', workerSpec('c', { spawnedBy: 'r', resultTo: { to: 'r', as: 'message' } }));
+    first.stopAgent('r', { by: 'oren' });
+    gates.release('g-c');
+    assert.ok((await child.settled).ok);
+    first.deliverAgentResult('c', [{ type: 'text', text: 'C-RESULT' }]);
+    const [held] = first.listHeldMail();
+    membrane.script('r', say('done'));
+    const resumed = await first.resumeAgent('r', { model: 'test-model', systemPrompt: 'x' });
+    // Its copy landed before (a release that missed a sync, say).
+    resumed.contextManager.addMessage('c', [{ type: 'text', text: 'C-RESULT' }], { dendrite: { mailId: held!.id } } as never);
+    resumed.contextManager.addMessage('user', [{ type: 'text', text: 'Go on.' }]);
+    await first.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+    assert.deepEqual(first.listHeldMail(), [], 'released');
+    const context = await first.inspectAgentContext('r');
+    assert.equal(context.getAllMessages().filter((m) => textOf(m.content).includes('C-RESULT')).length, 1, 'and in its context once');
+  });
+
   it('a job cancelled with its stream in flight rejects with AgentStoppedError naming who and why', async () => {
     const gates = new GateModule();
     const first = await boot(gates);
