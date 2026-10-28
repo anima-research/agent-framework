@@ -54,7 +54,7 @@ export function markedTexts(texts: readonly string[], marks: readonly boolean[] 
     at += text.length + 1;
   }
   const offsets: number[][] = texts.map(() => []);
-  const found = [...texts.join('\n').matchAll(NOTICE_OPENING)].map((match) => match.index);
+  const found = Array.from(texts.join('\n').matchAll(NOTICE_OPENING), (match) => match.index);
   holdersOf(starts, found).forEach((holder, i) => {
     const offset = found[i]! - starts[holder]!;
     if (marks[holder] !== false && texts[holder]![offset - 1] !== '\\') offsets[holder]!.push(offset);

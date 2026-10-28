@@ -185,6 +185,15 @@ test('wake_agent() wakes its agent with the payload, and past the cap it is refu
   assert.match(wakes[0]![1], /\(wake 1 of 2\): \{"n":1\}$/);
 });
 
+test('a wake_agent() payload is written in its notice on one line, as JSON that gives the payload back', async () => {
+  const { scripts, wakes } = setup({ config: { yieldMs: LONGER_THAN_ANY_START_MS } });
+  await scripts.run('alice', `await wake_agent({ text: 'first\\u2028second\\u0085third' }); return 1;`);
+  assert.equal(wakes.length, 1);
+  const notice = wakes[0]![1];
+  assert.ok(!/[\r\n\u0085\u2028\u2029]/.test(notice), JSON.stringify(notice));
+  assert.deepEqual(JSON.parse(notice.slice(notice.indexOf('): ') + 3)), { text: 'first\u2028second\u0085third' });
+});
+
 test('a listing counts the wakes the host delivered, not one whose delivery failed', async () => {
   const { scripts } = setup({ host: { wake: async (_agent, _scriptId, text) => { if (text.includes('"n":2')) throw new Error('no route'); } } });
   // A yield past the script's end, which comes first: the listing is read once it has ended.

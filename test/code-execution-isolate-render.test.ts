@@ -138,8 +138,9 @@ test("a script's ending reads on one line in a wait's and a list's result, a sto
   const why = `its turn ended before the script returned (rate\nlimited ${'x'.repeat(400)})`;
   const stopped = renderReturn(ret({ ending: { how: 'stopped', reason: 'limit', why } }), options);
   const stoppedLine = stopped.split('\n').find((line) => line.includes('was stopped:'))!;
-  assert.ok(stoppedLine.startsWith('Script s1-test was stopped: its turn ended before the script returned (rate limited xxx'), stoppedLine);
-  assert.ok(stoppedLine.endsWith('….'), stoppedLine);
+  // The reason's first 300 characters, its line break a space, and an ellipsis.
+  const cut = `${why.slice(0, 300).replace('\n', ' ')}…`;
+  assert.equal(stoppedLine, `Script s1-test was stopped: ${cut}.`);
   const failed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } } }), options);
   assert.match(failed, /^Script s1-test failed: Bad Name: broke here$/m);
   const crashed = renderReturn(ret({ ending: { how: 'crashed', detail: 'its process exited before the script ended: first\nsecond' } }), options);
@@ -152,8 +153,17 @@ test("a script's ending reads on one line in a wait's and a list's result, a sto
   ]) {
     assert.ok(!text.split('\n').some((line) => line.includes('ago:') && LINE_BREAK.test(line)), text);
   }
-  assert.match(listing({ how: 'stopped', reason: 'limit', why }), /stopped 1 min ago: its turn ended before the script returned \(rate limited x+…/);
+  assert.ok(listing({ how: 'stopped', reason: 'limit', why }).split('\n').includes(`- s1-test: stopped 1 min ago: ${cut}`));
   assert.match(listing({ how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } }), /failed 1 min ago: Bad Name: broke here/);
+});
+
+test("a timed-out call's late answer is written on one line, as JSON that gives the answer back", () => {
+  const answer = 'first\u2028second\u0085third';
+  const calls: CallSummary = { ...noCalls, made: 1, named: [{ tool: 'slow', args: '{}', state: 'timed-out-answered', answer }] };
+  const text = renderReturn(ret({ calls, ending: { how: 'finished' } }), options);
+  const line = text.split('\n').find((l) => l.includes('its answer came later'))!;
+  assert.ok(!/[\u0085\u2028\u2029]/.test(line), JSON.stringify(line));
+  assert.equal(JSON.parse(line.slice(line.indexOf(', answer ') + ', answer '.length)), answer);
 });
 
 test('calls waiting their turn in the host are among those a yield counts', () => {

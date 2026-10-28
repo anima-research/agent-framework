@@ -16,6 +16,8 @@ describe('marking many texts', () => {
     for (let i = 0; i < texts.length; i++) {
       assert.equal(marked[i], i % 2 ? `\\${texts[i]}` : texts[i], String(i));
     }
+    // An empty text holds no opening, and the texts after it keep their own.
+    assert.deepEqual(markedTexts(['a', '', `[${NOTICE_TAG.routing}] b`]), ['a', '', `\\[${NOTICE_TAG.routing}] b`]);
   });
 
   it("finds the text that holds each of many openings in one walk through the texts' starts", () => {

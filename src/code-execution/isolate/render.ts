@@ -9,7 +9,7 @@ import { fresh, toolRef, type CallSummary, type NamedCall } from './calls.js';
 import type { Ending } from './runner.js';
 import type { ScriptListing, ScriptReturn } from './scripts.js';
 import { renderOutput } from './output.js';
-import { suppliedValue } from '../../supplied-text.js';
+import { quotedValue, suppliedValue } from '../../supplied-text.js';
 
 /**
  * The most of a script's return value, or of a failure's message or stack,
@@ -108,7 +108,7 @@ function namedLine(call: NamedCall): string {
     case 'timed-out':
       return `- timed out in the script, and still running when the script ended, so it may still take effect: ${namedRef(call)}`;
     case 'timed-out-answered':
-      return `- timed out in the script, and its answer came later: ${namedRef(call)}, answer ${JSON.stringify(call.answer ?? '')}`;
+      return `- timed out in the script, and its answer came later: ${namedRef(call)}, answer ${quotedValue(call.answer ?? '')}`;
     case 'too-large':
       return `- answered with a result the script couldn't receive, too large for its memory or nested too deep, so it got an error instead: ${namedRef(call)}`;
     case 'unseen':

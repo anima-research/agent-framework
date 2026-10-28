@@ -32,7 +32,7 @@ import type { CallSummary } from './calls.js';
 import type { OutputBounds, OutputWindow } from './output.js';
 import type { PreludeTool } from './prelude.js';
 import { glimpse } from './render.js';
-import { suppliedValue } from '../../supplied-text.js';
+import { quotedValue, suppliedValue } from '../../supplied-text.js';
 
 /** The run or wait call watching a script: its turn, which the script's calls carry, and whether one of them ended that turn. */
 export interface ScriptWatch {
@@ -478,12 +478,13 @@ function leftEndingText(scriptId: string, ending: Ending): string {
     : ending.how === 'crashed'
       ? `crashed: ${suppliedValue(ending.detail)}`
       : ending.how === 'stopped'
-        ? ending.why ? `was stopped: ${ending.why}` : 'was stopped at its limit'
+        ? ending.why ? `was stopped: ${suppliedValue(glimpse(ending.why, 300))}` : 'was stopped at its limit'
         : 'ended';
   return `[${NOTICE_TAG.script} ${scriptId}] Your script ${how}. {"action": "wait", "script_id": "${scriptId}"} gives its result.`;
 }
 
 function wakeText(scriptId: string, payloadJson: string, n: number, max: number, ageMs: number): string {
   const minutes = Math.round(ageMs / 60_000);
-  return `[${NOTICE_TAG.script} ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${payloadJson}`;
+  // The payload is the JSON the script's wake_agent() sent; written again with quotedValue, it gives the same value on one line, with no opening of the framework's unescaped.
+  return `[${NOTICE_TAG.script} ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${quotedValue(JSON.parse(payloadJson))}`;
 }
