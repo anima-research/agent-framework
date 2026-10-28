@@ -525,7 +525,7 @@ describe('explicit prose routing', () => {
       assert.equal(draftState(copy), 'unconfirmed', 'a fresh draft cannot erase its source attempt risk');
       const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes(copy.id))!;
       assert.doesNotMatch(notice, /was not delivered/, 'an unconfirmed send is not also declared undelivered');
-      assert.ok(notice.includes(`draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true`), notice);
+      assert.ok(notice.includes(`draftIds: ["${copy.id}"], destination: "#<channel>", confirmDuplicate: true`), notice);
       assert.ok(!notice.includes('{{unsent}}'), `{{unsent}} would refuse it, so the notice doesn't offer it: ${notice}`);
     } finally {
       await framework.stop();
@@ -616,7 +616,7 @@ describe('explicit prose routing', () => {
       assert.match(notice, /Its last send's outcome isn't known, so sending it again could post it twice: resend it only with confirmDuplicate: true\./);
       assert.doesNotMatch(notice, /was not delivered/, 'an unconfirmed send is not also declared undelivered');
       assert.match(notice, /may not have been delivered/);
-      assert.ok(notice.includes(`draftIds: ["${original.id}"], destination: "#channel", confirmDuplicate: true`), notice);
+      assert.ok(notice.includes(`draftIds: ["${original.id}"], destination: "#<channel>", confirmDuplicate: true`), notice);
       assert.ok(notice.includes('resend it only with confirmDuplicate: true.'), notice);
       assert.ok(!notice.includes('{{unsent}}'), notice);
     } finally {
@@ -2844,7 +2844,7 @@ describe('explicit prose routing', () => {
     const cm = framework.getAgent('assistant')!.getContextManager();
     const texts = cm.getAllMessages().flatMap(m => m.content)
       .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
-    assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('not delivered') && t.includes('>>>#channel {{unsent}}')));
+    assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('not delivered') && t.includes('>>>#<channel> {{unsent}}')));
     await framework.stop();
   });
 
@@ -2921,7 +2921,7 @@ describe('explicit prose routing', () => {
         assert.doesNotMatch(notice, /\{\{unsent\}\}/);
         assert.equal(draftsOf(framework).open('assistant').some(d => d.text === 'fails'), false);
       } else {
-        assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('>>>#channel {{unsent}}')));
+        assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('>>>#<channel> {{unsent}}')));
       }
       await framework.stop();
     });

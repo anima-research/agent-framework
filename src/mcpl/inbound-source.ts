@@ -217,7 +217,9 @@ function storedBlock(block: unknown): unknown {
  * The version identity of a delivered body (agreed with the receipts lane,
  * room-220 #46752–#47210): SHA-256 hex of `canonicalJson([blocks])` over the
  * ContentBlock[] the framework stores for the body — after MCPL conversion,
- * before any host decoration is added and before storage shards it — with
+ * which marks the server's text at the framework's notice openings
+ * (supplied-text.ts), before any host decoration is added and before storage
+ * shards it — with
  * each block as the store keeps it, which context-manager's `blockAsStored`
  * gives. So a body hashes alike as delivered, as handed to storage, and as
  * read back unsharded from the store with its blobs resolved, except one

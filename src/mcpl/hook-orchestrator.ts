@@ -14,7 +14,8 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { convertBlock } from './convert-block.js';
+import { convertBlocks } from './convert-block.js';
+import { markedText } from '../supplied-text.js';
 import type { ContextInjection } from '@animalabs/context-manager';
 
 import type {
@@ -64,9 +65,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 function convertContent(content: string | McplContentBlock[], serverId: string): ContentBlock[] {
   if (typeof content === 'string') {
-    return [{ type: 'text', text: content }];
+    return [{ type: 'text', text: markedText(content) }];
   }
-  return content.map((block) => convertBlock(block, 'attachment on context injection', serverId));
+  return convertBlocks(content, 'attachment on context injection', serverId);
 }
 
 /**
