@@ -355,6 +355,58 @@ for (const [name, fail, failsAt] of [['refused by the provider, at its start', i
   });
 }
 
+test("a re-armed send that a deadline membrane marks cuts is sent again at the next delay, once in its chain; cut again, the chain ends", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+  stderr.length = 0;
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the first re-armed send to end exhausted');
+  assert.equal(r.admission().providerAdmission.heldRequests, 1, "its chain's first deadline cut is re-armed, as a transient failure is");
+  assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(2 of 3\)/);
+  await waitFor(() => r.count('inference:exhausted') === 3, 'the second re-armed send to end exhausted');
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'a second cut in the chain ends it');
+  assert.ok(stderr.some((line) => line.startsWith("[inference-rearm] agent=resident turn not re-armed: its failure isn't transient (timeout)")),
+    'the operator is told why no re-send is coming');
+  assert.equal(membrane.sends.length, 5, 'the window, then one send for each re-arm');
+  assert.equal(r.markers(), 2, "the first cut writes no marker of its own; the cut that ends the chain does");
+});
+
+for (const [clears, script] of [
+  ['a message said to the agent', (stalled: Error) => (n: number) => (n <= 3 ? serverError : () => stalled)],
+  ['a completed turn', (stalled: Error) => (n: number) => (n <= 3 || (n >= 6 && n <= 8) ? serverError : n === 5 ? undefined : () => stalled)],
+  ['a stop() and start()', (stalled: Error) => (n: number) => (n <= 3 || (n >= 5 && n <= 7) ? serverError : () => stalled)],
+] as const) {
+  test(`${clears} starts the chain afresh, so its next re-armed send's deadline cut is re-armed again`, async (t) => {
+    const stalled = await stalledByMembrane(t);
+    const membrane = new ScriptedMembrane(script(stalled));
+    const storeDir = mkdtempSync(join(tmpdir(), 'turn-rearm-store-'));
+    const store = JsStore.openOrCreate({ path: join(storeDir, 'store') });
+    const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100], store });
+    t.after(() => { store.close(); rmSync(storeDir, { recursive: true, force: true }); });
+    r.say('zz-question');
+    await waitFor(() => r.count('inference:exhausted') === 2, "the chain's first re-armed send to end exhausted, cut once");
+    assert.equal(r.admission().providerAdmission.heldRequests, 1);
+    if (clears === 'a message said to the agent') {
+      (r.fw as unknown as { addMessage(role: string, content: unknown[], metadata: unknown): unknown })
+        .addMessage('user', [{ type: 'text', text: 'zz-said' }], {});
+    } else if (clears === 'a completed turn') {
+      await waitFor(() => r.count('inference:completed') === 1, 'the next re-arm to answer');
+      queue(r, { reason: 'zz-wake' });
+      await waitFor(() => r.count('inference:exhausted') === 3, "a later turn's window to end exhausted");
+    } else {
+      await stepping(r.fw.stop(), 'the framework to stop');
+      r.fw.start();
+      queue(r, { reason: 'zz-wake' });
+      await waitFor(() => r.count('inference:exhausted') === 3, "the next lifecycle's window to end exhausted");
+    }
+    await waitFor(() => r.count('inference:exhausted') === 3 + (clears === 'a message said to the agent' ? 0 : 1),
+      'the next re-armed send to end exhausted, cut');
+    assert.equal(r.admission().providerAdmission.heldRequests, 1, "its cut is the chain's first again, so it is re-armed");
+    await stepping(r.fw.stop(), 'the framework to stop before its store closes');
+  });
+}
+
 test("a stated wait on a re-armed turn's send holds it as it holds any turn, and what follows is still that re-arm's one send", async (t) => {
   const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : n === 4 ? statedWait(250) : n === 5 ? serverError : undefined));
   const r = await resident(t, membrane);

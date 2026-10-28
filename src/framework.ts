@@ -1189,9 +1189,13 @@ function waitAlertsOnItsOwn(wait: ProviderWait): boolean {
 // connect timeout too), and doesn't export its reader.
 const MEMBRANE_DEADLINE_EXPIRY: unique symbol = Symbol.for('membrane.deadlineExpiry');
 
+function isDeadlineExpiry(error: Error): boolean {
+  return (error as { [MEMBRANE_DEADLINE_EXPIRY]?: unknown })[MEMBRANE_DEADLINE_EXPIRY] === true;
+}
+
 function isTransientFailure(error: Error): boolean {
   if (!isMembraneError(error) || error.retryable !== true) return false;
-  if ((error as { [MEMBRANE_DEADLINE_EXPIRY]?: unknown })[MEMBRANE_DEADLINE_EXPIRY] === true) return false;
+  if (isDeadlineExpiry(error)) return false;
   return error.type === 'server' || error.type === 'network' || error.type === 'timeout' || error.type === 'rate_limit';
 }
 
@@ -3517,6 +3521,7 @@ export class AgentFramework {
   private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
   private turnRearms: Map<string, number> = new Map();
   private exhaustingRearms: Set<string> = new Set();
+  private rearmDeadlineCuts: Set<string> = new Set();
   private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
@@ -6026,11 +6031,16 @@ export class AgentFramework {
     if (wait && trigger && (wait.until === null || wait.until > now)) this.noteStatedWaitRun(agent.name, wait, now);
     return true;
   }
+  private rearmsAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
+    return isTransientFailure(error)
+      || (isRearmed(trigger) && isDeadlineExpiry(error) && !this.rearmDeadlineCuts.has(agentName));
+  }
+
   private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined): void {
     if (!ownsProviderGate || trigger === undefined || this.providerAdmissionClosed || this.turnRearmMs.length === 0) return;
     const done = this.turnRearms.get(agent.name) ?? 0;
     const notSent = (why: string) => console.error(`[inference-rearm] agent=${agent.name} turn not re-armed: ${why}`);
-    if (!isTransientFailure(error)) {
+    if (!this.rearmsAsTransient(agent.name, error, trigger)) {
       if (done > 0) notSent(`its failure isn't transient (${isMembraneError(error) ? error.type : boundFailureText(error.message, FAILURE_SUMMARY_MAX_CHARS)})`);
       return;
     }
@@ -6047,6 +6057,7 @@ export class AgentFramework {
     const delayMs = this.turnRearmMs[done]!;
     const rearm = { number: done + 1, of: this.turnRearmMs.length };
     this.turnRearms.set(agent.name, rearm.number);
+    if (!isTransientFailure(error)) this.rearmDeadlineCuts.add(agent.name);
     const request: MarkedRequest = { ...trigger, [REARMED]: true };
     delete request[TURN_RETRY];
     delete request[MERGED_BATCH];
@@ -6486,7 +6497,7 @@ export class AgentFramework {
   private cancelProviderAdmission(): void {
     for (const cooldown of this.providerAccelerationCooldowns.values()) clearTimeout(cooldown.timer);
     this.providerAccelerationCooldowns.clear(); this.providerAccelerationRecoveries.clear();
-    this.turnRearms?.clear(); this.exhaustingRearms?.clear();
+    this.turnRearms?.clear(); this.exhaustingRearms?.clear(); this.rearmDeadlineCuts?.clear();
     for (const gate of this.providerGates.values()) {
       gate.primaryDepth = 0; gate.primaryPending = false;
       for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -21524,7 +21535,7 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
-        if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+        if (isRearmed(trigger) && this.rearmsAsTransient(agent.name, err, trigger)) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -23365,7 +23376,7 @@ export class AgentFramework {
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+              if (isRearmed(trigger) && this.rearmsAsTransient(agent.name, err, trigger)) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -23749,7 +23760,7 @@ export class AgentFramework {
         speech: '',
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
-      if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+      if (isRearmed(trigger) && this.rearmsAsTransient(agent.name, err, trigger)) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
@@ -26686,6 +26697,7 @@ export class AgentFramework {
   private noteSpokenTo(agentName: string, metadata: MessageMetadata | undefined): void {
     const agent = this.agents.get(agentName);
     if ((agent && !this.agentSees(agent, metadata)) || isOwnScheduleWrite(metadata) || !isConversationalInjection(metadata)) return;
+    this.rearmDeadlineCuts?.delete(agentName);
     if (this.turnRearms?.delete(agentName)) console.error(`[inference-rearm] agent=${agentName} re-send count started again: a message was said to it`);
   }
 
@@ -28123,7 +28135,7 @@ export class AgentFramework {
       if (name && this.exhaustionRewinds.get(name)) {
         this.exhaustionRewinds.set(name, 0);
       }
-      if (name) this.turnRearms?.delete(name);
+      if (name) { this.turnRearms?.delete(name); this.rearmDeadlineCuts?.delete(name); }
     }
     if (event.type === 'inference:completed' || event.type === 'inference:exhausted' || event.type === 'inference:aborted') {
       this.endStatedWaitRun(event.agentName as string);

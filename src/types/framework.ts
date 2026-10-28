@@ -242,7 +242,11 @@ export interface FrameworkConfig {
    * of the re-armed turn's rounds has run or had its tool calls cut off, its
    * failure gets no retries from the error policy: on another transient
    * failure the next delay follows, until the list runs out, and a failure of
-   * any other kind ends the re-arming. A wake for the agent while it waits
+   * any other kind ends the re-arming. The one exception is a re-armed turn's
+   * send cut by a deadline membrane marks, as when a stream stalls: that
+   * counts as a transient failure once until a turn completes or a message is
+   * said to the agent, and a second such cut before then ends the re-arming. A
+   * deadline the host sets still ends it. A wake for the agent while it waits
    * starts its turn at once, with the re-armed trigger merged in. That turn is
    * the wake's: the error policy retries its failures. A completed turn starts
    * the count again, and so does a message said to the agent: not a system
@@ -256,9 +260,9 @@ export interface FrameworkConfig {
    * transient failure writes no `[inference-failed]` marker unless a round of
    * it ran or had its tool calls cut off; any other failure of it writes one.
    * Each counts toward the hard-down streak. Ephemeral runs and conversation
-   * forks are never re-armed. The wait and the count are kept in memory:
-   * `stop()` drops them, and so does a restart. The wait isn't a turn, so
-   * `abortInference()` doesn't end it.
+   * forks are never re-armed. The wait, the count and a cut taken once are
+   * kept in memory: `stop()` drops them, and so does a restart. The wait isn't
+   * a turn, so `abortInference()` doesn't end it.
    */
   exhaustedTurnRearmMs?: number[] | false;
 
