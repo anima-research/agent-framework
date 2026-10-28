@@ -479,9 +479,11 @@ export class HostPresentation {
   }
 
   /** A server connected by other means (an operator's connect, a deploy): no longer a closed tab. */
-  noteConnected(serverId: string): void {
-    // Closed by an agent, or by its configured default: connected against it now, which is kept.
-    if (this.doc.closed[serverId] === true || (this.doc.closed[serverId] === undefined && this.server(serverId)?.configured === 'closed-tab')) {
+  noteConnected(serverId: string, wasClosedTab = false): void {
+    // Closed by an agent, or by its configured default (as the caller kept
+    // it): connected against it now, which is kept across restarts.
+    if (wasClosedTab || this.doc.closed[serverId] === true
+      || (this.doc.closed[serverId] === undefined && this.server(serverId)?.configured === 'closed-tab')) {
       this.doc.closed[serverId] = false;
       this.save();
     }

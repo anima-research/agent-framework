@@ -30898,8 +30898,10 @@ export class AgentFramework {
       throw new Error(`MCP server "${config.id}" was not connected: it was disconnected or lost while its tools were being listed`);
     }
     // Connected, however it was asked for: not a closed tab any more.
-    this.closedTabConfigs().delete(config.id);
-    this.hostPresentation?.noteConnected(config.id);
+    // Whether it was a closed tab is the kept configuration's to say, not
+    // the one it's connected with now, which may name another presentation.
+    const wasClosedTab = this.closedTabConfigs().delete(config.id);
+    this.hostPresentation?.noteConnected(config.id, wasClosedTab);
     this.emitMcplToolDiff(oldToolNames, config.id);
   }
 
@@ -31111,7 +31113,7 @@ export class AgentFramework {
       // server now, and one whose connect fails is left an ordinary server
       // that's down. Moved to another id, the old id's tab is no more.
       if (this.closedTabConfigs().has(id)) {
-        if (config.id === id) this.hostPresentation?.noteConnected(id);
+        if (config.id === id) this.hostPresentation?.noteConnected(id, true);
         else this.hostPresentation?.noteRemoved(id);
         this.closedTabConfigs().delete(id);
       }

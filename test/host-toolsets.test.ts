@@ -656,6 +656,26 @@ describe('server tabs', () => {
     } finally { await h.stop(); await server.close(); await other.server.close(); }
   });
 
+  it('keeps an operator\'s connect of a configured closed tab across a restart, whatever presentation that connect names', async () => {
+    const { server } = await pingServer();
+    const configured: McplServerConfig = { id: 'srv', url: server.url, toolPrefix: 'srv', presentation: 'closed-tab' };
+    const first = await makeFramework({ servers: [configured] });
+    try {
+      await first.framework.start();
+      assert.ok(!first.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'closed at startup');
+      // A re-deploy that leaves presentation out.
+      await first.framework.connectMcplServer({ id: 'srv', url: server.url, toolPrefix: 'srv' });
+      await waitFor(() => first.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'connected by its operator');
+      const doc = JSON.parse(readFileSync(join(first.dir, 'store', 'config', 'toolsets.json'), 'utf8'));
+      assert.equal(doc.closed?.srv, false, 'the connect is kept');
+    } finally { await first.stop(true); }
+    const second = await makeFramework({ dir: first.dir, servers: [configured] });
+    try {
+      await second.framework.start();
+      await waitFor(() => second.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'connected at startup under the original configuration');
+    } finally { await second.stop(); await server.close(); }
+  });
+
   it('ends a closed tab when a restart begins: a restart whose connect fails leaves an ordinary server that\'s down', async () => {
     const { server } = await pingServer();
     const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
