@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const WATCHDOG = pathToFileURL(join(import.meta.dirname, '../src/runtime/liveness-watchdog.js')).href;
+const LONGER_THAN_ANY_START_MS = 60_000;
+const NEVER_FIRES_IN_A_TEST_MS = 2 * LONGER_THAN_ANY_START_MS;
 
 /** On Linux desktops the kernel pipes every SIGABRT of a packaged binary to a
  *  crash handler (apport), so the 'abort' case below produces a crash report
@@ -25,9 +27,7 @@ function spawnChild(script: string) {
   return spawn(argv[0], argv.slice(1), { stdio: 'ignore' });
 }
 
-/** Spawn a child that starts the watchdog then wedges its main thread; resolve
- *  with how it died. */
-function runWedgedChild(action: 'exit' | 'abort', reportPath: string | null): Promise<{ code: number | null; signal: string | null }> {
+function runWedgedChild(action: 'exit' | 'abort', reportPath: string | null): Promise<{ code: number | null; signal: string | null; gaveUp: boolean }> {
   const dir = mkdtempSync(join(tmpdir(), 'wd-'));
   const script = join(dir, 'child.mjs');
   writeFileSync(
@@ -41,23 +41,26 @@ function runWedgedChild(action: 'exit' | 'abort', reportPath: string | null): Pr
     });
     w.start();
     w.setPhase('test-wedge');
-    // Heartbeat a few times, then wedge the main thread synchronously forever.
-    setTimeout(() => { const end = Date.now() + 30000; while (Date.now() < end) {} }, 300);
+    setTimeout(() => { const end = Date.now() + ${NEVER_FIRES_IN_A_TEST_MS}; while (Date.now() < end) {} }, 300);
     `,
   );
   return new Promise((resolve) => {
     const child = spawnChild(script);
-    const killTimer = setTimeout(() => child.kill('SIGTERM'), 8000); // safety net
+    let gaveUp = false;
+    const giveUp = setTimeout(() => { gaveUp = true; child.kill('SIGKILL'); }, LONGER_THAN_ANY_START_MS);
     child.on('exit', (code, signal) => {
-      clearTimeout(killTimer);
+      clearTimeout(giveUp);
       rmSync(dir, { recursive: true, force: true });
-      resolve({ code, signal });
+      resolve({ code, signal, gaveUp });
     });
   });
 }
 
+const gaveUpMessage = `the wedged child hadn't ended by ${LONGER_THAN_ANY_START_MS} ms, so the test ended it`;
+
 test("watchdog kills a wedged process (action: 'exit' → SIGKILL)", async () => {
-  const { signal } = await runWedgedChild('exit', null);
+  const { signal, gaveUp } = await runWedgedChild('exit', null);
+  assert.ok(!gaveUp, gaveUpMessage);
   assert.strictEqual(signal, 'SIGKILL', `expected SIGKILL, got code/signal ${signal}`);
 });
 
@@ -65,7 +68,8 @@ test("watchdog aborts a wedged process (action: 'abort' → SIGABRT) and writes 
   const dir = mkdtempSync(join(tmpdir(), 'wd-rep-'));
   const reportPath = join(dir, 'wedge.jsonl');
   try {
-    const { signal } = await runWedgedChild('abort', reportPath);
+    const { signal, gaveUp } = await runWedgedChild('abort', reportPath);
+    assert.ok(!gaveUp, gaveUpMessage);
     assert.strictEqual(signal, 'SIGABRT', `expected SIGABRT, got ${signal}`);
     assert.ok(existsSync(reportPath), 'wedge report file should exist');
     const rep = JSON.parse(readFileSync(reportPath, 'utf8').trim().split('\n')[0]);
