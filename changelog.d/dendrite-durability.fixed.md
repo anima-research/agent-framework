@@ -22,9 +22,10 @@
   registration, an end, a reparent, a hold — is put back when its write
   fails, so the call fails and a retry does it once (a stop whose write
   failed had left the agent recorded as stopped while it ran). The put-back
-  rewrites the registry's recovery files and its branch-local snapshot to
-  match memory; only an end already appended to the branch-local ended log
-  stays, and a boot reads that log only where no ended recovery file exists.
+  rewrites the registry's recovery files to match memory (the branch-local
+  snapshot, written last, never holds the change); only an end already
+  appended to the branch-local ended log stays, and a boot reads that log
+  only where no ended recovery file exists.
   A write that records something that has already happened — a
   release, a held mark, a message path — is not failed: it alerts, stays in
   memory, and the next write carries it. A result's hold is durable as it is

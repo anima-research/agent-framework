@@ -136,20 +136,12 @@ describe('the registry\'s recovery', () => {
     assert.equal(first.listHeldMail().length, 1, 'and the retry holds it once');
   });
 
-  it('a put-back rewrites the branch-local snapshot, and one rewrite failing doesn\'t stop the next', async () => {
+  it('a put-back rewrites every recovery file, one failing or not', async () => {
     const gates = new GateModule();
     const first = await boot(gates);
     first.start();
     await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
     const store = first.getStore();
-    // The branch-local write fails once: the put-back's own rewrite of it lands.
-    let failures = 0;
-    let undo = failOn(store, 'setStateJson', REGISTRY, () => failures++ === 0);
-    try {
-      assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated setStateJson failure/);
-    } finally { undo(); }
-    const local = store.getStateJson(REGISTRY) as { records: Array<{ name: string; ended?: unknown }> };
-    assert.ok(local.records.some((r) => r.name === 'boss' && r.ended === undefined), 'the branch-local snapshot has boss live again');
     // The ended file's rewrite fails during the put-back: the registry file's still happens.
     const internal = first as unknown as { writeRecoveryFile: (path: string, document: unknown) => void };
     const write = internal.writeRecoveryFile.bind(first);
@@ -158,7 +150,7 @@ describe('the registry\'s recovery', () => {
       if (putBack && path === endedFile()) throw new Error('EIO: the ended file');
       write(path, document);
     };
-    undo = failOn(store, 'setStateJson', REGISTRY, () => { putBack = true; return true; });
+    const undo = failOn(store, 'setStateJson', REGISTRY, () => { putBack = true; return true; });
     try {
       assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated setStateJson failure/);
     } finally {

@@ -11889,23 +11889,23 @@ export class AgentFramework {
   }
 
   /**
-   * A requested change was put back in the registry's memory: every copy
-   * that can be overwritten is rewritten from it (the snapshot's recovery
-   * file and branch-local state, and the ended log's recovery file), so none
-   * keeps the change the caller was told failed. The branch-local ended log
-   * is append-only, so an end appended before the failure stays there; it is
-   * read at boot only where no ended recovery file exists, and the restore
-   * then reads that agent as ended, as a restart ends bounded work anyway.
-   * A rewrite that fails is reported; the caller's own error goes on.
+   * A requested change was put back in the registry's memory: the recovery
+   * files, each written before the branch-local store, are rewritten from it
+   * (the snapshot's and the ended log's), so neither keeps the change the
+   * caller was told failed. The branch-local snapshot needs no rewrite: it is
+   * the last write a change makes, so a change that failed never reached it.
+   * The branch-local ended log is append-only, so an end appended before the
+   * failure stays there; it is read at boot only where no ended recovery file
+   * exists, and the restore then reads that agent as ended, as a restart ends
+   * bounded work anyway. A rewrite that fails is reported, the next is still
+   * made, and the caller's own error goes on.
    */
   private rewriteAgentRegistryAfterRollback(): void {
-    const snapshot = this.registry.snapshot();
     const rewrites: Array<[string, () => void]> = [
       ['the ended log recovery file', () => this.rewriteEndedRecovery(this.registry.endedHistory())],
       ...(this.agentRegistryPath
-        ? [['the registry recovery file', () => this.writeRecoveryFile(this.agentRegistryPath!, snapshot)] as [string, () => void]]
+        ? [['the registry recovery file', () => this.writeRecoveryFile(this.agentRegistryPath!, this.registry.snapshot())] as [string, () => void]]
         : []),
-      ['the branch-local registry', () => this.store.setStateJson(AGENT_REGISTRY_STATE_ID, snapshot)],
     ];
     for (const [what, rewrite] of rewrites) {
       try {
