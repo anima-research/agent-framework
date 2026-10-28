@@ -151,10 +151,20 @@ describe('tune-out, all-except scope', () => {
     try {
       await registerOpen(f, 'work', 'noisy');
       enterAllExcept(f, 'work');
-      (f.framework as unknown as { routingOf(agentName: string): { noChannel?: true } }).routingOf('agent').noChannel = true;
-      const result = await f.framework.executeToolCall({ id: 'p1', name: 'channel_publish', input: { content: 'zz-nowhere' }, callerAgentName: 'agent' } as never);
-      assert.equal(result.success, false);
-      assert.match(result.error ?? '', /name the channel with channelId\. This turn has no channel of its own/);
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content: 'zz-nowhere' } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]));
+      // A wake naming a channel no server registers: the turn has no channel by design (noChannel).
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'test', source: 'test', channelId: 'ghost', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      await eventually(() => stored(f).some((m) => JSON.stringify(m.content).includes('zz-nowhere')), 'the call was made');
+      const refused = stored(f).some((m) => JSON.stringify(m.content).includes('name the channel with channelId. This turn has no channel of its own'));
+      assert.ok(refused, "the call was refused for the turn's having no channel");
       assert.ok(!f.published.some((p) => JSON.stringify(p).includes('zz-nowhere')), 'nothing was posted');
     } finally { await f.close(); }
   });

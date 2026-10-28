@@ -37,6 +37,30 @@ describe('channel_publish without channelId', () => {
     } finally { await f.close(); }
   });
 
+  it("a call made outside the turn takes none of the turn's channels: after a turn woken in work it's refused, and under a focus it goes to the excepted channel", async () => {
+    const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+    try {
+      await registerOpen(f, 'work', 'other');
+      const before = await f.framework.executeToolCall({ id: 'p0', name: 'channel_publish', input: { content: 'zz-script-0' }, callerAgentName: 'agent' } as never);
+      assert.equal(before.success, false, 'with no turn yet, refused');
+      f.alwaysRespond();
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      const kept = (f.framework as unknown as { turnRouting: Map<string, { locus?: { channelId: string } | null }> }).turnRouting.get('agent');
+      assert.equal(kept?.locus?.channelId, 'work', "premise: the agent's latest routing still names work");
+      const result = await f.framework.executeToolCall({ id: 'p1', name: 'channel_publish', input: { content: 'zz-script' }, callerAgentName: 'agent' } as never);
+      assert.equal(result.success, false);
+      assert.match(result.error ?? '', /no channel to default to/);
+      assert.equal(publishOf(f, 'zz-script'), undefined, 'nothing was posted');
+      const coordinator = (f.framework as unknown as { tuneOutCoordinator: { enterAllExcept(ref: unknown, opts: unknown, source: string): { ok: boolean } } }).tuneOutCoordinator;
+      assert.ok(coordinator.enterAllExcept({ serverId: 'editor', channelId: 'other' }, { durationSeconds: 120 }, 'agent-tool').ok, 'premise: a focus on other');
+      const again = await f.framework.executeToolCall({ id: 'p2', name: 'channel_publish', input: { content: 'zz-script-2' }, callerAgentName: 'agent' } as never);
+      assert.ok(again.success, again.error);
+      await eventually(() => !!publishOf(f, 'zz-script-2'), 'the second call posted');
+      assert.equal(publishOf(f, 'zz-script-2')!.channelId, 'other', 'the registry default: the excepted channel');
+    } finally { await f.close(); }
+  });
+
   it('defaults to the turn locus: the waking delivery, then a channel opened this turn', async () => {
     const f = await fixture();
     try {

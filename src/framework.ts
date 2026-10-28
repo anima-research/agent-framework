@@ -26948,10 +26948,11 @@ export class AgentFramework {
     // synthesized verbs (think, skip_reply) are deliberately not routed
     // here.
     if (call.name.startsWith('channel_') && this.channelRegistry) {
+      const turn = call.name === 'channel_publish' && call.callerAgentName ? this.callingTurnOf(call.callerAgentName, call) : undefined;
       const input = call.name === 'channel_publish' && call.callerAgentName
-        ? this.publishInputWithTurnLocus(call.input, call.callerAgentName, this.callingTurnOf(call.callerAgentName, call))
+        ? this.publishInputWithTurnLocus(call.input, call.callerAgentName, turn)
         : call.input;
-      return this.channelRegistry.handleChannelToolCall(call.name, input, origin);
+      return this.channelRegistry.handleChannelToolCall(call.name, input, origin.kind === 'agent' && turn ? { ...origin, inTurn: true } : origin);
     }
 
     // drafts: the calling resident's own held drafts. A puppeted call has
@@ -36027,7 +36028,7 @@ export class AgentFramework {
       ? this.publishInputWithTurnLocus(call.input, agentName, callingTurn)
       : call.input;
     this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
-      kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(earlierWake ? { earlierWake } : {}),
+      kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(callingTurn ? { inTurn: true } : {}), ...(earlierWake ? { earlierWake } : {}),
     }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;

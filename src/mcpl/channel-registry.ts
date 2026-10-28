@@ -1147,6 +1147,10 @@ export type ChannelToolOrigin =
      *  wake due before it, when there is one, which its confirmation names
      *  (skipReplyNote). */
     earlierWake?: SkipReplyEarlierWake;
+    /** Made inside one of the agent's turns (the framework's callingTurnOf):
+     *  a channel_publish naming no channel arrives with that turn's default
+     *  already applied, so it takes no other. */
+    inTurn?: boolean;
   };
 
 /** The machine decision sources a module-origin channel_close may record.
@@ -6240,18 +6244,20 @@ export class ChannelRegistry {
     if (input.channelId === '' && tool === 'channel_publish') {
       return { success: false, error: `Nothing was posted: channelId is empty. ${findIds}`, isError: true };
     }
-    // Resolve channelId: default to where the caller's plain speech goes
-    // (resolveLocus): its home, its turn's own channel (none for a turn that
-    // has none), else the all-except hold's channel or, under the legacy
-    // locus rule, the latest delivered inbound one (a marker — reaction,
-    // edit, deletion — is never that channel), which an ephemeral run never
-    // takes (takesGlobalFallback), so it names one.
+    // Resolve channelId: a call made inside the agent's turn (inTurn) has
+    // the turn's default applied already, where its plain speech goes, and
+    // takes none here. Any other defaults to what the caller falls back to:
+    // the all-except hold's channel, else the latest delivered inbound
+    // channel under the legacy locus rule (a marker — reaction, edit,
+    // deletion — is never that channel), which an ephemeral run never takes
+    // (takesGlobalFallback), so it names one.
     // A channel named by a string means what it means to every channel tool
     // (entriesNamed): one channel, by its id or its server-qualified name,
     // and a name two servers' channels answer to is refused with them as
     // candidates, never sent to the first.
     const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
-    const fallback = caller !== undefined ? this.resolveLocus(caller) : this.sharedFallback();
+    const inTurn = origin?.kind === 'agent' && origin.inTurn === true;
+    const fallback = caller === undefined ? this.sharedFallback() : inTurn ? null : this.globalFallbackFor(caller);
     if (!(input.channelId ?? fallback)) {
       return {
         success: false,
@@ -6260,7 +6266,7 @@ export class ChannelRegistry {
           : caller !== undefined && this.takesGlobalFallback?.(caller) === false
             ? 'Nothing was posted: name the channel with channelId. A subagent has no default channel, since its plain '
               + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
-            : caller !== undefined && this.activeChannelResolver?.(caller) === null
+            : caller !== undefined && inTurn && this.activeChannelResolver?.(caller) === null
               ? `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
                 + `goes to none and channel_publish sends only to a channel it names. ${findIds}`
               : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
