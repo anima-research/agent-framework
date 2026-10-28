@@ -1357,10 +1357,15 @@ describe('present while acting', () => {
         });
       }
 
+      const reasons: string[] = [];
+      framework.onTrace((event) => {
+        if (event.type === 'inference:stream_restarted') reasons.push((event as { reason: string }).reason);
+      });
       trigger(framework);
       await framework.runUntilIdle();
 
-      assert.equal(membrane.calls.length, 2, 'the turn restarted for its budget');
+      assert.equal(membrane.calls.length, 2, 'the turn restarted');
+      assert.deepEqual(reasons, [physicalWindowTokens !== undefined ? 'physical_window' : 'context_budget'], 'the restart is the window projection\'s where it forces one');
       assert.deepEqual(routed, [
         { text: 'After the restart.', locus: expected },
       ]);

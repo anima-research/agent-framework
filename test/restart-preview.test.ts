@@ -258,7 +258,7 @@ async function loggedDuring(run: (logged: readonly string[]) => Promise<void>): 
   return logged;
 }
 
-type Preview = { args: unknown[]; fits: boolean | undefined; finalTokens?: number; budgetTokens?: number };
+type Preview = { args: unknown[]; fits: boolean | undefined; answeredNull?: boolean; finalTokens?: number; budgetTokens?: number };
 function recordPreviews(framework: AgentFramework): Preview[] {
   const cm = framework.getAgent('prime')!.getContextManager();
   const preview = cm.previewContext.bind(cm);
@@ -267,7 +267,7 @@ function recordPreviews(framework: AgentFramework): Preview[] {
     const asked: Preview = { args, fits: undefined };
     previews.push(asked);
     const answer = preview(...args);
-    Object.assign(asked, { fits: answer?.fits, finalTokens: answer?.finalTokens, budgetTokens: answer?.budgetTokens });
+    Object.assign(asked, { fits: answer?.fits, answeredNull: answer === null, finalTokens: answer?.finalTokens, budgetTokens: answer?.budgetTokens });
     return answer;
   };
   return previews;
@@ -366,7 +366,12 @@ test("where the window projection restarts the stream, the restart is the window
   const logged = await loggedDuring(() => withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
     ask(framework);
     await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
-    assert.equal((restarted(traces)[0] as { reason?: string } | undefined)?.reason, 'physical_window', 'the window projection restarted the stream');
+    const restart = restarted(traces)[0] as { reason?: string; inputTokens?: number; budget?: number } | undefined;
+    assert.equal(restart?.reason, 'physical_window', 'the window projection restarted the stream');
+    assert.equal(restart?.budget, 10_000, "the trace's budget is physicalWindowTokens");
+    assert.ok((restart?.inputTokens ?? 0) > 10_000, `its inputTokens is the projection past the window (${restart?.inputTokens})`);
+    const logged = framework.queryInferenceLogs({ agentName: 'prime' }).entries.map((entry) => entry.entry.stopReason);
+    assert.ok(logged.includes('physical_window'), `the stream's inference-log entry records physical_window (${logged.join(', ')})`);
     assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
     assert.equal(strategy.previews, 0, 'the restart decision asked for no preview');
     assert.deepEqual(declined(traces), [], 'no decline was reported');
@@ -393,18 +398,19 @@ class ScriptedPreviewStrategy extends AutobiographicalStrategy {
   previews = 0;
   readiness: ReturnType<AutobiographicalStrategy['checkReadiness']> = { ready: true };
   compressionCount = 0;
-  reportsStats = true;
-  constructor(private readonly answer: (budget: { maxTokens: number; reserveForResponse: number }, ask: number) => { fits: boolean; clearedBy: string[] }) {
+  reportsStats: boolean | 'none of the counts' = true;
+  constructor(private readonly answer: (budget: { maxTokens: number; reserveForResponse: number }, ask: number) => { fits: boolean; clearedBy?: string[] }) {
     super({ compressionModel: 'test-compression-model', targetChunkTokens: 1_000, recentWindowTokens: 2_000, adaptiveResolution: true });
   }
   override previewContext(...args: unknown[]): ReturnType<AutobiographicalStrategy['previewContext']> {
     const { fits, clearedBy } = this.answer(args[2] as { maxTokens: number; reserveForResponse: number }, ++this.previews);
-    return { fits, clearedBy, finalTokens: fits ? 1_000 : 9_000, budgetTokens: 8_000 } as unknown as ReturnType<AutobiographicalStrategy['previewContext']>;
+    return { fits, ...(clearedBy ? { clearedBy } : {}), finalTokens: fits ? 1_000 : 9_000, budgetTokens: 8_000 } as unknown as ReturnType<AutobiographicalStrategy['previewContext']>;
   }
   override checkReadiness(): ReturnType<AutobiographicalStrategy['checkReadiness']> {
     return this.readiness;
   }
   override getStats(): ReturnType<AutobiographicalStrategy['getStats']> {
+    if (this.reportsStats === 'none of the counts') return {} as unknown as ReturnType<AutobiographicalStrategy['getStats']>;
     return this.reportsStats ? { ...super.getStats(), compressionCount: this.compressionCount }
       : undefined as unknown as ReturnType<AutobiographicalStrategy['getStats']>;
   }
@@ -428,13 +434,16 @@ for (const { what, clearedBy } of [
   { what: 'the budget it was given changes', clearedBy: ['compression'] },
   { what: 'a compression hold is released', clearedBy: [] },
   { what: 'a live context setting changes', clearedBy: ['smaller-recent-window'] },
+  { what: 'the budget it was given changes, for a strategy that gives no clearedBy', clearedBy: undefined },
   { what: "the pending compression work of a strategy that reports no counts changes", clearedBy: ['compression'] },
+  { what: "the pending compression work of a strategy whose stats hold none of the counts changes", clearedBy: ['compression'] },
   { what: 'a compression lands', clearedBy: ['compression'] },
+  { what: "a compression lands, after a decline that named no way to make room while compression work was pending (an empty clearedBy isn't final)", clearedBy: [] },
 ] as const) {
   test(`a restart declined for a reason a newer message can't clear is previewed again once ${what}, and taken once it fits`, async () => {
     const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
     let changed = false;
-    const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: [...clearedBy] }));
+    const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, ...(clearedBy ? { clearedBy: [...clearedBy] } : {}) }));
     const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
     const module = new PagesModule();
     await withFramework(membrane, module, agent, async (framework, traces) => {
@@ -445,14 +454,15 @@ for (const { what, clearedBy } of [
       const [held] = compressHistory(framework, 1);
       cm.holdCompression([held]);
       strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
-      strategy.reportsStats = what !== "the pending compression work of a strategy that reports no counts changes";
+      strategy.reportsStats = what === "the pending compression work of a strategy that reports no counts changes" ? false
+        : what === "the pending compression work of a strategy whose stats hold none of the counts changes" ? 'none of the counts' : true;
       module.onCall = (call) => {
         if (call !== 6) return;
         changed = true;
-        if (what === 'the budget it was given changes') reserve = 0;
+        if (what.startsWith('the budget it was given changes')) reserve = 0;
         else if (what === 'a compression hold is released') cm.releaseCompression([held]);
         else if (what === 'a live context setting changes') cm.updateHotContextSettings({ tailTokens: 1_000 });
-        else if (what === "the pending compression work of a strategy that reports no counts changes") strategy.readiness = { ready: false, description: 'Compressing chunk 1' };
+        else if (what.startsWith('the pending compression work')) strategy.readiness = { ready: false, description: 'Compressing chunk 1' };
         else strategy.compressionCount++;
       };
       ask(framework);
@@ -468,12 +478,13 @@ for (const { what, clearedBy } of [
 // On the hierarchical path, once the dry select has succeeded, this copy of context-manager answers null. A strategy
 // built from another copy throws that copy's refusal, which this copy's ContextManager doesn't turn into null: a
 // 0.23.1 copy's NoFoldPlanToPreviewError, or 0.23.0's plain Error. Each says the compile fits.
-for (const { answer: preview, strategy: make } of [
+for (const { answer: preview, strategy: make, answersNull } of [
   { answer: "a 0.23.0 copy's plain Error", strategy: () => new ThrowingPreviewStrategy(new Error(HIERARCHICAL_REFUSAL), false) },
-  { answer: "another 0.23.1 copy's NoFoldPlanToPreviewError", strategy: () => new ThrowingPreviewStrategy(errorFromAnotherCopy('NoFoldPlanToPreviewError', HIERARCHICAL_REFUSAL), false) },
-  { answer: "this copy's NoFoldPlanToPreviewError, which its ContextManager answers as null", strategy: () => strategy('hierarchical') },
-]) {
+  { answer: "another 0.23.1 copy's NoFoldPlanToPreviewError", strategy: () => new ThrowingPreviewStrategy(errorFromAnotherCopy('NoFoldPlanToPreviewError', 'zz a copy whose refusal reads otherwise'), false) },
+  { answer: "this copy's NoFoldPlanToPreviewError, which its ContextManager answers as null", strategy: () => strategy('hierarchical'), answersNull: true },
+] as Array<{ answer: string; strategy: () => AutobiographicalStrategy; answersNull?: true }>) {
   test(`a maxStreamTokens restart is taken when the hierarchical preview answers with ${preview}`, async () => {
+    const nullAnswered = answersNull === true;
     const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
     const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy: make() });
     await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
@@ -481,6 +492,7 @@ for (const { answer: preview, strategy: make } of [
       ask(framework);
       await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.'));
       assert.ok(previews.length > 0, 'the restart decision asked for the preview');
+      if (nullAnswered) assert.ok(previews.every((asked) => asked.answeredNull), 'its ContextManager answered null');
       assert.equal((restarted(traces)[0] as { reason?: string } | undefined)?.reason, 'context_budget', 'the turn restarted');
       assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
     });
@@ -598,6 +610,7 @@ test(`on a host that sets no window, a maxStreamTokens restart whose preview can
       .filter((alert) => alert.kind === 'context-refusal');
     assert.equal(refusals.length, 1, 'the ending raised the context-refusal alert');
     assert.ok(refusals[0]?.message?.includes('restart was declined'), 'the alert says the restart was declined');
+    assert.ok(refusals[0]?.message?.includes('physicalWindowTokens'), 'and advises physicalWindowTokens');
     await waitUntil('the drain to end', () => lines.some((line) => line.includes('drain kicked for prime')));
   }));
   assert.ok(logged.some((line) => line.includes('drain kicked for prime')), 'the ending kicked the compression drain');
@@ -655,6 +668,9 @@ test("under kv-unified, a restart past the budget whose compile can't fit, since
     assert.ok(storedText(framework).includes(FINAL), 'the turn answered');
     assert.ok(restarted(traces).length > 0, 'restarts were taken while their compiles fit');
     assert.ok(declined(traces).length > 0, 'and declined once they no longer fit');
+    assert.ok(declined(traces).every((decline) => decline.reason === 'wont_fit'), "each decline says the restart's compile won't fit");
+    assert.ok(traces.findIndex((event) => event.type === 'inference:stream_restarted') < traces.findIndex((event) => event.type === 'inference:restart_declined'),
+      'the first decline came after a restart');
     assert.ok(!requestText(membrane.streams[membrane.streams.length - 1]).includes(SUMMARY), "the last stream's request holds no summary of the turn");
   });
 });
@@ -673,7 +689,8 @@ test("under kv-unified, a restart declined since only compression would make roo
     assert.deepEqual(declines[0]?.clearedBy, ['compression'], 'only compression would make room');
     assert.equal(declines[0]?.previewed, true, 'the first decline previewed');
     assert.ok(declines.slice(1).every((decline) => !decline.previewed), 'the later declines took its answer');
-    assert.ok(declines.every((decline) => decline.finalTokens === declines[0]!.finalTokens && decline.budgetTokens === declines[0]!.budgetTokens),
+    const declining = previews.find((preview) => preview.fits === false);
+    assert.ok(declines.every((decline) => decline.finalTokens === declining?.finalTokens && decline.budgetTokens === declining?.budgetTokens),
       "with the figures of the preview it took");
     assert.equal(previews.filter((preview) => preview.fits === false).length, 1, 'one preview declined');
     assert.equal(previews.length, restarted(traces).length + 1, 'every other preview was a restart that fit');

@@ -2035,19 +2035,21 @@ export class Agent {
    * What a preview's answer rests on besides the rows a stream adds, as one string: the budget it's given, the
    * compression holds, the live settings that change the select (`tailTokens`, `transitionPaceTokens`,
    * `preparedWindowTokens`), and the strategy's compression state: its counts of compressed chunks and summaries
-   * where it reports them (`getStats`), and otherwise its pending work. A restart declined for a reason a newer
-   * message can't clear is previewed again only once this has changed.
+   * where it reports any of them (`getStats`), and otherwise its pending work, whose text a landing can leave reading
+   * the same. A restart declined for a reason a newer message can't clear is previewed again only once this has
+   * changed.
    * @internal For the framework's restart decision; not a host API.
    */
   restartPreviewKey(): string {
     const cm = this.contextManager;
     const hot = this.getHotContextSettings();
     const stats = (cm.getStrategy() as { getStats?: () => Record<string, unknown> }).getStats?.();
+    const counts = stats && [stats.chunksCompressed, stats.compressionCount, stats.l1, stats.l2, stats.l3];
     return JSON.stringify([
       this.previewBudget(),
       [...cm.getCompressionHolds()].sort(),
       hot && [hot.tailTokens, hot.transitionPaceTokens ?? null, hot.preparedWindowTokens ?? null],
-      stats ? [stats.chunksCompressed, stats.compressionCount, stats.l1, stats.l2, stats.l3] : cm.getPendingWork()?.description ?? null,
+      counts?.some((count) => typeof count === 'number') ? counts : cm.getPendingWork()?.description ?? null,
     ]);
   }
 

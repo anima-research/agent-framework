@@ -100,7 +100,8 @@ export interface AgentConfig {
    *  It previews anew only once what the last preview rested on has
    *  changed (the budget, the compression holds, the live context settings
    *  or the strategy's compression state), unless that preview said a newer
-   *  message could make room, which every boundary previews. With
+   *  message could make room, failed, or met a drop no summary covers: each
+   *  of those every boundary previews. With
    *  `physicalWindowTokens` unset, nothing else then bounds the stream: it
    *  can go on until the provider refuses a request at its own window, and
    *  the turn then ends with its `context_length` failure row, which raises

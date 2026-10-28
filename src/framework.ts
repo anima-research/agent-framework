@@ -14355,7 +14355,7 @@ export class AgentFramework {
             ? this.declineBudgetRestart(agent) : undefined;
           const overBudget = overStreamBudget && !overPhysical && declined === undefined;
           // Past maxStreamTokens and restarting, whichever check forced it: the boundary leaves the turn's
-          // routing to the restart, as 0.28.0 did for every stream past maxStreamTokens.
+          // routing to the restart.
           const budgetRestart = overStreamBudget && (overPhysical || declined === undefined);
           if (declined) {
             const { decline, previewed } = declined;
@@ -28795,9 +28795,9 @@ export class AgentFramework {
     //
     // A stream whose maxStreamTokens restart was declined can go on until the
     // provider refuses a request as too long, where no window projection
-    // bounds it. That `context_length` ends the turn where 0.28.0's restart
-    // ended it at a refused compile, so it alerts and drains as that refusal
-    // did. It's the declining stream's own refusal: a retry is a new stream,
+    // bounds it. That `context_length` ends the turn as a refused restart
+    // compile would, so it alerts and drains as a refusal does. It's the
+    // declining stream's own refusal: a retry is a new stream,
     // whose compile refuses for itself if it can't fit.
     const decline = errorType === 'context_length' && agent ? this.restartDeclines?.get(agent) : undefined;
     const afterDecline = decline !== undefined && decline.streamId === agent?.streamId;
