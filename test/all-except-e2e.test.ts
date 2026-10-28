@@ -106,7 +106,7 @@ describe('tune-out, all-except scope', () => {
       await f.framework.runUntilIdle();
       await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-still in work')), 'the speech went out');
       assert.equal(f.published.find((p) => JSON.stringify(p).includes('zz-still in work'))!.channelId, 'work');
-      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work"));
+      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work; from your next turn it lands in the excepted channel while this holds, except on a heartbeat's turn, which has none."));
       assert.ok(told, "the focus result says this turn's speech stays in work");
     } finally { await f.close(); }
   });
