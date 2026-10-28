@@ -499,13 +499,18 @@ export class AgentRegistry {
       throw new Error(`the agent registry reads as version ${JSON.stringify(snapshot.version)}, which this code doesn't read; nothing was restored`);
     }
 
-    for (const [name, value] of Object.entries(snapshot.incarnations ?? {})) {
-      if (typeof value === 'number') this.incarnations.set(name, value);
-    }
     // Damaged in its content rather than its version: refused the same way,
-    // since taken as empty it would be overwritten.
+    // since taken as empty it would be overwritten, and without its counters
+    // every identity it names would start again at incarnation 1.
     if (!Array.isArray(snapshot.mail) || !Array.isArray(snapshot.records)) {
       throw new Error('the agent registry reads as version 1 but its records or mail are not lists; nothing was restored');
+    }
+    const counters: unknown = snapshot.incarnations;
+    if (counters === null || typeof counters !== 'object' || Array.isArray(counters)) {
+      throw new Error('the agent registry reads as version 1 but has no map of incarnations; nothing was restored');
+    }
+    for (const [name, value] of Object.entries(counters)) {
+      if (typeof value === 'number') this.incarnations.set(name, value);
     }
     this.mail = clone(snapshot.mail);
 

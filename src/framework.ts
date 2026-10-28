@@ -11838,23 +11838,31 @@ export class AgentFramework {
     );
     let snapshot: unknown;
     let snapshotFrom = this.agentRegistryPath ?? AGENT_REGISTRY_STATE_ID;
+    // Only a registry that was never written is absent: a recovery file that
+    // exists is the registry, whatever it holds, so one that reads as `null`
+    // is refused like any other that isn't a version-1 registry.
+    let absent = false;
     try {
       snapshot = this.agentRegistryPath ? this.readRecoveryFile(this.agentRegistryPath) : undefined;
       if (snapshot === undefined) {
         snapshotFrom = AGENT_REGISTRY_STATE_ID;
         snapshot = this.store.getStateJson(AGENT_REGISTRY_STATE_ID) ?? null;
+        absent = snapshot === null;
       }
     } catch (error) {
       throw refuse(snapshotFrom, "can't be read", error);
     }
-    if (snapshot !== null && (typeof snapshot !== 'object' || (snapshot as { version?: unknown }).version !== 1)) {
-      const version = (snapshot as { version?: unknown } | null)?.version;
-      throw refuse(snapshotFrom, `reads as something other than a version-1 registry (version ${JSON.stringify(version)})`);
+    if (!absent && (snapshot === null || typeof snapshot !== 'object' || (snapshot as { version?: unknown }).version !== 1)) {
+      const read = snapshot === null ? 'null' : `version ${JSON.stringify((snapshot as { version?: unknown }).version)}`;
+      throw refuse(snapshotFrom, `reads as something other than a version-1 registry (${read})`);
     }
-    if (snapshot !== null) {
-      const { records, mail } = snapshot as { records?: unknown; mail?: unknown };
+    if (!absent) {
+      const { records, mail, incarnations } = snapshot as { records?: unknown; mail?: unknown; incarnations?: unknown };
       if (!Array.isArray(records) || !Array.isArray(mail)) {
         throw refuse(snapshotFrom, 'reads as a version-1 registry whose records or mail are not lists');
+      }
+      if (incarnations === null || typeof incarnations !== 'object' || Array.isArray(incarnations)) {
+        throw refuse(snapshotFrom, 'reads as a version-1 registry with no map of incarnations, without which every agent it names would start again at incarnation 1');
       }
     }
 
