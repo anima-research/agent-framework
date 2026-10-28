@@ -26,6 +26,7 @@
  * dispatcher a script's calls go through, and how to wake an agent.
  */
 
+import { NOTICE_TAG } from '../../notice-tags.js';
 import { ChildCapacity, ScriptRun, type CallAnswer, type Ending, type ScriptRunOptions, type ToolAnswer } from './runner.js';
 import type { CallSummary } from './calls.js';
 import type { OutputBounds, OutputWindow } from './output.js';
@@ -479,10 +480,10 @@ function leftEndingText(scriptId: string, ending: Ending): string {
       : ending.how === 'stopped'
         ? ending.why ? `was stopped: ${ending.why}` : 'was stopped at its limit'
         : 'ended';
-  return `[script ${scriptId}] Your script ${how}. {"action": "wait", "script_id": "${scriptId}"} gives its result.`;
+  return `[${NOTICE_TAG.script} ${scriptId}] Your script ${how}. {"action": "wait", "script_id": "${scriptId}"} gives its result.`;
 }
 
 function wakeText(scriptId: string, payloadJson: string, n: number, max: number, ageMs: number): string {
   const minutes = Math.round(ageMs / 60_000);
-  return `[script ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${payloadJson}`;
+  return `[${NOTICE_TAG.script} ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${payloadJson}`;
 }

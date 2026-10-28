@@ -11,6 +11,8 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
+import { cutToFit, suppliedValue } from '../supplied-text.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
@@ -365,7 +367,7 @@ function referenceLine(count: number, channel: string, oldest: number, now: numb
 /** A handed batched-wake line's text (WakeLine), as it reads when written at
  *  `now`: the gate's words, its message's age counted to then. */
 export function wakeLineText(line: WakeLine, now: number): string {
-  return `[Gate: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
+  return `[${NOTICE_TAG.gate}: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
 }
 
 /** The event's own stored entry, as the framework is asked about it. */
@@ -1847,30 +1849,72 @@ function globAtLeastAsBroad(earlier: string | undefined, later: string | undefin
   return earlier === later;
 }
 
+/** The event types the gate can see from an MCPL server: its pushes and its
+ *  channels' messages. */
+export const MCPL_GATE_EVENT_TYPES: readonly string[] = ['mcpl:push-event', 'mcpl:channel-incoming'];
+
+/** The event types a host knows a source sends (EventGate's
+ *  `eventTypesFrom`), or undefined when it could send any. */
+export type EventTypesFrom = (source: string) => readonly string[] | undefined;
+
+/** The event types `rule` can match: its scope's, narrowed to those its
+ *  source is known to send; 'all' when neither says. */
+function typesSeenBy(rule: GatePolicy, eventTypesFrom?: EventTypesFrom): { types: string[] | 'all'; known: boolean } {
+  const scope = rule.match.scope && rule.match.scope.length > 0 ? rule.match.scope : undefined;
+  const source = rule.match.source;
+  let sent: readonly string[] | undefined;
+  if (eventTypesFrom && source !== undefined && !source.includes('*')) {
+    try {
+      sent = eventTypesFrom(source);
+    } catch {
+      sent = undefined;
+    }
+  }
+  if (scope && sent) return { types: scope.filter((t) => sent!.includes(t)), known: true };
+  if (scope) return { types: scope, known: true };
+  if (sent) return { types: [...sent], known: true };
+  return { types: 'all', known: false };
+}
+
 /**
- * Event types for which `earlier` provably matches EVERY event that `later`
- * would match — i.e. the types for which `later` is unreachable when
- * `earlier` sits before it and consumes its matches. Returns null when
- * subsumption can't be proven (which is not proof of safety — the lint is
- * deliberately one-sided so every warning it emits is true).
+ * Whether `earlier` provably matches events `later` would match, so that
+ * `later` doesn't see them when `earlier` sits before it and consumes its
+ * matches: the event types concerned, whether that's every event `later`
+ * would match, and whether `later` is known to see those types. Returns null
+ * when it can't be proven (which is not proof of safety — the lint is
+ * deliberately one-sided so every note it emits is true).
  */
-function subsumedEventTypes(earlier: GatePolicy, later: GatePolicy): string[] | 'all' | null {
+function subsumedEventTypes(
+  earlier: GatePolicy,
+  later: GatePolicy,
+  eventTypesFrom?: EventTypesFrom,
+): Omit<ShadowWarning, 'earlier' | 'later'> | null {
   const e = earlier.match;
   const l = later.match;
 
-  // Scope: which of `later`'s event types does `earlier` cover?
-  let covered: string[] | 'all';
-  if (!e.scope || e.scope.length === 0) {
-    covered = l.scope && l.scope.length > 0 ? l.scope : 'all';
-  } else if (!l.scope || l.scope.length === 0) {
-    // `later` matches all types; `earlier` only consumes its own scope, so
-    // the shadow is partial — exactly those types.
-    covered = e.scope;
+  // Event types: which of those `later` can match does `earlier` cover?
+  const seen = typesSeenBy(later, eventTypesFrom);
+  const earlierTypes = e.scope && e.scope.length > 0 ? e.scope : 'all';
+  let eventTypes: string[] | 'all';
+  let whole: boolean;
+  let known = seen.known;
+  if (earlierTypes === 'all') {
+    eventTypes = seen.types;
+    whole = true;
+  } else if (seen.types === 'all') {
+    // `later` matches every type; `earlier` only consumes its own scope, so
+    // the overlap is partial — exactly those types, which may never reach
+    // `later`.
+    eventTypes = earlierTypes;
+    whole = false;
   } else {
-    const overlap = l.scope.filter((t) => e.scope!.includes(t));
+    const overlap = seen.types.filter((t) => earlierTypes.includes(t));
     if (overlap.length === 0) return null;
-    covered = overlap;
+    eventTypes = overlap;
+    whole = overlap.length === seen.types.length;
+    known = true;
   }
+  if (Array.isArray(eventTypes) && eventTypes.length === 0) return null;
 
   // Every remaining discriminator on `earlier` must be at least as broad as
   // `later`'s, otherwise some `later` events slip past `earlier`.
@@ -1898,38 +1942,55 @@ function subsumedEventTypes(earlier: GatePolicy, later: GatePolicy): string[] | 
   if (e.tagsAll && !subsetOf(e.tagsAll, l.tagsAll ?? [])) return null;
   if (e.tagsNone && !subsetOf(e.tagsNone, l.tagsNone ?? [])) return null;
 
-  return covered;
+  return { eventTypes, whole, known };
 }
 
 /**
- * Find rules made unreachable by earlier, broader rules (first match wins).
+ * Find rules an earlier, broader rule keeps from applying (first match wins),
+ * in whole or for some event types.
  * The 2026-08-08 Mythos incident is the canonical catch: a prepended
  * `{scope:[mcpl:channel-incoming]}` sampler silently made the
  * direct-address and mention rules dead for the whole incoming lane.
  * `passthrough` observers shadow nothing — non-firing matches fall through.
+ * `eventTypesFrom` leaves out types a rule's source is known never to send:
+ * a rule for an MCPL server's events isn't told about another rule that
+ * takes every `external-message`.
  */
-export function findShadowedPolicies(policies: GatePolicy[]): ShadowWarning[] {
+export function findShadowedPolicies(policies: GatePolicy[], eventTypesFrom?: EventTypesFrom): ShadowWarning[] {
   const out: ShadowWarning[] = [];
   for (let i = 0; i < policies.length; i++) {
     const earlier = policies[i];
     if (earlier.passthrough) continue;
     for (let j = i + 1; j < policies.length; j++) {
-      const covered = subsumedEventTypes(earlier, policies[j]);
-      if (covered) {
-        out.push({ earlier: earlier.name, later: policies[j].name, eventTypes: covered });
+      const found = subsumedEventTypes(earlier, policies[j], eventTypesFrom);
+      if (found) {
+        out.push({ earlier: earlier.name, later: policies[j].name, ...found });
       }
     }
   }
   return out;
 }
 
-/** Human-readable one-liner for a ShadowWarning, used in tool results,
- *  traces, and gate_status alike so the same hazard reads the same way
- *  everywhere. */
+/** A ShadowWarning in words, used in tool results, traces, and gate_status
+ *  alike so the same note reads the same way everywhere. It says which of
+ *  three it is (the rule never applies; it misses some of its events; it
+ *  may not be meant for those events at all) and what to do. */
 export function formatShadowWarning(w: ShadowWarning): string {
-  const types = w.eventTypes === 'all' ? 'ALL event types' : w.eventTypes.join(', ');
-  return `rule "${w.earlier}" makes "${w.later}" unreachable for ${types} `
-    + `(first match wins — every event "${w.later}" would match is consumed by "${w.earlier}" first)`;
+  const later = `"${w.later}"`;
+  const earlier = `"${w.earlier}"`;
+  const move = `move ${later} above ${earlier} (wake_add_rule with the whole rule and insertBefore: "${w.earlier}")`;
+  if (w.whole) {
+    return `${later} never applies: ${earlier} comes first and matches every event ${later} would. `
+      + `If ${later} should apply, ${move}, or narrow ${earlier}.`;
+  }
+  const types = w.eventTypes === 'all' ? 'all' : w.eventTypes.join(', ');
+  if (w.known) {
+    return `${earlier} comes first and takes ${later}'s ${types} events, so ${later} applies only to its others. `
+      + `If it should apply to those too, ${move}.`;
+  }
+  return `${earlier} comes first and takes every ${types} event, so ${later} sees none. `
+    + `Nothing to do unless ${later} is meant for ${types} events; then ${move}. `
+    + `A scope on ${later} naming the event types it's for clears this note.`;
 }
 
 /** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
@@ -2057,10 +2118,12 @@ export class EventGate {
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
 
-  // Shadow-lint cache (see refreshShadowWarnings) — recomputed on every
-  // config change, fingerprinted so an unchanged hazard set doesn't re-trace.
-  private shadowWarningsCache: ShadowWarning[] = [];
+  // The shadow lint's last findings (see refreshShadowWarnings), recomputed
+  // on every config change and fingerprinted so an unchanged set doesn't
+  // re-trace.
   private shadowWarningsFingerprint = '[]';
+  /** See the constructor's `eventTypesFrom`. */
+  private eventTypesFromFn: EventTypesFrom | undefined;
 
   // Observability counters for events that didn't match any policy
   private totalEvaluations = 0;
@@ -2176,6 +2239,11 @@ export class EventGate {
      *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
      *  (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
+    /** The event types the gate can see from a source, when the host knows
+     *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
+     *  The rule-order notes (findShadowedPolicies) leave out types a rule's
+     *  source never sends. Absent: any source can send any type. */
+    eventTypesFrom?: EventTypesFrom;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -2186,6 +2254,7 @@ export class EventGate {
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
     this.isNewestEntryFn = opts.isNewestEntry;
+    this.eventTypesFromFn = opts.eventTypesFrom;
     this.now = opts.now ?? (() => Date.now());
     this.judgeFn = opts.judge;
     this.changesJudgedContextFn = opts.changesJudgedContext;
@@ -3471,22 +3540,32 @@ export class EventGate {
   /** Current shadow-lint findings for the live policy order. Fresh compute —
    *  cheap (policy lists are tens of entries at most). */
   lintShadows(): ShadowWarning[] {
-    return findShadowedPolicies(this.config.policies);
+    return findShadowedPolicies(this.config.policies, this.eventTypesFromFn);
   }
 
   /**
-   * Recompute shadow warnings and, when the set changed and is non-empty,
-   * emit a `gate:shadow-warnings` trace so the hazard lands in ops
-   * observability at the moment the order changed — not at the next missed
-   * DM. Called from writeConfig and reloadIfChanged.
+   * The sources the host knows changed (eventTypesFrom answers differently),
+   * as when an MCPL server connects or is removed: the rule-order notes are
+   * made again, and traced if they changed, as a change to the rules would.
+   */
+  sourcesChanged(): void {
+    this.refreshShadowWarnings('sources-changed');
+  }
+
+  /**
+   * Recompute shadow warnings and, when the set changed, emit a
+   * `gate:shadow-warnings` trace so the hazard lands in ops observability at
+   * the moment the order changed — not at the next missed DM — and, with an
+   * empty list, the moment the last of them went. Called from writeConfig,
+   * reloadIfChanged and sourcesChanged.
    */
   private refreshShadowWarnings(reason: string): void {
     const warnings = this.lintShadows();
     const fingerprint = JSON.stringify(warnings);
     if (fingerprint === this.shadowWarningsFingerprint) return;
+    const hadSome = this.shadowWarningsFingerprint !== '[]';
     this.shadowWarningsFingerprint = fingerprint;
-    this.shadowWarningsCache = warnings;
-    if (warnings.length > 0) {
+    if (warnings.length > 0 || hadSome) {
       this.emitTrace({
         type: 'gate:shadow-warnings',
         reason,
@@ -3645,7 +3724,7 @@ export class EventGate {
     const quoted = events.filter(e => !e.inContext);
     const referenced = events.filter(e => e.inContext);
 
-    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${suppliedValue(e.content)}`);
     // How each referenced channel is named in the line, in order.
     const shown: string[] = [];
     if (referenced.length > 0) {
@@ -3664,7 +3743,7 @@ export class EventGate {
           ? '(unknown channel)'
           : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
             ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
-            : id;
+            : suppliedValue(id);
         const key = JSON.stringify([e.serverId ?? null, id ?? null]);
         const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
@@ -3677,7 +3756,7 @@ export class EventGate {
         // agent can still address tools that want the composite id. A name
         // may carry its own `#`, so one is added only where the name lacks
         // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${name})` : name;
+        const channel = label ? `${label.startsWith('#') ? '' : '#'}${suppliedValue(label)} (${name})` : name;
         shown.push(channel);
         lines.push(referenceLine(count, channel, oldest, Date.now()));
       }
@@ -3690,7 +3769,7 @@ export class EventGate {
     // gate hands the line to the wake (WakeProvenance.line) and a fresh start
     // of the wake's turn decides it (WakeLine). Several messages, one with
     // anything after it, or content the line quotes, keep the line now.
-    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
     if (only && this.newestEntry(only)) {
@@ -3935,7 +4014,7 @@ export class EventGate {
     record.last = {
       at: Date.now(),
       verdict: outcome,
-      reason: safeSlice(reason, 0, 300),
+      reason: cutToFit(suppliedValue(reason), 300),
       eventCount: state.events.length,
       durationMs,
       ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
@@ -3943,7 +4022,7 @@ export class EventGate {
     if (this.config.policies.some((p) => p.name === policyName)) this.judgeRecords.set(policyName, record);
     if (failed) {
       this.judgeFailStreak++;
-      this.judgeLastFailure = safeSlice(reason, 0, 200);
+      this.judgeLastFailure = cutToFit(suppliedValue(reason), 200);
     } else {
       this.judgeFailStreak = 0;
     }
@@ -4273,7 +4352,7 @@ export class EventGate {
       const placement: WritePlacement = {};
       this.addMessageFn('user', [{
         type: 'text',
-        text: `[self-wake] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
+        text: `[${NOTICE_TAG.selfWake}] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
       }], { source: 'gate:self-wake' }, agentName, placement);
       this.requestInferenceFn(
         agentName,
@@ -4527,7 +4606,9 @@ export class EventGate {
         this.judgeUnwiredNotice(), this.judgeFailingNotice(),
       ]
         .filter((e): e is string => e !== null),
-      shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
+      // Fresh, not the cache: the sources the host knows (eventTypesFrom)
+      // change as servers connect, with no change to the rules.
+      shadowWarnings: this.lintShadows().map(formatShadowWarning),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,

@@ -275,39 +275,24 @@ describe('a module tool\'s arguments are checked before the module runs', () => 
     });
   });
 
-  it('checks a utils run against the utility it resolved, where a tool shares its name', async () => {
+  it('takes a name a tool and a utility of one module share for the tool, whose schema applies', async () => {
     const twin = new TwinModule();
     await withModule(twin, async (framework) => {
-      const run = await framework.executeToolCall({ id: 'zz-twin', name: 'utils', input: { action: 'run', name: 'twin--dup', args: { b: 'x' } }, callerAgentName: 'agent' });
-      assert.equal(run.success, true, run.error);
-      assert.deepEqual(twin.calls[0]!.input, { b: 'x' });
-      // The tool keeps its own schema on its own path.
+      const listed = framework.getAllTools().filter((t) => t.name === 'twin--dup');
+      assert.equal(listed.length, 1, 'one definition for the name');
+      assert.equal(listed[0]!.description, 'The tool.');
       const tool = await framework.executeToolCall({ id: 'zz-twin-2', name: 'twin--dup', input: { b: 'x' }, callerAgentName: 'agent' });
       assert.equal(tool.error, 'Nothing was done: twin--dup needs "a" (a string), and this call gave none; "b" isn\'t one of its parameters.');
     });
   });
 
-  it('checks the model\'s own utils run against the utility it resolved, where a tool shares its name', async () => {
-    const twin = new TwinModule();
-    await withModule(twin, async (framework, membrane) => {
-      membrane.pushResponse(createMockResponse([
-        { type: 'tool_use', id: 'zz-twin-run', name: 'utils', input: { action: 'run', name: 'twin--dup', args: { b: 'x' } } },
-      ], 'tool_use'));
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-done' }]));
-      const results = await firstToolResults(framework, membrane);
-      assert.ok(results, 'the model was answered');
-      assert.equal(results!.length, 1);
-      assert.notEqual(results![0]!.isError, true, JSON.stringify(results));
-      assert.deepEqual(twin.calls.map((c) => c.input), [{ b: 'x' }]);
-    });
-  });
-
-  it('names a key a utils run gave inside args that the utility doesn\'t declare, where a required one is missing', async () => {
+  it('names a key an act gave inside args that the utility doesn\'t declare, where a required one is missing', async () => {
     await withFramework(async (framework, probe) => {
-      const result = await call(framework, { action: 'run', name: 'probe--rare_op', args: { mood: 'x' } }, 'utils');
-      assert.equal(result.error,
-        'Nothing was done: probe--rare_op needs "mode" (a string), and this call gave none; "mood" isn\'t one of its parameters. ' +
-        `Schema for probe--rare_op: ${JSON.stringify(RARE_SCHEMA)}`);
+      const opened = await call(framework, { toolset: 'settings' }, 'toolsets--open');
+      assert.equal(opened.success, true, opened.error);
+      const result = await call(framework, { tool: 'probe--rare_op', args: { mood: 'x' } }, 'toolsets--act');
+      assert.match(String(result.error),
+        /^Invalid arguments for probe--rare_op: args\.mode: required; "mood" isn't one of its parameters\. Nothing was sent/);
       assert.equal(probe.calls.length, 0);
     });
   });

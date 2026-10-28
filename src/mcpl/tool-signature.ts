@@ -10,6 +10,7 @@
  * reference host of RFC-014. Dependency-free.
  */
 import { createHash } from 'node:crypto';
+import { nameToTypeBack, quotedValue, suppliedValue } from '../supplied-text.js';
 
 export type JsonSchema = Record<string, unknown>;
 
@@ -34,7 +35,7 @@ function nestsWithin(value: unknown, depth = 0): boolean {
 
 /** A schema's literal value (an enum's, a const or a default) as JSON, or … where it's nested too deeply to write. */
 function literal(value: unknown): string {
-  return nestsWithin(value) ? JSON.stringify(value) ?? 'null' : '…';
+  return nestsWithin(value) ? quotedValue(value) : '…';
 }
 
 function typeSig(schema: JsonSchema | undefined, depth = 0): string {
@@ -80,12 +81,12 @@ function typeSig(schema: JsonSchema | undefined, depth = 0): string {
       if (!isObj(props) || Object.keys(props).length === 0) return 'object';
       if (depth >= 3) return '{…}';
       const req = new Set(Array.isArray(schema.required) ? (schema.required as string[]) : []);
-      return `{${Object.entries(props).map(([k, v]) => `${k}${req.has(k) ? '' : '?'}: ${typeSig(v, depth + 1)}`).join(', ')}}`;
+      return `{${Object.entries(props).map(([k, v]) => `${nameToTypeBack(k)}${req.has(k) ? '' : '?'}: ${typeSig(v, depth + 1)}`).join(', ')}}`;
     }
     case undefined:
       return 'any';
     default:
-      return t;
+      return suppliedValue(t);
   }
 }
 
@@ -98,9 +99,9 @@ export function signature(tool: HintedTool): string {
   const req = new Set(Array.isArray(s.required) ? (s.required as string[]) : []);
   const params = Object.entries(props).map(([k, v]) => {
     const def = isObj(v) && v.default !== undefined ? ` =${literal(v.default)}` : '';
-    return `${k}${req.has(k) ? '' : '?'}: ${typeSig(v, 1)}${def}`;
+    return `${nameToTypeBack(k)}${req.has(k) ? '' : '?'}: ${typeSig(v, 1)}${def}`;
   });
-  return `${tool.name}(${params.join(', ')})`;
+  return `${nameToTypeBack(String(tool.name))}(${params.join(', ')})`;
 }
 
 /** An options schema as `{size?: 9|13|19 =9, …}` (a toolset's options). */
@@ -153,7 +154,7 @@ export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { descr
     const describe = opts.describeAll || !shown.has(d);
     shown.add(d);
     const sentence = describe ? firstSentence(t.description) : '';
-    return `${indent}${signature(t)}${sentence ? ` — ${sentence}` : ''}`;
+    return `${indent}${signature(t)}${sentence ? ` — ${suppliedValue(sentence)}` : ''}`;
   });
 }
 
@@ -161,7 +162,7 @@ export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { descr
 export function jsonText(value: unknown, space?: number): string {
   if (!nestsWithin(value)) return '(nested too deeply to show)';
   try {
-    return JSON.stringify(value, null, space) ?? '';
+    return JSON.stringify(value) === undefined ? '' : quotedValue(value, space);
   } catch {
     return '(too long to show)';
   }
@@ -173,8 +174,8 @@ export function renderToolDefinition(tool: HintedTool): string {
   const classes = Array.isArray(cls) ? cls.filter((c): c is string => typeof c === 'string') : [];
   return [
     signature(tool),
-    typeof tool.description === 'string' ? tool.description : '',
-    ...(classes.length ? [`class: ${classes.join(', ')}`] : []),
+    typeof tool.description === 'string' ? suppliedValue(tool.description) : '',
+    ...(classes.length ? [`class: ${classes.map(suppliedValue).join(', ')}`] : []),
     'inputSchema:',
     jsonText(tool.inputSchema ?? {}, 2),
   ]
@@ -252,15 +253,15 @@ function check(schema: unknown, value: unknown, at: string, depth: number, budge
   const s = schema;
   if (s.type !== undefined) {
     const types = Array.isArray(s.type) ? (s.type as string[]) : [s.type as string];
-    if (!types.some((t) => typeOk(t, value))) return `${at}: must be ${types.join(' or ')}`;
+    if (!types.some((t) => typeOk(t, value))) return `${at}: must be ${types.map(suppliedValue).join(' or ')}`;
   }
   if (Array.isArray(s.enum) || s.const !== undefined) {
     const own = canonicalJson(value);
     if (Array.isArray(s.enum)) {
       spend(budget, s.enum.length);
-      if (!s.enum.some((e) => canonicalJson(e) === own)) return `${at}: must be one of ${s.enum.map((e) => JSON.stringify(e)).join('|')}`;
+      if (!s.enum.some((e) => canonicalJson(e) === own)) return `${at}: must be one of ${s.enum.map((e) => quotedValue(e)).join('|')}`;
     }
-    if (s.const !== undefined && canonicalJson(s.const) !== own) return `${at}: must be ${JSON.stringify(s.const)}`;
+    if (s.const !== undefined && canonicalJson(s.const) !== own) return `${at}: must be ${quotedValue(s.const)}`;
   }
   if (typeof value === 'string') {
     const n = [...value].length;
@@ -286,16 +287,16 @@ function check(schema: unknown, value: unknown, at: string, depth: number, budge
   if (isObj(value)) {
     const props = isObj(s.properties) ? s.properties : {};
     for (const r of Array.isArray(s.required) ? (s.required as unknown[]) : []) {
-      if (typeof r === 'string' && !Object.hasOwn(value, r)) return `${at}.${r}: required`;
+      if (typeof r === 'string' && !Object.hasOwn(value, r)) return `${at}.${nameToTypeBack(r)}: required`;
     }
     for (const [k, v] of Object.entries(value)) {
       if (Object.hasOwn(props, k)) {
-        const e = check(props[k], v, `${at}.${k}`, depth + 1, budget);
+        const e = check(props[k], v, `${at}.${nameToTypeBack(k)}`, depth + 1, budget);
         if (e) return e;
       } else if (s.additionalProperties === false) {
-        return `${at}.${k}: not an argument of this tool`;
+        return `${at}.${nameToTypeBack(k)}: not an argument of this tool`;
       } else if (isObj(s.additionalProperties)) {
-        const e = check(s.additionalProperties, v, `${at}.${k}`, depth + 1, budget);
+        const e = check(s.additionalProperties, v, `${at}.${nameToTypeBack(k)}`, depth + 1, budget);
         if (e) return e;
       }
     }
