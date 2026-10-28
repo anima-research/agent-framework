@@ -8,7 +8,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
-import { createMockResponse } from './helpers/mock-membrane.js';
+import { createMockResponse, HeldStream } from './helpers/mock-membrane.js';
 import { registerOpen, incoming, MENTION } from './helpers/admission.js';
 
 const until = async (cond: () => boolean, what: string) => {
@@ -58,6 +58,43 @@ describe('channel_publish without channelId', () => {
       assert.ok(again.success, again.error);
       await eventually(() => !!publishOf(f, 'zz-script-2'), 'the second call posted');
       assert.equal(publishOf(f, 'zz-script-2')!.channelId, 'other', 'the registry default: the excepted channel');
+    } finally { await f.close(); }
+  });
+
+  it("a host's call carrying an open channelless turn's id meets the turn's rule: refused, though a focus holds another channel", async () => {
+    const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+    try {
+      await registerOpen(f, 'work');
+      const coordinator = (f.framework as unknown as { tuneOutCoordinator: { enterAllExcept(ref: unknown, opts: unknown, source: string): { ok: boolean } } }).tuneOutCoordinator;
+      assert.ok(coordinator.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok, 'premise: a focus on work');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      const fw = f.framework as unknown as { openLogical: Map<string, { turnId?: number; noChannel?: true }> };
+      const m = f.membrane as unknown as { responses: unknown[]; responseIndex: number; calls: unknown[]; lastStream: unknown };
+      let open: { turnId?: number; noChannel?: true } | undefined;
+      let host: Promise<{ success: boolean; error?: string }> | undefined;
+      // While the turn is open, the host calls as the agent, carrying the turn's id.
+      f.membrane.streamYielding = ((request: unknown) => {
+        m.calls.push(request);
+        const remaining = m.responses.slice(m.responseIndex);
+        m.responseIndex = m.responses.length;
+        open ??= fw.openLogical.get('agent');
+        host ??= f.framework.executeToolCall({ id: 'h1', name: 'channel_publish', input: { content: 'zz-host' }, callerAgentName: 'agent', callerTurnId: open?.turnId } as never) as never;
+        const stream = new HeldStream(host.then(() => undefined), remaining as never);
+        m.lastStream = stream;
+        return stream;
+      }) as never;
+      // A wake naming a channel no server registers: the turn has no channel by design (noChannel).
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'test', source: 'test', channelId: 'ghost', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      assert.ok(open?.turnId !== undefined && open.noChannel, 'premise: the call carried an open noChannel turn');
+      const result = await host!;
+      assert.equal(result.success, false);
+      assert.match(result.error ?? '', /This turn has no channel of its own/);
+      assert.equal(publishOf(f, 'zz-host'), undefined, 'nothing was posted');
     } finally { await f.close(); }
   });
 
