@@ -82,6 +82,9 @@ describe('a tune-out\'s dump of what it held', () => {
     const added: Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }> = [];
     const row = (author: string, text: string) => ({ participant: 'user', content: [{ type: 'text', text } as ContentBlock], metadata: { author: { name: author }, tuneOut: { epochId: 'eA' } } });
     const coordinator = new TuneOutCoordinator({
+      // No other tune-out or all-except hold, and nothing else stored.
+      getTuneOutState: () => null,
+      readCoordinatorState: () => null,
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       cancelTuneOut: () => ({ params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, wakeCount: 0 }),
@@ -120,6 +123,9 @@ describe('a tune-out\'s dump of what it held', () => {
     for (const words of CUT_INTO) for (let room = 60; room <= 700; room++) {
       const added: Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }> = [];
       const coordinator = new TuneOutCoordinator({
+        // No other tune-out or all-except hold, and nothing else stored.
+        getTuneOutState: () => null,
+        readCoordinatorState: () => null,
         nameShown: (channel: { channelId: string }) => channel.channelId,
         quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
         cancelTuneOut: () => ({ params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, wakeCount: 0 }),
