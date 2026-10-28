@@ -3701,12 +3701,16 @@ export class EventGate {
     // Delivery-time re-check: a channel tuned out after its events were
     // batched is held now, and "already shown above at arrival" would be
     // untrue of them. They are dropped; the hold's own reader has them.
-    const events = batched.filter((e) => !(e.channelId && this.isHeldFn(e.serverId, e.channelId)));
+    const heldAt = (e: PendingEvent): string | undefined => e.routeChannelId ?? e.channelId;
+    const events = batched.filter((e) => {
+      const channel = heldAt(e);
+      return !(channel && this.isHeldFn(e.serverId, channel));
+    });
     if (events.length < batched.length) {
       this.emitTrace({
         type: 'gate:held-dropped',
         dropped: batched.length - events.length,
-        channels: [...new Set(batched.filter((e) => !events.includes(e)).map((e) => e.channelId))],
+        channels: [...new Set(batched.filter((e) => !events.includes(e)).map(heldAt))],
         timestamp: this.now(),
       });
     }
