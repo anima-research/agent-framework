@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventGate } from '../src/gate/event-gate.js';
+import { firstSentence } from '../src/mcpl/tool-signature.js';
 import type { GateConfig, GateEventInfo, JudgeFn, JudgeRequest, JudgeVerdict } from '../src/gate/types.js';
 import type { ToolDefinition } from '../src/types/index.js';
 
@@ -1509,7 +1510,10 @@ describe('wake_add_rule with judge', () => {
     const shown = await call(example);
     assert.strictEqual(shown.isError, false, shown.content);
     assert.strictEqual(JSON.parse(shown.content).ignoredFields, undefined, 'every field the example gives is read');
-    assert.match(toolNamed('wake_remove_rule').description, /A judge rule's batch.*still goes to the judge, by the rule as it was\./);
+    const removal = toolNamed('wake_remove_rule').description;
+    assert.match(firstSentence(removal), /a judge rule's pending batches still go to the judge, by the rule as it was\.$/,
+      'the first sentence, all the settings toolset shows of it, says what a removal leaves to the judge');
+    assert.match(removal, /A judge rule's batch is pending while it waits out its quiet period, is held or is being judged\./);
   });
 
   it('a host that sets no GateOptions.judge has the judge wired, its defaults in force', async (t) => {
