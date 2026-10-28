@@ -4752,16 +4752,6 @@ describe('restarts and faults', () => {
 });
 
 describe('fingerprints', () => {
-  test('a recorded fingerprint vouches only for an unchanged, non-racy file on a ctime-keeping filesystem', () => {
-    const fp = { size: 4, mtimeNs: '1000000000000', ctimeNs: '1000000000000', ino: '7', dev: '9' };
-    const old = { ...fp, hashedAt: 1_000_000 + 5_000 };
-    assert.equal(fingerprintVouches(old, fp, true), true);
-    assert.equal(fingerprintVouches(old, fp, false), false, 'an unlisted filesystem type always rehashes');
-    assert.equal(fingerprintVouches({ ...fp, hashedAt: 1_000_000 + 1_000 }, fp, true), false, 'hashed inside the racy window');
-    assert.equal(fingerprintVouches(old, { ...fp, ctimeNs: '1000000000001' }, true), false, 'any field differing');
-    assert.equal(fingerprintVouches(undefined, fp, true), false);
-  });
-
   test('the ctime trust gate takes exactly the listed filesystems, and only on Linux', async (t) => {
     for (const trusted of [0xef53, 0x58465342, 0x9123683e, 0x01021994, 0xf2f52010, 0x2fc12fc1, 0x794c7630]) {
       assert.equal(fsTypeTrustsCtime(trusted), true, trusted.toString(16));
@@ -4776,9 +4766,6 @@ describe('fingerprints', () => {
     assert.equal(await filesystemTrustsCtime(env.dir), expected);
   });
 
-  // The racy window itself is pinned by fingerprintVouches' unit assertions
-  // above: reaching it here would take a write that leaves mtime and ctime
-  // unchanged, which no restore can do, since ctime can't be set.
   test('no restored timestamp hides a change: utimes, cp -p, and a write right after a hash', async (t) => {
     const env = new Env(t);
     const m = await env.open();

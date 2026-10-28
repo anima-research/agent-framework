@@ -66,3 +66,14 @@ describe('a recorded fingerprint vouches only for stamps more than 2,000 ms olde
     assert.equal(fingerprintVouches(recorded(was), was, true), false);
   });
 });
+
+describe('a recorded fingerprint vouches only where there is one to trust', () => {
+  test("never on a file system whose ctime the workspace doesn't trust", () => {
+    const was = file(10_000);
+    assert.equal(fingerprintVouches(recorded(was), was, false), false);
+  });
+
+  test('not when no fingerprint was recorded', () => {
+    assert.equal(fingerprintVouches(undefined, file(10_000), true), false);
+  });
+});
