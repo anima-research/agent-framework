@@ -32,7 +32,7 @@ import type { CallSummary } from './calls.js';
 import type { OutputBounds, OutputWindow } from './output.js';
 import type { PreludeTool } from './prelude.js';
 import { glimpse } from './render.js';
-import { quotedValue, suppliedValue } from '../../supplied-text.js';
+import { quotedJson, suppliedValue } from '../../supplied-text.js';
 
 /** The run or wait call watching a script: its turn, which the script's calls carry, and whether one of them ended that turn. */
 export interface ScriptWatch {
@@ -485,6 +485,5 @@ function leftEndingText(scriptId: string, ending: Ending): string {
 
 function wakeText(scriptId: string, payloadJson: string, n: number, max: number, ageMs: number): string {
   const minutes = Math.round(ageMs / 60_000);
-  // The payload is the JSON the script's wake_agent() sent; written again with quotedValue, it gives the same value on one line, with no opening of the framework's unescaped.
-  return `[${NOTICE_TAG.script} ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${quotedValue(JSON.parse(payloadJson))}`;
+  return `[${NOTICE_TAG.script} ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${quotedJson(payloadJson)}`;
 }

@@ -62,11 +62,6 @@ export function markedTexts(texts: readonly string[], marks: readonly boolean[] 
   return texts.map((text, i) => withMarks(text, offsets[i]!));
 }
 
-/**
- * The text that holds each place in texts joined with line breaks: the last
- * one starting at or before it. The places come in order, so one walk
- * through the starts finds them all.
- */
 export function holdersOf(starts: readonly number[], places: readonly number[]): number[] {
   let holder = 0;
   return places.map((place) => {
@@ -144,7 +139,11 @@ export function showsAsItself(value: string): boolean {
 const EDGE_OR_QUOTE = /^\s|\s$|["\\]/;
 
 export function quotedValue(value: unknown, space?: number): string {
-  return (JSON.stringify(value, null, space) ?? 'null').replace(/"(?:[^"\\]|\\.)*"/g, (literal) => quotedString(JSON.parse(literal)));
+  return quotedJson(JSON.stringify(value, null, space) ?? 'null');
+}
+
+export function quotedJson(json: string): string {
+  return json.replace(/"(?:[^"\\]|\\.)*"/g, (literal) => quotedString(JSON.parse(literal)));
 }
 
 function quotedString(text: string): string {

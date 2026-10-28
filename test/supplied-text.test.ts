@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { CONTEXT_MANAGER_TAGS, NOTICE_TAG } from '../src/notice-tags.js';
-import { cutToFit, markedText, markedTexts, holdersOf, markNoticeOpenings, nameToTypeBack, quotedValue, suppliedValue } from '../src/supplied-text.js';
+import { cutToFit, markedText, markedTexts, holdersOf, markNoticeOpenings, nameToTypeBack, quotedJson, quotedValue, suppliedValue } from '../src/supplied-text.js';
 import { convertBlocks } from '../src/mcpl/convert-block.js';
 import type { McplContentBlock } from '../src/mcpl/types.js';
 
@@ -16,7 +16,6 @@ describe('marking many texts', () => {
     for (let i = 0; i < texts.length; i++) {
       assert.equal(marked[i], i % 2 ? `\\${texts[i]}` : texts[i], String(i));
     }
-    // An empty text holds no opening, and the texts after it keep their own.
     assert.deepEqual(markedTexts(['a', '', `[${NOTICE_TAG.routing}] b`]), ['a', '', `\\[${NOTICE_TAG.routing}] b`]);
   });
 
@@ -31,9 +30,16 @@ describe('marking many texts', () => {
     });
     const places = Array.from({ length: n }, (_, i) => i * 10 + 3);
     assert.deepEqual(holdersOf(starts, places), places.map((_, i) => i));
-    // The walk reads one start for each step forward, n - 1 in all, and at most one more where each place stops it.
-    // A search back from the last text for each place reads about n * n / 2.
     assert.ok(reads <= 2 * n, `${reads} reads of the starts for ${n} places`);
+  });
+});
+
+describe('JSON text written again', () => {
+  it('gives back JSON nested deeper than JSON.stringify can recurse, each string escaped as quotedValue escapes it', () => {
+    const depth = 20_000;
+    const json = `${'['.repeat(depth)}"a\u2028b"${']'.repeat(depth)}`;
+    assert.equal(quotedJson(json), `${'['.repeat(depth)}"a\\u2028b"${']'.repeat(depth)}`);
+    assert.equal(quotedJson('{"k":"[routing] x\u0085y","n":1.50}'), '{"k":"\\u005brouting] x\\u0085y","n":1.50}');
   });
 });
 

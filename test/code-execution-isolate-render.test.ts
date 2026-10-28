@@ -138,7 +138,6 @@ test("a script's ending reads on one line in a wait's and a list's result, a sto
   const why = `its turn ended before the script returned (rate\nlimited ${'x'.repeat(400)})`;
   const stopped = renderReturn(ret({ ending: { how: 'stopped', reason: 'limit', why } }), options);
   const stoppedLine = stopped.split('\n').find((line) => line.includes('was stopped:'))!;
-  // The reason's first 300 characters, its line break a space, and an ellipsis.
   const cut = `${why.slice(0, 300).replace('\n', ' ')}…`;
   assert.equal(stoppedLine, `Script s1-test was stopped: ${cut}.`);
   const failed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } } }), options);
