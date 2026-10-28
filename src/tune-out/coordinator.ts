@@ -1607,6 +1607,18 @@ export class TuneOutCoordinator {
       }
       case 'cancel_tuneout': {
         const name = String(input.channelId ?? '');
+        const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
+        const endScope = (): { success: boolean; data?: unknown; error?: string; isError?: boolean } => {
+          const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
+          return result.ok
+            ? { success: true, data: { cancelled: true, scope: 'all-except' } }
+            : { success: false, error: result.error, isError: true };
+        };
+        // A call naming the all-except scope ends that hold outright, as the
+        // tool describes it and as the resident's tune_out cancel does: the
+        // channel it names, tuned out on its own or not, doesn't turn it
+        // into that channel's cancel, and with no hold it ends nothing.
+        if (input.scope === 'all-except') return endScope();
         const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
         // The name means what it means to every channel tool, the
         // resident's tune_out included: with a serverId, that server's
@@ -1624,18 +1636,14 @@ export class TuneOutCoordinator {
         const named = serverId ? [{ serverId, channelId: name }]
           : mine && 'channel' in mine ? [mine.channel] : this.channelRegistry.channelsNamed(name);
         const channel = refusal ? undefined : named[0];
-        const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
         if (!channel || !this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)) {
           // The reader keeps its latitude over the all-except hold too: a
-          // channel it holds (or the scope named outright) ends the scope.
+          // channel it holds (or the scope named as the channel) ends the scope.
           const scope = this.getAllExcept();
-          const heldByScope = scope && (input.scope === 'all-except' || name === 'all-except'
+          const heldByScope = scope && (name === 'all-except'
             || (channel !== undefined && this.holdFor(channel.serverId, channel.channelId)?.epochId === scope.params.epochId));
           if (!heldByScope) return { success: false, error: refusal ?? this.notTunedOut(JSON.stringify(name), 'the resident'), isError: true };
-          const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
-          return result.ok
-            ? { success: true, data: { cancelled: true, scope: 'all-except' } }
-            : { success: false, error: result.error, isError: false };
+          return endScope();
         }
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
         return result.ok
