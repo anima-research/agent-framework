@@ -27,9 +27,9 @@ import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResp
 class ToolModule implements Module {
   readonly name = 'tools';
   calls: ToolCall[] = [];
-  /** A message someone sends while the next call runs: the agent's turn is
-   * alive, so it is deferred to the tool boundary. */
-  arrive: string | null = null;
+  /** A message someone sends while the next call runs, as text or blocks: the
+   * agent's turn is alive, so it is deferred to the tool boundary. */
+  arrive: string | ContentBlock[] | null = null;
   /** The next call's result ends the turn. */
   endTurn = false;
   private ctx: ModuleContext | null = null;
@@ -41,7 +41,7 @@ class ToolModule implements Module {
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     this.calls.push(call);
     if (this.arrive !== null) {
-      this.ctx!.addMessage('nissa', [{ type: 'text', text: this.arrive }] as ContentBlock[]);
+      this.ctx!.addMessage('nissa', typeof this.arrive === 'string' ? [{ type: 'text', text: this.arrive }] as ContentBlock[] : this.arrive);
       this.arrive = null;
     }
     const endTurn = this.endTurn;
@@ -983,6 +983,22 @@ describe('replies to a [Continue] turn', () => {
       const doneAt = later.findIndex((m) => textOf(m) === 'all done');
       assert.equal(textOf(later[doneAt - 1]!), 'arrived mid-turn');
       assert.ok(!later.some((m) => textOf(m) === '[Continue]'));
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it("a later round handed only a system change at its tool boundary keeps following [Continue], as a compile there reads it", async () => {
+    const x = await make({ deliver: false, agent: { toolDeclarations: 'entries' } });
+    try {
+      await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
+      x.mod.arrive = [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZCHANGE', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock];
+      await timerWake(x,
+        signed('sig-c', 'checking', [{ type: 'tool_use', id: 'c-t1', name: 'tools--ping', input: {} } as ContentBlock]),
+        signed('sig-c2', 'all done'));
+      const injected = x.membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+      assert.ok(injected.some((m) => m.content.some((b) => (b as { type?: string }).type === 'system_change')), 'the boundary handed the change to the live stream');
+      const prompt = rowWith(x.framework, 'checking').metadata?.promptedBy;
+      assert.ok(prompt, 'the round followed [Continue]');
+      assert.deepEqual(rowWith(x.framework, 'all done').metadata?.promptedBy, prompt, 'and the round after the change follows it too');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
