@@ -118,7 +118,7 @@ framework.sendAgentMessage('oren', 'mira', [{ type: 'text', text: 'the build is 
 framework.deliverAgentResult('fork-1', [{ type: 'text', text: result.speech }], { causedBy: ['task-7'] });
 ```
 
-Both put the sender's content in the recipient's context **under the sender's own name**. `metadata.dendrite` carries the sender's name and incarnation, the mail id, the causal chain, and `producedAt`, when the sender produced it, so a result that arrives late reads as mail from then rather than as the present. Nothing is inserted into the recipient's own voice.
+Both put the sender's content in the recipient's context **under the sender's own name**. The one exception is a recipient that counts the sender as its own voice without being the sender, as a shared fork counts its parent: there the mail is stored under `<sender> (mail)`, such as `mira (mail)`, so no request presents it as the recipient's own turn. `metadata.dendrite` carries the sender's name and incarnation, the mail id, the causal chain, and `producedAt`, when the sender produced it, so a result that arrives late reads as mail from then rather than as the present. Nothing is inserted into the recipient's own voice.
 
 Published is not delivered. `dendrite:mail-deferred` fires when a message is queued for a recipient's next boundary; `dendrite:mail-delivered` fires only when it has entered the recipient's store. Neither says the model has seen it; that is a separate event the framework does not yet record.
 
@@ -163,7 +163,7 @@ The child's writes go to a Chronicle branch of its own, which its record names a
 
 ### The refusal ledger
 
-By default a fork does not inherit its parent's compression-refusal ledger (what the parent declined to compress, and why): a task fork is free of its parent's refusals. `inheritRefusals: true` brings it along, for a fork that stands in for the parent's attention and must not be asked the thing the parent said no to without knowing. Either way the creation record and event state it (`inherit.refusals`), so nobody discovers the difference by being asked. Inherited entries are the parent's; the child's own refusals append after them on its branch.
+By default a fork does not inherit its parent's compression-refusal ledger (what the parent declined to compress, and why): a task fork is free of its parent's refusals. With shared inheritance, `inheritRefusals: true` brings it along, for a fork that stands in for the parent's attention and must not be asked the thing the parent said no to without knowing. Either way the creation record and event state it (`inherit.refusals`), so nobody discovers the difference by being asked. A copy brings no ledger, so a copy derivation refuses `inheritRefusals: true` before anything is made. Inherited entries are the parent's; the child's own refusals append after them on its branch.
 
 The ledger is **consultable, never rendered**: it steers what the child's strategy will and will not compress, and nothing in it is placed in a compiled request. Refusal records are the most classifier-sensitive content in the pipeline, so this is part of the declaration, not something that happens to be true.
 
@@ -172,7 +172,7 @@ The ledger is **consultable, never rendered**: it steers what the child's strate
 - `solve: 'reuse'` (default): the child keeps the parent's rendering. Fold state arrives through the store. The part that lives only in memory (the previous compile's cache identities, an in-flight budget transition, a hot-tuned tail) is handed from the parent's strategy to the child's.
 - `solve: 'fresh'`: the child discards the inherited frontier and solves from scratch, for example at a different budget. The rendering changes and the provider cache misses. This is a supported choice.
 
-Any override that changes what is rendered (model, system prompt, budget, tools) has the same effect as a fresh solve on the provider cache.
+Any override that changes what is rendered (model, system prompt, budget, tools) has the same effect as a fresh solve on the provider cache. `solve` is for shared inheritance: a copy derivation refuses it before anything is made.
 
 ### Framing and the fork point
 
