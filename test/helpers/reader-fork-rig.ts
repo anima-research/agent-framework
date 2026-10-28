@@ -58,6 +58,7 @@ type Internals = {
   tuneOutCoordinator: TuneOutCoordinator | null;
   channelRegistry: { listChannelsRaw(): unknown[] } | null;
   agents: Map<string, { deniesAtDispatch(tool: string): boolean }>;
+  readerRefuses(agentName: string, tool: string): boolean;
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
 export const toolNames = (request: NormalizedRequest) => ((request as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
@@ -87,7 +88,9 @@ export function rig(name: string, allowChannelSpeech: boolean, opts: { modules?:
       if (/^(dendrite|tune-out|tool|mcpl:speech)/.test(event.type)) debug('trace', event.type, JSON.stringify(event).slice(0, 200));
       if (event.type === 'tool:failed' && (event as { module: string }).module === 'dendrite') {
         for (const [name, agent] of internals(state.framework!).agents) {
-          if (name !== 'scout' && !denies.has(name)) denies.set(name, Object.fromEntries(CHECKED.map((t) => [t, agent.deniesAtDispatch(t)])));
+          if (name !== 'scout' && !denies.has(name)) {
+            denies.set(name, Object.fromEntries(CHECKED.map((t) => [t, internals(state.framework!).readerRefuses(name, t) || agent.deniesAtDispatch(t)])));
+          }
         }
       }
     });

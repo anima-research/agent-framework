@@ -15552,7 +15552,6 @@ export class AgentFramework {
    * (attributed mail), may cancel the hold, and ends when its turn ends.
    */
   private invokeReaderFork(invocation: ReaderInvocation): void {
-    const READER_FORK_TOOLS = new Set(['deliver_summary', 'cancel_tuneout', 'note_disposition']);
     const primary = this.primaryAgentName;
     const cfg = this.subconsciousConfig;
     if (!primary || cfg?.reader !== 'forks' || !this.agents.has(primary)) return;
@@ -15585,13 +15584,6 @@ export class AgentFramework {
           config: {
             model: cfg.model,
             proseRouting: 'disabled',
-            // A reader reads and reports: its own tools, and speech only
-            // where the configuration allows it. Every other tool the
-            // resident has stays in the block (the shared prefix) and is
-            // refused at dispatch, so with speech off a fork can post
-            // nowhere (scout's condition, 2026-10-19).
-            denyToolsAtDispatch: this.listToolClasses(primary).map((t) => t.tool)
-              .filter((t) => !READER_FORK_TOOLS.has(t) && !(t === 'speak_in_channel' && cfg.allowChannelSpeech === true)),
           },
           inheritRefusals: true,
           onParentEnd: 'end',
@@ -26618,6 +26610,22 @@ export class AgentFramework {
     return { ok: true, call: inner, serverId: target.serverId, prefix, ...(target.instance !== undefined ? { instance: target.instance } : {}) };
   }
 
+  /**
+   * A reader reads and reports: a reader fork (registry kind
+   * 'subconscious-fork', in every incarnation) may call only its own tools,
+   * and speak_in_channel where allowChannelSpeech allows it. Every other
+   * tool the resident has stays in its block (the shared prefix) and is
+   * refused here, so with speech off a fork can post nowhere (scout's
+   * condition, 2026-10-19). It's decided at each call from what the reader
+   * may call, not from what it is shown, so a tool added or moved out of
+   * the block later is refused too.
+   */
+  private readerRefuses(agentName: string, toolName: string): boolean {
+    if (this.registry.get(agentName)?.kind !== 'subconscious-fork') return false;
+    if (toolName === 'speak_in_channel') return this.subconsciousConfig?.allowChannelSpeech !== true;
+    return !(SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(toolName);
+  }
+
   /** A toolsets--act call a host toolset resolved (HostPresentation.resolveAct):
    *  its refusal answered, or the tool's own call dispatched in its place,
    *  with the act's id, so its result is the act's. */
@@ -28411,7 +28419,7 @@ export class AgentFramework {
     // Dispatch-time deny (AgentConfig.denyToolsAtDispatch): the tool stays
     // advertised so the agent's request prefix is unchanged; the call is
     // refused here, before anything runs.
-    if (this.agents.get(agentName)?.deniesAtDispatch(call.name)) {
+    if (this.agents.get(agentName)?.deniesAtDispatch(call.name) || this.readerRefuses(agentName, call.name)) {
       const error = `${call.name} is not available to ${agentName}`;
       // RFC-007: refused before the tool runs — no lifecycle events.
       this.toolLifecycleEmitter?.refuse(agentName, call.id);
