@@ -34,6 +34,7 @@
  * follow-up.
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
 import { createHash } from 'node:crypto';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ChannelDescriptor } from './types.js';
@@ -144,7 +145,7 @@ export type RoutingDecision =
 const DEFAULT_IDLE_TTL_MS = 12 * 60 * 60 * 1000;
 
 export const DEFAULT_CLOSURE_PROMPT =
-  '[system] This engagement is closing due to inactivity. Finalize your ' +
+  `[${NOTICE_TAG.system}] This engagement is closing due to inactivity. Finalize your ` +
   'work: post any promised results to the channel and record outstanding ' +
   'threads as unresolved. Do not ask follow-up questions.';
 

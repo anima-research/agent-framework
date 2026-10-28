@@ -495,14 +495,15 @@ describe('mount include', () => {
     assert.match(uncovered, /"work\/gate\.json" is a symlink, which this mount does not follow/);
     assert.ok(!uncovered.includes('secret'), uncovered);
     assert.match(await refusal('work/x.md/y.md'), /"work\/x\.md" is a symlink to "work\/notes\.md", which this mount does not follow/);
-    assert.match(await refusal('work/dir.md/gate.json'), /"work\/dir\.md" is a symlink to "work\/real", which this mount does not follow; the mount's host can set followSymlinks: true, for what the include covers where it leads/);
+    assert.match(await refusal('work/dir.md/gate.json'),
+      /"work\/dir\.md" is a symlink to "work\/real", which this mount does not follow; use "work\/real" in place of "work\/dir\.md", or whoever runs this host can set followSymlinks: true on mount "work"; either way, the mount reaches only what its include covers there/);
     // A link the include doesn't cover is outside the mount itself: its refusal tells nothing of where it leads.
     const outside = await refusal('work/lnk/gate.json');
-    assert.match(outside, /"work\/lnk" is a symlink, which this mount does not follow$/);
+    assert.match(outside, /"work\/lnk" is a symlink, which this mount does not follow; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere$/);
     assert.ok(!outside.includes('real'), outside);
     // It's named as the parse reads the path, whatever empty, `.` or `..` segment the caller's text holds before it.
     for (const given of ['work/./lnk/gate.json', 'work/sub/../lnk/gate.json', 'work/.//lnk/gate.json']) {
-      assert.match(await refusal(given), /"work\/lnk" is a symlink, which this mount does not follow$/, given);
+      assert.match(await refusal(given), /"work\/lnk" is a symlink, which this mount does not follow; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere$/, given);
     }
     // Nor does a listing or a sync of the mount name the uncovered target.
     for (const [name, input] of [['ls', { path: 'work' }], ['ls', { path: 'work', recursive: true }], ['sync', {}]] as Array<[string, Record<string, unknown>]>) {
@@ -537,7 +538,7 @@ describe('mount include', () => {
         const plain = await call(await open(follow), 'sync', {}) as Sync;
         assert.equal(byPath(plain.incomplete)['link'], 'a symlink, not walked', JSON.stringify(plain));
         assert.equal(byPath(synced.incomplete)['link'], 'a symlink, not walked', label);
-        assert.equal(byPath(plain.skipped)['link/a.json'], 'disk could not be checked: a symlink, not walked', JSON.stringify(plain));
+        assert.equal(byPath(plain.skipped)['link/a.json'], 'disk could not be checked: a symlink, not walked — a sync of this path checks it', JSON.stringify(plain));
         assert.equal(byPath(synced.skipped)['link/a.json'], byPath(plain.skipped)['link/a.json'], `${label}; ${JSON.stringify(plain)}`);
         // A link to a file, and one that leads nowhere, are judged by their names, which the include leaves out.
         assert.equal(synced.passedOver?.find((p) => p.reason === OUTSIDE_INCLUDE)?.count, 2, label);
@@ -594,9 +595,9 @@ describe('mount include', () => {
       assert.match(await refusal('work/d.md/a.json'), /^other_mount: .*use "inner\/sub"/);
       // A link the outer include doesn't cover tells nothing of where it leads, the nested mount included.
       const uncovered = await refusal('work/d/a.json');
-      assert.match(uncovered, /^parent_symlink: .*"work\/d" is a symlink, which this mount does not follow$/);
+      assert.match(uncovered, /^parent_symlink: .*"work\/d" is a symlink, which this mount does not follow; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere$/);
       assert.ok(!uncovered.includes('inner'), uncovered);
-      assert.match(await refusal('work/./x/../d/a.json'), /^parent_symlink: .*"work\/d" is a symlink, which this mount does not follow$/);
+      assert.match(await refusal('work/./x/../d/a.json'), /^parent_symlink: .*"work\/d" is a symlink, which this mount does not follow; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere$/);
     } finally {
       await m.stop();
     }
@@ -640,7 +641,7 @@ describe('mount include', () => {
       // The sync says a link to the file leaves the mount, and beneath a link to a directory, it names that
       // directory, as a listing would, and not the file.
       assert.deepEqual((await call(m, 'sync', { path: 'work/h.txt' })).skipped, [
-        { mount: 'work', path: 'h.txt', reason: 'disk could not be checked: a symlink that leaves the mount' },
+        { mount: 'work', path: 'h.txt', reason: 'disk could not be checked: a symlink that leaves the mount — syncing this path again won\'t change that; nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it' },
       ]);
       assert.deepEqual((await call(m, 'sync', { path: 'work/d/b.txt' })).skipped, [
         { mount: 'work', path: 'd/b.txt', reason: 'disk could not be checked: "work/d" leads into mount "inner", nested in mount "work": use "inner/sub" in its place' },
@@ -657,7 +658,8 @@ describe('mount include', () => {
       ]);
       const synced = JSON.stringify((await call(m, 'sync', {})).skipped);
       assert.ok(synced.includes('use \\"inner/sub\\" in its place') && synced.includes('use \\"inner/kept.json\\" in its place'), synced);
-      assert.ok(synced.includes('"path":"h.txt","reason":"disk could not be checked: a symlink that leaves the mount"') && !synced.includes('hidden'), synced);
+      assert.ok(synced.includes('"path":"h.txt","reason":"disk could not be checked: a symlink that leaves the mount — syncing this path again won\'t change that; '
+        + 'nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it"') && !synced.includes('hidden'), synced);
     } finally {
       await m.stop();
     }
@@ -822,7 +824,7 @@ describe('mount include', () => {
     assert.deepEqual(byReason, [['ignored by the mount', 1], [OUTSIDE, 3]]);
     assert.deepEqual((data.incomplete as Array<{ path: string; reason: string }>).map(({ path, reason }) => [path, reason]), [
       ['', 'the walk cap (2) was reached: the next sync of the mount resumes after work/y/1.json'],
-      ['z', 'not visited: the walk cap (2) was reached'],
+      ['z', "not visited: the walk cap (2) was reached; naming this path walks only it, and whoever runs this host can raise the mount's walkCap"],
     ], 'z is left by the cap, and x, holding only files outside the include, is no region the cap left');
   });
 
@@ -1696,9 +1698,9 @@ describe("the checks where disk is acted on, called directly as a push and a rea
   test('the located read', async (t) => {
     const { at, view, rootReal } = rig(t);
     assert.deepEqual(await readPath(view, rootReal, 'hidden.txt', 1 << 20), { kind: 'unobserved', reason: leaves });
-    assert.deepEqual(await readPath(view, rootReal, 'kept.json', 1 << 20), { kind: 'unobserved', reason: named('kept.json', 'inner/kept.json') });
+    assert.deepEqual(await readPath(view, rootReal, 'kept.json', 1 << 20), { kind: 'unobserved', reason: named('kept.json', 'inner/kept.json'), ownStep: true });
     // Past the inner mount's own link, the place is judged where the path leads, a file that mount covers.
-    assert.deepEqual(await readPath(view, rootReal, 'x/a.json', 1 << 20), { kind: 'unobserved', reason: named('x/a.json', 'inner/sub/a.json') });
+    assert.deepEqual(await readPath(view, rootReal, 'x/a.json', 1 << 20), { kind: 'unobserved', reason: named('x/a.json', 'inner/sub/a.json'), ownStep: true });
   });
 
   test('the contained write, which leaves the file as it was', async (t) => {
