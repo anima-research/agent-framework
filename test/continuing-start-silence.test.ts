@@ -139,6 +139,7 @@ interface Harness {
   wake(request: Omit<InferenceRequest, 'agentName'>): void;
   endTurn(): Promise<void>;
   storeFor(agentName: string, body: string): ReturnType<ModuleContext['addMessage']>;
+  storeForResidents(body: string): ReturnType<ModuleContext['addMessage']>;
   remove(id: ReturnType<ModuleContext['addMessage']>): void;
 }
 
@@ -200,7 +201,6 @@ async function turn(options: {
   const internals = framework as unknown as {
     channelRegistry: { listChannelsRaw(): unknown[] };
     activeTurnTokens: Map<string, unknown>;
-    deferredMessages: unknown[];
     pendingRequests: InferenceRequest[];
     providerAccelerationCooldowns: Map<string, { until: number }>;
     openLogical: Map<string, unknown>;
@@ -221,7 +221,14 @@ async function turn(options: {
     incoming: (messageId, body, mode = 'addressed') =>
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: ROOM, messageId, mode, text: body }) + '\n'),
     until,
-    queued: (body) => JSON.stringify(internals.deferredMessages).includes(body),
+    // #291: no queue holds a message that arrives while scout's turn is
+    // alive. It is stored at once and stays out of scout's window until
+    // scout's next presentation point, which is what main's queue held it
+    // for: stored, and not yet in the window.
+    queued: (body) => {
+      const cm = framework.getAgent('scout')!.getContextManager();
+      return cm.getAllMessages().some((m) => JSON.stringify(m.content).includes(body) && cm.windowStatusOf(m.id) !== 'in');
+    },
     stored: (body) => JSON.stringify(framework.getAgent('scout')!.getContextManager().getAllMessages()).includes(body),
     wake: (request) => internals.pendingRequests.push({ agentName: 'scout', ...request } as InferenceRequest),
     endTurn: async () => { internals.openLogical.delete('scout'); },
@@ -229,6 +236,8 @@ async function turn(options: {
       assert.ok(!internals.activeTurnTokens.has(agentName), `${agentName} has no turn alive, so the write is stored`);
       return gate.ctx!.addMessage('user', [text(body)], undefined, { forAgent: agentName });
     },
+    // A write that names no agent: for every resident that takes untargeted inbound in the slot (#291).
+    storeForResidents: (body) => gate.ctx!.addMessage('user', [text(body)]),
     remove: (id) => gate.ctx!.removeMessage(id),
   };
   if (options.gather) gate.onGather = (agentName, n) => options.gather!(h, agentName, n);
@@ -450,23 +459,48 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
     assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
   });
 
+  // #291: a row is for the agents its audience names. main stores this
+  // message for `other` and scout reads it in the slot they share; here a
+  // write for `other` alone is elsewhere to scout (next case), so the
+  // message both residents' windows get is one that names no agent, stored
+  // in their slot for both. It reaches scout's window at the boundary the
+  // gated tool's result passes, while the failed stream runs.
   it("a message another resident's window gets while the failed stream runs clears the hold for the retry that reads it", async () => {
     const run = await turn({
-      proseRouting: 'locus', residents: true, whileGated: async (h) => { h.storeFor('other', CHATTER); },
+      proseRouting: 'locus', residents: true, whileGated: async (h) => { h.storeForResidents(CHATTER); },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
     });
     assert.ok(read(run.requests[1], CHATTER), 'the retry read the message');
     answered(run);
   });
 
-  it("a message stored while the retry gathers its context clears the hold for the compile that reads it", async () => {
+  it("a message for another resident alone isn't scout's to read: the retry doesn't read it, and the line it writes stays held", async () => {
     const run = await turn({
-      proseRouting: 'locus', residents: true,
-      gather: (h, agentName, n) => { if (agentName === 'scout' && n === 2) h.storeFor('other', CHATTER); },
+      proseRouting: 'locus', residents: true, whileGated: async (h) => { h.storeFor('other', CHATTER); },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
     });
-    assert.ok(read(run.requests[1], CHATTER), 'the retry read the message');
-    answered(run);
+    assert.ok(!read(run.requests[1], CHATTER), "the message is other's");
+    assert.deepEqual(run.publishes, []);
+    assert.ok(heldAsSend(run, REPLY), JSON.stringify(run.drafts));
+  });
+
+  // #291: an errorPolicy retry continues the turn and presents nothing that
+  // arrived since the turn began (presentAtStart's 'turn-start' is a fresh
+  // start's), so a message stored while it gathers its context, one for
+  // both residents included, is out of its compile and waits for scout's
+  // next presentation point. main's retry compiled the shared slot, which
+  // held it.
+  // The rule is the same: the hold stands until a request carries a new
+  // message, and this one carried none.
+  it("a message stored while the retry gathers its context waits for the turn's end: the compile doesn't read it, and the hold stands", async () => {
+    const run = await turn({
+      proseRouting: 'locus', residents: true,
+      gather: (h, agentName, n) => { if (agentName === 'scout' && n === 2) h.storeForResidents(CHATTER); },
+      stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
+    });
+    assert.ok(!read(run.requests[1], CHATTER), "the retry's compile doesn't carry it");
+    assert.deepEqual(run.publishes, []);
+    assert.ok(heldAsSend(run, REPLY), JSON.stringify(run.drafts));
   });
 
   it('a held retry that answers a new message and sends again keeps that send\'s hold through its own retry', async () => {
