@@ -271,6 +271,36 @@ describe('a context manager the framework is done with makes no further provider
     }
   });
 
+  it('a resumed job after cleanup(): the call its manager has out is aborted, and it makes no call', { timeout: 60_000 }, async () => {
+    const membrane = new CompressionMembrane(100);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const { dir, framework } = await setup('af-done-resumed-', membrane);
+    const errors = captureErrors();
+    try {
+      const first = await framework.createEphemeralAgent({ name: 'job', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      first.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const run = framework.runEphemeralToCompletion(first.agent, first.contextManager);
+      framework.start();
+      await run;
+      const resumed = await framework.resumeAgent('job', {
+        model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: drainingStrategy(),
+      });
+      addBacklog(resumed.contextManager, 30);
+      await until(() => membrane.compressions.length >= 1 && membrane.inFlight > 0);
+      resumed.cleanup();
+      const sent = membrane.compressions.length;
+      await sleep(800);
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after cleanup()');
+      assert.ok(membrane.aborted.length >= 1, 'the call it had out was aborted');
+      assert.deepEqual(drainLines(errors.lines), []);
+    } finally {
+      errors.restore();
+      await settle(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('after cleanup() with no run: the call it has out is aborted, it makes no call, and another agent compresses as before', { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(100);
     const { dir, framework } = await setup('af-done-cleanup-', membrane);

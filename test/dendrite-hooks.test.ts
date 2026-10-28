@@ -62,6 +62,28 @@ describe('dendrite.beforeDerive', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('is asked before an ended job resumes as a new incarnation, and can refuse it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hooks-'));
+    const seen: AgentSpec[] = [];
+    try {
+      const membrane = new RoutedMembrane();
+      const fw = await boot(dir, {
+        beforeDerive: (spec: AgentSpec) => {
+          seen.push(spec);
+          return spec.model === 'other-model' ? { refuse: 'not on those weights' } : undefined;
+        },
+      }, membrane);
+      membrane.script('job-h', say('job-h done'));
+      const made = await fw.createEphemeralAgent({ name: 'job-h', model: 'test-model', systemPrompt: 'x' }, { ...workerSpec('job-h', { spawnedBy: 'scout' }), name: undefined } as never);
+      made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      await fw.runEphemeralToCompletion(made.agent, made.contextManager);
+      await assert.rejects(fw.resumeAgent('job-h', { model: 'other-model', systemPrompt: 'x' }), /job-h was not resumed: not on those weights/);
+      assert.equal(fw.getAgentRecord('job-h')?.incarnation, 1, 'still its first incarnation');
+      assert.deepEqual(seen.map((s) => [s.name, s.model]), [['job-h', 'test-model'], ['job-h', 'other-model']]);
+      await fw.stop();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('refuses a derivation too, before the fork exists', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hooks-'));
     try {

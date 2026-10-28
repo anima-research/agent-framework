@@ -139,13 +139,14 @@ export interface FrameworkConfig {
      */
     collapseDerivationNoticesAfter?: number;
     /**
-     * A host's say over every derivation and spawn, before the agent exists:
-     * the spec as it will be registered (name, kind, spawner, route,
-     * inheritance, metadata). Return nothing to allow, or `{ refuse }` with
-     * the reason, which the caller gets as the error. The framework attaches
-     * no meaning to the decision — consent, budget, hours, a mind's standing
-     * instruction, a use not yet imagined are all the host's (architecture
-     * channel, 2026-10-19: semantics live outside the platform).
+     * A host's say over each derivation, ephemeral spawn and resume, before the
+     * agent or its new incarnation exists: the spec as it will be registered
+     * (name, kind, spawner, route, inheritance, metadata). Return nothing to
+     * allow, or `{ refuse }` with the reason, which the caller gets as the
+     * error. The framework attaches no meaning to the decision — consent,
+     * budget, hours, a mind's standing instruction, a use not yet imagined
+     * are all the host's (architecture channel, 2026-10-19: semantics live
+     * outside the platform).
      */
     beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
     /**

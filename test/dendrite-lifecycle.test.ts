@@ -625,6 +625,43 @@ describe('Dendrite lifecycle', () => {
     assert.ok(logged.some((line) => line.includes('the notice hook failed')), logged.join('\n'));
   });
 
+  it('of two overlapping resumes of one ended job, one resumes it and the other is refused', async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('job-r', say('job-r done'));
+    const made = await framework.createEphemeralAgent(
+      { name: 'job-r', model: 'test-model', systemPrompt: 'Do the task.' },
+      workerSpec('job-r', { spawnedBy: 'mira' }),
+    );
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await framework.runEphemeralToCompletion(made.agent, made.contextManager);
+    const config = { model: 'test-model', systemPrompt: 'Do the task.' };
+    const outcomes = await Promise.allSettled([framework.resumeAgent('job-r', config), framework.resumeAgent('job-r', config)]);
+    assert.deepEqual(outcomes.map((o) => o.status).sort(), ['fulfilled', 'rejected']);
+    assert.match(String((outcomes.find((o) => o.status === 'rejected') as PromiseRejectedResult).reason), /"job-r" is already being resumed/);
+    const resumed = (outcomes.find((o) => o.status === 'fulfilled') as PromiseFulfilledResult<Awaited<ReturnType<typeof framework.resumeAgent>>>).value;
+    membrane.script('job-r', say('job-r again'));
+    assert.equal((await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager)).speech, 'job-r again');
+    assert.equal(framework.getAgentRecord('job-r')?.incarnation, 2);
+  });
+
+  it('a resume refused for its configuration leaves the job free to resume', async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('job-v', say('job-v done'));
+    const made = await framework.createEphemeralAgent(
+      { name: 'job-v', model: 'test-model', systemPrompt: 'Do the task.' },
+      workerSpec('job-v', { spawnedBy: 'mira' }),
+    );
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await framework.runEphemeralToCompletion(made.agent, made.contextManager);
+    await assert.rejects(
+      framework.resumeAgent('job-v', { model: 'test-model', systemPrompt: 'Do the task.', promptCaching: 'yes' as unknown as boolean }),
+      /promptCaching/,
+    );
+    const resumed = await framework.resumeAgent('job-v', { model: 'test-model', systemPrompt: 'Do the task.' });
+    resumed.cleanup();
+  });
 });
 
 describe('Dendrite restart', () => {

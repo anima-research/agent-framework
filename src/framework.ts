@@ -4022,7 +4022,7 @@ export class AgentFramework {
    * (config.dendrite.collapseDerivationNoticesAfter; 0 = never collapse).
    */
   private collapseDerivationNoticesAfter = 10;
-  /** The host's say over every derivation and spawn (config.dendrite.beforeDerive). */
+  /** The host's say over each derivation, ephemeral spawn and resume (config.dendrite.beforeDerive). */
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
   /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, the default line. */
   private derivationNoticeHook?: (record: AgentRecord, from: string, defaultText: string) => string | null;
@@ -4045,6 +4045,7 @@ export class AgentFramework {
   private readonly releasesAfterResume = new Map<string, Agent>();
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
+  private readonly resumesPending = new Set<string>();
   // context-manager 0.23.1: a strategy that keeps its context, as
   // AutobiographicalStrategy does (hostContext, autobiographical.ts:2897),
   // keeps its manager reachable while its work is pending, since the
@@ -10934,6 +10935,9 @@ export class AgentFramework {
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
+    if (this.resumesPending.has(name)) {
+      throw new Error(`resumeAgent: "${name}" is already being resumed`);
+    }
     if (this.registry.has(name) || this.agents.has(name) || this.ephemeralRuns.has(name)) {
       throw new Error(`resumeAgent: "${name}" is still registered; only an ended agent resumes`);
     }
@@ -10952,38 +10956,66 @@ export class AgentFramework {
         : {}),
       ...(config.presentAs === undefined && record.presentAs ? { presentAs: record.presentAs } : {}),
     };
-    const contextManager = await this.reopenAgentContext(record, config.strategy);
-
-    const agent = new Agent(fullConfig, contextManager, this.membrane);
-    this.adoptToolResultGuard(agent);
-    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-
     const spawnedBy = record.relationships.spawnedBy;
     const resultTo = record.relationships.resultTo;
     const keepSpawner = spawnedBy !== undefined && this.registry.has(spawnedBy);
+    const spec: AgentSpec = {
+      name,
+      kind: record.kind,
+      model: fullConfig.model,
+      roles: record.roles,
+      lifetime: record.lifetime,
+      ...(record.activation ? { activation: record.activation } : {}),
+      ...(keepSpawner ? { spawnedBy, onParentEnd: record.onParentEnd } : {}),
+      ...(resultTo && this.registry.has(resultTo.to) ? { resultTo } : {}),
+      ...(record.inherit ? { inherit: record.inherit } : {}),
+      ...(fullConfig.selfParticipants?.length ? { selfParticipants: fullConfig.selfParticipants } : {}),
+      ...(fullConfig.presentAs && fullConfig.presentAs !== name ? { presentAs: fullConfig.presentAs } : {}),
+      ...(record.namespace ? { namespace: record.namespace } : {}),
+      ...(record.metadata ? { metadata: record.metadata } : {}),
+    };
+    if (this.beforeDerive) {
+      const verdict = this.beforeDerive(spec);
+      if (verdict && typeof verdict === 'object' && 'refuse' in verdict) {
+        throw new Error(`${name} was not resumed: ${verdict.refuse}`);
+      }
+    }
+
+    this.resumesPending.add(name);
+    const release: ManagerRelease = { released: false, calls: new Set() };
+    let contextManager: ContextManager;
+    try {
+      contextManager = await this.reopenAgentContext(record, config.strategy, this.ephemeralAuxiliaryMembraneFor(name, release));
+    } catch (error) {
+      this.resumesPending.delete(name);
+      throw error;
+    }
+    this.trackManager(contextManager);
+    release.manager = contextManager;
+    let agent: Agent;
+    try {
+      if (this.registry.has(name) || this.agents.has(name) || this.ephemeralRuns.has(name)) {
+        throw new Error(`resumeAgent: "${name}" was registered while it was being resumed`);
+      }
+      agent = new Agent(fullConfig, contextManager, this.membrane);
+      this.adoptToolResultGuard(agent);
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    } catch (error) {
+      this.resumesPending.delete(name);
+      this.closeManager(contextManager);
+      throw error;
+    }
+
     this.usedEphemeralAgentNames.set(name, 'run'); // a resumed job is an ephemeral run: no global fallback (takesGlobalFallback)
     this.ephemeralAgents.add(agent); // and its usage counts in the shared ephemeral entry (#558)
-    this.ephemeralCandidates.set(agent, {
-      contextManager,
-      config: fullConfig,
-      resume: true,
-      spec: {
-        name,
-        kind: record.kind,
-        model: fullConfig.model,
-        roles: record.roles,
-        lifetime: record.lifetime,
-        ...(record.activation ? { activation: record.activation } : {}),
-        ...(keepSpawner ? { spawnedBy, onParentEnd: record.onParentEnd } : {}),
-        ...(resultTo && this.registry.has(resultTo.to) ? { resultTo } : {}),
-        ...(record.inherit ? { inherit: record.inherit } : {}),
-        ...(fullConfig.selfParticipants?.length ? { selfParticipants: fullConfig.selfParticipants } : {}),
-        ...(fullConfig.presentAs && fullConfig.presentAs !== name ? { presentAs: fullConfig.presentAs } : {}),
-        ...(record.namespace ? { namespace: record.namespace } : {}),
-        ...(record.metadata ? { metadata: record.metadata } : {}),
-      },
-    });
-    return { agent, contextManager, cleanup: () => {} };
+    this.ephemeralCandidates.set(agent, { contextManager, config: fullConfig, resume: true, spec });
+    this.managerReleases.set(agent, release);
+    const cleanup = () => {
+      if (this.ephemeralCandidates.has(agent)) this.resumesPending.delete(name);
+      this.releasedByCleanup.add(agent);
+      this.releaseManager(agent);
+    };
+    return { agent, contextManager, cleanup };
   }
 
   /**
@@ -11028,7 +11060,7 @@ export class AgentFramework {
   }
 
   /** Open the context an ended agent left, wherever it lives. */
-  private async reopenAgentContext(record: AgentRecord, strategy?: ContextStrategy): Promise<ContextManager> {
+  private async reopenAgentContext(record: AgentRecord, strategy?: ContextStrategy, membrane: Membrane = this.membrane): Promise<ContextManager> {
     // The residents' view as createAgent gives it: held rows out, and another
     // agent's stored context injections out, since those are that agent's
     // context, not conversation (Weft's ninth-round probe: an ended reader
@@ -11069,7 +11101,7 @@ export class AgentFramework {
         store: this.store,
         derivation,
         strategy: strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        membrane,
         ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
@@ -11088,7 +11120,7 @@ export class AgentFramework {
       namespace: record.namespace,
       ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : { isolate: true }),
       strategy: strategy ?? new PassthroughStrategy(),
-      membrane: this.membrane,
+      membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
     return sees ? seen(opened, sees) : opened;
@@ -12079,6 +12111,7 @@ export class AgentFramework {
     // Consume before any await/registration: the exact (Agent, ContextManager)
     // generation is one-shot even if startup later fails.
     this.ephemeralCandidates.delete(agent);
+    if (candidate.resume) this.resumesPending.delete(agent.name);
     if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
       throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
     }
