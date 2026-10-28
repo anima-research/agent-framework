@@ -962,6 +962,8 @@ export type TraceEvent =
       incarnation: number;
       reason: string;
       by?: string;
+      /** The agent that spawned it, when its record names one. */
+      spawnedBy?: string;
     })
   | (TraceEventBase & {
       /** The last event a replay of create()'s traces delivers when the

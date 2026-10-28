@@ -11837,6 +11837,7 @@ export class AgentFramework {
         incarnation: record.incarnation,
         reason: record.ended?.reason ?? 'stopped',
         ...(record.ended?.by ? { by: record.ended.by } : {}),
+        ...(record.relationships.spawnedBy ? { spawnedBy: record.relationships.spawnedBy } : {}),
       });
     }
     for (const record of outcome.cascaded) this.teardownEndedAgent(record);
@@ -12088,6 +12089,7 @@ export class AgentFramework {
         kind: record.kind,
         incarnation: record.incarnation,
         reason: 'host-restart',
+        ...(record.relationships.spawnedBy ? { spawnedBy: record.relationships.spawnedBy } : {}),
       });
       const route = record.relationships.resultTo;
       if (route?.as !== 'message' || !this.agents.has(route.to)) continue;

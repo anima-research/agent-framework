@@ -718,6 +718,18 @@ describe('Dendrite lifecycle', () => {
     second.cleanup();
   });
 
+  it("an ended spawned agent's agent-ended trace names its spawner", async () => {
+    const framework = await boot();
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    framework.start();
+    const worker = await startBlocked(framework, 'worker-s', 'g-s', workerSpec('worker-s', { spawnedBy: 'oren' }));
+    framework.stopAgent('worker-s', { by: 'mira' });
+    await worker.settled;
+    const ended = traces.find((t) => t.type === 'dendrite:agent-ended' && t.agentName === 'worker-s') as { spawnedBy?: string } | undefined;
+    assert.equal(ended?.spawnedBy, 'oren');
+    gates.release('g-s');
+  });
 });
 
 describe('Dendrite restart', () => {
@@ -818,6 +830,18 @@ describe('Dendrite restart', () => {
     const third = await process(new GateModule());
     assert.equal(third.getAgentRecord('mira')!.incarnation, 3);
     assert.equal(textsIn(third, 'mira').filter((m) => m.metadata.kind === 'agent-lifecycle').length, 1);
+  });
+
+  it("a job a restart interrupted is ended in a trace that names its spawner", async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    await blockedJob(first, gates1, 'job-t', workerSpec('job-t', { spawnedBy: 'mira' }));
+    const second = await process(new GateModule());
+    const traces: TraceEvent[] = [];
+    second.onTrace((event) => traces.push(event), { replay: true });
+    const ended = traces.find((t) => t.type === 'dendrite:agent-ended' && t.agentName === 'job-t') as { reason?: string; spawnedBy?: string } | undefined;
+    assert.deepEqual([ended?.reason, ended?.spawnedBy], ['host-restart', 'mira']);
   });
 
   it('a job interrupted by a restart resumes on its own context and still returns its result', async () => {
