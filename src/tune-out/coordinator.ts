@@ -516,7 +516,7 @@ export class TuneOutCoordinator {
   enter(
     serverId: string,
     channelId: string,
-    opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
+    opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string; alreadyTunedOut?: true } {
     // No reader (issue #232 §3.3): a silent hold, where the host opted into
@@ -888,7 +888,7 @@ export class TuneOutCoordinator {
 
   enterAllExcept(
     except: { serverId: string; channelId: string },
-    opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
+    opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: AllExceptParams } | { ok: false; error: string } {
     const read = this.readOptions(opts, {

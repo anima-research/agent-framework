@@ -85,6 +85,11 @@ describe('tune-out, all-except scope', () => {
       assert.equal(report.allExcept!.epochId, scope.epochId);
       assert.deepEqual(report.allExcept!.held, { noisy: 2, other: 1 });
       assert.deepEqual(report.peek, ['antra: noise two'], 'peek shows the newest held line, capped');
+      const viaTool = await internals(f).handleTuneOutTool('agent', { mode: 'check', peek: 'noisy', peekLimit: '1' });
+      assert.deepEqual((viaTool.data as { peek?: string[] }).peek, ['antra: noise two'], "the tool reads peekLimit's numeric string as its number");
+      const refused = await internals(f).handleTuneOutTool('agent', { mode: 'check', peek: 'noisy', peekLimit: 'many' });
+      assert.equal(refused.success, false);
+      assert.match(refused.error ?? '', /peekLimit must be a finite number of lines, and it was the string "many"/);
       assert.ok(internals(f).tuneOutCoordinator!.getAllExcept(), 'still active');
       assert.equal(stored(f).filter(held).length, 3, 'nothing released');
       assert.ok(!has(f, '<tuned-out-backlog'), 'no release notice');
@@ -195,6 +200,21 @@ describe('tune-out, all-except scope', () => {
       const second = internals(f).tuneOutCoordinator!.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool');
       assert.equal(second.ok, false);
       assert.match((second as { error: string }).error, /already/);
+    } finally { await f.close(); }
+  });
+
+  it("the tool reads a numeric string as its number and refuses a value that gives none, naming it, as the coordinator does", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const i = internals(f);
+      const soon = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 'soon' });
+      assert.equal(soon.success, false);
+      assert.match(soon.error ?? '', /durationSeconds must be a finite number of seconds, and it was the string "soon"/);
+      assert.equal(i.tuneOutCoordinator!.getAllExcept(), null, 'nothing changed');
+      const entered = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: '120', backlogCap: '7' });
+      assert.ok(entered.success, entered.error);
+      assert.equal(i.tuneOutCoordinator!.getAllExcept()!.params.backlogCap, 7);
     } finally { await f.close(); }
   });
 

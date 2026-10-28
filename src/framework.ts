@@ -36088,7 +36088,6 @@ export class AgentFramework {
     const openThrew = (err: unknown): string =>
       'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
       `failed: ${thrownText(err)}`;
-    const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
     const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
     const allExcept = input.scope === 'all-except';
 
@@ -36104,7 +36103,14 @@ export class AgentFramework {
         if ('error' in resolved) return { success: false, error: this.unknownChannelWords(input.peek, resolved.error, own), isError: true };
         peek = { serverId: resolved.serverId, channelId: resolved.channelId };
       }
-      return { success: true, data: coordinator.check({ ...(peek ? { peek } : {}), peekLimit: num(input.peekLimit) }) };
+      // Read as the other options are (readOptions): a numeric string is its
+      // number, and a value that gives none is refused, named.
+      const peekLimit = input.peekLimit == null ? undefined : Number(input.peekLimit);
+      if (peekLimit !== undefined && !Number.isFinite(peekLimit)) {
+        const got = typeof input.peekLimit === 'string' ? `the string ${JSON.stringify(input.peekLimit)}` : `the value ${JSON.stringify(input.peekLimit)}`;
+        return { success: false, error: `Nothing was checked: peekLimit must be a finite number of lines, and it was ${got}. Leave it out for 5.`, isError: true };
+      }
+      return { success: true, data: coordinator.check({ ...(peek ? { peek } : {}), ...(peekLimit !== undefined ? { peekLimit } : {}) }) };
     }
     if (input.mode === 'cancel' && (allExcept || (!input.channelId && coordinator.getAllExcept()))) {
       const r = coordinator.cancelAllExcept('agent-tool', 'agent request');
@@ -36127,10 +36133,10 @@ export class AgentFramework {
     }
     if (allExcept) {
       const r = coordinator.enterAllExcept(resolved, {
-        cadenceSeconds: num(input.cadenceSeconds),
-        backlogCap: num(input.backlogCap),
-        maxWakes: num(input.maxWakes),
-        durationSeconds: num(input.durationSeconds),
+        cadenceSeconds: input.cadenceSeconds,
+        backlogCap: input.backlogCap,
+        maxWakes: input.maxWakes,
+        durationSeconds: input.durationSeconds,
       }, 'agent-tool');
       if (!r.ok) return { success: false, error: r.error, isError: true };
       return {
@@ -36150,10 +36156,10 @@ export class AgentFramework {
       };
     }
     const r = coordinator.enter(resolved.serverId, resolved.channelId, {
-      cadenceSeconds: num(input.cadenceSeconds),
-      backlogCap: num(input.backlogCap),
-      maxWakes: num(input.maxWakes),
-      durationSeconds: num(input.durationSeconds),
+      cadenceSeconds: input.cadenceSeconds,
+      backlogCap: input.backlogCap,
+      maxWakes: input.maxWakes,
+      durationSeconds: input.durationSeconds,
     }, 'agent-tool');
     if (!r.ok) {
       // tune_out repeated on a channel already tuned out is where an agent
