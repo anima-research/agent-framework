@@ -18356,11 +18356,11 @@ export class AgentFramework {
         .map((b) => b.text)
         .join('\n'),
       gateMetadata: {
+        ...(origin ?? {}),
         serverId: occ.serverId,
         featureSet: push.featureSet,
         eventId: occ.eventId,
         eventType: 'mcpl:push-event',
-        ...(origin ?? {}),
         ...(occ.tags ? { tags: occ.tags } : {}),
       },
     });
@@ -18656,11 +18656,11 @@ export class AgentFramework {
         .map((b) => b.text)
         .join('\n'),
       gateMetadata: {
+        ...(event.origin ?? {}),
         serverId: event.serverId,
         featureSet: event.featureSet,
         eventId: event.eventId,
         eventType: 'mcpl:push-event',
-        ...(event.origin ?? {}),
         ...(event.tags ? { tags: event.tags } : {}),
       },
     });
