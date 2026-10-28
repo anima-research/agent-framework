@@ -282,8 +282,8 @@ export class ModuleRegistry {
   /**
    * All utilities from all modules, namespaced exactly like tools
    * (`module--name`). See Module.getUtilities — these are deliberately kept
-   * out of the model-facing tool list and surfaced through the framework's
-   * `utils` meta-tool; dispatch goes through the same handleToolCall.
+   * out of the model-facing tool list and presented in the host's built-in
+   * toolset; dispatch goes through the same handleToolCall.
    */
   getAllUtilities(): ToolDefinition[] {
     const utilities: ToolDefinition[] = [];
@@ -300,8 +300,8 @@ export class ModuleRegistry {
 
   /**
    * A module tool's call for a path that stores or sends its result: the
-   * model's dispatch, a script's inner call, the `utils` meta-tool for a
-   * model. The result is checked and read once, in its JSON form
+   * model's dispatch (a `toolsets--act` call of it included), a script's
+   * inner call. The result is checked and read once, in its JSON form
    * ({@link storableToolResult}).
    */
   async storableToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
@@ -320,9 +320,8 @@ export class ModuleRegistry {
    * So is a call membrane marked `unparseableInput`, unless its text is JSON
    * `null`, which reaches the module as a call with no arguments
    * (markedInputRefusal).
-   * A caller that has already resolved the tool's definition, as the `utils`
-   * tool has a utility's, passes it as `definition`, and it's checked against
-   * that one.
+   * A caller that has already resolved the tool's definition passes it as
+   * `definition`, and it's checked against that one.
    */
   async handleToolCall(given: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
     const marked = markedInputRefusal(given);
