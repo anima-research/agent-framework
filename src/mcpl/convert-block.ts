@@ -63,7 +63,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       }
       if (isFilledString(block.uri)) {
         if (referenceRegistry.findByUri(block.uri)?.payloadNever) {
-          return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+          return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
         }
         return {
           type: 'image',
