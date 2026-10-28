@@ -1919,6 +1919,9 @@ describe('the framework wires the reply judge', () => {
       modules: [],
       gate: { configPath: join(dir, 'gate.json'), config: JUDGED },
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false as const }) },
+      // A failed turn nothing sends again: a re-armed one is held, as
+      // exhausted-turn-rearm's judge test has it.
+      exhaustedTurnRearmMs: false,
     });
     t.after(async () => {
       useRealClock();

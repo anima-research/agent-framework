@@ -463,6 +463,8 @@ test("a judge rule's wake while the agent waits is judged as usual, and the judg
   const told = [JSON.stringify(request.system ?? ''), ...request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '')].join('\n');
   const when = /- in (\d+) s: a turn whose retries ran out, sent again \(1 of 1\)/.exec(told);
   assert.ok(when, 'the judge is told of the re-arm');
+  assert.match(told, /resident's last turn, \d+s ago, failed and may not have answered all of what woke it\. A wake for resident is held, due to be let go in \d+ s\./,
+    'and that the failed turn is held, not that nothing runs it again');
   const leastLeft = Math.floor((heldUntil - membrane.judgedAt[1]!) / 1000);
   const mostLeft = Math.ceil((heldUntil - saidAt) / 1000);
   assert.ok(Number(when[1]) >= leastLeft && Number(when[1]) <= mostLeft, `and when it comes: in ${when[1]} s, between ${leastLeft} and ${mostLeft}`);
