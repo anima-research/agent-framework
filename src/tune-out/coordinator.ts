@@ -917,25 +917,38 @@ export class TuneOutCoordinator {
     const key = TuneOutCoordinator.SCOPE_KEY;
     const expiry = this.expiryTimers.get(key);
     if (expiry) clearTimeout(expiry);
-    armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
-      this.expiryTimers.delete(key);
-      this.cancelAllExcept('duration', 'duration elapsed');
-    });
+    // As a channel's timers: the next turn is armed before this one's work,
+    // and a throw is reported (timerFailed) rather than left to end the host.
+    const { serverId: exceptServer, channelId: exceptChannel } = params.except;
+    const holdExpiry = (timer: ReturnType<typeof setTimeout>): void => { this.expiryTimers.set(key, timer); };
+    const end = (): void => {
+      try {
+        holdExpiry(setTimeout(end, EXPIRY_RETRY_MS));
+        if (!this.cancelAllExcept('duration', 'duration elapsed').ok) this.clearScopeTimers();
+      } catch (err) {
+        this.timerFailed('expiry', exceptServer, exceptChannel, err);
+      }
+    };
+    armAt(params.expiresAtMs, holdExpiry, end);
     if (!this.readerAvailable()) return;
     const cadence = this.cadenceTimers.get(key);
     if (cadence) clearTimeout(cadence);
     const hold = (timer: ReturnType<typeof setTimeout>): void => { this.cadenceTimers.set(key, timer); };
     const tick = () => {
-      const scope = this.getAllExcept();
-      if (!scope) return;
-      // One look per held channel with new traffic since the last look.
-      for (const [channelKey, diverted] of this.divertedSinceInvocation) {
-        if (diverted <= 0) continue;
-        const [serverId, channelId] = channelKey.split('\0') as [string, string];
-        if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue; // a per-channel epoch's own cadence
-        this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+      try {
+        const scope = this.getAllExcept();
+        if (!scope) return;
+        armAfter(params.cadenceSeconds * 1000, hold, tick);
+        // One look per held channel with new traffic since the last look.
+        for (const [channelKey, diverted] of this.divertedSinceInvocation) {
+          if (diverted <= 0) continue;
+          const [serverId, channelId] = channelKey.split('\0') as [string, string];
+          if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue; // a per-channel epoch's own cadence
+          this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+        }
+      } catch (err) {
+        this.timerFailed('cadence', exceptServer, exceptChannel, err);
       }
-      armAfter(params.cadenceSeconds * 1000, hold, tick);
     };
     armAfter(params.cadenceSeconds * 1000, hold, tick);
   }
