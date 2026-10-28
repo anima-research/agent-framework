@@ -21066,7 +21066,6 @@ export class AgentFramework {
     const pin = routing.locus ?? null;
     const key = destinationKey(channel);
     if (sameChannel(channel, pin) || routing.addressedElsewhere.has(key)) return undefined;
-    routing.addressedElsewhere.add(key);
     const where = pin ? `still lands in ${this.channelShown(pin)}` : 'stays in your archive (no channel)';
     const content: ContentBlock[] = [{
       type: 'text',
@@ -21078,12 +21077,27 @@ export class AgentFramework {
         `Your plain speech ${where} this turn; reaching them takes an explicit send.`,
     }];
     const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
+    const before = this.storedCountOf(agent);
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
+      routing.addressedElsewhere.add(key);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       return { participant: 'user', content, metadata };
     } catch (err) {
-      console.error('addressed-elsewhere notice: failed to record routing notice:', err);
+      // A write can throw after its row landed, as storeInjections' can: a
+      // notice that landed is the turn's notice for the channel, as one
+      // stored without a throw is.
+      const text = (content[0] as { text: string }).text;
+      const landed = before === undefined ? undefined : this.storedSince(agent, before, (m) =>
+        (m.metadata as { kind?: unknown } | undefined)?.kind === 'routing-notice'
+          && m.content.some((b) => b.type === 'text' && (b as { text: string }).text === text),
+      'routing', 'the addressed-elsewhere notice');
+      if (landed && landed.length > 0) {
+        routing.addressedElsewhere.add(key);
+        console.error(`addressed-elsewhere notice: ${agent.name}: the notice landed though its write threw:`, err);
+        return { participant: 'user', content, metadata };
+      }
+      console.error(`addressed-elsewhere notice: failed to record routing notice${landed ? '' : ' (whether it landed is unknown)'}:`, err);
       return undefined;
     }
   }
