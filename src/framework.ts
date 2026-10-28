@@ -11318,13 +11318,13 @@ export class AgentFramework {
     if (run) {
       run.endReason ??= 'stopped';
       run.endedBy ??= options.by;
-    }
-    const cancelled = this.abortInference(name, options.reason ?? 'cancelled');
-    if (run && !cancelled) {
-      // Nothing in flight to abort (startup, or between rounds): settle the
-      // awaiting caller directly so the job still ends.
+      // The awaiting caller is told who stopped the job and why, whether or
+      // not a stream was in flight: settled first, so the aborted stream's own
+      // settle ('Stream cancelled') finds the run already settled. The caller's
+      // teardown runs after this call, as for stopAgent.
       run.settle.reject(new AgentStoppedError(name, 'stopped', options.by, options.reason));
     }
+    const cancelled = this.abortInference(name, options.reason ?? 'cancelled');
     if (cancelled || run) {
       this.emitTrace({
         type: 'dendrite:activation-cancelled',

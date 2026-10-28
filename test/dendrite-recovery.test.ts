@@ -14,6 +14,7 @@
  * - a worker's namespace is where its context opens;
  * - an agent that ended past the registry's memory is still found;
  * - a finished orphan's held result is told of and can be adopted;
+ * - a cancelled job's caller hears who cancelled it and why.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -269,5 +270,17 @@ describe('the registry\'s recovery', () => {
     const record = first.reparentAgent('job', 'oren', { by: 'oren' });
     assert.equal(record.ended?.reason, 'completed', 'the record stays as it ended');
     assert.equal(rowsWith(first, 'oren', 'RESULT-1').length, 1, 'and the result reaches oren');
+  });
+
+  it('a job cancelled with its stream in flight rejects with AgentStoppedError naming who and why', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    const worker = await startBlocked(first, gates, 'w', 'g-w', workerSpec('w', { spawnedBy: 'oren' }));
+    assert.equal(first.cancelActivation('w', { by: 'oren', reason: 'changed plans' }), true);
+    const result = await worker.settled;
+    assert.ok(!result.ok && result.error instanceof AgentStoppedError, `rejected with ${result.ok ? 'nothing' : String(result.error)}`);
+    assert.equal((result.error as AgentStoppedError).by, 'oren');
+    assert.match((result.error as Error).message, /changed plans/);
   });
 });
