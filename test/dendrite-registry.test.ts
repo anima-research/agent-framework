@@ -279,6 +279,56 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.deepEqual(state.snapshot!.records.map((r) => r.name).sort(), ['Subconscious', 'mira'], 'and the snapshot no longer lists them');
   });
 
+  it('settles every interrupted end, more than memory keeps, and keeps one whose write fails pending', () => {
+    const state = { snapshot: null as RegistrySnapshot | null, ended: [] as AgentRecord[] };
+    let failFor: string | undefined;
+    const failed: string[] = [];
+    let clock = 1_000;
+    const make = () => new AgentRegistry({
+      now: () => ++clock,
+      endedRetention: 2,
+      persist: (snapshot) => { state.snapshot = JSON.parse(JSON.stringify(snapshot)); },
+      appendEnded: (record) => {
+        if (record.name === failFor) throw new Error('EIO: the ended log');
+        state.ended.push(JSON.parse(JSON.stringify(record)));
+      },
+      onRecordWriteFailed: (what) => { failed.push(what); },
+    });
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    for (const name of ['j1', 'j2', 'j3', 'j4']) first.register(workerSpec(name, { spawnedBy: 'mira' }));
+    // The process dies with four jobs live; memory keeps two ended records.
+    const second = make();
+    assert.equal(second.restore(state.snapshot, state.ended).interrupted.length, 4);
+    assert.deepEqual(second.endedHistory(), [], 'an end not yet written is no history a put-back could write');
+    failFor = 'j3';
+    second.settleInterrupted();
+    assert.deepEqual(state.ended.map((r) => r.name), ['j1', 'j2', 'j4'], 'every end is written but the one that failed');
+    assert.deepEqual(failed, ['the end of j3']);
+    const jobs = () => state.snapshot!.records.filter((r) => r.name.startsWith('j')).map((r) => r.name);
+    assert.deepEqual(jobs(), ['j3'], 'which stays in the snapshot');
+    assert.equal(second.inspect('j3')?.ended?.reason, 'host-restart');
+    failFor = undefined;
+    second.settleInterrupted();
+    assert.deepEqual(state.ended.map((r) => r.name), ['j1', 'j2', 'j4', 'j3'], 'and the next settlement writes it');
+    assert.deepEqual(jobs(), []);
+  });
+
+  it('settles two interrupted incarnations of one name as two ends', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(workerSpec('j', { spawnedBy: 'mira' }));
+    const snapshot = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    const older = snapshot.records.find((r) => r.name === 'j')!;
+    snapshot.records.push({ ...older, incarnation: 2 });
+    snapshot.incarnations.j = 2;
+    const second = make();
+    assert.equal(second.restore(snapshot, []).interrupted.length, 2);
+    second.settleInterrupted();
+    assert.deepEqual(state.ended.filter((r) => r.name === 'j').map((r) => r.incarnation).sort(), [1, 2]);
+  });
+
   it('restores a snapshot whose fork keeps its home as a bare id, as one written before homes carried their server', () => {
     const { state, make } = persisted();
     const first = make();

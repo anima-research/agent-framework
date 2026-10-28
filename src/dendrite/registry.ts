@@ -88,7 +88,7 @@ export class AgentRegistry {
    * recipient (settleInterrupted), so a crash before then owes the same
    * notices at the next boot rather than none.
    */
-  private readonly interruptedPending = new Map<AgentName, AgentRecord>();
+  private readonly interruptedPending = new Map<string, { asWas: AgentRecord; ended: AgentRecord }>();
   private readonly incarnations = new Map<AgentName, number>();
   private mail: HeldMail[] = [];
   private readonly now: () => number;
@@ -228,6 +228,8 @@ export class AgentRegistry {
     for (let i = this.ended.length - 1; i >= 0; i--) {
       if (this.ended[i]!.name === name) return this.ended[i];
     }
+    // An interrupted record trimmed from memory before its end is written.
+    for (const pending of this.interruptedPending.values()) if (pending.ended.name === name) return pending.ended;
     return this.findEnded?.(name);
   }
 
@@ -244,7 +246,8 @@ export class AgentRegistry {
    * so it holds none.
    */
   namespaceHolder(namespace: string, except: AgentName): AgentName | undefined {
-    for (const record of [...this.live.values(), ...this.awaiting.values(), ...this.ended]) {
+    const pending = [...this.interruptedPending.values()].map((entry) => entry.asWas);
+    for (const record of [...this.live.values(), ...this.awaiting.values(), ...pending, ...this.ended]) {
       if (record.name !== except && record.namespace === namespace && record.inherit?.mode !== 'shared') return record.name;
     }
     return undefined;
@@ -519,14 +522,15 @@ export class AgentRegistry {
   // ==========================================================================
 
   snapshot(): RegistrySnapshot {
-    const records = [...this.awaiting.values(), ...this.interruptedPending.values(), ...this.live.values()].map((record) => clone(record));
+    const pending = [...this.interruptedPending.values()].map((entry) => entry.asWas);
+    const records = [...this.awaiting.values(), ...pending, ...this.live.values()].map((record) => clone(record));
     // Counters are kept for identities that can still be referred to: live
     // agents, persistent agents awaiting re-declaration, and ended agents
     // still in retention. A single-use name that has aged out restarts at 1.
     const referable = new Set<AgentName>([
       ...this.live.keys(),
       ...this.awaiting.keys(),
-      ...this.interruptedPending.keys(),
+      ...pending.map((record) => record.name),
       ...this.ended.map((record) => record.name),
     ]);
     const incarnations: Record<AgentName, number> = {};
@@ -587,8 +591,9 @@ export class AgentRegistry {
         this.awaiting.set(record.name, record);
         continue;
       }
-      this.interruptedPending.set(record.name, clone(record));
+      const asWas = clone(record);
       this.pushEnded(record, 'host-restart');
+      this.interruptedPending.set(`${record.name}#${record.incarnation}`, { asWas, ended: clone(record) });
       interrupted.push(record);
     }
     if (dropped) this.persist();
@@ -598,23 +603,23 @@ export class AgentRegistry {
   /**
    * The host has told each interrupted job's recipient (restore's
    * `interrupted`): their ends are written now, and the snapshot no longer
-   * lists them. A record of what the restart did, so a failed write alerts
-   * and the next write carries it.
+   * lists them. Each pending entry carries its own end, as memory keeps only
+   * the newest `endedRetention`. An end whose write fails is reported and
+   * stays pending, so the snapshot still lists it and a later settlement (the
+   * next boot's) writes it; a failed snapshot write is reported too.
    */
   settleInterrupted(): void {
     if (this.interruptedPending.size === 0) return;
-    this.recording(() => {
-      for (const pending of this.interruptedPending.values()) {
-        for (let i = this.ended.length - 1; i >= 0; i--) {
-          const record = this.ended[i]!;
-          if (record.name !== pending.name || record.incarnation !== pending.incarnation) continue;
-          this.appendEndedRecord(record);
-          break;
-        }
+    for (const [key, { ended }] of [...this.interruptedPending]) {
+      try {
+        this.appendEndedFn?.(clone(ended));
+      } catch (error) {
+        this.onRecordWriteFailed(`the end of ${ended.name}`, error);
+        continue;
       }
-      this.interruptedPending.clear();
-      this.persist();
-    });
+      this.interruptedPending.delete(key);
+    }
+    this.recording(() => this.persist());
   }
 
   /**
@@ -722,7 +727,12 @@ export class AgentRegistry {
 
   /** The ended records in memory, newest last. */
   endedHistory(): AgentRecord[] {
-    return this.ended.map(clone);
+    // An interrupted end not yet written isn't history yet: written into the
+    // ended file early, it would let a crash drop the record before its
+    // recipient is told (restore drops what the ended history holds).
+    return this.ended
+      .filter((record) => !this.interruptedPending.has(`${record.name}#${record.incarnation}`))
+      .map(clone);
   }
 
   /** Persist a record of something that has already happened: a failure
