@@ -1,19 +1,20 @@
 - **A module no longer acts once its `stop()` has completed,** through
-  `removeModule()` or the framework's `stop()`, except to answer a tool
-  call it was already running (below). Before, a removed module's context
-  could go on writing its state and log state, which a later module of the
-  same name then read as its own, adding and editing messages in an
-  agent's window, calling other modules' tools with module origin, pushing
-  events that every remaining module processed, registering or removing
-  speech handlers under its name, sending ops alerts, and receiving
-  traces. And an event already being dispatched could still call the
-  removed module's `onProcess`, with a later namesake's context, apply its
-  response, writing its state update into a namesake's state, and call its
-  speech handler on a namesake; and a turn whose context was being
-  gathered when its removal completed still took its `gatherContext`
-  answer. Now, once a module's `stop()` has completed (a module added
-  again under its name, even the same object, is a new registration, which
-  none of this touches):
+  `removeModule()` or the framework's `stop()`, except that the result its
+  `handleToolCall` returns for a call it was already running is still
+  delivered (below). Before, a removed module's context could go on
+  writing its state and log state, which a later module of the same name
+  then read as its own, adding and editing messages in an agent's window,
+  calling other modules' tools with module origin, pushing events that
+  every remaining module processed, registering or removing speech
+  handlers under its name, sending ops alerts, and receiving traces. And
+  an event already being dispatched could still call the removed module's
+  `onProcess`, with a later namesake's context, apply its response,
+  writing its state update into a namesake's state, and call its speech
+  handler on a namesake; and a turn whose context was being gathered when
+  its removal completed still took its `gatherContext` answer. Now, once a
+  module's `stop()` has completed (a module added again under its name,
+  even the same object, is a new registration, which none of this
+  touches):
   - each push through its context is dropped with a log line, as a push
     after the framework's `stop()` is: per push, since a tool result's line
     names the call, the tool where the event names one, and whether it
@@ -42,13 +43,16 @@
   - a module added later under its name has its `onToolBatchComplete`
     called, even while the stopped module's own hook is still running past
     its bound.
-- **A tool call a module was running when its `stop()` completed still
-  delivers its result,** like a push it made while registered: the agent
-  asked while the module was there, and the result is the true answer to
-  what ran. An error in its place would tell the agent a tool that ran
-  didn't, and dropping it would leave the call unanswered. A response
-  differs because the framework applies a response for the module, after
-  it's gone.
+- **The result a module's `handleToolCall` returns for a call it was
+  running when its `stop()` completed is still delivered,** like a push it
+  made while registered: the agent asked while the module was there, and
+  the result is the true answer to what ran. An error in its place would
+  tell the agent a tool that ran didn't, and dropping it would leave the
+  call unanswered. A response differs because the framework applies a
+  response for the module, after it's gone. A result the module pushes
+  through its context after its stop completes is a push like any other:
+  it's dropped, with the line that names the call, the tool and whether it
+  succeeded.
 - **A module may still write from inside its own `stop()`,** and a module
   whose `stop()` fails stays registered with a working context, for the
   retry.

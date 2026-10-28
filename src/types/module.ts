@@ -283,12 +283,14 @@ export interface AgentSettingsExtension {
  * response of its that hadn't been applied by then, with a line naming what
  * the response asked for if it asked for anything; and it leaves its
  * `gatherContext` answer out of a turn whose answers it hadn't merged by
- * then, with a line if it held injections. A tool call the module was
- * running when its `stop()` completed still delivers its result: the agent
- * asked while the module was registered, and the result is the answer to
- * what ran, whereas a response is something the framework would apply for
- * the module after it's gone. A module whose `stop()` fails stays
- * registered, and its context keeps working.
+ * then, with a line if it held injections. The result its `handleToolCall`
+ * returns for a call it was running when its `stop()` completed is still
+ * delivered: the agent asked while the module was registered, and the
+ * result is the answer to what ran, whereas a response is something the
+ * framework would apply for the module after it's gone. A result it pushes
+ * through its context afterwards is dropped, as its other pushes are. A
+ * module whose `stop()` fails stays registered, and its context keeps
+ * working.
  * References the module already holds, to other modules or to its own
  * timers, aren't the context's, and stay as they are.
  */
