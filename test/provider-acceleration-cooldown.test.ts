@@ -76,11 +76,12 @@ class AlwaysSuccessMembrane extends MockMembrane {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const LONGER_THAN_ANY_START_MS = 60_000;
 
 async function waitFor(framework: AgentFramework, done: () => boolean, what: string): Promise<void> {
-  const deadline = performance.now() + 5_000;
+  const deadline = performance.now() + LONGER_THAN_ANY_START_MS;
   while (!done()) {
-    if (performance.now() > deadline) throw new Error(`${what} did not happen within 5 s`);
+    if (performance.now() > deadline) throw new Error(`${what} did not happen within ${LONGER_THAN_ANY_START_MS} ms`);
     await framework.runUntilIdle();
     await sleep(10);
   }
@@ -92,7 +93,7 @@ function textOf(request: NormalizedRequest): string {
     .map((b) => b.text).join('\n');
 }
 
-test('organization acceleration 429 defers one fresh compile, includes arrivals, and avoids failure breaker', async () => {
+test('organization acceleration 429 defers one fresh compile, includes arrivals, and avoids failure breaker', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'af-provider-cooldown-'));
   const membrane = new AccelerationThenSuccessMembrane();
   const framework = await AgentFramework.create({
@@ -111,6 +112,7 @@ test('organization acceleration 429 defers one fresh compile, includes arrivals,
   };
   internal.providerAccelerationDefaultCooldownMs = 1_000;
   internal.providerAccelerationJitterMs = 0;
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   try {
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
     await framework.runUntilIdle();
@@ -118,13 +120,14 @@ test('organization acceleration 429 defers one fresh compile, includes arrivals,
     assert.equal(internal.consecutiveInferenceFailures.get('resident') ?? 0, 0, 'capacity does not enter hard-down streak');
     assert.equal(internal.providerAccelerationCooldowns.size, 1);
 
+    t.mock.timers.tick(1);
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'arrived during cooldown', metadata: {} });
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 1, 'new arrival is held, not separately inferred');
     assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2);
 
-    await sleep(1_100);
-    await framework.runUntilIdle();
+    t.mock.timers.tick(999);
+    await waitFor(framework, () => membrane.calls.length >= 2, 'the deferred attempt once the cooldown had passed');
     assert.equal(membrane.calls.length, 2, 'one deferred primary attempt');
     assert.match(textOf(membrane.calls[1]!), /first/);
     assert.match(textOf(membrane.calls[1]!), /arrived during cooldown/);
@@ -136,11 +139,13 @@ test('organization acceleration 429 defers one fresh compile, includes arrivals,
     assert.equal(authoredReceipt.length, 0, 'provider admission never authors resident memory');
     const recovery = internal.providerAccelerationLastRecovery.get('resident');
     assert.ok(recovery, 'operational recovery receipt is exposed outside Chronicle');
+    assert.equal(recovery.cooldownMs, 1_000);
     assert.ok(recovery.waitedMs >= recovery.cooldownMs);
     assert.equal(recovery.heldRequests, 2);
     assert.ok(recovery.messageCount > 0);
     assert.equal(recovery.stopReason, 'end_turn');
   } finally {
+    t.mock.timers.reset();
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
