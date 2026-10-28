@@ -3614,8 +3614,9 @@ export class AgentFramework {
   private midTurnInputSignals: Set<string> = new Set();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
-   *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
-   *  first turn's locus is announced once to re-establish the baseline. */
+   *  (KV-safe, no per-turn chatter). Kept in the store as well
+   *  (rememberAnnouncedLocus), so a restart compares with what the agent was
+   *  last told rather than with nothing. */
   private lastAnnouncedLocus: Map<string, ChannelRef | null> = new Map();
 
   // ---- Held prose drafts (src/prose-drafts.ts) ---------------------------
@@ -11582,7 +11583,7 @@ export class AgentFramework {
     }
     const agent = this.agents.get(name);
     if (!agent) return;
-    this.releaseAgentRuntime(agent, this.channelOfHome(record.homeChannel));
+    this.releaseAgentRuntime(agent, this.channelOfHome(record.homeChannel), undefined, record.lifetime.kind === 'persistent');
   }
 
   /**
@@ -11594,7 +11595,7 @@ export class AgentFramework {
    * never read reached no one). The window release delivers what the agent
    * never read to the primary, now or after a resume, as the idle reap did.
    */
-  private releaseAgentRuntime(agent: Agent, home?: ChannelRef, why = 'its agent ended'): void {
+  private releaseAgentRuntime(agent: Agent, home?: ChannelRef, why = 'its agent ended', declared = false): void {
     const name = agent.name;
     if (home && this.conversationRouter?.getBinding(home)?.agentName === name) {
       this.conversationRouter.unbind(home);
@@ -11637,6 +11638,11 @@ export class AgentFramework {
     this.turnRouting.delete(name);
     this.proseSpeechChains.delete(name);
     this.openLogical.delete(name);
+    // What it was last told of where its speech goes goes with it, kept
+    // only for an agent declared by configuration, which comes back under
+    // its name at the next boot: so the stored baselines are those of
+    // agents that are live or come back.
+    if (!declared) this.forgetAnnouncedLocus(name);
     // Its scripts go with it, and leave the map once they've ended: no later
     // run of the name trims them.
     this.codeExecution?.scripts.agentGone(name);
@@ -12214,6 +12220,7 @@ export class AgentFramework {
         this.turnRouting.delete(agent.name);
         this.proseSpeechChains.delete(agent.name);
         this.openLogical.delete(agent.name);
+        this.forgetAnnouncedLocus(agent.name);
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
@@ -17377,6 +17384,7 @@ export class AgentFramework {
       this.turnRouting.delete(agentName);
       this.proseSpeechChains.delete(agentName);
       this.openLogical.delete(agentName);
+      this.forgetAnnouncedLocus(agentName);
       this.codeExecution?.scripts.agentGone(agentName);
     }
     this.settleEndedAgent(this.registry.end(agentName, 'idle-ttl', 'framework', { record: true }));
@@ -20593,17 +20601,56 @@ export class AgentFramework {
     }
   }
 
+  private rememberAnnouncedLocus(agentName: string, locus: ChannelRef | null): void {
+    this.lastAnnouncedLocus.set(agentName, locus);
+    this.writeAnnouncedLocus(agentName, locus ? { serverId: locus.serverId, channelId: locus.channelId } : null);
+  }
+
+  private forgetAnnouncedLocus(agentName: string): void {
+    this.lastAnnouncedLocus.delete(agentName);
+    this.writeAnnouncedLocus(agentName, undefined);
+  }
+
+  /** The stored baseline's entry for the agent set (rememberAnnouncedLocus),
+   *  or removed (undefined) when the agent ends without coming back. */
+  private writeAnnouncedLocus(agentName: string, locus: ChannelRef | null | undefined): void {
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      const loci = { ...((state.announcedLoci as Record<string, ChannelRef | null> | undefined) ?? {}) };
+      if (locus === undefined) {
+        if (!Object.hasOwn(loci, agentName)) return;
+        delete loci[agentName];
+      } else {
+        loci[agentName] = locus;
+      }
+      state.announcedLoci = loci;
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    } catch (err) {
+      console.error(`[routing] ${agentName}: the announced locus wasn't ${locus === undefined ? 'removed from' : 'written to'} the store:`, err);
+    }
+  }
+
   /**
    * Announce-on-change locus notice (turn-frozen routing). Appends a durable
    * `[routing]` window message when the turn's effective outbound locus
    * differs from the last one announced — the agent must never have to guess
    * where its plain prose lands. Durable append (never retracted) keeps the
-   * KV prefix stable; change-only keeps it out of steady-state turns. The
-   * first resolution after boot announces only a non-null locus ("prose has
-   * no destination" is the unremarkable boot default). Never triggers
+   * KV prefix stable; change-only keeps it out of steady-state turns. An
+   * agent never told of a locus, here or before a restart, hears only of a
+   * non-null one ("prose has no destination" is the unremarkable start).
+   * Never triggers
    * inference; never locus-eligible itself (system + no channel metadata).
    */
   private announceLocusIfChanged(agentName: string, locus: ChannelRef | null): void {
+    if (!this.lastAnnouncedLocus.has(agentName)) {
+      try {
+        const stored = (this.store.getStateJson(FRAMEWORK_STATE_ID) as { announcedLoci?: Record<string, ChannelRef | null> } | null)?.announcedLoci;
+        if (stored && Object.hasOwn(stored, agentName)) this.lastAnnouncedLocus.set(agentName, stored[agentName] ?? null);
+      } catch (err) {
+        console.error(`[routing] ${agentName}: the announced locus couldn't be read back, so this turn compares with none:`, err);
+      }
+    }
     const hasBaseline = this.lastAnnouncedLocus.has(agentName);
     const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
     if (hasBaseline ? sameChannel(prev, locus) : locus === null) {
@@ -20637,7 +20684,7 @@ export class AgentFramework {
       );
       // The baseline is what the agent was told: it moves once the notice is
       // stored, so a notice that fails is announced again at the next turn.
-      this.lastAnnouncedLocus.set(agentName, locus);
+      this.rememberAnnouncedLocus(agentName, locus);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       console.error(
         `[routing] ${agentName}: locus ${prev ? qualifiedChannelName(prev) : '(none)'} -> ${locus ? qualifiedChannelName(locus) : '(none)'} (announced in window)`,
@@ -21037,7 +21084,7 @@ export class AgentFramework {
     const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
-      this.lastAnnouncedLocus.set(agent.name, channel);
+      this.rememberAnnouncedLocus(agent.name, channel);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       console.error(`[routing] ${agent.name}: ${cause} re-pin ${prevPin ? qualifiedChannelName(prevPin) : '(none)'} -> ${qualifiedChannelName(channel)}`);
       return { participant: 'user', content, metadata, id };
@@ -35713,7 +35760,7 @@ export class AgentFramework {
               && this.openLogical.get(agentName) === callingTurn) {
               callingTurn.locus = opened;
               noteTurnChannel(callingTurn, opened);
-              this.lastAnnouncedLocus.set(agentName, opened);
+              this.rememberAnnouncedLocus(agentName, opened);
               const inboundOnlyServer = this.channelRegistry?.inboundOnlyServer(opened);
               // The routing word comes first, ahead of any backscroll, so a
               // result cut to its head for being long keeps it.
