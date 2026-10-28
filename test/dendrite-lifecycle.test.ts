@@ -588,6 +588,24 @@ describe('Dendrite lifecycle', () => {
     assert.equal(gate.getSleepState(), null, "oren's sleep ended with oren");
   });
 
+  it('a derivation that fails after its child is made closes the manager it opened, and its name stays used', async () => {
+    const framework = await boot();
+    const openManagers = () => (framework as unknown as { openManagers: Set<WeakRef<object>> }).openManagers.size;
+    const before = openManagers();
+    const source = framework.getAgent('mira')!.getContextManager();
+    const compile = source.compile.bind(source);
+    let failNext = true;
+    source.compile = ((...args: Parameters<typeof compile>) => {
+      if (failNext) { failNext = false; return Promise.reject(new Error('the source would not compile')); }
+      return compile(...args);
+    }) as typeof source.compile;
+    await assert.rejects(framework.deriveAgent({ name: 'fork-c', from: 'mira', mode: 'copy' }), /the source would not compile/);
+    assert.equal(framework.getAgentRecord('fork-c'), null, 'nothing registered');
+    assert.equal(openManagers(), before, "the child's manager is closed");
+    await assert.rejects(framework.deriveAgent({ name: 'fork-c', from: 'mira', mode: 'copy' }), /has been used in this framework/,
+      'what was written under the name stays its own');
+  });
+
 });
 
 describe('Dendrite restart', () => {

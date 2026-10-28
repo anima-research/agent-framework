@@ -10795,27 +10795,44 @@ export class AgentFramework {
     };
 
     const created = await this.createEphemeralAgent(config, specBody);
-    if (options.config?.allowedTools === undefined) {
-      this.toolSurfaceOwners.set(options.name, this.toolSurfaceOwners.get(options.from) ?? options.from);
-    }
-
-    if (!shared) {
-      // The historical copy: the parent's compiled view, its turns renamed
-      // so the child reads its inheritance as its own history.
-      const { messages } = await parent.getContextManager().compile();
-      for (const message of messages) {
-        created.contextManager.addMessage(
-          parent.isOwnParticipant(message.participant) ? options.name : message.participant,
-          message.content,
-        );
+    try {
+      if (this.agents.get(options.from) !== parent) {
+        throw new Error(`deriveAgent: "${options.from}" ended while "${options.name}" was being derived from it`);
       }
-      created.agent.markContextConsumed();
+      if (options.config?.allowedTools === undefined) {
+        this.toolSurfaceOwners.set(options.name, this.toolSurfaceOwners.get(options.from) ?? options.from);
+      }
+
+      if (!shared) {
+        // The historical copy: the parent's compiled view, its turns renamed
+        // so the child reads its inheritance as its own history.
+        const { messages } = await parent.getContextManager().compile();
+        for (const message of messages) {
+          created.contextManager.addMessage(
+            parent.isOwnParticipant(message.participant) ? options.name : message.participant,
+            message.content,
+          );
+        }
+        created.agent.markContextConsumed();
+      }
+      await this.framePendingRound(parent, created.contextManager, options, shared);
+      for (const message of options.framing ?? []) {
+        created.contextManager.addMessage(message.participant, message.content, message.metadata);
+      }
+      return created;
+    } catch (error) {
+      this.discardEphemeralCandidate(created.agent, created.contextManager);
+      throw error;
     }
-    await this.framePendingRound(parent, created.contextManager, options, shared);
-    for (const message of options.framing ?? []) {
-      created.contextManager.addMessage(message.participant, message.content, message.metadata);
-    }
-    return created;
+  }
+
+  private discardEphemeralCandidate(agent: Agent, contextManager: ContextManager): void {
+    this.ephemeralCandidates.delete(agent);
+    this.ephemeralAgents.delete(agent);
+    if (this.toolSurfaceOwners.has(agent.name) && !this.agents.has(agent.name)) this.toolSurfaceOwners.delete(agent.name);
+    this.releaseManager(agent);
+    this.managerReleases.delete(agent);
+    this.closeManager(contextManager);
   }
 
   /**
