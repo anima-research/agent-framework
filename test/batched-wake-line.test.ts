@@ -490,6 +490,15 @@ describe('isNewestContextEntry', () => {
     assert.equal(ask(), false);
   });
 
+  it("still newest with a row the agent's view leaves out after it, as a tune-out's", async () => {
+    command(`dm ev-${++n} 134 1548000000000000001 a DM`);
+    const md = await stored('a DM');
+    internals().addMessage('someone', [{ type: 'text', text: 'diverted after it' }],
+      { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-t-${n}`, tuneOut: { epochId: 'epoch-1' } });
+    await stored('diverted after it');
+    assert.equal(internals().isNewestContextEntry({ eventType: 'mcpl:push-event', serverId: 'discord', eventId: md.eventId as string }), true);
+  });
+
   it('false while a turn is alive (started, or streaming) or a write is deferred for the agent', async () => {
     command(`dm ev-${++n} 134 1548000000000000001 a DM`);
     const md = await stored('a DM');

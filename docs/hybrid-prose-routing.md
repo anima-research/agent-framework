@@ -20,8 +20,9 @@ Two views are intentionally preserved:
   in Chronicle and remains in recent context;
 - **publication:** recipients receive only the envelope body.
 
-At logical turn end, a `[delivered]` receipt names canonical destinations (or a
-bounce explains failure), so authored intent cannot impersonate delivery.
+At logical turn end, unless the turn failed or was stopped, a `[delivered]`
+receipt names canonical destinations (or a bounce explains failure), so
+authored intent cannot impersonate delivery.
 Unprefixed prose after a successful envelope follows that explicit destination
 for the remainder of the turn; a fresh turn begins at its ordinary locus.
 After `>>>skip_reply`, or a `>>>` envelope that is malformed, doesn't resolve

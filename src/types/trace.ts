@@ -150,6 +150,23 @@ export type TraceEvent =
       error: string;
     })
   | (TraceEventBase & {
+      /**
+       * A turn waiting out its error policy's delay before a retry says so:
+       * as the wait begins, with when it is due to end, and again every 60
+       * seconds while it lasts, while its agent is the one registered under
+       * its name, and never after the wait ends (its time coming, a stop, or
+       * an abort). The failure being retried is the `inference:failed` just
+       * before it. A host watching for agents gone quiet can tell a waiting
+       * one from a stuck one by it.
+       */
+      type: 'inference:waiting';
+      agentName: string;
+      /** When the wait is due to end (epoch ms): it counts down by its
+       *  timers, so a stalled event loop can end it later. Absent for a wait
+       *  too long for a date. */
+      until?: number;
+    })
+  | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
@@ -506,6 +523,24 @@ export type TraceEvent =
       type: 'gate:debounce-delivered';
       policyName: string;
       eventCount: number;
+    })
+  | (TraceEventBase & {
+      /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
+       *  `reply` or `wait` as the judge answered, `error` when it failed,
+       *  timed out or answered nothing usable; `woke` is whether the batch
+       *  then woke the agent (an error does by the host's onError).
+       *  The judge's reason is in the agent's gate_status, not here: it's
+       *  written from the agent's context. */
+      type: 'gate:judge-verdict';
+      policyName: string;
+      verdict: 'reply' | 'wait' | 'error';
+      woke: boolean;
+      eventCount: number;
+      durationMs: number;
+      model?: string;
+      inputTokens?: number;
+      cacheReadTokens?: number;
+      outputTokens?: number;
     })
   | (TraceEventBase & {
       /** A batched wake's turn started without its `[Gate: …]` line (the

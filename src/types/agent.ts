@@ -55,13 +55,15 @@ export interface AgentConfig {
    * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
    * - string[]: exact tool names, including module--utility names for utilities.
-   * Utilities aren't tools of their own: an agent's model and its scripts are
-   * offered them only through 'utils', whose run checks the utility's own
-   * name. An agent that should use a utility lists both 'utils' and
-   * 'module--utility'. The name alone passes the dispatch check for any call
-   * by that name, whether the host makes it with executeToolCall on the
-   * agent's behalf or the model or a script makes it without being offered
-   * it. The slot is hidden when no utility is permitted.
+   * Utilities and the host's other rarely-used tools are in the host's
+   * built-in toolset ("settings"), out of the tool list: the model reaches
+   * them with toolsets--open {toolset:"settings"} and toolsets--act, each
+   * checked under the tool's own name. An agent that should use a utility
+   * from its model lists 'toolsets--open', 'toolsets--act' and
+   * 'module--utility' (an agent without the two meta-tools keeps every other
+   * tool in its list, but no utility). The name alone passes the dispatch
+   * check for any call by that name, whether the host makes it with
+   * executeToolCall on the agent's behalf or the model or a script makes it.
    * Trusted module calls are exempt. Genuinely unidentified public callers,
    * including unknown legacy names, remain unrestricted. Framework-created
    * identities have tool authority only while registered.
@@ -681,6 +683,16 @@ export interface InferenceRequest {
    * addressed one.
    */
   ambient?: true;
+  /**
+   * Host-owned: true when the triggering message's server marked it a
+   * `chat:system` notice (RFC-001 rev 3): an event about the place, such as
+   * a join or the weather changing, not something anyone said. Such a wake
+   * names no channel for its turn's plain speech, though it carries
+   * `channelId`: a turn it starts alone resolves its locus as a heartbeat's
+   * does. Like an ambient one, a wake to read it is done once read. Never
+   * set on a coalesced render's wake, which may fold messages too.
+   */
+  systemNotice?: true;
   /**
    * Who spoke the message that triggered this inference, as an adapter-
    * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display

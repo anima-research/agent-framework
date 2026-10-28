@@ -55,10 +55,10 @@ function u32le(value: number): Buffer {
 }
 
 const INVALID_IMAGES = {
-  signatureOnlyPng: { file: 'signature-only.png', bytes: PNG_SIGNATURE, error: 'Invalid PNG image: work/signature-only.png' },
-  signatureOnlyJpeg: { file: 'signature-only.jpg', bytes: JPEG_SIGNATURE, error: 'Invalid JPEG image: work/signature-only.jpg' },
-  signatureOnlyGif: { file: 'signature-only.gif', bytes: GIF89A_SIGNATURE, error: 'Invalid GIF image: work/signature-only.gif' },
-  signatureOnlyWebp: { file: 'signature-only.webp', bytes: WEBP_SIGNATURE, error: 'Invalid WebP image: work/signature-only.webp' },
+  signatureOnlyPng: { file: 'signature-only.png', bytes: PNG_SIGNATURE, error: `The read_image did nothing: "work/signature-only.png" starts as a PNG image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.` },
+  signatureOnlyJpeg: { file: 'signature-only.jpg', bytes: JPEG_SIGNATURE, error: `The read_image did nothing: "work/signature-only.jpg" starts as a JPEG image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.` },
+  signatureOnlyGif: { file: 'signature-only.gif', bytes: GIF89A_SIGNATURE, error: `The read_image did nothing: "work/signature-only.gif" starts as a GIF image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.` },
+  signatureOnlyWebp: { file: 'signature-only.webp', bytes: WEBP_SIGNATURE, error: `The read_image did nothing: "work/signature-only.webp" starts as a WebP image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.` },
   pngWithoutIdat: {
     file: 'no-idat.png',
     bytes: Buffer.concat([
@@ -79,12 +79,12 @@ const INVALID_IMAGES = {
       Buffer.from('IEND', 'ascii'),
       Buffer.alloc(4),
     ]),
-    error: 'Invalid PNG image: work/no-idat.png',
+    error: `The read_image did nothing: "work/no-idat.png" starts as a PNG image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
   malformedPng: {
     file: 'malformed-chunk.png',
     bytes: Buffer.concat([PNG_SIGNATURE, Buffer.from([0x00, 0x00, 0x00, 0x0d]), Buffer.from('IHDR', 'ascii')]),
-    error: 'Invalid PNG image: work/malformed-chunk.png',
+    error: `The read_image did nothing: "work/malformed-chunk.png" starts as a PNG image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
   zeroDescriptorGif: {
     file: 'zero-descriptor.gif',
@@ -100,7 +100,7 @@ const INVALID_IMAGES = {
       0x00,
       0x3b,
     ]),
-    error: 'Invalid GIF image: work/zero-descriptor.gif',
+    error: `The read_image did nothing: "work/zero-descriptor.gif" starts as a GIF image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
   invalidLzwGif: {
     file: 'invalid-lzw.gif',
@@ -116,7 +116,7 @@ const INVALID_IMAGES = {
       0x00,
       0x3b,
     ]),
-    error: 'Invalid GIF image: work/invalid-lzw.gif',
+    error: `The read_image did nothing: "work/invalid-lzw.gif" starts as a GIF image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
   malformedGif: {
     file: 'malformed-block.gif',
@@ -130,12 +130,12 @@ const INVALID_IMAGES = {
       0x02,
       0x02, 0x4c,
     ]),
-    error: 'Invalid GIF image: work/malformed-block.gif',
+    error: `The read_image did nothing: "work/malformed-block.gif" starts as a GIF image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
   malformedJpeg: {
     file: 'malformed-segment.jpg',
     bytes: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x41, 0x42, 0xff, 0xd9]),
-    error: 'Invalid JPEG image: work/malformed-segment.jpg',
+    error: `The read_image did nothing: "work/malformed-segment.jpg" starts as a JPEG image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
   malformedWebp: {
     file: 'malformed-chunk.webp',
@@ -145,7 +145,7 @@ const INVALID_IMAGES = {
       Buffer.from('WEBPVP8X', 'ascii'),
       Buffer.from([0x0a, 0x00, 0x00, 0x00]),
     ]),
-    error: 'Invalid WebP image: work/malformed-chunk.webp',
+    error: `The read_image did nothing: "work/malformed-chunk.webp" starts as a WebP image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
   vp8xOnlyWebp: {
     file: 'vp8x-only.webp',
@@ -160,7 +160,7 @@ const INVALID_IMAGES = {
         0x00, 0x00, 0x00,
       ]),
     ]),
-    error: 'Invalid WebP image: work/vp8x-only.webp',
+    error: `The read_image did nothing: "work/vp8x-only.webp" starts as a WebP image, but its data doesn't hold together as one. Calling again won't change that; only a whole image in its place would.`,
   },
 } as const;
 
@@ -386,7 +386,7 @@ test('an image that grows past maxFileSize after the open is refused without loa
   assert.ok(TINY_IMAGES.png.bytes.length <= 100, 'within the limit at the open');
   const { result, loaded } = await countingLoads(() => changedAfterFstat(path, () => appendFileSync(path, Buffer.alloc(4096)),
     () => callReadImage(workspace, 'work/growing.png')));
-  assert.equal(result.error, 'Image file exceeds max size (100 bytes): work/growing.png');
+  assert.equal(result.error, `The read_image did nothing: "work/growing.png" is at least 101 bytes, past the 100-byte limit this mount sets on a file, so read_image doesn't show it. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.`);
   assert.ok(loaded <= 101, `loaded ${loaded} bytes: no more than the limit, and the one byte that shows the file goes on`);
 });
 
@@ -399,13 +399,14 @@ test('unknown mount, mount root, directory, unknown/truncated/empty/oversize fil
   writeFileSync(join(mountDir, 'too-large.png'), Buffer.alloc(17, 0xff));
 
   const cases = [
-    { path: 'missing/file.png', error: 'Unknown mount: "missing". Available: work' },
-    { path: 'work', error: 'Path is a directory: work' },
-    { path: 'work/folder', error: 'Path is a directory: work/folder' },
-    { path: 'work/unknown.bin', error: 'Unsupported image format: work/unknown.bin' },
-    { path: 'work/truncated.png', error: 'Truncated image signature: work/truncated.png' },
-    { path: 'work/empty.png', error: 'Image file is empty: work/empty.png' },
-    { path: 'work/too-large.png', error: 'Image file exceeds max size (16 bytes): work/too-large.png' },
+    { path: 'missing/file.png', error: `The read_image did nothing: "missing/file.png" starts with "missing", which is no mount's name, and a path starts with its mount's name; the mounts are "work".` },
+    { path: 'work', error: `The read_image did nothing: "work" names the root of mount "work", which isn't a file; ls "work" lists the files in it.` },
+    { path: 'work/folder', error: `The read_image did nothing: "work/folder" is a directory, not a file; ls "work/folder" lists what's in it.` },
+    { path: 'work/unknown.bin', error: `The read_image did nothing: "work/unknown.bin" isn't a PNG, JPEG, GIF or WebP image, the formats read_image shows. read shows it, if it's text.` },
+    { path: 'work/truncated.png', error: `The read_image did nothing: "work/truncated.png" is too short to be an image: it ends inside an image format's signature. Calling again won't change that; only a whole image in its place would.` },
+    { path: 'work/empty.png', error: `The read_image did nothing: "work/empty.png" is empty, so there's no image in it. Calling again won't change that; only a whole image in its place would.` },
+    { path: 'work/too-large.png', error: 'The read_image did nothing: "work/too-large.png" is 17 bytes, past the 16-byte limit this mount sets on a file, so read_image doesn\'t show it. '
+      + "The limit is the mount's maxFileSize setting, which only whoever runs the host can change." },
   ];
 
   for (const check of cases) {
@@ -444,13 +445,13 @@ test('lexical traversal and symlink escape fail without leaking absolute paths',
   const traversal = await callReadImage(workspace, 'work/../outside/outside.png');
   assert.equal(traversal.success, false);
   assert.equal(traversal.isError, true);
-  assert.equal(traversal.error, 'Path traversal detected: "work/../outside/outside.png" climbs above the root of mount "work".');
+  assert.equal(traversal.error, `The read_image did nothing: "work/../outside/outside.png" climbs above the root of mount "work" with "..", and a path can't leave its mount. Name a file from its own mount's name; the mounts are "work".`);
   assert.ok(!traversal.error?.includes(root));
 
   const escape = await callReadImage(workspace, 'work/escape.png');
   assert.equal(escape.success, false);
   assert.equal(escape.isError, true);
-  assert.equal(escape.error, 'Symlink escape detected: work/escape.png');
+  assert.equal(escape.error, `The read_image did nothing: "work/escape.png" leads through a symlink to a place outside its mount, so the workspace's tools don't reach it. Calling again won't change that; whoever runs this host can mount it, or a directory that holds it.`);
   assert.ok(!escape.error?.includes(root));
   assert.ok(!escape.error?.includes(outsideFile));
 });

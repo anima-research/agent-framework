@@ -172,7 +172,7 @@ test('an unreadable but writable disk copy is refused, not treated as absent', a
   assert.equal(data.materialized.length, 0, 'nothing silently written');
   const skip = (data.skipped ?? []).find((s) => s.reason.includes('script.sh'));
   assert.ok(skip, `the unverifiable path must be listed, got: ${JSON.stringify(data)}`);
-  assert.match(skip!.reason, /EACCES/, 'reason carries the filesystem error');
+  assert.match(skip!.reason, /permission denied/, 'reason carries the filesystem error');
   assert.match(skip!.reason, /force/, 'reason names the override');
 
   // force still overwrites deliberately.

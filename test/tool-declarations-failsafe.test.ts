@@ -221,3 +221,88 @@ describe("toolDeclarations' fail-safe", () => {
     assert.deepEqual(run.inputs, [inputOf(0), inputOf(1), inputOf(2)], 'the latest answer\'s, after each turn');
   });
 });
+
+/** A failure the provider recovers from: a re-arm sends the turn again after it. */
+const overloaded = () => Object.assign(
+  new MembraneError({ type: 'server', retryable: true, message: 'the provider is overloaded', rawError: { status: 503 } }),
+  { httpStatus: 503 },
+);
+
+/**
+ * A resident's first turn adopts its head, and its tools then change. The
+ * second turn's one send fails with `overloaded`, so that turn is re-armed;
+ * the provider answers each request after that with what `later` returns.
+ * The error policy would retry a refusal, and nothing else, so a retry the
+ * re-arm's one-send rule refuses would show as a send.
+ */
+async function rearmed(later: () => Error | undefined) {
+  const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-rearm-'));
+  const membrane = new MockMembrane();
+  membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+    const n = membrane.calls.push(request) - 1;
+    const error = n === 0 ? undefined : n === 1 ? overloaded() : later();
+    return error
+      ? new RefusedStream(error)
+      : new MockYieldingStream([{ ...createMockResponse([{ type: 'text', text: 'done' }]), usage: usageOf(n) } as NormalizedResponse]);
+  };
+  const tools = new ChangingTools();
+  const policyCalls: number[] = [];
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{
+      name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled',
+      toolDeclarations: 'entries', thinkingBinding: { binds: true },
+    }],
+    modules: [new Input(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0, exhaustedTurnRearmMs: [50, 50],
+    errorPolicy: {
+      maxRetries: 1,
+      onInferenceError: (error: Error, _name: string, attempt: number) => {
+        policyCalls.push(attempt);
+        return { retry: error instanceof MembraneError && error.type === 'invalid_request', delayMs: 0 };
+      },
+    },
+  });
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => { traces.push(event); });
+  framework.start();
+  const count = (type: string) => traces.filter((t) => t.type === type).length;
+  const held = () => ((framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { heldRequests: number } }> })
+    .agents.find((a) => a.name === 'resident')!).providerAdmission.heldRequests;
+  const say = (text: string) => framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
+  try {
+    say('first');
+    assert.ok(await pollUntil(() => count('inference:completed') === 1), 'the first turn adopted its head');
+    tools.names = ['a', 'b'];
+    say('second');
+    const done = await pollUntil(() => count('inference:completed') === 2 || count('inference:exhausted') === 2);
+    return { done, calls: membrane.calls, traces, policyCalls, held: held(), completed: count('inference:completed'), exhausted: count('inference:exhausted') };
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("toolDeclarations' fail-safe in a re-armed turn", () => {
+  it('resends a re-armed send refused for its system change once, at once, on the head, and the resend answers the turn', async () => {
+    let refused = 0;
+    const run = await rearmed(() => (refused++ === 0 ? refusal(true) : undefined));
+    assert.ok(run.done, 'the re-armed turn ended');
+    assert.equal(run.completed, 2, 'it completed');
+    assert.equal(run.calls.length, 4, 'the adopting turn, the overloaded send, the re-armed send, its resend');
+    assert.equal(carriesChange(run.calls[2]!), true, 'the re-armed send carried the change');
+    assert.ok(toolNames(run.calls[3]!).includes(B) && !carriesChange(run.calls[3]!), 'the resend went out on the head');
+    assert.equal(resends(run.traces), 1);
+    assert.deepEqual(run.policyCalls, [0], 'the policy saw the overloaded send alone');
+  });
+
+  it('ends a re-armed turn whose resend is refused again, with no third send and no retry, even under a policy that would retry it', async () => {
+    const run = await rearmed(() => refusal(true));
+    assert.ok(run.done, 'the re-armed turn ended');
+    assert.equal(run.exhausted, 2, 'the overloaded turn and the re-armed one ended exhausted');
+    assert.equal(run.calls.length, 4, 'the adopting turn, the overloaded send, the re-armed send, its resend, and nothing after');
+    assert.equal(carriesChange(run.calls[3]!), false, 'the resend carried no change');
+    assert.equal(resends(run.traces), 1);
+    assert.deepEqual(run.policyCalls, [0], 'the policy never saw the re-armed turn\'s refusals');
+    assert.equal(run.held, 0, 'a refusal is no transient failure, so nothing is re-armed');
+  });
+});
