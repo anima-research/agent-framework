@@ -119,7 +119,11 @@ describe('AgentRegistry spec validation', () => {
       () => registry.register(workerSpec('w', { resultTo: { to: 'ghost', as: 'message' } })),
       /result recipient "ghost"/,
     );
-    assert.throws(() => registry.register(taskForkSpec('w', { parent: 'ghost' })), /"ghost" is not a registered agent/);
+    // Spawned by mira, so only the context source names nobody.
+    assert.throws(
+      () => registry.register(taskForkSpec('w', { parent: 'ghost', spawnedBy: 'mira' })),
+      /context source "ghost" is not a registered agent/,
+    );
     assert.throws(
       () => registry.register({ ...workerSpec('w'), observes: [{ agent: 'ghost' }] }),
       /observed agent "ghost"/,

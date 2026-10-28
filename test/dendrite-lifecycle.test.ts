@@ -169,7 +169,8 @@ describe('Dendrite lifecycle', () => {
     gates.release('g1');
     assert.ok((await worker.settled).ok);
     await framework.runUntilIdle();
-    // The job made exactly its own two rounds' worth of requests: one stream.
+    // One stream, which held both of the job's own rounds: the broadcast
+    // started no turn of its own for the job.
     assert.equal(membrane.callsFor('worker-1').length, 1);
     assert.ok(membrane.calls.length >= before + 2);
   });
@@ -320,6 +321,31 @@ describe('Dendrite lifecycle', () => {
     assert.equal(membrane.callsFor('mira').length, 0, 'the primary is not woken for a result routed elsewhere');
   });
 
+  it('refuses to deliver a result whose route is a tool result: the caller awaiting the run already has it', async () => {
+    const framework = await boot();
+    framework.start();
+    const job = await startBlocked(
+      framework,
+      'inline-1',
+      'g1',
+      workerSpec('inline-1', { spawnedBy: 'oren', resultTo: { to: 'oren', as: 'tool-result' } }),
+      'the inline answer',
+    );
+    gates.release('g1');
+    assert.ok((await job.settled).ok);
+    assert.throws(
+      () => framework.deliverAgentResult('inline-1', [{ type: 'text', text: 'the inline answer' }]),
+      /deliverAgentResult: "inline-1" returns its result as a tool-result; the caller awaiting the run delivers it/,
+    );
+    assert.deepEqual(framework.listHeldMail({ from: 'inline-1' }), [], 'nothing is held for delivery');
+    await framework.runUntilIdle();
+    assert.equal(
+      textsIn(framework, 'oren').filter((m) => m.metadata.kind === 'agent-result').length,
+      0,
+      "no second copy lands in the caller's context",
+    );
+  });
+
   it('a derivation tells the agent it was made from — name, kind, weights, inheritance, route, lifetime — and not the fork (#270)', async () => {
     const framework = await boot();
     framework.start();
@@ -333,13 +359,14 @@ describe('Dendrite lifecycle', () => {
     assert.equal(told().length, 1, 'the source hears of the derivation once, as a host-framed lifecycle line');
     const line = told()[0]!;
     assert.equal(line.participant, 'user', 'host-framed, voiced as nobody');
-    for (const fact of ['fork-1', 'task-fork', 'your weights', 'copy of your context', 'returns to you', 'orphaned']) {
+    for (const fact of ['fork-1', 'task-fork', 'your weights', 'copy of your context', 'returns to you', 'it ends when its task does (idle 10 min)', 'orphaned']) {
       assert.ok(line.text.includes(fact), `the notice names ${JSON.stringify(fact)}: ${line.text}`);
     }
-    assert.deepEqual(
-      { ...(line.metadata.dendrite as Record<string, unknown>), lifetime: undefined, inherit: undefined },
-      { event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model', resultTo: { to: 'oren', as: 'message' }, lifetime: undefined, inherit: undefined },
-    );
+    assert.deepEqual(line.metadata.dendrite, {
+      event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model',
+      inherit: { from: 'oren', mode: 'copy' }, resultTo: { to: 'oren', as: 'message' },
+      lifetime: { kind: 'task', idleTimeoutMs: 600_000 },
+    });
     assert.ok(
       !fork.contextManager.getAllMessages().some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle'),
       'the fork never inherits the notice about itself',

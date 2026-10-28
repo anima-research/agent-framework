@@ -15,12 +15,6 @@ import { join } from 'node:path';
 import { AgentFramework, workerSpec } from '../src/index.js';
 import type { AgentSpec, AgentRecord } from '../src/index.js';
 import { RoutedMembrane, say } from './helpers/dendrite.js';
-import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
-
-const derives =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
 
 async function boot(dir: string, dendrite: Record<string, unknown>, membrane = new RoutedMembrane()) {
   const fw = await AgentFramework.create({
@@ -68,7 +62,7 @@ describe('dendrite.beforeDerive', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('refuses a derivation too, before the fork exists', { skip: derives ? false : 'needs ContextManager.derive' }, async () => {
+  it('refuses a derivation too, before the fork exists', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hooks-'));
     try {
       const fw = await boot(dir, { beforeDerive: (spec: AgentSpec) => (spec.kind === 'task-fork' ? { refuse: 'no forks of scout today' } : undefined) });
@@ -79,7 +73,7 @@ describe('dendrite.beforeDerive', () => {
   });
 });
 
-describe('dendrite.derivationNotice', { skip: derives ? false : 'needs ContextManager.derive' }, () => {
+describe('dendrite.derivationNotice', () => {
   const lines = (fw: AgentFramework) => (fw.getAgent('scout')!.getContextManager().getAllMessages() as unknown as Array<{ content: Array<{ text?: string }>; metadata?: { kind?: string } }>)
     .filter((m) => m.metadata?.kind === 'agent-lifecycle').map((m) => m.content.map((b) => b.text ?? '').join(''));
 

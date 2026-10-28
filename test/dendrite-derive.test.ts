@@ -65,8 +65,8 @@ function providerFormat(request: NormalizedRequest) {
     cacheTtl: request.cacheTtl,
   } as never) as unknown as {
     messages: Array<{ role: string; content: Array<Record<string, unknown>> | string }>;
-    system?: unknown;
-    tools?: unknown;
+    systemContent?: unknown;
+    nativeTools?: unknown[];
   };
   return built;
 }
@@ -224,8 +224,10 @@ describe('Dendrite deriveAgent', () => {
 
     const parent = providerFormat(parentRequest);
     const fork = providerFormat(forkRequest);
-    assert.equal(JSON.stringify(fork.system), JSON.stringify(parent.system));
-    assert.equal(JSON.stringify(fork.tools), JSON.stringify(parent.tools));
+    assert.ok(parent.systemContent !== undefined, 'the premise: the formatter gives a system block to compare');
+    assert.ok((parent.nativeTools?.length ?? 0) > 0, 'the premise: and a tool block');
+    assert.equal(JSON.stringify(fork.systemContent), JSON.stringify(parent.systemContent));
+    assert.equal(JSON.stringify(fork.nativeTools), JSON.stringify(parent.nativeTools));
 
     // Up to the boundary: every provider message of the parent's request,
     // and within the last one every block, appears unchanged in the fork's.
