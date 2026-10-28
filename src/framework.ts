@@ -11615,7 +11615,13 @@ export class AgentFramework {
     }
     // Cancel before deregistration: a late stream event is discarded by
     // driveStream's Agent-identity check once the name no longer maps to it.
-    if (this.activeStreams.has(name)) agent.cancelStream();
+    if (this.activeStreams.has(name)) {
+      try {
+        agent.cancelStream();
+      } catch (error) {
+        console.error(`[dendrite] agent=${name} its stream's cancel failed as it ended; it is released all the same:`, error);
+      }
+    }
     this.activeStreams.delete(name);
     this.pendingAssistantBlocks.delete(name);
     this.eventGate?.onInferenceEnded(name);

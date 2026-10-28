@@ -557,6 +557,25 @@ describe('Dendrite lifecycle', () => {
     assert.deepEqual(framework.getAgentRecord('mira')!.relationships.messagePeers, [], 'a path is directional');
     assert.throws(() => framework.sendAgentMessage('ghost', 'mira', []), /sender "ghost" is not a known agent/);
   });
+
+  it("stopping a resident whose stream's cancel throws still leaves nothing running under its ended record", async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('oren', waitCall('g-oren'), say('oren done'));
+    framework.sendAgentMessage('mira', 'oren', [{ type: 'text', text: 'look at this' }]);
+    await until(() => gates.entered.has('g-oren'), 'oren to block on g-oren');
+    framework.getAgent('oren')!.cancelStream = () => { throw new Error('the stream refused to cancel'); };
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      assert.equal(framework.stopAgent('oren', { by: 'mira' }).ended.ended?.reason, 'stopped');
+    } finally { console.error = consoleError; }
+    assert.equal(framework.getAgent('oren'), null, 'no agent runs under the ended record');
+    assert.ok(logged.some((line) => line.includes('the stream refused to cancel')), logged.join('\n'));
+    gates.release('g-oren');
+  });
+
 });
 
 describe('Dendrite restart', () => {
