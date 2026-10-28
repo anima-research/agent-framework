@@ -265,6 +265,30 @@ describe('the registry\'s recovery', () => {
       'and w2\'s end is written now');
   });
 
+  it('a reused name\'s interruption is told although an earlier one of that name and incarnation was', async () => {
+    const store = JsStore.openOrCreate({ path: storePath() });
+    stores.push(store);
+    const paths = { agentRegistryPath: join(tempDir, 'registry.json'), agentRegistryEndedPath: join(tempDir, 'ended.json') };
+    const run = async () => {
+      const gates = new GateModule();
+      const framework = await boot(gates, { store, ...paths });
+      framework.start();
+      await startBlocked(framework, gates, 'w', 'g-w', workerSpec('w', { spawnedBy: 'oren', resultTo: { to: 'oren', as: 'message' } }));
+    };
+    await run(); // w#1 is live when the process dies
+    await boot(new GateModule(), { store, ...paths }); // oren is told, and w's end written
+    // w ages out of memory: its counter and its end leave the recovery files.
+    const registry = JSON.parse(readFileSync(paths.agentRegistryPath, 'utf8')) as { incarnations: Record<string, number> };
+    delete registry.incarnations.w;
+    writeFileSync(paths.agentRegistryPath, JSON.stringify(registry));
+    const ended = JSON.parse(readFileSync(paths.agentRegistryEndedPath, 'utf8')) as { ended: Array<{ name: string }> };
+    writeFileSync(paths.agentRegistryEndedPath, JSON.stringify({ ...ended, ended: ended.ended.filter((r) => r.name !== 'w') }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await run(); // a new w, incarnation 1 again, is live when the process dies
+    const last = await boot(new GateModule(), { store, ...paths });
+    assert.equal(rowsWith(last, 'oren', 'the host restarted while "w"').length, 2, 'oren is told of each');
+  });
+
   it('an app-owned store with neither a storePath nor the recovery paths is warned at create', async () => {
     const store = JsStore.openOrCreate({ path: storePath() });
     stores.push(store);

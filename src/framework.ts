@@ -12113,9 +12113,10 @@ export class AgentFramework {
       // durable and their ends are written (settleInterrupted below), so a
       // crash after it landed, or an end whose write failed, comes here
       // again: a record an earlier interrupted notice to this recipient names
-      // (its key lists each name and incarnation), in the recipient's store
-      // or the restored deferred queue, has been told, however many of that
-      // notice's records have ended since.
+      // (its key lists each name, incarnation and creation time, since a
+      // single-use name that aged out of memory starts again at incarnation
+      // 1), in the recipient's store or the restored deferred queue, has been
+      // told, however many of that notice's records have ended since.
       const toldKeys = new Set<string>();
       const noteTold = (metadata: unknown) => {
         const key = (metadata as { dendrite?: { noticeKey?: unknown } } | undefined)?.dendrite?.noticeKey;
@@ -12124,9 +12125,10 @@ export class AgentFramework {
       for (const message of this.agents.get(recipient)!.getContextManager()
         .queryMessages({ metadata: { 'dendrite.event': 'interrupted' } }).messages) noteTold(message.metadata);
       for (const message of this.deferredMessages) noteTold(message.metadata);
-      const records = all.filter((record) => !toldKeys.has(`${record.name}#${record.incarnation}`));
+      const keyOf = (record: AgentRecord) => `${record.name}#${record.incarnation}@${record.createdAt}`;
+      const records = all.filter((record) => !toldKeys.has(keyOf(record)));
       if (records.length === 0) continue;
-      const noticeKey = records.map((record) => `${record.name}#${record.incarnation}`).sort().join(',');
+      const noticeKey = records.map(keyOf).sort().join(',');
       const names = records.map((record) => `"${record.name}"`).join(', ');
       this.lifecycleNotice(
         recipient,
