@@ -28,6 +28,7 @@ function harness(opts?: { privileged?: boolean }) {
   const registry = {
     // Each channel's id is unique here, so it's shown by its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
+    quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
     getTuneOutState: () => ({ params: PARAMS, wakeCount: 0 }),
     recordTuneOutWake: () => ({ params: PARAMS, wakeCount: 1 }),
     listChannelsRaw: () => [],
@@ -69,6 +70,7 @@ describe('duration expiry', () => {
       // Each channel's id is unique here, so it's shown by its id.
       getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: '#a' } }],
       getTuneOutState: () => ({
         params: { ...PARAMS, expiresAtMs: Date.now() - 5_000 },
@@ -104,6 +106,7 @@ describe('duration expiry', () => {
       // Each channel's id is unique here, so it's shown by its id.
       getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
       enterTuneOut: () => {},
@@ -142,6 +145,7 @@ describe('duration expiry', () => {
       // Each channel's id is unique here, so it's shown by its id.
       getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
       enterTuneOut: (_s: string, _c: string, p: TuneOutParams) => { entered.push(p); },
@@ -177,6 +181,7 @@ describe('dispositions injection', () => {
       // Each channel's id is unique here, so it's shown by its id.
       getDescriptor: (channel: { channelId: string }) => ({ id: channel.channelId }),
       nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
       readCoordinatorState: () => null,

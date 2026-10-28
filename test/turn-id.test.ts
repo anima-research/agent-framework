@@ -271,9 +271,10 @@ test("a script's inner calls carry what its agent had read when the run call sta
   });
 });
 
-test('a utility run through utils carries the turn of the utils call', async () => {
+test('a utility run through toolsets--act carries the turn of the act call', async () => {
   await withFramework({}, async ({ framework, membrane, recorder }) => {
-    queueToolTurn(membrane, { id: 'call-utils', name: 'utils', input: { action: 'run', name: 'test--note', args: {} } });
+    await framework.executeToolCall({ id: 'open-settings', name: 'toolsets--open', input: { toolset: 'settings' }, callerAgentName: 'assistant' });
+    queueToolTurn(membrane, { id: 'call-act', name: 'toolsets--act', input: { tool: 'test--note', args: {} } });
     await runTurn(framework, 'go');
     const note = recorder.calls.filter((c) => c.name === 'note');
     assert.equal(note.length, 1, 'the utility ran');

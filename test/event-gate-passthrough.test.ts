@@ -16,7 +16,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { EventGate, findShadowedPolicies, formatShadowWarning } from '../src/gate/event-gate.js';
+import { EventGate, MCPL_GATE_EVENT_TYPES, findShadowedPolicies, formatShadowWarning } from '../src/gate/event-gate.js';
 import type { GateConfig, GateEventInfo, GatePolicy } from '../src/gate/types.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-passthrough');
@@ -32,7 +32,7 @@ interface Harness {
   traces: TraceEntry[];
 }
 
-function makeGate(initialConfig: GateConfig): Harness {
+function makeGate(initialConfig: GateConfig, eventTypesFrom?: (source: string) => readonly string[] | undefined): Harness {
   mkdirSync(TMP_DIR, { recursive: true });
   const configPath = join(TMP_DIR, `gate-${Math.random().toString(36).slice(2)}.json`);
   const traces: TraceEntry[] = [];
@@ -44,6 +44,7 @@ function makeGate(initialConfig: GateConfig): Harness {
     requestInference: () => {},
     getAgentNames: () => ['agent'],
     now: () => 1_000_000,
+    ...(eventTypesFrom ? { eventTypesFrom } : {}),
   });
   return { gate, configPath, traces };
 }
@@ -60,6 +61,11 @@ function event(overrides?: Partial<GateEventInfo>): GateEventInfo {
 }
 
 /** The Mythos incident's policy shapes, reusable across cases. */
+const SAMPLER_PLAIN: GatePolicy = {
+  name: 'stand-back-density',
+  match: { scope: ['mcpl:channel-incoming'] },
+  behavior: 'skip',
+};
 const SAMPLER: GatePolicy = {
   name: 'stand-back-density',
   match: { scope: ['mcpl:channel-incoming'] },
@@ -203,7 +209,15 @@ describe('shadow lint', () => {
     assert.ok(hit, `expected direct-address shadow warning, got ${JSON.stringify(warnings)}`);
     assert.strictEqual(hit.earlier, 'stand-back-density');
     assert.deepStrictEqual(hit.eventTypes, ['mcpl:channel-incoming']);
-    assert.match(formatShadowWarning(hit), /unreachable for mcpl:channel-incoming/);
+    // Its scope names the type, so it surely misses those events.
+    assert.strictEqual(hit.whole, false);
+    assert.strictEqual(hit.known, true);
+    assert.strictEqual(
+      formatShadowWarning(hit),
+      '"stand-back-density" comes first and takes "discord-direct-address"\'s mcpl:channel-incoming events, '
+        + 'so "discord-direct-address" applies only to its others. If it should apply to those too, move '
+        + '"discord-direct-address" above "stand-back-density" (wake_add_rule with the whole rule and insertBefore: "stand-back-density").',
+    );
   });
 
   it('a passthrough observer shadows nothing', () => {
@@ -230,6 +244,119 @@ describe('shadow lint', () => {
     assert.strictEqual(warnings.length, 1);
     assert.strictEqual(warnings[0].later, 'narrow');
     assert.strictEqual(warnings[0].eventTypes, 'all');
+    assert.strictEqual(warnings[0].whole, true);
+    assert.strictEqual(
+      formatShadowWarning(warnings[0]),
+      '"narrow" never applies: "broad" comes first and matches every event "narrow" would. '
+        + 'If "narrow" should apply, move "narrow" above "broad" (wake_add_rule with the whole rule and insertBefore: "broad"), or narrow "broad".',
+    );
+  });
+
+  // A host's input rule ahead of a rule for an MCPL server's events (the
+  // shape that warned a resident about its eidoverse rules for nothing).
+  const CLI_INPUT: GatePolicy = { name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' };
+  const WORLD: GatePolicy = { name: 'world-judged', match: { source: 'world' }, behavior: { debounce: 30_000 } };
+  const mcplServers = (...ids: string[]) => (source: string) => (ids.includes(source) ? MCPL_GATE_EVENT_TYPES : undefined);
+
+  it("says a rule with no scope may simply not be meant for the types an earlier rule takes, when its source's are unknown", () => {
+    const warnings = findShadowedPolicies([CLI_INPUT, WORLD]);
+    assert.strictEqual(warnings.length, 1);
+    assert.deepStrictEqual(
+      { ...warnings[0] },
+      { earlier: 'cli-input', later: 'world-judged', eventTypes: ['external-message'], whole: false, known: false },
+    );
+    assert.strictEqual(
+      formatShadowWarning(warnings[0]),
+      '"cli-input" comes first and takes every external-message event, so "world-judged" sees none. '
+        + 'Nothing to do unless "world-judged" is meant for external-message events; then move "world-judged" above "cli-input" '
+        + '(wake_add_rule with the whole rule and insertBefore: "cli-input"). '
+        + 'A scope on "world-judged" naming the event types it\'s for clears this note.',
+    );
+  });
+
+  it("notes nothing for types a rule's source is known never to send: an MCPL server's events are never external-message", () => {
+    assert.deepStrictEqual(findShadowedPolicies([CLI_INPUT, WORLD], mcplServers('world')), []);
+    // Nor with a scope naming both: the source still never sends external-message.
+    assert.deepStrictEqual(
+      findShadowedPolicies([CLI_INPUT, { ...WORLD, match: { source: 'world', scope: ['external-message', 'mcpl:push-event'] } }], mcplServers('world')),
+      [],
+    );
+    // A source not among them, or a glob, could send anything.
+    assert.strictEqual(findShadowedPolicies([CLI_INPUT, WORLD], mcplServers('discord')).length, 1);
+    assert.strictEqual(findShadowedPolicies([CLI_INPUT, { ...WORLD, match: { source: 'wor*' } }], mcplServers('world')).length, 1);
+    // A resolver that throws counts as knowing nothing.
+    assert.strictEqual(findShadowedPolicies([CLI_INPUT, WORLD], () => { throw new Error('boom'); }).length, 1);
+  });
+
+  it("says a rule never applies when an earlier one takes every type its source sends", () => {
+    const warnings = findShadowedPolicies([AMBIENT, WORLD], mcplServers('world'));
+    assert.strictEqual(warnings.length, 1);
+    assert.deepStrictEqual(
+      { ...warnings[0] },
+      { earlier: 'discord-ambient', later: 'world-judged', eventTypes: [...MCPL_GATE_EVENT_TYPES], whole: true, known: true },
+    );
+    assert.match(formatShadowWarning(warnings[0]), /^"world-judged" never applies: "discord-ambient" comes first/);
+    // Without knowing the source's types it's only the partial, unsure note.
+    const unsure = findShadowedPolicies([AMBIENT, WORLD]);
+    assert.strictEqual(unsure[0].whole, false);
+    assert.strictEqual(unsure[0].known, false);
+  });
+
+  it("says which of its source's events a rule misses when an earlier one takes some", () => {
+    const warnings = findShadowedPolicies([SAMPLER_PLAIN, { name: 'discord-all', match: { source: 'discord' }, behavior: 'always' }], mcplServers('discord'));
+    assert.strictEqual(warnings.length, 1);
+    assert.deepStrictEqual(warnings[0].eventTypes, ['mcpl:channel-incoming']);
+    assert.strictEqual(warnings[0].whole, false);
+    assert.strictEqual(warnings[0].known, true);
+    assert.match(formatShadowWarning(warnings[0]), /takes "discord-all"'s mcpl:channel-incoming events, so "discord-all" applies only to its others/);
+  });
+
+  it("says a rule never applies when an earlier rule's scope covers all of its scope, with no source known", () => {
+    const warnings = findShadowedPolicies([
+      { name: 'mcpl-catch-all', match: { scope: ['mcpl:push-event', 'mcpl:channel-incoming'] }, behavior: 'skip' },
+      { name: 'incoming', match: { scope: ['mcpl:channel-incoming'] }, behavior: 'always' },
+    ]);
+    assert.deepStrictEqual(
+      warnings.map((w) => ({ ...w })),
+      [{ earlier: 'mcpl-catch-all', later: 'incoming', eventTypes: ['mcpl:channel-incoming'], whole: true, known: true }],
+    );
+    assert.match(formatShadowWarning(warnings[0]), /^"incoming" never applies: "mcpl-catch-all" comes first/);
+  });
+
+  it("notes nothing for a rule whose scope its source narrows to nothing", () => {
+    const never = { name: 'world-cli', match: { source: 'world', scope: ['external-message'] }, behavior: 'always' as const };
+    assert.deepStrictEqual(findShadowedPolicies([CLI_INPUT, never], mcplServers('world')), []);
+    // Unknown, it's the whole of that rule.
+    assert.strictEqual(findShadowedPolicies([CLI_INPUT, never])[0].whole, true);
+  });
+
+  it("traces the notes again when the sources the host knows change, an empty list when the last goes, and not again for the same set", () => {
+    const known = new Set<string>();
+    const { gate, traces } = makeGate({ policies: [CLI_INPUT, WORLD], default: 'skip' }, (source) => (known.has(source) ? MCPL_GATE_EVENT_TYPES : undefined));
+    const shadowTraces = () => traces.filter((t) => t.type === 'gate:shadow-warnings');
+    assert.strictEqual(shadowTraces().length, 1, 'the start traces the note');
+    known.add('world');
+    gate.sourcesChanged();
+    assert.strictEqual(shadowTraces().length, 2);
+    assert.deepStrictEqual(shadowTraces()[1].warnings, []);
+    assert.strictEqual(shadowTraces()[1].reason, 'sources-changed');
+    gate.sourcesChanged();
+    // A rule change that brings no note doesn't trace the cleared one again.
+    gate.addPolicy({ name: 'unrelated', match: { source: 'other', scope: ['mcpl:push-event'] }, behavior: 'always' });
+    assert.strictEqual(shadowTraces().length, 2);
+    known.delete('world');
+    gate.sourcesChanged();
+    assert.strictEqual(shadowTraces().length, 3);
+    assert.strictEqual((shadowTraces()[2].warnings as string[]).length, 1);
+  });
+
+  it("gate_status reads the sources the host knows now, as servers connect, with no change to the rules", () => {
+    const known = new Set<string>();
+    const { gate } = makeGate({ policies: [CLI_INPUT, WORLD], default: 'skip' }, (source) => (known.has(source) ? MCPL_GATE_EVENT_TYPES : undefined));
+    assert.strictEqual(gate.getStatus().shadowWarnings.length, 1);
+    known.add('world');
+    assert.deepStrictEqual(gate.getStatus().shadowWarnings, []);
+    assert.deepStrictEqual(gate.lintShadows(), []);
   });
 
   it('surfaces via gate:shadow-warnings trace and getStatus on mutation', () => {
