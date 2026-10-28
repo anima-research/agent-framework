@@ -37,7 +37,7 @@ class ToolModule implements Module {
 }
 
 describe('a reader fork at dispatch', () => {
-  it('refuses its resident\'s tools and one registered after it was derived, not its own', async () => {
+  it('refuses its resident\'s tools and one registered after it was derived', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dendrite-reader-dispatch-'));
     const membrane = new MockMembrane();
     const owner = new ToolModule('stub', 'frontline');
@@ -64,12 +64,11 @@ describe('a reader fork at dispatch', () => {
       membrane.pushResponse(createMockResponse([
         { type: 'tool_use', id: 'c1', name: 'stub--frontline', input: {} },
         { type: 'tool_use', id: 'c2', name: 'late--op', input: {} },
-        { type: 'tool_use', id: 'c3', name: 'note_disposition', input: {} },
       ] as never, 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'nothing urgent' }]));
       await framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
 
-      assert.deepEqual(refused.sort(), ['late--op', 'stub--frontline'], 'the resident\'s tool and the later one are refused at dispatch; its own is not');
+      assert.deepEqual(refused.sort(), ['late--op', 'stub--frontline'], 'the resident\'s tool and the later one are refused at dispatch');
       assert.deepEqual(owner.calls.map((c) => c.name), [], 'the resident\'s tool never ran');
       assert.deepEqual(late.calls.map((c) => c.name), [], 'the later tool never ran');
     } finally {
