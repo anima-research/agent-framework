@@ -18356,6 +18356,25 @@ export class AgentFramework {
         ...(occ.tags ? { tags: occ.tags } : {}),
       },
     });
+    if (decision.held && !plain && this.pushCoalescer) {
+      // A held batch wakes nobody, so no turn's assembly would store it while
+      // the hold lasts, and readers of held traffic and the release would
+      // never see it. It's stored now, stamped with its hold as a plain push
+      // under the hold is, and consumed, so the turn after the hold doesn't
+      // take it again. Outside the coalescer's lock: this runs inside it.
+      // A hold that ended before the batch was stored left it stored unheld:
+      // it then takes the wake an unheld push gets, every recipient's.
+      const coalescer = this.pushCoalescer;
+      void this.coalescedAudience(occ)
+        .then((audience) => (audience[0] !== undefined ? coalescer.materializeNow(audience[0], subject) : false))
+        .then(async (stored) => {
+          if (stored && !(channelId !== undefined && this.tuneOutCoordinator?.holdFor(occ.serverId, channelId))) {
+            await this.queueCoalescedWakes(occ, true);
+          }
+        })
+        .catch((err) => console.error(`[coalescing] a held batch for ${logValue(subject)} could not be stored:`, err));
+      return;
+    }
     if (!decision.wake) return;
     for (const agentName of await this.coalescedAudience(occ)) {
       this.pendingRequests.push({
