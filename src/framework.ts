@@ -2373,6 +2373,19 @@ const MAINTENANCE_TICKS_PER_PASS = 8;
  *  together, and then on awareness drains still running, such as its
  *  startup's delivery. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
+const ABANDON_GRACE_MS = 10_000;
+
+const testAbandonGraces = new WeakMap<AgentFramework, number>();
+
+/**
+ * For tests only: `framework`'s abandon takes `ms` as its grace in place of
+ * {@link ABANDON_GRACE_MS}. Set it only where the test holds every turn the
+ * abandon reaches past the grace, so no turn can end within it and a short
+ * grace only brings the abandon's report sooner.
+ */
+export function setAbandonGraceForTests(framework: AgentFramework, ms: number): void {
+  testAbandonGraces.set(framework, ms);
+}
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
 interface LocalProviderGate {
@@ -8535,7 +8548,7 @@ export class AgentFramework {
     // Bounded grace for cancelled streams. Stop cancels streams too; a turn
     // with no stream settles on its own. Report the abandon that already ran,
     // even if stop cuts its grace short.
-    const grace = Date.now() + 10_000;
+    const grace = Date.now() + (testAbandonGraces.get(this) ?? ABANDON_GRACE_MS);
     while (this.quiesced && !this.queue?.isClosed && this.activeTurnTokens.size > 0 && Date.now() < grace) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }

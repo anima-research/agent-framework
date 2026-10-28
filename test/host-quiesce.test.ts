@@ -24,6 +24,7 @@ import type { StreamEvent, YieldingStream, NormalizedRequest } from '@animalabs/
 import { JsStore } from '@animalabs/chronicle';
 
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { schedulerPasses } from './helpers/scheduler-passes.js';
@@ -1005,6 +1006,7 @@ test('abandon reports turns it cannot cancel (token held, no stream)', async () 
     // A turn between dequeue and stream registration: token held, agent idle.
     const tokens = (framework as unknown as { activeTurnTokens: Map<string, object> }).activeTurnTokens;
     tokens.set('agent', {});
+    setAbandonGraceForTests(framework, 50);
     try {
       const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
       assert.equal(status.drained, false);

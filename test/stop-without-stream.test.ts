@@ -35,7 +35,10 @@ import {
 import type { ContextInjection } from '@animalabs/context-manager';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+
+const SHORT_ABANDON_GRACE_MS = 50;
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -426,10 +429,10 @@ describe('a stop before the turn has a stream', () => {
   it("a quiesce's abandon of a turn whose hooks outlast the abandon's grace lists it, and still ends it when they return", async () => {
     const h = await aliveWithoutStream();
     try {
+      setAbandonGraceForTests(h.framework, SHORT_ABANDON_GRACE_MS);
       const reached = abandonReached(h.framework);
       const quiescing = h.framework.quiesce({ timeoutMs: 50, abandon: true });
       await within('the abandon to reach the turn', reached);
-      // The abandon waits up to 10 s for the turns it reached to end.
       const status = await within('the quiesce to return', quiescing, 15_000);
       assert.deepEqual(status.unabandonable, ['prime'], 'the turn still in its hooks is listed');
       assert.deepEqual(status.activeTurnAgents, ['prime'], 'it still holds its turn');
@@ -1625,10 +1628,10 @@ describe("a stop while the guard's refusal retry waits", () => {
   it("an abandon of the wait while it still holds the finished stream lists the turn if it outlasts the grace, and still ends it as the abandon", async () => {
     const g = await guardRetryWaiting();
     try {
+      setAbandonGraceForTests(g.framework, SHORT_ABANDON_GRACE_MS);
       const reached = abandonReached(g.framework);
       const quiescing = g.framework.quiesce({ timeoutMs: 50, abandon: true });
       await within('the abandon to reach the turn', reached);
-      // The round's post stays held through the abandon's ten-second grace.
       const status = await within('the quiesce to return', quiescing, 15_000);
       assert.deepEqual(status.unabandonable, ['assistant'], 'the turn still waiting is listed');
       g.releasePost();
