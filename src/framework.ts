@@ -76,7 +76,7 @@ import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './hel
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches, dryCompileStatsOf, type RenderStats } from './agent.js';
+import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -1762,9 +1762,10 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
 /**
  * Refuse a config whose `subconscious`, `watchdog` or `processLogging` is
  * anything but an object, null or false (holdsSettings), or whose switch in
- * one holds anything but true or false (assertBooleanSetting). A subconscious
- * that isn't on has its `allowChannelSpeech` left unchecked, since nothing
- * reads it then.
+ * one holds anything but true or false (assertBooleanSetting), or whose
+ * subconscious's `thinkingBinding` assertThinkingBinding refuses. A
+ * subconscious that isn't on has its `allowChannelSpeech` and
+ * `thinkingBinding` left unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
@@ -1780,6 +1781,7 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
         config.subconscious.allowChannelSpeech,
         'true lets the subconscious speak in channels with speak_in_channel, and false or leaving it out refuses it',
       );
+      assertThinkingBinding('subconscious.thinkingBinding', config.subconscious.thinkingBinding);
     }
   }
   if (holdsSettings('watchdog', config.watchdog, '{ enabled: true }')) {
@@ -13790,8 +13792,9 @@ export class AgentFramework {
     // idiom): reasoning effort (thinking), provider params, token ceilings,
     // caching, refusal handling, timezone — a same-model side-process must
     // not silently run under different inference conditions than the
-    // resident it serves. Only identity- and surface-defining fields are
-    // overridden below.
+    // resident it serves. Below, identity- and surface-defining fields are
+    // overridden, and the window and thinking binding where the
+    // subconscious's config sets its own.
     const model = cfg.model ?? primaryConfig.model;
     const inherited: AgentConfig = { ...primaryConfig };
     if (model !== primaryConfig.model) {
@@ -13800,7 +13803,7 @@ export class AgentFramework {
     const agentConfig: AgentConfig = {
       ...inherited,
       ...(cfg.physicalWindowTokens != null ? { physicalWindowTokens: cfg.physicalWindowTokens } : {}),
-      ...(cfg.thinkingBinding != null ? { thinkingBinding: cfg.thinkingBinding } : {}),
+      ...(holdsSettings('subconscious.thinkingBinding', cfg.thinkingBinding, '{ binds: true }') ? { thinkingBinding: cfg.thinkingBinding } : {}),
       name,
       model,
       systemPrompt: cfg.systemPrompt,

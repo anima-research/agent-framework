@@ -119,10 +119,12 @@ export interface SubconsciousConfig {
    *  binding (SUBCONSCIOUS_MODEL_FIELDS); the two below set its own. */
   model?: string;
   /** Its model's context window, as AgentConfig.physicalWindowTokens, in
-   *  place of the primary's. */
+   *  place of the primary's. Left out or null, it has the primary's on the
+   *  primary's model and none on another. */
   physicalWindowTokens?: AgentConfig['physicalWindowTokens'];
   /** Its model's thinking binding, as AgentConfig.thinkingBinding, in place
-   *  of the primary's. */
+   *  of the primary's. Left out, null or false, it has the primary's on the
+   *  primary's model and none on another. */
   thinkingBinding?: AgentConfig['thinkingBinding'];
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the

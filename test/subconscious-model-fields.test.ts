@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentFramework } from '../src/index.js';
@@ -60,10 +60,10 @@ describe('the subconscious and the resident\'s model fields', () => {
 
   it('on another model, it carries the window and binding set for it, and the resident\'s config keeps its own', async () => {
     const { framework, residentConfig } = await withSubconscious(resident, {
-      model: 'model-b', physicalWindowTokens: 200_000, thinkingBinding: { binds: true, dropBlock: false },
+      model: 'model-b', physicalWindowTokens: 200_000, thinkingBinding: { binds: true, dropBlock: true },
     });
     try {
-      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: 200_000, thinkingBinds: true, thinkingDropBlock: false });
+      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: 200_000, thinkingBinds: true, thinkingDropBlock: true });
       assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true });
       for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
         assert.equal(config?.physicalWindowTokens, 1_000_000);
@@ -72,11 +72,41 @@ describe('the subconscious and the resident\'s model fields', () => {
     } finally { await framework.stop(); }
   });
 
-  it('on the resident\'s model, the window and binding set for it take the place of the resident\'s', async () => {
-    const { framework } = await withSubconscious(resident, { physicalWindowTokens: 500_000, thinkingBinding: { binds: false } });
-    try {
-      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-a', physicalWindowTokens: 500_000, thinkingBinds: false, thinkingDropBlock: false });
-    } finally { await framework.stop(); }
+  it('on the resident\'s model, each of the two set for it takes the place of the resident\'s, and null or false leaves it out', async () => {
+    const cases: Array<[Record<string, unknown>, ReturnType<typeof fieldsOf>]> = [
+      [{ physicalWindowTokens: 500_000 }, { model: 'model-a', physicalWindowTokens: 500_000, thinkingBinds: true, thinkingDropBlock: true }],
+      [{ thinkingBinding: { binds: false } }, { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: false, thinkingDropBlock: false }],
+      [{ physicalWindowTokens: null, thinkingBinding: null }, { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true }],
+      [{ thinkingBinding: false }, { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true }],
+    ];
+    for (const [subconscious, expected] of cases) {
+      const { framework, residentConfig } = await withSubconscious(resident, subconscious as Partial<SubconsciousConfig>);
+      try {
+        assert.deepEqual(fieldsOf(framework, 'Subconscious'), expected, JSON.stringify(subconscious));
+        for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
+          assert.equal(config?.physicalWindowTokens, 1_000_000);
+          assert.deepEqual(config?.thinkingBinding, { binds: true, dropBlock: true });
+        }
+      } finally { await framework.stop(); }
+    }
+  });
+
+  it('a subconscious thinkingBinding that isn\'t an object or holds a switch that isn\'t true or false is refused before anything opens', async () => {
+    for (const thinkingBinding of ['yes', { binds: 'true' }]) {
+      const dir = mkdtempSync(join(tmpdir(), 'subconscious-model-fields-'));
+      dirs.push(dir);
+      await assert.rejects(
+        AgentFramework.create({
+          storePath: join(dir, 'store'),
+          membrane: new MockMembrane().asMembrane(),
+          agents: [{ name: 'assistant', model: 'model-a', systemPrompt: 'test', maxTokens: 4_000 }],
+          modules: [],
+          subconscious: { enabled: true, systemPrompt: 'notice', thinkingBinding } as unknown as SubconsciousConfig,
+        }),
+        /subconscious\.thinkingBinding/,
+      );
+      assert.deepEqual(readdirSync(dir), [], JSON.stringify(thinkingBinding));
+    }
   });
 
   it('on another model, it still carries every other field of the resident\'s config that the copy doesn\'t override', async () => {
