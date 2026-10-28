@@ -26,6 +26,7 @@
  * of bytes from another surface is the failure this exists to end.
  */
 
+import { NOTICE_TAG } from './notice-tags.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { REFERENCE_STUB_MAX_CHARS, referenceTypeLabel } from './mcpl/references.js';
 import { safeSlice } from './safe-slice.js';
@@ -256,7 +257,7 @@ export type ParsedImagePlaceholder =
 const PLACEHOLDER_RE = /\[image: ([a-z0-9!#$&^_.+-]{1,127}\/[a-z0-9!#$&^_.+-]{1,127}), (~?[\d.]{1,16}(?:B|KB|MB))(?:, ref (img_[0-9a-z]{1,16}_\d{1,16}))?\]/g;
 /** `[ref_1_ab3d] cam.png — image/png, 1.2MB claimed — from tool result — …`
  *  (one line, at most REFERENCE_STUB_MAX_CHARS long: see parseImagePlaceholders). */
-const REFERENCE_STUB_RE = /^\[(ref_[0-9a-z]+_[0-9a-z]+)\] ([^\n]*)$/gm;
+const REFERENCE_STUB_RE = new RegExp(`^\\[(${NOTICE_TAG.referenceId}_[0-9a-z]+_[0-9a-z]+)\\] ([^\\n]*)$`, 'gm');
 const IMAGE_MIME_RE = /\bimage\/[a-z0-9!#$&^_.+-]+/i;
 
 /**

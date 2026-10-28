@@ -71,8 +71,12 @@ export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './co
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
 // EventGate
-export { EventGate, wakeLineText, type WakeProvenance, type WritePlacement } from './gate/index.js';
+export { EventGate, MCPL_GATE_EVENT_TYPES, wakeLineText, type EventTypesFrom, type WakeProvenance, type WritePlacement } from './gate/index.js';
 export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine } from './gate/index.js';
+export { ReplyJudge, DEFAULT_JUDGE_MODEL, DEFAULT_JUDGE_MAX_INPUT_TOKENS, MIN_JUDGE_INPUT_TOKENS } from './gate/index.js';
+export type { JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, ReplyJudgeDeps, UpcomingWake } from './gate/index.js';
+export { Heartbeat, DEFAULT_HEARTBEAT, HEARTBEAT_TOOL_PREFIX } from './heartbeat/heartbeat.js';
+export type { HeartbeatOptions, HeartbeatSettings, HeartbeatWake, HeartbeatDeliveryMode, HeartbeatScheduledWake, Reminder } from './heartbeat/heartbeat.js';
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';

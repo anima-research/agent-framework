@@ -400,13 +400,16 @@ test("a closed-channel invitation in a tuned-out channel doesn't offer the decli
   }, 'agent-tool');
   assert.equal(registry.isChannelOpen(ref(channelId)), false);
   const tunedOut = invite(channelId, '#upkeep');
-  assert.match(tunedOut, /it will be delivered there, which opens the channel\.\n/);
+  assert.ok(tunedOut.includes("1. Reply — your plain speech lands where the latest word on where it lands says: a [routing] notice, "
+    + "or channel_open's result. If that is #upkeep (discord:g1:444555), write your reply with no prefix; it will be delivered there. "
+    + 'If that is another channel, or you see none, to reply here, check whether discord exposes a send tool that can address it.\n'), tunedOut);
+  assert.doesNotMatch(tunedOut, /open it \(option 2\)/);
   assert.doesNotMatch(tunedOut, /decline it first/);
   assert.equal((await registry.handleChannelToolCall('channel_decline', { channelId, messageId: 'm7' }, origin)).success, false,
     'channel_decline refuses it');
   // A closed channel nobody decided about is offered the decline.
   assert.match(invite('discord:g1:777888', '#lobby'),
-    /which opens the channel\. To reply without opening it, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/);
+    /which opens the channel\. To reply without opening it, decline it first \(option 3\): a channel you've declined stays closed when you speak there\. If that is another channel, or you see none/);
 });
 
 test("a channel the agent closed whose server refused the close is still open, so a send there carries no note", async () => {

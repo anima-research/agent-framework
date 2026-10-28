@@ -98,3 +98,21 @@
   wake that names its channel without its server is: the one registered
   channel with that id, or, where none or several are, a home on no
   server.
+- Merged `main` at 0.28.0. main's view rule (#853: every check of whether
+  an agent sees a row asks the predicate its store was opened with) reads
+  this branch's views: a resident's (held rows and another agent's stored
+  context injections out), a derived agent's (its source's, which
+  context-manager's `derive` keeps) and a context reopened on the shared
+  slot (the residents'). A tool boundary, an arrival and the unread check
+  ask it, and a shared-slot message's readers are the registry's. main's
+  heartbeat (#827) wakes the agents whose spec takes untargeted inbound, as
+  an untargeted push does. An ended agent's re-arm count, exhausted-turn
+  record and run of stated waits (#846, #840) go with it. A `chat:system`
+  notice (#830) leaves the latest delivered inbound where it was, as a
+  marker does. Supplied text (#852): a channel message's author, which this
+  branch writes into the stored text and a held line, is kept to one line
+  with its notice openings marked, as is the author an addressed-elsewhere
+  notice names; `[Agent lifecycle: …]` and `[Focus: …]` are notice tags, so
+  a participant's text that opens with one is marked; tune-out's texts quote
+  a channel's name as `tune_out` takes it back, and name one no name picks
+  alone by its id and server.

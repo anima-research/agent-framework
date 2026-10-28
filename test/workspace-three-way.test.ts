@@ -969,7 +969,7 @@ describe('a file tool naming a path passed over by design', () => {
       assert.equal(stored(), 'v2\n', "and stores disk's change");
       env.rmDisk(path);
       const gone = await refused(m, 'read', { path: `work/${path}` });
-      assert.equal(gone, `File not found: work/${path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`);
+      assert.equal(gone, `The read did nothing: there's no file at "work/${path}" any more: disk's copy was deleted since the workspace last agreed with it, and the workspace took that in first. ls or glob lists the files that exist.`);
       assert.equal(stored(), null, "and disk's deletion is stored");
     });
   }
@@ -1122,7 +1122,7 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     // (parseFilePath), and edit_many stores none of its edits, the outer
     // mount's own included.
     const nestedRefusal = '"work/a/b/inner.txt" lies in mount "deep", nested in mount "work", which neither reads nor writes it: use "deep/inner.txt".';
-    assert.equal(await refused(m, 'edit', { path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }), nestedRefusal);
+    assert.equal(await refused(m, 'edit', { path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }), `The edit did nothing: ${nestedRefusal}`);
     assert.equal(await refused(m, 'edit_many', { edits: [{ path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }] }),
       `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${nestedRefusal}`);
     assert.equal(await refused(m, 'edit_many', { edits: [
@@ -1897,7 +1897,7 @@ describe("a file's mode is kept with its bytes", () => {
     assert.equal(full('s.sh'), 0o700, "setgid gone before the bytes; the person's 0o700 stays, as the guard keeps a mode set since planning");
   });
 
-  test('a mode-only push refuses a file whose bytes changed, or that became a link, after planning', async (t) => {
+  test('a mode-only push refuses a file whose bytes changed, or that became a link or a directory, after planning, and says what gets past it', async (t) => {
     const env = new Env(t);
     const m = await env.open();
     await owedMode(env, m, 'y.sh');
@@ -1912,6 +1912,18 @@ describe("a file's mode is kept with its bytes", () => {
     pushed = await pushModes(env, m, ['z.sh'], { beforeEffect: () => { rmSync(env.disk('z.sh')); symlinkSync(outside, env.disk('z.sh')); } });
     assert.equal(statSync(outside).mode & 0o777, 0o600, 'a link swapped in: its target is untouched');
     assert.deepEqual(pushed.written, []);
+    assert.deepEqual(pushed.skipped.map((x) => x.reason), [
+      "not given the workspace's mode: a symlink, which this mount does not follow — materializing again won't change that; "
+        + 'whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere',
+    ]);
+
+    await owedMode(env, m, 'd.sh');
+    pushed = await pushModes(env, m, ['d.sh'], { beforeEffect: () => { rmSync(env.disk('d.sh')); mkdirSync(env.disk('d.sh')); } });
+    assert.deepEqual(pushed.written, []);
+    assert.deepEqual(pushed.skipped.map((x) => x.reason), [
+      "not given the workspace's mode: not a regular file — materializing again won't change that; "
+        + 'whoever runs this host can put a regular file there, and materializing again then gets past it',
+    ]);
   });
 
   test("a private file's bytes are never written at a wider mode, and a widening comes after the bytes", async (t) => {
@@ -3655,7 +3667,7 @@ describe('shell deletions', () => {
       env.rmDisk('gone.txt');
       m = await run(env, m);
       assert.equal(env.store.treeGet(TREE, 'gone.txt'), null, 'the tree entry is removed');
-      assert.match(await refused(m, 'read', { path: 'work/gone.txt' }), /File not found/);
+      assert.match(await refused(m, 'read', { path: 'work/gone.txt' }), /^The read did nothing: there's no file at "work\/gone\.txt"/);
       assert.ok(env.eventsOf('workspace:deleted').some((e) => e.paths.includes('work/gone.txt')), 'a deleted event was pushed');
     });
   }
@@ -4155,8 +4167,8 @@ describe('restarts and faults', () => {
     // C against A on disk B as both-changed and record a sticky conflict. It
     // refuses instead, and records nothing.
     env.store.switchBranch('draft-c');
-    assert.match(await refused(m, 'ls', { path: 'work', recursive: true }), /evidence is unavailable until the store is reopened/);
-    assert.match(await refused(m, 'materialize', { path: 'work/a.txt' }), /evidence is unavailable until the store is reopened/);
+    assert.match(await refused(m, 'ls', { path: 'work', recursive: true }), /^The ls did nothing: the workspace can't check its files against disk until its store is reopened/);
+    assert.match(await refused(m, 'materialize', { path: 'work/a.txt' }), /^The materialize did nothing: the workspace can't check its files against disk until its store is reopened/);
     const intents = (m as unknown as { intents: Map<string, { get(path: string): { conflict?: unknown } | undefined }> }).intents;
     assert.equal(intents.get('work')!.get('a.txt')?.conflict, undefined, 'no conflict was recorded');
 
@@ -4236,7 +4248,7 @@ describe('restarts and faults', () => {
       storeSync.call(env.store);
     };
     try {
-      assert.match(await refused(m, 'ls', { path: 'work' }), /injected EIO at the barrier/);
+      assert.match(await refused(m, 'ls', { path: 'work' }), /^The ls of "work" stopped on an error the workspace didn't expect: an input\/output error on the disk\./);
       assert.equal((m as any).agreement.needsBarrier, true, 'the obligation survives the failed pass');
       DiskAgreement.prototype.set = set;
       syncs = 0;
@@ -4396,7 +4408,7 @@ describe('restarts and faults', () => {
     }
     assert.equal(calls, 1, 'the file barrier failed; nothing after it ran');
     assert.deepEqual(res.materialized, []);
-    assert.match(res.skipped[0].reason, /a\.txt: could not make the write durable \(file fsync\): injected EIO/);
+    assert.match(res.skipped[0].reason, /a\.txt: could not make the write durable \(file fsync\): an input\/output error on the disk — whether disk holds the change isn't known until it's checked: a materialize of this path checks it and says how it ended$/);
     assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending', 'no completion was recorded');
     const entry = await entryOf(m, 'a.txt');
     assert.equal(entry?.state, 'synced', 'the next observation decides from disk');
@@ -4420,7 +4432,7 @@ describe('restarts and faults', () => {
     await call(m, 'write', { path: 'work/a/b/c.txt', content: 'deep' });
     const failing = await withSyncs(env, (id) => existsSync(env.disk('a')) && id === idOf(env.disk('a')), () => call(m, 'materialize', {}));
     assert.deepEqual(failing.result.materialized, []);
-    assert.match(failing.result.skipped[0].reason, /a\/b\/c\.txt: could not make the write durable \(directory fsync of a\): injected EIO/);
+    assert.match(failing.result.skipped[0].reason, /a\/b\/c\.txt: could not make the write durable \(directory fsync of a\): an input\/output error on the disk — whether disk holds the change isn't known until it's checked: a materialize of this path checks it and says how it ended$/);
     assert.equal((m as any).agreement.get('work', 'a/b/c.txt').kind, 'pending');
 
     const retry = await withSyncs(env, () => false, () => call(m, 'materialize', {}));
@@ -4542,7 +4554,7 @@ describe('restarts and faults', () => {
         beforeEffect: () => writeFileSync(env.disk('gone.txt'), 'a new file from the shell'),
       });
       assert.deepEqual(pushed.deleted, []);
-      assert.match(pushed.skipped[0]!.reason, /^not unlinked: a file appeared at this path since it was checked$/);
+      assert.match(pushed.skipped[0]!.reason, /^not unlinked: a file appeared at this path since it was checked — materializing again with applyDeletions checks it afresh$/);
       assert.equal(env.readDisk('gone.txt'), 'a new file from the shell');
       assert.deepEqual((m as any).agreement.get('work', 'gone.txt'), pending, 'still owed, as before');
     });
@@ -4562,7 +4574,7 @@ describe('restarts and faults', () => {
         beforeEffect: () => assert.equal(spawnSync('mkfifo', [env.disk('gone.txt')]).status, 0, 'mkfifo'),
       });
       assert.deepEqual(pushed.deleted, []);
-      assert.match(pushed.skipped[0]!.reason, /^not unlinked: a pipe, socket or device appeared at this path since it was checked$/);
+      assert.match(pushed.skipped[0]!.reason, /^not unlinked: a pipe, socket or device appeared at this path since it was checked — materializing again with applyDeletions checks it afresh$/);
       assert.ok(lstatSync(env.disk('gone.txt')).isFIFO(), 'the pipe stays');
       assert.deepEqual((m as any).agreement.get('work', 'gone.txt'), pending, 'still owed, as before');
     });
@@ -6387,7 +6399,7 @@ describe('the mount boundary', () => {
       return info;
     }, () => confirmAbsent(view, rootReal, 'sub/a.txt'));
     assert.equal(swapped, true);
-    assert.equal(typeof proof, 'string', `no absence is proven: ${JSON.stringify(proof)}`);
+    assert.ok(!(typeof proof === 'object' && 'by' in proof), `no absence is proven: ${JSON.stringify(proof)}`);
     assert.equal(readFileSync(join(away, 'sub/a.txt'), 'utf8'), 'A', 'the original still holds the file');
   });
 
@@ -6475,7 +6487,7 @@ describe('the mount boundary', () => {
 
     const res = await call(m, 'materialize', { force: true });
     const reasons = ((res.skipped ?? []) as Array<{ reason: string }>).map((s) => s.reason).join('\n');
-    assert.match(reasons, /link\.txt: not written: a symlink, which this mount does not follow/);
+    assert.match(reasons, /link\.txt: not written: disk has a symlink at this path, which this mount does not follow, and no push writes through one, forced or not/);
     // This mount doesn't follow symlinks, so a symlinked directory on the way
     // is refused as such, wherever it leads.
     assert.match(reasons, /linkdir\/inner\.txt: not written: "work\/linkdir" is a symlink leading outside the mount, which this mount does not follow/);
@@ -6540,7 +6552,7 @@ describe('the mount boundary', () => {
       const pushed = await pushWith(env, m, ['sub/a.txt'], { force, beforeEffect: () => swapForSymlink(env, 'sub', outside) });
       assert.equal(readFileSync(join(outside, 'a.txt'), 'utf8'), 'outside, untouched');
       assert.deepEqual(pushed.written, []);
-      assert.match(pushed.skipped[0]!.reason, /^not written: "work\/sub" is a symlink leading outside the mount, which this mount does not follow$/);
+      assert.match(pushed.skipped[0]!.reason, /^not written: "work\/sub" is a symlink leading outside the mount, which this mount does not follow; followed or not, nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it$/);
       assert.deepEqual((m as any).agreement.get('work', 'sub/a.txt'), before, 'its evidence is exactly as before the intent');
       assert.equal(env.readDisk('saved/a.txt'), 'original');
     });
@@ -6558,7 +6570,7 @@ describe('the mount boundary', () => {
     const pushed = await pushWith(env, m, ['sub/gone.txt'], { applyDeletions: true, beforeEffect: () => swapForSymlink(env, 'sub', outside) });
     assert.equal(readFileSync(join(outside, 'gone.txt'), 'utf8'), 'outside, untouched');
     assert.deepEqual(pushed.deleted, []);
-    assert.match(pushed.skipped[0]!.reason, /^not unlinked: "work\/sub" is a symlink leading outside the mount, which this mount does not follow$/);
+    assert.match(pushed.skipped[0]!.reason, /^not unlinked: "work\/sub" is a symlink leading outside the mount, which this mount does not follow; followed or not, nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it$/);
   });
 
   test('a disk edit made after planning is not overwritten without force, and reads as a conflict', async (t) => {
@@ -6571,7 +6583,7 @@ describe('the mount boundary', () => {
     const pushed = await pushWith(env, m, ['a.txt'], { beforeEffect: () => writeFileSync(env.disk('a.txt'), 'edited meanwhile') });
     assert.equal(env.readDisk('a.txt'), 'edited meanwhile');
     assert.deepEqual(pushed.written, []);
-    assert.match(pushed.skipped[0]!.reason, /^not written: disk changed since it was checked$/);
+    assert.match(pushed.skipped[0]!.reason, /^not written: disk changed since it was checked — materializing again checks it afresh$/);
     assert.deepEqual((m as any).agreement.get('work', 'a.txt'), before);
     const entry = await entryOf(m, 'a.txt');
     assert.equal(entry?.state, 'conflict');
@@ -6589,7 +6601,7 @@ describe('the mount boundary', () => {
 
     const pushed = await pushWith(env, m, ['new.txt'], { beforeEffect: () => writeFileSync(env.disk('new.txt'), 'from the shell') });
     assert.equal(env.readDisk('new.txt'), 'from the shell');
-    assert.match(pushed.skipped[0]!.reason, /^not written: something appeared at this path since it was checked$/);
+    assert.match(pushed.skipped[0]!.reason, /^not written: something appeared at this path since it was checked — materializing again checks it afresh$/);
     assert.equal((m as any).agreement.get('work', 'new.txt'), undefined, 'still unknown, as before the intent');
     assert.equal(await stateOf(m, 'new.txt'), 'conflict');
   });
@@ -6626,7 +6638,7 @@ describe('the mount boundary', () => {
     }, () => pushWith(env, m, ['a.txt'], { force: true }));
     assert.equal(swapped, true);
     assert.deepEqual(pushed.written, []);
-    assert.match(pushed.skipped[0]!.reason, /disk changed since it was checked/);
+    assert.match(pushed.skipped[0]!.reason, /disk changed since it was checked — materializing again checks it afresh$/);
     assert.equal(env.readDisk('backup.txt'), 'v1', 'the renamed file is untouched');
     assert.equal(env.readDisk('a.txt'), 'a new disk edit', 'and so is the file now at the path');
   });
@@ -6711,7 +6723,7 @@ describe('the mount boundary', () => {
     const states = new Map((data.entries as Entry[]).map((e) => [e.path, e.state]));
     assert.equal(states.has('sub/secret.txt'), false, 'no outside name is listed');
     assert.equal(states.get('sub/a.txt'), 'unverified');
-    assert.deepEqual(data.incomplete, [{ path: 'sub', reason: 'the directory changed while the walk ran' }]);
+    assert.deepEqual(data.incomplete, [{ path: 'sub', reason: 'the directory changed while the walk ran — listing it checks it afresh' }]);
     assert.notEqual(env.store.treeGet(TREE, 'sub/a.txt'), null, 'the agreed entry stays');
   });
 
@@ -6822,8 +6834,8 @@ describe('the mount boundary', () => {
       assert.deepEqual(scoped.incomplete, [{
         path: 'escape',
         reason: followSymlinks
-          ? 'the directory resolves outside the mount'
-          : '"work/escape" is a symlink leading outside the mount, which this mount does not follow',
+          ? 'the directory resolves outside the mount — listing it won\'t change that; nothing done through this mount reaches where it resolves, and whoever runs this host can mount that place'
+          : '"work/escape" is a symlink leading outside the mount, which this mount does not follow; followed or not, nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it',
       }]);
       const whole = await listing(m);
       assert.equal([...whole.keys()].some((p) => p.startsWith('escape/')), false);
@@ -6838,7 +6850,7 @@ describe('the mount boundary', () => {
     const m = await env.open({ path: join(env.root, 'never-created'), mode: 'read-only' });
     const data = await call(m, 'ls', { path: 'work' });
     assert.deepEqual(data.entries, []);
-    assert.deepEqual(data.incomplete, [{ path: '', reason: 'the mount root is unavailable' }]);
+    assert.deepEqual(data.incomplete, [{ path: '', reason: "the mount root is unavailable — listing it won't change that; whoever runs this host can put the mount's directory back at its path, and the workspace then reaches it" }]);
   });
 
   for (const followSymlinks of [false, true]) {
@@ -7120,11 +7132,11 @@ describe('on-agent-action', () => {
     const scan = (await call(m, 'status', {})).work.lastAgentActionScan;
     assert.equal(scan.complete, true, 'it finished');
     assert.equal(scan.withinDeadline, true);
-    assert.deepEqual(scan.incomplete, [{ path: 'locked', reason: 'cannot list (EACCES)' }]);
+    assert.deepEqual(scan.incomplete, [{ path: 'locked', reason: "cannot list (permission denied) — listing it won't change that; whoever runs this host can change the permissions, and the workspace then reaches it" }]);
     const event = env.events.find((e) => e.type === 'workspace:agent-action-scan-incomplete') as unknown as
       | { mount: string; incomplete: Array<{ path: string; reason: string }> } | undefined;
     assert.equal(event?.mount, 'work');
-    assert.deepEqual(event?.incomplete, [{ path: 'locked', reason: 'cannot list (EACCES)' }]);
+    assert.deepEqual(event?.incomplete, [{ path: 'locked', reason: "cannot list (permission denied) — listing it won't change that; whoever runs this host can change the permissions, and the workspace then reaches it" }]);
   });
 
   test('a scan that outlasts its deadline is reported incomplete, and still finishes', async (t) => {
@@ -7335,7 +7347,7 @@ describe('on-agent-action', () => {
     const data = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
       () => call(m, 'ls', { path: 'work', recursive: true }));
     assert.deepEqual(data.entries, []);
-    assert.deepEqual(data.incomplete, [{ path: '', reason: 'the selected branch kept changing while the scan ran' }]);
+    assert.deepEqual(data.incomplete, [{ path: '', reason: 'the selected branch kept changing while the scan ran — listing it checks it afresh' }]);
   });
 
   test("a read whose disk check gives up on a branch that keeps changing says it shows the workspace's copy, and why", async (t) => {
@@ -7388,7 +7400,7 @@ describe('on-agent-action', () => {
     env.store.createBranch('other', main);
     const error = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
       () => refused(m, 'read', { path: 'work/b.txt' }));
-    assert.equal(error, 'work/b.txt is not in the workspace, and disk could not be checked (the selected branch kept changing while the scan ran). Read again to check it.');
+    assert.equal(error, `The read did nothing: "work/b.txt" isn't in the workspace, and disk couldn't be checked: the selected branch kept changing while the scan ran. Make the same call again, which checks disk first.`);
   });
 
   /**
@@ -7440,9 +7452,9 @@ describe('on-agent-action', () => {
         assert.equal(again.success, true, `${tool} again: ${JSON.stringify(again)}`);
       }
     }
-    const unchecked = `work/new.txt is not in the workspace, and disk could not be checked (${KEPT_CHANGING}). Make the same call again, which checks disk first.`;
+    const unchecked = `"work/new.txt" isn't in the workspace, and disk couldn't be checked: ${KEPT_CHANGING}. Make the same call again, which checks disk first.`;
     assert.deepEqual(answers, {
-      delete: unchecked,
+      delete: `The delete did nothing: ${unchecked}`,
       readBinary: unchecked,
       edit: `work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Make the same call again, which checks disk first.`,
       edit_many: 'The edit_many call stored none of its edits: 1 problem.\n\n'
@@ -7530,8 +7542,8 @@ describe('on-agent-action', () => {
     const read = await m.readBinary('work/new.txt');
     const deleted = await m.handleToolCall({ id: 't', name: 'delete', input: { path: 'work/new.txt' } });
     assert.ok('error' in read, JSON.stringify(read));
-    assert.match(read.error, /^work\/new\.txt is not in the workspace, and disk could not be checked \(.+\)\.$/);
-    assert.equal(read.error, deleted.error);
+    assert.match(read.error, /^"work\/new\.txt" isn't in the workspace, and disk couldn't be checked: .+$/);
+    assert.equal(deleted.error, `The delete did nothing: ${read.error}`);
   });
 
   test("an edit under a pass that decided, with a region left incomplete, applies to the workspace's copy and says so, where one that decided nothing refuses", async (t) => {
@@ -7810,7 +7822,7 @@ describe('a named mount, and a path the workspace and disk hold differently', ()
     ] } as Partial<WorkspaceConfig>);
     const status = await call(m, 'status', { mount: 'work' });
     assert.deepEqual(Object.keys(status.mounts ?? status), ['work'], JSON.stringify(status));
-    assert.match(await refused(m, 'status', { mount: 'nowhere' }), /Unknown mount: nowhere/);
+    assert.match(await refused(m, 'status', { mount: 'nowhere' }), /^The status did nothing: "mount" is "nowhere", which is no mount's name/);
     const done = await call(m, 'materialize', { mount: 'second' });
     assert.equal(done.count, 0);
     assert.match(JSON.stringify(done.skipped), /a read-only mount: materialize writes nothing to it/);

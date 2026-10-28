@@ -196,8 +196,10 @@ describe('skip_reply wake capability', () => {
     await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
       .startAgentStream(agent, { agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
     await framework.runUntilIdle();
+    const drafts = (framework as unknown as { proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> } })
+      .proseDrafts.open('agent').map((d) => [d.text, d.reason]);
     await framework.stop();
-    return { routed, streams: membrane.calls.length, completed };
+    return { routed, streams: membrane.calls.length, completed, drafts };
   }
   const send = (id: string): ContentBlock =>
     ({ type: 'tool_use', id, name: 'channel_publish', input: { channelId: 'channel:test', content: 'sent' } } as ContentBlock);
@@ -221,11 +223,11 @@ describe('skip_reply wake capability', () => {
     assert.deepEqual(routed, []);
   });
 
-  it('a budget restart after a refused wake starts from its trigger, as after any other round', async () => {
-    // A send silences the rest of its stream; then a round crosses the
+  it('a budget restart after a refused wake keeps the send\'s hold, as after any other round', async () => {
+    // A send silences the rest of its turn; then a round crosses the
     // stream's budget, and the turn restarts. Whether that round was a refused
     // wake or a plain tool call, the restarted stream speaks the same: nothing
-    // of the refused call outlives its stream.
+    // of the refused call outlives its own round.
     const restartedAfter = (store: string, second: ContentBlock) => {
       const overBudget = createMockResponse([{ type: 'text', text: 'this round stays private' }, second] as ContentBlock[], 'tool_use');
       overBudget.usage = { inputTokens: 100, outputTokens: 5 };
@@ -238,8 +240,10 @@ describe('skip_reply wake capability', () => {
     const plain = await restartedAfter('restart-plain', { type: 'tool_use', id: 'think-2', name: 'think', input: { content: 'a plan' } } as ContentBlock);
     assert.equal(refused.streams, 2, 'the refused round crossed the budget, and the turn restarted');
     assert.equal(plain.streams, 2);
-    assert.deepEqual(plain.routed, ['after the restart'], 'the restarted stream starts from its trigger, unsilenced');
+    assert.deepEqual(plain.routed, [], 'the restarted stream keeps the send\'s hold');
+    assert.ok(plain.drafts.some(([t, reason]) => t === 'after the restart' && reason === 'explicit-send'), JSON.stringify(plain.drafts));
     assert.deepEqual(refused.routed, plain.routed);
+    assert.ok(refused.drafts.some(([t, reason]) => t === 'after the restart' && reason === 'explicit-send'), JSON.stringify(refused.drafts));
   });
 
   it('keeps the existing successful end-turn behavior when EventGate exists', async () => {
@@ -412,6 +416,22 @@ describe('the channel registry\'s skip_reply confirmation names the wake the gat
     }
     assert.equal(await note(undefined), 'Turn ended; nothing sent.');
     assert.equal(await note(null), 'Turn ended; nothing sent.');
+  });
+
+  it('names the heartbeat the framework says is due sooner, and only beside a wake it set', async () => {
+    const registry = new ChannelRegistry(
+      {} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { eventGatePresent: true },
+    );
+    const earlierWake = { inSeconds: 300, what: 'your heartbeat (a silent tick, every 60 min)' };
+    const noteOf = async (input: Record<string, unknown>) => ((await registry.handleChannelToolCall(
+      'skip_reply', input, { kind: 'agent', agentName: 'agent', earlierWake },
+    )) as { data?: { note?: string } }).data?.note;
+    assert.equal(
+      await noteOf({ wake_in_seconds: 900 }),
+      'Turn ended; nothing sent. Self-wake in ~900s unless something wakes you first. Your heartbeat (a silent tick, every 60 min) '
+        + 'is due sooner, in ~300s; if it wakes you, the self-wake is cancelled, so set it again for the ~600s left if you still want it.',
+    );
+    assert.equal(await noteOf({}), 'Turn ended; nothing sent.', 'a skip with no wake has no self-wake to cancel');
   });
 
   it('a call whose input is null is an ordinary skip, where it used to throw reading wake_in_seconds', async () => {

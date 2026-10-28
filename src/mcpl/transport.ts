@@ -19,9 +19,10 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
+import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
+import { escapeLineSeparators, readLines } from '../line-reader.js';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
@@ -325,16 +326,18 @@ export class StdioTransport extends McplTransport {
     });
   }
 
+  private readonly stopLines: () => void;
+
   private constructor(
     private readonly child: ChildProcess,
-    private readonly rl: ReadlineInterface,
+    stdout: Readable,
     /** The server this child serves, named in its stderr lines and in what
      *  its reaping reports. */
     serverId: string,
   ) {
     super(serverId);
 
-    this.rl.on('line', (line: string) => this.pushLine(line));
+    this.stopLines = readLines(stdout, (line) => this.pushLine(line));
 
     // Stitch stderr chunks into whole lines (a chunk can split a line, and a
     // character's bytes), and keep the stream's last characters for
@@ -383,12 +386,7 @@ export class StdioTransport extends McplTransport {
       });
     };
     this.child.stdin?.on('error', endOnPipeError);
-    // On the stream itself, since close() closes readline, which takes its own
-    // listener off the stream. While readline is open, its listener, which
-    // came first, re-emits the error on the interface, where an empty
-    // listener absorbs that copy.
     this.child.stdout?.on('error', endOnPipeError);
-    this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
     // stderr carries diagnostics only: a read error on it is reported, to the
     // listeners or else in the log, and never thrown. It ends nothing once
     // the connection is wired; during a handshake the listener is the
@@ -453,8 +451,7 @@ export class StdioTransport extends McplTransport {
         resolve();
       });
     });
-    const rl = createInterface({ input: child.stdout! });
-    return new StdioTransport(child, rl, config.id);
+    return new StdioTransport(child, child.stdout!, config.id);
   }
 
   writeLine(json: string): void {
@@ -462,7 +459,7 @@ export class StdioTransport extends McplTransport {
     // transport is ending it.
     if (this.pipeError) return;
     // stdin may be gone if the child died between the closed-check and here.
-    this.child.stdin?.write(json + '\n');
+    this.child.stdin?.write(escapeLineSeparators(json) + '\n');
   }
 
   private closing: Promise<void> | null = null;
@@ -492,7 +489,7 @@ export class StdioTransport extends McplTransport {
 
   private async reap(): Promise<void> {
     this.markClosed({ reason: 'closed by host' });
-    this.rl.close();
+    this.stopLines();
     await this.terminate();
   }
 
@@ -696,7 +693,7 @@ export class WebSocketTransport extends McplTransport {
 
   writeLine(json: string): void {
     if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(json);
+      this.ws.send(escapeLineSeparators(json));
     }
   }
 
@@ -830,7 +827,7 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
   inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
   reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
   allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
-  toolHints: 'true advertises MCPL tool hints (RFC-014), so the server\'s dynamic tools are announced in the conversation and called through toolsets--act, and false or leaving it out lists every tool as before',
+  toolHints: 'true advertises MCPL tool hints (RFC-014) to an MCPL server, so its dynamic tools are announced in the conversation and called through toolsets--act; leaving it out does the same wherever the name toolsets is free; false lists every tool as before and advertises none',
 };
 
 /**

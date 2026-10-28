@@ -13,8 +13,10 @@
  * - Build channel context for beforeInference params
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
 import type { ContentBlock } from '@animalabs/membrane';
-import { convertBlock } from './convert-block.js';
+import { convertBlocks } from './convert-block.js';
+import { cutToFit, markedText, markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, suppliedValue } from '../supplied-text.js';
 import type { JsStore } from '@animalabs/chronicle';
 import { isDeepStrictEqual } from 'node:util';
 import { ensureStateRegistered } from '../module-registry.js';
@@ -45,7 +47,7 @@ import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
-import { readSkipReplyWake } from './skip-reply-wake.js';
+import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
 
 // ============================================================================
@@ -643,19 +645,21 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // Constructor Options
 // ============================================================================
 
-/** Bound connector values for notices, logs and an outcome's reason. A
- *  PublishOutcome keeps the connector's structured data (`detail`) as the
- *  connection gives it, its strings redacted (redactedData). */
+/** Bound connector values for notices, logs and an outcome's reason, on one
+ *  line with their notice openings marked (suppliedValue). A PublishOutcome
+ *  keeps the connector's structured data (`detail`) as the connection gives
+ *  it, its strings redacted (redactedData). */
 export function connectorText(value: unknown): string {
   let text: string;
   try {
     text = typeof value === 'string' ? value : JSON.stringify(value) ?? String(value);
   } catch {
-    return '[unserializable connector value]';
+    return `[${NOTICE_TAG.unserializableConnectorValue}]`;
   }
   const limit = 2000;
-  const suffix = '… [truncated]';
-  return text.length > limit ? text.slice(0, limit - suffix.length) + suffix : text;
+  const suffix = `… [${NOTICE_TAG.truncated}]`;
+  const shown = suppliedValue(text);
+  return shown.length > limit ? cutToFit(shown, limit - suffix.length) + suffix : shown;
 }
 
 /**
@@ -688,6 +692,9 @@ export function sameChannel(a: ChannelRef | null | undefined, b: ChannelRef | nu
   return a.serverId === b.serverId && a.channelId === b.channelId;
 }
 
+export const NO_CHANNEL_EXAMPLE = '#<channel>';
+export const NO_PERSON_EXAMPLE = '@<person>';
+
 /**
  * A channel's server-qualified name, `serverId:channelId`. A name given as a
  * string (a tool's channelId, a `>>` target, a host's call) may take this
@@ -699,11 +706,31 @@ export function qualifiedChannelName(ref: ChannelRef): string {
   return `${ref.serverId}:${ref.channelId}`;
 }
 
-/** A channel told apart by its id and its server, for one no string picks
- *  alone: `"b:room" on server "a"`. No input takes it for a name. */
-function channelOnServer(ref: ChannelRef): string {
-  return `${JSON.stringify(ref.channelId)} on server ${JSON.stringify(ref.serverId)}`;
+function markedHistory(history: readonly unknown[]): unknown[] {
+  return history.map((item) => {
+    if (item === null || typeof item !== 'object' || Array.isArray(item) || !('content' in item)) return item;
+    const { content } = item as { content: unknown };
+    if (Array.isArray(content)) return { ...item, content: markNoticeOpenings(content.map(withEmbeddedTextMarked) as object[]) };
+    return typeof content === 'string' ? { ...item, content: markedText(content) } : item;
+  });
 }
+
+function withEmbeddedTextMarked(block: unknown): unknown {
+  if (block === null || typeof block !== 'object' || (block as { type?: unknown }).type !== 'resource') return block;
+  const { resource } = block as { resource?: unknown };
+  if (resource === null || typeof resource !== 'object' || typeof (resource as { text?: unknown }).text !== 'string') return block;
+  return { ...block, resource: { ...resource, text: markedText((resource as { text: string }).text) } };
+}
+
+/** A channel told apart by its id and its server, for one no string picks
+ *  alone or whose name wouldn't show as itself: `"b:room" on server "a"`,
+ *  each a JSON literal a channel tool's channelId and serverId take back
+ *  (quotedValue). No input takes the whole form for a name. */
+function channelOnServer(ref: ChannelRef): string {
+  return `${quotedValue(ref.channelId)} on server ${quotedValue(ref.serverId)}`;
+}
+
+const CHANNEL_ON_SERVER_AT_END = /("(?:[^"\\]|\\.)*") on server ("(?:[^"\\]|\\.)*")$/;
 
 /**
  * What one channels/publish attempt established (ChannelRegistry.publish).
@@ -1115,6 +1142,10 @@ export type ChannelToolOrigin =
      *  name one of them answers to by its id means that channel
      *  (ChannelRegistry.ownChannelNamed). */
     own?: readonly ChannelRef[];
+    /** For a skip_reply whose self-wake the framework armed: the heartbeat's
+     *  wake due before it, when there is one, which its confirmation names
+     *  (skipReplyNote). */
+    earlierWake?: SkipReplyEarlierWake;
   };
 
 /** The machine decision sources a module-origin channel_close may record.
@@ -1923,7 +1954,7 @@ export class ChannelRegistry {
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
-      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message', serverId));
+      const convertedContent: ContentBlock[] = convertBlocks(message.content, 'attachment on channel message', serverId);
       if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
         rejectEmpty();
         continue;
@@ -2298,8 +2329,10 @@ export class ChannelRegistry {
    */
   noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): void {
     // A marker is ABOUT a message, not one the agent replies to: it leaves
-    // the anchor where it was (#157). An edit the coalescer delivered as the
-    // agent's first view of its message counts as that message.
+    // the anchor where it was (#157), and so does a chat:system notice (a
+    // join, the weather), which is about the place (isMarkerTagged). An edit
+    // the coalescer delivered as the agent's first view of its message counts
+    // as that message.
     if (isMarkerTagged(tags, firstView)) return;
     if (!this.entryAt(channel)) return;
     this.defaultPublishChannel = { serverId: channel.serverId, channelId: channel.channelId };
@@ -2446,7 +2479,10 @@ export class ChannelRegistry {
         return this.handleToolJournal(input as { content?: string });
 
       case 'skip_reply':
-        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: unknown });
+        return this.handleToolSkipReply(
+          input as { reason?: string; wake_in_seconds?: unknown },
+          origin?.kind === 'agent' ? origin.earlierWake : undefined,
+        );
 
       default:
         // Not every agent is given every channel tool, so the refusal points
@@ -3988,12 +4024,20 @@ export class ChannelRegistry {
    * name, only where no registered channel takes that name, as a channel
    * tool reads it or a `>>` target does (by label or raw id too), so the
    * name can't send anything to another channel; else by its id and server.
+   * A name that wouldn't show as itself (showsAsItself: one holding a line
+   * break, a notice opening, a quote, a backslash or a lone surrogate, or
+   * whitespace at its edges) is shown by its id and its server too, which
+   * the channel tools take exactly and the prose resolver doesn't, so no name
+   * shown can be another channel's.
    */
   nameShown(ref: ChannelRef): string {
     const entry = this.entryAt(ref);
-    if (entry) return this.nameFor(entry) ?? channelOnServer(ref);
+    if (entry) {
+      const name = this.nameFor(entry);
+      return name !== undefined && showsAsItself(name) ? name : channelOnServer(ref);
+    }
     for (const name of [ref.channelId, qualifiedChannelName(ref)]) {
-      if (this.entriesNamed(name).length === 0 && !('channelId' in this.resolveProseTarget(name))) return name;
+      if (showsAsItself(name) && this.entriesNamed(name).length === 0 && !('channelId' in this.resolveProseTarget(name))) return name;
     }
     return channelOnServer(ref);
   }
@@ -4032,9 +4076,13 @@ export class ChannelRegistry {
 
   private tuneOutEndText(entry: ChannelEntry, tool?: string): string {
     const close = tool === 'channel_close';
-    const names = this.nameFor(entry) !== undefined
-      ? `channelId ${this.quotedShown(refOf(entry))}`
-      : `channelId ${JSON.stringify(entry.descriptor.id)}, serverId ${JSON.stringify(entry.serverId)}`;
+    // A name is written as a literal tune_out's channelId takes back
+    // (quotedValue, main's #852); one no name picks alone, by its id and
+    // server, since this branch's tune_out takes a serverId.
+    const name = this.nameFor(entry);
+    const names = name !== undefined
+      ? `channelId ${quotedValue(name)}`
+      : `channelId ${quotedValue(entry.descriptor.id)}, serverId ${JSON.stringify(entry.serverId)}`;
     return `Call tune_out with ${names} and mode "cancel" for it to resume normal ` +
       `attention; cancelling delivers the diverted backlog${close ? ', and channel_close closes it after that.' : '.'}`;
   }
@@ -4045,7 +4093,7 @@ export class ChannelRegistry {
    */
   quotedShown(ref: ChannelRef): string {
     const shown = this.nameShown(ref);
-    return shown === channelOnServer(ref) ? shown : JSON.stringify(shown);
+    return shown === channelOnServer(ref) ? shown : quotedValue(shown);
   }
 
   /**
@@ -4083,7 +4131,7 @@ export class ChannelRegistry {
     const nothing = opts.nothing ?? 'nothing ran';
     const names = entries.map((e) => this.nameFor(e));
     if (names.every((n) => n !== undefined)) {
-      const listed = names.map((n) => JSON.stringify(n)).join(', ');
+      const listed = names.map((n) => quotedValue(n!)).join(', ');
       const servers = [...new Set(entries.map((e) => JSON.stringify(e.serverId)))];
       // One server's two channels can answer to one name too, as `s`'s
       // `s:room` and `room` both do to `s:room`; its server picks neither.
@@ -4104,8 +4152,8 @@ export class ChannelRegistry {
       const own = names[i];
       if (own === undefined && !opts.takesServerId) return `- ${where}: no channelId reaches it alone.`;
       return own !== undefined
-        ? `- ${where}: call again with channelId ${JSON.stringify(own)}.`
-        : `- ${where}: call again with channelId ${JSON.stringify(e.descriptor.id)} and serverId ${JSON.stringify(e.serverId)}.`;
+        ? `- ${where}: call again with channelId ${quotedValue(own)}.`
+        : `- ${where}: call again with channelId ${quotedValue(e.descriptor.id)} and serverId ${JSON.stringify(e.serverId)}.`;
     });
     const count = entries.length === 2 ? 'either of two channels' : `any of ${entries.length} channels`;
     return `Channel ${JSON.stringify(name)} could mean ${count}, so ${nothing}:\n${lines.join('\n')}`;
@@ -4144,7 +4192,7 @@ export class ChannelRegistry {
       // so the text says whose.
       if (!alone) return 'channel_list shows the channels and their servers.';
       const one = named[0]!;
-      const names = `${JSON.stringify(channelId)} alone names channel ${JSON.stringify(one.descriptor.id)} on server `
+      const names = `${JSON.stringify(channelId)} alone names channel ${quotedValue(one.descriptor.id)} on server `
         + JSON.stringify(one.serverId);
       return takesServerId ? `${names}: for that one, call again with serverId left out.` : `${names}.`;
     }
@@ -4156,7 +4204,7 @@ export class ChannelRegistry {
       const places = elsewhere.map((e) => {
         const at = `on server ${JSON.stringify(e.serverId)}`;
         const name = this.nameFor(e);
-        return name === undefined ? `${at} (no channelId reaches it alone)` : `${at} as ${JSON.stringify(name)}`;
+        return name === undefined ? `${at} (no channelId reaches it alone)` : `${at} as ${quotedValue(name)}`;
       });
       return `It's ${places.length === 1 ? places[0] : `${places.slice(0, -1).join(', ')} and ${places.at(-1)}`}.`;
     }
@@ -4460,17 +4508,19 @@ export class ChannelRegistry {
     spec: string,
     opts?: { forSpeech?: boolean; own?: readonly ChannelRef[] },
   ): PublishDestination | { error: string; candidates?: string[]; refusedChannelId?: string } {
-    const own = this.ownChannelNamed(spec.trim(), opts?.own);
+    const name = spec.trim();
+    if (name === NO_CHANNEL_EXAMPLE || name === NO_PERSON_EXAMPLE) return { error: `${name} is the example's placeholder: write the name it stands for in its place` };
+    const own = this.ownChannelNamed(name, opts?.own);
     let resolved: PublishDestination | { error: string; candidates?: string[] };
     if (own === undefined) {
-      resolved = this.resolveTargetByName(spec);
+      resolved = this.resolveTargetByName(name);
     } else if ('neither' in own) {
-      resolved = { error: `"${spec.trim()}" is the id of this turn's channels on more than one server`, candidates: this.ownCandidates(own.neither).map((c) => c.text) };
+      resolved = { error: `"${name}" is the id of this turn's channels on more than one server`, candidates: this.ownCandidates(own.neither).map((c) => c.prose) };
     } else {
       const entry = this.entryAt(own.channel);
       resolved = entry
         ? { channelId: entry.descriptor.id, serverId: entry.serverId, label: entry.descriptor.label }
-        : { error: `${this.ownChannelGoneText(spec.trim(), own.channel)}, and nothing can be sent there until that server registers it again` };
+        : { error: `${this.ownChannelGoneText(name, own.channel)}, and nothing can be sent there until that server registers it again` };
     }
     if (!opts?.forSpeech || 'error' in resolved) return resolved;
     const entry = this.entryAt(resolved);
@@ -4529,7 +4579,7 @@ export class ChannelRegistry {
     if (!mine) return undefined;
     if ('neither' in mine) {
       const done = tool === 'publish' ? 'was posted' : tool === 'deliver' ? 'was delivered' : 'ran';
-      return { error: this.ownNeitherRefusal(name, mine.neither, done) };
+      return { error: this.ownNeitherRefusal(name, mine.neither, done, false) };
     }
     return this.entryAt(mine.channel) ? { channel: mine.channel } : { error: this.ownChannelGoneRefusal(name, mine.channel, tool) };
   }
@@ -4548,32 +4598,73 @@ export class ChannelRegistry {
   /**
    * The turn's channels a name means neither of (ownChannelNamed), each by a
    * string that reaches it outside the turn's rule: its server-qualified
-   * name, where that picks it alone, since its id is the name refused. One
-   * no string picks alone, and one its server no longer registers, is named
-   * by its id and server, saying so; `reaches` says which a name reaches.
+   * name, where that picks it alone, since its id is the name refused. `text`
+   * is that name, which a refusal writes as JSON; `prose`, which a `>>`
+   * target reads, is that name where it shows as itself, else its id and
+   * server. One no string picks alone, and one its server no longer
+   * registers, are named by id and server in both, saying so. `reaches` says
+   * which a name reaches.
    */
-  private ownCandidates(channels: readonly ChannelRef[]): Array<{ text: string; reaches: boolean }> {
+  private ownCandidates(channels: readonly ChannelRef[]): Array<{ text: string; prose: string; reaches: boolean; byServer: boolean }> {
     return channels.map((c) => {
       const entry = this.entryAt(c);
-      if (!entry) return { text: `${channelOnServer(c)} (its server no longer registers it)`, reaches: false };
+      if (!entry) {
+        const text = `${channelOnServer(c)} (its server no longer registers it)`;
+        return { text, prose: text, reaches: false, byServer: false };
+      }
       const qualified = qualifiedChannelName(c);
       const picked = this.entriesNamed(qualified);
-      return picked.length === 1 && picked[0] === entry
-        ? { text: qualified, reaches: true }
-        : { text: `${channelOnServer(c)} (no channelId reaches it alone)`, reaches: false };
+      if (picked.length !== 1 || picked[0] !== entry) {
+        const text = `${channelOnServer(c)} (no channelId reaches it alone)`;
+        return { text, prose: text, reaches: false, byServer: true };
+      }
+      return { text: qualified, prose: showsAsItself(qualified) ? qualified : channelOnServer(c), reaches: true, byServer: false };
     });
+  }
+
+  /**
+   * What a refusal listing these candidates says of each one that is a
+   * channel shown by its id and server: the channelId channel_publish reaches
+   * it by, or that no channelId reaches it alone. That is its server-qualified
+   * name where that picks it alone, since a bare id is what a turn's own
+   * channels answer to first, whether or not their server still registers
+   * them (ownChannelNamed), and else its id where that picks it alone and
+   * isn't empty (channel_publish refuses an empty one). It leaves out a channel no
+   * longer registered and a candidate that already says no channelId reaches
+   * it alone, and is empty when nothing is left.
+   */
+  publishRouteFor(candidates: readonly string[]): string {
+    const parts = new Set<string>();
+    for (const candidate of candidates) {
+      const shown = CHANNEL_ON_SERVER_AT_END.exec(candidate);
+      if (!shown) continue;
+      const ref: ChannelRef = { channelId: JSON.parse(shown[1]!) as string, serverId: JSON.parse(shown[2]!) as string };
+      const entry = this.entryAt(ref);
+      if (!entry) continue;
+      const name = [qualifiedChannelName(ref), ref.channelId].find((n) => {
+        const named = n === '' ? [] : this.entriesNamed(n);
+        return named.length === 1 && named[0] === entry;
+      });
+      parts.add(name !== undefined
+        ? `channel_publish reaches ${channelOnServer(ref)} with channelId ${quotedValue(name)}`
+        : `no channelId reaches ${channelOnServer(ref)} alone`);
+    }
+    return parts.size ? ` For a channel shown by its id and server: ${[...parts].join('; ')}.` : '';
   }
 
   /** A tool's refusal of a name the turn's channels on more than one server
    *  answer to by their id (ownChannelNamed's neither). */
-  private ownNeitherRefusal(name: string, channels: readonly ChannelRef[], done: string): string {
+  private ownNeitherRefusal(name: string, channels: readonly ChannelRef[], done: string, takesServer = true): string {
     const candidates = this.ownCandidates(channels);
-    const named = candidates.filter((c) => c.reaches).map((c) => JSON.stringify(c.text));
+    const named = candidates.filter((c) => c.reaches).map((c) => quotedValue(c.text));
     const pick = named.length === candidates.length ? ' Call again with channelId set to one of them.'
       : named.length === 1 ? ` Call again with channelId ${named[0]}.`
         : named.length > 1 ? ` Call again with channelId set to one of ${named.join(', ')}.` : '';
-    const listed = candidates.map((c) => (c.reaches ? JSON.stringify(c.text) : c.text)).join(', ');
-    return `"${name}" is the id of this turn's channels on more than one server (${listed}), so nothing ${done}.${pick}`;
+    const listed = candidates.map((c) => (c.reaches ? quotedValue(c.text) : c.text)).join(', ');
+    const byServer = takesServer && candidates.some((c) => c.byServer)
+      ? ' For a channel shown by its id and server, call again with that channelId and that serverId.'
+      : '';
+    return `"${name}" is the id of this turn's channels on more than one server (${listed}), so nothing ${done}.${pick}${byServer}`;
   }
 
   private resolveTargetByName(
@@ -4587,7 +4678,7 @@ export class ChannelRegistry {
     // A candidate is named by the token that picks it alone (nameFor), so
     // two servers' channels with one id or one label can be told apart, or,
     // where no string picks it alone, by its id and its server.
-    const token = (e: ChannelEntry): string => this.nameFor(e) ?? channelOnServer(refOf(e));
+    const token = (e: ChannelEntry): string => this.nameShown(refOf(e));
     // A DM is shown by its label, the person, where that label, given as a
     // target, picks that DM. It doesn't where another channel answers to that
     // label too, as two servers' DMs with one person do (a label is matched
@@ -4603,7 +4694,7 @@ export class ChannelRegistry {
     };
     const dmShown = (list: ChannelEntry[]): string[] => list.map((e) => {
       const label = e.descriptor.label ?? e.descriptor.id;
-      return labelPicks(e, label) ? label : token(e);
+      return showsAsItself(label) && labelPicks(e, label) ? label : token(e);
     });
 
     // A channel id, or its server-qualified name (entriesNamed).
@@ -4721,7 +4812,7 @@ export class ChannelRegistry {
     if (byName.length > 1) {
       return {
         error: `"${trimmed}" matches several channels`,
-        candidates: byName.map((e) => `${e.descriptor.label} = ${token(e)}`),
+        candidates: byName.map((e) => `${nameToTypeBack(e.descriptor.label ?? '')} = ${token(e)}`),
       };
     }
 
@@ -4730,7 +4821,7 @@ export class ChannelRegistry {
     const near = entries
       .filter((e) => norm(e.descriptor.label ?? '').includes(norm(trimmed)))
       .slice(0, 5)
-      .map((e) => `${e.descriptor.label} = ${token(e)}`);
+      .map((e) => `${nameToTypeBack(e.descriptor.label ?? '')} = ${token(e)}`);
     return { error: `no channel matches "${trimmed}"`, ...(near.length ? { candidates: near } : {}) };
   }
 
@@ -4767,7 +4858,7 @@ export class ChannelRegistry {
       qualifiedChannelName(ref),
     ];
     for (const c of candidates) {
-      if (!isProseTargetToken(c) || c === '#') continue;
+      if (!isProseTargetToken(c) || c === '#' || !showsAsItself(c)) continue;
       const r = this.resolveProseTarget(c, { forSpeech: true });
       if ('channelId' in r && sameChannel(r, ref)) return c;
     }
@@ -5056,7 +5147,7 @@ export class ChannelRegistry {
           channelId: input.channelId,
           serverId: entry.serverId,
           status: alreadyDesiredOpen ? 'reconciled' : 'opened',
-          ...(result.history ? { history: result.history } : {}),
+          ...(result.history ? { history: markedHistory(result.history) } : {}),
           ...(result.historyTruncated ? { historyTruncated: true } : {}),
         },
       };
@@ -5549,13 +5640,14 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }, earlierWake?: SkipReplyEarlierWake): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
     // EventGate) BEFORE its dispatch reaches this handler, from the same
     // reading, and the framework refuses a wake the host can't set before
     // dispatching. A caller of this registry's handleChannelToolCall
     // (AgentFramework.channels) goes past both, so its note names a wake
-    // nothing armed.
+    // nothing armed. The framework, which also owns the heartbeat, says
+    // which of its wakes is due before the self-wake (`earlierWake`).
     const wake = readSkipReplyWake(input);
     const selfWake = wake.kind === 'wake' ? wake.seconds : undefined;
     return {
@@ -5571,9 +5663,7 @@ export class ChannelRegistry {
       // on Fable: ~60% of skip_reply result bytes were verbatim input echo).
       data: {
         skipped: true,
-        note: selfWake !== undefined
-          ? `Turn ended; nothing sent. Self-wake in ~${selfWake}s unless something wakes you first.`
-          : 'Turn ended; nothing sent.',
+        note: skipReplyNote(selfWake, selfWake !== undefined ? earlierWake : undefined),
       },
     };
   }
@@ -6186,7 +6276,7 @@ export class ChannelRegistry {
       entry = this.entryAt(serverGiven ? { serverId: input.serverId!, channelId: fallback!.channelId } : fallback!);
     } else if (own && 'neither' in own) {
       if (seen) seen.refusal = 'shared-id';
-      return { success: false, error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted'), isError: true };
+      return { success: false, error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted', false), isError: true };
     } else if (own) {
       entry = this.entryAt(own.channel);
       if (!entry) {
@@ -6217,7 +6307,7 @@ export class ChannelRegistry {
         // channel with its id isn't where its message came from.
         error: input.channelId === undefined
           ? serverGiven
-            ? `Server "${input.serverId}" has no channel "${fallback!.channelId}", the id of the channel this call would default to, so nothing was posted.`
+            ? `Server "${input.serverId}" has no channel ${quotedValue(fallback!.channelId)}, the id of the channel this call would default to, so nothing was posted.`
             : `The channel this would default to, ${this.quotedShown(fallback!)}, isn't registered now, so nothing was posted.`
           // This tool's schema has no serverId, so one given here is a host's
           // ref (publishForAgent), or one an agent added unasked, and the
