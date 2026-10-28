@@ -685,8 +685,11 @@ const systemNoticeMark = (tags?: string[]): { systemNotice?: true } =>
  * every plain word private already (suppressProse). Its turn's plain speech
  * has no destination (TurnRouting.heartbeat).
  */
-function isHeartbeatWake(trigger: Pick<InferenceRequest, 'source' | 'channelId' | 'suppressProse'> | undefined): boolean {
-  return trigger !== undefined && trigger.source === 'heartbeat' && !trigger.channelId && trigger.suppressProse !== true;
+function isHeartbeatWake(
+  trigger: Pick<InferenceRequest, 'source' | 'channelId' | 'suppressProse' | 'heartbeatTurn'> | undefined,
+): boolean {
+  if (trigger === undefined || trigger.channelId || trigger.suppressProse === true) return false;
+  return trigger.heartbeatTurn ?? trigger.source === 'heartbeat';
 }
 
 // parseProsePrefix lives in ./mcpl/prose-grammar.ts. The outgoing stream
@@ -17153,13 +17156,14 @@ export class AgentFramework {
       //      an open channel — legacy last-inbound semantics).
       // A chat:system notice (RFC-001 rev 3: weather in a world, someone
       // joining) names no channel at all: nobody spoke there, so a turn it
-      // wakes alone takes the global fallback, as a heartbeat does, and the
-      // agent sends there explicitly if it means to.
+      // wakes alone takes the global fallback, and the agent sends there
+      // explicitly if it means to.
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
       // carry channelId) leave both undefined → global fallback, which an
-      // ephemeral run never takes (takesGlobalFallback).
+      // ephemeral run never takes (takesGlobalFallback), except a heartbeat's
+      // turn, which takes none (heartbeatTurn below).
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
@@ -17235,6 +17239,9 @@ export class AgentFramework {
         wakeLines: mergeWakeLines(requests),
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
+        // A heartbeat's turn when any cause is a heartbeat's wake and none
+        // names a channel, whatever the batch's order (isHeartbeatWake).
+        heartbeatTurn: !channelReq && requests.some((r) => isHeartbeatWake(r)),
         // The channel and its server from the one request, so the turn's
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
@@ -18238,6 +18245,13 @@ export class AgentFramework {
     return this.channelRegistry!.routeSpeech(agent.name, text, locus);
   }
 
+  /** The mark a framework wake takes from a heartbeat's turn with no locus
+   *  of its own (InferenceRequest.heartbeatTurn), so the turn it opens is a
+   *  heartbeat's too; nothing for any other turn. */
+  private heartbeatTurnMark(routing: TurnRouting): { heartbeatTurn?: true } {
+    return routing.heartbeat && !routing.locus ? { heartbeatTurn: true } : {};
+  }
+
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
   private holdHeartbeatProse(agent: Agent, texts: string[], round: ProseRound): Draft[] {
     console.error(`[prose] ${agent.name}: heartbeat turn — ${texts.length} plain-speech segment(s) held as drafts (no destination)`);
@@ -18462,16 +18476,6 @@ export class AgentFramework {
   }
 
   /**
-   * Announce-on-change locus notice (turn-frozen routing). Appends a durable
-   * `[routing]` window message when the turn's effective outbound locus
-   * differs from the last one announced — the agent must never have to guess
-   * where its plain prose lands. Durable append (never retracted) keeps the
-   * KV prefix stable; change-only keeps it out of steady-state turns. The
-   * first resolution after boot announces only a non-null locus ("prose has
-   * no destination" is the unremarkable boot default). Never triggers
-   * inference; never locus-eligible itself (system + no channel metadata).
-   */
-  /**
    * Tell a heartbeat's turn, before it compiles, that its plain speech has
    * no destination (TurnRouting.heartbeat): the last `[routing]` notice may
    * name a channel, and this turn's words won't go there. It leaves the
@@ -18491,6 +18495,16 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * Announce-on-change locus notice (turn-frozen routing). Appends a durable
+   * `[routing]` window message when the turn's effective outbound locus
+   * differs from the last one announced — the agent must never have to guess
+   * where its plain prose lands. Durable append (never retracted) keeps the
+   * KV prefix stable; change-only keeps it out of steady-state turns. The
+   * first resolution after boot announces only a non-null locus ("prose has
+   * no destination" is the unremarkable boot default). Never triggers
+   * inference; never locus-eligible itself (system + no channel metadata).
+   */
   private announceLocusIfChanged(agentName: string, locus: ChannelRef | null): void {
     const hasBaseline = this.lastAnnouncedLocus.has(agentName);
     const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
@@ -19357,6 +19371,7 @@ export class AgentFramework {
       reason: 'prose-continuation',
       source: 'framework',
       timestamp: Date.now(),
+      ...this.heartbeatTurnMark(routing),
     });
   }
 
@@ -19447,14 +19462,8 @@ export class AgentFramework {
       source: 'framework',
       timestamp: Date.now(),
       ...channel,
-      autoContinueRun: {
-        stop,
-        ...(opts.heldAfterSend ? { heldAfterSend: true } : {}),
-        // A heartbeat's turn has no channel to pass on: its continuation is
-        // marked, so it holds its plain speech too, rather than taking the
-        // global fallback (TurnRouting.heartbeat).
-        ...(routing.heartbeat && !routing.locus ? { heartbeat: true as const } : {}),
-      },
+      autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
+      ...this.heartbeatTurnMark(routing),
     });
   }
 
@@ -19474,12 +19483,12 @@ export class AgentFramework {
    * starts (startAgentStream), with the run's count as it stands and the
    * agent's cap. False when it couldn't be stored.
    */
-  private writeAutoContinueNotice(agent: Agent, mark: AutoContinueRun): boolean {
+  private writeAutoContinueNotice(agent: Agent, mark: AutoContinueRun, heartbeat = false): boolean {
     const count = this.autoContinueStreaks.get(agent.name) ?? 1;
     const max = agent.autoContinue?.maxConsecutive ?? count;
     const text = autoContinueNotice({
       agentName: agent.name, stop: mark.stop, last: count >= max, heldAfterSend: mark.heldAfterSend,
-      heartbeat: mark.heartbeat === true,
+      heartbeat,
     });
     const before = this.storedCountOf(agent);
     let id: MessageId;
@@ -20304,6 +20313,7 @@ export class AgentFramework {
         reason: 'prose-bounce',
         source: 'framework',
         timestamp: Date.now(),
+        ...this.heartbeatTurnMark(round.routing),
       });
     }
   }
@@ -21017,16 +21027,16 @@ export class AgentFramework {
     // without the mark, so a retry doesn't write it again. A row that can't
     // be stored gives back the run's count, and withdraws a turn the
     // continuation alone caused: it would wake to nothing it can read.
-    // A continuation of a heartbeat's turn is a heartbeat's turn too
-    // (AutoContinueRun.heartbeat), read here before the mark goes.
-    const continuesHeartbeat = trigger?.autoContinueRun?.heartbeat === true;
+    // A framework wake that continues a heartbeat's turn (heartbeatTurn) is
+    // one too, and isn't told again what the turn that started the run was.
+    const continuesHeartbeat = trigger?.heartbeatTurn === true && trigger.source === 'framework';
     if (attempt === 0 && !resumesTurn && trigger?.autoContinueRun) {
       const mark = trigger.autoContinueRun;
       const { autoContinueRun: _mark, ...unmarked } = trigger;
       trigger = unmarked;
       // Another reader's turn may have started since the scheduler checked.
       const busy = this.sharedSlotBusy(agent);
-      if (busy || !this.writeAutoContinueNotice(agent, mark)) {
+      if (busy || !this.writeAutoContinueNotice(agent, mark, trigger.heartbeatTurn === true)) {
         this.giveBackAutoContinue(agent.name, busy ? "another resident's turn is alive in the shared slot" : 'its row could not be stored');
         if (mark.sole) {
           console.error(`[continue] ${agent.name}: turn not started (the continuation was its only cause)`);
@@ -21178,7 +21188,7 @@ export class AgentFramework {
       else delete routing.noChannel;
       // A heartbeat's turn has no channel, and takes no fallback: its plain
       // speech is held as a draft (TurnRouting.heartbeat).
-      if (isHeartbeatWake(trigger) || (continuesHeartbeat && !trigger?.channelId)) routing.heartbeat = true;
+      if (isHeartbeatWake(trigger)) routing.heartbeat = true;
       else delete routing.heartbeat;
       // Resolve the turn's outbound locus now: the home channel for forks,
       // else the trigger channel, else the global default, which an
@@ -22492,9 +22502,9 @@ export class AgentFramework {
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
                 );
               } else {
-                console.error(
-                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${roundLocus ?? '(default)'}`,
-                );
+                console.error(roundLocus === null && streamRouting.heartbeat
+                  ? `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) held as drafts (a heartbeat turn)`
+                  : `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${roundLocus ?? '(default)'}`);
                 for (const seg of roundSegments) {
                   enqueueSpeech(seg, roundLocus, roundPublished, roundOpts);
                 }

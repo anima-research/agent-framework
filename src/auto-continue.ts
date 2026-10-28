@@ -43,7 +43,7 @@ export function autoContinueNotice(opts: {
       ? ' Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going.'
       : '') +
     (opts.heartbeat
-      ? ` If you're done, ${opts.stop}; anything you write without it is held as a draft, as on the heartbeat's turn, and an explicit send reaches a channel.`
+      ? ` If you're done, ${opts.stop}; plain words you write without it and with no destination are held as drafts, as on the heartbeat's turn, and an explicit send reaches a channel.`
       : ` If you're done, ${opts.stop}; anything you write without it is sent as usual.`) +
     (opts.last ? ' This is the last continuation in a row: after this turn you wait for the next event either way.' : '');
 }

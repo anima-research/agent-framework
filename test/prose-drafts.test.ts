@@ -4319,6 +4319,40 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
     }
   });
 
+  it('a heartbeat batched behind another channel-less wake is still a heartbeat\'s turn', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      h.membrane.pushResponse(createMockResponse([text('words from a batched tick')]));
+      const before = h.membrane.calls.length;
+      const pending = (h.framework as unknown as { pendingRequests: unknown[] }).pendingRequests;
+      const t = Date.now();
+      pending.push(
+        { agentName: 'scout', reason: 'test', source: 'test', timestamp: t },
+        { agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: t + 1 },
+      );
+      await h.until(() => h.membrane.calls.length > before, 'the batch\'s turn');
+      await h.framework.runUntilIdle();
+      await h.until(() => h.drafts().length === 1, 'the held words');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room'], 'the batch order does not decide');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: the resend wake after a heartbeat turn's failed >>> target is a heartbeat's turn too", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      onSecondStream(h.membrane, createMockResponse([text('unprefixed words on the resend turn')]));
+      await h.turn([createMockResponse([text('>>>#nowhere words meant for someone')])], 'scout', 'heartbeat');
+      await h.until(() => h.drafts().some((d) => d.text === 'unprefixed words on the resend turn'), 'the resend turn\'s words held');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('an explicit send from a heartbeat turn still posts', async () => {
     const h = await harness();
     try {
@@ -4377,7 +4411,7 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
       assert.deepEqual(h.drafts().map((d) => d.text).reverse(), ['first heartbeat words', 'continued heartbeat words']);
       assert.equal(h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).length, 1,
         'the continuation is not told again');
-      assert.ok(h.texts().some((t) => t.startsWith('[continue]') && t.includes('is held as a draft, as on the heartbeat')),
+      assert.ok(h.texts().some((t) => t.startsWith('[continue]') && t.includes('are held as drafts, as on the heartbeat')),
         'its [continue] row says its words are held');
     } finally {
       await h.close();

@@ -20,9 +20,6 @@ export interface AutoContinueRun {
   heldAfterSend?: boolean;
   /** Set by the scheduler: the continuation is the turn's only cause. */
   sole?: boolean;
-  /** The turn it continues was a heartbeat's: it has no channel either, and
-   *  holds its plain speech as drafts as that turn did. */
-  heartbeat?: true;
 }
 
 /** `AgentConfig.autoContinue` as an object (`true` means `{}`). */
@@ -608,6 +605,17 @@ export interface InferenceRequest {
    * it starts. Hosts don't set it.
    */
   autoContinueRun?: AutoContinueRun;
+  /**
+   * Framework-set: whether this wake's turn is a heartbeat's, which has no
+   * channel and holds its plain speech as drafts. True on a wake that
+   * continues a heartbeat's turn with no channel of its own (an autoContinue
+   * continuation, a bounce's resend wake, a ` !` continuation, and a re-arm,
+   * which copies its trigger), and on a merged batch whose causes include a
+   * heartbeat's wake and name no channel; false on a merged batch with none,
+   * so the batch's first request doesn't decide it. Unset, a wake is a
+   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it.
+   */
+  heartbeatTurn?: boolean;
   /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
