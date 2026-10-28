@@ -36352,9 +36352,12 @@ export class AgentFramework {
   private readerToolCall(agentName: string, call: ToolCall): { refused: string } | { result: Promise<ToolResult> } {
     const isReader = agentName === this.subconsciousAgentName || this.registry.get(agentName)?.kind === 'subconscious-fork';
     if (!this.tuneOutCoordinator || !isReader) return { refused: `${call.name} is available to the resident's reader, not to ${agentName}` };
+    // A reader fork acts for the epoch it was derived to read (invokeReaderFork records it on the fork's record).
+    const epoch = this.registry.get(agentName)?.metadata?.epochId;
     return {
       result: this.tuneOutCoordinator
-        .handleSubconsciousTool(call.name, call.input as Record<string, unknown>, this.callOwnChannels(agentName, call), agentName)
+        .handleSubconsciousTool(call.name, call.input as Record<string, unknown>, this.callOwnChannels(agentName, call), agentName,
+          typeof epoch === 'string' ? epoch : undefined)
         .catch((err): ToolResult => ({ success: false, error: thrownText(err), isError: true })),
     };
   }

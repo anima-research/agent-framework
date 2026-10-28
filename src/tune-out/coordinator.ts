@@ -1780,6 +1780,8 @@ export class TuneOutCoordinator {
     own: readonly ChannelRef[] = [],
     /** The calling agent: the persistent subconscious, or a reader fork. */
     caller?: string,
+    /** A reader fork's epoch, the one it was derived to read: it acts only on that epoch's hold. */
+    readerEpoch?: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     switch (name) {
       case 'deliver_summary': {
@@ -1834,7 +1836,16 @@ export class TuneOutCoordinator {
       case 'cancel_tuneout': {
         const name = String(input.channelId ?? '');
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
+        const newer = (held: string) => ({
+          success: false,
+          error: `Nothing was cancelled: the hold you were reading for has ended, and ${held} is a newer one, set after `
+            + 'you began reading. A reader cancels only the hold it was derived for; your report can say what you would '
+            + 'judge of this one.',
+          isError: true,
+        });
         const endScope = (): { success: boolean; data?: unknown; error?: string; isError?: boolean } => {
+          const scope = this.getAllExcept();
+          if (readerEpoch !== undefined && scope && scope.params.epochId !== readerEpoch) return newer('the all-except hold in place now');
           const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
           return result.ok
             ? { success: true, data: { cancelled: true, scope: 'all-except' } }
@@ -1882,6 +1893,10 @@ export class TuneOutCoordinator {
             };
           }
           return endScope();
+        }
+        const held = this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId);
+        if (readerEpoch !== undefined && held && held.params.epochId !== readerEpoch) {
+          return newer(`the tune-out holding ${this.quotedShown(channel.serverId, channel.channelId)} now`);
         }
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
         return result.ok
