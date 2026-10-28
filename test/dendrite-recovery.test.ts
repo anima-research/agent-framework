@@ -12,6 +12,7 @@
  * - a recovery file that holds null, or a registry without its counters, is
  *   refused rather than read as empty;
  * - an agent that ended past the registry's memory is still found;
+ * - a finished orphan's held result is told of and can be adopted;
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -234,5 +235,22 @@ describe('the registry\'s recovery', () => {
     const second = await boot();
     assert.equal(second.getAgentRecord('old-0')?.ended?.reason, 'completed', 'the oldest is still found');
     assert.equal(second.getAgentRecord('never-was'), null);
+  });
+
+  it('a finished orphan\'s held result is told of, and adopting the ended orphan delivers it', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const job = await startBlocked(first, gates, 'job', 'g-job', workerSpec('job', { spawnedBy: 'boss', resultTo: { to: 'boss', as: 'message' } }), 'job result');
+    first.stopAgent('boss', { by: 'mira' });
+    gates.release('g-job');
+    assert.ok((await job.settled).ok, 'the orphaned job finishes');
+    first.deliverAgentResult('job', [{ type: 'text', text: 'RESULT-1' }]);
+    assert.deepEqual(first.listHeldMail().map((m) => [m.to, m.heldBecause]), [['boss', 'recipient-gone']]);
+    assert.equal(rowsWith(first, 'oren', 'reparenting "job" to you delivers it').length, 1, 'the first candidate is told the result is held');
+    const record = first.reparentAgent('job', 'oren', { by: 'oren' });
+    assert.equal(record.ended?.reason, 'completed', 'the record stays as it ended');
+    assert.equal(rowsWith(first, 'oren', 'RESULT-1').length, 1, 'and the result reaches oren');
   });
 });

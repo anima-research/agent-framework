@@ -429,6 +429,29 @@ export class AgentRegistry {
     return { record, deliverable };
   }
 
+  /**
+   * An ended agent's held results find a new recipient: mail it produced for
+   * a recipient that is gone is re-addressed to `newParent` and returned for
+   * delivery. Its record stays as it ended, since history isn't reparented.
+   */
+  readdressHeldMail(name: AgentName, newParent: AgentName): { record: AgentRecord; deliverable: HeldMail[] } {
+    return this.requested(() => {
+      const record = this.inspect(name);
+      if (!record?.ended) throw new AgentSpecError(name, 'is not an ended agent');
+      if (!this.live.has(newParent)) throw new AgentSpecError(name, `new parent "${newParent}" is not a registered agent`);
+      const deliverable: HeldMail[] = [];
+      for (const item of this.mail) {
+        if (item.from.agent === name && !this.live.has(item.to)) {
+          item.to = newParent;
+          item.heldBecause = 'undelivered';
+          deliverable.push(item);
+        }
+      }
+      if (deliverable.length > 0) this.persist();
+      return { record, deliverable };
+    });
+  }
+
   // ==========================================================================
   // Held mail
   // ==========================================================================

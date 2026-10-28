@@ -11363,6 +11363,20 @@ export class AgentFramework {
    * produced for the lost recipient are delivered to the new one.
    */
   reparentAgent(name: string, newParent: string, options: { by?: string } = {}): AgentRecord {
+    // An orphan that finished before it was adopted: its record stays as it
+    // ended, and the results it held for a recipient that is gone go to the
+    // new parent.
+    if (!this.registry.has(name) && this.registry.inspect(name)?.ended) {
+      const ended = this.registry.readdressHeldMail(name, newParent);
+      this.emitTrace({
+        type: 'dendrite:agent-reparented',
+        agentName: name,
+        parent: newParent,
+        ...(options.by ? { by: options.by } : {}),
+      });
+      for (const mail of ended.deliverable) this.attemptMailDelivery(mail);
+      return structuredClone(ended.record);
+    }
     const { record, deliverable } = this.registry.reparent(name, newParent);
     this.emitTrace({
       type: 'dendrite:agent-reparented',
@@ -11458,7 +11472,23 @@ export class AgentFramework {
   private attemptMailDelivery(mail: HeldMail, wake = true): boolean {
     const recipient = this.registry.has(mail.to) ? this.agents.get(mail.to) : undefined;
     if (!recipient) {
+      const newlyHeld = mail.heldBecause !== 'recipient-gone';
       this.registry.markMailHeld(mail.id, 'recipient-gone');
+      // A result whose sender has ended, held for a recipient that is gone:
+      // the first adoption candidate is told it exists and how it arrives,
+      // since nothing else would surface it (reparentAgent delivers it).
+      const sender = this.registry.inspect(mail.from.agent);
+      const candidate = sender?.orphaned?.candidates[0];
+      if (newlyHeld && mail.kind === 'result' && sender?.ended && candidate && this.announceOrphans) {
+        this.lifecycleNotice(
+          candidate,
+          `[${NOTICE_TAG.agentLifecycle}: "${sender.name}" finished after ${sender.orphaned!.formerParent.agent} had ended, ` +
+            `so its result has nowhere to go. The result is held; reparenting "${sender.name}" to you delivers it.]`,
+          // `heldMailId`, not `mailId`: a row carrying dendrite.mailId is read
+          // as that mail having landed, which would release it.
+          { event: 'result-held', agent: sender.name, heldMailId: mail.id, formerParent: sender.orphaned!.formerParent },
+        );
+      }
       this.emitTrace({
         type: 'dendrite:mail-held',
         mailId: mail.id,
