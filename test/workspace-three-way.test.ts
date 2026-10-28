@@ -24,7 +24,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DISK_AGREEMENT_RECORD_TYPE, DiskAgreement, sameRootIdentity } from '../src/modules/workspace/disk-agreement.js';
 import { RecordJournal } from '../src/record-journal.js';
-import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
+import { RACY_WINDOW_MS, confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
@@ -198,6 +198,11 @@ async function seedSynced(env: Env, m: WorkspaceModule, path: string, content: s
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function clockPastTheRacyWindow(t: TestContext): void {
+  const realNow = Date.now;
+  t.mock.method(Date, 'now', () => realNow.call(Date) + RACY_WINDOW_MS + 100);
+}
 
 /** The hash evidence and disk facts carry for this text. */
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -1512,9 +1517,15 @@ describe('the catch-up pass at start', () => {
   }
   /** A wait that ends when `open` is called. */
   const gate = () => {
-    let open!: () => void;
-    const opened = new Promise<void>((r) => { open = r; });
-    return { wait: () => opened, open };
+    let isOpen = false;
+    let release!: () => void;
+    const opened = new Promise<void>((r) => { release = r; });
+    const g = {
+      held: 0,
+      wait: () => { if (!isOpen) g.held++; return opened; },
+      open: () => { isOpen = true; release(); },
+    };
+    return g;
   };
   const storedText = (env: Env, f: string) => {
     const e = env.store.treeGet(TREE, f);
@@ -1536,6 +1547,22 @@ describe('the catch-up pass at start', () => {
       return initialScan(name);
     };
     return readyAt;
+  };
+  const passesEnded = (m: WorkspaceModule) => {
+    const started: Promise<unknown>[] = [];
+    const initialScan = (m as any).initialScan.bind(m);
+    (m as any).initialScan = (name: string) => {
+      const pass = initialScan(name);
+      started.push(pass);
+      return pass;
+    };
+    return async () => {
+      for (let seen = -1; seen !== started.length;) {
+        seen = started.length;
+        await new Promise((r) => setTimeout(r, 0));
+        await Promise.allSettled(started);
+      }
+    };
   };
   const ctxFor = (env: Env) => ({
     isRestart: false,
@@ -1565,16 +1592,21 @@ describe('the catch-up pass at start', () => {
   // On macOS a write made right after ready can fall before libuv's FSEventStream exists and go unreported until a
   // later change in its directory, which this change doesn't close, so the two tests that write then and wait for
   // the watcher run on Linux.
-  test("starts once the watcher is ready, so a change made after the pass took a file in reaches the store while chokidar's scan lags", { skip: process.platform !== 'linux' }, async (t) => {
+  test("starts once the watcher is ready, so a change made after the pass took a file in reaches the store while chokidar's scan is held behind any pass started beside it", { skip: process.platform !== 'linux' }, async (t) => {
     const env = new Env(t);
     for (let i = 0; i < 20; i++) env.writeDisk(`d${i % 4}/f${i}.txt`, 'v1');
-    // Each of chokidar's directory reads waits a second, so its scan reaches d0's files long after a pass started
-    // beside it would have taken them in.
-    await withChokidarReaddir(() => new Promise((r) => setTimeout(r, 1000)), async (reads) => {
+    const scan = gate();
+    let gaveUp = false;
+    const heldAtMost = new Promise<void>((r) => setTimeout(() => { gaveUp = true; r(); }, 15_000).unref());
+    await withChokidarReaddir(() => Promise.race([scan.wait(), heldAtMost]), async () => {
       let readyAt: Array<number | null> = [];
-      await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { readyAt = readyAtPasses(m); });
+      let ended: () => Promise<unknown> = async () => {};
+      await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { readyAt = readyAtPasses(m); ended = passesEnded(m); });
+      await ended();
+      scan.open();
+      assert.equal(gaveUp, false, 'the start returned, and the passes it started ended, while chokidar was held');
       await until(() => storedText(env, 'd0/f0.txt') === 'v1', 'the catch-up pass took d0/f0.txt in', 15_000);
-      assert.ok(reads.delayed > 0, "chokidar's directory reads waited");
+      assert.ok(scan.held > 0, "some of chokidar's directory reads waited at the closed gate");
       assert.ok(readyAt.length > 0 && readyAt.every((at) => at !== null),
         `each catch-up pass started once the watcher was ready (its watcherReadyAt as each started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('d0/f0.txt', 'v2');
@@ -1591,15 +1623,20 @@ describe('the catch-up pass at start', () => {
     await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the first pass took gate.json in');
     const firstReadyAt: number = mount.watcherReadyAt;
     const readyAt = readyAtPasses(m);
-    // The watcher re-attaches to the same directory, which the module still agrees with, as it does at a rename
-    // named like a root it can't hold open. gate.json changes once the old chokidar instance has begun to close, which
-    // takes its listeners first, so no watcher reports the change. chokidar's directory reads each wait a second
-    // meanwhile, so the re-attached watcher's scan reaches gate.json long after a pass started at the re-attach would
-    // have run.
-    await withChokidarReaddir(() => new Promise((r) => setTimeout(r, 1000)), async (reads) => {
+    const ended = passesEnded(m);
+    const scan = gate();
+    let gaveUp = false;
+    const heldAtMost = new Promise<void>((r) => setTimeout(() => { gaveUp = true; r(); }, 15_000).unref());
+    for (; Date.now() <= firstReadyAt;) await new Promise((r) => setImmediate(r));
+    await withChokidarReaddir(() => Promise.race([scan.wait(), heldAtMost]), async () => {
       const reattaching: Promise<void> = (m as any).watchers.get('work').reattach();
+      // chokidar's close removes its listeners first, so once reattach() has begun closing the old instance, no
+      // watcher reports this write.
       env.writeDisk('gate.json', 'v2');
       await reattaching;
+      await ended();
+      scan.open();
+      assert.equal(gaveUp, false, 'the re-attach returned, and the passes started since ended, while chokidar was held');
       await until(() => reattached(env), 'the watcher re-attached');
       await until(() => storedText(env, 'gate.json') === 'v2', 'gate.json\'s v2 was taken in', 15_000);
       // The re-attach leaves watcherReadyAt as the first ready set it, until the re-attached watcher's own ready.
@@ -1607,7 +1644,7 @@ describe('the catch-up pass at start', () => {
         `the re-attached watcher's pass started at its own ready (first ready ${firstReadyAt}; watcherReadyAt as each pass started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('gate.json', 'v3');
       await until(() => storedText(env, 'gate.json') === 'v3', "the change made after the re-attach reached the store", 15_000);
-      assert.ok(reads.delayed > 0, "chokidar's directory reads waited");
+      assert.ok(scan.held > 0, "some of chokidar's directory reads waited at the closed gate");
     });
   });
 
@@ -4746,8 +4783,8 @@ describe('fingerprints', () => {
     const env = new Env(t);
     const m = await env.open();
     await seedSynced(env, m, 'f.txt', 'aaaa');
-    await sleep(2100);
-    await call(m, 'ls', { path: 'work' }); // records a fingerprint old enough to vouch
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(env.disk('f.txt'), old, old);
     const before = statSync(env.disk('f.txt'));
 
     env.writeDisk('f.txt', 'bbbb'); // same size
@@ -4757,8 +4794,6 @@ describe('fingerprints', () => {
     assert.equal(await stateOf(m, 'f.txt'), 'synced');
     assert.equal(storedOf(env, 'f.txt'), 'bbbb', 'utimes restoring mtime: rehashed and adopted');
 
-    await sleep(2100);
-    await call(m, 'ls', { path: 'work' });
     env.writeDisk(join('..', 'src.txt'), 'cccc');
     utimesSync(join(env.root, 'src.txt'), before.atime, before.mtime);
     const cp = spawnSync('cp', ['-p', join(env.root, 'src.txt'), env.disk('f.txt')]);
@@ -4804,9 +4839,13 @@ describe('trust and identity at the point of use', () => {
     (m as any).ctimeTrust.set(realpathSync(env.dir), statSync(env.disk('f.txt'), { bigint: true }).dev.toString());
     const old = new Date(Date.now() - 60_000);
     utimesSync(env.disk('f.txt'), old, old);
-    await sleep(2100); // past the racy window of the ctime that utimes set
+    clockPastTheRacyWindow(t);
     await call(m, 'sync', {}); // a full recheck rehashes, and records the fingerprint the stamps changed
     const agreement = (m as any).agreement;
+    const now = statSync(env.disk('f.txt'), { bigint: true });
+    const recorded = agreement.get('work', 'f.txt');
+    assert.ok(fingerprintVouches(recorded?.fp, { size: Number(now.size), mtimeNs: now.mtimeNs.toString(), ctimeNs: now.ctimeNs.toString(), ino: now.ino.toString(), dev: now.dev.toString() }, true),
+      'the first recheck recorded a fingerprint that vouches for the file');
     const set = agreement.set.bind(agreement);
     let appended = 0;
     agreement.set = (...args: unknown[]) => { appended++; return set(...args); };
@@ -7271,7 +7310,7 @@ describe('on-agent-action', () => {
 
   test("a batch that comes while a late scan's successor still runs isn't held either", async (t) => {
     const env = new Env(t);
-    const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 300 });
+    const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 50 });
     const mod = m as any;
     // Each scan's pass runs, then waits to be released.
     const pass = mod.passUnlocked.bind(mod);
