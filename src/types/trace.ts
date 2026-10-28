@@ -964,6 +964,12 @@ export type TraceEvent =
       by?: string;
     })
   | (TraceEventBase & {
+      /** The last event a replay of create()'s traces delivers when the
+       *  buffer kept only their first 1,000: how many came after. */
+      type: 'dendrite:early-traces-dropped';
+      dropped: number;
+    })
+  | (TraceEventBase & {
       type: 'dendrite:agent-orphaned';
       agentName: string;
       formerParent: string;

@@ -3548,8 +3548,11 @@ export class AgentFramework {
   private traceListeners: TraceRegistration[] = [];
   /** Traces emitted before start() — registry restore, interrupted work,
    *  resumed epochs — replayed to listeners that attach afterwards, since a
-   *  host attaches its sinks after create() returns. Dropped at start(). */
+   *  host attaches its sinks after create() returns. Dropped at start().
+   *  It keeps the first 1,000, the start of the stream, and counts the rest
+   *  (earlyTracesDropped), which a replay ends by naming. */
   private earlyTraces: TraceEvent[] | null = [];
+  private earlyTracesDropped = 0;
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private maintenanceIntervalMs: number;
@@ -7226,7 +7229,11 @@ export class AgentFramework {
     // create() emitted (registry restore, interrupted work, resumed epochs)
     // are replayed to a listener that asks; dropped at start().
     if (options?.replay) {
-      for (const event of this.earlyTraces ?? []) {
+      const replayed: TraceEvent[] = [...(this.earlyTraces ?? [])];
+      if (this.earlyTraces && this.earlyTracesDropped > 0) {
+        replayed.push({ type: 'dendrite:early-traces-dropped', dropped: this.earlyTracesDropped, timestamp: Date.now() });
+      }
+      for (const event of replayed) {
         try { registration.listener(event); } catch (error) { console.error('Trace listener error (replay):', error); }
       }
     }
@@ -30550,8 +30557,8 @@ export class AgentFramework {
     if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
 
     if (this.earlyTraces) {
-      this.earlyTraces.push(traceEvent);
-      if (this.earlyTraces.length > 1000) this.earlyTraces.shift();
+      if (this.earlyTraces.length < 1000) this.earlyTraces.push(traceEvent);
+      else this.earlyTracesDropped++;
     }
     // An event goes to the subscriptions present when its delivery starts,
     // each one only if it is still active when its turn comes, as the DOM's

@@ -261,6 +261,22 @@ describe('Dendrite lifecycle', () => {
     assert.ok(!result.ok);
   });
 
+  it('a replay of create()\'s traces keeps the first 1,000 and ends by naming how many it dropped', async () => {
+    const framework = await boot();
+    const emit = (framework as unknown as { emitTrace(event: unknown): void }).emitTrace.bind(framework);
+    for (let i = 0; i < 1005; i++) emit({ type: 'dendrite:test-early', seq: i });
+    const replayed: Array<{ type: string; seq?: number; dropped?: number }> = [];
+    framework.onTrace((event) => replayed.push(event as never), { replay: true });
+    assert.equal(replayed.length, 1001, 'the first 1,000, then one event naming the rest');
+    const ours = replayed.filter((e) => e.type === 'dendrite:test-early').map((e) => e.seq);
+    assert.equal(ours[0], 0, 'the start of the stream is kept');
+    assert.deepEqual(ours, [...ours].sort((a, b) => a! - b!), 'in order');
+    assert.ok(!ours.includes(1004), 'the newest are the ones dropped');
+    const last = replayed.at(-1)!;
+    assert.equal(last.type, 'dendrite:early-traces-dropped');
+    assert.equal(last.dropped, 1005 - ours.length);
+  });
+
   it('delivers a result as attributed mail in the child\'s own name and wakes the recipient', async () => {
     const framework = await boot();
     framework.start();
