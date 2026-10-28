@@ -76,6 +76,13 @@ export class AgentRegistry {
   private ended: AgentRecord[] = [];
   /** Persistent records from the previous process, not yet re-declared. */
   private readonly awaiting = new Map<AgentName, AgentRecord>();
+  /**
+   * Bounded work the previous process left live, ended by this restart in
+   * memory but kept in the snapshot as it was until the host has told each
+   * recipient (settleInterrupted), so a crash before then owes the same
+   * notices at the next boot rather than none.
+   */
+  private readonly interruptedPending = new Map<AgentName, AgentRecord>();
   private readonly incarnations = new Map<AgentName, number>();
   private mail: HeldMail[] = [];
   private readonly now: () => number;
@@ -468,13 +475,14 @@ export class AgentRegistry {
   // ==========================================================================
 
   snapshot(): RegistrySnapshot {
-    const records = [...this.awaiting.values(), ...this.live.values()].map((record) => clone(record));
+    const records = [...this.awaiting.values(), ...this.interruptedPending.values(), ...this.live.values()].map((record) => clone(record));
     // Counters are kept for identities that can still be referred to: live
     // agents, persistent agents awaiting re-declaration, and ended agents
     // still in retention. A single-use name that has aged out restarts at 1.
     const referable = new Set<AgentName>([
       ...this.live.keys(),
       ...this.awaiting.keys(),
+      ...this.interruptedPending.keys(),
       ...this.ended.map((record) => record.name),
     ]);
     const incarnations: Record<AgentName, number> = {};
@@ -486,8 +494,10 @@ export class AgentRegistry {
    * Load what the previous process persisted. Restart behaviour follows
    * from lifetime: a persistent agent waits to be re-declared by
    * configuration (see {@link reconcile}); every other agent that was live
-   * is ended here as interrupted, and returned so its result recipient can
-   * be told. Held mail is kept for redelivery.
+   * is ended here as interrupted, in memory, and returned so its result
+   * recipient can be told. It stays in the snapshot as it was, and its end
+   * is written, once the host has told the recipients (settleInterrupted).
+   * Held mail is kept for redelivery.
    *
    * A record the ended history already holds, by name and incarnation, ended
    * before the previous process could write the snapshot without it: it is
@@ -533,11 +543,34 @@ export class AgentRegistry {
         this.awaiting.set(record.name, record);
         continue;
       }
-      this.recordEnded(record, 'host-restart');
+      this.interruptedPending.set(record.name, clone(record));
+      this.pushEnded(record, 'host-restart');
       interrupted.push(record);
     }
-    if (interrupted.length > 0 || dropped) this.persist();
+    if (dropped) this.persist();
     return { interrupted };
+  }
+
+  /**
+   * The host has told each interrupted job's recipient (restore's
+   * `interrupted`): their ends are written now, and the snapshot no longer
+   * lists them. A record of what the restart did, so a failed write alerts
+   * and the next write carries it.
+   */
+  settleInterrupted(): void {
+    if (this.interruptedPending.size === 0) return;
+    this.recording(() => {
+      for (const pending of this.interruptedPending.values()) {
+        for (let i = this.ended.length - 1; i >= 0; i--) {
+          const record = this.ended[i]!;
+          if (record.name !== pending.name || record.incarnation !== pending.incarnation) continue;
+          this.appendEndedRecord(record);
+          break;
+        }
+      }
+      this.interruptedPending.clear();
+      this.persist();
+    });
   }
 
   /**
@@ -566,11 +599,21 @@ export class AgentRegistry {
   }
 
   private recordEnded(record: AgentRecord, reason: AgentEndReason, by?: string): void {
+    this.pushEnded(record, reason, by);
+    this.appendEndedRecord(record);
+  }
+
+  /** Mark a record ended and keep it in memory, without writing the end. */
+  private pushEnded(record: AgentRecord, reason: AgentEndReason, by?: string): void {
     record.ended = { at: this.now(), reason, ...(by ? { by } : {}) };
     this.ended.push(record);
     if (this.ended.length > this.endedRetention) {
       this.ended.splice(0, this.ended.length - this.endedRetention);
     }
+  }
+
+  /** Write an ended record through the host's append hook. */
+  private appendEndedRecord(record: AgentRecord): void {
     if (!this.appendEndedFn) return;
     // A failed append fails the end that made it, as a failed persist does —
     // unless the end records a run that has ended, when it alerts instead.

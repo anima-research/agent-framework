@@ -5,6 +5,9 @@
  *   holding it, and a put-back that fails too doesn't hide the change's error;
  * - an agent whose end was written before the snapshot let go of it ends once
  *   at the next boot, and its recipient isn't told of a restart it didn't meet;
+ * - an interrupted job's recipient is told even when the boot that found it
+ *   dies before telling, and told once when the boot that told dies before
+ *   writing the end;
  * - an app-owned store names its recovery files, and is warned without them;
  * - a recovery file that holds null, or a registry without its counters, is
  *   refused rather than read as empty;
@@ -166,6 +169,38 @@ describe('the registry\'s recovery', () => {
     const records = second.listAgents({ includeEnded: true }).filter((r) => r.name === 'w');
     assert.deepEqual(records.map((r) => r.ended?.reason), ['completed'], 'w ended once, as it did');
     assert.deepEqual(rowsWith(second, 'oren', 'the host restarted while'), [], 'and oren is told of no restart');
+  });
+
+  it('an interrupted job\'s recipient is told even when the boot that found it dies before telling, and told once', async () => {
+    const store = JsStore.openOrCreate({ path: storePath() });
+    stores.push(store);
+    const paths = { agentRegistryPath: join(tempDir, 'registry.json'), agentRegistryEndedPath: join(tempDir, 'ended.json') };
+    const gates = new GateModule();
+    const first = await boot(gates, { store, ...paths });
+    first.start();
+    await startBlocked(first, gates, 'w', 'g-w', workerSpec('w', { spawnedBy: 'oren', resultTo: { to: 'oren', as: 'message' } }));
+    assert.ok(existsSync(paths.agentRegistryPath), 'the app-owned store\'s registry recovery file is where it was named');
+    // The process dies with w live; the next boot dies too, after the restore
+    // and before it tells oren (its conversations name a template it doesn't run).
+    await assert.rejects(
+      boot(new GateModule(), { store, ...paths, conversations: { templateAgent: 'nobody' } as FrameworkConfig['conversations'] }),
+      /conversations\.templateAgent "nobody" is not a configured agent/,
+    );
+    // The next boot tells oren and dies before writing w's end.
+    const settle = AgentRegistry.prototype.settleInterrupted;
+    AgentRegistry.prototype.settleInterrupted = function settleNothing() { /* the process dies here */ };
+    let third: AgentFramework;
+    try {
+      third = await boot(new GateModule(), { store, ...paths });
+    } finally { AgentRegistry.prototype.settleInterrupted = settle; }
+    assert.equal(rowsWith(third, 'oren', 'the host restarted while "w"').length, 1, 'oren is told');
+    assert.equal(third.getAgentRecord('w')?.ended?.reason, 'host-restart');
+    // The one after finds the notice and doesn't tell it twice, and writes w's end.
+    const fourth = await boot(new GateModule(), { store, ...paths });
+    assert.equal(rowsWith(fourth, 'oren', 'the host restarted while "w"').length, 1, 'oren is told once');
+    assert.equal(fourth.listAgents({ includeEnded: true }).filter((r) => r.name === 'w').length, 1, 'and w ended once');
+    assert.ok(existsSync(paths.agentRegistryEndedPath), 'its end is in the ended recovery file named for it');
+    assert.ok(!(JSON.parse(readFileSync(paths.agentRegistryPath, 'utf8')) as { records: Array<{ name: string }> }).records.some((r) => r.name === 'w'), 'and the registry no longer lists it');
   });
 
   it('an app-owned store with neither a storePath nor the recovery paths is warned at create', async () => {

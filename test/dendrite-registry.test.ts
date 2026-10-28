@@ -269,7 +269,14 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.deepEqual(second.listMail().map((m) => [m.id, m.from.agent, m.from.incarnation, m.to]), [
       [held.id, 'job', 1, 'mira'],
     ]);
+    // Until the host has told the recipients, the interrupted records stay in
+    // the snapshot as they were and their ends aren't written, so a crash here
+    // owes the same notices at the next boot.
+    assert.equal(state.ended.length, 0, 'no end is written before the recipients are told');
+    assert.deepEqual(state.snapshot!.records.filter((r) => !r.ended).map((r) => r.name).sort(), ['Subconscious', 'job', 'mira', 'mira-c1']);
+    second.settleInterrupted();
     assert.deepEqual(state.ended.map((r) => r.name).sort(), ['job', 'mira-c1']);
+    assert.deepEqual(state.snapshot!.records.map((r) => r.name).sort(), ['Subconscious', 'mira'], 'and the snapshot no longer lists them');
   });
 
   it('restores a snapshot whose fork keeps its home as a bare id, as one written before homes carried their server', () => {

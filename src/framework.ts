@@ -11950,12 +11950,24 @@ export class AgentFramework {
       byRecipient.set(route.to, [...(byRecipient.get(route.to) ?? []), record]);
     }
     for (const [recipient, records] of byRecipient) {
+      // The interrupted records stay in the snapshot until this notice is
+      // durable (settleInterrupted below), so a crash after it landed and
+      // before their ends were written comes here again: the key, the same
+      // set of name and incarnation, finds the notice already told, in the
+      // recipient's store or the restored deferred queue.
+      const noticeKey = records.map((record) => `${record.name}#${record.incarnation}`).sort().join(',');
+      const told = this.agents.get(recipient)!.getContextManager()
+        .queryMessages({ metadata: { 'dendrite.noticeKey': noticeKey } }).messages.length > 0
+        || this.deferredMessages.some(
+          (m) => (m.metadata as { dendrite?: { noticeKey?: unknown } } | undefined)?.dendrite?.noticeKey === noticeKey,
+        );
+      if (told) continue;
       const names = records.map((record) => `"${record.name}"`).join(', ');
       this.lifecycleNotice(
         recipient,
         `[${NOTICE_TAG.agentLifecycle}: the host restarted while ${names} ${records.length === 1 ? 'was' : 'were'} ` +
           `still working for you. ${records.length === 1 ? 'It was' : 'They were'} ended without a result.]`,
-        { event: 'interrupted', agents: records.map((record) => record.name), reason: 'host-restart' },
+        { event: 'interrupted', agents: records.map((record) => record.name), reason: 'host-restart', noticeKey },
       );
       this.pendingRequests.push({
         agentName: recipient,
@@ -11963,6 +11975,17 @@ export class AgentFramework {
         source: 'dendrite',
         timestamp: Date.now(),
       });
+    }
+    // The notices are durable once the store has synced (a quiesced host's
+    // are in the deferred queue's recovery file already); only then are the
+    // interrupted records' ends written and the snapshot let go of them.
+    if (interrupted.length > 0) {
+      try {
+        this.store.sync();
+        this.registry.settleInterrupted();
+      } catch (error) {
+        console.error('[dendrite] the restart notices could not be synced; the interrupted records stay in the registry, and the next boot tells their recipients again unless the notice is found:', error);
+      }
     }
 
     for (const mail of this.registry.listMail()) {
