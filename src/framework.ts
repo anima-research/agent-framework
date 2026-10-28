@@ -4568,9 +4568,11 @@ export class AgentFramework {
         ...(framework.agentRegistryEndedPath ? [] : ['agentRegistryEndedPath']),
       ];
       console.error(
-        `[dendrite] no storePath / ${missing.join(' / ')}: the agent registry's ${framework.agentRegistryPath ? 'ended log' : 'records and held results'} ` +
-        'persist only in the branch-local store, where a branch switch or historical rollback can erase them and a crash ' +
-        'can lose what wasn\'t synced; configure the recovery paths',
+        `[dendrite] no storePath / ${missing.join(' / ')}: the agent registry's ` +
+        (framework.agentRegistryPath
+          ? 'ended log persists only in the branch-local store, where a branch switch or historical rollback can erase it'
+          : 'records and held results persist only in the branch-local store, where a branch switch or historical rollback can erase them') +
+        ', and a crash can lose what wasn\'t synced; configure the recovery paths',
       );
     }
     const interruptedAgents = framework.restoreAgentRegistry();
