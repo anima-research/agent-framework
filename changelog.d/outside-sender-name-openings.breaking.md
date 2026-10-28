@@ -5,8 +5,9 @@
   with none of those openings is stored as before. This corrects 0.29.0's
   entry for these modules where it gives the stored form as
   `<username> (Discord)` and `<name> (API)`: from this release, a name
-  holding one of those openings is stored, and returned by the `ApiServer`'s
-  message list, in its marked form. 0.29.0's entry on supplied text ends
+  holding one of those openings is stored in its marked form, and that is
+  the form the `ApiServer`'s message list shows wherever it lists such a
+  message. 0.29.0's entry on supplied text ends
   "This change doesn't mark these openings in the name a message is stored
   under"; for these two modules, this release does.
 
@@ -15,6 +16,6 @@
   has one, which this change leaves as it was.
 
   **Unchanged:** rows stored before this change keep the name they were
-  stored with. A history sync that rebuilds a stored Discord message
-  rewrites its content, not the name it is stored under. The generic name
-  `user`, in any capitalization, is stored as given.
+  stored with: a history sync or an edit through these modules may change a
+  stored message's content, never the name it is stored under. The generic
+  name `user`, in any capitalization, is stored as given.
