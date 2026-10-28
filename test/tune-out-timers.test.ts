@@ -72,6 +72,7 @@ function harness(
   const registry = {
     // Each channel's id is unique here, so it's shown by its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
+    quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
     listChannelsRaw: () => (state ? [{ serverId: 'disc', descriptor: { id: '#a' } }] : []),
     getTuneOutState: () => state,
     enterTuneOut: (_s: string, _c: string, params: TuneOutParams) => {

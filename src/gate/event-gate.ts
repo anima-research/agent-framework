@@ -11,6 +11,8 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
+import { cutToFit, suppliedValue } from '../supplied-text.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
@@ -343,7 +345,7 @@ function referenceLine(count: number, channel: string, oldest: number, now: numb
 /** A handed batched-wake line's text (WakeLine), as it reads when written at
  *  `now`: the gate's words, its message's age counted to then. */
 export function wakeLineText(line: WakeLine, now: number): string {
-  return `[Gate: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
+  return `[${NOTICE_TAG.gate}: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
 }
 
 /** The event's own stored entry, as the framework is asked about it. */
@@ -3698,7 +3700,7 @@ export class EventGate {
     const quoted = events.filter(e => !e.inContext);
     const referenced = events.filter(e => e.inContext);
 
-    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${suppliedValue(e.content)}`);
     // How each referenced channel is named in the line, in order.
     const shown: string[] = [];
     if (referenced.length > 0) {
@@ -3717,7 +3719,7 @@ export class EventGate {
           ? '(unknown channel)'
           : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
             ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
-            : id;
+            : suppliedValue(id);
         const key = JSON.stringify([e.serverId ?? null, id ?? null]);
         const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
@@ -3730,7 +3732,7 @@ export class EventGate {
         // agent can still address tools that want the composite id. A name
         // may carry its own `#`, so one is added only where the name lacks
         // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${name})` : name;
+        const channel = label ? `${label.startsWith('#') ? '' : '#'}${suppliedValue(label)} (${name})` : name;
         shown.push(channel);
         lines.push(referenceLine(count, channel, oldest, Date.now()));
       }
@@ -3743,7 +3745,7 @@ export class EventGate {
     // gate hands the line to the wake (WakeProvenance.line) and a fresh start
     // of the wake's turn decides it (WakeLine). Several messages, one with
     // anything after it, or content the line quotes, keep the line now.
-    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
     if (only && this.newestEntry(only)) {
@@ -3988,7 +3990,7 @@ export class EventGate {
     record.last = {
       at: Date.now(),
       verdict: outcome,
-      reason: safeSlice(reason, 0, 300),
+      reason: cutToFit(suppliedValue(reason), 300),
       eventCount: state.events.length,
       durationMs,
       ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
@@ -3996,7 +3998,7 @@ export class EventGate {
     if (this.config.policies.some((p) => p.name === policyName)) this.judgeRecords.set(policyName, record);
     if (failed) {
       this.judgeFailStreak++;
-      this.judgeLastFailure = safeSlice(reason, 0, 200);
+      this.judgeLastFailure = cutToFit(suppliedValue(reason), 200);
     } else {
       this.judgeFailStreak = 0;
     }
@@ -4323,7 +4325,7 @@ export class EventGate {
       const placement: WritePlacement = {};
       this.addMessageFn('user', [{
         type: 'text',
-        text: `[self-wake] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
+        text: `[${NOTICE_TAG.selfWake}] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
       }], { source: 'gate:self-wake' }, agentName, placement);
       this.requestInferenceFn(
         agentName,
