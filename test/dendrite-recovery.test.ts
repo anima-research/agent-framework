@@ -1,8 +1,9 @@
 /**
  * The registry's recovery when a write fails or a process dies on the way:
  *
- * - a change that failed and was put back leaves no copy of the registry
- *   holding it, and a put-back that fails too doesn't hide the change's error;
+ * - a change that failed and was put back leaves no recovery file holding it
+ *   (an end already appended to the branch-local ended log stays), and a
+ *   put-back that fails too doesn't hide the change's error;
  * - an agent whose end was written before the snapshot let go of it ends once
  *   at the next boot, and its recipient isn't told of a restart it didn't meet;
  * - an interrupted job's recipient is told even when the boot that found it

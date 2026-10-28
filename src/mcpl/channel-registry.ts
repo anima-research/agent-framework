@@ -1009,7 +1009,7 @@ interface ChannelRegistryOptions {
   /**
    * A channel is being closed by tool: an all-except hold whose exception
    * this is ends through the cancel flow (release the backlog, record the
-   * end) before the lifecycle state flips to closed (issue #232 gap 9). A
+   * end) before the lifecycle state flips to closed. A
    * tuned-out channel's close is refused before this (its cancel ends it).
    * Returns what it ended, in a sentence the close's answer adds when the
    * close itself isn't recorded.

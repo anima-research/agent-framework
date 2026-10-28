@@ -10659,7 +10659,7 @@ export class AgentFramework {
       // the record says and what inspection and resumption open later.
       let namespace = spec?.namespace ?? `subagent/${config.name}`;
       let contextManager: ContextManager;
-      // The host's say, on the spec as it will be registered.
+      // The host's say, on the spec of what is about to exist.
       if (this.beforeDerive) {
         const effective: AgentSpec = spec
           ? { ...spec, name: config.name, model: config.model }
@@ -11597,7 +11597,8 @@ export class AgentFramework {
    * creation is also told to the agent it was derived from (#270, Linn:
    * "told when the body changes" as a property, not a courtesy): one
    * host-framed line in the source's context, built from the same facts as
-   * the trace, no wake, no switch. Both derivation paths announce after the
+   * the trace, with no wake; a host's derivationNotice can replace the line
+   * or send none. Both derivation paths announce after the
    * fork's branch or copy exists, so a fork never inherits the notice about
    * itself; a source that has ended is told nothing (lifecycleNotice).
    */
@@ -11631,7 +11632,7 @@ export class AgentFramework {
     // past the threshold, a reader loop that forks a hundred times a session
     // would fill its source's context with stamps (Linn, 2026-10-15), so
     // the source hears a count line every `threshold` forks instead, with
-    // the latest described; every record stays in the registry and traces.
+    // the latest described; every derivation still emits its trace.
     const threshold = this.collapseDerivationNoticesAfter;
     const tell = (defaultText: string, extra: Record<string, unknown> = {}) => {
       try {
@@ -31725,7 +31726,7 @@ export class AgentFramework {
         latestInboundLocus: this.speechLocus === 'latest-inbound',
         // A tool close of the channel an all-except hold excepts ends that
         // hold through the cancel flow, since there is nothing left to speak
-        // into (#232 gap 9). A tool close of a tuned-out channel is refused
+        // into. A tool close of a tuned-out channel is refused
         // before this hook is called (ChannelRegistry.tunedOutRefusal).
         onToolClose: (serverId, channelId) => {
           const coordinator = this.tuneOutCoordinator;
