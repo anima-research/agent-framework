@@ -28541,8 +28541,7 @@ export class AgentFramework {
     // refused here, before anything runs.
     if (this.deniedAtDispatch(agentName, call.name)) {
       const error = `${call.name} is not available to ${agentName}`;
-      // RFC-007: refused before the tool runs — no lifecycle events.
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      const result = this.refusedResult(agentName, call.id, error);
       this.emitTrace({ type: 'tool:failed', module: 'dendrite', tool: call.name, callId: call.id, error });
       this.pushEvent({
         type: 'tool-result',
@@ -28550,7 +28549,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: 'dendrite',
-        result: { success: false, error, isError: true },
+        result,
       });
       return;
     }
@@ -28647,11 +28646,10 @@ export class AgentFramework {
       const routed = this.readerToolCall(agentName, enrichedCall);
       if ('refused' in routed) {
         const error = routed.refused;
-        this.toolLifecycleEmitter?.refuse(agentName, call.id);
+        const result = this.refusedResult(agentName, call.id, error);
         this.emitTrace({ type: 'tool:failed', module: 'tune-out', tool: call.name, callId: call.id, error });
         this.pushEvent({
-          type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'tune-out',
-          result: { success: false, error, isError: true },
+          type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'tune-out', result,
         });
         return;
       }
