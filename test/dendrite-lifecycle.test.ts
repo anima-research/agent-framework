@@ -232,12 +232,21 @@ describe('Dendrite lifecycle', () => {
   it('enforces a task deadline however lively the run is', async () => {
     const framework = await boot();
     framework.start();
-    const worker = await startBlocked(
-      framework,
-      'worker-1',
-      'g1',
+    // The outcome alone is awaited: on a loaded machine the 60 ms deadline can
+    // pass before the job reaches its gate, and either way the job must end
+    // at its deadline, so nothing here waits on the gate first.
+    membrane.script('worker-1', waitCall('g1'), say('worker-1 done'));
+    const { agent, contextManager } = await framework.createEphemeralAgent(
+      { name: 'worker-1', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' },
       { ...workerSpec('worker-1'), lifetime: { kind: 'task', deadlineMs: 60 } },
     );
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    const worker = {
+      settled: framework.runEphemeralToCompletion(agent, contextManager).then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      ),
+    };
     const result = await worker.settled;
     assert.ok(!result.ok && result.error instanceof AgentStoppedError);
     assert.equal(framework.getAgentRecord('worker-1')?.ended?.reason, 'deadline');
