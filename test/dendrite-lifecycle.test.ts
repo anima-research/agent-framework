@@ -625,6 +625,24 @@ describe('Dendrite lifecycle', () => {
     assert.ok(logged.some((line) => line.includes('the notice hook failed')), logged.join('\n'));
   });
 
+  it("mail from an agent the recipient counts as its own voice arrives as '<sender> (mail)', not as its own words", async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('fork-m', waitCall('g-fork-m'), say('fork-m done'));
+    const fork = await framework.deriveAgent({ name: 'fork-m', from: 'mira', mode: 'copy', config: { selfParticipants: ['mira'] } });
+    fork.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    const run = framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+    await until(() => gates.entered.has('g-fork-m'), 'fork-m to block on g-fork-m');
+    framework.sendAgentMessage('mira', 'fork-m', [{ type: 'text', text: 'also check the docs' }], { wake: false });
+    gates.release('g-fork-m');
+    await run;
+    const mail = fork.contextManager.getAllMessages().find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-message');
+    assert.equal(mail?.participant, 'mira (mail)');
+    assert.deepEqual((mail!.metadata as { dendrite: { from: unknown } }).dendrite.from, { agent: 'mira', incarnation: 1 });
+    assert.ok(!membrane.callsFor('fork-m').some((call) => call.messages.some((m) =>
+      m.participant === 'fork-m' && JSON.stringify(m.content).includes('also check the docs'))), 'never presented as its own turn');
+  });
+
   it('a copy derivation that asks for what only a shared one inherits is refused before anything is made', async () => {
     const framework = await boot();
     await assert.rejects(framework.deriveAgent({ name: 'fork-r', from: 'mira', mode: 'copy', inheritRefusals: true }), /inheritRefusals is for mode 'shared'/);

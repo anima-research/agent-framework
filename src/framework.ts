@@ -11457,7 +11457,9 @@ export class AgentFramework {
     const placement: { agent?: string; messageId?: MessageId; deferredId?: string } = {};
     this.addMessage(
       // The sender's own name: its words stay its own.
-      mail.from.agent,
+      recipient.isOwnParticipant(mail.from.agent) && mail.from.agent !== recipient.name
+        ? `${mail.from.agent} (mail)`
+        : mail.from.agent,
       mail.content as ContentBlock[],
       {
         kind: `agent-${mail.kind}`,
