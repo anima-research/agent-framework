@@ -273,6 +273,21 @@ describe('presentedTools', () => {
     } finally { await h.stop(); }
   });
 
+  it('applies a registered agent\'s own hidden tools and descriptions, as its requests carry them', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'host-toolsets-presented-'));
+    const workspace = new WorkspaceModule({ mounts: [{ name: 'board', path: dir, mode: 'read-write', watch: 'never' }] });
+    const h = await makeFramework({ dir, modules: [new StubModule(), workspace], toolPresentation: true });
+    try {
+      await call(h.framework, 'toolsets--open', { toolset: 'settings' });
+      assert.ok((await call(h.framework, 'toolsets--act', { tool: 'set_tool_visibility', args: { name: 'stub--frontline', visible: false } })).success);
+      assert.ok((await call(h.framework, 'toolsets--act', { tool: 'set_tool_description', args: { name: 'workspace--read', description: 'Read, in my words.' } })).success);
+      const presented = h.framework.presentedTools('scout', h.framework.getAllTools());
+      assert.ok(!presented.some((t) => t.name === 'stub--frontline'), 'a hidden tool left out');
+      assert.equal(presented.find((t) => t.name === 'workspace--read')?.description, 'Read, in my words.', 'its description applied');
+      assert.deepEqual(presented.map((t) => t.name).sort(), (await headerNames(h.framework)).sort(), 'as its request carries them');
+    } finally { await h.stop(); }
+  });
+
   it('presents nothing out of the list where a module given to create() holds the name toolsets, whatever the host says', async () => {
     const own = { name: 'toolsets', start: async () => {}, stop: async () => {}, getTools: () => [], handleToolCall: async () => ({ success: true }), onProcess: async () => ({}) };
     const h = await makeFramework({ modules: [new StubModule(), own as never] });
@@ -608,11 +623,12 @@ describe('server tabs', () => {
       await h.framework.start();
       await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
       await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true });
-      const internals = h.framework as unknown as { runConnectMcplServer(config: unknown, claim?: unknown, opts?: unknown): Promise<void> };
-      const real = internals.runConnectMcplServer;
-      internals.runConnectMcplServer = async () => { throw new Error('refused by the server'); };
+      // The connect fails once its configuration is taken, as an unreachable server's does.
+      const internals = h.framework as unknown as { connectMcplServerInternal(config: McplServerConfig, ...rest: unknown[]): Promise<unknown>; setMcplServerConfig(config: McplServerConfig): void };
+      const real = internals.connectMcplServerInternal;
+      internals.connectMcplServerInternal = async (config: McplServerConfig) => { internals.setMcplServerConfig(config); throw new Error('refused by the server'); };
       const failed = await call(h.framework, 'toolsets--open', { server: 'srv', full: true });
-      internals.runConnectMcplServer = real;
+      internals.connectMcplServerInternal = real;
       assert.ok(failed.isError, 'the caller is told it failed');
       assert.match(String(failed.error), /refused by the server/);
       assert.ok(!(await headerNames(h.framework)).includes('srv--ping'), 'not put back in the tool list');
@@ -715,6 +731,23 @@ describe('server tabs', () => {
       assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look', { server: 'srv' })), /closed tab/, 'nor to the agent');
       await h.framework.restartMcplServer('srv', { id: 'srv', url: server.url, toolPrefix: 'srv' });
       await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'connected by the operator\'s retry');
+    } finally { await h.stop(); await server.close(); }
+  });
+
+  it('keeps the closed tab when an operator\'s connect is refused before its configuration is taken', async () => {
+    const { server } = await pingServer();
+    const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv', presentation: 'closed-tab' }] });
+    try {
+      await h.framework.start();
+      const internals = h.framework as unknown as { connectMcplServerInternal(...args: unknown[]): Promise<unknown> };
+      const real = internals.connectMcplServerInternal;
+      internals.connectMcplServerInternal = async () => { throw new Error('its transport is refused'); };
+      await assert.rejects(h.framework.connectMcplServer({ id: 'srv', url: 'not a url', toolPrefix: 'srv' }), /its transport is refused/);
+      internals.connectMcplServerInternal = real;
+      const listed = h.framework.listMcplServers().find((x) => x.id === 'srv');
+      assert.ok(listed?.closedTab, `still a closed tab: ${JSON.stringify(listed)}`);
+      await assert.rejects(h.framework.connectMcplServer({ id: 'taker', url: server.url, toolPrefix: 'srv' }), /a closed tab/, 'its prefix kept');
+      assert.match(resultText(await call(h.framework, 'toolsets--open', { server: 'srv' })), /srv connected/, 'an agent opens it with its kept configuration');
     } finally { await h.stop(); await server.close(); }
   });
 

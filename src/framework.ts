@@ -29971,7 +29971,8 @@ export class AgentFramework {
    * The tool list an agent's requests carry, from the tools it may call: its
    * host presentation applied (the built-in toolset's tools, the servers it
    * has as tabs and its hidden tools left out; a utility never in it), as
-   * every request of a registered agent has it. For a stream that isn't
+   * every request of a registered agent has it (with its own tool
+   * presentation, hidden tools and descriptions, applied first). For a stream that isn't
    * registered yet, such as a fork whose orientation is written before its
    * run starts, the host says whether it will be able to call
    * `toolsets--open` and `toolsets--act` (`canUseMeta`); left out, the agent
@@ -29980,6 +29981,14 @@ export class AgentFramework {
    * configured presentation.
    */
   presentedTools(agentName: string, tools: import('./types/index.js').ToolDefinition[], canUseMeta?: boolean): import('./types/index.js').ToolDefinition[] {
+    // A registered agent's own presentation first, as its requests have it
+    // before the host's: the tools it hid left out, its descriptions applied.
+    const snapshot = this.agents.has(agentName) ? this.inspectToolPresentation(agentName) : undefined;
+    if (snapshot) {
+      const hidden = new Set(snapshot.entries.filter((e) => !e.visible).map((e) => e.name));
+      const shown = new Map(snapshot.advertised.map((t) => [t.name, t]));
+      tools = tools.filter((t) => !hidden.has(t.name)).map((t) => shown.get(t.name) ?? t);
+    }
     if (!this.hostPresentation) return tools;
     if (canUseMeta === undefined) return this.hostPresentation.header(agentName, tools);
     // As hostToolsetsFor decides for a registered agent: the subconscious and
@@ -30899,13 +30908,29 @@ export class AgentFramework {
     // read never reaches a registered server's trees.
     this.checkpointManager?.loadHostStates(config.id);
     // An operator's connect ends a closed tab as it begins, as a restart
-    // does: one that fails leaves an ordinary server that's down, under the
-    // configuration it was given. Whether it was one is the kept
-    // configuration's to say. An agent's open (reopen) ends it only once
-    // connected, so one that fails leaves the closed tab to open again.
-    if (!opts.reopen && this.closedTabConfigs().delete(config.id)) this.hostPresentation?.noteConnected(config.id, true);
+    // does: one that fails once its configuration is taken leaves an
+    // ordinary server that's down, under that configuration; one refused
+    // before (its transport, the awareness ledger) changes nothing, and the
+    // closed tab is put back. Whether it was one is the kept configuration's
+    // to say. An agent's open (reopen) ends it only once connected, so one
+    // that fails leaves the closed tab to open again.
+    const keptClosedTab = opts.reopen ? undefined : this.closedTabConfigs().get(config.id);
+    const closedWas = keptClosedTab ? this.hostPresentation?.closedState(config.id) : undefined;
+    if (keptClosedTab) {
+      this.closedTabConfigs().delete(config.id);
+      this.hostPresentation?.noteConnected(config.id, true);
+    }
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
-    const connection = await this.connectMcplServerInternal(config, false, claim);
+    let connection: Awaited<ReturnType<AgentFramework['connectMcplServerInternal']>>;
+    try {
+      connection = await this.connectMcplServerInternal(config, false, claim);
+    } catch (error) {
+      if (keptClosedTab && !this.mcplServerConfigs.has(config.id) && !this.closedTabConfigs().has(config.id)) {
+        this.closedTabConfigs().set(config.id, keptClosedTab);
+        this.hostPresentation?.restoreClosed(config.id, closedWas);
+      }
+      throw error;
+    }
     // A stop() that began during the connect's setup or its tool listing
     // ends the connect: it doesn't wait on a server for a framework that is
     // stopping, and the teardown closes what the connect set up.

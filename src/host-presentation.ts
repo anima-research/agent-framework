@@ -490,6 +490,18 @@ export class HostPresentation {
     }
   }
 
+  /** A server's saved closed state: true closed, false connected against a closed-tab default, undefined neither. */
+  closedState(serverId: string): boolean | undefined {
+    return this.doc.closed[serverId];
+  }
+
+  /** A connect refused before anything changed: its closed tab is put back as it was. */
+  restoreClosed(serverId: string, was: boolean | undefined): void {
+    if (was === undefined) delete this.doc.closed[serverId];
+    else this.doc.closed[serverId] = was;
+    this.save();
+  }
+
   /** A server removed for good (an operator's disconnect): nothing of its tab is kept. */
   noteRemoved(serverId: string): void {
     let changed = false;
