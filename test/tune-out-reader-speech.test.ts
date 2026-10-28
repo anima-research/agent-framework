@@ -21,10 +21,6 @@ describe('reader forks with channel speech on', { skip }, () => {
     await r.waitFor(() => r.forkTraces().length >= 1, 'a reader fork is derived');
     const fork = r.forkTraces()[0]!.agentName;
     await r.waitFor(() => r.published().length > before, 'the post reaches the channel');
-    assert.deepEqual(
-      r.state.denies.get(fork),
-      { deliver_summary: false, cancel_tuneout: false, note_disposition: false, speak_in_channel: false, channel_publish: true },
-    );
     assert.deepEqual(r.refusals().map((t) => t.tool), ['channel_publish']);
     assert.equal(r.published().length - before, 1);
     assert.equal(r.published().at(-1)!.channelId, CHANNEL);

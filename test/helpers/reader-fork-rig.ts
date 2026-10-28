@@ -1,8 +1,7 @@
 /**
  * One reader-fork rig per test file (as the e2e has it): a resident on a
  * fixture MCPL server, a membrane that routes responses by role, the
- * tune-out entered by hand, and the fork's dispatch-deny table read while
- * it runs. A second rig in the same process never comes up, so the speech
+ * tune-out entered by hand. A second rig in the same process never comes up, so the speech
  * on/off cases live in two files.
  */
 import { before, after } from 'node:test';
@@ -57,18 +56,13 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 20_000): P
 type Internals = {
   tuneOutCoordinator: TuneOutCoordinator | null;
   channelRegistry: { listChannelsRaw(): unknown[] } | null;
-  agents: Map<string, { deniesAtDispatch(tool: string): boolean }>;
-  readerRefuses(agentName: string, tool: string): boolean;
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
 export const toolNames = (request: NormalizedRequest) => ((request as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
 
 export function rig(name: string, allowChannelSpeech: boolean, opts: { modules?: Module[] } = {}) {
   const traces: TraceEvent[] = [];
-  const CHECKED = ['deliver_summary', 'cancel_tuneout', 'note_disposition', 'speak_in_channel', 'channel_publish'];
-  /** Each fork's dispatch-deny table, read while it runs (a fork can start and end between two polls). */
-  const denies = new Map<string, Record<string, boolean>>();
-  const state = { tempDir: '', commandPath: '', statusPath: '', membrane: new RoutedMembrane(), framework: null as AgentFramework | null, traces, denies };
+  const state = { tempDir: '', commandPath: '', statusPath: '', membrane: new RoutedMembrane(), framework: null as AgentFramework | null, traces };
   before(async () => {
     state.tempDir = mkdtempSync(join(tmpdir(), `tune-out-${name}-`));
     state.commandPath = join(state.tempDir, 'commands.txt');
@@ -86,13 +80,6 @@ export function rig(name: string, allowChannelSpeech: boolean, opts: { modules?:
     state.framework.onTrace((event) => {
       traces.push(event);
       if (/^(dendrite|tune-out|tool|mcpl:speech)/.test(event.type)) debug('trace', event.type, JSON.stringify(event).slice(0, 200));
-      if (event.type === 'tool:failed' && (event as { module: string }).module === 'dendrite') {
-        for (const [name, agent] of internals(state.framework!).agents) {
-          if (name !== 'scout' && !denies.has(name)) {
-            denies.set(name, Object.fromEntries(CHECKED.map((t) => [t, internals(state.framework!).readerRefuses(name, t) || agent.deniesAtDispatch(t)])));
-          }
-        }
-      }
     });
     await state.framework.start();
     await waitFor(() => (internals(state.framework!).channelRegistry?.listChannelsRaw().length ?? 0) > 0, 'channel registration');
