@@ -489,6 +489,10 @@ export class AgentRegistry {
    * is ended here as interrupted, and returned so its result recipient can
    * be told. Held mail is kept for redelivery.
    *
+   * A record the ended history already holds, by name and incarnation, ended
+   * before the previous process could write the snapshot without it: it is
+   * dropped, not ended again.
+   *
    * `endedHistory` is the tail of the ended-record log, oldest first.
    */
   restore(snapshot: RegistrySnapshot | null | undefined, endedHistory: AgentRecord[] = []): RestoreOutcome {
@@ -516,9 +520,15 @@ export class AgentRegistry {
     }
     this.mail = clone(snapshot.mail);
 
+    const endedKeys = new Set(this.ended.map((record) => `${record.name}#${record.incarnation}`));
+    let dropped = false;
     for (const raw of snapshot.records) {
       const record = clone(raw);
       if (record.ended) continue; // history lives in the ended log
+      if (endedKeys.has(`${record.name}#${record.incarnation}`)) {
+        dropped = true;
+        continue;
+      }
       if (record.lifetime.kind === 'persistent') {
         this.awaiting.set(record.name, record);
         continue;
@@ -526,7 +536,7 @@ export class AgentRegistry {
       this.recordEnded(record, 'host-restart');
       interrupted.push(record);
     }
-    if (interrupted.length > 0) this.persist();
+    if (interrupted.length > 0 || dropped) this.persist();
     return { interrupted };
   }
 

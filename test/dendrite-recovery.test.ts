@@ -3,6 +3,8 @@
  *
  * - a change that failed and was put back leaves no copy of the registry
  *   holding it, and a put-back that fails too doesn't hide the change's error;
+ * - an agent whose end was written before the snapshot let go of it ends once
+ *   at the next boot, and its recipient isn't told of a restart it didn't meet;
  * - a recovery file that holds null, or a registry without its counters, is
  *   refused rather than read as empty;
  */
@@ -145,5 +147,23 @@ describe('the registry\'s recovery', () => {
       undo();
       delete (first as unknown as Record<string, unknown>).writeRecoveryFile;
     }
+  });
+
+  it('an end written before the snapshot let go of the agent ends it once at the next boot, and tells nobody of a restart', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    const job = await startBlocked(first, gates, 'w', 'g-w', workerSpec('w', { spawnedBy: 'oren', resultTo: { to: 'oren', as: 'message' } }));
+    const whileLive = readFileSync(registryFile(), 'utf8');
+    gates.release('g-w');
+    assert.ok((await job.settled).ok);
+    assert.equal(first.getAgentRecord('w')?.ended?.reason, 'completed');
+    await first.stop();
+    // The previous process wrote w's end and died before the snapshot without w.
+    writeFileSync(registryFile(), whileLive);
+    const second = await boot();
+    const records = second.listAgents({ includeEnded: true }).filter((r) => r.name === 'w');
+    assert.deepEqual(records.map((r) => r.ended?.reason), ['completed'], 'w ended once, as it did');
+    assert.deepEqual(rowsWith(second, 'oren', 'the host restarted while'), [], 'and oren is told of no restart');
   });
 });
