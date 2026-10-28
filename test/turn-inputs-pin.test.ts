@@ -445,16 +445,37 @@ test("two committing compiles that refuse at once with the turn's pin held each 
     for (let tick = 0; tick < 600 && cm.getPendingWork(); tick++) await cm.tick();
     let held = 0;
     let outcomes: string[] = [];
+    const compiles: Array<{ pinned: number; outcome: unknown }> = [];
     module.onCall = async () => {
       held = inputPins(framework).length;
       const agent = framework.getAgent('prime')!;
       const budget = { maxTokens: 26_000, reserveForResponse: 0 };
-      outcomes = await Promise.all([agent.compileContext(budget), agent.compileContext(budget)]
-        .map((p) => p.then(() => 'compiled', (error: unknown) => String((error as { name?: unknown }).name))));
+      const compile = cm.compile.bind(cm);
+      cm.compile = async (...args: Parameters<typeof compile>) => {
+        const pinned = inputPins(framework).length;
+        try {
+          const result = await compile(...args);
+          compiles.push({ pinned, outcome: 'compiled' });
+          return result;
+        } catch (error) {
+          compiles.push({ pinned, outcome: (error as { name?: unknown }).name });
+          throw error;
+        }
+      };
+      try {
+        outcomes = await Promise.all([agent.compileContext(budget), agent.compileContext(budget)]
+          .map((p) => p.then(() => 'compiled', (error: unknown) => String((error as { name?: unknown }).name))));
+      } finally {
+        cm.compile = compile;
+      }
     };
     ask(framework);
     await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || failureRows(framework).length > 0);
     assert.equal(held, 1, 'the turn held its pin when both compiles started');
+    assert.deepEqual(compiles, [
+      { pinned: 1, outcome: 'OverBudgetError' }, { pinned: 1, outcome: 'OverBudgetError' },
+      { pinned: 0, outcome: 'compiled' }, { pinned: 0, outcome: 'compiled' },
+    ], 'both refused with the pin held, then each compiled once without it');
     assert.deepEqual(outcomes, ['compiled', 'compiled'], 'both compiled without the pin');
   });
 });
