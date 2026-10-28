@@ -16947,7 +16947,10 @@ export class AgentFramework {
           // and a wake for a deferred write or a stored message is dropped
           // once the agent is done with that write: neither may absorb an
           // unrelated wake that would vanish with it.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
+          // A heartbeat's wake keeps its own key, so a later channel-less wake
+          // can't absorb it: resumed together, they make a heartbeat's batch
+          // (heartbeatTurn), as they would have without the quiesce.
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's

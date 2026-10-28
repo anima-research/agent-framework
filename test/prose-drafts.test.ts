@@ -4353,6 +4353,30 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
     }
   });
 
+  it("a quiesce parks a heartbeat's wake apart from a later channel-less wake, so neither absorbs the other", async () => {
+    const h = await harness();
+    const internals = h.framework as unknown as {
+      pendingRequests: Array<{ agentName: string; source: string }>;
+      processInferenceRequests(): Promise<void>;
+      quiesced: boolean;
+    };
+    try {
+      const t = Date.now();
+      internals.quiesced = true;
+      internals.pendingRequests.push(
+        { agentName: 'scout', reason: 'mcpl:push-event', source: 'heartbeat', timestamp: t } as never,
+        { agentName: 'scout', reason: 'mcpl:push-event', source: 'other', timestamp: t + 1 } as never,
+      );
+      await internals.processInferenceRequests();
+      assert.deepEqual(internals.pendingRequests.filter((r) => r.agentName === 'scout').map((r) => r.source).sort(), ['heartbeat', 'other'],
+        'both wait for the resume, where they make a heartbeat\'s batch');
+    } finally {
+      internals.quiesced = false;
+      internals.pendingRequests.length = 0;
+      await h.close();
+    }
+  });
+
   it('an explicit send from a heartbeat turn still posts', async () => {
     const h = await harness();
     try {
