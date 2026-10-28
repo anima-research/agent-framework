@@ -521,7 +521,10 @@ and each server's presentation where the agent changed it, are kept in
 `<storePath>/config/toolsets.json`. An open host toolset whose announcement has
 left the context is reminded of, as a server's toolset is (§8.3). A call of a
 tool the agent may call by name still works by name; the tool list just
-doesn't carry it.
+doesn't carry it. `framework.presentedTools(agentName, tools, canUseMeta?)`
+applies this presentation to a tool list, so a host can tell a stream that
+isn't registered yet (a fork, before its run starts) what its first request
+will carry.
 
 `server` can be left out when only one server has the name. By our reading of
 the code, a server with no toolsets stops presenting them once its latest `tools/list` has no dynamic

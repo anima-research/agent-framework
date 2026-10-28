@@ -255,6 +255,34 @@ describe('reminders across a restart', () => {
   });
 });
 
+describe('presentedTools', () => {
+  it('gives a stream that isn\'t registered yet the tool list its first request will carry', async () => {
+    const h = await makeFramework();
+    try {
+      const all = h.framework.getAllTools();
+      // A fork that will be able to use the meta-tools: the built-in toolset's tools and utilities left out.
+      const forked = h.framework.presentedTools('scout::fork-a', all, true).map((t) => t.name);
+      assert.ok(forked.includes('toolsets--open') && forked.includes('stub--frontline'));
+      for (const out of ['agent_settings', 'stub--adminish', 'stub--rare_op']) assert.ok(!forked.includes(out), `${out} out`);
+      // One that won't: every tool it may call stays, but no utility.
+      const narrow = h.framework.presentedTools('scout::fork-b', all, false).map((t) => t.name);
+      assert.ok(narrow.includes('agent_settings') && narrow.includes('stub--adminish'), 'placed tools stay without the meta-tools');
+      assert.ok(!narrow.includes('stub--rare_op'), 'a utility is never in a tool list');
+      // Left out, the registered agent is asked: as its own requests carry it.
+      assert.deepEqual(h.framework.presentedTools('scout', all).map((t) => t.name).sort(), forked.slice().sort());
+    } finally { await h.stop(); }
+  });
+
+  it('presents nothing out of the list where a module given to create() holds the name toolsets, whatever the host says', async () => {
+    const own = { name: 'toolsets', start: async () => {}, stop: async () => {}, getTools: () => [], handleToolCall: async () => ({ success: true }), onProcess: async () => ({}) };
+    const h = await makeFramework({ modules: [new StubModule(), own as never] });
+    try {
+      const names = h.framework.presentedTools('scout::fork-a', h.framework.getAllTools(), true).map((t) => t.name);
+      assert.ok(names.includes('agent_settings') && names.includes('stub--adminish'), 'nothing folded');
+    } finally { await h.stop(); }
+  });
+});
+
 describe('utils', () => {
   it('is answered where utilities went whatever the allowlist names, on the model\'s path and in process, traced as failed', async () => {
     const h = await makeFramework({ agent: { allowedTools: ['stub--frontline'] } });
@@ -580,11 +608,11 @@ describe('server tabs', () => {
       await h.framework.start();
       await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
       await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true });
-      const internals = h.framework as unknown as { connectMcplServer(config: unknown): Promise<void> };
-      const real = internals.connectMcplServer;
-      internals.connectMcplServer = async () => { throw new Error('refused by the server'); };
+      const internals = h.framework as unknown as { runConnectMcplServer(config: unknown, claim?: unknown, opts?: unknown): Promise<void> };
+      const real = internals.runConnectMcplServer;
+      internals.runConnectMcplServer = async () => { throw new Error('refused by the server'); };
       const failed = await call(h.framework, 'toolsets--open', { server: 'srv', full: true });
-      internals.connectMcplServer = real;
+      internals.runConnectMcplServer = real;
       assert.ok(failed.isError, 'the caller is told it failed');
       assert.match(String(failed.error), /refused by the server/);
       assert.ok(!(await headerNames(h.framework)).includes('srv--ping'), 'not put back in the tool list');
@@ -673,6 +701,38 @@ describe('server tabs', () => {
     try {
       await second.framework.start();
       await waitFor(() => second.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'connected at startup under the original configuration');
+    } finally { await second.stop(); await server.close(); }
+  });
+
+  it('ends a closed tab when an operator\'s connect begins: one that fails leaves an ordinary server that\'s down', async () => {
+    const { server } = await pingServer();
+    const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv', presentation: 'closed-tab' }] });
+    try {
+      await h.framework.start();
+      await assert.rejects(h.framework.connectMcplServer({ id: 'srv', url: 'ws://127.0.0.1:9/mcpl', toolPrefix: 'srv', reconnect: false }));
+      const listed = h.framework.listMcplServers().find((x) => x.id === 'srv');
+      assert.ok(listed && !listed.connected && !listed.closedTab, `down, no longer a closed tab: ${JSON.stringify(listed)}`);
+      assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look', { server: 'srv' })), /closed tab/, 'nor to the agent');
+      await h.framework.restartMcplServer('srv', { id: 'srv', url: server.url, toolPrefix: 'srv' });
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'connected by the operator\'s retry');
+    } finally { await h.stop(); await server.close(); }
+  });
+
+  it('keeps a runtime-connected server\'s configured closed-tab default for the next start', async () => {
+    const { server } = await pingServer();
+    const config: McplServerConfig = { id: 'srv', url: server.url, toolPrefix: 'srv', presentation: 'closed-tab' };
+    const first = await makeFramework();
+    try {
+      await first.framework.start();
+      await first.framework.connectMcplServer(config);
+      await waitFor(() => first.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'connected at runtime');
+      const state = join(first.dir, 'store', 'config', 'toolsets.json');
+      assert.ok(!existsSync(state) || JSON.parse(readFileSync(state, 'utf8')).closed?.srv === undefined, 'nothing saved against its default');
+    } finally { await first.stop(true); }
+    const second = await makeFramework({ dir: first.dir, servers: [config] });
+    try {
+      await second.framework.start();
+      assert.ok(!second.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'closed at startup, as configured');
     } finally { await second.stop(); await server.close(); }
   });
 

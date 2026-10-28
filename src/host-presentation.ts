@@ -232,10 +232,10 @@ export class HostPresentation {
   // ── the tool list ──
 
   /** The tool list an agent is shown: what it may call, less the built-in toolset and its tabs. */
-  header(agentName: string, tools: ToolDefinition[]): ToolDefinition[] {
+  header(agentName: string, tools: ToolDefinition[], active: boolean = this.active(agentName)): ToolDefinition[] {
     // Without the meta-tools nothing is presented out of the tool list, but a
     // utility still isn't in it: it was never a tool-list tool.
-    if (!this.active(agentName)) return tools.filter((t) => isMetaTool(t.name) || !this.deps.isUtility(t.name));
+    if (!active) return tools.filter((t) => isMetaTool(t.name) || !this.deps.isUtility(t.name));
     return tools.filter((t) => !this.outOfHeader(agentName, t.name));
   }
 
@@ -480,10 +480,11 @@ export class HostPresentation {
 
   /** A server connected by other means (an operator's connect, a deploy): no longer a closed tab. */
   noteConnected(serverId: string, wasClosedTab = false): void {
-    // Closed by an agent, or by its configured default (as the caller kept
-    // it): connected against it now, which is kept across restarts.
-    if (wasClosedTab || this.doc.closed[serverId] === true
-      || (this.doc.closed[serverId] === undefined && this.server(serverId)?.configured === 'closed-tab')) {
+    // Closed by an agent, or by its configured default (the caller says,
+    // from the configuration it kept): connected against it now, which is
+    // kept across restarts. A server that wasn't a closed tab writes
+    // nothing, so a configured closed-tab default still applies at startup.
+    if (wasClosedTab || this.doc.closed[serverId] === true) {
       this.doc.closed[serverId] = false;
       this.save();
     }

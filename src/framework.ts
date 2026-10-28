@@ -29896,8 +29896,8 @@ export class AgentFramework {
       reconnect: async (serverId) => {
         const config = this.closedTabConfigs().get(serverId);
         if (!config) throw new Error(`no MCPL server "${serverId}" is kept as a closed tab here`);
-        await this.connectMcplServer(config);
-        this.closedTabConfigs().delete(serverId);
+        this.refuseOperatorAfterStop('connect MCPL server');
+        await this.trackOperatorOperation('mcpl:connect', () => this.runConnectMcplServer(config, undefined, { reopen: true }));
       },
       log: (line) => console.error(line),
       isUtility: (name) => this.isModuleUtility(name),
@@ -29965,6 +29965,28 @@ export class AgentFramework {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * The tool list an agent's requests carry, from the tools it may call: its
+   * host presentation applied (the built-in toolset's tools, the servers it
+   * has as tabs and its hidden tools left out; a utility never in it), as
+   * every request of a registered agent has it. For a stream that isn't
+   * registered yet, such as a fork whose orientation is written before its
+   * run starts, the host says whether it will be able to call
+   * `toolsets--open` and `toolsets--act` (`canUseMeta`); left out, the agent
+   * registered under that name is asked. Presentation it chose itself (open
+   * toolsets, tabs) is read under that name, so a new name starts from the
+   * configured presentation.
+   */
+  presentedTools(agentName: string, tools: import('./types/index.js').ToolDefinition[], canUseMeta?: boolean): import('./types/index.js').ToolDefinition[] {
+    if (!this.hostPresentation) return tools;
+    if (canUseMeta === undefined) return this.hostPresentation.header(agentName, tools);
+    // As hostToolsetsFor decides for a registered agent: the subconscious and
+    // a host whose module named toolsets isn't the framework's present nothing.
+    const meta = canUseMeta && agentName !== this.subconsciousAgentName
+      && this.moduleRegistry.getAllModules().find((m) => m.name === TOOLSETS_MODULE) instanceof ToolsetsModule;
+    return this.hostPresentation.header(agentName, tools, meta);
   }
 
   /** The host presentation of a server's tools, for the tool list: the agent's
@@ -30849,6 +30871,7 @@ export class AgentFramework {
   private async runConnectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
     claim?: McpRestartClaim,
+    opts: { reopen?: boolean } = {},
   ): Promise<void> {
     assertServerConfigBooleans(config);
     // Lazily bring up the MCPL subsystem — a framework that started with zero
@@ -30875,6 +30898,12 @@ export class AgentFramework {
     // registers. A server already registered was refused just above, so the
     // read never reaches a registered server's trees.
     this.checkpointManager?.loadHostStates(config.id);
+    // An operator's connect ends a closed tab as it begins, as a restart
+    // does: one that fails leaves an ordinary server that's down, under the
+    // configuration it was given. Whether it was one is the kept
+    // configuration's to say. An agent's open (reopen) ends it only once
+    // connected, so one that fails leaves the closed tab to open again.
+    if (!opts.reopen && this.closedTabConfigs().delete(config.id)) this.hostPresentation?.noteConnected(config.id, true);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     const connection = await this.connectMcplServerInternal(config, false, claim);
     // A stop() that began during the connect's setup or its tool listing
@@ -30898,8 +30927,6 @@ export class AgentFramework {
       throw new Error(`MCP server "${config.id}" was not connected: it was disconnected or lost while its tools were being listed`);
     }
     // Connected, however it was asked for: not a closed tab any more.
-    // Whether it was a closed tab is the kept configuration's to say, not
-    // the one it's connected with now, which may name another presentation.
     const wasClosedTab = this.closedTabConfigs().delete(config.id);
     this.hostPresentation?.noteConnected(config.id, wasClosedTab);
     this.emitMcplToolDiff(oldToolNames, config.id);
