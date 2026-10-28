@@ -237,6 +237,19 @@ export class AgentRegistry {
     return options.includeEnded ? [...this.ended, ...live] : live;
   }
 
+  /**
+   * An agent other than `except` whose own context a namespace holds, among
+   * the records in memory: live, awaiting re-declaration, or ended. A shared
+   * fork's record names its parent's namespace, where it owns only a branch,
+   * so it holds none.
+   */
+  namespaceHolder(namespace: string, except: AgentName): AgentName | undefined {
+    for (const record of [...this.live.values(), ...this.awaiting.values(), ...this.ended]) {
+      if (record.name !== except && record.namespace === namespace && record.inherit?.mode !== 'shared') return record.name;
+    }
+    return undefined;
+  }
+
   /** Provenance stamp for a live agent (or its last incarnation). */
   ref(name: AgentName): AgentRef {
     const record = this.inspect(name);

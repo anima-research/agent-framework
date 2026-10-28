@@ -3842,6 +3842,10 @@ export class AgentFramework {
   private endedRecovery: AgentRecord[] = [];
   /** The branch-local ended log by name (its newest entry for each), and how far it is indexed (findEndedAgentRecord). */
   private readonly endedLogIndex = new Map<string, number>();
+  /** The ended log's entries by the namespace their context holds (the latest for each). */
+  private readonly endedLogNamespaceIndex = new Map<string, number>();
+  /** Namespaces this process opened for an ephemeral agent's context, by owner: candidates not yet registered included. */
+  private readonly namespaceOwners = new Map<string, string>();
   private endedLogIndexed = 0;
   /** The last indexed entry's mark, so a log that changed under the index is seen. */
   private endedLogTail = '';
@@ -10649,6 +10653,7 @@ export class AgentFramework {
     }
     this.usedEphemeralAgentNames.set(config.name, 'run');
     const release: ManagerRelease = { released: false, calls: new Set() };
+    let opened: string | undefined;
     try {
       // A namespace the spec names is where the context opens, as it is what
       // the record says and what inspection and resumption open later.
@@ -10674,16 +10679,22 @@ export class AgentFramework {
         inherit = derived.inherit;
         namespace = derived.namespace;
       } else {
-        // Two managers writing one namespace would interleave two contexts,
-        // so one a live agent's context holds is refused. An ended agent's
-        // stays open to reuse, as resumption reopens it.
-        const holder = this.registry.list().find((record) => record.namespace === namespace);
+        // A namespace belongs to the agent that opened it: another agent's
+        // turns there would be read as its own by inspection and by its
+        // resumption, which reopens "its own namespace". So one another
+        // agent's context holds (live, a candidate, awaiting re-declaration
+        // or ended) is refused; an agent's own reopens in a new incarnation.
+        const holder = this.namespaceHolder(namespace, config.name);
         if (holder) {
+          // The default is offered only where it isn't the namespace refused.
+          const fallback = `subagent/${config.name}`;
           throw new Error(
-            `Ephemeral agent "${config.name}" refused: namespace "${namespace}" holds the context of the live agent ` +
-              `"${holder.name}"; name another, or none for subagent/${config.name}`,
+            `Ephemeral agent "${config.name}" refused: namespace "${namespace}" holds the context of agent ` +
+              `"${holder}"; name another${namespace === fallback ? '' : `, or none for ${fallback}`}`,
           );
         }
+        this.namespaceOwners.set(namespace, config.name);
+        opened = namespace;
         contextManager = await ContextManager.open({
           store: this.store,
           namespace,
@@ -10727,6 +10738,7 @@ export class AgentFramework {
     } catch (error) {
       if (release.manager) this.closeManager(release.manager);
       this.usedEphemeralAgentNames.delete(config.name);
+      if (opened !== undefined) this.namespaceOwners.delete(opened);
       throw error;
     }
   }
@@ -11927,6 +11939,21 @@ export class AgentFramework {
    * the name indexed for it.
    */
   private findEndedAgentRecord(name: string): AgentRecord | undefined {
+    return this.findInEndedLog('name', name);
+  }
+
+  /**
+   * The ended log's latest record whose own context a namespace holds. A
+   * shared fork's record names its parent's namespace, where it owns only a
+   * branch, so it is indexed by name alone.
+   */
+  private findInEndedLog(by: 'name' | 'namespace', value: string): AgentRecord | undefined {
+    const byKey = by === 'name' ? this.endedLogIndex : this.endedLogNamespaceIndex;
+    const reset = () => {
+      this.endedLogIndex.clear();
+      this.endedLogNamespaceIndex.clear();
+      this.endedLogIndexed = 0;
+    };
     const read = (index: number) => this.store.getStateItemJson(AGENT_REGISTRY_ENDED_ID, index) as AgentRecord | null;
     const mark = (record: AgentRecord | null) => (record ? `${record.name}#${record.incarnation}@${record.ended?.at}` : '');
     let length: number;
@@ -11938,23 +11965,35 @@ export class AgentFramework {
     for (let attempt = 0; attempt < 2; attempt++) {
       if (length < this.endedLogIndexed
         || (this.endedLogIndexed > 0 && mark(read(this.endedLogIndexed - 1)) !== this.endedLogTail)) {
-        this.endedLogIndex.clear();
-        this.endedLogIndexed = 0;
+        reset();
       }
       for (let index = this.endedLogIndexed; index < length; index++) {
         const record = read(index);
-        if (record?.ended && typeof record.name === 'string') this.endedLogIndex.set(record.name, index);
+        if (!record?.ended || typeof record.name !== 'string') continue;
+        this.endedLogIndex.set(record.name, index);
+        if (typeof record.namespace === 'string' && record.inherit?.mode !== 'shared') {
+          this.endedLogNamespaceIndex.set(record.namespace, index);
+        }
       }
       this.endedLogIndexed = length;
       this.endedLogTail = length > 0 ? mark(read(length - 1)) : '';
-      const at = this.endedLogIndex.get(name);
+      const at = byKey.get(value);
       if (at === undefined) return undefined;
       const record = read(at);
-      if (record?.name === name && record.ended) return record;
-      this.endedLogIndex.clear();
-      this.endedLogIndexed = 0;
+      if (record?.ended && record[by] === value) return record;
+      reset();
     }
     return undefined;
+  }
+
+  /** Another agent whose context a namespace holds: opened in this process, in the registry, or in the ended log. */
+  private namespaceHolder(namespace: string, except: string): string | undefined {
+    const opened = this.namespaceOwners.get(namespace);
+    if (opened !== undefined && opened !== except) return opened;
+    const held = this.registry.namespaceHolder(namespace, except);
+    if (held) return held;
+    const ended = this.findInEndedLog('namespace', namespace);
+    return ended && ended.name !== except ? ended.name : undefined;
   }
 
   /** The ended log's recovery file, rewritten as the newest records (as many as a restart reads). */

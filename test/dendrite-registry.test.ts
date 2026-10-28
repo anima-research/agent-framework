@@ -319,6 +319,19 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.equal(registry.list({ includeEnded: true }).filter((r) => r.name === 'job').length, 2);
   });
 
+  it('names the agent whose own context a namespace holds; a shared fork holds none', () => {
+    const registry = new AgentRegistry();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(workerSpec('w', { spawnedBy: 'mira', namespace: 'jobs/w' }));
+    registry.register({ ...workerSpec('fork', { spawnedBy: 'mira' }), namespace: 'jobs/p', inherit: { from: 'mira', mode: 'shared' } });
+    assert.equal(registry.namespaceHolder('agents/mira', 'x'), 'mira');
+    assert.equal(registry.namespaceHolder('jobs/w', 'x'), 'w');
+    assert.equal(registry.namespaceHolder('jobs/w', 'w'), undefined, 'not its own');
+    assert.equal(registry.namespaceHolder('jobs/p', 'x'), undefined, 'a shared fork owns a branch, not the namespace');
+    registry.end('w', 'stopped', 'mira');
+    assert.equal(registry.namespaceHolder('jobs/w', 'x'), 'w', 'an ended agent\'s');
+  });
+
   it('refuses a version-1 snapshot without its map of incarnations', () => {
     assert.throws(
       () => new AgentRegistry().restore({ version: 1, records: [], mail: [] } as unknown as RegistrySnapshot),
