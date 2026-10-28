@@ -2847,9 +2847,11 @@ function inTextUnits(text: string, hit: MatchHit): MatchHit {
 // author filtering
 // ============================================================================
 
-/** metadata.author as written by MCPL channel ingestion ({id, name}). Every
- *  incoming channel message is stored with participant "user" — the real
- *  author lives only here. */
+/** metadata.author as MCPL channel ingestion and DiscordModule write it
+ *  ({id, name}), and ApiModule ({name}, or the author object an api:message
+ *  event carries). Their participant is "user", or the sender's name marked
+ *  with its source unless it's the generic "user", so the plain author
+ *  name is read here. */
 function authorOf(msg: StoredMessage): { id?: string; name?: string } | undefined {
   const a = (msg.metadata as { author?: unknown } | undefined)?.author;
   if (!a || typeof a !== 'object') return undefined;
@@ -2916,9 +2918,9 @@ function toAuthorSet(spec: AuthorSpec | undefined, field: string): Set<string> |
 
 /**
  * Predicate for `author`/`excludeAuthor`, or null when neither is given.
- * A message's identities are its metadata.author name and id plus its
- * stored participant — the last is what identifies the agent's own turns
- * (and anything else ingested without author metadata). Exact match after
+ * A message's identities are its metadata.author name and id when it has
+ * one, and otherwise its stored participant, which is what identifies the
+ * agent's own turns (and anything else ingested without author metadata). Exact match after
  * normalization, never substring: "ann" must not pull in "joanne".
  */
 function buildAuthorFilter(include: AuthorSpec | undefined, exclude: AuthorSpec | undefined): ((m: StoredMessage) => boolean) | null {

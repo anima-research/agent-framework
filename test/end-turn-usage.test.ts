@@ -697,7 +697,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
       assert.ok(await pollUntil(() => r.traces.some((e) => e.type === 'usage:updated')), 'the finished round was counted');
       const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
       assert.equal(logs.length, 1);
-      assert.match(String(logs[0].error), /^Provider acceleration cooldown: /);
+      assert.match(String(logs[0].error), /^This request would exceed your organization's maximum usage increase rate/);
       assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage));
       assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
       assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);
@@ -730,7 +730,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         && r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'the finished round was counted and logged');
       const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
       assert.equal(logs.length, 1, 'the wait writes the stream\'s one entry');
-      assert.match(String(logs[0].error), /^Provider wait: /);
+      assert.equal(String(logs[0].error), 'zz rate limit reached for requests');
       assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'and it carries the finished round');
       assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
       assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);

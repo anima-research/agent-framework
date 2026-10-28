@@ -209,7 +209,10 @@ function factsOf(
  * - another agent's own row: elsewhere (decision 1: another agent's rounds
  *   reach an agent only through an observe edge);
  * - a row whose audience names it: an arrival, unless it is held and the
- *   reader leaves held rows out;
+ *   reader leaves held rows out, or it is another agent's stored injection,
+ *   which the reader's view leaves out too (what the reader's own view
+ *   leaves out is never its arrival: main's #853 asks that view, agentSees,
+ *   at a tool boundary);
  * - a row stamped otherwise (mail for a co-resident, a held row): elsewhere;
  * - a row with no stamp (stored by a host's writer that doesn't stamp): an
  *   arrival for the slot's owners, as it reads today, unless it is a shared
@@ -236,6 +239,7 @@ export function bearingOf(
   if (stamp) {
     if (stamp.ownRowOf !== undefined) return stamp.ownRowOf === reader.name ? 'own' : 'elsewhere';
     if (!stamp.audience.includes(reader.name)) return 'elsewhere';
+    if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
     return reader.hidesHeld && heldFromResidents(metadata) ? 'elsewhere' : 'arrival';
   }
   if (reader.derivedAt !== undefined && row.sequence <= reader.derivedAt) return 'elsewhere';

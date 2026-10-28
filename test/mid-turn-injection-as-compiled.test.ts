@@ -3,8 +3,9 @@
  * compile sends it: the agent's strategy renders the boundary's batch as the
  * newest of its window (ContextManager.renderAsNewest), cut by the per-message
  * cap and with the image limits applied across the batch. One the render
- * can't place among the newest goes in as stored: the next compile sends it
- * from before its recent window. The same with the presentation index on.
+ * can't place among the newest, such as one before the recent window under
+ * context-manager 0.23.0's memory strategy, goes in as stored, which is how
+ * the next compile sends it. The same with the presentation index on.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -202,6 +203,69 @@ describe('a message injected at a tool boundary', () => {
     assert.ok(tuned && (tuned.metadata as { tuneOut?: unknown } | undefined)?.tuneOut, 'the premise: the boundary stored the tuned-out message, stamped');
     assert.equal(seen.calls, 1, 'the premise: the render ran');
     assert.deepEqual(injected.map((m) => m.content), [[text('PICTURED'), image()]]);
+  });
+
+  it("isn't injected where the agent's own view leaves it out, as it leaves out another agent's stored context injection, and the next request leaves it out too", async () => {
+    await create(new AutobiographicalStrategy({ recentWindowTokens: 30_000 } as never));
+    const agent = framework.getAgent('assistant')!;
+    module.interjectionMetadata = [{ contextInjection: { agent: 'another', namespace: 'test', contentHash: 'h', part: 0, parts: 1 } }];
+    const injected = await turnWith([[text('OTHERSCONTEXT')], [text('HEARD')]]);
+    const row = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('OTHERSCONTEXT'));
+    assert.ok(row, 'the premise: the boundary stored it');
+    assert.equal(holding(injected, 'OTHERSCONTEXT'), '');
+    assert.notEqual(holding(injected, 'HEARD'), '', 'the message beside it goes in');
+    const next = await nextRequest();
+    assert.equal(next('OTHERSCONTEXT'), '');
+    assert.notEqual(next('HEARD'), '');
+  });
+
+  it("at the subconscious's boundary, its own view decides: a row written for it with a tune-out's stamp goes in, and another agent's stored context injection stays out, as its next request has them", async () => {
+    let ctx: ModuleContext | null = null;
+    const writer: Module = {
+      name: 'writer',
+      async start(c: ModuleContext) { ctx = c; },
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; },
+      async onProcess() { return {}; },
+    };
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' }],
+      modules: [writer],
+      subconscious: { enabled: true, systemPrompt: 'notice' },
+    });
+    framework.start();
+    // Written for the subconscious as its turn's stream opens, so they wait for its tool boundary.
+    const streams: Array<{ receivedToolResultOptions: Array<{ injectedMessages?: Array<{ content: unknown[] }> } | undefined> }> = [];
+    const open = membrane.streamYielding.bind(membrane);
+    let wrote = false;
+    membrane.streamYielding = ((request: never, options: never) => {
+      const stream = open(request, options);
+      streams.push(stream as never);
+      if (!wrote) {
+        wrote = true;
+        ctx!.addMessage('Antra', [text('TUNEDOUT')], { tuneOut: { epochId: 'epoch-1' } } as never, { forAgent: 'Subconscious' });
+        ctx!.addMessage('Antra', [text('OTHERSCONTEXT')], { contextInjection: { agent: 'another', namespace: 'test', contentHash: 'h', part: 0, parts: 1 } } as never, { forAgent: 'Subconscious' });
+      }
+      return stream;
+    }) as never;
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 't1', name: 'think', input: { content: 'hm' } }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([text('Noted.')]));
+    assert.equal(framework.nudgeAgent('Subconscious').ok, true);
+    await framework.runUntilIdle();
+    const injected = streams.flatMap((s) => s.receivedToolResultOptions).flatMap((o) => o?.injectedMessages ?? []);
+    assert.ok(wrote, 'the premise: the writes were made while its turn ran');
+    const stored = framework.getAgent('Subconscious')!.getContextManager().getAllMessages();
+    assert.ok(stored.some((m) => JSON.stringify(m.content).includes('OTHERSCONTEXT')), 'the marked row is stored, not dropped');
+    assert.notEqual(holding(injected, 'TUNEDOUT'), '', "its view holds a row with a tune-out's stamp, so it goes in");
+    assert.equal(holding(injected, 'OTHERSCONTEXT'), '');
+    membrane.pushResponse(createMockResponse([text('Again.')]));
+    assert.equal(framework.nudgeAgent('Subconscious').ok, true);
+    await framework.runUntilIdle();
+    const sent = JSON.stringify(membrane.calls[membrane.calls.length - 1]!.messages);
+    assert.ok(sent.includes('TUNEDOUT') && !sent.includes('OTHERSCONTEXT'), 'its next request has the one and not the other');
   });
 
   it('under the memory strategy, a batch bigger than the recent window whose oldest the render gives null goes in whole, as the next request sends it (context-manager#275, R1-1)', async () => {

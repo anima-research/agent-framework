@@ -305,6 +305,50 @@ export interface FrameworkConfig {
    */
   providerHold?: ProviderHoldHook;
 
+  /**
+   * Delays before a turn whose retries ran out is sent again, in ms (default
+   * `[120000, 480000, 1920000]`: 2, 8 and 32 minutes), or `false` never to.
+   * When a persistent agent's turn ends exhausted on a transient failure (a
+   * server error, an overload, a rate limit, a network failure, or a timeout
+   * membrane marks retryable and not as a deadline it reports as run out, such
+   * as a 408 or a socket's ETIMEDOUT), its trigger is queued again after the
+   * first delay, as a wake of its own. It opens where the exhausted turn's
+   * plain speech was going: its locus, where a message mid-turn may have moved
+   * it, else its trigger channel. Carrying that channel, it ranks as addressed
+   * in a merged wake's choice of channel, so a newer ambient wake from
+   * elsewhere doesn't take it; an autoContinue continuation's still yields its
+   * channel to any wake's, as it does on main; a continuation's, such as a
+   * budget restart's, names no author. A re-arm that would have to guess a
+   * channel isn't sent again: one whose turn was woken for a channel id that
+   * names no one registered channel and never found one, and whose request
+   * names none of its own. A failure that states a wait is held for that wait
+   * first, as any turn's is, and a deadline ends the turn as before, whether
+   * the host set it or membrane marks one as run out: the runtime's or
+   * undici's on a sent request, the Anthropic adapter's watchdogs, or the
+   * Anthropic SDK's timeout, which covers its connect timeout too. Until one
+   * of the re-armed turn's rounds has run or had its tool calls cut off, its
+   * failure gets no retries from the error policy: on another transient
+   * failure the next delay follows, until the list runs out, and a failure of
+   * any other kind ends the re-arming. A wake for the agent while it waits
+   * starts its turn at once, with the re-armed trigger merged in. That turn is
+   * the wake's: the error policy retries its failures. A completed turn starts
+   * the count again, and so does a message said to the agent: not a system
+   * message or notice; not an edit, reaction or deletion, unless an edit is
+   * the first version of a message the agent sees; not a message its own view
+   * leaves out, such as one a tune-out holds from it; and not the agent's own
+   * schedule, the heartbeat's tick or reminder, a self-wake timer it set, or a
+   * script's wake. A notice a module or an MCPL server stores as a message
+   * counts. A message in the residents' shared slot counts for each resident
+   * that reads it. Any other wake leaves the count going on. A re-armed turn's
+   * transient failure writes no `[inference-failed]` marker unless a round of
+   * it ran or had its tool calls cut off; any other failure of it writes one.
+   * Each counts toward the hard-down streak. Ephemeral runs and conversation
+   * forks are never re-armed. The wait and the count are kept in memory:
+   * `stop()` drops them, and so does a restart. The wait isn't a turn, so
+   * `abortInference()` doesn't end it.
+   */
+  exhaustedTurnRearmMs?: number[] | false;
+
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;
 
@@ -386,6 +430,21 @@ export interface FrameworkConfig {
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;
+  /**
+   * The heartbeat: the agent's own periodic check-in and reminders, kept by
+   * the framework (src/heartbeat/heartbeat.ts), with the tools
+   * `heartbeat--heartbeat_status`, `heartbeat--heartbeat_configure`,
+   * `heartbeat--heartbeat_trigger`, `heartbeat--reminder_add`,
+   * `heartbeat--reminder_list` and `heartbeat--reminder_cancel`. `true` turns it
+   * on with its defaults; `false`, null or leaving it out leaves it off. Its
+   * wakes go to the gate as heartbeat-mcpl's pushes did, from the server id
+   * `heartbeat`, so the agent's rules decide them and a sleep lets them
+   * through. It replaces the heartbeat-mcpl server, which is refused beside it
+   * (by its id, a heartbeat tool prefix, or its command), at create and at a
+   * runtime connect: both would wake the agent. `importFrom` brings that
+   * server's schedule and reminders along.
+   */
+  heartbeat?: boolean | null | import('../heartbeat/heartbeat.js').HeartbeatOptions;
 
   /**
    * Liveness watchdog: fail hard (and let the supervisor restart) if the main

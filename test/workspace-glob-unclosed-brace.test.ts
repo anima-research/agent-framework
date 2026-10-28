@@ -75,7 +75,7 @@ function assertRefused(name: 'glob' | 'grep', input: Record<string, unknown>, pa
   assert.equal(answer.isError, true);
   assert.equal(
     answer.error,
-    `glob pattern ${JSON.stringify(pattern)} ${problem}. To match a "{" in a name, put "?" in its place.`,
+    `The ${name} did nothing: glob pattern ${JSON.stringify(pattern)} ${problem}. To match a "{" in a name, put "?" in its place.`,
   );
 }
 

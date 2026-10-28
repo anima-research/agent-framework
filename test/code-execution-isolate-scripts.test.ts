@@ -31,6 +31,9 @@ after(async () => {
   for (const scripts of made) await scripts.dispose();
 });
 
+const LONGER_THAN_ANY_START_MS = 60_000;
+const NEVER_FIRES_IN_A_TEST_MS = 2 * LONGER_THAN_ANY_START_MS;
+
 function setup(over: { host?: Partial<ScriptsHost>; config?: Partial<ScriptsConfig>; capacity?: number } = {}) {
   const wakes: [string, string][] = [];
   const gates = new Map<string, () => void>();
@@ -52,9 +55,9 @@ function setup(over: { host?: Partial<ScriptsHost>; config?: Partial<ScriptsConf
     output: { headChars: 1000, tailChars: 1000 },
     flushMs: 20,
     yieldMs: 300,
-    maxYieldMs: 5_000,
-    lifetimeMs: 60_000,
-    toolCallTimeoutMs: 60_000,
+    maxYieldMs: LONGER_THAN_ANY_START_MS,
+    lifetimeMs: NEVER_FIRES_IN_A_TEST_MS,
+    toolCallTimeoutMs: NEVER_FIRES_IN_A_TEST_MS,
     stopGraceMs: 2_000,
     maxRunning: 3,
     keepEnded: 8,
@@ -66,7 +69,7 @@ function setup(over: { host?: Partial<ScriptsHost>; config?: Partial<ScriptsConf
   made.push(scripts);
   /** Wait until the script's call `key` is waiting in the host. */
   const called = async (key = 'slow') => {
-    for (let i = 0; i < 1000 && !gates.has(key); i++) await new Promise((r) => setTimeout(r, 10));
+    for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !gates.has(key);) await new Promise((r) => setTimeout(r, 10));
     assert.ok(gates.has(key), `the call ${key} arrived`);
   };
   const release = async (key = 'slow') => {
@@ -79,7 +82,7 @@ function setup(over: { host?: Partial<ScriptsHost>; config?: Partial<ScriptsConf
 
 test('a script that ends within its bound returns whole', async () => {
   // A bound no child's start reaches, however loaded the host.
-  const { scripts } = setup({ config: { yieldMs: 30_000 } });
+  const { scripts } = setup({ config: { yieldMs: LONGER_THAN_ANY_START_MS } });
   const r = await scripts.run('alice', `const a = await tools.echo({ x: 1 }); text(a.content[0].text); return 7;`);
   assert.equal(r.running, false);
   assert.deepEqual(r.ending, { how: 'finished', value: '7' });
@@ -93,7 +96,7 @@ test('past its bound a script yields what it wrote, and each wait returns only w
   const first = await scripts.run('alice', `text('one'); await tools.slow({}); text('two'); return 'end';`, 0);
   assert.equal(first.running, true);
   // Once its call waits, what it wrote first has been flushed.
-  const waiting = scripts.wait('alice', first.scriptId, 10_000);
+  const waiting = scripts.wait('alice', first.scriptId, LONGER_THAN_ANY_START_MS);
   await release();
   const second = await waiting;
   assert.equal(second.running, false);
@@ -105,12 +108,13 @@ test('past its bound a script yields what it wrote, and each wait returns only w
 });
 
 test("a non-primary agent's yield says its turn's end will stop it, and that stop wakes no one", async () => {
-  const { scripts, wakes } = setup({ host: { outlivesTurn: (agent) => agent === 'primary' } });
+  const { scripts, wakes, called } = setup({ host: { outlivesTurn: (agent) => agent === 'primary' } });
   const r = await scripts.run('helper', `await tools.slow({});`);
   assert.equal(r.running, true);
   assert.equal(r.stopsAtTurnEnd, true);
+  await called();
   scripts.turnEnded('helper', { id: 1, live: [] }, false);
-  for (let i = 0; i < 200 && scripts.running('helper') > 0; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && scripts.running('helper') > 0;) await new Promise((res) => setTimeout(res, 10));
   const [listed] = scripts.list('helper');
   assert.deepEqual(listed!.ending, { how: 'stopped', reason: 'limit', why: "its agent's turn ended, and only the primary agent's scripts outlive a turn" });
   assert.deepEqual(wakes, []);
@@ -123,7 +127,7 @@ test('a left script that fails wakes its agent; one that finishes says nothing',
   assert.equal(failing.running && finishing.running, true);
   await release('a');
   await release('b');
-  for (let i = 0; i < 300 && scripts.running('alice') > 0; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && scripts.running('alice') > 0;) await new Promise((res) => setTimeout(res, 10));
   assert.equal(wakes.length, 1);
   assert.match(wakes[0]![1], new RegExp(`\\[script ${failing.scriptId}\\] Your script failed: Error: broke`));
   const later = await scripts.wait('alice', finishing.scriptId);
@@ -174,7 +178,7 @@ test("another host's id names no script here, as one from before a restart doesn
 });
 
 test('wake_agent() wakes its agent with the payload, and past the cap it is refused', async () => {
-  const { scripts, wakes } = setup({ config: { maxWakesPerScript: 2, yieldMs: 30_000 } });
+  const { scripts, wakes } = setup({ config: { maxWakesPerScript: 2, yieldMs: LONGER_THAN_ANY_START_MS } });
   const r = await scripts.run('alice', `await wake_agent({ n: 1 }); await wake_agent({ n: 2 }); try { await wake_agent({ n: 3 }); } catch (e) { return e.message; }`);
   assert.equal(r.running, false);
   assert.match(r.ending?.how === 'finished' ? r.ending.value ?? '' : '', /wake limit reached: 2 per script/);
@@ -185,7 +189,7 @@ test('wake_agent() wakes its agent with the payload, and past the cap it is refu
 test('a listing counts the wakes the host delivered, not one whose delivery failed', async () => {
   const { scripts } = setup({ host: { wake: async (_agent, _scriptId, text) => { if (text.includes('"n":2')) throw new Error('no route'); } } });
   // A yield past the script's end, which comes first: the listing is read once it has ended.
-  const r = await scripts.run('alice', `await wake_agent({ n: 1 }); try { await wake_agent({ n: 2 }); } catch {} await wake_agent({ n: 3 }); return 1;`, 5_000);
+  const r = await scripts.run('alice', `await wake_agent({ n: 1 }); try { await wake_agent({ n: 2 }); } catch {} await wake_agent({ n: 3 }); return 1;`, LONGER_THAN_ANY_START_MS);
   assert.equal(r.running, false, JSON.stringify(r.ending));
   const listed = scripts.list('alice');
   assert.equal(listed.find((s) => s.scriptId === r.scriptId)?.wakes, 2);
@@ -197,7 +201,7 @@ test('a listing counts the wakes the host delivered, not one whose delivery fail
 test('an early wake waits for its spacing rather than being dropped', async () => {
   const at: number[] = [];
   const { scripts, wakes } = setup({
-    config: { wakeMinIntervalMs: 250, yieldMs: 3_000 },
+    config: { wakeMinIntervalMs: 250, yieldMs: LONGER_THAN_ANY_START_MS },
     host: { wake: async (agent, _id, text) => { at.push(Date.now()); wakes.push([agent, text]); } },
   });
   await scripts.run('alice', `await wake_agent('a'); await wake_agent('b');`);
@@ -209,7 +213,7 @@ test('an early wake waits for its spacing rather than being dropped', async () =
 test('wakes go out in the order they were made, and a failed delivery refuses its wake and not the next', async () => {
   let n = 0;
   const { scripts, wakes } = setup({
-    config: { wakeMinIntervalMs: 50, yieldMs: 10_000 },
+    config: { wakeMinIntervalMs: 50, yieldMs: LONGER_THAN_ANY_START_MS },
     host: {
       wake: async (agent, _id, text) => {
         n += 1;
@@ -224,7 +228,7 @@ test('wakes go out in the order they were made, and a failed delivery refuses it
 });
 
 test("an abandoned turn stops a script that hadn't returned, quietly, and its pending return takes no output", async () => {
-  const { scripts, wakes, called } = setup({ config: { yieldMs: 10_000 } });
+  const { scripts, wakes, called } = setup({ config: { yieldMs: LONGER_THAN_ANY_START_MS } });
   const pending = scripts.run('alice', `text('hi'); await tools.slow({});`, undefined, { watch: { turnId: 1, endTurn: false } });
   // Once its call waits, what it wrote first has been flushed.
   await called();
@@ -238,7 +242,7 @@ test("an abandoned turn stops a script that hadn't returned, quietly, and its pe
 
 test('only the newest ended scripts are kept, newest by when each ended, from each ending on', async () => {
   // Each run returns at its end: a bound no child's start reaches, however loaded the host.
-  const { scripts, release } = setup({ config: { keepEnded: 2, yieldMs: 30_000 } });
+  const { scripts, release } = setup({ config: { keepEnded: 2, yieldMs: LONGER_THAN_ANY_START_MS } });
   // The first started ends last, so it's among the newest ended.
   const first = await scripts.run('alice', `await tools.slow({}); return 'first';`, 0);
   const ids: string[] = [];
@@ -246,7 +250,7 @@ test('only the newest ended scripts are kept, newest by when each ended, from ea
   // The bound holds as each ends, before any later start.
   assert.deepEqual(scripts.list('alice').map((s) => s.scriptId), [first.scriptId, ids[1], ids[2]]);
   await release();
-  for (let i = 0; i < 300 && scripts.running('alice') > 0; i++) await new Promise((r) => setTimeout(r, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && scripts.running('alice') > 0;) await new Promise((r) => setTimeout(r, 10));
   assert.deepEqual(scripts.list('alice').map((s) => s.scriptId).sort(), [first.scriptId, ids[2]].sort());
   await assert.rejects(scripts.wait('alice', ids[0]!), /You have no script/);
 });
@@ -255,12 +259,12 @@ test('an abandoned wait leaves its yielded script running, and a later failure s
   const { scripts, wakes, release } = setup({ config: { yieldMs: 200 } });
   const first = await scripts.run('alice', `await tools.slow({}); throw new Error('later');`);
   assert.equal(first.running, true);
-  const waiting = scripts.wait('alice', first.scriptId, 10_000, { turnId: 1, endTurn: false });
+  const waiting = scripts.wait('alice', first.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 1, endTurn: false });
   await new Promise((r) => setTimeout(r, 50));
   scripts.turnEnded('alice', { id: 1, live: [] }, true);
   assert.equal(scripts.running('alice'), 1, 'still running');
   await release();
-  for (let i = 0; i < 300 && scripts.running('alice') > 0; i++) await new Promise((r) => setTimeout(r, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && scripts.running('alice') > 0;) await new Promise((r) => setTimeout(r, 10));
   assert.equal(wakes.length, 1);
   assert.match(wakes[0]![1], /Your script failed: Error: later/);
   await waiting;
@@ -271,7 +275,7 @@ test("each call carries the script's origin, and the watching call's turn only w
   const gates: Array<() => void> = [];
   const { scripts } = setup({
     // A bound no child's start reaches, however loaded the host: both calls come while the run watches.
-    config: { yieldMs: 30_000 },
+    config: { yieldMs: LONGER_THAN_ANY_START_MS },
     host: {
       dispatch: async (_agent, name, args, context) => {
         contexts.push({ name, ...context });
@@ -282,7 +286,7 @@ test("each call carries the script's origin, and the watching call's turn only w
   });
   const watch = { turnId: 7, endTurn: false };
   const running = scripts.run('alice', `await tools.echo({}); await tools.slow({});`, undefined, { origin: 'origin-1', watch });
-  for (let i = 0; i < 2_000 && gates.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && gates.length === 0;) await new Promise((r) => setTimeout(r, 10));
   assert.deepEqual(
     contexts.map((c) => { const { watching: _, ...rest } = c as { watching?: unknown }; return rest; }),
     [
@@ -303,7 +307,7 @@ test("a script's calls carry the turn its run was made in, and what its agent ha
   const contexts: Array<{ name: string; watch?: { turnId?: number }; startTurnId?: number; startReadThrough?: unknown }> = [];
   const gates: Array<() => void> = [];
   const { scripts } = setup({
-    config: { yieldMs: 30_000 },
+    config: { yieldMs: LONGER_THAN_ANY_START_MS },
     host: {
       dispatch: async (_agent, name, args, context) => {
         contexts.push({ name, ...context });
@@ -316,8 +320,8 @@ test("a script's calls carry the turn its run was made in, and what its agent ha
   // A read mark is opaque (read-marks.ts, #291): the scripts pass it through untouched.
   const atStart = readMarkForTest('main', 3, null);
   const run = await scripts.run('alice', `await tools.slow({}); await tools.echo({});`, 0, { watch: { turnId: 7, endTurn: false }, startReadThrough: atStart });
-  for (let i = 0; i < 2_000 && gates.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
-  const waiting = scripts.wait('alice', run.scriptId, 30_000, { turnId: 9, endTurn: false });
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && gates.length === 0;) await new Promise((r) => setTimeout(r, 10));
+  const waiting = scripts.wait('alice', run.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 9, endTurn: false });
   gates[0]!();
   const r = await waiting;
   assert.deepEqual(r.ending, { how: 'finished' });
@@ -341,7 +345,7 @@ test("a script's code is read only by its own agent", async () => {
 
 test('an agent gone, or the host stopping, stops its scripts quietly, and a gone agent keeps none', async () => {
   const { scripts, wakes } = setup({ config: { yieldMs: 100 } });
-  const ended = await scripts.run('eph', `return 1;`, 30_000);
+  const ended = await scripts.run('eph', `return 1;`, LONGER_THAN_ANY_START_MS);
   assert.equal(ended.running, false);
   const left = await scripts.run('eph', `await tools.slow({});`);
   await scripts.run('alice', `await tools.slow({ key: 'x' });`);
@@ -356,7 +360,7 @@ test('an agent gone, or the host stopping, stops its scripts quietly, and a gone
   assert.equal(scripts.codeOf('eph', left.scriptId), undefined);
   await assert.rejects(scripts.wait('eph', left.scriptId, 0), (e: unknown) => e instanceof ScriptRefusal);
   await assert.rejects(scripts.stop('eph', left.scriptId), (e: unknown) => e instanceof ScriptRefusal);
-  for (let i = 0; i < 200 && [...internals.scripts.values()].some((s) => s.agentName === 'eph'); i++) await new Promise((r) => setTimeout(r, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && [...internals.scripts.values()].some((s) => s.agentName === 'eph');) await new Promise((r) => setTimeout(r, 10));
   assert.equal([...internals.scripts.values()].filter((s) => s.agentName === 'eph').length, 0);
   await scripts.dispose();
   assert.equal(scripts.running('alice'), 0);
@@ -366,7 +370,7 @@ test('an agent gone, or the host stopping, stops its scripts quietly, and a gone
 test('a second call on a script another call is waiting on is refused, with nothing changed', async () => {
   const { scripts, release } = setup({ config: { yieldMs: 100 } });
   const r = await scripts.run('alice', `await tools.slow({}); return 2;`);
-  const waiting = scripts.wait('alice', r.scriptId, 10_000);
+  const waiting = scripts.wait('alice', r.scriptId, LONGER_THAN_ANY_START_MS);
   await assert.rejects(scripts.wait('alice', r.scriptId, 0), (e: unknown) => e instanceof ScriptRefusal && /Another of your calls is waiting on .* Nothing was changed\./.test(e.message));
   await assert.rejects(scripts.stop('alice', r.scriptId), /Another of your calls is waiting on/);
   await release();
@@ -397,7 +401,7 @@ test("a turn's end stop and an agent's end say why, not that a limit was reached
   const { scripts } = setup({ host: { outlivesTurn: () => false }, config: { yieldMs: 100 } });
   const r = await scripts.run('helper', `await tools.slow({});`);
   scripts.turnEnded('helper', { id: 1, live: [] }, false);
-  for (let i = 0; i < 200 && scripts.running('helper') > 0; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && scripts.running('helper') > 0;) await new Promise((res) => setTimeout(res, 10));
   const { renderList } = await import('../src/code-execution/isolate/render.js');
   const listed = renderList(scripts.list('helper'), Date.now());
   assert.match(listed, new RegExp(`${r.scriptId}: stopped under a minute ago: its agent's turn ended`));
@@ -416,7 +420,7 @@ test("a script's calls carry the turn of the call watching when each reaches the
   let answer!: () => void;
   const held = new Promise<void>((resolve) => (answer = resolve));
   const { scripts } = setup({
-    config: { yieldMs: 100, maxYieldMs: 60_000, lifetimeMs: 120_000 },
+    config: { yieldMs: 100 },
     host: {
       dispatch: async (_agent, name, args, context) => {
         contexts.push({ name, ...context });
@@ -430,18 +434,18 @@ test("a script's calls carry the turn of the call watching when each reaches the
       },
     },
   });
-  const yields = fireNextYieldAsSet(scripts, 60_000);
-  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, 60_000);
+  const yields = fireNextYieldAsSet(scripts, LONGER_THAN_ANY_START_MS);
+  const r = await scripts.run('alice', `const p = tools.slow({}); await tools.echo({ a: 1 }); await p; await tools.echo({ b: 2 }); return 3;`, LONGER_THAN_ANY_START_MS);
   assert.deepEqual(yields, { fired: true }, 'the run yielded as its timer was set');
   assert.equal(r.running, true);
   const first = { turnId: 1, endTurn: false };
-  const firstWait = scripts.wait('alice', r.scriptId, 30_000, first);
-  for (let i = 0; i < 2_000 && contexts.length < 2; i++) await new Promise((res) => setTimeout(res, 10));
+  const firstWait = scripts.wait('alice', r.scriptId, LONGER_THAN_ANY_START_MS, first);
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && contexts.length < 2;) await new Promise((res) => setTimeout(res, 10));
   // Its turn is abandoned, and the script is left running with its slow call held.
   scripts.turnEnded('alice', { id: 1, live: [] }, true);
   // A later wait, in a later turn: the call made under it carries its turn, and the held result ends it.
   const second = { turnId: 2, endTurn: false };
-  const waiting = scripts.wait('alice', r.scriptId, 30_000, second);
+  const waiting = scripts.wait('alice', r.scriptId, LONGER_THAN_ANY_START_MS, second);
   answer();
   const done = await waiting;
   assert.deepEqual(done.ending, { how: 'finished', value: '3' });
@@ -453,7 +457,7 @@ test("a script's calls carry the turn of the call watching when each reaches the
 
 test("the host's places come back as children exit, a launch that fails included", async () => {
   const capacity = new ChildCapacity(2);
-  const { scripts } = setup({ config: { yieldMs: 30_000 } });
+  const { scripts } = setup({ config: { yieldMs: LONGER_THAN_ANY_START_MS } });
   const scriptsWith = new AgentScripts(
     { tools: () => [], dispatch: async () => result(''), wake: async () => {}, outlivesTurn: () => true },
     { ...(scripts as unknown as { config: ScriptsConfig }).config },
@@ -462,7 +466,7 @@ test("the host's places come back as children exit, a launch that fails included
   made.push(scriptsWith);
   await scriptsWith.run('alice', 'return 1;');
   await scriptsWith.run('alice', 'return 2;');
-  for (let i = 0; i < 300 && capacity.running > 0; i++) await new Promise((r) => setTimeout(r, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && capacity.running > 0;) await new Promise((r) => setTimeout(r, 10));
   assert.equal(capacity.running, 0, 'both places back once the children exited');
   const failing = new AgentScripts(
     { tools: () => [], dispatch: async () => result(''), wake: async () => {}, outlivesTurn: () => true },
@@ -472,8 +476,26 @@ test("the host's places come back as children exit, a launch that fails included
   made.push(failing);
   const r = await failing.run('alice', 'return 1;');
   assert.equal(r.ending?.how, 'crashed');
-  for (let i = 0; i < 300 && capacity.running > 0; i++) await new Promise((r2) => setTimeout(r2, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && capacity.running > 0;) await new Promise((r2) => setTimeout(r2, 10));
   assert.equal(capacity.running, 0, 'a launch that failed gives its place back');
+});
+
+test("a finished script whose child hasn't exited keeps its place in the host until the child exits", async () => {
+  const capacity = new ChildCapacity(1);
+  const { scripts } = setup({ config: { childEntry: LINGERING_CHILD, stopGraceMs: NEVER_FIRES_IN_A_TEST_MS, yieldMs: LONGER_THAN_ANY_START_MS } });
+  const lingering = new AgentScripts(
+    { tools: () => [], dispatch: async () => result(''), wake: async () => {}, outlivesTurn: () => true },
+    { ...(scripts as unknown as { config: ScriptsConfig }).config },
+    capacity,
+  );
+  made.push(lingering);
+  const r = await lingering.run('alice', 'return 1;');
+  assert.deepEqual(r.ending, { how: 'finished', value: '1' });
+  assert.equal(capacity.running, 1, 'its child is alive, so its place is still taken');
+  const disposed = await Promise.race([lingering.dispose().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), LONGER_THAN_ANY_START_MS).unref())]);
+  assert.equal(disposed, true, 'dispose ended its child');
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && capacity.running > 0;) await new Promise((res) => setTimeout(res, 10));
+  assert.equal(capacity.running, 0, 'the place comes back once the child has exited');
 });
 
 test('a script that ends at its start, before it is in the map, still leaves the ended scripts at their bound', async () => {
@@ -490,7 +512,7 @@ test('a tool list that throws refuses the run with nothing taken, and the host s
   const { scripts } = setup({
     capacity: 1,
     // Long enough that run() returns the ending, however slowly the child starts.
-    config: { yieldMs: 30_000 },
+    config: { yieldMs: LONGER_THAN_ANY_START_MS },
     host: { tools: () => { if (fail) throw new Error('a module listed nothing'); return [{ name: 'echo', description: 'Echoes.' }]; } },
   });
   await assert.rejects(scripts.run('alice', `return 1;`), (e: unknown) => e instanceof ScriptRefusal && /The script's tools couldn't be listed: a module listed nothing\. Nothing was run\./.test(e.message));
@@ -527,14 +549,14 @@ test("a left script's ending reaches its agent after a wake it sent that was sti
   const held = heldWake();
   const { scripts } = setup({ config: { yieldMs: 0 }, host: { wake: held.wake } });
   const r = await scripts.run('alice', WAKE_THEN_SPIN);
-  for (let i = 0; i < 500 && !held.state.entered; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !held.state.entered;) await new Promise((res) => setTimeout(res, 10));
   assert.equal(held.state.entered, true, 'the wake is being delivered');
   // Its limit stops it while the wake is still being delivered.
   await (scripts as unknown as Internals).scripts.get(r.scriptId)!.run.stop('limit');
   await new Promise((res) => setTimeout(res, 100));
   assert.deepEqual(held.wakes, [], 'the ending waits for the wake');
   held.deliver();
-  for (let i = 0; i < 500 && held.wakes.length < 2; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && held.wakes.length < 2;) await new Promise((res) => setTimeout(res, 10));
   assert.match(held.wakes[0]!, /working/);
   assert.match(held.wakes[1]!, /was stopped at its limit/);
 });
@@ -543,10 +565,10 @@ test("a left script's ending that a wait has returned isn't sent again as a noti
   const held = heldWake();
   const { scripts } = setup({ config: { yieldMs: 0 }, host: { wake: held.wake } });
   const r = await scripts.run('alice', WAKE_THEN_SPIN);
-  for (let i = 0; i < 500 && !held.state.entered; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !held.state.entered;) await new Promise((res) => setTimeout(res, 10));
   await (scripts as unknown as Internals).scripts.get(r.scriptId)!.run.stop('limit');
   // The agent waits on it while its notice waits for the wake's delivery, and gets the ending there.
-  const waited = await scripts.wait('alice', r.scriptId, 1_000);
+  const waited = await scripts.wait('alice', r.scriptId, LONGER_THAN_ANY_START_MS);
   assert.equal(waited.ending?.how, 'stopped');
   held.deliver();
   await new Promise((res) => setTimeout(res, 200));
@@ -557,22 +579,22 @@ test("a left script's ending that a wait has returned isn't sent again as a noti
 test('the ended scripts kept are those whose endings came last, though the clock says otherwise', async (t) => {
   // A clock that doesn't move: endings in the same millisecond, or a clock stepped back.
   t.mock.method(Date, 'now', () => 1_000_000);
-  const { scripts, release } = setup({ config: { keepEnded: 1, yieldMs: 30_000 } });
+  const { scripts, release } = setup({ config: { keepEnded: 1, yieldMs: LONGER_THAN_ANY_START_MS } });
   // The first started ends last.
   const first = await scripts.run('alice', `await tools.slow({}); return 'first';`, 0);
   const second = await scripts.run('alice', `return 'second';`);
   assert.deepEqual(scripts.list('alice').map((s) => s.scriptId), [first.scriptId, second.scriptId]);
   await release();
-  for (let i = 0; i < 300 && scripts.running('alice') > 0; i++) await new Promise((r) => setTimeout(r, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && scripts.running('alice') > 0;) await new Promise((r) => setTimeout(r, 10));
   assert.deepEqual(scripts.list('alice').map((s) => s.scriptId), [first.scriptId]);
 });
 
 test("dispose ends a child that said how its script ended and stayed", async () => {
-  const { scripts } = setup({ config: { childEntry: LINGERING_CHILD, stopGraceMs: 60_000, yieldMs: 30_000 } });
+  const { scripts } = setup({ config: { childEntry: LINGERING_CHILD, stopGraceMs: NEVER_FIRES_IN_A_TEST_MS, yieldMs: LONGER_THAN_ANY_START_MS } });
   const r = await scripts.run('alice', `return 1;`);
   assert.deepEqual(r.ending, { how: 'finished', value: '1' });
   // Its child hasn't exited, and nothing has ended it: dispose must.
-  const disposed = await Promise.race([scripts.dispose().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 10_000))]);
+  const disposed = await Promise.race([scripts.dispose().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), LONGER_THAN_ANY_START_MS).unref())]);
   assert.equal(disposed, true);
 });
 
@@ -593,7 +615,7 @@ test("a left script's failure wakes its agent with a glimpse of a long message, 
   const r = await scripts.run('alice', `await tools.slow({ key: 'g' }); throw new Error('w'.repeat(20000));`);
   assert.equal(r.running, true);
   await release('g');
-  for (let i = 0; i < 300 && wakes.length === 0; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && wakes.length === 0;) await new Promise((res) => setTimeout(res, 10));
   assert.equal(wakes.length, 1, `${r.scriptId} woke its agent`);
   assert.match(wakes[0]![1], /Your script failed: Error: w{300}…/);
   assert.doesNotMatch(wakes[0]![1], /dropped here/);
@@ -606,7 +628,7 @@ test("turns that overlap: a turn's end stops a non-primary agent's scripts whose
   const running = (id: string) => scripts.list('helper').find((x) => x.scriptId === id)!.running;
   // Those a turn's end stops have ended once their stops land; the rest were never stopped.
   const ended = async (...ids: string[]) => {
-    for (let i = 0; i < 1_000 && ids.some(running); i++) await new Promise((res) => setTimeout(res, 10));
+    for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && ids.some(running);) await new Promise((res) => setTimeout(res, 10));
   };
   const older = await start(3);
   const open = await start(5);
@@ -640,14 +662,14 @@ test("turns that overlap: a turn's end stops a non-primary agent's scripts whose
 });
 
 test("an abandoned turn stops a non-primary agent's script its calls watch that never returned, though the turn is live, and lets go of one that did", async () => {
-  const { scripts, release } = setup({ host: { outlivesTurn: () => false }, config: { maxRunning: 6 } });
+  const { scripts, release, called } = setup({ host: { outlivesTurn: () => false }, config: { maxRunning: 6 } });
   const internals = scripts as unknown as { scripts: Map<string, { watch: unknown }> };
   // Its run call is still waiting on it: the script hasn't returned.
-  const pending = scripts.run('helper', `await tools.slow({ key: 'u' });`, 30_000, { watch: { turnId: 5, endTurn: false } });
+  const pending = scripts.run('helper', `await tools.slow({ key: 'u' });`, LONGER_THAN_ANY_START_MS, { watch: { turnId: 5, endTurn: false } });
   // This one returned at once, and a wait of the same turn watches it now.
   const returned = await scripts.run('helper', `await tools.slow({ key: 'r' });`, 0, { watch: { turnId: 5, endTurn: false } });
-  const waiting = scripts.wait('helper', returned.scriptId, 30_000, { turnId: 5, endTurn: false });
-  await new Promise((res) => setTimeout(res, 50));
+  const waiting = scripts.wait('helper', returned.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 5, endTurn: false });
+  await called('u');
   // Turn 5's stream is abandoned and will run again: the turn stays live.
   scripts.turnEnded('helper', { id: 5, live: [5] }, true, 'stream error');
   assert.deepEqual((await pending).ending, { how: 'stopped', reason: 'limit', why: 'its turn ended before the script returned (stream error)' });
@@ -660,9 +682,9 @@ test("an abandoned turn stops a non-primary agent's script its calls watch that 
 test("every turn of a primary agent's abandoned at once: a watched script that never returned stops, and one that did is let go", async () => {
   const { scripts, release } = setup({ config: { maxRunning: 6 } });
   const internals = scripts as unknown as { scripts: Map<string, { watch: unknown }> };
-  const pending = scripts.run('alice', `await tools.slow({ key: 'u' });`, 30_000, { watch: { turnId: 2, endTurn: false } });
+  const pending = scripts.run('alice', `await tools.slow({ key: 'u' });`, LONGER_THAN_ANY_START_MS, { watch: { turnId: 2, endTurn: false } });
   const returned = await scripts.run('alice', `await tools.slow({ key: 'r' });`, 0, { watch: { turnId: 3, endTurn: false } });
-  const waiting = scripts.wait('alice', returned.scriptId, 30_000, { turnId: 3, endTurn: false });
+  const waiting = scripts.wait('alice', returned.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 3, endTurn: false });
   await new Promise((res) => setTimeout(res, 50));
   scripts.turnEnded('alice', 'every', true, 'turn abandoned by quiesce');
   assert.equal((await pending).ending?.how, 'stopped');
@@ -680,7 +702,7 @@ test("an abandoned turn acts only on the scripts its own calls watch", async () 
   const bySilent = await watched(7);
   const running = (id: string) => scripts.list('alice').find((x) => x.scriptId === id)!.running;
   // The waits that watch them: each script's run returned once, so an abandoned watch is let go, not stopped.
-  const waits = [scripts.wait('alice', byOpen, 30_000, { turnId: 5, endTurn: false }), scripts.wait('alice', bySilent, 30_000, { turnId: 7, endTurn: false })];
+  const waits = [scripts.wait('alice', byOpen, LONGER_THAN_ANY_START_MS, { turnId: 5, endTurn: false }), scripts.wait('alice', bySilent, LONGER_THAN_ANY_START_MS, { turnId: 7, endTurn: false })];
   await new Promise((res) => setTimeout(res, 50));
   scripts.turnEnded('alice', { id: 7, live: [5] }, true);
   const internals = scripts as unknown as { scripts: Map<string, { watch: { turnId?: number } | null }> };
@@ -696,15 +718,15 @@ test("a wait whose turn was abandoned takes the ending to no one, so the ending'
   const held = heldWake();
   const { scripts } = setup({ config: { yieldMs: 0 }, host: { wake: held.wake } });
   const r = await scripts.run('alice', WAKE_THEN_SPIN, 0);
-  for (let i = 0; i < 500 && !held.state.entered; i++) await new Promise((res) => setTimeout(res, 10));
-  const waiting = scripts.wait('alice', r.scriptId, 30_000, { turnId: 1, endTurn: false });
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !held.state.entered;) await new Promise((res) => setTimeout(res, 10));
+  const waiting = scripts.wait('alice', r.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 1, endTurn: false });
   await new Promise((res) => setTimeout(res, 50));
   // The wait's turn is abandoned: the script had returned once, so its watch is let go.
   scripts.turnEnded('alice', { id: 1, live: [] }, true);
   await (scripts as unknown as Internals).scripts.get(r.scriptId)!.run.stop('limit');
   assert.equal((await waiting).ending?.how, 'stopped');
   held.deliver();
-  for (let i = 0; i < 500 && held.wakes.length < 2; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && held.wakes.length < 2;) await new Promise((res) => setTimeout(res, 10));
   assert.match(held.wakes[1]!, /was stopped at its limit/);
 });
 
@@ -715,7 +737,7 @@ test("a stop watches the script with its own call's watch: a call in flight sees
     host: { dispatch: async (_agent, _name, _args, ctx) => { context = ctx; return new Promise(() => {}); } },
   });
   const r = await scripts.run('alice', `await tools.slow({});`, 0);
-  for (let i = 0; i < 500 && !context; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !context;) await new Promise((res) => setTimeout(res, 10));
   const watch = { turnId: 9, endTurn: false };
   const stopping = scripts.stop('alice', r.scriptId, watch);
   // A turn-ending result arriving now would mark the stop's watch, and so end the stop's turn.
@@ -727,15 +749,15 @@ test("a wait started on an ended script takes its ending at once, so a notice wh
   const held = heldWake();
   const { scripts } = setup({ config: { yieldMs: 0 }, host: { wake: held.wake } });
   const r = await scripts.run('alice', WAKE_THEN_SPIN, 0);
-  for (let i = 0; i < 500 && !held.state.entered; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !held.state.entered;) await new Promise((res) => setTimeout(res, 10));
   const internals = scripts as unknown as { scripts: Map<string, { run: { stop(reason: 'limit'): Promise<unknown> }; delivering: Promise<void> | null }> };
   // A reaction to the delivery, ordered before the notice's: it starts the
   // wait, and the notice runs before the wait's own continuation does.
   let waiting: Promise<unknown> | undefined;
-  void internals.scripts.get(r.scriptId)!.delivering!.then(() => { waiting = scripts.wait('alice', r.scriptId, 1_000); });
+  void internals.scripts.get(r.scriptId)!.delivering!.then(() => { waiting = scripts.wait('alice', r.scriptId, LONGER_THAN_ANY_START_MS); });
   await internals.scripts.get(r.scriptId)!.run.stop('limit');
   held.deliver();
-  for (let i = 0; i < 500 && !waiting; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !waiting;) await new Promise((res) => setTimeout(res, 10));
   assert.ok(waiting, 'the wait started, before the notice ran');
   await waiting;
   await new Promise((res) => setTimeout(res, 100));
@@ -746,7 +768,7 @@ test("a stop started on an ended script takes its ending at once, so a notice wh
   const held = heldWake();
   const { scripts } = setup({ config: { yieldMs: 0 }, host: { wake: held.wake } });
   const r = await scripts.run('alice', WAKE_THEN_SPIN, 0);
-  for (let i = 0; i < 500 && !held.state.entered; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !held.state.entered;) await new Promise((res) => setTimeout(res, 10));
   const internals = scripts as unknown as { scripts: Map<string, { run: { stop(reason: 'limit'): Promise<unknown> }; delivering: Promise<void> | null }> };
   // A reaction to the delivery, ordered before the notice's: it starts the
   // stop, whose own stop of the ended run yields before the notice runs.
@@ -754,7 +776,7 @@ test("a stop started on an ended script takes its ending at once, so a notice wh
   void internals.scripts.get(r.scriptId)!.delivering!.then(() => { stopping = scripts.stop('alice', r.scriptId); });
   await internals.scripts.get(r.scriptId)!.run.stop('limit');
   held.deliver();
-  for (let i = 0; i < 500 && !stopping; i++) await new Promise((res) => setTimeout(res, 10));
+  for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !stopping;) await new Promise((res) => setTimeout(res, 10));
   assert.ok(stopping, 'the stop started, before the notice ran');
   assert.equal((await stopping).ending?.how, 'stopped');
   await new Promise((res) => setTimeout(res, 100));

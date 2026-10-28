@@ -51,6 +51,8 @@ function world() {
 
   const registry = {
     nameShown: (ref: { channelId: string }) => ref.channelId,
+    // main's #852: a channel named in a sentence is quoted as tune_out takes it back.
+    quotedShown: (ref: { channelId: string }) => JSON.stringify(ref.channelId),
     listChannelsRaw: () => [NOISY, OTHER, 'disc:guild:work'].map((id) => ({ serverId: SERVER, descriptor: { id } })),
     getTuneOutState: (serverId: string, channelId: string) => active.get(`${serverId}\0${channelId}`) ?? null,
     cancelTuneOut: (serverId: string, channelId: string) => {

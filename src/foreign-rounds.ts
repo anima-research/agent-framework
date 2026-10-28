@@ -24,38 +24,45 @@
  * another participant (`user`) and are told by the call they answer.
  */
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import { safeSlice } from './safe-slice.js';
+import { NOTICE_TAG } from './notice-tags.js';
+import { cutToFit, markedText } from './supplied-text.js';
 
 /** How long one transcript line's call or outcome runs before it is cut. */
 const BRIEF_CHARS = 160;
 
-/** `text` on one line, cut to BRIEF_CHARS with an ellipsis. */
+/** `text` on one line, cut to BRIEF_CHARS with an ellipsis, at a whole
+ *  character, never parting a mark from its bracket (cutToFit). */
 function brief(text: string): string {
   const line = text.replace(/\s+/g, ' ').trim();
-  return line.length > BRIEF_CHARS ? `${safeSlice(line, 0, BRIEF_CHARS - 1)}…` : line;
+  return line.length > BRIEF_CHARS ? `${cutToFit(line, BRIEF_CHARS - 1)}…` : line;
 }
 
-/** A tool result's content as text: its text, its other blocks named by kind. */
+/** A tool result's content as text: its text, its other blocks named by
+ *  kind. What a result holds is supplied text (#852): set inside the
+ *  framework's bracket here, where a tool_result block's own content isn't,
+ *  an opening of one of the framework's notices in it is marked
+ *  (markedText). The kind placeholders are the framework's own. */
 function resultText(content: string | ContentBlock[]): string {
-  if (typeof content === 'string') return content;
+  if (typeof content === 'string') return markedText(content);
   return content
-    .map((b) => (b.type === 'text' ? (b as { text: string }).text : `[${b.type}]`))
+    .map((b) => (b.type === 'text' ? markedText((b as { text: string }).text) : `[${b.type}]`))
     .filter((part) => part.length > 0)
     .join(' ');
 }
 
-/** A call's input in brief: its JSON, or what the model sent when that wasn't an object. */
+/** A call's input in brief: its JSON, or what the model sent when that
+ *  wasn't an object, marked as a result's text is (resultText). */
 function callText(block: Extract<ContentBlock, { type: 'tool_use' }>): string {
-  if (block.unparseableInput !== undefined) return block.unparseableInput;
+  if (block.unparseableInput !== undefined) return markedText(block.unparseableInput);
   try {
-    return JSON.stringify(block.input ?? {}) ?? '';
+    return markedText(JSON.stringify(block.input ?? {}) ?? '');
   } catch {
     return '';
   }
 }
 
 /** Where a row with nothing left to send stands, so the transcript keeps a row for each stored one. */
-const NOTHING_SAID = '[no text]';
+const NOTHING_SAID = `[${NOTICE_TAG.noText}]`;
 
 /**
  * One stored row of another agent's as the watcher is sent it: thinking

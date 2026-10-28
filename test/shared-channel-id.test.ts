@@ -661,9 +661,14 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
   // A name no string picks alone: server "a" has "b:room" and server "a:b" has "room", both answering to "a:b:room".
   const odd = fixture([['a', 'b:room'], ['a:b', 'room'], ['c', 'b:room']]);
   const ownOdd: ChannelRef[] = [{ serverId: 'a', channelId: 'b:room' }, { serverId: 'c', channelId: 'b:room' }];
+  // channel_publish takes no serverId, so its refusal names none; channel_open does.
   const oddRefusal = await odd.registry.handleChannelToolCall('channel_publish', { channelId: 'b:room', content: 'x' }, inTurn(ownOdd));
   assert.equal(oddRefusal.error, '"b:room" is the id of this turn\'s channels on more than one server ("b:room" on server "a" (no channelId '
     + 'reaches it alone), "c:b:room"), so nothing was posted. Call again with channelId "c:b:room".');
+  const oddOpen = await odd.registry.handleChannelToolCall('channel_open', { channelId: 'b:room' }, inTurn(ownOdd));
+  assert.equal(oddOpen.error, '"b:room" is the id of this turn\'s channels on more than one server ("b:room" on server "a" (no channelId '
+    + 'reaches it alone), "c:b:room"), so nothing ran. Call again with channelId "c:b:room". For a channel shown by its id and '
+    + 'server, call again with that channelId and that serverId.');
   // None reachable by a name: no "Call again".
   await odd.registry.handleChanged('c', { removed: ['b:room'] });
   const none = await odd.registry.handleChannelToolCall('channel_publish', { channelId: 'b:room', content: 'x' }, inTurn(ownOdd));
@@ -676,6 +681,65 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
   const two = await three.registry.handleChannelToolCall('channel_publish', { channelId: 'general', content: 'x' }, inTurn([a, b, d]));
   assert.equal(two.error, '"general" is the id of this turn\'s channels on more than one server ("a:general", "b:general", "general" on '
     + 'server "d" (its server no longer registers it)), so nothing was posted. Call again with channelId set to one of "a:general", "b:general".');
+});
+
+test("a refusal names the channelId channel_publish reaches a channel it shows by id and server by, or says none reaches it alone", async () => {
+  // Server "a"'s "b\"x:room" is the only channel with that id, though its qualified name is server "a:b\"x"'s "room"'s too.
+  const f = fixture([['a', 'b"x:room'], ['a:b"x', 'room']]);
+  for (const candidate of ['"b\\"x:room" on server "a"', '#lounge = "b\\"x:room" on server "a"']) {
+    assert.equal(f.registry.publishRouteFor([candidate]), ' For a channel shown by its id and server: channel_publish reaches '
+      + '"b\\"x:room" on server "a" with channelId "b\\"x:room".', candidate);
+  }
+  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: 'b"x:room', content: 'hello' });
+  assert.equal(posted.success, true, posted.error);
+  assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a b"x:room']);
+  // Server "a"'s "b:room": its id is server "c"'s too, and its qualified name server "a:b"'s "room"'s.
+  const odd = fixture([['a', 'b:room'], ['a:b', 'room'], ['c', 'b:room']]);
+  assert.equal(odd.registry.publishRouteFor(['"b:room" on server "a"']),
+    ' For a channel shown by its id and server: no channelId reaches "b:room" on server "a" alone.');
+  assert.equal(odd.registry.publishRouteFor(['"b:room" on server "a" (no channelId reaches it alone)', 'c:b:room']), '');
+});
+
+test("the route a refusal names is the qualified name first, which a turn's own channel withdrawn with the same id doesn't take, and never an empty id", async () => {
+  const f = fixture([['a', 'x"y']]);
+  // Server "b" no longer registers its "x\"y", which is still the turn's own channel.
+  const own: ChannelRef[] = [{ serverId: 'a', channelId: 'x"y' }, { serverId: 'b', channelId: 'x"y' }];
+  const inTurn = { kind: 'agent', agentName: 'scout', own } as never;
+  const route = f.registry.publishRouteFor(['"x\\"y" on server "a"']);
+  assert.equal(route, ' For a channel shown by its id and server: channel_publish reaches "x\\"y" on server "a" with channelId "a:x\\"y".');
+  const offered = JSON.parse(/with channelId (".*")\.$/.exec(route)![1]!) as string;
+  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: offered, content: 'hello' }, inTurn);
+  assert.equal(posted.success, true, posted.error);
+  assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a x"y']);
+  // The bare id would mean both of the turn's channels, and be refused.
+  const bare = await f.registry.handleChannelToolCall('channel_publish', { channelId: 'x"y', content: 'hello' }, inTurn);
+  assert.equal(bare.success, false);
+  // A channel whose id is empty is reached by its qualified name; channel_publish refuses an empty channelId.
+  const empty = fixture([['a', '']]);
+  const emptyRoute = empty.registry.publishRouteFor(['"" on server "a"']);
+  assert.equal(emptyRoute, ' For a channel shown by its id and server: channel_publish reaches "" on server "a" with channelId "a:".');
+  const reached = await empty.registry.handleChannelToolCall('channel_publish', { channelId: 'a:', content: 'hello' });
+  assert.equal(reached.success, true, reached.error);
+  assert.deepEqual(empty.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a ']);
+});
+
+test("a turn's channels sharing an id whose qualified names don't show as themselves stay reachable by those names, as JSON", async () => {
+  const f = fixture([['a', 'x"y'], ['b', 'x"y']]);
+  const own: ChannelRef[] = [{ serverId: 'a', channelId: 'x"y' }, { serverId: 'b', channelId: 'x"y' }];
+  const inTurn = (refs: ChannelRef[]) => ({ kind: 'agent', agentName: 'scout', own: refs }) as never;
+  for (const [tool, done] of [['channel_publish', 'was posted'], ['channel_open', 'ran']] as const) {
+    const refused = await f.registry.handleChannelToolCall(tool, { channelId: 'x"y', content: 'x' }, inTurn(own));
+    assert.equal(refused.error, '"x"y" is the id of this turn\'s channels on more than one server ("a:x\\"y", "b:x\\"y"), '
+      + `so nothing ${done}. Call again with channelId set to one of them.`, tool);
+  }
+  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: JSON.parse('"a:x\\"y"'), content: 'hello' }, inTurn(own));
+  assert.equal(posted.success, true, posted.error);
+  assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a x"y']);
+  // A `>>` target can't take JSON: the prose resolver lists them by id and server, and says what channel_publish takes.
+  const resolved = f.registry.resolveProseTarget('x"y', { forSpeech: true, own }) as { error?: string; candidates?: string[] };
+  assert.deepEqual(resolved.candidates, ['"x\\"y" on server "a"', '"x\\"y" on server "b"']);
+  assert.equal(f.registry.publishRouteFor(resolved.candidates!), ' For a channel shown by its id and server: channel_publish reaches '
+    + '"x\\"y" on server "a" with channelId "a:x\\"y"; channel_publish reaches "x\\"y" on server "b" with channelId "b:x\\"y".');
 });
 
 test("a default channel's reply anchors survive a withdrawal, as on main, and go with its server's disconnect, as on main, while its ref stays", async () => {
@@ -951,7 +1015,7 @@ test("a publish's failed or unconfirmed answer names its channel apart, as it's 
 });
 
 test("a closed-channel invitation offers no >> reply a line reads as private speech, with the real registry or without its proseTargetFor", async (t) => {
-  const f = await frameworkWith(t, ['a', 'b']);
+  const f = await frameworkWith(t, ['a', 'b'], 'explicit');
   // A stand-in registry that can't name targets: the framework guesses one.
   (f.i.channelRegistry as unknown as { proseTargetFor?: unknown }).proseTargetFor = undefined;
   const invite = (f.framework as unknown as { buildClosedChannelInvitation(o: unknown): unknown }).buildClosedChannelInvitation({
@@ -1276,7 +1340,35 @@ for (const order of orders) {
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce')
       .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text))[0] ?? '';
     assert.ok(bounce.includes('DM: antra (work)'), bounce);
-    assert.ok(bounce.includes('">>#channel {{unsent}}"'), 'no candidate is one token, so the example is generic');
+    assert.ok(bounce.includes('">>#<channel> {{unsent}}"'), 'no candidate is one token, so the example is generic');
+    assert.ok(bounce.includes('">>@<person> {{unsent}}"'), 'and the DM example a placeholder too');
+    assert.ok(!bounce.includes('For a channel shown by its id and server'), 'no candidate is shown by its id and server');
+  });
+
+  test(`a bounce that shows a candidate by its id and server says which tool reaches it (${registered})`, async (t) => {
+    const f = await frameworkWith(t, order, 'explicit');
+    // Two servers' channels labelled alike, whose ids don't show as themselves.
+    const map = (f.i.channelRegistry as unknown as { channels: Map<string, unknown> }).channels;
+    for (const serverId of ['a', 'b'] as const) {
+      map.set(destinationKey({ serverId, channelId: `gen"${serverId}` }), {
+        serverId, descriptor: { id: `gen"${serverId}`, type: 'chat', label: '#lounge' }, open: true,
+      });
+    }
+    f.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#lounge hello' }]));
+    let starts = 0;
+    f.framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started' && ++starts >= 2) {
+        f.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }]));
+      }
+    });
+    f.framework.pushEvent(incomingOn('b', 'hello from b'));
+    await f.framework.runUntilIdle();
+    const bounce = f.framework.getAgent('scout')!.getContextManager().queryMessages({}).messages
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce')
+      .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text))[0] ?? '';
+    assert.ok(bounce.includes('"gen\\"a" on server "a"'), bounce);
+    assert.ok(bounce.includes('channel_publish reaches "gen\\"a" on server "a" with channelId "a:gen\\"a"'), bounce);
+    assert.ok(!bounce.includes('serverId'), 'channel_publish takes no serverId, so the bounce names none');
   });
 
   test(`a >> delivery that fails names the channel it was for apart, in its bounce (${registered})`, async (t) => {

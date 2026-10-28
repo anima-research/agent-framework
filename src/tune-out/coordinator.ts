@@ -15,6 +15,8 @@
  * lifecycle facts (the [Gate: …] precedent).
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
+import { cutToFit, quotedValue, suppliedValue } from '../supplied-text.js';
 import { randomUUID } from 'node:crypto';
 import { authorLine } from '../author-presentation.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -43,6 +45,8 @@ const WAKE_COALESCE_MS = 2_000;
  * is, anything else named by kind (`[image]`, `[document]`), so a release
  * never drops a block silently (#232 gap 4). The author is named once: a
  * server that renders `Name: body` into the text itself is not doubled.
+ * A name the line adds is a value someone supplied, kept to one line with
+ * its notice openings marked (authorLine), as main's dump writes it.
  */
 export function renderHeldLine(m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string {
   const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
@@ -155,14 +159,14 @@ export interface TuneOutCheck {
 const EXPIRY_RETRY_MS = 60_000;
 
 /** Ends a backlog line cut to fit in one of the residents' messages. */
-const CUT_MARK = " [cut to fit; the whole message is in the channel's history]";
+const CUT_MARK = ` [${NOTICE_TAG.cutToFit}; the whole message is in the channel's history]`;
 
 /**
  * tune_out's refusal of a channel already tuned out: its settings, then what
  * its transport is now where the repeat tried to open it again (`transport`,
  * from the framework's dispatch), then how to change the settings.
  */
-export function alreadyTunedOutText(shown: string, p: TuneOutParams, transport?: string): string {
+export function alreadyTunedOutText(quoted: string, p: TuneOutParams, transport?: string): string {
   // A duration so long its end is past what a Date can hold has no time to show.
   const expires = p.expiresAtMs !== undefined ? new Date(p.expiresAtMs) : undefined;
   const until = expires && Number.isFinite(expires.getTime())
@@ -170,19 +174,11 @@ export function alreadyTunedOutText(shown: string, p: TuneOutParams, transport?:
     : '';
   // A thrown error's words may end without a stop.
   const now = transport === undefined ? '' : /[.!?]$/.test(transport) ? `${transport} ` : `${transport}. `;
-  return `Nothing changed${transport !== undefined ? ' in the tune-out' : ''}: ${JSON.stringify(shown)} is already `
+  return `Nothing changed${transport !== undefined ? ' in the tune-out' : ''}: ${quoted} is already `
     + `tuned out, with cadenceSeconds ${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. `
     + now
     + 'To change those, cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call '
     + 'tune_out again with the new settings.';
-}
-
-/** The first `length` code units of `text`, one fewer where the last would be
- *  the first half of a surrogate pair. */
-function prefixOf(text: string, length: number): string {
-  const cut = text.slice(0, Math.max(0, length));
-  const last = cut.charCodeAt(cut.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
 /** What a thrown value says, without throwing: an Error's message, or the
@@ -382,6 +378,10 @@ export class TuneOutCoordinator {
       console.error('[tune-out] could not read the writes a surgery holds in memory, so the stored messages alone are read:', err);
     }
     return kept.length > 0 ? [...stored, ...kept] : stored;
+  }
+
+  private quotedShown(serverId: string, channelId: string): string {
+    return this.channelRegistry.quotedShown({ serverId, channelId });
   }
 
   /** Restart cadence + expiry timers and re-anchor after a process restart. */
@@ -699,17 +699,17 @@ export class TuneOutCoordinator {
     if (this.hooks.isForkBound({ serverId, channelId })) {
       return {
         ok: false,
-        error: `Nothing changed: a conversation is bound to ${JSON.stringify(this.shown(serverId, channelId))}, so its messages go to that `
+        error: `Nothing changed: a conversation is bound to ${this.quotedShown(serverId, channelId)}, so its messages go to that `
           + "conversation, and tune_out won't divert a channel while one is. Calling tune_out on it again won't change "
           + 'that until the conversation ends, which happens only once the channel has been quiet for a while. Tune '
           + 'out a different channel, or ask whoever runs this host if this one should be diverted.',
       };
     }
     const current = this.channelRegistry.getTuneOutState(serverId, channelId);
-    if (current) return { ok: false, error: alreadyTunedOutText(this.shown(serverId, channelId), current.params), alreadyTunedOut: true };
+    if (current) return { ok: false, error: alreadyTunedOutText(this.quotedShown(serverId, channelId), current.params), alreadyTunedOut: true };
     const scope = this.getAllExcept();
     if (scope && scope.params.except.serverId === serverId && scope.params.except.channelId === channelId) {
-      return { ok: false, error: `channel ${channelId} is the excepted channel of the active all-except hold; cancel that first` };
+      return { ok: false, error: `channel ${this.quotedShown(serverId, channelId)} is the excepted channel of the active all-except hold; cancel that first` };
     }
     const read = this.readOptions(opts, {
       durationSeconds: 'to stay tuned out until you cancel',
@@ -772,7 +772,7 @@ export class TuneOutCoordinator {
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
     if (!ended) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
-      return { ok: false, error: this.notTunedOut(this.shown(serverId, channelId), 'you') };
+      return { ok: false, error: this.notTunedOut(this.quotedShown(serverId, channelId), 'you') };
     }
     this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
@@ -797,10 +797,10 @@ export class TuneOutCoordinator {
     const historyTool = this.hooks.historyTool ? this.hooks.historyTool() : 'fetch_history';
     // The channel as the resident and the subconscious are shown it.
     const name = this.shown(serverId, channelId);
-    const lifecycle = `[Tune-out: ${name} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]`;
+    const lifecycle = `[${NOTICE_TAG.tuneOut}: ${name} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]`;
     const render = (lines: string[], truncated: number): string => {
       const attrs = [
-        `channel="${name}"`,
+        `channel=${this.quotedShown(serverId, channelId)}`,
         `messages=${backlog.length}`,
         ...(truncated > 0
           ? [`truncated=${truncated} (oldest; ${historyTool ? `${historyTool} covers the rest` : 'not delivered'})`]
@@ -845,7 +845,7 @@ export class TuneOutCoordinator {
       // What of the newest line's text fits beside the frame and the mark. A
       // cut shows some of it or none: a room under one character, or one
       // that would split a surrogate pair, leaves the head empty.
-      const head = prefixOf(lines.at(-1) ?? '', room - frameShowing(1) - CUT_MARK.length);
+      const head = cutToFit(lines.at(-1) ?? '', room - frameShowing(1) - CUT_MARK.length);
       if (kept === 0 && head !== '') {
         lines = [head + CUT_MARK];
         shown = shown.slice(-1);
@@ -909,7 +909,7 @@ export class TuneOutCoordinator {
         : '';
       this.hooks.addMessage(
         'user',
-        [{ type: 'text', text: `[Tune-out cancelled: ${this.shown(serverId, channelId)} — ${reason}.${truncNote}${unseenNote}]` }],
+        [{ type: 'text', text: `[${NOTICE_TAG.tuneOutCancelled}: ${this.shown(serverId, channelId)} — ${reason}.${truncNote}${unseenNote}]` }],
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
@@ -928,7 +928,7 @@ export class TuneOutCoordinator {
         const lateNote = selfCancel
           ? ` ${unread === 1 ? 'This message' : `These ${unread} messages`} arrived after the reader that cancelled was handed its own.`
           : '';
-        this.invokeReaderFork(serverId, channelId, epochId, 'cancel', `[Tune-out cancelled: ${name} — ${reason}.${truncNote}${lateNote}]`, stored);
+        this.invokeReaderFork(serverId, channelId, epochId, 'cancel', `[${NOTICE_TAG.tuneOutCancelled}: ${name} — ${reason}.${truncNote}${lateNote}]`, stored);
       }
     }
     this.readerCursor.delete(this.key(serverId, channelId));
@@ -1063,7 +1063,7 @@ export class TuneOutCoordinator {
     const minutes = Math.max(1, Math.round((params.expiresAtMs - params.startedAtMs) / 60_000));
     const until = new Date(params.expiresAtMs).toISOString().slice(11, 16);
     this.announce(except, params.epochId, 'entered',
-      `[Focus: ${this.hooks.primaryName() ?? 'the resident'} is here for ${minutes} min, until ${until} UTC; other channels are held meanwhile.]`);
+      `[${NOTICE_TAG.focus}: ${this.hooks.primaryName() ?? 'the resident'} is here for ${minutes} min, until ${until} UTC; other channels are held meanwhile.]`);
     return { ok: true, params };
   }
 
@@ -1185,7 +1185,7 @@ export class TuneOutCoordinator {
       const shown = backlogCap > 0 ? backlog.slice(-backlogCap) : [];
       const truncated = backlog.length - shown.length;
       const attrs = [
-        `channel="${channelId}"`,
+        `channel=${quotedValue(channelId)}`,
         `messages=${backlog.length}`,
         ...(truncated > 0 ? [`truncated=${truncated} (oldest; ${historyTool ? `${historyTool} covers the rest` : 'not delivered'})`] : []),
       ];
@@ -1196,7 +1196,7 @@ export class TuneOutCoordinator {
       : `${all.length} message${all.length === 1 ? '' : 's'} held in ${byChannel.size} channel${byChannel.size === 1 ? '' : 's'}.`;
     this.hooks.addMessage(
       'user',
-      [{ type: 'text', text: `[Tune-out: all channels except ${except.channelId} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
+      [{ type: 'text', text: `[${NOTICE_TAG.tuneOut}: all channels except ${this.shown(except.serverId, except.channelId)} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
       { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
     );
     this.hooks.commitDeliveries?.();
@@ -1208,7 +1208,7 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
-    const notice = `[Tune-out cancelled: all channels except ${except.channelId} — ${reason}.]`;
+    const notice = `[${NOTICE_TAG.tuneOutCancelled}: all channels except ${this.shown(except.serverId, except.channelId)} — ${reason}.]`;
     if (source !== 'subconscious' && subName) {
       this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);
       this.hooks.requestInference(subName, 'tune-out cancelled: all-except', 'tune-out');
@@ -1243,7 +1243,7 @@ export class TuneOutCoordinator {
     }
     this.forgetWindowStart(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
-    this.announce(except, epochId, 'released', `[Focus: ${primary ?? 'the resident'} released — ${reason}.]`);
+    this.announce(except, epochId, 'released', `[${NOTICE_TAG.focus}: ${primary ?? 'the resident'} released — ${reason}.]`);
     return { ok: true };
   }
 
@@ -1481,8 +1481,8 @@ export class TuneOutCoordinator {
 
     const shown = this.shown(serverId, channelId);
     const notice = trigger === 'wake'
-      ? `[Tune-out wake: ${shown} — ${count} addressed message${count === 1 ? '' : 's'}]`
-      : `[Tune-out cadence: ${shown} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
+      ? `[${NOTICE_TAG.tuneOutWake}: ${shown} — ${count} addressed message${count === 1 ? '' : 's'}]`
+      : `[${NOTICE_TAG.tuneOutCadence}: ${shown} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
     if (!subName) {
       const hold = this.holdFor(serverId, channelId);
       if (!hold) return;
@@ -1621,7 +1621,7 @@ export class TuneOutCoordinator {
       position: 'system',
       content: [{
         type: 'text',
-        text: `[Standing dispositions]\n${entries.map(([k, v]) => `- ${k}: ${v}`).join('\n')}`,
+        text: `[${NOTICE_TAG.standingDispositions}]\n${entries.map(([k, v]) => `- ${k}: ${v}`).join('\n')}`,
       }],
     };
   }
@@ -1747,7 +1747,7 @@ export class TuneOutCoordinator {
           const scope = this.getAllExcept();
           const heldByScope = scope && (input.scope === 'all-except' || name === 'all-except'
             || (channel !== undefined && this.holdFor(channel.serverId, channel.channelId)?.epochId === scope.params.epochId));
-          if (!heldByScope) return { success: false, error: refusal ?? this.notTunedOut(name, 'the resident'), isError: true };
+          if (!heldByScope) return { success: false, error: refusal ?? this.notTunedOut(JSON.stringify(name), 'the resident'), isError: true };
           const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
           return result.ok
             ? { success: true, data: { cancelled: true, scope: 'all-except' } }
@@ -1815,7 +1815,7 @@ export class TuneOutCoordinator {
   }
 
   /**
-   * A cancel of a channel that isn't tuned out, by the name the caller gave
+   * A cancel of a channel that isn't tuned out, by the name, quoted, the caller gave
    * or knows it by: which channels are, so the next call can name one, and
    * how a tune-out ends without one. `backlogTo`
    * names the resident as the message's reader knows it: "you" to the
@@ -1825,11 +1825,11 @@ export class TuneOutCoordinator {
    * neither this list nor the name's lookup (channelsNamed, which reads the
    * registered channels too), and the text claims nothing about it.
    */
-  private notTunedOut(name: string, backlogTo: 'you' | 'the resident'): string {
-    const active = this.listActive().map((e) => JSON.stringify(this.shown(e.serverId, e.channelId)));
+  private notTunedOut(quoted: string, backlogTo: 'you' | 'the resident'): string {
+    const active = this.listActive().map((e) => this.quotedShown(e.serverId, e.channelId));
     const opening = active.length === 0
       ? 'no connected channel is tuned out now.'
-      : `no connected channel ${JSON.stringify(name)} is tuned out. Connected channels tuned out now: `
+      : `no connected channel ${quoted} is tuned out. Connected channels tuned out now: `
         + `${active.join(', ')}.`;
     return `Nothing was cancelled: ${opening} A tune-out also ends by itself when its duration runs out, or at the `
       + `first wake past its wake budget, and its backlog goes to ${backlogTo} then.`;

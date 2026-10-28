@@ -426,7 +426,7 @@ test('a rebuild whose file wasn\'t fetched writes nothing over a row holding tex
   assert.deepEqual(held(), [[fileBlock], [text('both'), fileBlock, more], [text(''), notFetched], [text('caption'), notFetched], [notFetched, fileBlock, more], [fileBlock]]);
   reachable = true;
   assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 4, deletedMessages: 0 });
-  assert.deepEqual(held(), [[text(''), fileBlock], [text('both'), fileBlock], [text(''), notFetched], [text('caption'), notFetched], [notFetched, fileBlock], [text('gained'), fileBlock]]);
+  assert.deepEqual(held(), [[text(''), fileBlock], [text('both'), fileBlock], [text(''), notFetched], [text('caption'), notFetched], [text(`\\${notFetched.text}`), fileBlock], [text('gained'), fileBlock]]);
   assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 0 });
 });
 

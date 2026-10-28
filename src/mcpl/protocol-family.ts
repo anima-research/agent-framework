@@ -22,6 +22,7 @@
  * isn't `initialize`), the SDK's stdio probe launches the server twice, and a
  * server's era is a stable fact its configuration can state.
  */
+import { NOTICE_TAG } from '../notice-tags.js';
 import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
 import { DEFAULT_MAX_INPUT_BYTES } from './tool-lifecycle.js';
@@ -198,11 +199,11 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
 
 /** What a redaction gives in place of text when the configuration it
  *  redacts with can't be read ({@link redactServerText}). */
-export const WITHHELD_TEXT = "[withheld: the server's configuration couldn't be read to redact this]";
+export const WITHHELD_TEXT = `[${NOTICE_TAG.withheld}: the server's configuration couldn't be read to redact this]`;
 
 /** What {@link redactedData} gives in place of data nested deeper than it
  *  walks. */
-export const TOO_DEEP_TEXT = '[withheld: nested too deep to redact]';
+export const TOO_DEEP_TEXT = `[${NOTICE_TAG.withheld}: nested too deep to redact]`;
 
 /** How deep {@link redactedData} walks. A server's JSON can nest deeper than
  *  a recursive walk's stack holds (10,000 levels overflow it), and the walk
@@ -528,7 +529,7 @@ export function credentialRedactor(patterns: readonly CredentialPattern[]): Reda
 /** Any value as text: a value that can't be printed reads as a placeholder. */
 export function asText(text: unknown): string {
   if (typeof text === 'string') return text;
-  try { return String(text); } catch { return '[a value that cannot be printed]'; }
+  try { return String(text); } catch { return `[${NOTICE_TAG.unprintableValue}]`; }
 }
 
 /** A part of an environment variable's name that ends with a credential word, in the singular or plural, with any digits after it. */
@@ -868,4 +869,24 @@ export function checkServerConfig(config: McplServerConfig): ServerBinding {
   if (problems.length > 0) throw new Error(problems.join('; '));
   for (const warning of serverConfigWarnings(config)) console.warn(`[mcp] ${warning}`);
   return resolveServerBinding(config);
+}
+
+const DROPPED_LINES_LOGGED = 3;
+const droppedLinesLogged = new WeakMap<object, number>();
+
+export function logDroppedLine(serverId: string, line: string, reason: 'unparsed' | 'not-object', connection: object): void {
+  if (/^[ \t]*$/.test(line)) return;
+  const logged = droppedLinesLogged.get(connection) ?? 0;
+  if (logged > DROPPED_LINES_LOGGED) return;
+  droppedLinesLogged.set(connection, logged + 1);
+  if (logged === DROPPED_LINES_LOGGED) {
+    console.error(`MCP server "${serverId}" sent another line that isn't a JSON object, so it was dropped; more such lines on this connection are dropped without a log line`);
+    return;
+  }
+  let length = 0;
+  for (const _ of line) length++;
+  const why = reason === 'not-object' ? 'is JSON but not an object'
+    : /^[ \t]*\{/.test(line) ? "starts like a JSON object but doesn't parse"
+    : "isn't JSON";
+  console.error(`MCP server "${serverId}" sent a line of length ${length} that ${why}, so it was dropped`);
 }

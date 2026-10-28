@@ -26,6 +26,7 @@
  * Ported from mcpl-cc-bridge's presence.ts, the reference host.
  */
 import { objectSignature, renderToolLines, toolDigest, type HintedTool, type Shown } from './tool-signature.js';
+import { nameToTypeBack, quotedValue, suppliedValue } from '../supplied-text.js';
 
 export interface ToolsetDecl {
   title?: string;
@@ -531,7 +532,7 @@ export class ToolPresence {
     const endedKeys = new Set<string>();
     for (const e of ended) {
       if (!e.id || !this.toldEnded.has(e.id)) endedKeys.add(keyOf(e.toolset, e.instance));
-      const note = `${this.label(keyOf(e.toolset, e.instance))} ended${e.reason ? `: ${e.reason}` : ''}.`;
+      const note = `${this.label(keyOf(e.toolset, e.instance))} ended${e.reason ? `: ${suppliedValue(e.reason)}` : ''}.`;
       if (e.id) {
         if (!this.toldEnded.has(e.id)) told.push({ id: e.id, note });
       } else notes.push(note);
@@ -588,27 +589,27 @@ export class ToolPresence {
   /** The marker a key's announcements begin with, `[server/toolset:instance]`, which a reminder looks for. */
   label(key: string): string {
     const { toolset, instance } = splitKey(key);
-    return `[${this.server}${toolset ? `/${toolset}` : ''}${instance ? `:${instance}` : ''}]`;
+    return `[${this.server}${toolset ? `/${nameToTypeBack(toolset)}` : ''}${instance ? `:${nameToTypeBack(instance)}` : ''}]`;
   }
 
   callHint(key: string): string {
     const { instance } = splitKey(key);
-    return `${this.names.act} {server:"${this.server}"${instance ? `, instance:"${instance}"` : ''}, tool, args}`;
+    return `${this.names.act} {server:"${this.server}"${instance ? `, instance:${quotedValue(instance)}` : ''}, tool, args}`;
   }
 
   closeHint(key: string): string | null {
     const { toolset, instance } = splitKey(key);
     if (!toolset) return null;
-    return `${this.names.close} {server:"${this.server}", toolset:"${toolset}"${instance ? `, instance:"${instance}"` : ''}}`;
+    return `${this.names.close} {server:"${this.server}", toolset:${quotedValue(toolset)}${instance ? `, instance:${quotedValue(instance)}` : ''}}`;
   }
 
   openHint(toolset: string, instance?: string): string {
-    return `${this.names.open} {server:"${this.server}", toolset:"${toolset}"${instance ? `, instance:"${instance}"` : ''}}`;
+    return `${this.names.open} {server:"${this.server}", toolset:${quotedValue(toolset)}${instance ? `, instance:${quotedValue(instance)}` : ''}}`;
   }
 
   /** The tool block for one key: its label, how to call, and the visible tools (new or changed ones described). */
   toolBlock(key: string, tools: HintedTool[], opts: { describeAll?: boolean; headed?: boolean; title?: string; seen?: Shown } = {}): string[] {
-    const head = opts.headed === false ? '' : `${this.label(key)}${opts.title ? ` ${opts.title}` : ''} `;
+    const head = opts.headed === false ? '' : `${this.label(key)}${opts.title ? ` ${suppliedValue(opts.title)}` : ''} `;
     if (!tools.length) return [`${head}no tools available right now.`];
     return [`${head}tools now — ${this.callHint(key)}:`, ...renderToolLines(tools, opts.seen ?? this.shown, { describeAll: opts.describeAll })];
   }
@@ -627,13 +628,13 @@ export class ToolPresence {
     for (const c of cs.changes) {
       const bare = opts.bare === c.key;
       if (c.closed) {
-        lines.push(`${this.label(c.key)} closed.${c.gone.length ? ` Now unavailable: ${c.gone.join(', ')}.` : ''}`);
+        lines.push(`${this.label(c.key)} closed.${c.gone.length ? ` Now unavailable: ${c.gone.map(suppliedValue).join(', ')}.` : ''}`);
         continue;
       }
       const title = (c.opened || c.retitled) && !bare ? c.title : undefined;
       if (showsBlock(c)) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title, seen, describeAll: opts.describeAll }));
-      else if (title) lines.push(`${this.label(c.key)} ${title}`);
-      if (c.gone.length) lines.push(`now unavailable: ${c.gone.join(', ')}`);
+      else if (title) lines.push(`${this.label(c.key)} ${suppliedValue(title)}`);
+      if (c.gone.length) lines.push(`now unavailable: ${c.gone.map(suppliedValue).join(', ')}`);
       if (c.opened && !bare) {
         const close = this.closeHint(c.key);
         if (close) lines.push(`${close} closes it.`);
@@ -646,9 +647,9 @@ export class ToolPresence {
 
   /** RFC §6.2: a suggestion is shown, never acted on. */
   renderSuggestion(s: Suggestion): string {
-    const what = `${s.toolset}${s.instance ? `:${s.instance}` : ''}`;
+    const what = suppliedValue(`${s.toolset}${s.instance ? `:${s.instance}` : ''}`);
     const how = s.action === 'open' ? this.openHint(s.toolset, s.instance) : this.closeHint(keyOf(s.toolset, s.instance));
-    return `${this.server} suggests ${s.action === 'open' ? 'opening' : 'closing'} ${what}${s.reason ? `: ${s.reason}` : ''} — ${how} if you want to (nothing was done).`;
+    return `${this.server} suggests ${s.action === 'open' ? 'opening' : 'closing'} ${what}${s.reason ? `: ${suppliedValue(s.reason)}` : ''} — ${how} if you want to (nothing was done).`;
   }
 
   /** The keys a reminder restates: every open key of this server's view. */
@@ -674,7 +675,7 @@ export class ToolPresence {
    *  reach no agent. */
   catalog(opts: { mark?: boolean } = {}): string {
     const lines: string[] = [];
-    lines.push(this.surface ? `${this.server} — ${[this.surface.title, this.surface.summary].filter(Boolean).join(': ')}` : this.server);
+    lines.push(this.surface ? `${this.server} — ${[this.surface.title, this.surface.summary].filter(Boolean).map(suppliedValue).join(': ')}` : this.server);
     const v = this.view();
     if (v.size) {
       for (const [key, e] of v) {
@@ -689,7 +690,7 @@ export class ToolPresence {
     for (const [name, d] of Object.entries(this.declared)) {
       if (!d.instances && this.isOpen(name)) continue;
       openable.push(
-        `  ${name}${d.title ? ` — ${d.title}` : ''}${d.summary ? `: ${d.summary}` : ''}` +
+        `  ${nameToTypeBack(name)}${d.title ? ` — ${suppliedValue(d.title)}` : ''}${d.summary ? `: ${suppliedValue(d.summary)}` : ''}` +
           (d.instances ? ' (several can be open at once; name each with instance)' : '') +
           (d.options ? ` · options ${objectSignature(d.options)}` : ''),
       );
@@ -697,7 +698,7 @@ export class ToolPresence {
     for (const g of this.undeclaredGroups) {
       if (this.groups.has(g)) continue;
       const names = this.allTools.filter((t) => this.toolsetOf(t.name) === g).map((t) => t.name);
-      openable.push(`  ${g}: ${names.join(', ')}`);
+      openable.push(`  ${nameToTypeBack(g)}: ${names.map(nameToTypeBack).join(', ')}`);
     }
     if (openable.length) lines.push(`can open — ${this.names.open} {server:"${this.server}", toolset, instance?, options?}:`, ...openable);
     return lines.join('\n');
@@ -705,12 +706,12 @@ export class ToolPresence {
 
   /** Where a tool can be called from now, for `look` naming it. */
   toolStatus(tool: string): string {
-    if (this.presenceOf(tool) === 'static') return `static — called by name, as ${this.listedName(tool)}`;
+    if (this.presenceOf(tool) === 'static') return `static — called by name, as ${nameToTypeBack(this.listedName(tool))}`;
     const where = [...this.view().entries()].filter(([, e]) => e.tools.has(tool)).map(([k]) => k);
     const ts = this.toolsetOf(tool);
     return where.length
-      ? `available now in ${where.map((k) => this.label(k)).join(', ')} — ${this.names.act} {server:"${this.server}", tool:"${tool}"${where.length > 1 ? ', instance' : ''}, args}`
-      : `not available right now${ts ? ` (toolset ${ts})` : ''}`;
+      ? `available now in ${where.map((k) => this.label(k)).join(', ')} — ${this.names.act} {server:"${this.server}", tool:${quotedValue(tool)}${where.length > 1 ? ', instance' : ''}, args}`
+      : `not available right now${ts ? ` (toolset ${nameToTypeBack(ts)})` : ''}`;
   }
 
 }

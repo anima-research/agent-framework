@@ -4,10 +4,16 @@
   with the id `''`: a live operator surgery (a rollback, a suppression, a branch switch), whose release stores it in
   arrival order, and an agent's context manager that refuses its work after a failed re-initialization, which keeps
   each write for the agent until a `switchBranch()` re-initializes it and that switch's release stores them in
-  arrival order (if the agent ends first, those the primary takes in its place go on to it and the rest are dropped).
-  A crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's
-  queue on disk. A write made while quiesced is on the branch the store was on when it was made: a rollback or a
-  branch switch later in the same quiesce leaves it there, where it used to land on the branch chosen by resume.
+  arrival order (if the agent ends first, those the primary takes in its place, a module's write for a run or a fork,
+  a failed reply's notice or a channel notice it could act on, go on to it, and the rest are dropped, logged). A
+  crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's queue
+  on disk. The `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
+  for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral
+  queue. The `context-reinit-failed` alert for a conversation agent a move disposes counts the writes held for it, by
+  the move's hold or while its manager refused its work, and how many of them went to the primary, stored at the
+  release; the rest, such as its channel's messages, are dropped, logged. A write made while quiesced is on the
+  branch the store was on when it was made: a rollback or a branch switch later in the same quiesce leaves it there,
+  where it used to land on the branch chosen by resume.
   - **Module authors:** `ModuleContext.addMessage` answers the stored id, never a `held:` handle. `ModuleMessage.held`
     keeps its name with a new meaning: the row is stored and not in the window of the agent the read is for (not yet
     presented to it, or taken out as an undone turn's); its `id`, `sequence` and `timestamp` are the store's. It is

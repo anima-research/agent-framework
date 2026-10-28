@@ -539,7 +539,7 @@ test('resume gates on a fresh feasibility verdict; force overrides', async () =>
   });
 });
 
-test('resume proceeds with a warn when the strategy cannot preview', async () => {
+test('resume proceeds when the strategy cannot preview', async () => {
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
     // Default PassthroughStrategy: no previewContext at all.

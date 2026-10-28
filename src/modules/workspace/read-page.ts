@@ -1,6 +1,7 @@
 import type { ToolResult } from '../../types/events.js';
 import { answerText, fieldLine, sectionLead, sectionText, textAnswer } from './result-text.js';
 import { type FileText, MAX_LINE_CHARS, numberedLine, safeCut } from './text.js';
+import { didNothing } from './answers.js';
 
 /**
  * One page of a read, held to the result limit as its text measures it: a
@@ -184,7 +185,12 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   const text = file.raw;
   const start = Math.min(offsetChars, text.length);
   if (splitsPair(text, start)) {
-    return { success: false, isError: true, error: 'offsetChars splits a surrogate pair; use nextOffsetChars from the previous page.' };
+    return {
+      success: false,
+      isError: true,
+      error: didNothing('read', `"offsetChars" ${start} falls between the two halves of a surrogate pair, one character in UTF-16. `
+        + `Give ${start - 1} or ${start + 1}; a page's nextOffsetChars never splits one.`),
+    };
   }
   let end = start + Math.min(limitChars, text.length - start);
   if (splitsPair(text, end)) end++;

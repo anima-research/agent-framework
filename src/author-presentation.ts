@@ -17,6 +17,7 @@
  * `metadata.author` as the structured record.
  */
 import type { ContentBlock, MessageMetadata } from '@animalabs/membrane';
+import { suppliedValue } from './supplied-text.js';
 
 /** The participant the framework stores channel traffic under: a role, not a name. */
 export const ANONYMOUS_PARTICIPANT = 'user';
@@ -36,9 +37,25 @@ export function beginsWithAuthor(author: string, text: string): boolean {
   return after === '' || after === ' ' || after === '\n';
 }
 
+/**
+ * The author's name as a line of the framework's writes it: a value someone
+ * supplied, kept to one line with its notice openings marked (main's #852,
+ * suppliedValue), so a name can't open a line that reads as the framework's
+ * own notice.
+ */
+export function authorShown(author: string): string {
+  return suppliedValue(author);
+}
+
+/** Whether `text` begins with the author's line, as the author wrote their
+ *  name or as the framework shows it (authorShown). */
+function beginsWithAuthorLine(author: string, text: string): boolean {
+  return beginsWithAuthor(author, text) || beginsWithAuthor(authorShown(author), text);
+}
+
 /** `author: text`, unless `text` begins that way already. */
 export function authorLine(author: string, text: string): string {
-  return beginsWithAuthor(author, text) ? text : `${author}: ${text}`;
+  return beginsWithAuthorLine(author, text) ? text : `${authorShown(author)}: ${text}`;
 }
 
 /**
@@ -54,11 +71,11 @@ export function presentAuthor<M extends { participant: string; content: ContentB
   if (author === undefined) return message;
   const index = message.content.findIndex((b) => b.type === 'text');
   if (index === -1) {
-    return { ...message, content: [{ type: 'text', text: `${author}:` } as TextBlock, ...message.content] };
+    return { ...message, content: [{ type: 'text', text: `${authorShown(author)}:` } as TextBlock, ...message.content] };
   }
   const block = message.content[index] as TextBlock;
-  if (typeof block.text !== 'string' || beginsWithAuthor(author, block.text)) return message;
+  if (typeof block.text !== 'string' || beginsWithAuthorLine(author, block.text)) return message;
   const content = [...message.content];
-  content[index] = { ...block, text: `${author}: ${block.text}` };
+  content[index] = { ...block, text: `${authorShown(author)}: ${block.text}` };
   return { ...message, content };
 }

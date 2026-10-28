@@ -33,9 +33,18 @@
  * succeed, since its completion releases a draft's protection.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { resolve } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import { RecordJournal } from '../../record-journal.js';
+import { Refusal, onlyTheHost } from './answers.js';
+
+const UNTIL_REOPENED = "the workspace can't check its files against disk until its store is reopened";
+const REOPEN = onlyTheHost('reopen it with a restart');
+
+export class EvidenceUnavailable extends Refusal {}
+
+export const callGate = new AsyncLocalStorage<{ passed: boolean }>();
 
 /** Everything `stat` says about a file that can vouch for unchanged bytes. */
 export interface Fingerprint {
@@ -233,18 +242,18 @@ export class DiskAgreement {
    */
   ensureReconciled(): void {
     if (this.journal.needsReopen) {
-      throw new Error(
-        'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
-        'an append to its journal failed inside the store, and the evidence may lack what it recorded',
-      );
+      throw new EvidenceUnavailable(`${UNTIL_REOPENED}: an append to its record of what disk last agreed with failed inside the store, so that record may lack what the append held. ${REOPEN}`);
     }
     if (!this.whole) {
-      throw new Error(
-        'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
-        'reading it back from the store failed',
-      );
+      throw new EvidenceUnavailable(`${UNTIL_REOPENED}: reading back its record of what disk last agreed with failed. ${REOPEN}`);
     }
     if (this.journal.needsReconcile) this.rebuild();
+    const gate = callGate.getStore();
+    if (gate) gate.passed = true;
+  }
+
+  get awaitsReopen(): boolean {
+    return this.journal.needsReopen || !this.whole;
   }
 
   /** Whether evidence recorded so far still awaits a barrier. */

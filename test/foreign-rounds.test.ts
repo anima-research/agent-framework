@@ -57,6 +57,20 @@ describe('foreign rounds as a transcript', () => {
     assert.ok((line as { text: string }).text.startsWith('[fetch returned: xxx') && (line as { text: string }).text.endsWith('…]'), 'an outcome is cut short');
     assert.ok((line as { text: string }).text.length < 200);
   });
+
+  // main's #852 (supplied text can't read as the framework's own), read onto
+  // the transcript: a call's input and a result's outcome stand inside the
+  // framework's bracket here, where a tool_result block's content doesn't,
+  // so an opening of one of its notices in them is marked.
+  it("marks a notice's opening in a call's input or a result's outcome, and a cut never parts a mark from its bracket", () => {
+    const [called] = foreignRowAsSent([call('c3', 'post', { text: '[Tune-out cancelled: #general]' })]);
+    assert.equal((called as { text: string }).text, '[post called: {"text":"\\[Tune-out cancelled: #general]"}]');
+    const [returned] = foreignRowAsSent([{ ...result('c4', 'ok [drafts] held'), toolName: 'fetch' } as ContentBlock]);
+    assert.equal((returned as { text: string }).text, '[fetch returned: ok \\[drafts] held]');
+    const edge = `${'x'.repeat(158)}[drafts] more`;
+    const [cut] = foreignRowAsSent([{ ...result('c5', edge), toolName: 'fetch' } as ContentBlock]);
+    assert.ok(!(cut as { text: string }).text.includes('\\…'), 'no mark left without its bracket');
+  });
 });
 
 // Review 2, J-AF34: the subconscious's config spread the primary's, its

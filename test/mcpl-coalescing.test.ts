@@ -1968,10 +1968,11 @@ test("a wake to read a render that carries a channel starts its turn until the a
   // Legacy-mode marks (no index length), by branch and the store's head.
   const at = (onBranch: string, sequence: number): ReadMark => readMarkForTest(onBranch, sequence, null);
   agent.answeredWatermark = at(branch, row.sequence);
-  const pass = async (tagged?: 'addressed' | 'ambient' | 'untagged'): Promise<number> => {
+  const pass = async (tagged?: 'addressed' | 'ambient' | 'untagged' | 'notice'): Promise<number> => {
     internals.pendingRequests.push({
       agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), channelId: 'editor:room', readsRow: row.id,
-      ...(tagged === 'addressed' ? { addressed: true } : tagged === 'ambient' ? { addressed: false, ambient: true } : tagged === 'untagged' ? { addressed: false } : {}),
+      ...(tagged === 'addressed' ? { addressed: true } : tagged === 'ambient' ? { addressed: false, ambient: true } : tagged === 'untagged' ? { addressed: false }
+        : tagged === 'notice' ? { addressed: false, systemNotice: true as const } : {}),
     });
     let started = 0;
     const start = internals.startAgentStream;
@@ -1989,6 +1990,9 @@ test("a wake to read a render that carries a channel starts its turn until the a
   // A render its server marked ambient asked nothing of the agent: reading
   // it was all its wake was for, as before a publish was asked of any render.
   assert.equal(await pass('ambient'), 0, 'marked ambient, read and not answered, the wake starts no turn');
+  // A chat:system notice asks nothing either, and no speech is routed by it,
+  // so its channel would never see the answer the check waits for.
+  assert.equal(await pass('notice'), 0, 'a notice, not ambient, read and not answered, the wake starts no turn');
   // Neither tag is doubt: such a render waits for an answer, as an
   // addressed one does.
   assert.equal(await pass('untagged'), 1, 'with neither tag, read but not answered in its channel, the wake starts the turn');

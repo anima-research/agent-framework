@@ -1,5 +1,5 @@
 - **Hosts and packages that install agent-framework:** it now depends on `@animalabs/chronicle` `^0.5.0` (was
-  `^0.4.0`) and `@animalabs/context-manager` `^0.24.0` (was `^0.22.0`): the chronicle release that carries the
+  `^0.4.0`) and `@animalabs/context-manager` `^0.24.0` (was `^0.23.0`): the chronicle release that carries the
   identity-stamped batched append (`appendManyToStateJsonWithIdentity`), and the context-manager release that keeps
   each agent's window (`windowStatusOf`, `presentRows`, `retractRows`, `getPresentedMessages`) and writes a window
   write as one record with it (context-manager's 291-chronicle-0.5 and 291-window-batches entries). The range starts

@@ -19,8 +19,8 @@
 - A wake for a row stored for its agent carries `InferenceRequest.readsRow`
   (the row's stored id) whether or not the row was presented to that agent
   at its write, not only for a row kept out of its window while its turn
-  was alive: #814's mark for a message stored as it arrived (the
-  stored-message-wake entry), read onto the presentation index. The wake is
+  was alive: #814's mark for a message stored as it arrived (0.28.0's
+  entry for it), read onto the presentation index. The wake is
   dropped only once an answered request carried the row, which that
   request's mark says by the row's place in the agent's window, so a
   request that never carried the row keeps its wake. A resumed turn (a
