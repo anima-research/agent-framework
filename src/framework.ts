@@ -10748,6 +10748,13 @@ export class AgentFramework {
     },
   ];
 
+  /** wake_remove_rule's description after its first sentence, the same for
+   *  every agent. */
+  private static readonly WAKE_REMOVE_RULE_REST =
+    'Any pending debounce batch for that rule is still delivered, held while your turn runs, as ' +
+    'its timer would deliver it. Returns whether a rule was removed (false if no ' +
+    'rule had that name).';
+
   /** Synthesized wake-rule tools: add/remove a gate.json policy at runtime.
    *  Present when a gate is wired. They write validated policies into the
    *  hot-reloaded gate.json (same validation as load), so a rule takes effect
@@ -10875,10 +10882,7 @@ export class AgentFramework {
     {
       name: 'wake_remove_rule',
       description:
-        'Remove a wake rule (gate.json policy) by name at runtime. Any pending ' +
-        'debounce batch for that rule is still delivered, held while your turn runs, as ' +
-        'its timer would deliver it. Returns whether a rule was removed (false if no ' +
-        'rule had that name).',
+        'Remove a wake rule (gate.json policy) by name at runtime. ' + AgentFramework.WAKE_REMOVE_RULE_REST,
       inputSchema: {
         type: 'object',
         properties: {
@@ -10892,10 +10896,13 @@ export class AgentFramework {
   private static readonly JUDGED_WAKE_RULE_TOOLS: import('./types/index.js').ToolDefinition[] =
     AgentFramework.WAKE_RULE_TOOLS.map((tool) => {
       if (tool.name === 'wake_remove_rule') {
+        // The settings toolset shows a tool by its first sentence alone
+        // (firstSentence), so what a removal leaves to the judge is said there.
         return {
           ...tool,
-          description: tool.description + ' A judge rule\'s batch, whether waiting out its quiet period, ' +
-            'held or being judged, still goes to the judge, by the rule as it was.',
+          description: 'Remove a wake rule (gate.json policy) by name at runtime; a judge rule\'s pending ' +
+            'batches still go to the judge, by the rule as it was. ' + AgentFramework.WAKE_REMOVE_RULE_REST +
+            ' A judge rule\'s batch is pending while it waits out its quiet period, is held or is being judged.',
         };
       }
       if (tool.name !== 'wake_add_rule') return tool;
