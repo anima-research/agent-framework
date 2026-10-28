@@ -6235,17 +6235,18 @@ export class ChannelRegistry {
     if (input.channelId === '' && tool === 'channel_publish') {
       return { success: false, error: `Nothing was posted: channelId is empty. ${findIds}`, isError: true };
     }
-    // Resolve channelId: default to what the caller falls back to — the
-    // all-except hold's channel, else the latest delivered inbound channel
-    // under the legacy locus rule (a marker — reaction, edit, deletion — is
-    // never that channel) — which an ephemeral run never takes
-    // (takesGlobalFallback), so it names one.
+    // Resolve channelId: default to where the caller's plain speech goes
+    // (resolveLocus): its home, its turn's own channel (none for a turn that
+    // has none), else the all-except hold's channel or, under the legacy
+    // locus rule, the latest delivered inbound one (a marker — reaction,
+    // edit, deletion — is never that channel), which an ephemeral run never
+    // takes (takesGlobalFallback), so it names one.
     // A channel named by a string means what it means to every channel tool
     // (entriesNamed): one channel, by its id or its server-qualified name,
     // and a name two servers' channels answer to is refused with them as
     // candidates, never sent to the first.
     const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
-    const fallback = caller !== undefined ? this.globalFallbackFor(caller) : this.sharedFallback();
+    const fallback = caller !== undefined ? this.resolveLocus(caller) : this.sharedFallback();
     if (!(input.channelId ?? fallback)) {
       return {
         success: false,
@@ -6254,7 +6255,10 @@ export class ChannelRegistry {
           : caller !== undefined && this.takesGlobalFallback?.(caller) === false
             ? 'Nothing was posted: name the channel with channelId. A subagent has no default channel, since its plain '
               + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
-            : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
+            : caller !== undefined && this.activeChannelResolver?.(caller) === null
+              ? `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
+                + `goes to none and channel_publish sends only to a channel it names. ${findIds}`
+              : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
         isError: true,
       };
     }

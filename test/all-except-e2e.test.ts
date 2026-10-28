@@ -5,8 +5,10 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture } from './helpers/coalescing-fixture.js';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import { createMockResponse, HeldStream } from './helpers/mock-membrane.js';
 import {
   SUB, internals, textOf, stored, held, has, find, MENTION,
   incoming, dm, registerOpen, enter, settle, channellessTurnLocus,
@@ -68,6 +70,95 @@ describe('tune-out, all-except scope', () => {
       f.alwaysRespond(); // the release wakes the resident and the reader
       await f.framework.runUntilIdle();
       assert.equal(await channellessTurnLocus(f), null, 'gone with the scope');
+    } finally { await f.close(); }
+  });
+
+  it('focus entered during a turn with no channel of its own gives that turn the excepted channel: its plain speech lands there', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'fx', name: 'focus', input: { channelId: 'work', durationSeconds: 120 } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-here for a while' }] as ContentBlock[]));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'test', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-here for a while')), 'the speech went out');
+      assert.equal(f.published.find((p) => JSON.stringify(p).includes('zz-here for a while'))!.channelId, 'work');
+    } finally { await f.close(); }
+  });
+
+  it("a focus whose call no open turn made, as a script's left from an earlier turn, leaves the open turn's speech where it was", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      f.membrane.responses.length = 0;
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-mine alone' }] as ContentBlock[]));
+      const m = f.membrane as unknown as { responses: unknown[]; responseIndex: number; calls: unknown[]; lastStream: unknown };
+      let outside: Promise<{ success: boolean; error?: string }> | undefined;
+      // While the turn is open, a call naming the agent that carries no turn.
+      f.membrane.streamYielding = ((request: unknown) => {
+        m.calls.push(request);
+        const remaining = m.responses.slice(m.responseIndex);
+        m.responseIndex = m.responses.length;
+        outside ??= f.framework.executeToolCall({ id: 'fz', name: 'focus', input: { channelId: 'work', durationSeconds: 120 }, callerAgentName: 'agent' } as never) as never;
+        const stream = new HeldStream(outside.then(() => undefined), remaining as never);
+        m.lastStream = stream;
+        return stream;
+      }) as never;
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'test', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      assert.ok(outside, 'premise: the call was made while the turn was open');
+      const entered = await outside;
+      assert.ok(entered.success, entered.error);
+      assert.ok(internals(f).tuneOutCoordinator!.getAllExcept(), 'premise: the focus holds');
+      await eventually(() => stored(f).some((x) => textOf(x).includes('zz-mine alone')), 'the turn spoke');
+      const routing = (f.framework as unknown as { routingOf(agentName: string): { locus?: { channelId: string } | null } }).routingOf('agent');
+      assert.equal(routing.locus ?? null, null, "the open turn's locus didn't move");
+      await new Promise((r) => setTimeout(r, 100));
+      assert.ok(!f.published.some((p) => JSON.stringify(p).includes('zz-mine alone')), 'its speech went to no channel');
+    } finally { await f.close(); }
+  });
+
+  it("a turn that has no channel by design publishes nowhere when channel_publish names none, though a focus holds, as its plain speech goes nowhere", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enterAllExcept(f, 'work');
+      (f.framework as unknown as { routingOf(agentName: string): { noChannel?: true } }).routingOf('agent').noChannel = true;
+      const result = await f.framework.executeToolCall({ id: 'p1', name: 'channel_publish', input: { content: 'zz-nowhere' }, callerAgentName: 'agent' } as never);
+      assert.equal(result.success, false);
+      assert.match(result.error ?? '', /name the channel with channelId\. This turn has no channel of its own/);
+      assert.ok(!f.published.some((p) => JSON.stringify(p).includes('zz-nowhere')), 'nothing was posted');
+    } finally { await f.close(); }
+  });
+
+  it("under the legacy latest-inbound rule too, a heartbeat turn's channel_publish naming no channel is refused, as its plain speech has no channel", async () => {
+    const f = await fixture({ framework: { subconscious: SUB, speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work');
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.turn();
+      assert.equal((internals(f).channelRegistry.getDefaultPublishChannel() as unknown as { channelId: string } | null)?.channelId, 'work', 'premise: work is the latest inbound channel');
+      f.membrane.responses.length = 0;
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'pb', name: 'channel_publish', input: { content: 'zz-beat' } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'beat done' }] as ContentBlock[]));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      await eventually(() => stored(f).some((m) => JSON.stringify(m.content).includes('This turn has no channel of its own')) || f.published.some((p) => JSON.stringify(p).includes('zz-beat')), 'the publish was answered');
+      assert.ok(!f.published.some((p) => JSON.stringify(p).includes('zz-beat')), 'nothing was posted');
     } finally { await f.close(); }
   });
 

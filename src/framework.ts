@@ -26663,7 +26663,8 @@ export class AgentFramework {
       const input = (call.input ?? {}) as Record<string, unknown>;
       // The calling turn's own channels, as the channel tools read them here (origin.own).
       const own = origin.kind === 'agent' ? origin.own ?? [] : [];
-      return call.name === 'focus' ? this.handleFocusTool(agentName, input, own) : this.handleTuneOutTool(agentName, input, own);
+      const turn = this.callingTurnOf(agentName, call);
+      return call.name === 'focus' ? this.handleFocusTool(agentName, input, own, turn) : this.handleTuneOutTool(agentName, input, own, turn);
     }
     return this.moduleRegistry.handleToolCall(call);
   }
@@ -36038,10 +36039,11 @@ export class AgentFramework {
     // (ChannelRegistry.ownChannelFor): read here, while the call is the
     // turn's, before the answer can wait.
     const own = this.callOwnChannels(agentName, call);
+    const turn = this.callingTurnOf(agentName, call);
     // The answer can wait for the tune-out's transport (openForTuneOut), so
     // the result goes through pushEvent when it is known, as every other
     // tool's does; a rejection is answered too, never left unhandled.
-    void (call.name === 'focus' ? this.handleFocusTool(agentName, input, own) : this.handleTuneOutTool(agentName, input, own))
+    void (call.name === 'focus' ? this.handleFocusTool(agentName, input, own, turn) : this.handleTuneOutTool(agentName, input, own, turn))
       .catch((err: unknown) => ({ success: false, error: thrownText(err), isError: true }))
       .then((result) => {
         this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'tune-out', result });
@@ -36049,8 +36051,8 @@ export class AgentFramework {
   }
 
   /** `focus` is `tune_out` with scope "all-except". */
-  private handleFocusTool(agentName: string, input: Record<string, unknown>, own: readonly ChannelRef[] = []): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
-    return this.handleTuneOutTool(agentName, { ...input, scope: 'all-except' }, own);
+  private handleFocusTool(agentName: string, input: Record<string, unknown>, own: readonly ChannelRef[] = [], turn?: TurnRouting): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
+    return this.handleTuneOutTool(agentName, { ...input, scope: 'all-except' }, own, turn);
   }
 
   /**
@@ -36072,12 +36074,14 @@ export class AgentFramework {
    * own channels answers to by its id means that channel; otherwise the one
    * channel the name means, which may be server-qualified, and a name two
    * servers' channels answer to is refused with them as candidates (#232
-   * gap 8).
+   * gap 8). `turn` is the turn that made the call (callingTurnOf), the only
+   * one whose speech an all-except entry moves.
    */
   private async handleTuneOutTool(
-    _agentName: string,
+    agentName: string,
     input: Record<string, unknown>,
     own: readonly ChannelRef[] = [],
+    turn?: TurnRouting,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     const coordinator = this.tuneOutCoordinator;
     const channelRegistry = this.channelRegistry;
@@ -36139,6 +36143,13 @@ export class AgentFramework {
         durationSeconds: input.durationSeconds,
       }, 'agent-tool');
       if (!r.ok) return { success: false, error: r.error, isError: true };
+      const speaker = this.agents.get(agentName);
+      if (turn && this.openLogical.get(agentName) === turn && turn.locus == null && !turn.noChannel && !turn.heartbeat && !this.homeOf(agentName)
+        && (speaker?.proseRouting === 'locus' || speaker?.proseRouting === 'hybrid')) {
+        turn.locus = resolved;
+        noteTurnChannel(turn, resolved);
+        this.rememberAnnouncedLocus(agentName, resolved);
+      }
       return {
         success: true,
         data: {
