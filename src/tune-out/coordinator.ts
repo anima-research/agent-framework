@@ -816,18 +816,22 @@ export class TuneOutCoordinator {
 
   getAllExcept(): AllExceptState | null {
     if (this.scopeCache !== undefined) return this.scopeCache;
-    try {
-      const raw = this.channelRegistry.readCoordinatorState(this.scopeStateId) as AllExceptState | null;
-      this.scopeCache = raw && typeof raw === 'object' && raw.params && typeof raw.params.epochId === 'string' ? raw : null;
-    } catch {
-      this.scopeCache = null;
+    // A record that can't be read, or isn't a hold's, is not taken for no
+    // hold: the error goes to the caller and nothing is cached, so the next
+    // read tries again. At create() that refuses the start, as an
+    // unreadable registry does.
+    const raw = this.channelRegistry.readCoordinatorState(this.scopeStateId) as AllExceptState | null;
+    if (raw !== null && raw !== undefined && !(typeof raw === 'object' && raw.params && typeof raw.params.epochId === 'string')) {
+      throw new Error(`the all-except hold's stored record (${this.scopeStateId}) is not a hold's record; it was left as it is`);
     }
+    this.scopeCache = raw ?? null;
     return this.scopeCache;
   }
 
   private writeScope(state: AllExceptState | null): void {
-    this.scopeCache = state;
+    // Durable first: a write that fails leaves memory as the store has it.
     this.channelRegistry.writeCoordinatorState(this.scopeStateId, state);
+    this.scopeCache = state;
   }
 
   enterAllExcept(
@@ -976,15 +980,7 @@ export class TuneOutCoordinator {
   ): { ok: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
-    this.writeScope(null);
-    this.clearScopeTimers();
     const { epochId, except, backlogCap } = scope.params;
-    for (const [key, pending] of this.pendingWakes) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
-      if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
-      clearTimeout(pending.timer);
-      this.pendingWakes.delete(key);
-    }
 
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
@@ -1014,6 +1010,17 @@ export class TuneOutCoordinator {
       { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
     );
     this.hooks.commitDeliveries?.();
+    // The release is recorded before the hold is: a failure past this point
+    // leaves the hold in force with its release already delivered, which a
+    // retry repeats, where the other order lost the release outright.
+    this.writeScope(null);
+    this.clearScopeTimers();
+    for (const [key, pending] of this.pendingWakes) {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
+      clearTimeout(pending.timer);
+      this.pendingWakes.delete(key);
+    }
     const subName = this.hooks.subconsciousName();
     if (note && subName) {
       this.hooks.addMessage(subName, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });

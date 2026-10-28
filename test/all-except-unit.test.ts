@@ -15,17 +15,25 @@ function harness() {
   const wakes: string[] = [];
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
   const traces: string[] = [];
+  const fail = { read: false, write: false, addMessage: false };
   const registry = {
     getTuneOutState: () => null,
     // Each channel is shown by its id: no other server registers it.
     nameShown: (ref: { channelId: string }) => ref.channelId,
     listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: 'work' } }, { serverId: 'disc', descriptor: { id: 'noisy' } }],
-    readCoordinatorState: (id: string) => state.get(id) ?? null,
-    writeCoordinatorState: (id: string, value: unknown) => { state.set(id, value); },
+    readCoordinatorState: (id: string) => {
+      if (fail.read) throw new Error('store unreadable');
+      return state.get(id) ?? null;
+    },
+    writeCoordinatorState: (id: string, value: unknown) => {
+      if (fail.write) throw new Error('store write failed');
+      state.set(id, value);
+    },
   } as unknown as ChannelRegistry;
   const servers = { getServer: () => undefined } as unknown as McplServerRegistry;
   const hooks = {
     addMessage: (participant: string, content: Array<{ type: string; text?: string }>, _m: unknown, forAgent?: string) => {
+      if (fail.addMessage) throw new Error('context write failed');
       messages.push({ participant, text: content.map((b) => b.text ?? '').join(''), forAgent });
       return 'id';
     },
@@ -41,7 +49,7 @@ function harness() {
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
-  return { make, state, wakes, messages, traces };
+  return { make, state, wakes, messages, traces, fail };
 }
 
 describe('all-except scope on the coordinator', () => {
@@ -76,5 +84,55 @@ describe('all-except scope on the coordinator', () => {
     assert.ok(h.messages.some((m) => /all channels except work released — duration elapsed/.test(m.text)), 'the release reached the resident');
     assert.ok(h.wakes.includes('scout'), 'and woke them');
     second.stop();
+  });
+
+  it('a stored hold that can\'t be read is not taken for no hold, and the next read tries again', () => {
+    const h = harness();
+    const first = h.make();
+    assert.ok(first.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    first.stop();
+    h.fail.read = true;
+    const second = h.make();
+    assert.throws(() => second.resumeActiveEpochs(), /store unreadable/, 'resume refuses rather than resume with no hold');
+    h.fail.read = false;
+    assert.equal(second.getAllExcept()?.params.except.channelId, 'work', 'the failure was not remembered as no hold');
+    assert.ok(second.holdFor('disc', 'noisy'), 'and the hold holds');
+    second.stop();
+  });
+
+  it('a stored record that isn\'t a hold\'s is refused, not read as no hold', () => {
+    const h = harness();
+    const c = h.make();
+    h.state.set('tune-out/scout/all-except', { params: { except: 'not a hold' } });
+    assert.throws(() => c.getAllExcept(), /is not a hold's record/);
+    assert.ok(h.state.has('tune-out/scout/all-except'), 'left as it is');
+    c.stop();
+  });
+
+  it('an entry whose write fails leaves no hold in memory', () => {
+    const h = harness();
+    const c = h.make();
+    h.fail.write = true;
+    assert.throws(() => c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool'), /store write failed/);
+    h.fail.write = false;
+    assert.equal(c.getAllExcept(), null, 'memory agrees with the store');
+    assert.equal(c.holdFor('disc', 'noisy'), null);
+    c.stop();
+  });
+
+  it('a release that fails to be recorded leaves the hold in force, to release again', () => {
+    const h = harness();
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    h.fail.addMessage = true;
+    assert.throws(() => c.cancelAllExcept('agent-tool', 'done'), /context write failed/);
+    h.fail.addMessage = false;
+    assert.ok(c.getAllExcept(), 'the hold is still in force');
+    assert.ok([...h.state.values()].some((v) => v !== null), 'and still stored');
+    const again = c.cancelAllExcept('agent-tool', 'done');
+    assert.ok(again.ok);
+    assert.equal(c.getAllExcept(), null);
+    assert.ok(h.messages.some((m) => /all channels except work released — done/.test(m.text)), 'the release reached the resident');
+    c.stop();
   });
 });
