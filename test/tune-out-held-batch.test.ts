@@ -74,3 +74,38 @@ test('a hold that ends while its batch renders leaves the batch stored unheld, w
   assert.ok(asked('other').some((c) => JSON.stringify(c).includes('document_diff')), 'the second recipient reads the batch');
   assert.equal(f.renders.length, 1, 'rendered once');
 });
+
+test('a held batch that opens while an earlier one renders is stored under the hold too, and released in the dump', async (t) => {
+  const f = await fixture({ framework: { tuneOut: { enabled: true, announce: false } } as never });
+  t.after(f.close);
+  await f.register('chat');
+  let release!: () => void;
+  const first = new Promise<void>((resolve) => { release = resolve; });
+  let rendered = 0;
+  f.renderer(async () => {
+    rendered += 1;
+    const n = rendered;
+    if (n === 1) await first;
+    return { content: [{ type: 'text', text: `document_diff_${n}` }] };
+  });
+  const coordinator = (f.framework as unknown as Internals).tuneOutCoordinator!;
+  assert.ok(coordinator.enter('editor', 'chat', { durationSeconds: 600 }, 'agent-tool').ok);
+  const epochId = (coordinator as unknown as Listing).listActive().find((e) => e.channelId === 'chat')!.params.epochId;
+  const held = () => f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId);
+
+  await f.send('push/event', f.params('e1', 'notice_fallback', { channelId: 'chat', key: 'doc1', deferred: true }));
+  await eventually(() => f.renders.length === 1, 'the first batch to start rendering');
+  await f.send('push/event', f.params('e2', 'notice_fallback', { channelId: 'chat', key: 'doc1', deferred: true }));
+  release();
+  await eventually(() => held().some((m) => JSON.stringify(m.content).includes('document_diff_2')), 'the second batch stored under the hold');
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'the hold woke nobody');
+
+  assert.ok(coordinator.cancel('editor', 'chat', 'agent-tool', 'done').ok);
+  const dump = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(dump.length, 1);
+  assert.match(JSON.stringify(dump[0]!.content), /document_diff_2/, 'the release dump includes the second batch');
+});

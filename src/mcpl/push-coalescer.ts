@@ -1005,15 +1005,18 @@ export class PushCoalescer<E = unknown> {
    * outside a turn's assembly: a batch whose wake a hold keeps back, stored
    * as it renders (held, as a plain push under the hold is), so whoever reads
    * held traffic sees it and the turn after the hold doesn't take it again.
-   * Resolves whether it materialized.
+   * A batch that opened while another render ran is rendered once that
+   * render settles. Resolves whether it materialized.
    */
   async materializeNow(agentName: string, subject: string): Promise<boolean> {
-    if (this.suspended) return false;
-    const started = await this.locked(() => this.freeze(subject, agentName));
-    if (!started || started === 'declined') return false;
-    await started.done;
-    this.persist();
-    return started.rendering.materialized === true && !started.joined;
+    for (;;) {
+      if (this.suspended) return false;
+      const started = await this.locked(() => this.freeze(subject, agentName));
+      if (!started || started === 'declined') return false;
+      await started.done;
+      this.persist();
+      if (!started.joined) return started.rendering.materialized === true;
+    }
   }
 
   /**
