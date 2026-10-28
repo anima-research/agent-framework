@@ -25375,7 +25375,7 @@ export class AgentFramework {
                 .filter((c): c is { id?: unknown; name: string; input?: unknown; unparseableInput?: string } =>
                   typeof c.name === 'string' && !cutIds.has(c.id as string)
                   && markedInputRefusal({ ...c, name: c.name }) === undefined
-                  && this.canAgentUseTool(agent.name, c.name));
+                  && this.mayCallTool(agent.name, c.name));
               const toolNames = toolCalls.map((c) => c.name);
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
@@ -28345,11 +28345,22 @@ export class AgentFramework {
     return agent ? agent.canUseTool(toolName) : !this.usedEphemeralAgentNames.has(agentName);
   }
 
+  /** Whether a call of `toolName` as `agentName` is refused at dispatch (AgentConfig.denyToolsAtDispatch, or a reader's own rule). */
+  private deniedAtDispatch(agentName: string, toolName: string): boolean {
+    return this.agents.get(agentName)?.deniesAtDispatch(toolName) === true || this.readerRefuses(agentName, toolName);
+  }
+
+  /** Whether `agentName` may call `toolName`: the one rule dispatch applies (agentToolPermissionFailure), for whatever else judges a call. */
+  private mayCallTool(agentName: string, toolName: string): boolean {
+    return !this.deniedAtDispatch(agentName, toolName)
+      && (this.canAgentUseTool(agentName, toolName) || this.readerMayCall(agentName, toolName));
+  }
+
   private agentToolPermissionFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
     // A tool refused at dispatch is refused on every path that runs the
     // agent's call (a toolset's act, executeToolCall), not only the stream's.
-    const denied = this.agents.get(agentName)?.deniesAtDispatch(call.name) === true || this.readerRefuses(agentName, call.name);
-    if (!denied && (this.canAgentUseTool(agentName, call.name) || this.readerMayCall(agentName, call.name))) return undefined;
+    if (this.mayCallTool(agentName, call.name)) return undefined;
+    const denied = this.deniedAtDispatch(agentName, call.name);
     const why = denied
       ? `${call.name} is not available to ${agentName}`
       : !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
@@ -28430,7 +28441,7 @@ export class AgentFramework {
    * (`refusedHere`) counts as one the list refuses.
    */
   private roundCallOf(agentName: string, call: { name: string; input?: unknown; unparseableInput?: string }, refusedHere = false): RoundCall {
-    const permitted = !refusedHere && markedInputRefusal(call) === undefined && this.canAgentUseTool(agentName, call.name);
+    const permitted = !refusedHere && markedInputRefusal(call) === undefined && this.mayCallTool(agentName, call.name);
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
     return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused, permitted };
   }
@@ -28457,7 +28468,7 @@ export class AgentFramework {
     // Dispatch-time deny (AgentConfig.denyToolsAtDispatch): the tool stays
     // advertised so the agent's request prefix is unchanged; the call is
     // refused here, before anything runs.
-    if (this.agents.get(agentName)?.deniesAtDispatch(call.name) || this.readerRefuses(agentName, call.name)) {
+    if (this.deniedAtDispatch(agentName, call.name)) {
       const error = `${call.name} is not available to ${agentName}`;
       // RFC-007: refused before the tool runs — no lifecycle events.
       this.toolLifecycleEmitter?.refuse(agentName, call.id);

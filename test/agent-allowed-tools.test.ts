@@ -303,6 +303,22 @@ function asXmlTurn(membrane: MockMembrane, call: { type: 'tool_use'; id: string;
 }
 
 for (const fallback of [false, true]) {
+  test(`${fallback ? 'fallback' : 'native'}: a skip_reply refused at dispatch silences nothing after its round, as one allowedTools refuses`, async () => {
+    const h = await harness({ allowedTools: ['skip_reply'], denyToolsAtDispatch: ['skip_reply'], sameRoundThinkTextPolicy: 'private' });
+    try {
+      const routed = captureRouting(h.framework);
+      const call = { type: 'tool_use' as const, id: 'disposition', name: 'skip_reply', input: { reason: 'test' } };
+      if (fallback) asXmlTurn(h.membrane, call);
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      await h.framework.runUntilIdle();
+      assert.ok(routed.includes('Public trailing prose'), 'a refused call silences nothing after its round');
+    } finally { await h.close(); }
+  });
+}
+
+for (const fallback of [false, true]) {
   for (const name of ['skip_reply', 'think', 'channel_publish']) {
     for (const permitted of [false, true]) {
       test(`${fallback ? 'fallback' : 'native'} prose disposition ${permitted ? 'honors permitted' : 'of a refused'} ${name}`, async () => {
