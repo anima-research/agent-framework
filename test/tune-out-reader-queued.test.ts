@@ -275,14 +275,24 @@ describe('reader forks and messages queued behind the resident turn', () => {
     w.coordinator.stop();
   });
 
-  it('a fork that fails after its epoch ended gives nothing back', () => {
+  it('a fork still running when its epoch ends, which then fails, has what it was handed go to one late fork', () => {
     const w = world();
     w.tuneOut();
     w.queue('ann', 'Q-1', 'w1');
+    w.store('bo', 'S-2 stored');
     w.wake();
     const failed = w.invocations[0]!;
+    assert.deepEqual(bodies(failed), { stored: ['S-2 stored'], queued: ['Q-1'] });
     assert.deepEqual(w.coordinator.cancel(SERVER, NOISY, 'agent-tool', 'resident cancelled'), { ok: true });
-    assert.equal(w.coordinator.readerFailed(failed), 0, 'the epoch is over: its cancel had its own last fork');
+    const atCancel = w.invocations.length;
+    assert.deepEqual(w.invocations.slice(1).map(bodies), [{ stored: [], queued: [] }], "premise: the cancel's last fork is handed neither");
+    w.land();
+    assert.equal(w.coordinator.readerFailed(failed), 2, 'both go to a late fork');
+    const late = w.invocations.slice(atCancel);
+    assert.equal(late.length, 1, 'one late fork');
+    assert.deepEqual(bodies(late[0]!), { stored: ['S-2 stored', 'Q-1'], queued: [] }, 'Q-1, landed since, handed as stored');
+    assert.equal(late[0]!.epochId, EPOCH);
+    assert.ok(late[0]!.notice.includes('These 2 messages were handed to a reader that failed after the tune-out ended'), late[0]!.notice);
     w.coordinator.stop();
   });
 
@@ -438,14 +448,19 @@ describe("a channel held in turn by the all-except hold and by its own tune-out"
     w.coordinator.stop();
   });
 
-  it('a fork that fails after its epoch ended gives nothing back', () => {
+  it("a late fork's own failure derives no other", () => {
     const w = world();
     w.tuneOut();
     w.store('ann', 'P-1 under its own tune-out');
     w.wake();
     const running = w.invocations[0]!;
     assert.deepEqual(w.coordinator.cancel(SERVER, NOISY, 'agent-tool', 'resident cancelled'), { ok: true });
-    assert.equal(w.coordinator.readerFailed(running), 0, "the cancel's own last fork covered the epoch");
+    assert.equal(w.coordinator.readerFailed(running), 1, 'premise: a late fork is handed P-1');
+    const late = w.invocations.at(-1)!;
+    assert.deepEqual(bodies(late), { stored: ['P-1 under its own tune-out'], queued: [] });
+    const forks = w.invocations.length;
+    assert.equal(w.coordinator.readerFailed(late), 0, 'the late fork fails too: nothing more');
+    assert.equal(w.invocations.length, forks, 'and no other fork is derived');
     w.coordinator.stop();
   });
 });

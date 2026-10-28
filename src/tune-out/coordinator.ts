@@ -314,6 +314,11 @@ export class TuneOutCoordinator {
    * (stored or still queued now). Cleared with the cursor.
    */
   private readerReturned = new Map<string, { ids: Set<string>; writeIds: Set<string> }>();
+  /**
+   * `reader: 'forks'`: the late forks derived for an ended epoch's messages
+   * (readerFailed), so that a late fork's own failure derives no other.
+   */
+  private lateForks = new WeakSet<object>();
   /** The all-except scope's durable record, cached (undefined = not read yet). */
   private scopeCache: AllExceptState | null | undefined;
   /** The epoch whose release this process delivered and whose hold is not yet recorded as cleared. */
@@ -1615,14 +1620,16 @@ export class TuneOutCoordinator {
    * channel, and its next invocation for the channel is handed them: the
    * scope's while the scope is active, though the channel's own tune-out
    * has taken the channel meanwhile, and a channel's own tune-out's while it
-   * holds the channel. Returns how many went back (0 once the epoch has
-   * ended: its cancel had its own last fork).
+   * holds the channel. Once the epoch has ended, its cancel's last fork was
+   * handed only what no fork had been, so a fork still running then is the
+   * only reader its messages had: one late fork is handed them instead
+   * (lateFork). Returns how many went back or to the late fork.
    */
   readerFailed(invocation: Pick<ReaderInvocation, 'serverId' | 'channelId' | 'epochId' | 'backlog' | 'queued'>): number {
     const { serverId, channelId, epochId } = invocation;
     const active = this.getAllExcept()?.params.epochId === epochId
       || this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId === epochId;
-    if (!active) return 0;
+    if (!active) return this.lateFork(invocation);
     const key = this.handOffKey(epochId, serverId, channelId);
     const returned = this.readerReturned.get(key) ?? { ids: new Set<string>(), writeIds: new Set<string>() };
     for (const m of invocation.backlog) returned.ids.add(m.id);
@@ -1639,6 +1646,46 @@ export class TuneOutCoordinator {
         this.divertedSinceInvocation.set(tally, (this.divertedSinceInvocation.get(tally) ?? 0) + count);
       }
     }
+    return count;
+  }
+
+  /**
+   * A fork that failed after its epoch ended: one late fork is handed what it
+   * was, with a notice saying a reader handed them failed after the tune-out
+   * ended. Those still queued when it was handed that have landed since are
+   * handed as stored. A late fork's own failure derives no other, so a
+   * reader that keeps failing costs one more fork, not a chain of them.
+   * Returns how many the late fork was handed.
+   */
+  private lateFork(invocation: Pick<ReaderInvocation, 'serverId' | 'channelId' | 'epochId' | 'backlog' | 'queued'>): number {
+    if (!this.hooks.invokeReader || this.lateForks.has(invocation)) return 0;
+    const { serverId, channelId, epochId } = invocation;
+    const landed = new Map<string, StoredMessage>();
+    for (const m of this.hooks.getStoredMessages()) {
+      const writeId = writeIdOf(m);
+      if (writeId !== undefined) landed.set(writeId, m);
+    }
+    const backlog = [...invocation.backlog, ...invocation.queued.flatMap((m) => landed.get(m.writeId) ?? [])]
+      .sort((a, b) => a.sequence - b.sequence);
+    const queued = invocation.queued.filter((m) => !landed.has(m.writeId));
+    const count = backlog.length + queued.length;
+    if (count === 0) return 0;
+    const these = count === 1 ? 'This message was' : `These ${count} messages were`;
+    const notice = `[${NOTICE_TAG.tuneOutCancelled}: ${this.shown(serverId, channelId)} — ${these} handed to a reader that `
+      + `failed after the tune-out ended, so no reader has read ${count === 1 ? 'it' : 'them'} yet.]`;
+    const entries = Object.entries(this.readDispositions());
+    const late: ReaderInvocation = {
+      serverId,
+      channelId,
+      epochId,
+      trigger: 'cancel',
+      notice,
+      backlog,
+      queued,
+      dispositions: entries.length > 0 ? entries.map(([k, v]) => `- ${k}: ${v}`).join('\n') : null,
+    };
+    this.lateForks.add(late);
+    this.hooks.invokeReader(late);
     return count;
   }
 
