@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../../src/index.js';
 import type { TraceEvent } from '../../src/index.js';
+import type { Module } from '../../src/types/index.js';
 import { MockYieldingStream, createMockResponse } from './mock-membrane.js';
 import type { TuneOutCoordinator } from '../../src/tune-out/coordinator.js';
 import { JsStore } from '@animalabs/chronicle';
@@ -61,7 +62,7 @@ type Internals = {
 const internals = (f: AgentFramework) => f as unknown as Internals;
 export const toolNames = (request: NormalizedRequest) => ((request as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name);
 
-export function rig(name: string, allowChannelSpeech: boolean) {
+export function rig(name: string, allowChannelSpeech: boolean, opts: { modules?: Module[] } = {}) {
   const traces: TraceEvent[] = [];
   const CHECKED = ['deliver_summary', 'cancel_tuneout', 'note_disposition', 'speak_in_channel', 'channel_publish'];
   /** Each fork's dispatch-deny table, read while it runs (a fork can start and end between two polls). */
@@ -79,7 +80,7 @@ export function rig(name: string, allowChannelSpeech: boolean) {
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       subconscious: { enabled: true, reader: 'forks', ...SECTION, allowChannelSpeech },
       mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: state.statusPath, COMMAND_PATH: state.commandPath } }],
-      modules: [],
+      modules: opts.modules ?? [],
     });
     state.framework.onTrace((event) => {
       traces.push(event);
