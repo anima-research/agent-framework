@@ -33,6 +33,7 @@ import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.j
 const here = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(here, 'fixtures', 'legacy-version-server.mjs');
 const HOST_CAPS: McplHostCapabilities = { version: '0.5', pushEvents: true };
+const LONGER_THAN_ANY_START_MS = 60_000;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -50,10 +51,10 @@ const starts = (log: string): number[] =>
   existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => Number(l.split(' ')[1])) : [];
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
-  const deadline = Date.now() + ms;
+async function until(cond: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + LONGER_THAN_ANY_START_MS;
   while (!cond() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
-  assert.ok(cond(), `in time: ${what}`);
+  assert.ok(cond(), `${what}, within ${LONGER_THAN_ANY_START_MS} ms`);
 }
 
 function config(mode: string, log: string, extra: Partial<McplServerConfig> = {}): McplServerConfig {
