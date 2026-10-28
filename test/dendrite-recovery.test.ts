@@ -136,6 +136,39 @@ describe('the registry\'s recovery', () => {
     assert.equal(first.listHeldMail().length, 1, 'and the retry holds it once');
   });
 
+  it('a put-back rewrites the branch-local snapshot, and one rewrite failing doesn\'t stop the next', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const store = first.getStore();
+    // The branch-local write fails once: the put-back's own rewrite of it lands.
+    let failures = 0;
+    let undo = failOn(store, 'setStateJson', REGISTRY, () => failures++ === 0);
+    try {
+      assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated setStateJson failure/);
+    } finally { undo(); }
+    const local = store.getStateJson(REGISTRY) as { records: Array<{ name: string; ended?: unknown }> };
+    assert.ok(local.records.some((r) => r.name === 'boss' && r.ended === undefined), 'the branch-local snapshot has boss live again');
+    // The ended file's rewrite fails during the put-back: the registry file's still happens.
+    const internal = first as unknown as { writeRecoveryFile: (path: string, document: unknown) => void };
+    const write = internal.writeRecoveryFile.bind(first);
+    let putBack = false;
+    internal.writeRecoveryFile = (path, document) => {
+      if (putBack && path === endedFile()) throw new Error('EIO: the ended file');
+      write(path, document);
+    };
+    undo = failOn(store, 'setStateJson', REGISTRY, () => { putBack = true; return true; });
+    try {
+      assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated setStateJson failure/);
+    } finally {
+      undo();
+      delete (first as unknown as Record<string, unknown>).writeRecoveryFile;
+    }
+    const file = JSON.parse(readFileSync(registryFile(), 'utf8')) as { records: Array<{ name: string; ended?: unknown }> };
+    assert.ok(file.records.some((r) => r.name === 'boss' && r.ended === undefined), 'the registry file is rewritten from memory, not left as the stop wrote it');
+  });
+
   it('when the put-back fails too, the caller still hears why its change failed', async () => {
     const gates = new GateModule();
     const first = await boot(gates);

@@ -319,6 +319,25 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.equal(registry.list({ includeEnded: true }).filter((r) => r.name === 'job').length, 2);
   });
 
+  it('refuses a version-1 snapshot without its map of incarnations', () => {
+    assert.throws(
+      () => new AgentRegistry().restore({ version: 1, records: [], mail: [] } as unknown as RegistrySnapshot),
+      /reads as version 1 but has no map of incarnations; nothing was restored/,
+    );
+  });
+
+  it('a put-back that throws is reported, and the change\'s own error is what the caller hears', () => {
+    const said: string[] = [];
+    const registry = new AgentRegistry({
+      persist: () => { throw new Error('EIO: the change'); },
+      onRollback: () => { throw new Error('EIO: the put-back'); },
+      onRecordWriteFailed: (what) => { said.push(what); },
+    });
+    assert.throws(() => registry.register(residentSpec('mira', { primary: true })), /EIO: the change/);
+    assert.equal(registry.has('mira'), false, 'and the change is put back');
+    assert.deepEqual(said, ['the put-back of a change that failed']);
+  });
+
   it('tolerates a missing snapshot, and refuses one in a version it does not read', () => {
     const registry = new AgentRegistry();
     assert.deepEqual(registry.restore(null), { interrupted: [] });
