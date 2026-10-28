@@ -12,7 +12,7 @@
  */
 
 import WebSocket from 'ws';
-import { createInterface } from 'node:readline';
+import { escapeLineSeparators, readLines } from '../line-reader.js';
 import type { ApiRequest, ApiResponse, ApiEvent } from './types.js';
 
 // ============================================================================
@@ -86,18 +86,7 @@ export class McpServer {
     // Connect to WebSocket API
     await this.connectWs();
 
-    // Set up stdio interface
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false,
-    });
-
-    rl.on('line', (line) => {
-      this.handleInput(line);
-    });
-
-    rl.on('close', () => {
+    readLines(process.stdin, (line) => this.handleInput(line), () => {
       this.close();
       process.exit(0);
     });
@@ -667,7 +656,7 @@ export class McpServer {
   }
 
   private send(message: JsonRpcResponse | JsonRpcNotification): void {
-    process.stdout.write(JSON.stringify(message) + '\n');
+    process.stdout.write(escapeLineSeparators(JSON.stringify(message)) + '\n');
   }
 
   close(): void {
