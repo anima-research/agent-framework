@@ -329,6 +329,21 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.deepEqual(second.reconcile().unconfigured.map((o) => o.ended.name), ['oren'], 'oren was awaiting re-declaration');
   });
 
+  it('inspects the newest of two pending incarnations once memory has let both go', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(workerSpec('j', { spawnedBy: 'mira' }));
+    first.register(workerSpec('k', { spawnedBy: 'mira' }));
+    const snapshot = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    const j = snapshot.records.find((r) => r.name === 'j')!;
+    snapshot.records.splice(snapshot.records.indexOf(j) + 1, 0, { ...j, incarnation: 2 });
+    snapshot.incarnations.j = 2;
+    const second = new AgentRegistry({ endedRetention: 1, persist: () => {}, appendEnded: () => {} });
+    second.restore(snapshot, []);
+    assert.equal(second.inspect('j')?.incarnation, 2);
+  });
+
   it('settles two interrupted incarnations of one name as two ends', () => {
     const { state, make } = persisted();
     const first = make();

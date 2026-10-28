@@ -259,9 +259,13 @@ export class AgentRegistry {
     for (let i = this.ended.length - 1; i >= 0; i--) {
       if (this.ended[i]!.name === name) return this.ended[i];
     }
-    // An interrupted record trimmed from memory before its end is written.
-    for (const pending of this.interruptedPending.values()) if (pending.ended.name === name) return pending.ended;
-    return this.findEnded?.(name);
+    // An interrupted record trimmed from memory before its end is written:
+    // the newest incarnation, where two of one name are pending.
+    let newest: AgentRecord | undefined;
+    for (const { ended } of this.interruptedPending.values()) {
+      if (ended.name === name && (!newest || ended.incarnation > newest.incarnation)) newest = ended;
+    }
+    return newest ?? this.findEnded?.(name);
   }
 
   /** Flat list of agents — the discovery surface. Ended ones on request. */
