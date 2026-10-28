@@ -352,6 +352,39 @@ describe('tune-out, all-except scope', () => {
     } finally { await f.close(); }
   });
 
+  it("a close of the excepted channel that can't be recorded still says the focus ended, since it did", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enterAllExcept(f, 'work');
+      const registry = internals(f).channelRegistry as unknown as { setDesiredState(...args: unknown[]): void };
+      const record = registry.setDesiredState.bind(registry);
+      registry.setDesiredState = (...args: unknown[]) => {
+        if (args[2] === 'closed') throw new Error('the log refused it');
+        return record(...args);
+      };
+      const result = await f.framework.executeToolCall({ id: 'c1', name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never);
+      assert.equal(result.success, false);
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'the scope ended');
+      assert.match(result.error ?? '', /The focus on it ended all the same/);
+    } finally { await f.close(); }
+  });
+
+  it('closing the excepted channel ends the scope when the channel was closed already', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const close = (id: string) => f.framework.executeToolCall({ id, name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never);
+      assert.ok((await close('c0')).success);
+      await eventually(() => internals(f).channelRegistry.getDesiredState('editor', 'work') === 'closed', 'work closed');
+      enterAllExcept(f, 'work');
+      const result = await close('c1');
+      assert.ok(result.success, result.error);
+      assert.equal((result.data as { status?: string }).status, 'already closed');
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'the scope ended');
+    } finally { await f.close(); }
+  });
+
   it("where another server shares a channel's id, check/peek and focus take the names the other modes take, and the subconscious's cancel_tuneout naming the scope ends it though channelId names that shared id", async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {

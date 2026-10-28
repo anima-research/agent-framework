@@ -31444,14 +31444,11 @@ export class AgentFramework {
         // before this hook is called (ChannelRegistry.tunedOutRefusal).
         onToolClose: (serverId, channelId) => {
           const coordinator = this.tuneOutCoordinator;
-          if (!coordinator) return;
-          if (this.channelRegistry?.getTuneOutState(serverId, channelId)) {
-            coordinator.cancel(serverId, channelId, 'channel-close', 'channel closed', undefined, undefined, 'closed');
-          }
+          if (!coordinator) return undefined;
           const scope = coordinator.getAllExcept();
-          if (scope && scope.params.except.serverId === serverId && scope.params.except.channelId === channelId) {
-            coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
-          }
+          if (!scope || scope.params.except.serverId !== serverId || scope.params.except.channelId !== channelId) return undefined;
+          coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+          return 'The focus on it ended all the same, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
         // Route a conversation fork's plain-text speech to its HOME channel, not

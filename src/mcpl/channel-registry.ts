@@ -1010,9 +1010,11 @@ interface ChannelRegistryOptions {
    * A channel is being closed by tool: an all-except hold whose exception
    * this is ends through the cancel flow (release the backlog, record the
    * end) before the lifecycle state flips to closed (issue #232 gap 9). A
-   * tool close of a tuned-out channel is refused before this is called.
+   * tuned-out channel's close is refused before this (its cancel ends it).
+   * Returns what it ended, in a sentence the close's answer adds when the
+   * close itself isn't recorded.
    */
-  onToolClose?: (serverId: string, channelId: string) => void;
+  onToolClose?: (serverId: string, channelId: string) => string | undefined;
   /**
    * The channel unprefixed speech lands in while an all-except hold is
    * active (its exception), else null. Consulted after a fork's home and
@@ -1180,7 +1182,7 @@ export class ChannelRegistry {
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private readonly latestInboundLocus: boolean;
-  private onToolClose?: (serverId: string, channelId: string) => void;
+  private onToolClose?: (serverId: string, channelId: string) => string | undefined;
   private focusChannelResolver?: () => ChannelRef | null;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
@@ -5227,12 +5229,13 @@ export class ChannelRegistry {
       // Closed already, perhaps only by default: the agent's close is still
       // its decision, and is recorded as one (setDesiredState), so a later
       // registration's lift of a default leaves the channel closed.
+      const ended = this.onToolClose?.(entry.serverId, input.channelId);
       try {
         this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
       } catch (err) {
         return {
           success: false,
-          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}`,
+          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended}` : ''}`,
           isError: true,
         };
       }
@@ -5278,13 +5281,15 @@ export class ChannelRegistry {
     // A hold around this channel — the all-except scope it is the excepted
     // channel of — ends through the cancel flow: backlog released, end
     // recorded, never by overwriting state (#232 gap 9).
-    this.onToolClose?.(entry.serverId, input.channelId);
+    const ended = this.onToolClose?.(entry.serverId, input.channelId);
 
-    // A decision the log refused changed nothing, and the answer says so.
+    // A decision the log refused changed nothing for the channel, and the
+    // answer says so, and what the hook ended all the same.
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     } catch (err) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, unrecordedDecision(err)), isError: true };
+      const text = this.lifecycleFailureText('close', entry, unrecordedDecision(err));
+      return { success: false, error: ended ? `${text} ${ended}` : text, isError: true };
     }
     // This channel's typing, not every channel with its id (stopTyping's
     // fan-out of a bare name).
