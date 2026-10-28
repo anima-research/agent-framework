@@ -223,22 +223,6 @@ export interface GateOptions {
    *  null), the judge is wired with its defaults; it runs only for `judge`
    *  rules, so a gate with none makes no judge calls. */
   judge?: ReplyJudgeOptions | null;
-  /**
-   * Hold message-driven wakes (MCPL channel-incoming / push-event that the
-   * policies would trigger) until no further message has arrived in the same
-   * channel for `quietMs`, capped at `maxWaitMs` (default 30000) from the
-   * channel's first held message; then wake once for the burst. Messages
-   * still enter context at arrival; only the wake waits. A message the
-   * policies didn't trigger extends a hold already open for its channel (a
-   * rate-limited part of the same burst) but opens none. The held wake goes
-   * the way a `debounce` policy's batch does: it carries the burst's route
-   * (`routeChannelId`, so a held DM's reply goes back to the DM), an agent
-   * mid-turn gets it after the turn, a quiesced host at resume, and an agent
-   * asleep when the hold ends gets none (the messages are in context for its
-   * wake). The heartbeat, scheduled wakes and tool results are unaffected.
-   * Default off.
-   */
-  messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
 }
 
 /**
@@ -358,8 +342,6 @@ export interface GateDecision {
   policyName: string | null;
   /** The behavior that was applied. */
   behavior: GateBehavior;
-  /** The trigger was converted into a held quiet-period wake. */
-  quietHeld?: boolean;
   /**
    * Names of `passthrough` policies that matched and counted this event but
    * did not fire, so evaluation continued past them. Absent when none did.

@@ -806,6 +806,53 @@ const turnRearmDelays = (value: unknown): readonly number[] => {
   return [...value];
 };
 
+/** FrameworkConfig.messageQuietPeriod, read once: both numbers finite and
+ *  0 or more, maxWaitMs defaulting to 30 s; anything else refuses the config. */
+const quietPeriodOf = (value: unknown): { quietMs: number; maxWaitMs: number } | undefined => {
+  if (value === undefined) return undefined;
+  const bad = (): never => {
+    throw new Error('FrameworkConfig.messageQuietPeriod must be { quietMs, maxWaitMs? }, each a finite number ' +
+      `of ms, 0 or more, not ${shownValue(value)}`);
+  };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return bad();
+  const { quietMs, maxWaitMs } = value as { quietMs?: unknown; maxWaitMs?: unknown };
+  if (typeof quietMs !== 'number' || !Number.isFinite(quietMs) || quietMs < 0) return bad();
+  if (maxWaitMs !== undefined && (typeof maxWaitMs !== 'number' || !Number.isFinite(maxWaitMs) || maxWaitMs < 0)) return bad();
+  return { quietMs, maxWaitMs: maxWaitMs ?? 30_000 };
+};
+
+/**
+ * How much longer an idle agent's turn waits for its message burst to end
+ * (FrameworkConfig.messageQuietPeriod), in ms; 0 starts it now. The batch
+ * waits only while every wake in it is a message wake: a channel message's
+ * or a server event's (other than the heartbeat's), and none a continuation
+ * or a retry of the agent's turn. It ends `quietMs` after the newest message
+ * wake, or `maxWaitMs` after the oldest, whichever is first.
+ */
+export function quietHoldRemaining(
+  requests: readonly InferenceRequest[],
+  now: number,
+  quiet: { quietMs: number; maxWaitMs: number } | undefined,
+): number {
+  if (!quiet || quiet.quietMs <= 0 || requests.length === 0) return 0;
+  let newest = -Infinity;
+  let oldest = Infinity;
+  for (const r of requests) {
+    if (!isMessageWake(r)) return 0;
+    if (r.timestamp > newest) newest = r.timestamp;
+    if (r.timestamp < oldest) oldest = r.timestamp;
+  }
+  return Math.max(0, Math.min(quiet.quietMs - (now - newest), quiet.maxWaitMs - (now - oldest)));
+}
+
+/** A wake a message made: a channel message's or a server event's, other
+ *  than the heartbeat's, that neither continues nor retries a turn. */
+function isMessageWake(r: InferenceRequest): boolean {
+  return (r.reason === 'mcpl:channel-incoming' || r.reason === 'mcpl:push-event')
+    && r.source !== 'heartbeat'
+    && !continuesTurn(r) && !carriesContinuation(r) && mergedBatch(r) === undefined;
+}
+
 const settingBoolean = (name: string, value: unknown): boolean => {
   if (typeof value === 'boolean') return value;
   if (value === 'true' || value === 'false') return value === 'true';
@@ -3508,6 +3555,10 @@ export class AgentFramework {
    *  Drives hard-down escalation — see noteInferenceExhausted. */
   private consecutiveInferenceFailures: Map<string, number> = new Map();
   private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
+  /** FrameworkConfig.messageQuietPeriod, validated; undefined when off. */
+  private quietPeriod: { quietMs: number; maxWaitMs: number } | undefined;
+  /** Agents whose turn start a quiet period holds now, for one log line per burst. */
+  private quietHeldAgents = new Set<string>();
   private turnRearms: Map<string, number> = new Map();
   private exhaustingRearms: Set<string> = new Set();
   private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
@@ -4251,6 +4302,7 @@ export class AgentFramework {
     );
     framework.providerHoldHook = config.providerHold;
     framework.turnRearmMs = turnRearmDelays(config.exhaustedTurnRearmMs);
+    framework.quietPeriod = quietPeriodOf(config.messageQuietPeriod);
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
@@ -4369,7 +4421,6 @@ export class AgentFramework {
         } : {}),
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
-        messageQuietPeriod: config.gate.messageQuietPeriod,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
@@ -17030,6 +17081,24 @@ export class AgentFramework {
         this.pendingRequests.push(...requests);
         continue;
       }
+
+      // A message quiet period (FrameworkConfig.messageQuietPeriod): an idle
+      // agent's turn waits while message wakes for it keep arriving, and
+      // starts once with everything queued (the merge below). Each wake
+      // keeps what the gate and the ingress gave it; only the start waits.
+      // The loop's next pass reads the queue again (runLoop's backoff), so
+      // the requests go back as a busy agent's do, with no timer of their
+      // own. A batch holding any other wake starts now (quietHoldRemaining).
+      const quietLeft = quietHoldRemaining(requests, now, this.quietPeriod);
+      if (quietLeft > 0) {
+        if (!this.quietHeldAgents.has(agentName)) {
+          this.quietHeldAgents.add(agentName);
+          console.error(`[quiet-period] agent=${agentName}: holding the turn for a message burst (${requests.length} wake(s) so far)`);
+        }
+        this.pendingRequests.push(...requests);
+        continue;
+      }
+      this.quietHeldAgents.delete(agentName);
 
       // A wake whose sole cause was a write deferred for this agent
       // (readsDeferredWrite), or a message stored for it as it arrived

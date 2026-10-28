@@ -241,8 +241,6 @@ interface RateBucket {
 
 /** Synthetic key used when a policy has no `keyBy` or the field is missing. */
 const SHARED_BUCKET_KEY = '__shared__';
-/** The policy name a quiet-period hold's events carry (GateOptions.messageQuietPeriod). */
-const QUIET_PERIOD_POLICY = 'quiet-period';
 
 interface CompiledPolicy {
   policy: GatePolicy;
@@ -2056,14 +2054,6 @@ export class EventGate {
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
-  // Message quiet period (GateOptions.messageQuietPeriod): a message-driven
-  // wake is held until no further message has arrived in its channel for
-  // quietMs (capped at maxWaitMs from the channel's first held one), then
-  // fires once, through the debounce path (fireDebounce): an agent mid-turn
-  // gets it after the turn, a quiesced host at resume.
-  private readonly quietMs: number;
-  private readonly quietMaxWaitMs: number;
-  private readonly quietHolds = new Map<string, { timer: ReturnType<typeof setTimeout>; events: PendingEvent[]; firstAt: number }>();
 
   // Reply judge state (`judge` rules). The judge itself, when the host wires
   // one; without it a judge rule's batch is delivered as a debounce's.
@@ -2226,18 +2216,12 @@ export class EventGate {
      *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
      *  (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
-    /** See GateOptions.messageQuietPeriod. */
-    messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
      *  source never sends. Absent: any source can send any type. */
     eventTypesFrom?: EventTypesFrom;
   }) {
-    this.quietMs = Math.max(0, opts.messageQuietPeriod?.quietMs ?? 0);
-    // The cap is the operator's: a maxWaitMs below quietMs ends the hold at
-    // maxWaitMs, not at quietMs.
-    this.quietMaxWaitMs = Math.max(0, opts.messageQuietPeriod?.maxWaitMs ?? 30_000);
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
     this.emitTrace = opts.emitTrace;
@@ -3192,25 +3176,6 @@ export class EventGate {
       this.defaultByEventType.set(info.eventType, bucket);
     }
     if (observed.length > 0) decision.observed = observed;
-    // Message quiet period: a message's wake is held, by channel, until the
-    // channel goes quiet. The heartbeat is no message (its wakes stay
-    // immediate, as under sleep). A message the policies didn't trigger
-    // (a rate-limited part of the same burst, say) extends a hold already
-    // open for its channel, so the wake waits for the whole burst, but opens
-    // none.
-    if (
-      this.quietMs > 0 &&
-      info.serverId !== 'heartbeat' &&
-      (info.eventType === 'mcpl:channel-incoming' || info.eventType === 'mcpl:push-event')
-    ) {
-      const key = this.quietKeyFor(info);
-      if (decision.trigger) {
-        this.holdForQuietPeriod(key, info);
-        decision = { ...decision, trigger: false, quietHeld: true };
-      } else if (this.quietHolds.has(key)) {
-        this.armQuietHold(key);
-      }
-    }
 
     this.emitTrace({
       type: 'gate:decision',
@@ -3622,87 +3587,6 @@ export class EventGate {
     }
   }
 
-  /** The hold a message belongs to: its registered channel, else its own
-   *  channel id, else one shared hold, so chatter in one channel doesn't hold
-   *  a DM in another. */
-  private quietKeyFor(info: GateEventInfo): string {
-    return this.routeChannelFor(info) ?? (info.channelId || SHARED_BUCKET_KEY);
-  }
-
-  /** Hold a message-driven wake until its channel goes quiet. The message
-   *  itself is already in context (stored at arrival); only the WAKE waits,
-   *  so a caption and its images, or a reply split into several Discord
-   *  messages, reach the agent as one turn instead of several. The held event
-   *  is shaped as a debounce policy's, and fires through the same path. */
-  private holdForQuietPeriod(key: string, info: GateEventInfo): void {
-    const now = this.now();
-    const event: PendingEvent = {
-      policyName: QUIET_PERIOD_POLICY,
-      content: info.content.length > MAX_CONTENT_SNIPPET
-        ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
-        : info.content,
-      eventType: info.eventType,
-      timestamp: now,
-      inContext: true,
-      channelId: info.channelId || undefined,
-      channelLabel:
-        typeof info.metadata?.channelName === 'string' && info.metadata.channelName
-          ? (info.metadata.channelName as string)
-          : undefined,
-      authorId: this.extractAuthorId(info.metadata) ?? undefined,
-      serverId: info.serverId || undefined,
-      addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
-      // The held wake's route: a held DM's reply goes back to the DM.
-      routeChannelId: this.routeChannelFor(info),
-      ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
-      ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
-    };
-    const hold = this.quietHolds.get(key);
-    if (hold) {
-      hold.events.push(event);
-    } else {
-      this.quietHolds.set(key, { timer: setTimeout(() => {}, 0), events: [event], firstAt: now });
-    }
-    this.armQuietHold(key);
-  }
-
-  /** (Re)arm a hold's timer: quietMs from now, but no later than maxWaitMs
-   *  from the hold's first message. */
-  private armQuietHold(key: string): void {
-    const hold = this.quietHolds.get(key);
-    if (!hold) return;
-    clearTimeout(hold.timer);
-    const wait = Math.max(0, Math.min(this.quietMs, hold.firstAt + this.quietMaxWaitMs - this.now()));
-    hold.timer = setTimeout(() => this.fireQuietHold(key), wait);
-  }
-
-  /** A hold's end. Asleep, the wake is dropped as the messages' own would
-   *  have been (sleep suppresses external wakes; the messages are in context
-   *  for the agent's wake). Otherwise the batch goes as a debounce batch
-   *  does: buffered for an agent mid-turn or a quiesced host, delivered
-   *  now otherwise. */
-  private fireQuietHold(key: string): void {
-    const hold = this.quietHolds.get(key);
-    this.quietHolds.delete(key);
-    if (!hold || hold.events.length === 0) return;
-    const events = hold.events;
-    if (this.sleepUntil > this.now()) {
-      this.sleepSuppressed += events.length;
-      this.emitTrace({
-        type: 'gate:decision',
-        eventType: events[events.length - 1].eventType,
-        serverId: events[events.length - 1].serverId,
-        channelId: events[events.length - 1].channelId,
-        matchedPolicy: 'asleep',
-        trigger: false,
-        behavior: 'skip',
-        timestamp: this.now(),
-      });
-      return;
-    }
-    this.fireBatch(QUIET_PERIOD_POLICY, events);
-  }
-
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
     const debounceMs = batchQuietMs(policy.behavior) ?? MIN_DEBOUNCE_MS;
     const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
@@ -3761,16 +3645,12 @@ export class EventGate {
 
     // A judge rule's batch goes to the reply judge, which delivers it, or
     // doesn't, once it has decided (judgeBatch). Without a judge wired it's
-    // delivered as a debounce's batch is (fireBatch).
+    // delivered below, as a debounce's batch is.
     if (state.judge && this.judgeFn) {
       this.judgeBatch(policyName, events, state.judge);
       return;
     }
-    this.fireBatch(policyName, events);
-  }
 
-  /** A batch's end, for a debounce policy's and a quiet-period hold's alike. */
-  private fireBatch(policyName: string, events: PendingEvent[]): void {
     // If any agent is currently inferring — or the host is quiesced — buffer
     // for later (with cap). While quiesced, delivering would write a
     // "[Gate: N events]" message into the very context being operated on
@@ -3810,20 +3690,15 @@ export class EventGate {
   private deliverEvents(events: PendingEvent[]): void {
     if (events.length === 0) return;
 
-    // A quiet-period hold's messages get no line: they are the newest
-    // entries of their channel's window, right above the wake, and the hold
-    // exists to spend one turn on them, not to add to it. A debounce
-    // policy's events keep their line as before.
-    const lined = events.filter(e => e.policyName !== QUIET_PERIOD_POLICY);
-    const policyNames = [...new Set(lined.map(e => e.policyName))];
+    const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL
     // channel-incoming / push-event) get a compact REFERENCE — re-quoting
     // them here would inject a duplicate copy of the message minutes after
     // the fact, reading as fresh input the agent may have already handled.
     // Only events with no context entry of their own carry their content.
-    const quoted = lined.filter(e => !e.inContext);
-    const referenced = lined.filter(e => e.inContext);
+    const quoted = events.filter(e => !e.inContext);
+    const referenced = events.filter(e => e.inContext);
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${suppliedValue(e.content)}`);
     // How each referenced channel is named in the line, in order.
@@ -3870,12 +3745,10 @@ export class EventGate {
     // gate hands the line to the wake (WakeProvenance.line) and a fresh start
     // of the wake's turn decides it (WakeLine). Several messages, one with
     // anything after it, or content the line quotes, keep the line now.
-    const text = `[${NOTICE_TAG.gate}: ${lined.length} event${lined.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
-    const only = lined.length === 1 && lined[0].inContext ? lined[0] : undefined;
+    const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
-    if (lined.length === 0) {
-      // Nothing to write: a quiet-period batch alone.
-    } else if (only && this.newestEntry(only)) {
+    if (only && this.newestEntry(only)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
       line = {
         entry: entryRef(only),
@@ -3902,9 +3775,8 @@ export class EventGate {
     // shared by every agent the batch wakes, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
-    const reason = lined.length === 0 ? 'gate:quiet-period' : 'gate:debounce';
     for (const agentName of this.getAgentNamesFn()) {
-      this.requestInferenceFn(agentName, reason, 'gate', provenance);
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
 
@@ -4755,13 +4627,6 @@ export class EventGate {
     }
     this.judging.clear();
     this.judgeHeld.clear();
-    // A quiet-period hold goes with the gate: fired after a stop(), its wake
-    // would reach a stopped framework. Its messages are in context; the next
-    // lifecycle's first wake reads them.
-    for (const hold of this.quietHolds.values()) {
-      clearTimeout(hold.timer);
-    }
-    this.quietHolds.clear();
     for (const timer of this.selfWakeTimers.values()) {
       clearTimeout(timer);
     }

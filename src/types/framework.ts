@@ -261,6 +261,22 @@ export interface FrameworkConfig {
    * `abortInference()` doesn't end it.
    */
   exhaustedTurnRearmMs?: number[] | false;
+  /**
+   * A message quiet period: an idle agent's turn waits while message wakes
+   * for it keep arriving, so a burst (a caption and its images, a reply split
+   * into several messages) starts one turn, not one per part. The scheduler
+   * holds the start until `quietMs` have passed since the agent's newest
+   * message wake, or `maxWaitMs` (default 30000) since its oldest held one,
+   * then starts one turn with everything queued, as it merges queued wakes
+   * today. A message wake is a channel message's or a server event's
+   * (`mcpl:channel-incoming`, `mcpl:push-event`) other than the heartbeat's.
+   * Each message's own decision stays what the gate gives it: who wakes a
+   * sleeping agent, where a reply goes, what tune-out and conversation
+   * routing see. A batch holding any other wake (a timer, an operator, a
+   * tool result, a continuation or a retry of the agent's turn) starts now.
+   * Off when omitted.
+   */
+  messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
 
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;

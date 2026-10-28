@@ -1,11 +1,12 @@
-- Opt-in gate `messageQuietPeriod: { quietMs, maxWaitMs? }`: a message's
-  wake is held until its channel has been quiet for `quietMs` (at most
-  `maxWaitMs`, default 30 s, from the channel's first held message), so a
-  caption and its attachments, or a reply split into several messages, wake
-  the agent once instead of once per part. Messages still enter context at
-  arrival; only the wake waits, and no line is written for it. The held wake
-  goes as a `debounce` policy's batch does: it carries the burst's route, so
-  a held DM's reply goes back to the DM; an agent mid-turn gets it after the
-  turn; a quiesced host at resume; an agent asleep when the hold ends gets
-  none. Holds are per channel, so chatter in one channel delays no other's.
-  The heartbeat, scheduled wakes and tool results are unaffected.
+- Opt-in `FrameworkConfig.messageQuietPeriod: { quietMs, maxWaitMs? }`: an
+  idle agent's turn waits while message wakes for it keep arriving, so a
+  burst (a caption and its attachments, a reply split into several messages)
+  starts one turn instead of one per part. The scheduler holds the start
+  until `quietMs` have passed since the agent's newest message wake, or
+  `maxWaitMs` (default 30 s) since its oldest held one, then starts one turn
+  with everything queued, as it merges queued wakes today. Each message's
+  own decision stays what the gate gives it: who wakes a sleeping agent,
+  where a reply goes, what tune-out and conversation routing see. A batch
+  holding any other wake (a timer, an operator, a tool result, a
+  continuation or a retry of the agent's turn) starts now; the heartbeat is
+  no message wake. (#179, carried by #856.)
