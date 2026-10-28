@@ -23,41 +23,41 @@
   a transient failure, unless it follows another such cut with no transient
   failure or answered round between them: two such cuts in a row end the
   re-arming, and the second gets no retry from the error policy, even in a
-  re-armed turn that got partway. A re-armed turn's transient failure or
-  answered round clears an earlier cut, and so do a completed turn, a message
-  said to the agent and `stop()`. Every such cut counts, including one the
-  error policy retries or a host's provider hold takes. A deadline the host
-  sets on a turn still ends it. A wake for the agent while it waits starts its
-  turn at once, with the re-armed trigger merged in. That turn is the wake's:
-  the error policy retries its failures. A completed turn starts the count
-  again, and so does a message said to the agent (not a system message or
-  notice; not an edit, reaction or deletion, unless an edit is the first
-  version of a message the agent sees; not a message its own view leaves out,
-  such as one a tune-out holds from it; and not the agent's own schedule: the
-  heartbeat's tick or reminder, a self-wake timer it set, or a script's wake.
-  A notice a module or an MCPL server stores as a message counts, and a
-  message in the residents' shared slot counts for each resident that reads
-  it), so each such message gets its own re-sends, over about 42 minutes after
-  its turn first exhausts at the default delays; any other wake leaves the
-  count going on. A heartbeat-mcpl server registered under another id stores
-  its ticks as ordinary messages, so each of its ticks starts the count again
-  too. A re-armed turn's transient failure writes no `[inference-failed]`
-  marker unless it got partway, so the agent's context keeps the one the first
+  re-armed turn that got partway. A transient failure or an answered round in
+  any of the agent's turns clears an earlier cut, and so does a message said
+  to the agent. Every such cut counts, including one the error policy retries
+  or a host's provider hold takes. A deadline the host sets on a turn still
+  ends it. A wake for the agent while it waits starts its turn at once, with
+  the re-armed trigger merged in. That turn is the wake's: the error policy
+  retries its failures. A completed turn starts the count again, and so does a
+  message said to the agent (not a system message or notice; not an edit,
+  reaction or deletion, unless an edit is the first version of a message the
+  agent sees; not a message its own view leaves out, such as one a tune-out
+  holds from it; and not the agent's own schedule: the heartbeat's tick or
+  reminder, a self-wake timer it set, or a script's wake. A notice a module or
+  an MCPL server stores as a message counts, and a message in the residents'
+  shared slot counts for each resident that reads it), so each such message
+  gets its own re-sends, over about 42 minutes after its turn first exhausts
+  at the default delays; any other wake leaves the count going on. A
+  heartbeat-mcpl server registered under another id stores its ticks as
+  ordinary messages, so each of its ticks starts the count again too. A
+  re-armed turn's transient failure writes no `[inference-failed]` marker
+  unless it got partway, so the agent's context keeps the one the first
   exhaustion wrote; a failure of another kind writes its own. A judge rule's
   judge is told when the re-arm comes, and can make its calls while the agent
   waits. The health snapshot shows the wait under `providerAdmission`, with a
   `cooldownReason` that says the turn is sent again; a re-arm that comes while
   a provider hold is already on the agent waits for that hold instead, under
-  its reason, and takes its count all the same. The wait, the count and a cut
-  taken once are kept in memory, so `stop()` or a restart drops them, and
-  `abortInference()` doesn't end the wait. Set `exhaustedTurnRearmMs` to other
-  delays, or to `false` to send nothing again. **Unchanged:** ephemeral runs
-  and conversation forks, a failure the provider refuses, a compile refused
-  over budget, a deadline, whether the host set it or membrane marks one as
-  run out (the runtime's or undici's on a sent request, the Anthropic
-  adapter's watchdogs, or the Anthropic SDK's timeout, which covers its
-  connect timeout too) apart from that one exception, and a provider's stated
-  wait, which the framework holds as before.
+  its reason, and takes its count all the same. The wait and the count are
+  kept in memory, so `stop()` or a restart drops them, and `abortInference()`
+  doesn't end the wait. Set `exhaustedTurnRearmMs` to other delays, or to
+  `false` to send nothing again. **Unchanged:** ephemeral runs and
+  conversation forks, a failure the provider refuses, a compile refused over
+  budget, a deadline, whether the host set it or membrane marks one as run out
+  (the runtime's or undici's on a sent request, the Anthropic adapter's
+  watchdogs, or the Anthropic SDK's timeout, which covers its connect timeout
+  too) apart from that one exception, and a provider's stated wait, which the
+  framework holds as before.
 - **Operators:** each re-armed turn's failure counts toward the hard-down
   streak, so the hard-down alert now comes during an outage from a single
   wake, at the third exhaustion, about 10 minutes after the first at the

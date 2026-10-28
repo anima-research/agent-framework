@@ -6047,12 +6047,12 @@ export class AgentFramework {
   }
   private takeAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
     if (isTransientFailure(error)) {
-      if (isRearmed(trigger)) this.rearmDeadlineCuts.delete(agentName);
+      this.rearmDeadlineCuts.delete(agentName);
       return true;
     }
     if (!isRearmed(trigger) || !isDeadlineExpiry(error)) return false;
     const first = !this.rearmDeadlineCuts.has(agentName);
-    if (!this.providerAdmissionClosed) this.rearmDeadlineCuts.add(agentName);
+    this.rearmDeadlineCuts.add(agentName);
     return first;
   }
 
@@ -6516,7 +6516,7 @@ export class AgentFramework {
   private cancelProviderAdmission(): void {
     for (const cooldown of this.providerAccelerationCooldowns.values()) clearTimeout(cooldown.timer);
     this.providerAccelerationCooldowns.clear(); this.providerAccelerationRecoveries.clear();
-    this.turnRearms?.clear(); this.exhaustingRearms?.clear(); this.rearmDeadlineCuts?.clear();
+    this.turnRearms?.clear(); this.exhaustingRearms?.clear();
     for (const gate of this.providerGates.values()) {
       gate.primaryDepth = 0; gate.primaryPending = false;
       for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -23511,7 +23511,7 @@ export class AgentFramework {
           }
 
           case 'usage': {
-            if (isRearmed(trigger)) this.rearmDeadlineCuts.delete(agent.name);
+            this.rearmDeadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
             // The stream's accumulated fresh input, which is what the
@@ -28194,7 +28194,7 @@ export class AgentFramework {
       if (name && this.exhaustionRewinds.get(name)) {
         this.exhaustionRewinds.set(name, 0);
       }
-      if (name) { this.turnRearms?.delete(name); this.rearmDeadlineCuts?.delete(name); }
+      if (name) this.turnRearms?.delete(name);
     }
     if (event.type === 'inference:completed' || event.type === 'inference:exhausted' || event.type === 'inference:aborted') {
       this.endStatedWaitRun(event.agentName as string);
