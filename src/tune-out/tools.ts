@@ -54,7 +54,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
       'End the tune-out on a channel now — use when something needs the ' +
       'resident\'s full attention. The diverted backlog is delivered to ' +
       'them (capped), and normal attention resumes. Add your own note in ' +
-      '`text`; it arrives alongside the backlog, in your voice.',
+      '`text`; it arrives alongside the backlog, in your voice. If you were ' +
+      'started to read one hold, you can end only that hold.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -94,8 +95,10 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
       'clearly as yourself (not as the resident); it goes out through the ' +
       'resident\'s publish path, so the channel sees it under their account. ' +
       'Use sparingly — e.g. to tell someone the resident is tuned out and ' +
-      'when to expect them. Disabled unless the resident\'s configuration ' +
-      'allows it.',
+      'when to expect them. If you were started to read one hold, you can ' +
+      'post only into a channel that hold still holds, and once it has ended ' +
+      'a post is refused; your report can say it instead. Disabled unless ' +
+      'the resident\'s configuration allows it.',
     inputSchema: {
       type: 'object',
       properties: {

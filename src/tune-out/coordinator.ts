@@ -1780,8 +1780,9 @@ export class TuneOutCoordinator {
     own: readonly ChannelRef[] = [],
     /** The calling agent: the persistent subconscious, or a reader fork. */
     caller?: string,
-    /** A reader fork's epoch, the one it was derived to read: it acts only on that epoch's hold. */
-    readerEpoch?: string,
+    /** A reader fork, with the epoch it was derived to read, if any: it ends and posts only through that epoch's
+     *  hold (forkRefusal). The persistent subconscious, which reads every epoch, passes none. */
+    fork?: { epochId?: string },
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     switch (name) {
       case 'deliver_summary': {
@@ -1836,16 +1837,12 @@ export class TuneOutCoordinator {
       case 'cancel_tuneout': {
         const name = String(input.channelId ?? '');
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
-        const newer = (held: string) => ({
-          success: false,
-          error: `Nothing was cancelled: the hold you were reading for has ended, and ${held} is a newer one, set after `
-            + 'you began reading. A reader cancels only the hold it was derived for; your report can say what you would '
-            + 'judge of this one.',
-          isError: true,
-        });
         const endScope = (): { success: boolean; data?: unknown; error?: string; isError?: boolean } => {
           const scope = this.getAllExcept();
-          if (readerEpoch !== undefined && scope && scope.params.epochId !== readerEpoch) return newer('the all-except hold in place now');
+          const refused = fork && scope
+            ? this.forkRefusal(fork, { epochId: scope.params.epochId }, 'cancel', "the all-except hold isn't the hold you were started to read")
+            : undefined;
+          if (refused) return { success: false, error: refused, isError: true };
           const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
           return result.ok
             ? { success: true, data: { cancelled: true, scope: 'all-except' } }
@@ -1894,10 +1891,10 @@ export class TuneOutCoordinator {
           }
           return endScope();
         }
-        const held = this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId);
-        if (readerEpoch !== undefined && held && held.params.epochId !== readerEpoch) {
-          return newer(`the tune-out holding ${this.quotedShown(channel.serverId, channel.channelId)} now`);
-        }
+        const held = this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)!;
+        const refused = fork && this.forkRefusal(fork, { epochId: held.params.epochId }, 'cancel',
+          `the tune-out on ${this.quotedShown(channel.serverId, channel.channelId)} isn't the hold you were started to read`);
+        if (refused) return { success: false, error: refused, isError: true };
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
         return result.ok
           ? { success: true, data: { cancelled: true } }
@@ -1952,11 +1949,45 @@ export class TuneOutCoordinator {
         // means that channel, as for every channel tool (ownChannelFor).
         const mine = this.channelRegistry.ownChannelFor(channelId, own, 'publish');
         if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        if (fork) {
+          const named = mine ? [mine.channel] : this.channelRegistry.channelsNamed(channelId);
+          const at = named.length === 1 ? named[0] : undefined;
+          const hold = at ? this.holdFor(at.serverId, at.channelId) : null;
+          const shown = at ? this.quotedShown(at.serverId, at.channelId) : JSON.stringify(channelId);
+          const refused = (at || fork.epochId === undefined) && this.forkRefusal(fork, hold, 'speech', hold
+            ? `${shown} is held by a hold other than the one you were started to read`
+            : `${shown} isn't held now`);
+          if (refused) return { success: false, error: refused, isError: true };
+        }
         return this.channelRegistry.publishForAgent(mine ? mine.channel : channelId, text, this.hooks.subconsciousName() ?? caller ?? 'Subconscious');
       }
       default:
         return { success: false, error: `unknown subconscious tool: ${name}`, isError: true };
     }
+  }
+
+  /**
+   * Why a reader fork may not act through `hold` (the epoch holding what its
+   * call names, or null): a fork ends and posts only through the hold of the
+   * epoch it was derived to read, and one derived for none acts through no
+   * hold. Undefined where the hold is its own. `why` says, for the fork, how
+   * what its call names isn't its own hold; its reports stay open to it.
+   */
+  private forkRefusal(
+    fork: { epochId?: string },
+    hold: { epochId: string } | null,
+    act: 'cancel' | 'speech',
+    why: string,
+  ): string | undefined {
+    if (fork.epochId !== undefined && hold?.epochId === fork.epochId) return undefined;
+    const nothing = act === 'cancel' ? 'Nothing was cancelled' : 'Nothing was posted';
+    const report = `Your report can say what you would ${act === 'cancel' ? 'judge of it' : 'have posted'}, and the resident reads it.`;
+    if (fork.epochId === undefined) {
+      return `${nothing}: you weren't started to read a tune-out, so there's no hold you can `
+        + `${act === 'cancel' ? 'end' : 'post through'}. ${report}`;
+    }
+    const rule = act === 'cancel' ? 'a reader ends only its own' : 'a reader posts only into a channel its own hold holds';
+    return `${nothing}: ${why}, and ${rule}. ${report}`;
   }
 
   /**
