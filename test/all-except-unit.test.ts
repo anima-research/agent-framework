@@ -16,6 +16,7 @@ function harness() {
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
   const traces: string[] = [];
   const fail = { read: false, write: false, addMessage: false };
+  const stored: Array<{ participant: string; content: Array<{ type: string; text: string }>; metadata: Record<string, unknown> }> = [];
   const registry = {
     getTuneOutState: () => null,
     // Each channel is shown by its id: no other server registers it.
@@ -40,7 +41,7 @@ function harness() {
     requestInference: (agentName: string) => { wakes.push(agentName); },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
-    getStoredMessages: () => [],
+    getStoredMessages: () => stored,
     currentSequence: () => 1,
     setSubconsciousAnchor: () => {},
     isForkBound: () => false,
@@ -49,7 +50,7 @@ function harness() {
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
-  return { make, state, wakes, messages, traces, fail };
+  return { make, state, wakes, messages, traces, fail, stored };
 }
 
 describe('all-except scope on the coordinator', () => {
@@ -134,5 +135,32 @@ describe('all-except scope on the coordinator', () => {
     assert.equal(c.getAllExcept(), null);
     assert.ok(h.messages.some((m) => /all channels except work released — done/.test(m.text)), 'the release reached the resident');
     c.stop();
+  });
+
+  it('a fractional backlog cap counts whole messages, as a channel\'s does: below one shows none', () => {
+    const h = harness();
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 0.5 }, 'agent-tool').ok);
+    assert.equal(c.getAllExcept()!.params.backlogCap, 0);
+    c.stop();
+  });
+
+  it('a hold stored with a fractional cap, before entry floored it, still releases whole messages', () => {
+    const h = harness();
+    const first = h.make();
+    assert.ok(first.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    first.stop();
+    const id = [...h.state.keys()].find((k) => k.endsWith('/all-except'))!;
+    const record = h.state.get(id) as { params: { backlogCap: number; epochId: string } };
+    record.params.backlogCap = 0.5;
+    for (const text of ['held one', 'held two']) {
+      h.stored.push({ participant: 'u', content: [{ type: 'text', text }], metadata: { channelId: 'noisy', serverId: 'disc', tuneOut: { epochId: record.params.epochId } } });
+    }
+    const second = h.make();
+    assert.ok(second.cancelAllExcept('agent-tool', 'done').ok);
+    const release = h.messages.find((m) => /released — done/.test(m.text))!;
+    assert.match(release.text, /messages=2/);
+    assert.doesNotMatch(release.text, /held one|held two/, 'a cap below one shows no message');
+    second.stop();
   });
 });

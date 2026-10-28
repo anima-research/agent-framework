@@ -863,7 +863,9 @@ export class TuneOutCoordinator {
       epochId: randomUUID(),
       except,
       cadenceSeconds: Math.max(30, given.cadenceSeconds ?? TUNE_OUT_DEFAULTS.cadenceSeconds),
-      backlogCap: Math.max(0, given.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap),
+      // Whole messages, as a channel's cap is counted: a cap below one shows
+      // none, where slice(-0.5) would take them all.
+      backlogCap: Math.max(0, Math.floor(given.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap)),
       maxWakes: Math.max(1, given.maxWakes ?? TUNE_OUT_DEFAULTS.maxWakes),
       startedAtSequence: this.hooks.currentSequence(),
       startedAtMs: read.now,
@@ -1005,7 +1007,10 @@ export class TuneOutCoordinator {
     }
     const historyTool = this.hooks.historyTool?.() ?? null;
     const dumps = [...byChannel.entries()].map(([channelId, backlog]) => {
-      const shown = backlogCap > 0 ? backlog.slice(-backlogCap) : [];
+      // Floored here too: a hold stored before entry floored its cap can hold
+      // a fraction.
+      const cap = Math.floor(backlogCap);
+      const shown = cap > 0 ? backlog.slice(-cap) : [];
       const truncated = backlog.length - shown.length;
       const attrs = [
         `channel=${quotedValue(channelId)}`,
