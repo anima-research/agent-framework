@@ -201,7 +201,7 @@ describe('present while acting', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(agentOptions: { maxStreamTokens?: number; proseRouting?: 'locus' | 'hybrid' } = {}): Promise<AgentFramework> {
+  async function createFramework(agentOptions: { maxStreamTokens?: number; physicalWindowTokens?: number; proseRouting?: 'locus' | 'hybrid' } = {}): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -1329,9 +1329,11 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  for (const [label, withdrawn, expected] of [
-    ['re-pins to an addressed message its over-budget boundary left unweighed', false, 'discord:dm:antra'],
-    ['moves nothing for such a message withdrawn before it starts', true, 'chan-live-1'],
+  for (const [label, withdrawn, expected, physicalWindowTokens] of [
+    ['re-pins to an addressed message its over-budget boundary left unweighed', false, 'discord:dm:antra', undefined],
+    ['moves nothing for such a message withdrawn before it starts', true, 'chan-live-1', undefined],
+    ['the window projection forces as well re-pins to such a message', false, 'discord:dm:antra', 50],
+    ['the window projection forces as well moves nothing for such a message withdrawn before it starts', true, 'chan-live-1', 50],
   ] as const) {
     it(`a budget restart ${label}`, async () => {
       const overBudget = createMockResponse([
@@ -1340,7 +1342,7 @@ describe('present while acting', () => {
       overBudget.usage = { inputTokens: 100, outputTokens: 5 };
       membrane.pushResponse(overBudget);
 
-      const framework = await createFramework({ maxStreamTokens: 20 });
+      const framework = await createFramework({ maxStreamTokens: 20, ...(physicalWindowTokens !== undefined ? { physicalWindowTokens } : {}) });
       const routed = stubChannelRegistry(framework);
       module.toolDelayMs = 25;
       module.interjection = 'quick question for you';

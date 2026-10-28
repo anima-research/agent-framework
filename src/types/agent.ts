@@ -92,12 +92,21 @@ export interface AgentConfig {
    *  where a prompt is mostly cached, this setting doesn't bound the
    *  request's size: `physicalWindowTokens`, when set, does. The restart is
    *  declined when context-manager's preview of its compile says it won't
-   *  fit, or the preview fails, which is logged (a strategy with no preview
-   *  restarts as before): the stream goes on, and the next tool boundary
-   *  over this budget considers the restart again. With
+   *  fit, or the preview fails (a strategy with no preview restarts as
+   *  before), and each boundary that declines it emits an
+   *  `inference:restart_declined` trace; a preview that fails other than
+   *  with an `UncoveredDropError` is also logged. The stream goes on, and
+   *  the next tool boundary over this budget considers the restart again.
+   *  It previews anew only once what the last preview rested on has
+   *  changed (the budget, the compression holds, the live context settings
+   *  or the strategy's compression state), unless that preview said a newer
+   *  message could make room, which every boundary previews. With
    *  `physicalWindowTokens` unset, nothing else then bounds the stream: it
-   *  goes on until the provider refuses a request at its own window, and
-   *  the turn ends with its failure row. The preview can't count the rows
+   *  can go on until the provider refuses a request at its own window, and
+   *  the turn then ends with its `context_length` failure row, which raises
+   *  the `context-refusal` ops alert and kicks the compression drain, as a
+   *  refused compile does.
+   *  The preview can't count the rows
    *  the restart's start then stores (such as new or changed afterUser
    *  injections, or a routing notice for an arrival the turn heard), so a
    *  restart whose preview leaves less room than those rows take can still

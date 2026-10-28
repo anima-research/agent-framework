@@ -2015,19 +2015,44 @@ export class Agent {
 
   /**
    * Whether a compile of this agent now, at the budget and with the binding that compile is given, would fit,
-   * committing nothing (`ContextManager.previewContext`). Null where the strategy offers no preview, and on
-   * context-manager 0.23.1's hierarchical path. A select over the budget answers `fits: false`. It throws what
-   * `previewContext` throws: an `UncoveredDropError` from its dry select's coverage check, and on context-manager
-   * 0.23.0 a plain Error from a hierarchical strategy whose select succeeded.
+   * committing nothing (`ContextManager.previewContext`). Null where the strategy offers no preview, and on the
+   * hierarchical path of a strategy built from this context-manager copy. A select over the budget answers
+   * `fits: false`. It throws what `previewContext` throws: an `UncoveredDropError` from its dry select's coverage
+   * check, and from a hierarchical strategy built from another copy, whose select succeeded, that copy's refusal:
+   * a `NoFoldPlanToPreviewError` from a 0.23.1 copy, or a plain Error from a 0.23.0 copy, such as a host's own.
    * @internal For the framework's restart decision; not a host API.
    */
-  previewCompile(): { fits: boolean } | null {
+  previewCompile(): ReturnType<ContextManager['previewContext']> {
     const thinkingBinding = this.thinkingBindingOption();
     return this.contextManager.previewContext(
-      this.compileBudget() ?? CONTEXT_MANAGER_DEFAULT_BUDGET,
+      this.previewBudget(),
       undefined,
       thinkingBinding ? { thinkingBinding } : undefined,
     );
+  }
+
+  /**
+   * What a preview's answer rests on besides the rows a stream adds, as one string: the budget it's given, the
+   * compression holds, the live settings that change the select (`tailTokens`, `transitionPaceTokens`,
+   * `preparedWindowTokens`), and the strategy's compression state: its counts of compressed chunks and summaries
+   * where it reports them (`getStats`), and otherwise its pending work. A restart declined for a reason a newer
+   * message can't clear is previewed again only once this has changed.
+   * @internal For the framework's restart decision; not a host API.
+   */
+  restartPreviewKey(): string {
+    const cm = this.contextManager;
+    const hot = this.getHotContextSettings();
+    const stats = (cm.getStrategy() as { getStats?: () => Record<string, unknown> }).getStats?.();
+    return JSON.stringify([
+      this.previewBudget(),
+      [...cm.getCompressionHolds()].sort(),
+      hot && [hot.tailTokens, hot.transitionPaceTokens ?? null, hot.preparedWindowTokens ?? null],
+      stats ? [stats.chunksCompressed, stats.compressionCount, stats.l1, stats.l2, stats.l3] : cm.getPendingWork()?.description ?? null,
+    ]);
+  }
+
+  private previewBudget(): TokenBudget {
+    return this.compileBudget() ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
   }
 
   /**

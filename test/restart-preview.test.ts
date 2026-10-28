@@ -35,10 +35,11 @@ class PagesModule implements Module {
   getTools(): ToolDefinition[] {
     return [{ name: 'read', description: 'Read the next page', inputSchema: { type: 'object', properties: {} } }];
   }
+  endTurnAt: number | undefined;
   async handleToolCall(): Promise<ToolResult> {
     this.calls++;
     await this.onCall?.(this.calls);
-    return { success: true, data: page(this.calls) };
+    return { success: true, data: page(this.calls), ...(this.calls === this.endTurnAt ? { endTurn: true } : {}) };
   }
   async gatherContext(): Promise<ContextInjection[]> {
     return this.injectAt?.(++this.starts) ?? [];
@@ -229,6 +230,48 @@ async function drain(framework: AgentFramework, ticks: number): Promise<void> {
 }
 
 const restarted = (traces: TraceEvent[]) => traces.filter((event) => event.type === 'inference:stream_restarted');
+type Declined = Extract<TraceEvent, { type: 'inference:restart_declined' }>;
+const declined = (traces: TraceEvent[]) => traces.filter((event): event is Declined => event.type === 'inference:restart_declined');
+
+const HIERARCHICAL_REFUSAL = 'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview';
+
+// What a strategy built from another copy of context-manager throws: an error whose class isn't this copy's, with
+// that copy's name and message.
+function errorFromAnotherCopy(name: string, message: string): Error {
+  const error = new (class extends Error {})(message);
+  error.name = name;
+  return error;
+}
+
+async function loggedDuring(run: (logged: readonly string[]) => Promise<void>): Promise<string[]> {
+  const logged: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args.map(String).join(' '));
+    consoleError(...args);
+  };
+  try {
+    await run(logged);
+  } finally {
+    console.error = consoleError;
+  }
+  return logged;
+}
+
+type Preview = { args: unknown[]; fits: boolean | undefined; finalTokens?: number; budgetTokens?: number };
+function recordPreviews(framework: AgentFramework): Preview[] {
+  const cm = framework.getAgent('prime')!.getContextManager();
+  const preview = cm.previewContext.bind(cm);
+  const previews: Preview[] = [];
+  cm.previewContext = (...args: Parameters<typeof preview>) => {
+    const asked: Preview = { args, fits: undefined };
+    previews.push(asked);
+    const answer = preview(...args);
+    Object.assign(asked, { fits: answer?.fits, finalTokens: answer?.finalTokens, budgetTokens: answer?.budgetTokens });
+    return answer;
+  };
+  return previews;
+}
 
 for (const kind of ['kv-stable', 'kv-unified'] satisfies Kind[]) {
   test(`a maxStreamTokens restart is taken when its preview fits under ${kind}, and the turn answers on the restarted stream`, async () => {
@@ -280,54 +323,164 @@ class ThrowingPreviewStrategy extends AutobiographicalStrategy {
   }
 }
 
-test('a maxStreamTokens restart is skipped when the preview throws an unexpected error, and the turn goes on', async () => {
+test('a maxStreamTokens restart is declined when the preview throws an unexpected error, and the turn goes on', async () => {
   const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer(FINAL)], [answer('Done on a restarted stream.')]]);
   const strategy = new ThrowingPreviewStrategy(new Error('the preview failed'));
   const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
-  const logged: string[] = [];
-  const consoleError = console.error;
-  console.error = (...args: unknown[]) => {
-    logged.push(args.map(String).join(' '));
-    consoleError(...args);
-  };
-  try {
-    await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
-      ask(framework);
-      await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on a restarted stream.') || failureRows(framework).length > 0);
-      assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
-      assert.equal(membrane.streams.length, 1, 'the turn ran on one stream');
-      assert.equal(restarted(traces).length, 0, 'no restart');
-      assert.ok(strategy.previews > 0, 'the restart decision asked for the preview');
-    });
-  } finally {
-    console.error = consoleError;
-  }
-  assert.ok(logged.some((line) => line.includes("the restart's preview failed, so the stream goes on") && line.includes('the preview failed')),
-    'the decline on an unexpected throw is logged');
+  const logged = await loggedDuring(() => withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on a restarted stream.') || failureRows(framework).length > 0);
+    assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
+    assert.equal(membrane.streams.length, 1, 'the turn ran on one stream');
+    assert.equal(restarted(traces).length, 0, 'no restart');
+    assert.ok(declined(traces).length > 0, 'each boundary that declined the restart said so');
+    for (const decline of declined(traces)) {
+      assert.equal(decline.reason, 'preview_error', 'the decline names the failed preview');
+      assert.equal(decline.previewed, true, 'a failed preview is asked again at each boundary');
+    }
+    assert.equal(strategy.previews, declined(traces).length, 'the restart decision asked for the preview at each boundary past the budget');
+  }));
+  assert.equal(logged.filter((line) => line.includes("the restart's preview failed, so the maxStreamTokens restart is declined") && line.includes('the preview failed')).length,
+    strategy.previews, 'each failed preview is logged');
 });
 
-class NullPreviewStrategy extends AutobiographicalStrategy {
+test("a maxStreamTokens restart is declined, with no log, when the preview throws another context-manager copy's UncoveredDropError", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer(FINAL)], [answer('Done on a restarted stream.')]]);
+  const strategy = new ThrowingPreviewStrategy(errorFromAnotherCopy('UncoveredDropError', 'the select drops messages no summary covers'));
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+  const logged = await loggedDuring(() => withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on a restarted stream.') || failureRows(framework).length > 0);
+    assert.equal(membrane.streams.length, 1, 'the turn ran on one stream');
+    assert.equal(restarted(traces).length, 0, 'no restart');
+    assert.ok(declined(traces).length > 0, 'each boundary that declined the restart said so');
+    for (const decline of declined(traces)) assert.equal(decline.reason, 'uncovered_drop', 'the decline names the uncovered drop');
+  }));
+  assert.ok(!logged.some((line) => line.includes("the restart's preview failed")), 'an uncovered drop is not logged as a failed preview');
+});
+
+test("where the window projection restarts the stream, the restart is the window's, with no preview asked and no decline reported", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  const strategy = new ThrowingPreviewStrategy(new Error('the preview failed'));
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: 10_000, strategy });
+  const logged = await loggedDuring(() => withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.equal((restarted(traces)[0] as { reason?: string } | undefined)?.reason, 'physical_window', 'the window projection restarted the stream');
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
+    assert.equal(strategy.previews, 0, 'the restart decision asked for no preview');
+    assert.deepEqual(declined(traces), [], 'no decline was reported');
+  }));
+  assert.ok(!logged.some((line) => line.includes("the restart's preview failed")), 'nothing logged a decline');
+});
+
+test("a boundary whose tool result ends the turn asks for no restart preview", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer(FINAL)], [answer('Done on a restarted stream.')]]);
+  const strategy = new ThrowingPreviewStrategy(new Error('the preview failed'));
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+  const module = new PagesModule();
+  module.endTurnAt = 5;
+  await loggedDuring(() => withFramework(membrane, module, agent, async (framework, traces) => {
+    ask(framework);
+    await waitUntil('the turn to end', () => traces.some((event) => event.type === 'inference:turn_ended') || failureRows(framework).length > 0);
+    assert.equal(module.calls, 5, 'the turn ended at the tool result that asked it to');
+    assert.equal(strategy.previews, 1, 'only the boundary past the budget before it asked for the preview');
+    assert.equal(declined(traces).length, 1, 'and only it declined the restart');
+  }));
+});
+
+class ScriptedPreviewStrategy extends AutobiographicalStrategy {
   previews = 0;
-  override previewContext(): ReturnType<AutobiographicalStrategy['previewContext']> {
-    this.previews++;
-    return null as unknown as ReturnType<AutobiographicalStrategy['previewContext']>;
+  readiness: ReturnType<AutobiographicalStrategy['checkReadiness']> = { ready: true };
+  compressionCount = 0;
+  reportsStats = true;
+  constructor(private readonly answer: (budget: { maxTokens: number; reserveForResponse: number }, ask: number) => { fits: boolean; clearedBy: string[] }) {
+    super({ compressionModel: 'test-compression-model', targetChunkTokens: 1_000, recentWindowTokens: 2_000, adaptiveResolution: true });
+  }
+  override previewContext(...args: unknown[]): ReturnType<AutobiographicalStrategy['previewContext']> {
+    const { fits, clearedBy } = this.answer(args[2] as { maxTokens: number; reserveForResponse: number }, ++this.previews);
+    return { fits, clearedBy, finalTokens: fits ? 1_000 : 9_000, budgetTokens: 8_000 } as unknown as ReturnType<AutobiographicalStrategy['previewContext']>;
+  }
+  override checkReadiness(): ReturnType<AutobiographicalStrategy['checkReadiness']> {
+    return this.readiness;
+  }
+  override getStats(): ReturnType<AutobiographicalStrategy['getStats']> {
+    return this.reportsStats ? { ...super.getStats(), compressionCount: this.compressionCount }
+      : undefined as unknown as ReturnType<AutobiographicalStrategy['getStats']>;
   }
 }
 
-// context-manager 0.23.0 throws this plain Error on the hierarchical path once the dry select has succeeded;
-// 0.23.1 returns null there. Both say the compile fits.
+test('a restart declined since a newer message would make room is previewed again at the next boundary, and taken once it fits', async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  const strategy = new ScriptedPreviewStrategy((_, ask) => (ask === 1 ? { fits: false, clearedBy: ['newer-message'] } : { fits: true, clearedBy: [] }));
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+  await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.deepEqual(declined(traces).map((decline) => [decline.clearedBy, decline.previewed]), [[['newer-message'], true]], 'one boundary declined');
+    assert.equal(strategy.previews, 2, 'the next boundary asked again');
+    assert.equal(restarted(traces).length, 1, 'and restarted');
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
+  });
+});
+
+for (const { what, clearedBy } of [
+  { what: 'the budget it was given changes', clearedBy: ['compression'] },
+  { what: 'a compression hold is released', clearedBy: [] },
+  { what: 'a live context setting changes', clearedBy: ['smaller-recent-window'] },
+  { what: "the pending compression work of a strategy that reports no counts changes", clearedBy: ['compression'] },
+  { what: 'a compression lands', clearedBy: ['compression'] },
+] as const) {
+  test(`a restart declined for a reason a newer message can't clear is previewed again once ${what}, and taken once it fits`, async () => {
+    const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+    let changed = false;
+    const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: [...clearedBy] }));
+    const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+    const module = new PagesModule();
+    await withFramework(membrane, module, agent, async (framework, traces) => {
+      const prime = framework.getAgent('prime')!;
+      const cm = prime.getContextManager();
+      let reserve = 20_000;
+      Object.defineProperty(prime.toolResultGuard, 'pendingWireReserveTokens', { get: () => reserve });
+      const [held] = compressHistory(framework, 1);
+      cm.holdCompression([held]);
+      strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+      strategy.reportsStats = what !== "the pending compression work of a strategy that reports no counts changes";
+      module.onCall = (call) => {
+        if (call !== 6) return;
+        changed = true;
+        if (what === 'the budget it was given changes') reserve = 0;
+        else if (what === 'a compression hold is released') cm.releaseCompression([held]);
+        else if (what === 'a live context setting changes') cm.updateHotContextSettings({ tailTokens: 1_000 });
+        else if (what === "the pending compression work of a strategy that reports no counts changes") strategy.readiness = { ready: false, description: 'Compressing chunk 1' };
+        else strategy.compressionCount++;
+      };
+      ask(framework);
+      await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+      assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false], 'the 4th boundary declined, the 5th took its answer');
+      assert.equal(strategy.previews, 2, `the 6th boundary, once ${what}, asked again`);
+      assert.equal(restarted(traces).length, 1, 'and restarted');
+      assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
+    });
+  });
+}
+
+// On the hierarchical path, once the dry select has succeeded, this copy of context-manager answers null. A strategy
+// built from another copy throws that copy's refusal, which this copy's ContextManager doesn't turn into null: a
+// 0.23.1 copy's NoFoldPlanToPreviewError, or 0.23.0's plain Error. Each says the compile fits.
 for (const { answer: preview, strategy: make } of [
-  { answer: "0.23.0's plain Error", strategy: () => new ThrowingPreviewStrategy(new Error('previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview'), false) },
-  { answer: "0.23.1's null", strategy: () => new NullPreviewStrategy({ compressionModel: 'test-compression-model', targetChunkTokens: 1_000, recentWindowTokens: 2_000 }) },
+  { answer: "a 0.23.0 copy's plain Error", strategy: () => new ThrowingPreviewStrategy(new Error(HIERARCHICAL_REFUSAL), false) },
+  { answer: "another 0.23.1 copy's NoFoldPlanToPreviewError", strategy: () => new ThrowingPreviewStrategy(errorFromAnotherCopy('NoFoldPlanToPreviewError', HIERARCHICAL_REFUSAL), false) },
+  { answer: "this copy's NoFoldPlanToPreviewError, which its ContextManager answers as null", strategy: () => strategy('hierarchical') },
 ]) {
   test(`a maxStreamTokens restart is taken when the hierarchical preview answers with ${preview}`, async () => {
     const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
-    const strategy = make();
-    const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+    const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy: make() });
     await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+      const previews = recordPreviews(framework);
       ask(framework);
       await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.'));
-      assert.ok(strategy.previews > 0, 'the restart decision asked for the preview');
+      assert.ok(previews.length > 0, 'the restart decision asked for the preview');
       assert.equal((restarted(traces)[0] as { reason?: string } | undefined)?.reason, 'context_budget', 'the turn restarted');
       assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
     });
@@ -348,15 +501,30 @@ test('a maxStreamTokens restart is taken as before under a strategy with no prev
 });
 
 for (const kind of ['hierarchical', 'kv-stable', 'kv-unified'] satisfies Kind[]) {
-  test(`a maxStreamTokens restart whose preview can't fit is skipped, and the turn goes on, under ${kind}`, async () => {
+  test(`a maxStreamTokens restart whose preview can't fit is declined, and the turn goes on, under ${kind}, each boundary saying why`, async () => {
     const membrane = new TurnMembrane([[...toolRounds(ROUNDS, 4_000), answer(FINAL)]]);
     const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 8_000, physicalWindowTokens: undefined, strategy: strategy(kind) });
-    await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    const module = new PagesModule();
+    await withFramework(membrane, module, agent, async (framework, traces) => {
+      const previews = recordPreviews(framework);
       ask(framework);
       await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || failureRows(framework).length > 0);
       assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
       assert.equal(membrane.streams.length, 1, 'the turn ran on one stream');
       assert.equal(restarted(traces).length, 0, 'no restart');
+      const declines = declined(traces);
+      assert.equal(declines.length, module.calls - 3, 'every boundary past maxStreamTokens declined the restart and said so');
+      let latest: Preview | undefined;
+      let asked = 0;
+      for (const decline of declines) {
+        assert.equal(decline.reason, 'wont_fit', "the decline says the restart's compile won't fit");
+        assert.ok(decline.inputTokens > decline.maxStreamTokens, 'it names the count past maxStreamTokens');
+        if (decline.previewed) latest = previews[asked++];
+        assert.ok(latest !== undefined && latest.fits === false, 'the decline rests on a preview that said no');
+        assert.equal(decline.finalTokens, latest.finalTokens, "it carries that preview's size");
+        assert.equal(decline.budgetTokens, latest.budgetTokens, "and that preview's budget");
+      }
+      assert.equal(asked, previews.length, 'every preview asked was a decline that said so');
     });
   });
 }
@@ -387,20 +555,52 @@ test("the restart's preview is given the thinking binding its compile is given, 
   });
 });
 
-test(`on a host that sets no window, a maxStreamTokens restart whose preview can't fit is skipped under kv-unified, and the turn goes on until the provider refuses a request as too long, then ends with its failure row`, async () => {
+test("the restart's preview is given the budget the restart's compile is given, the agent's maxTokens and a pending tool-result reserve included", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, maxTokens: 3_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified') });
+  await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    const prime = framework.getAgent('prime')!;
+    Object.defineProperty(prime.toolResultGuard, 'pendingWireReserveTokens', { get: () => 1_234 });
+    const previews = recordPreviews(framework);
+    const cm = prime.getContextManager();
+    const compile = cm.compile.bind(cm);
+    const compiled: unknown[] = [];
+    cm.compile = ((...args: Parameters<typeof compile>) => {
+      compiled.push(args[0]);
+      return compile(...args);
+    }) as typeof cm.compile;
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.equal(restarted(traces).length, 1, 'the turn restarted');
+    const budget = { maxTokens: 60_000, reserveForResponse: 3_000 + 1_234 };
+    assert.ok(previews.length > 0, 'the restart decision asked for the preview');
+    for (const preview of previews) assert.deepEqual(preview.args[0], budget, 'the preview was given the compile budget');
+    assert.ok(compiled.length >= 2, 'the turn compiled at its start and at the restart');
+    for (const given of compiled) assert.deepEqual(given, budget, "each compile, the restart's included, was given the same budget");
+  });
+});
+
+test(`on a host that sets no window, a maxStreamTokens restart whose preview can't fit is declined under kv-unified, and the turn goes on until the provider refuses a request as too long, then ends with its failure row, the context-refusal alert and the drain`, async () => {
   const membrane = new TurnMembrane([[...toolRounds(ROUNDS, 4_000), answer(FINAL)]], 9_000);
   const module = new PagesModule();
   const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 8_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified') });
-  await withFramework(membrane, module, agent, async (framework, traces) => {
+  const logged = await loggedDuring((lines) => withFramework(membrane, module, agent, async (framework, traces) => {
     ask(framework);
     await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL), 60_000);
     assert.equal(restarted(traces).length, 0, 'no restart');
+    assert.ok(declined(traces).length > 0, 'the restart was declined');
     assert.equal(membrane.streams.length, 1, 'the turn ran on one stream');
     assert.ok(membrane.windowStreams[0]?.refusedAt !== undefined, 'the provider refused a request past its window');
     assert.ok(module.calls > 4, `the turn went on past the boundaries where the restart was considered (calls: ${module.calls})`);
     assert.ok(!storedText(framework).includes(FINAL), 'the turn did not answer');
     assert.equal(failureRows(framework)[0]?.errorType, 'context_length', "the turn ended with the provider's refusal as its failure row");
-  });
+    const refusals = (traces.filter((event) => event.type === 'ops:alert') as Array<{ kind?: string; message?: string }>)
+      .filter((alert) => alert.kind === 'context-refusal');
+    assert.equal(refusals.length, 1, 'the ending raised the context-refusal alert');
+    assert.ok(refusals[0]?.message?.includes('restart was declined'), 'the alert says the restart was declined');
+    await waitUntil('the drain to end', () => lines.some((line) => line.includes('drain kicked for prime')));
+  }));
+  assert.ok(logged.some((line) => line.includes('drain kicked for prime')), 'the ending kicked the compression drain');
 });
 
 // A long agentic turn, its stream's usage reporting each call's request size, summed over the stream's calls as
@@ -454,7 +654,29 @@ test("under kv-unified, a restart past the budget whose compile can't fit, since
     assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
     assert.ok(storedText(framework).includes(FINAL), 'the turn answered');
     assert.ok(restarted(traces).length > 0, 'restarts were taken while their compiles fit');
+    assert.ok(declined(traces).length > 0, 'and declined once they no longer fit');
     assert.ok(!requestText(membrane.streams[membrane.streams.length - 1]).includes(SUMMARY), "the last stream's request holds no summary of the turn");
+  });
+});
+
+test("under kv-unified, a restart declined since only compression would make room isn't previewed again at that stream's later boundaries while no compression lands", async () => {
+  const module = new PagesModule();
+  const membrane = new LongTurnMembrane(longTurn(30), module, 40_000);
+  const agent = agentConfig({ maxStreamTokens: 8_000, contextBudgetTokens: 20_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified', 6_000) });
+  await withFramework(membrane, module, agent, async (framework, traces) => {
+    const previews = recordPreviews(framework);
+    ask(framework);
+    await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL), 120_000);
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered');
+    const declines = declined(traces);
+    assert.ok(declines.length > 1, `the restart was declined at more than one boundary (${declines.length})`);
+    assert.deepEqual(declines[0]?.clearedBy, ['compression'], 'only compression would make room');
+    assert.equal(declines[0]?.previewed, true, 'the first decline previewed');
+    assert.ok(declines.slice(1).every((decline) => !decline.previewed), 'the later declines took its answer');
+    assert.ok(declines.every((decline) => decline.finalTokens === declines[0]!.finalTokens && decline.budgetTokens === declines[0]!.budgetTokens),
+      "with the figures of the preview it took");
+    assert.equal(previews.filter((preview) => preview.fits === false).length, 1, 'one preview declined');
+    assert.equal(previews.length, restarted(traces).length + 1, 'every other preview was a restart that fit');
   });
 });
 
