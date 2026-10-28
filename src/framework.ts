@@ -4010,9 +4010,7 @@ export class AgentFramework {
   private readonly registry: AgentRegistry = new AgentRegistry({
     persist: (snapshot) => this.persistAgentRegistry(snapshot),
     appendEnded: (record) => this.appendEndedAgentRecord(record),
-    // A requested end that was put back: its ended record came off the
-    // registry's memory, so it comes off the recovery file too.
-    onRollback: () => this.rewriteEndedRecovery(this.registry.endedHistory()),
+    onRollback: () => this.rewriteAgentRegistryAfterRollback(),
   });
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
@@ -11810,6 +11808,34 @@ export class AgentFramework {
   private appendEndedAgentRecord(record: AgentRecord): void {
     this.rewriteEndedRecovery([...this.endedRecovery, record]);
     this.store.appendToStateJson(AGENT_REGISTRY_ENDED_ID, record);
+  }
+
+  /**
+   * A requested change was put back in the registry's memory: every copy
+   * that can be overwritten is rewritten from it (the snapshot's recovery
+   * file and branch-local state, and the ended log's recovery file), so none
+   * keeps the change the caller was told failed. The branch-local ended log
+   * is append-only, so an end appended before the failure stays there; it is
+   * read at boot only where no ended recovery file exists, and the restore
+   * then reads that agent as ended, as a restart ends bounded work anyway.
+   * A rewrite that fails is reported; the caller's own error goes on.
+   */
+  private rewriteAgentRegistryAfterRollback(): void {
+    const snapshot = this.registry.snapshot();
+    const rewrites: Array<[string, () => void]> = [
+      ['the ended log recovery file', () => this.rewriteEndedRecovery(this.registry.endedHistory())],
+      ...(this.agentRegistryPath
+        ? [['the registry recovery file', () => this.writeRecoveryFile(this.agentRegistryPath!, snapshot)] as [string, () => void]]
+        : []),
+      ['the branch-local registry', () => this.store.setStateJson(AGENT_REGISTRY_STATE_ID, snapshot)],
+    ];
+    for (const [what, rewrite] of rewrites) {
+      try {
+        rewrite();
+      } catch (error) {
+        console.error(`[dendrite] after a registry change failed and was put back in memory, ${what} could not be rewritten to match; the next registry write rewrites it:`, error);
+      }
+    }
   }
 
   /** The ended log's recovery file, rewritten as the newest records (as many as a restart reads). */

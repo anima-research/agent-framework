@@ -1,6 +1,8 @@
 /**
  * The registry's recovery when a write fails or a process dies on the way:
  *
+ * - a change that failed and was put back leaves no copy of the registry
+ *   holding it, and a put-back that fails too doesn't hide the change's error;
  * - a recovery file that holds null, or a registry without its counters, is
  *   refused rather than read as empty;
  */
@@ -87,5 +89,61 @@ describe('the registry\'s recovery', () => {
     delete stored.incarnations;
     writeFileSync(registryFile(), JSON.stringify(stored));
     await assert.rejects(boot(), /reads as a version-1 registry with no map of incarnations/);
+  });
+
+  it('a stop whose branch-local write fails leaves the recovery file as memory is: the agent live', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const undo = failOn(first.getStore(), 'setStateJson', REGISTRY);
+    try {
+      assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated setStateJson failure/);
+    } finally { undo(); }
+    assert.equal(first.getAgentRecord('boss')?.ended, undefined, 'boss is live in memory');
+    const file = JSON.parse(readFileSync(registryFile(), 'utf8')) as { records: Array<{ name: string; ended?: unknown }> };
+    assert.ok(file.records.some((r) => r.name === 'boss' && r.ended === undefined), 'and in the recovery file that wins at boot');
+    const ended = JSON.parse(readFileSync(endedFile(), 'utf8')) as { ended: Array<{ name: string }> };
+    assert.equal(ended.ended.filter((r) => r.name === 'boss').length, 0, 'and its end is off the ended file');
+  });
+
+  it('a hold whose branch-local write fails is in no copy of the registry, so a retry holds it once', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const job = await startBlocked(first, gates, 'job', 'g-job', workerSpec('job', { spawnedBy: 'boss', resultTo: { to: 'boss', as: 'message' } }));
+    first.stopAgent('boss', { by: 'mira' });
+    gates.release('g-job');
+    assert.ok((await job.settled).ok);
+    const undo = failOn(first.getStore(), 'setStateJson', REGISTRY);
+    try {
+      assert.throws(() => first.deliverAgentResult('job', [{ type: 'text', text: 'RESULT-1' }]), /EIO: simulated setStateJson failure/);
+    } finally { undo(); }
+    const file = JSON.parse(readFileSync(registryFile(), 'utf8')) as { mail: unknown[] };
+    assert.equal(file.mail.length, 0, 'the recovery file holds no copy of the failed hold');
+    first.deliverAgentResult('job', [{ type: 'text', text: 'RESULT-1' }]);
+    assert.equal(first.listHeldMail().length, 1, 'and the retry holds it once');
+  });
+
+  it('when the put-back fails too, the caller still hears why its change failed', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const internal = first as unknown as { writeRecoveryFile: (path: string, document: unknown) => void };
+    const write = internal.writeRecoveryFile.bind(first);
+    let putBack = false;
+    internal.writeRecoveryFile = (path, document) => {
+      if (putBack) throw new Error('EIO: the put-back failed');
+      write(path, document);
+    };
+    const undo = failOn(first.getStore(), 'setStateJson', REGISTRY, () => { putBack = true; return true; });
+    try {
+      assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated setStateJson failure/);
+    } finally {
+      undo();
+      delete (first as unknown as Record<string, unknown>).writeRecoveryFile;
+    }
   });
 });

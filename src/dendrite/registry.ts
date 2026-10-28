@@ -48,7 +48,7 @@ export interface AgentRegistryOptions {
    * failure is logged.
    */
   onRecordWriteFailed?: (what: string, error: unknown) => void;
-  /** Told after a requested change was put back: the host puts back what it wrote alongside (its ended log). */
+  /** Told after a change that failed was put back in memory (a requested change, or a hold): the host rewrites what it wrote alongside to match. */
   onRollback?: () => void;
 }
 
@@ -428,11 +428,13 @@ export class AgentRegistry {
     };
     this.mail.push(item);
     // A hold that isn't durable isn't held: the persist's failure fails this
-    // call, and the item leaves memory too, so a retry holds it once.
+    // call, and the item leaves memory and every copy written before the
+    // failure too, so a retry holds it once.
     try {
       this.persist();
     } catch (error) {
       this.mail.pop();
+      this.putBack();
       throw error;
     }
     return item;
@@ -596,8 +598,18 @@ export class AgentRegistry {
       this.awaiting.clear(); for (const [k, v] of saved.awaiting) this.awaiting.set(k, v);
       this.incarnations.clear(); for (const [k, v] of saved.incarnations) this.incarnations.set(k, v);
       this.mail = saved.mail;
-      this.onRollback?.();
+      this.putBack();
       throw error;
+    }
+  }
+
+  /** Memory is as it was before a change that failed: the host rewrites its copies to match. The caller hears why
+   *  its change failed, not why the put-back did. */
+  private putBack(): void {
+    try {
+      this.onRollback?.();
+    } catch (rollbackError) {
+      this.onRecordWriteFailed('the put-back of a change that failed', rollbackError);
     }
   }
 
