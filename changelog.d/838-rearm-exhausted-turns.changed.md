@@ -20,15 +20,15 @@
   re-arming. A wake for the agent while it waits starts its turn at once, with
   the re-armed trigger merged in. That turn is the wake's: the error policy
   retries its failures. A completed turn starts the count again, and so does a
-  message said to the agent (not a system message or notice; not an edit,
-  reaction or deletion, unless an edit is the first version of a message the
-  agent sees; not a message its own view leaves out, such as one a tune-out
-  holds from it; and not the agent's own schedule: the heartbeat's tick or
-  reminder, a self-wake timer it set, or a script's wake. A notice a module or
-  an MCPL server stores as a message counts, and a message in the residents'
-  shared slot counts for each resident that reads it), so each such message
-  gets its own re-sends, over about 42 minutes after its turn first exhausts
-  at the default delays; any other wake leaves the count going on. A
+  message said to the agent (not a system message, notice or system change;
+  not an edit, reaction or deletion, unless an edit is the first version of a
+  message the agent sees; not a message its own view leaves out, such as one a
+  tune-out holds from it; and not the agent's own schedule: the heartbeat's
+  tick or reminder, a self-wake timer it set, or a script's wake. A notice a
+  module or an MCPL server stores as a message counts, and a message in the
+  residents' shared slot counts for each resident that reads it), so each such
+  message gets its own re-sends, over about 42 minutes after its turn first
+  exhausts at the default delays; any other wake leaves the count going on. A
   heartbeat-mcpl server registered under another id stores its ticks as
   ordinary messages, so each of its ticks starts the count again too. A
   re-armed turn's transient failure writes no `[inference-failed]` marker

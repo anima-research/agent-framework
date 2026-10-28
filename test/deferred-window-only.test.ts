@@ -1203,7 +1203,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const internals = drainInternals(framework) as ReturnType<typeof drainInternals> & {
       unackedDeferredWrites: DeferredEntry[];
       durableDeferredWrites(): DeferredEntry[];
-      noteStored(agent: unknown, metadata: unknown, stored: string): void;
+      noteStored(agent: unknown, row: unknown, stored: string): void;
     };
     internals.deferredWritesPersisted = true;
     heldAndStored(framework, 'w-found', 'look left');
@@ -1211,9 +1211,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       .queryMessages({ metadata: { deferredWriteId: 'w-found' } } as never).messages;
     const noted: string[] = [];
     const note = internals.noteStored;
-    internals.noteStored = function (this: unknown, agent: unknown, metadata: unknown, stored: string) {
+    internals.noteStored = function (this: unknown, agent: unknown, row: unknown, stored: string) {
       noted.push(stored);
-      return note.call(this, agent, metadata, stored);
+      return note.call(this, agent, row, stored);
     };
     const errors: string[] = [];
     const error = console.error;

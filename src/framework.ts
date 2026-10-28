@@ -439,6 +439,11 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   return true;
 };
 
+type ViewedRow = { content: readonly ContentBlock[]; metadata?: unknown };
+
+const isConversationalRow = (row: ViewedRow): boolean =>
+  !isSystemChangeMessage(row) && isConversationalInjection(row.metadata as MessageMetadata | undefined);
+
 /**
  * The first message a module's process response adds, or edit it makes,
  * whose content context-manager won't store: `where` names it in the
@@ -3818,7 +3823,7 @@ export class AgentFramework {
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
   private readonly openManagerRefs = new WeakMap<ContextManager, WeakRef<ContextManager>>();
-  private readonly storeSees = new WeakMap<ContextManager, (metadata: unknown) => boolean>();
+  private readonly storeViews = new WeakMap<ContextManager, { sees: (metadata: unknown) => boolean; keeps: (row: ViewedRow) => boolean }>();
   private readonly collectedManagers = new FinalizationRegistry<WeakRef<ContextManager>>((ref) => this.openManagers.delete(ref));
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -13889,6 +13894,7 @@ export class AgentFramework {
     const sees = (metadata: unknown): boolean =>
       !(metadata as { tuneOut?: unknown } | undefined)?.tuneOut
       && !isAnotherAgentsInjection(metadata, config.name);
+    const keeps = (message: ViewedRow): boolean => sees(message.metadata) && !isOthersSystemChange(message, config.name);
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -13911,10 +13917,10 @@ export class AgentFramework {
       // and so out of its folds, as the residents share this slot. So does a
       // system change stamped as another resident's (it declares another's
       // tools), which only its content marks.
-      viewFilter: (message) => sees(message.metadata) && !isOthersSystemChange(message, config.name),
+      viewFilter: keeps,
     });
     this.trackManager(contextManager);
-    this.storeSees.set(contextManager, sees);
+    this.storeViews.set(contextManager, { sees, keeps });
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.attachHeads(agent);
@@ -13984,6 +13990,7 @@ export class AgentFramework {
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
     const sees = (metadata: unknown): boolean => !isAnotherAgentsInjection(metadata, name);
+    const keeps = (message: ViewedRow): boolean => sees(message.metadata) && !isSystemChangeNotOwn(message, name);
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,
@@ -13996,13 +14003,13 @@ export class AgentFramework {
       // context injections (stored-injections.ts), their context, which this
       // agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
-      viewFilter: (message) => sees(message.metadata) && !isSystemChangeNotOwn(message, name),
+      viewFilter: keeps,
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
     this.trackManager(contextManager);
-    this.storeSees.set(contextManager, sees);
+    this.storeViews.set(contextManager, { sees, keeps });
 
     // Inherit the principal's inference settings wholesale (fork-template
     // idiom): reasoning effort (thinking), provider params, token ceilings,
@@ -14337,7 +14344,8 @@ export class AgentFramework {
           // context injection, is drained and stored like any other, but not
           // injected: the next compile leaves it out as well, so the window's
           // compiled prefix and the live request still match without it
-          // (#232 gap 5).
+          // (#232 gap 5). So is a system change for an agent on its head,
+          // whose requests leave every change out.
           //
           // A stream that declares it can't carry injected messages
           // (supportsInjectedMessages false: membrane's XML prefill path,
@@ -14370,11 +14378,11 @@ export class AgentFramework {
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
-              this.noteSpokenTo(agent.name, msg.metadata);
+              this.noteSpokenTo(agent.name, msg);
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
-              this.noteForOtherResidents(agent, msg.metadata, id);
-              if (!this.agentSees(agent, msg.metadata)) continue;
+              this.noteForOtherResidents(agent, msg, id);
+              if (!this.agentKeeps(agent, msg) || (isSystemChangeMessage(msg) && !agent.declaresEntries())) continue;
               heard.push({ msg, id, content });
             }
             // Rendered in one call: a render prepares as a compile does, so
@@ -14438,7 +14446,7 @@ export class AgentFramework {
           // clear the send suppression: nothing new was said to the agent.
           // An edit the coalescer marks as the agent's first view is the
           // message it replaced, so it does (isConversationalInjection).
-          if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
+          if (midTurnInjections.some((inj) => isConversationalRow(inj))) {
             this.midTurnInputSignals.add(agent.name);
           }
 
@@ -14553,7 +14561,7 @@ export class AgentFramework {
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: ChannelRef | undefined;
-            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
+            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj, routing) ?? newLocus;
             if (newLocus) {
               // What this boundary just stored is newer than any arrival the
               // turn holds, so the arrivals can't move the locus back.
@@ -14566,7 +14574,7 @@ export class AgentFramework {
             // stream to tell) leaves what it stored for the agent to the
             // turn's next start, as arrivals: a budget restart, or a
             // re-inference on these tool results.
-            for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
+            for (const { msg, id } of heard) this.noteArrival(agent.name, msg, id);
           }
 
           // A boundary that ends the stream (a result that ends the turn, a restart, a stopping framework) has
@@ -18709,16 +18717,16 @@ export class AgentFramework {
   /**
    * The channel a message moves its turn's locus to, by the addressed
    * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (by
-   * isConversationalInjection: not a system marker, nor a reaction, reaction
+   * isConversationalRow: not a system change or a system marker, nor a reaction, reaction
    * removal, edit or deletion marker, apart from an edit the coalescer marks
    * as the agent's first view) that addressed the agent, or that follows up
    * in a channel the turn sent into (TurnRouting.engaged). Undefined for any
    * other message. A tool boundary weighs the messages it injects by it,
    * and noteArrival the ones no boundary of the turn weighs.
    */
-  private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): ChannelRef | undefined {
-    if (!isConversationalInjection(metadata)) return undefined;
-    const m = metadata as Record<string, unknown> | undefined;
+  private repinChannel(row: ViewedRow, routing: TurnRouting): ChannelRef | undefined {
+    if (!isConversationalRow(row)) return undefined;
+    const m = row.metadata as Record<string, unknown> | undefined;
     if (typeof m?.channelId !== 'string') return undefined;
     // The message's own server, which every channel message's metadata
     // carries; one without it names its channel only if no other server
@@ -18962,8 +18970,13 @@ export class AgentFramework {
   }
 
   private agentSees(agent: Agent, metadata: unknown): boolean {
-    const sees = this.storeSees.get(agent.getContextManager());
-    return !sees || sees(metadata);
+    const view = this.storeViews.get(agent.getContextManager());
+    return !view || view.sees(metadata);
+  }
+
+  private agentKeeps(agent: Agent, row: ViewedRow): boolean {
+    const view = this.storeViews.get(agent.getContextManager());
+    return !view || view.keeps(row);
   }
 
   /**
@@ -18973,13 +18986,13 @@ export class AgentFramework {
    * out, such as one a tune-out diverted (metadata.tuneOut), never enters
    * its compiled view, so the agent won't see it, and it moves nothing.
    */
-  private noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void {
+  private noteArrival(agentName: string, row: ViewedRow, messageId: MessageId): void {
     const open = this.openLogical.get(agentName);
     if (!open) return;
     const agent = this.agents.get(agentName);
-    if (agent && !this.agentSees(agent, metadata)) return;
-    if (isConversationalInjection(metadata)) (open.heard ??= new Map()).set(messageId, ++lastHeardAt);
-    const channel = this.repinChannel(metadata, open);
+    if (agent && !this.agentSees(agent, row.metadata)) return;
+    if (isConversationalRow(row)) (open.heard ??= new Map()).set(messageId, ++lastHeardAt);
+    const channel = this.repinChannel(row, open);
     if (channel) open.arrivals.push({ messageId, channel });
   }
 
@@ -18999,12 +19012,12 @@ export class AgentFramework {
    * message slot, and a tool boundary weighs only the messages drained for
    * its own agent, so no boundary of another resident's turn weighs it.
    */
-  private noteForOtherResidents(agent: Agent, metadata: MessageMetadata | undefined, messageId: MessageId): void {
+  private noteForOtherResidents(agent: Agent, row: ViewedRow, messageId: MessageId): void {
     if (!this.isOrdinaryResident(agent)) return;
     for (const reader of this.sharedSlotAgents) {
       if (reader !== agent && this.agents.get(reader.name) === reader && this.isOrdinaryResident(reader)) {
-        this.noteSpokenTo(reader.name, metadata);
-        this.noteArrival(reader.name, metadata, messageId);
+        this.noteSpokenTo(reader.name, row);
+        this.noteArrival(reader.name, row, messageId);
       }
     }
   }
@@ -26831,7 +26844,7 @@ export class AgentFramework {
       opts?.fromQueue ? withDeferredWriteId(metadata, opts.fromQueue.id) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
-    this.noteStored(agent, metadata, stored, opts?.bypassDeferralFor);
+    this.noteStored(agent, { content, metadata }, stored, opts?.bypassDeferralFor);
     return stored;
   }
 
@@ -26976,9 +26989,9 @@ export class AgentFramework {
         : this.agents.values().next().value;
   }
 
-  private noteSpokenTo(agentName: string, metadata: MessageMetadata | undefined): void {
+  private noteSpokenTo(agentName: string, row: ViewedRow): void {
     const agent = this.agents.get(agentName);
-    if ((agent && !this.agentSees(agent, metadata)) || isOwnScheduleWrite(metadata) || !isConversationalInjection(metadata)) return;
+    if ((agent && !this.agentSees(agent, row.metadata)) || isOwnScheduleWrite(row.metadata as MessageMetadata | undefined) || !isConversationalRow(row)) return;
     if (this.turnRearms?.delete(agentName)) console.error(`[inference-rearm] agent=${agentName} re-send count started again: a message was said to it`);
   }
 
@@ -26986,12 +26999,12 @@ export class AgentFramework {
    *  agent when none of its turns is alive or the message was assembled for
    *  the start now beginning (no tool boundary will weigh it), and one for
    *  every other resident's open turn. */
-  private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId, bypassDeferralFor?: string): void {
-    this.noteSpokenTo(agent.name, metadata);
+  private noteStored(agent: Agent, row: ViewedRow, stored: MessageId, bypassDeferralFor?: string): void {
+    this.noteSpokenTo(agent.name, row);
     if (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name) {
-      this.noteArrival(agent.name, metadata, stored);
+      this.noteArrival(agent.name, row, stored);
     }
-    this.noteForOtherResidents(agent, metadata, stored);
+    this.noteForOtherResidents(agent, row, stored);
   }
 
   /**
@@ -27444,9 +27457,9 @@ export class AgentFramework {
       agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
     for (const [msg, { id }] of stored) {
       this.emitTrace({ type: 'message:added', messageId: id, source: `deferred-flush:${occasion}` });
-      this.noteSpokenTo(agent.name, msg.metadata);
-      this.noteArrival(agent.name, msg.metadata, id);
-      this.noteForOtherResidents(agent, msg.metadata, id);
+      this.noteSpokenTo(agent.name, msg);
+      this.noteArrival(agent.name, msg, id);
+      this.noteForOtherResidents(agent, msg, id);
     }
     this.ackDeferredWrites();
     return this.queuedFor(agent.name);
@@ -27502,7 +27515,7 @@ export class AgentFramework {
         ...(bypassFor(msg) ? { bypassDeferralFor: bypassFor(msg) } : {}),
       }), (msg, id) => {
       const agent = this.deliveryAgent(msg.forAgent);
-      if (agent) this.noteStored(agent, msg.metadata, id, bypassFor(msg));
+      if (agent) this.noteStored(agent, msg, id, bypassFor(msg));
     });
     if (opts?.traceAs) {
       for (const { id } of written.values()) if (id) this.emitTrace({ type: 'message:added', messageId: id, source: opts.traceAs });
@@ -28152,7 +28165,7 @@ export class AgentFramework {
   private settleFound(msg: DeferredWrite, agent: Agent, stored: MessageId, landed: { count?: number; sharded: boolean; named?: true }): void {
     this.deferredMessages = this.deferredMessages.filter((m) => m !== msg);
     this.unackedDeferredWrites.push(msg);
-    this.noteStored(agent, msg.metadata, stored);
+    this.noteStored(agent, msg, stored);
     this.logDeferredWriteError(msg, `held writes for ${agent.name}`, undefined, { ...landed, foundLater: true });
   }
 

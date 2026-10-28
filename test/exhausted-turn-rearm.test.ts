@@ -280,10 +280,14 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
       ['a self-wake timer the agent set', { source: 'gate:self-wake' }],
       ["a script's wake", { source: 'code-execution-script', tags: ['script:wake'] }],
       ['a message a tune-out holds from the agent', { tuneOut: { epochId: 'zz-epoch' } }],
+      ["a host's system change, stored without metadata", undefined],
     ] as const;
     for (const [i, [what, metadata]] of unsaid.entries()) {
+      const content = metadata === undefined
+        ? [{ type: 'system_change', defineTools: [{ name: `zz_tool_${i}`, description: 'a tool', inputSchema: { type: 'object', properties: {} } }] }]
+        : [{ type: 'text', text: `zz-unsaid-${i}` }];
       (r.fw as unknown as { addMessage(role: string, content: unknown[], metadata: unknown): unknown })
-        .addMessage('user', [{ type: 'text', text: `zz-unsaid-${i}` }], metadata);
+        .addMessage('user', content, metadata);
       queue(r, { reason: 'zz-wake' });
       await waitFor(() => r.count('inference:exhausted') === 5 + i, `a wake's turn after ${what} to end exhausted`);
       assert.equal(r.admission().providerAdmission.heldRequests, 0, `${what} doesn't start the count again`);
@@ -466,6 +470,24 @@ test("a judge rule's wake while the agent waits is judged as usual, and the judg
   const leastLeft = Math.floor((heldUntil - membrane.judgedAt[1]!) / 1000);
   const mostLeft = Math.ceil((heldUntil - saidAt) / 1000);
   assert.ok(Number(when[1]) >= leastLeft && Number(when[1]) <= mostLeft, `and when it comes: in ${when[1]} s, between ${leastLeft} and ${mostLeft}`);
+});
+
+test("a host's system change written for the subconscious, which its view leaves out, doesn't start its count again", async (t) => {
+  const membrane = new ScriptedMembrane(() => serverError);
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100], subconscious: { enabled: true, systemPrompt: 'notice' } });
+  const held = () => ((r.fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { heldRequests: number } }> })
+    .agents.find((a) => a.name === 'Subconscious')!).providerAdmission.heldRequests;
+  queue(r, { agentName: 'Subconscious', reason: 'zz-wake' });
+  await waitFor(() => r.count('inference:exhausted') === 2, "the subconscious's window and its one re-arm to end exhausted");
+  assert.equal(held(), 0, 'its re-arms are spent');
+  stderr.length = 0;
+  (r.fw as unknown as { addMessage(role: string, content: unknown[], metadata: unknown, opts: unknown): unknown }).addMessage('Antra',
+    [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'a tool', inputSchema: { type: 'object', properties: {} } }] }],
+    undefined, { forAgent: 'Subconscious' });
+  queue(r, { agentName: 'Subconscious', reason: 'zz-wake' });
+  await waitFor(() => r.count('inference:exhausted') === 3, "the subconscious's next turn to end exhausted");
+  assert.equal(held(), 0, "its view never holds the change, so its count doesn't start again");
+  assert.ok(!stderr.some((line) => line.includes('re-send count started again')), 'nor says it did');
 });
 
 test("a message stored in the residents' shared slot starts the count again for each resident that reads it", async (t) => {

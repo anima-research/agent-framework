@@ -32,3 +32,10 @@
   request does, where it wrote such a field as null. A host whose tool
   definitions carry one, built as objects rather than parsed from JSON, gets
   one fresh layout at the upgrade, on `'head'` too.
+- A system change row is never a message said to an agent: it restarts no
+  re-send count, counts as nothing heard, and moves no turn to a channel,
+  whatever its metadata. A row the agent's own view leaves out, such as
+  another resident's change, or for the subconscious any change not its own,
+  is stored but not injected into its live turn at a tool boundary, and isn't
+  noted as said to it or heard; and for an agent on its head, which sends no
+  change row, neither is any change row stored at its tool boundary injected.
