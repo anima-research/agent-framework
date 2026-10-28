@@ -246,24 +246,24 @@ export interface FrameworkConfig {
    * send that fails with a deadline membrane marks, as when a stream stalls.
    * Such a cut counts as a transient failure, so a turn that ends on it is
    * re-armed as for a transient failure, unless it follows another such cut
-   * with no other answer from the provider between them: two such cuts in a
-   * row end the re-arming, and the second gets no retry from the error policy,
-   * even in a re-armed turn that got partway. A transient failure or a round
-   * that answered, in a re-armed turn, is such an answer, and a completed
-   * turn, a message said to the agent and `stop()` start afresh too. Every
-   * such cut counts, including one the error policy retries or a host's
-   * provider hold takes. A deadline the host sets still ends it. A wake for
-   * the agent while it waits starts its turn at once, with the re-armed
-   * trigger merged in. That turn is the wake's: the error policy retries its
-   * failures. A completed turn starts the count again, and so does a message
-   * said to the agent: not a system message or notice; not an edit, reaction
-   * or deletion, unless an edit is the first version of a message the agent
-   * sees; not a message its own view leaves out, such as one a tune-out holds
-   * from it; and not the agent's own schedule, the heartbeat's tick or
-   * reminder, a self-wake timer it set, or a script's wake. A notice a module
-   * or an MCPL server stores as a message counts. A message in the residents'
-   * shared slot counts for each resident that reads it. Any other wake leaves
-   * the count going on. A re-armed turn's transient failure writes no
+   * with no transient failure or answered round between them: two such cuts in
+   * a row end the re-arming, and the second gets no retry from the error
+   * policy, even in a re-armed turn that got partway. A re-armed turn's
+   * transient failure or answered round clears an earlier cut, and so do a
+   * completed turn, a message said to the agent and `stop()`. Every such cut
+   * counts, including one the error policy retries or a host's provider hold
+   * takes. A deadline the host sets still ends it. A wake for the agent while
+   * it waits starts its turn at once, with the re-armed trigger merged in.
+   * That turn is the wake's: the error policy retries its failures. A
+   * completed turn starts the count again, and so does a message said to the
+   * agent: not a system message or notice; not an edit, reaction or deletion,
+   * unless an edit is the first version of a message the agent sees; not a
+   * message its own view leaves out, such as one a tune-out holds from it; and
+   * not the agent's own schedule, the heartbeat's tick or reminder, a
+   * self-wake timer it set, or a script's wake. A notice a module or an MCPL
+   * server stores as a message counts. A message in the residents' shared slot
+   * counts for each resident that reads it. Any other wake leaves the count
+   * going on. A re-armed turn's transient failure writes no
    * `[inference-failed]` marker unless a round of it ran or had its tool calls
    * cut off; any other failure of it writes one. Each counts toward the
    * hard-down streak. Ephemeral runs and conversation forks are never

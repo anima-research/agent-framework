@@ -20,22 +20,22 @@
   re-arming. The one exception is a re-armed turn's send that fails with a
   deadline membrane marks, as when a provider's stream stalls. Such a cut
   counts as a transient failure, so a turn that ends on it is re-armed as for
-  a transient failure, unless it follows another such cut with no other answer
-  from the provider between them: two such cuts in a row end the re-arming,
-  and the second gets no retry from the error policy, even in a re-armed turn
-  that got partway. A transient failure or a round that answered, in a
-  re-armed turn, is such an answer, and a completed turn, a message said to
-  the agent and `stop()` start afresh too. Every such cut counts, including
-  one the error policy retries or a host's provider hold takes. A deadline the
-  host sets on a turn still ends it. A wake for the agent while it waits
-  starts its turn at once, with the re-armed trigger merged in. That turn is
-  the wake's: the error policy retries its failures. A completed turn starts
-  the count again, and so does a message said to the agent (not a system
-  message or notice; not an edit, reaction or deletion, unless an edit is the
-  first version of a message the agent sees; not a message its own view leaves
-  out, such as one a tune-out holds from it; and not the agent's own schedule:
-  the heartbeat's tick or reminder, a self-wake timer it set, or a script's
-  wake. A notice a module or an MCPL server stores as a message counts, and a
+  a transient failure, unless it follows another such cut with no transient
+  failure or answered round between them: two such cuts in a row end the
+  re-arming, and the second gets no retry from the error policy, even in a
+  re-armed turn that got partway. A re-armed turn's transient failure or
+  answered round clears an earlier cut, and so do a completed turn, a message
+  said to the agent and `stop()`. Every such cut counts, including one the
+  error policy retries or a host's provider hold takes. A deadline the host
+  sets on a turn still ends it. A wake for the agent while it waits starts its
+  turn at once, with the re-armed trigger merged in. That turn is the wake's:
+  the error policy retries its failures. A completed turn starts the count
+  again, and so does a message said to the agent (not a system message or
+  notice; not an edit, reaction or deletion, unless an edit is the first
+  version of a message the agent sees; not a message its own view leaves out,
+  such as one a tune-out holds from it; and not the agent's own schedule: the
+  heartbeat's tick or reminder, a self-wake timer it set, or a script's wake.
+  A notice a module or an MCPL server stores as a message counts, and a
   message in the residents' shared slot counts for each resident that reads
   it), so each such message gets its own re-sends, over about 42 minutes after
   its turn first exhausts at the default delays; any other wake leaves the
