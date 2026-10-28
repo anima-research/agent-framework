@@ -124,7 +124,8 @@ export interface SubconsciousConfig {
   physicalWindowTokens?: AgentConfig['physicalWindowTokens'];
   /** Its model's thinking binding, as AgentConfig.thinkingBinding, in place
    *  of the primary's. Left out, null or false, it has the primary's on the
-   *  primary's model and none on another. */
+   *  primary's model and none on another; `{ binds: false }` gives it none
+   *  on the primary's model. */
   thinkingBinding?: AgentConfig['thinkingBinding'];
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the
