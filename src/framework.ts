@@ -4053,7 +4053,7 @@ export class AgentFramework {
   private readonly releasesAfterResume = new Map<string, Agent>();
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
-  private readonly resumesPending = new Set<string>();
+  private readonly resumesPending = new Map<string, Agent | undefined>();
   // context-manager 0.23.1: a strategy that keeps its context, as
   // AutobiographicalStrategy does (hostContext, autobiographical.ts:2897),
   // keeps its manager reachable while its work is pending, since the
@@ -11030,7 +11030,7 @@ export class AgentFramework {
       }
     }
 
-    this.resumesPending.add(name);
+    this.resumesPending.set(name, undefined);
     const release: ManagerRelease = { released: false, calls: new Set() };
     let contextManager: ContextManager;
     try {
@@ -11059,8 +11059,9 @@ export class AgentFramework {
     this.ephemeralAgents.add(agent); // and its usage counts in the shared ephemeral entry (#558)
     this.ephemeralCandidates.set(agent, { contextManager, config: fullConfig, resume: true, spec });
     this.managerReleases.set(agent, release);
+    this.resumesPending.set(name, agent);
     const cleanup = () => {
-      if (this.ephemeralCandidates.has(agent)) this.resumesPending.delete(name);
+      if (this.resumesPending.get(name) === agent) this.resumesPending.delete(name);
       this.releasedByCleanup.add(agent);
       this.releaseManager(agent);
     };
@@ -12334,7 +12335,7 @@ export class AgentFramework {
     // Consume before any await/registration: the exact (Agent, ContextManager)
     // generation is one-shot even if startup later fails.
     this.ephemeralCandidates.delete(agent);
-    if (candidate.resume) this.resumesPending.delete(agent.name);
+    if (candidate.resume && this.resumesPending.get(agent.name) === agent) this.resumesPending.delete(agent.name);
     if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
       throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
     }

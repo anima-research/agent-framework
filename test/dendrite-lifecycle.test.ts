@@ -698,6 +698,26 @@ describe('Dendrite lifecycle', () => {
     const resumed = await framework.resumeAgent('job-v', { model: 'test-model', systemPrompt: 'Do the task.' });
     resumed.cleanup();
   });
+
+  it("an earlier resume's cleanup, called again, leaves a later resume's hold on the name", async () => {
+    const framework = await boot();
+    framework.start();
+    membrane.script('job-c', say('job-c done'));
+    const made = await framework.createEphemeralAgent(
+      { name: 'job-c', model: 'test-model', systemPrompt: 'Do the task.' },
+      workerSpec('job-c', { spawnedBy: 'mira' }),
+    );
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await framework.runEphemeralToCompletion(made.agent, made.contextManager);
+    const config = { model: 'test-model', systemPrompt: 'Do the task.' };
+    const first = await framework.resumeAgent('job-c', config);
+    first.cleanup();
+    const second = await framework.resumeAgent('job-c', config);
+    first.cleanup();
+    await assert.rejects(framework.resumeAgent('job-c', config), /"job-c" is already being resumed/);
+    second.cleanup();
+  });
+
 });
 
 describe('Dendrite restart', () => {
