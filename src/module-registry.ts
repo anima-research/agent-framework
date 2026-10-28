@@ -678,11 +678,11 @@ export class ModuleRegistry {
     // Find handlers that match this agent
     const handlers = this.speechHandlers.filter(
       (h) => h.agents === '*' || h.agents.includes(agentName)
-    );
+    ).map((handler) => ({ handler, registration: this.moduleContexts.get(handler.moduleName) }));
 
     // Call each handler
-    for (const handler of handlers) {
-      if (!this.speechHandlers.includes(handler)) continue;
+    for (const { handler, registration } of handlers) {
+      if (this.moduleContexts.get(handler.moduleName) !== registration) continue;
       const module = this.modules.get(handler.moduleName);
       if (module?.onAgentSpeech) {
         try {

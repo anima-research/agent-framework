@@ -442,6 +442,23 @@ test("speech being dispatched when a module's removal completes doesn't reach a 
   });
 });
 
+test("a running module that registers or removes its speech handler while speech is being dispatched is still called for it", async () => {
+  const held = gate();
+  const first = probe('first', { onStart: (ctx) => ctx.registerSpeechHandler('*'), speak: async () => { held.enter(); await held.opened; } });
+  const replacing = probe('replacing', { onStart: (ctx) => ctx.registerSpeechHandler('*') });
+  const removing = probe('removing', { onStart: (ctx) => ctx.registerSpeechHandler('*') });
+  await withFramework([first.module, replacing.module, removing.module], async (framework) => {
+    const registry = (framework as unknown as { moduleRegistry: { dispatchSpeech(agent: string, content: ContentBlock[], context: never): Promise<void> } }).moduleRegistry;
+    const speaking = registry.dispatchSpeech('assistant', text('spoken'), {} as never);
+    await held.entered('the speech to reach the first module');
+    replacing.ctx().registerSpeechHandler(['assistant']);
+    removing.ctx().unregisterSpeechHandler();
+    held.open();
+    await speaking;
+    assert.deepEqual([replacing.spoke, removing.spoke], [['assistant'], ['assistant']]);
+  });
+});
+
 interface BareRegistry {
   registry: ModuleRegistry;
   queued: string[];
