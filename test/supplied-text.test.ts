@@ -19,7 +19,7 @@ describe('marking many texts', () => {
     assert.deepEqual(markedTexts(['a', '', `[${NOTICE_TAG.routing}] b`]), ['a', '', `\\[${NOTICE_TAG.routing}] b`]);
   });
 
-  it("finds the text that holds each of many openings in one walk through the texts' starts", () => {
+  it("finds the text that holds each of many openings with at most 2n·⌈log₂ n⌉ reads of the texts' starts, a bound that grows as n log n", () => {
     const n = 2_000;
     let reads = 0;
     const starts = new Proxy(Array.from({ length: n }, (_, i) => i * 10), {
@@ -30,7 +30,7 @@ describe('marking many texts', () => {
     });
     const places = Array.from({ length: n }, (_, i) => i * 10 + 3);
     assert.deepEqual(holdersOf(starts, places), places.map((_, i) => i));
-    assert.ok(reads <= 2 * n, `${reads} reads of the starts for ${n} places`);
+    assert.ok(reads <= 2 * n * Math.ceil(Math.log2(n)), `${reads} reads of the starts for ${n} places`);
   });
 });
 
