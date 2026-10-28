@@ -36496,10 +36496,10 @@ export class AgentFramework {
       const speech = home
         ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
         : open?.locus && !sameChannel(open.locus, resolved)
-          ? `This turn's plain speech still lands in ${this.channelShown(open.locus)}; from your next turn it lands in the excepted channel while this holds, except on a heartbeat's turn, which has none.`
+          ? `This turn's plain speech still lands in ${this.channelShown(open.locus)}; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's.`
           : open && (open.noChannel || open.heartbeat)
-            ? "This turn has no channel, so its plain speech goes to none; from your next turn it lands in the excepted channel while this holds, except on a heartbeat's turn, which has none."
-            : "Your plain speech lands in the excepted channel while this holds, except on a heartbeat's turn, which has none.";
+            ? "This turn has no channel, so its plain speech goes to none; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's."
+            : "Your plain speech lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's.";
       return {
         success: true,
         data: {
