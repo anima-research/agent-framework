@@ -27021,9 +27021,12 @@ export class AgentFramework {
    * What a reader fork may call: exactly its own tools and the speech its
    * configuration allows, never widened or narrowed by its resident's
    * allowedTools. The resident's list bounds the resident's own surface;
-   * the reader's tools are the framework's, for reading on its behalf. The
-   * fork still shows its resident's block (the shared prefix): what it may
-   * call is decided here, at each call, apart from what it is shown.
+   * the reader's tools are the framework's, for reading on its behalf. A
+   * denyToolsAtDispatch entry the fork takes from its resident that names
+   * one of them still refuses it (mayCallTool checks the deny first): a
+   * resident never holds a reader tool, so such an entry is about readers.
+   * The fork still shows its resident's block (the shared prefix): what it
+   * may call is decided here, at each call, apart from what it is shown.
    */
   private readerMayCall(agentName: string, toolName: string): boolean {
     if (this.registry.get(agentName)?.kind !== 'subconscious-fork') return false;
