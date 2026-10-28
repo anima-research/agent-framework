@@ -12371,6 +12371,10 @@ export class AgentFramework {
     if (registered.orphaned) {
       this.announceOrphaned(registered, registered.orphaned.candidates, registered.orphaned.formerParent.agent, registered.orphaned.reason);
     }
+    // Mail held for this name (a resumed incarnation's, sent while it was
+    // ended) reaches it now rather than at the next boot. Its run is
+    // starting, so it wakes nothing.
+    for (const mail of this.registry.listMail({ to: agent.name })) this.attemptMailDelivery(mail, false);
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
       inferenceStarted: false,

@@ -511,6 +511,26 @@ describe('the registry\'s recovery', () => {
     assert.equal(first.getAgentRecord('w'), null);
   });
 
+  it('mail held for a job while it was ended reaches its resumed incarnation when that registers', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'r', 'g-r', workerSpec('r', { spawnedBy: 'oren' }));
+    const child = await startBlocked(first, gates, 'c', 'g-c', workerSpec('c', { spawnedBy: 'r', resultTo: { to: 'r', as: 'message' } }));
+    first.stopAgent('r', { by: 'oren' });
+    gates.release('g-c');
+    assert.ok((await child.settled).ok);
+    first.deliverAgentResult('c', [{ type: 'text', text: 'C-RESULT' }]);
+    assert.deepEqual(first.listHeldMail().map((m) => [m.to, m.heldBecause]), [['r', 'recipient-gone']]);
+    membrane.script('r', say('done'));
+    const resumed = await first.resumeAgent('r', { model: 'test-model', systemPrompt: 'x' });
+    resumed.contextManager.addMessage('user', [{ type: 'text', text: 'Go on.' }]);
+    await first.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+    assert.deepEqual(first.listHeldMail(), [], 'nothing is held for it now');
+    const context = await first.inspectAgentContext('r');
+    assert.ok(context.getAllMessages().some((m) => textOf(m.content).includes('C-RESULT')), 'and the result is in its context');
+  });
+
   it('a job cancelled with its stream in flight rejects with AgentStoppedError naming who and why', async () => {
     const gates = new GateModule();
     const first = await boot(gates);
