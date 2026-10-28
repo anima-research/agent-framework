@@ -26666,6 +26666,10 @@ export class AgentFramework {
       const turn = this.callingTurnOf(agentName, call);
       return call.name === 'focus' ? this.handleFocusTool(agentName, input, own, turn) : this.handleTuneOutTool(agentName, input, own, turn);
     }
+    if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(call.name)) {
+      const routed = this.readerToolCall(origin.kind === 'agent' ? origin.agentName : call.callerAgentName ?? '__ephemeral__', call);
+      return 'refused' in routed ? failed({ success: false, error: `${routed.refused}, so the call didn't run.`, isError: true }) : routed.result;
+    }
     return this.moduleRegistry.handleToolCall(call);
   }
 
@@ -28635,13 +28639,9 @@ export class AgentFramework {
       return;
     }
     if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(enrichedCall.name)) {
-      const isReader =
-        agentName === this.subconsciousAgentName ||
-        this.registry.get(agentName)?.kind === 'subconscious-fork';
-      if (!this.tuneOutCoordinator || !isReader) {
-        // Advertised to residents so reader forks share their prefix;
-        // usable only by a reader.
-        const error = `${enrichedCall.name} is available to the resident's reader, not to ${agentName}`;
+      const routed = this.readerToolCall(agentName, enrichedCall);
+      if ('refused' in routed) {
+        const error = routed.refused;
         this.toolLifecycleEmitter?.refuse(agentName, call.id);
         this.emitTrace({ type: 'tool:failed', module: 'tune-out', tool: call.name, callId: call.id, error });
         this.pushEvent({
@@ -28650,11 +28650,7 @@ export class AgentFramework {
         });
         return;
       }
-      void this.tuneOutCoordinator
-        .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>, this.callOwnChannels(agentName, enrichedCall), agentName)
-        // A rejection is answered with a failed result, as a framework tool's
-        // dispatch failure is (dispatchAgentSettingsToolCall), never left unhandled.
-        .catch((err): ToolResult => ({ success: false, error: thrownText(err), isError: true }))
+      void routed.result
         .then((result) => {
           // Through pushEvent, like every other tool's result, so one that
           // arrives after stop() is dropped rather than rejected unhandled.
@@ -36021,6 +36017,24 @@ export class AgentFramework {
       const msg = err instanceof Error ? err.message : String(err);
       finish({ success: false, error: msg, isError: true });
     }
+  }
+
+  /**
+   * A reader's own tool (SUBCONSCIOUS_TOOL_NAMES), for both entries that run
+   * an agent's call: the dispatcher's, for the model's call, and
+   * executeToolCallFrom's, for a host's or the puppet's. The tools are
+   * advertised to residents so reader forks share their prefix, and only a
+   * registered reader may use them. A rejection is answered with a failed
+   * result, never left unhandled.
+   */
+  private readerToolCall(agentName: string, call: ToolCall): { refused: string } | { result: Promise<ToolResult> } {
+    const isReader = agentName === this.subconsciousAgentName || this.registry.get(agentName)?.kind === 'subconscious-fork';
+    if (!this.tuneOutCoordinator || !isReader) return { refused: `${call.name} is available to the resident's reader, not to ${agentName}` };
+    return {
+      result: this.tuneOutCoordinator
+        .handleSubconsciousTool(call.name, call.input as Record<string, unknown>, this.callOwnChannels(agentName, call), agentName)
+        .catch((err): ToolResult => ({ success: false, error: thrownText(err), isError: true })),
+    };
   }
 
   /**
