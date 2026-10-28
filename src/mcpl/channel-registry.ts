@@ -2542,7 +2542,8 @@ export class ChannelRegistry {
     // declared it inbound-only, since speech isn't posted there): a conversation
     // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
-    // (heartbeats). Without this, a fork
+    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none).
+    // Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
     // Each lookup is keyed on whether a name was given, not its truthiness:

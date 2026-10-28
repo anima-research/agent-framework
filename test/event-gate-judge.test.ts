@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventGate } from '../src/gate/event-gate.js';
 import type { GateConfig, GateEventInfo, JudgeFn, JudgeRequest, JudgeVerdict } from '../src/gate/types.js';
+import type { ToolDefinition } from '../src/types/index.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-judge');
 
@@ -790,10 +791,11 @@ async function judgeFramework(t: { after: (fn: () => Promise<void>) => void }, j
     const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
     return round![0]!;
   };
-  const toolNamed = (name: string) => {
-    const tools = membrane.calls.at(-1)!.tools ?? [];
-    return tools.find((tool) => tool.name === name)!;
-  };
+  // The definition the agent reads: wake rules are in the host's built-in
+  // toolset, out of the request's tool list, so it's read as that toolset
+  // lists it for this agent (its own presentation applied).
+  const host = (framework as unknown as { hostPresentation: { builtinTools(agent: string): ToolDefinition[] } }).hostPresentation;
+  const toolNamed = (name: string) => host.builtinTools('scout').find((tool) => tool.name === name)!;
   const wakeAddRule = () => toolNamed('wake_add_rule');
   return { framework, membrane, configPath, call, wakeAddRule, toolNamed };
 }

@@ -55,13 +55,15 @@ export interface AgentConfig {
    * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
    * - string[]: exact tool names, including module--utility names for utilities.
-   * Utilities aren't tools of their own: an agent's model and its scripts are
-   * offered them only through 'utils', whose run checks the utility's own
-   * name. An agent that should use a utility lists both 'utils' and
-   * 'module--utility'. The name alone passes the dispatch check for any call
-   * by that name, whether the host makes it with executeToolCall on the
-   * agent's behalf or the model or a script makes it without being offered
-   * it. The slot is hidden when no utility is permitted.
+   * Utilities and the host's other rarely-used tools are in the host's
+   * built-in toolset ("settings"), out of the tool list: the model reaches
+   * them with toolsets--open {toolset:"settings"} and toolsets--act, each
+   * checked under the tool's own name. An agent that should use a utility
+   * from its model lists 'toolsets--open', 'toolsets--act' and
+   * 'module--utility' (an agent without the two meta-tools keeps every other
+   * tool in its list, but no utility). The name alone passes the dispatch
+   * check for any call by that name, whether the host makes it with
+   * executeToolCall on the agent's behalf or the model or a script makes it.
    * Trusted module calls are exempt. Genuinely unidentified public callers,
    * including unknown legacy names, remain unrestricted. Framework-created
    * identities have tool authority only while registered.
@@ -608,8 +610,9 @@ export interface InferenceRequest {
    * the turn's auto-published plain-text speech here so a single TRUNK agent
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
-   * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel, except an
+   * redux). Undefined for non-channel wakes (heartbeat, timers, module events).
+   * A heartbeat's turn takes no channel at all, and holds its plain speech as
+   * drafts; any other falls back to the global default channel, except an
    * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
@@ -632,6 +635,17 @@ export interface InferenceRequest {
    * it starts. Hosts don't set it.
    */
   autoContinueRun?: AutoContinueRun;
+  /**
+   * Framework-set: whether this wake's turn is a heartbeat's, which has no
+   * channel and holds its plain speech as drafts. True on a wake that
+   * continues a heartbeat's turn with no channel of its own (an autoContinue
+   * continuation, a bounce's resend wake, a ` !` continuation, and a re-arm,
+   * which copies its trigger), and on a merged batch whose causes include a
+   * heartbeat's wake and name no channel; false on a merged batch with none,
+   * so the batch's first request doesn't decide it. Unset, a wake is a
+   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it.
+   */
+  heartbeatTurn?: boolean;
   /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake

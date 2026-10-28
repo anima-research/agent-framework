@@ -13,9 +13,9 @@
  * results, in the results of calls that changed them, in push events and in
  * notices) and called through `toolsets--act`, which this module only
  * resolves (resolveAct): the framework dispatches the call it resolves to
- * down the same path as a direct call of the server's tool. The module is registered when an MCPL
- * server has tool hints (`toolHints` not false; left out, where the name `toolsets` is free), at
- * startup or at its first runtime connect; its tools never change after that.
+ * down the same path as a direct call of the server's tool. The module is registered at create(),
+ * for every agent (the host's own toolsets use it too), unless a module given to create() holds
+ * the name; its tools never change after that.
  *
  * Its gatherContext publishes the RFC §8.3 reminder, as a stored `afterUser`
  * injection, when an agent's earlier announcements of an open toolset have
@@ -31,6 +31,7 @@ import { META_TOOL_NAMES, TOOLSETS_MODULE, type ToolsetController, type ToolsetH
 import { keyOf, type ChangeSet, type ToolPresence } from './tool-presence.js';
 import { checkArgs, jsonText, renderToolDefinition, type HintedTool } from './tool-signature.js';
 import { McplRequestError } from './server-connection.js';
+import { BUILTIN_TOOLSET, type HostPresentation } from '../host-presentation.js';
 
 /** The namespace a reminder's stored injection carries. */
 export const TOOLSETS_REMINDER_NAMESPACE = 'mcpl-toolsets';
@@ -39,24 +40,26 @@ const META_TOOLS: ToolDefinition[] = [
   {
     name: 'open',
     description:
-      'Open a toolset of an MCPL server (a game, a building mode, a card table) so its tools can be called with toolsets--act. ' +
-      'Returns what the server shows on opening and the tools available now. server may be left out when one server has the toolset, ' +
-      'and toolset when the server has only one; instance names a separate copy where a toolset allows several (two games at once); ' +
+      'Open a toolset so its tools can be called with toolsets--act: the host\'s own settings and controls (toolset "settings"), ' +
+      'an MCPL server\'s tab (server alone: its tools without putting them in your tool list; a closed tab is connected again; ' +
+      'full: true puts the server back in your tool list), or a toolset an MCPL server declares (a game, a building mode, a card table: ' +
+      'server and toolset). Returns the tools available now. instance names a separate copy where a toolset allows several; ' +
       'options as toolsets--look lists them.',
     inputSchema: {
       type: 'object',
       properties: {
         server: { type: 'string', description: 'the MCPL server id' },
-        toolset: { type: 'string' },
+        toolset: { type: 'string', description: '"settings" for the host\'s own; a server\'s toolset with server' },
         instance: { type: 'string', description: 'a name for this copy (toolsets with instances only)' },
         options: { type: 'object', description: 'toolset options, as toolsets--look shows them' },
+        full: { type: 'boolean', description: 'with server alone: put the server\'s tools back in your tool list' },
       },
     },
   },
   {
     name: 'act',
     description:
-      'Call a tool that was announced in the conversation (a tool of an open toolset, or another dynamic tool); they are not in your tool list. ' +
+      'Call a tool of an open toolset (the host\'s "settings", a server\'s tab, or a server\'s own toolset) or another dynamic tool, as announced in the conversation; they are not in your tool list. ' +
       'args are the arguments its signature shows; instance picks the open copy when several are open; server is needed only when two servers have the tool. ' +
       'Returns the server\'s result, then any change it made in which tools are available, unless that change already went out as a notice. toolsets--look shows what is available now.',
     inputSchema: {
@@ -73,7 +76,7 @@ const META_TOOLS: ToolDefinition[] = [
   {
     name: 'look',
     description:
-      'Show what is open and what can be opened on MCPL servers, with the tools usable now: announcements earlier in the conversation may be out of date. ' +
+      'Show what is open and what can be opened (the host\'s "settings", each MCPL server\'s tab, servers\' own toolsets), with the tools usable now: announcements earlier in the conversation may be out of date. ' +
       'With tool: that tool\'s full description and input schema. With toolset or instance: just that one.',
     inputSchema: {
       type: 'object',
@@ -87,13 +90,15 @@ const META_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'close',
-    description: 'Close an open toolset or instance: its tools stop, and for a toolset the server declares, the server is told and stops its events too. Closing a game in progress may count as leaving it.',
+    description: 'Close an open toolset or instance: its tools stop, and for a toolset the server declares, the server is told and stops its events too. Closing a game in progress may count as leaving it. ' +
+      'server alone moves a server out of your tool list into a tab (connected, its events still come), or hides its open tab; with disconnect: true it is disconnected until you open it again.',
     inputSchema: {
       type: 'object',
       properties: {
         server: { type: 'string', description: 'the MCPL server id (may be left out when one server has the toolset open)' },
-        toolset: { type: 'string', description: 'may be left out when only one thing is open on the server' },
+        toolset: { type: 'string', description: '"settings" for the host\'s own; may be left out when only one thing is open on the server' },
         instance: { type: 'string' },
+        disconnect: { type: 'boolean', description: 'with server alone: disconnect it as a closed tab until it is opened again' },
       },
     },
   },
@@ -284,6 +289,8 @@ export class ToolsetsModule implements Module {
   constructor(
     private readonly hub: ToolsetHub,
     private readonly takerFor: (call: ToolCall) => ((taken: TakenChange) => void) | null,
+    /** The host's own toolsets (the built-in "settings" and server tabs), when the framework presents them. */
+    private readonly host: HostPresentation | null = null,
   ) {}
 
   async start(_ctx: ModuleContext): Promise<void> {}
@@ -308,7 +315,16 @@ export class ToolsetsModule implements Module {
     const args = isObj(call.input) ? call.input : {};
     try {
       checkSelectors(args);
+      const hosted = await this.hostCall(call.name, args, call.callerAgentName);
+      if (hosted) return hosted;
       const take = this.takerFor(call);
+      const lead = call.name === 'look' ? this.hostLookLead(args, call.callerAgentName) : null;
+      if (lead !== null) {
+        if (!this.hub.presenting().length) return textResult(lead);
+        const theirs = await this.look(args, take);
+        if (theirs.isError || typeof theirs.data !== 'string') return theirs;
+        return textResult(`${lead}\n\n${theirs.data}`);
+      }
       switch (call.name) {
         case 'open': return await this.open(args, take);
         case 'act': return this.act(args);
@@ -322,6 +338,62 @@ export class ToolsetsModule implements Module {
         : `${META_TOOL_NAMES[call.name as keyof typeof META_TOOL_NAMES] ?? call.name}: ${error instanceof Error ? error.message : String(error)}`;
       return { success: false, isError: true, error: message };
     }
+  }
+
+  /**
+   * The host's own toolsets: `toolset: "settings"` alone, or `server` alone
+   * (a server's tab), for open, close and look; a tool a host toolset has, for
+   * look. Null for everything else, which the servers' toolsets answer.
+   */
+  private async hostCall(name: string, args: Record<string, unknown>, agentName: string | undefined): Promise<ToolResult | null> {
+    const host = this.host;
+    if (!host || !agentName || !host.active(agentName)) return null;
+    const server = str(args.server);
+    const toolset = str(args.toolset);
+    const instance = str(args.instance);
+    const tool = str(args.tool);
+    const builtin = toolset === BUILTIN_TOOLSET && !server && !instance;
+    const tab = !!server && !toolset && !instance && args.options === undefined;
+    if (args.full !== undefined && typeof args.full !== 'boolean') fail('full must be true or false');
+    if (args.disconnect !== undefined && typeof args.disconnect !== 'boolean') fail('disconnect must be true or false');
+    if (tab && !host.knows(server!) && !this.hub.get(server!)) fail(`no MCPL server "${server}" is configured here`);
+    switch (name) {
+      case 'open':
+        if (builtin) return textResult(host.openBuiltin(agentName));
+        if (tab) return textResult(await host.openServer(agentName, server!, { full: args.full === true }));
+        if (args.full !== undefined) fail('full goes with server alone');
+        return null;
+      case 'close':
+        if (builtin) return textResult(host.closeBuiltin(agentName));
+        if (tab) return textResult(await host.closeServer(agentName, server!, { disconnect: args.disconnect === true }));
+        if (args.disconnect !== undefined) fail('disconnect goes with server alone');
+        return null;
+      case 'look': {
+        // A host toolset's tool, with or without its server named (as act takes it).
+        if (tool && !toolset && !instance) {
+          const shown = host.lookTool(agentName, tool, server);
+          if (shown) return textResult(shown);
+          return null;
+        }
+        if (builtin) return textResult(host.lookToolset(agentName, { builtin: true }));
+        // A server's tab, and every host toolset with no selector, go first in
+        // what the servers' own look says (handleToolCall adds them).
+        if (tab && !tool && !this.hub.get(server!)?.presents) return textResult(host.lookToolset(agentName, { serverId: server! }));
+        return null;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /** What the host's own toolsets add ahead of the servers' look: everything, or one presenting server's tab. */
+  private hostLookLead(args: Record<string, unknown>, agentName: string | undefined): string | null {
+    const host = this.host;
+    if (!host || !agentName || !host.active(agentName)) return null;
+    const server = str(args.server);
+    if (str(args.toolset) || str(args.instance) || str(args.tool)) return null;
+    if (!server) return host.catalog(agentName).join('\n');
+    return host.knows(server) ? host.lookToolset(agentName, { serverId: server }) : null;
   }
 
   private toolsAt(c: ToolsetController, key: string): HintedTool[] {
