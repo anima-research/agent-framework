@@ -69,6 +69,15 @@ test('a request with id null is answered, with id null', (t) => {
   ]);
 });
 
+test('a tools/hints request with id null, read while a read tap listens, is answered with id null', (t) => {
+  const { connection, send, replies } = wire(t);
+  const reads: string[] = [];
+  connection.setReadTap((read) => { reads.push(read.kind); });
+  send({ jsonrpc: '2.0', id: null, method: 'tools/hints', params: { rev: 1, tools: [] } });
+  assert.deepEqual(reads, ['hints']);
+  assert.deepEqual(replies(), [{ jsonrpc: '2.0', id: null, result: {} }]);
+});
+
 test('a request with id null held while the planes are paused is answered with id null when they open', async () => {
   const transport = new ResponseTransport();
   const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
