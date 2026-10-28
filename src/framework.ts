@@ -409,6 +409,12 @@ const HOST_METADATA_KEYS = [
  * marker too. A marker that wakes the agent can still set that turn's speech
  * channel (agent-framework#189); a `chat:system` notice can't (systemNotice).
  */
+const isOwnScheduleWrite = (metadata?: MessageMetadata): boolean => {
+  const m = metadata as { serverId?: unknown; source?: unknown; tags?: unknown } | undefined;
+  return m?.serverId === 'heartbeat' || m?.source === 'gate:self-wake'
+    || (Array.isArray(m?.tags) && m.tags.includes('script:wake'));
+};
+
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
@@ -785,6 +791,19 @@ const settingNumber = (name: string, value: unknown): number => {
   throw new Error(`${name} must be a number, not ${shownValue(value)}`);
 };
 
+const DEFAULT_TURN_REARM_MS: readonly number[] = [2 * 60_000, 8 * 60_000, 32 * 60_000];
+
+const turnRearmDelays = (value: unknown): readonly number[] => {
+  if (value === undefined) return DEFAULT_TURN_REARM_MS;
+  if (value === false) return [];
+  if (!Array.isArray(value) || value.length === 0
+    || ![...value].every((ms) => typeof ms === 'number' && Number.isFinite(ms) && ms > 0)) {
+    throw new Error('FrameworkConfig.exhaustedTurnRearmMs must be false, or a list of one or more delays in ms, ' +
+      `each a number above 0, not ${shownValue(value)}`);
+  }
+  return [...value];
+};
+
 const settingBoolean = (name: string, value: unknown): boolean => {
   if (typeof value === 'boolean') return value;
   if (value === 'true' || value === 'false') return value === 'true';
@@ -1144,13 +1163,41 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
+const REARMED: unique symbol = Symbol('rearmed');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
 interface TurnCarry {
   silence: TurnSilence | null;
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true };
+
+function isRearmed(request: InferenceRequest | undefined): boolean {
+  return request !== undefined && (request as MarkedRequest)[REARMED] === true;
+}
+
+interface StatedWaitRun { since: number; holds: number; alerted: boolean; model: string; reason: string; heldUntil: number }
+
+function waitAlertsOnItsOwn(wait: ProviderWait): boolean {
+  return wait.until === null || wait.until - wait.setAt > PROVIDER_WAIT_ALERT_MS;
+}
+
+// membrane 0.8.0 marks a deadline it reports as run out with this registered
+// symbol (on a sent request, or the Anthropic SDK's timeout, which covers its
+// connect timeout too), and doesn't export its reader.
+const MEMBRANE_DEADLINE_EXPIRY: unique symbol = Symbol.for('membrane.deadlineExpiry');
+
+function isTransientFailure(error: Error): boolean {
+  if (!isMembraneError(error) || error.retryable !== true) return false;
+  if ((error as { [MEMBRANE_DEADLINE_EXPIRY]?: unknown })[MEMBRANE_DEADLINE_EXPIRY] === true) return false;
+  return error.type === 'server' || error.type === 'network' || error.type === 'timeout' || error.type === 'rate_limit';
+}
+
+function gotPartway(routing: TurnRouting): boolean {
+  return routing.roundsRan === true || (routing.unflushedRounds ?? 0) > 0;
+}
+
+const REARM_REASON = 'exhausted-turn-rearm';
 
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
   return (request as MarkedRequest)[MERGED_BATCH];
@@ -2329,6 +2376,7 @@ interface ProviderAccelerationCooldown {
   /** Its held requests were taken out by dropContinuations: release reopens
    *  admission without synthesising an inference in their place. */
   emptiedByDrop?: boolean;
+  rearm?: { number: number; of: number };
   /** Set when this hold is a provider wait (a stated retry-after) for the
    *  agent's primary model: it holds primary turns only. Auxiliary calls are
    *  admitted per model by the provider waits themselves, so a compression
@@ -2385,7 +2433,9 @@ const WAITING_TRACE_EVERY_MS = 60_000;
 /** A stated wait recorded to hold a model longer than this, or until
  *  released, raises an ops alert. It is honoured in full either way: a hold
  *  that long is a quota-scale event or a provider's mistake, and a person
- *  decides which (release-provider-wait). Shorter waits are pacing. */
+ *  decides which (release-provider-wait). Shorter waits are pacing, until
+ *  waits in a row hold one turn longer than this (noteStatedWaitRun,
+ *  endStatedWaitRun). */
 const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
 /**
  * A MembraneError, from this framework's copy of membrane or from another: the
@@ -3456,6 +3506,10 @@ export class AgentFramework {
    *  completes (inference:completed), not when a call answers mid-turn.
    *  Drives hard-down escalation — see noteInferenceExhausted. */
   private consecutiveInferenceFailures: Map<string, number> = new Map();
+  private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
+  private turnRearms: Map<string, number> = new Map();
+  private exhaustingRearms: Set<string> = new Set();
+  private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
   private readonly inferenceFailureEscalationThreshold = 3;
@@ -4191,6 +4245,7 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
+    framework.turnRearmMs = turnRearmDelays(config.exhaustedTurnRearmMs);
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
@@ -5420,7 +5475,7 @@ export class AgentFramework {
    *  only its own model, which auxiliary admission checks per call. */
   private cooldownBlocksAuxiliary(agentName: string): boolean {
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    return cooldown !== undefined && cooldown.waitModel === undefined;
+    return cooldown !== undefined && cooldown.waitModel === undefined && cooldown.rearm === undefined;
   }
   private acquirePrimaryProviderGate(agentName: string): void {
     const gate = this.providerGate(agentName); gate.primaryPending = false; gate.primaryDepth++;
@@ -5533,7 +5588,9 @@ export class AgentFramework {
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
-      wakes.push({ at: cooldown.until, certain: true, what: 'a turn held by a provider cooldown, when it ends' });
+      wakes.push({ at: cooldown.until, certain: true, what: cooldown.rearm
+        ? `a turn whose retries ran out, sent again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
+        : 'a turn held by a provider cooldown, when it ends' });
     }
     wakes.push(...this.heartbeatWakesFor(agentName));
     return wakes;
@@ -5958,7 +6015,58 @@ export class AgentFramework {
     console.error(`[provider-cooldown] agent=${agent.name} ` +
       `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
+    if (wait && trigger && (wait.until === null || wait.until > now)) this.noteStatedWaitRun(agent.name, wait, now);
     return true;
+  }
+  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined): void {
+    if (!ownsProviderGate || trigger === undefined || this.providerAdmissionClosed || this.turnRearmMs.length === 0) return;
+    const done = this.turnRearms.get(agent.name) ?? 0;
+    const notSent = (why: string) => console.error(`[inference-rearm] agent=${agent.name} turn not re-armed: ${why}`);
+    if (!isTransientFailure(error)) {
+      if (done > 0) notSent(`its failure isn't transient (${isMembraneError(error) ? error.type : boundFailureText(error.message, FAILURE_SUMMARY_MAX_CHARS)})`);
+      return;
+    }
+    const continuation = isTurnContinuation(trigger.reason);
+    const speaking = routing?.locus ?? routing?.triggerChannel;
+    if (!speaking && routing?.noChannel && !trigger.channelId) {
+      notSent('it would have to guess a channel');
+      return;
+    }
+    if (done >= this.turnRearmMs.length) {
+      notSent(`its ${this.turnRearmMs.length} re-arms are spent until a turn completes or a message is said to it`);
+      return;
+    }
+    const delayMs = this.turnRearmMs[done]!;
+    const rearm = { number: done + 1, of: this.turnRearmMs.length };
+    this.turnRearms.set(agent.name, rearm.number);
+    const request: MarkedRequest = { ...trigger, [REARMED]: true };
+    delete request[TURN_RETRY];
+    delete request[MERGED_BATCH];
+    if (continuation) {
+      request.reason = REARM_REASON;
+      delete request.counterparty;
+    }
+    if (speaking) {
+      request.channelId = speaking.channelId;
+      request.channelServerId = speaking.serverId;
+      request.addressed = true;
+    }
+    const existing = this.providerAccelerationCooldowns.get(agent.name);
+    if (existing) {
+      this.holdRequest(existing.heldRequests, request);
+    } else {
+      const now = Date.now();
+      const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), this.providerHoldTimerMs(delayMs));
+      timer.unref?.();
+      this.providerAccelerationCooldowns.set(agent.name, {
+        startedAt: now, until: now + delayMs, timer, heldRequests: [request], failures: 0, rearm,
+        reason: `its turn's retries ran out (${boundFailureText(error.message, FAILURE_SUMMARY_MAX_CHARS)}), ` +
+          `so it is sent again (${rearm.number} of ${rearm.of})`,
+      });
+    }
+    console.error(`[inference-rearm] agent=${agent.name} turn sent again ` +
+      (existing ? 'when the provider hold already on the agent ends' : `in ${delayMs}ms`) +
+      ` (${rearm.number} of ${rearm.of})`);
   }
   /**
    * A provider's stated wait on a turn that doesn't own provider admission:
@@ -6068,8 +6176,10 @@ export class AgentFramework {
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
       reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
     this.pendingRequests.push(...requests);
-    console.error(`[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
-      `fresh compile queued with ${requests.length} retained request(s)`);
+    console.error(cooldown.rearm
+      ? `[inference-rearm] agent=${agentName} turn queued again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
+      : `[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
+        `fresh compile queued with ${requests.length} retained request(s)`);
   }
   /**
    * Wait an error policy's retry delay, all of it: the delay can be a
@@ -6143,7 +6253,7 @@ export class AgentFramework {
         : `until ${new Date(wait.until).toISOString()}`;
       const stated = `${error.type}${error.httpStatus !== undefined ? ` HTTP ${error.httpStatus}` : ''}, retry-after ${String(error.retryAfterMs)}ms`;
       console.error(`[provider-wait] agent=${agentName} model=${model} holds ${until}: ${stated}`);
-      if (remaining > PROVIDER_WAIT_ALERT_MS) {
+      if (waitAlertsOnItsOwn(wait)) {
         this.opsAlert('provider-wait', agentName,
           `provider wait on ${model} holds ${until} (${stated}: ${reason}); ` +
           'if the provider did not mean that, release it with release-provider-wait',
@@ -6152,6 +6262,41 @@ export class AgentFramework {
     }
     return wait;
   }
+
+  private noteStatedWaitRun(agentName: string, wait: ProviderWait, now: number): void {
+    let run = this.statedWaitRuns.get(agentName);
+    if (!run) {
+      run = { since: now, holds: 0, alerted: false, model: wait.model, reason: wait.reason, heldUntil: now };
+      this.statedWaitRuns.set(agentName, run);
+    }
+    run.holds++;
+    run.model = wait.model;
+    run.reason = wait.reason;
+    if (wait.until !== null) run.heldUntil = Math.max(run.heldUntil, wait.until);
+    if (waitAlertsOnItsOwn(wait)) run.alerted = true;
+    if (now - run.since > PROVIDER_WAIT_ALERT_MS) this.alertStatedWaitRun(agentName, run, now);
+  }
+
+  private alertStatedWaitRun(agentName: string, run: StatedWaitRun, now: number): void {
+    if (run.alerted) return;
+    run.alerted = true;
+    const since = new Date(run.since).toISOString();
+    this.opsAlert('provider-wait', agentName,
+      `a turn's ${run.holds} stated waits in a row on ${run.model} span ${Math.round((now - run.since) / 60_000)} min ` +
+      `since ${since}: ${run.reason}; a provider stating waits that long in a row points to the account's rate limit ` +
+      "or quota, or this host's load",
+      { data: { model: run.model, since, holds: run.holds } });
+  }
+
+  private endStatedWaitRun(agentName: string): void {
+    const run = this.statedWaitRuns?.get(agentName);
+    if (!run) return;
+    this.statedWaitRuns.delete(agentName);
+    const end = Math.min(Date.now(), run.heldUntil);
+    if (end - run.since > PROVIDER_WAIT_ALERT_MS) this.alertStatedWaitRun(agentName, run, end);
+  }
+
+
 
   /**
    * Hold this agent's primary turns for a provider wait on its model. The
@@ -6183,7 +6328,10 @@ export class AgentFramework {
     for (const request of requests) this.holdRequest(held, request);
     // An acceleration or host hold already parks the whole agent; its release
     // re-checks this wait at admission.
-    if (existing && existing.waitModel === undefined) return true;
+    if (existing && existing.waitModel === undefined) {
+      if (failed) this.noteStatedWaitRun(agent.name, wait, now);
+      return true;
+    }
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), this.providerHoldTimerMs(until - now));
     timer.unref?.();
@@ -6196,6 +6344,7 @@ export class AgentFramework {
       console.error(`[provider-wait] agent=${agent.name} model=${wait.model} holding primary turns ` +
         `${wait.until === null ? 'until released' : `until ${new Date(wait.until).toISOString()}`}; ${held.length} request(s) retained`);
     }
+    if (failed) this.noteStatedWaitRun(agent.name, wait, now);
     return true;
   }
 
@@ -6251,6 +6400,8 @@ export class AgentFramework {
     // names every model, the same as omitting it, everywhere below.
     if (model === EVERY_MODEL) model = undefined;
     const released = this.providerWaits?.release(agentName, model, by) ?? [];
+    const run = this.statedWaitRuns?.get(agentName);
+    if (run && released.some(({ wait }) => wait.model === run.model)) run.heldUntil = Math.min(run.heldUntil, Date.now());
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
     }
@@ -6327,6 +6478,7 @@ export class AgentFramework {
   private cancelProviderAdmission(): void {
     for (const cooldown of this.providerAccelerationCooldowns.values()) clearTimeout(cooldown.timer);
     this.providerAccelerationCooldowns.clear(); this.providerAccelerationRecoveries.clear();
+    this.turnRearms?.clear(); this.exhaustingRearms?.clear();
     for (const gate of this.providerGates.values()) {
       gate.primaryDepth = 0; gate.primaryPending = false;
       for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -13873,6 +14025,7 @@ export class AgentFramework {
           if (flushedTurn) {
             flushedTurn.roundsRan = true;
             if (flushedTurn.unflushedRounds) flushedTurn.unflushedRounds--;
+            this.endStatedWaitRun(agent.name);
           }
           if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent
             && pendingBlocks!.some((b) => b.type === 'text' && (b as { text?: string }).text?.trim())) {
@@ -13978,6 +14131,7 @@ export class AgentFramework {
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
+              this.noteSpokenTo(agent.name, msg.metadata);
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
@@ -16647,7 +16801,8 @@ export class AgentFramework {
         // A provider wait binds its own model; with a different primary model
         // selected now, the turn proceeds (the wait stays recorded).
         const otherModel = providerCooldown.waitModel !== undefined && providerCooldown.waitModel !== agent.model;
-        if (!otherModel && (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown))) {
+        if (!otherModel && !providerCooldown.rearm
+          && (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown))) {
           for (const req of requests) this.holdRequest(providerCooldown.heldRequests, req);
           const recovery = this.providerAccelerationRecoveries.get(agentName);
           if (recovery) recovery.heldRequests = providerCooldown.heldRequests.length;
@@ -16658,6 +16813,10 @@ export class AgentFramework {
         // the held causes into this one current compile.
         clearTimeout(providerCooldown.timer);
         this.providerAccelerationCooldowns.delete(agentName);
+        if (providerCooldown.rearm) {
+          console.error(`[inference-rearm] agent=${agentName} turn queued again with a wake ` +
+            `(${providerCooldown.rearm.number} of ${providerCooldown.rearm.of})`);
+        }
         const recovery = this.providerAccelerationRecoveries.get(agentName);
         if (recovery) recovery.releasedAt = now;
         requests = [...providerCooldown.heldRequests, ...requests];
@@ -17054,6 +17213,8 @@ export class AgentFramework {
       const carry = requests.map(turnCarryOf).find((c) => c !== undefined);
       if (carry) start[TURN_CARRY] = carry;
       else delete start[TURN_CARRY];
+      if (requests.every(isRearmed)) start[REARMED] = true;
+      else delete start[REARMED];
       // A start that carries a turn on and took in wakes that don't records
       // the batch it was merged from (MERGED_BATCH): until it takes its
       // token it stands for them all.
@@ -18172,7 +18333,7 @@ export class AgentFramework {
 
   private noteFailedTurnEnd(agent: Agent, routing: TurnRouting): void {
     const callsCutOff = (routing.unflushedRounds ?? 0) > 0;
-    if (routing.roundsRan || callsCutOff) {
+    if (gotPartway(routing)) {
       this.exhaustedTurns?.set(agent.name, {
         roundsRan: routing.roundsRan === true, callsCutOff, liveSpeech: routing.liveSpeech === true,
         speechRouting: (routing.speechRouting ?? 0) > 0,
@@ -18569,6 +18730,7 @@ export class AgentFramework {
     if (!this.isOrdinaryResident(agent)) return;
     for (const reader of this.sharedSlotAgents) {
       if (reader !== agent && this.agents.get(reader.name) === reader && this.isOrdinaryResident(reader)) {
+        this.noteSpokenTo(reader.name, metadata);
         this.noteArrival(reader.name, metadata, messageId);
       }
     }
@@ -20227,6 +20389,7 @@ export class AgentFramework {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
         }, this.openLogical.get(agent.name));
       }
+      this.endStatedWaitRun(agent.name);
       // The agent's window at the event gate ends here too, while this start
       // still holds the turn token, as at the provider-wait hold above. A
       // start that resumes a turn (a budget restart, a tool-result-guard
@@ -21270,7 +21433,8 @@ export class AgentFramework {
         return false;
       }
 
-      const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(routing))
+        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow, agent);
@@ -21330,6 +21494,7 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
+        if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -21349,6 +21514,7 @@ export class AgentFramework {
         if (action.emit) {
           this.pushEvent(action.emit);
         }
+        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing);
       }
       // No handoff on either failure branch: the terminal branch deleted the
       // token above; the retry branch's recursive startAgentStream replaced
@@ -23111,7 +23277,8 @@ export class AgentFramework {
               break;
             }
 
-            const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(streamRouting))
+              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
@@ -23168,6 +23335,7 @@ export class AgentFramework {
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
+              if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -23185,6 +23353,7 @@ export class AgentFramework {
               if (action.emit) {
                 this.pushEvent(action.emit);
               }
+              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
             }
             break;
           }
@@ -23259,6 +23428,7 @@ export class AgentFramework {
                   agentName: agent.name,
                   error: terminal,
                 });
+                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
                 // inference log so future investigations can attribute the
                 // terminal cause without relying on live in-memory reducer
@@ -23549,12 +23719,14 @@ export class AgentFramework {
         speech: '',
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
+      if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
         ...this.classifyInferenceError(err),
       });
+      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
@@ -26481,11 +26653,18 @@ export class AgentFramework {
         : this.agents.values().next().value;
   }
 
+  private noteSpokenTo(agentName: string, metadata: MessageMetadata | undefined): void {
+    const agent = this.agents.get(agentName);
+    if ((agent && !this.agentSees(agent, metadata)) || isOwnScheduleWrite(metadata) || !isConversationalInjection(metadata)) return;
+    if (this.turnRearms?.delete(agentName)) console.error(`[inference-rearm] agent=${agentName} re-send count started again: a message was said to it`);
+  }
+
   /** The notes addMessage takes for a message it stored: an arrival for the
    *  agent when none of its turns is alive or the message was assembled for
    *  the start now beginning (no tool boundary will weigh it), and one for
    *  every other resident's open turn. */
   private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId, bypassDeferralFor?: string): void {
+    this.noteSpokenTo(agent.name, metadata);
     if (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name) {
       this.noteArrival(agent.name, metadata, stored);
     }
@@ -26942,6 +27121,7 @@ export class AgentFramework {
       agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
     for (const [msg, { id }] of stored) {
       this.emitTrace({ type: 'message:added', messageId: id, source: `deferred-flush:${occasion}` });
+      this.noteSpokenTo(agent.name, msg.metadata);
       this.noteArrival(agent.name, msg.metadata, id);
       this.noteForOtherResidents(agent, msg.metadata, id);
     }
@@ -27914,6 +28094,10 @@ export class AgentFramework {
       if (name && this.exhaustionRewinds.get(name)) {
         this.exhaustionRewinds.set(name, 0);
       }
+      if (name) this.turnRearms?.delete(name);
+    }
+    if (event.type === 'inference:completed' || event.type === 'inference:exhausted' || event.type === 'inference:aborted') {
+      this.endStatedWaitRun(event.agentName as string);
     }
 
     const traceEvent = {
@@ -28328,6 +28512,7 @@ export class AgentFramework {
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
+    const rearmed = this.exhaustingRearms?.delete(agentName) === true;
     // The reason is the failure's own message, and a provider can echo the
     // whole rejected request in it: one household's [inference-failed]
     // marker carried ~1.7 MB of its own request back into its context. Every
@@ -28383,7 +28568,7 @@ export class AgentFramework {
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
-    if (agent && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+    if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined)
         .join(', ');
