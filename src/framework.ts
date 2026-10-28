@@ -10747,6 +10747,12 @@ export class AgentFramework {
     }
     const mode = options.mode ?? 'shared';
     const shared = mode === 'shared';
+    if (!shared && options.inheritRefusals === true) {
+      throw new Error(`deriveAgent: "${options.name}" was not created: inheritRefusals is for mode 'shared', and a copy brings no refusal ledger`);
+    }
+    if (!shared && options.solve !== undefined) {
+      throw new Error(`deriveAgent: "${options.name}" was not created: solve is for mode 'shared', and a copy is not solved`);
+    }
 
     const config: AgentConfig = {
       ...parentConfig,

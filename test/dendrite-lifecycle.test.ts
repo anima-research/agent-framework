@@ -625,6 +625,15 @@ describe('Dendrite lifecycle', () => {
     assert.ok(logged.some((line) => line.includes('the notice hook failed')), logged.join('\n'));
   });
 
+  it('a copy derivation that asks for what only a shared one inherits is refused before anything is made', async () => {
+    const framework = await boot();
+    await assert.rejects(framework.deriveAgent({ name: 'fork-r', from: 'mira', mode: 'copy', inheritRefusals: true }), /inheritRefusals is for mode 'shared'/);
+    await assert.rejects(framework.deriveAgent({ name: 'fork-s', from: 'mira', mode: 'copy', solve: 'fresh' }), /solve is for mode 'shared'/);
+    assert.equal(framework.getAgentRecord('fork-r'), null);
+    const made = await framework.deriveAgent({ name: 'fork-r', from: 'mira', mode: 'copy' });
+    made.cleanup();
+  });
+
   it('of two overlapping resumes of one ended job, one resumes it and the other is refused', async () => {
     const framework = await boot();
     framework.start();
