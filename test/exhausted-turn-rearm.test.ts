@@ -136,13 +136,14 @@ class ScriptedMembrane extends MockMembrane {
   readonly judgedAt: number[] = [];
   letGo: () => void = () => {};
   private readonly heldOpen = new Promise<void>((resolve) => { this.letGo = resolve; });
-  constructor(private readonly script: (send: number) => (() => Error) | 'tool round, then a server error' | 'tool calls cut off by a server error'
+  constructor(private readonly script: (send: number) => (() => Error) | { toolRoundThen: Error } | 'tool round, then a server error' | 'tool calls cut off by a server error'
     | 'tool round, then a stated wait' | 'a deadline' | 'held open' | undefined, private readonly failsAt: FailsAt = 'event') { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     const texts = request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '')
       .filter((t) => t.startsWith('zz-')).join(' | ');
     this.sends.push({ at: Date.now(), texts });
     const fail = this.script(this.sends.length);
+    if (typeof fail === 'object') return new ToolRoundThenErrorStream(fail.toolRoundThen);
     if (fail === 'tool round, then a server error') return new ToolRoundThenErrorStream(serverError());
     if (fail === 'tool calls cut off by a server error') return new ToolRoundThenErrorStream(serverError(), true);
     if (fail === 'a deadline') return new DeadlineStream();
@@ -359,20 +360,65 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
   test(`a re-armed send that a deadline membrane marks cuts is sent again at the next delay, once in its chain; cut again, the chain ends (cut ${failsAt === 'setup' ? 'at its start' : failsAt === 'throw' ? 'thrown by its stream' : 'reported by its stream'})`, async (t) => {
     const stalled = await stalledByMembrane(t);
     const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled), failsAt);
-    const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+    const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 300, 900] });
     stderr.length = 0;
     r.say('zz-question');
     await waitFor(() => r.count('inference:exhausted') === 2, 'the first re-armed send to end exhausted');
     assert.equal(r.admission().providerAdmission.heldRequests, 1, "its chain's first deadline cut is re-armed, as a transient failure is");
     assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(2 of 3\)/);
+    assert.equal(r.markers(), 1, 'the first cut writes no marker of its own');
     await waitFor(() => r.count('inference:exhausted') === 3, 'the second re-armed send to end exhausted');
     assert.equal(r.admission().providerAdmission.heldRequests, 0, 'a second cut in the chain ends it');
     assert.ok(stderr.some((line) => line.startsWith("[inference-rearm] agent=resident turn not re-armed: its failure isn't transient (timeout)")),
       'the operator is told why no re-send is coming');
     assert.equal(membrane.sends.length, 5, 'the window, then one send for each re-arm');
-    assert.equal(r.markers(), 2, "the first cut writes no marker of its own; the cut that ends the chain does");
+    assert.equal(r.markers(), 2, 'the cut that ends the chain writes its marker');
+    const afterCut = gaps(membrane.sends)[3]!;
+    assert.ok(afterCut >= 290 && afterCut < 890, `the send after the first cut waited the next delay: ${afterCut}ms`);
   });
 }
+
+test("a re-armed turn that got partway counts each deadline cut its error policy retried, so a cut that then exhausts it ends the re-arming", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : n === 4 ? { toolRoundThen: stalled } : () => stalled));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+  stderr.length = 0;
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the re-armed turn to end exhausted');
+  assert.equal(membrane.sends.length, 6, "the window, then the re-armed turn's send and the error policy's two retries of its cuts");
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'its cut is not the chain\'s first, so nothing is re-armed');
+  assert.ok(stderr.some((line) => line.startsWith("[inference-rearm] agent=resident turn not re-armed: its failure isn't transient (timeout)")),
+    'the operator is told why no re-send is coming');
+});
+
+for (const failsAt of ['setup', 'event'] as const) {
+  test(`a message said while a re-armed send's cut is reported starts the chain afresh after that cut, so the next cut is re-armed too (cut ${failsAt === 'setup' ? 'at its start' : 'reported by its stream'})`, async (t) => {
+    const stalled = await stalledByMembrane(t);
+    const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled), failsAt);
+    const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+    let said = false;
+    r.fw.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:exhausted' || said || r.count('inference:exhausted') < 2) return;
+      said = true;
+      (r.fw as unknown as { addMessage(role: string, content: unknown[], metadata: unknown): unknown })
+        .addMessage('user', [{ type: 'text', text: 'zz-said-during-the-cut' }], {});
+    });
+    r.say('zz-question');
+    await waitFor(() => r.count('inference:exhausted') === 3, 'the next re-armed send to end exhausted, cut');
+    assert.ok(said, "the message was said while the first cut's exhaustion was reported");
+    assert.equal(r.admission().providerAdmission.heldRequests, 1, 'the cut before the message belongs to the chain it ended, so this cut is the new chain\'s first');
+  });
+}
+
+test("deadline cuts in a turn that isn't a re-arm don't count toward the chain: the first re-armed send's cut is still re-armed", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 2 || n >= 4 ? () => stalled : serverError));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the window, cut twice then failing with a server error, and its first re-arm, cut, to end exhausted');
+  assert.equal(r.admission().providerAdmission.heldRequests, 1, "the window's cuts were the error policy's, so the re-armed send's cut is the chain's first");
+  assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(2 of 3\)/);
+});
 
 for (const [clears, script] of [
   ['a message said to the agent', (stalled: Error) => (n: number) => (n <= 3 ? serverError : () => stalled)],

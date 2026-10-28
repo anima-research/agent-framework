@@ -6031,16 +6031,19 @@ export class AgentFramework {
     if (wait && trigger && (wait.until === null || wait.until > now)) this.noteStatedWaitRun(agent.name, wait, now);
     return true;
   }
-  private rearmsAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
-    return isTransientFailure(error)
-      || (isRearmed(trigger) && isDeadlineExpiry(error) && !this.rearmDeadlineCuts.has(agentName));
+  private takeAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
+    if (isTransientFailure(error)) return true;
+    if (!isRearmed(trigger) || !isDeadlineExpiry(error)) return false;
+    const first = !this.rearmDeadlineCuts.has(agentName);
+    this.rearmDeadlineCuts.add(agentName);
+    return first;
   }
 
-  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined): void {
+  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined, asTransient: boolean): void {
     if (!ownsProviderGate || trigger === undefined || this.providerAdmissionClosed || this.turnRearmMs.length === 0) return;
     const done = this.turnRearms.get(agent.name) ?? 0;
     const notSent = (why: string) => console.error(`[inference-rearm] agent=${agent.name} turn not re-armed: ${why}`);
-    if (!this.rearmsAsTransient(agent.name, error, trigger)) {
+    if (!asTransient) {
       if (done > 0) notSent(`its failure isn't transient (${isMembraneError(error) ? error.type : boundFailureText(error.message, FAILURE_SUMMARY_MAX_CHARS)})`);
       return;
     }
@@ -6057,7 +6060,6 @@ export class AgentFramework {
     const delayMs = this.turnRearmMs[done]!;
     const rearm = { number: done + 1, of: this.turnRearmMs.length };
     this.turnRearms.set(agent.name, rearm.number);
-    if (!isTransientFailure(error)) this.rearmDeadlineCuts.add(agent.name);
     const request: MarkedRequest = { ...trigger, [REARMED]: true };
     delete request[TURN_RETRY];
     delete request[MERGED_BATCH];
@@ -21477,6 +21479,7 @@ export class AgentFramework {
       const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(routing))
         ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
+        this.takeAsTransient(agent.name, err, trigger);
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow, agent);
         if (this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
@@ -21535,7 +21538,8 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
-        if (isRearmed(trigger) && this.rearmsAsTransient(agent.name, err, trigger)) this.exhaustingRearms.add(agent.name);
+        const asTransient = this.takeAsTransient(agent.name, err, trigger);
+        if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -21555,7 +21559,7 @@ export class AgentFramework {
         if (action.emit) {
           this.pushEvent(action.emit);
         }
-        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing);
+        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing, asTransient);
       }
       // No handoff on either failure branch: the terminal branch deleted the
       // token above; the retry branch's recursive startAgentStream replaced
@@ -23321,6 +23325,7 @@ export class AgentFramework {
             const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(streamRouting))
               ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
+              this.takeAsTransient(agent.name, err, trigger);
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
               // does. Until then, that check is ahead, in a window of its own
@@ -23376,7 +23381,8 @@ export class AgentFramework {
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              if (isRearmed(trigger) && this.rearmsAsTransient(agent.name, err, trigger)) this.exhaustingRearms.add(agent.name);
+              const asTransient = this.takeAsTransient(agent.name, err, trigger);
+              if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -23394,7 +23400,7 @@ export class AgentFramework {
               if (action.emit) {
                 this.pushEvent(action.emit);
               }
-              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
             }
             break;
           }
@@ -23469,7 +23475,7 @@ export class AgentFramework {
                   agentName: agent.name,
                   error: terminal,
                 });
-                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting);
+                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
                 // inference log so future investigations can attribute the
                 // terminal cause without relying on live in-memory reducer
@@ -23760,14 +23766,15 @@ export class AgentFramework {
         speech: '',
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
-      if (isRearmed(trigger) && this.rearmsAsTransient(agent.name, err, trigger)) this.exhaustingRearms.add(agent.name);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
+      if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
         ...this.classifyInferenceError(err),
       });
-      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
