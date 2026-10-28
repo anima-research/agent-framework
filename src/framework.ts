@@ -26656,8 +26656,21 @@ export class AgentFramework {
    */
   private readerRefuses(agentName: string, toolName: string): boolean {
     if (this.registry.get(agentName)?.kind !== 'subconscious-fork') return false;
-    if (toolName === 'speak_in_channel') return this.subconsciousConfig?.allowChannelSpeech !== true;
-    return !(SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(toolName);
+    return !this.readerMayCall(agentName, toolName);
+  }
+
+  /**
+   * What a reader fork may call: exactly its own tools and the speech its
+   * configuration allows, never widened or narrowed by its resident's
+   * allowedTools. The resident's list bounds the resident's own surface;
+   * the reader's tools are the framework's, for reading on its behalf. The
+   * fork still shows its resident's block (the shared prefix): what it may
+   * call is decided here, at each call, apart from what it is shown.
+   */
+  private readerMayCall(agentName: string, toolName: string): boolean {
+    if (this.registry.get(agentName)?.kind !== 'subconscious-fork') return false;
+    if (toolName === 'speak_in_channel') return this.subconsciousConfig?.allowChannelSpeech === true;
+    return (SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(toolName);
   }
 
   /** A toolsets--act call a host toolset resolved (HostPresentation.resolveAct):
@@ -28336,7 +28349,7 @@ export class AgentFramework {
     // A tool refused at dispatch is refused on every path that runs the
     // agent's call (a toolset's act, executeToolCall), not only the stream's.
     const denied = this.agents.get(agentName)?.deniesAtDispatch(call.name) === true || this.readerRefuses(agentName, call.name);
-    if (!denied && this.canAgentUseTool(agentName, call.name)) return undefined;
+    if (!denied && (this.canAgentUseTool(agentName, call.name) || this.readerMayCall(agentName, call.name))) return undefined;
     const why = denied
       ? `${call.name} is not available to ${agentName}`
       : !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
