@@ -474,6 +474,16 @@ export function journalToolDescription(canSkipReply: boolean): string {
     'text is routed' + (canSkipReply ? '; to end the turn without replying, call skip_reply afterwards.' : '.');
 }
 
+export function skipReplyDescription(named: boolean): string {
+  return 'End your turn WITHOUT sending anything to any channel or surface. Use when you have ' +
+    'read the messages but deliberately choose not to reply right now — ambient chatter, ' +
+    'nothing to add, or you are waiting. Any plain text you wrote this turn ' +
+    (named
+      ? 'is NOT posted. To reply instead, send it with a tool that names where it goes. '
+      : 'stays private and is NOT posted. To reply instead, just write plain text (no tool call). ') +
+    'To end this turn but come back on your own shortly, set wake_in_seconds.';
+}
+
 /**
  * channel_open's and channel_close's descriptions for an agent whose window doesn't hold a channel's traffic: an
  * ephemeral run, whose store is its own unless it's where channel messages are stored (on a host with no residents,
@@ -612,12 +622,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'skip_reply',
-    description:
-      'End your turn WITHOUT sending anything to any channel or surface. Use when you have ' +
-      'read the messages but deliberately choose not to reply right now — ambient chatter, ' +
-      'nothing to add, or you are waiting. Any plain text you wrote this turn stays private ' +
-      'and is NOT posted. To reply instead, just write plain text (no tool call). ' +
-      'To end this turn but come back on your own shortly, set wake_in_seconds.',
+    description: skipReplyDescription(false),
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1084,6 +1089,12 @@ interface ChannelRegistryOptions {
    * delivery. Absent, every conversation takes it.
    */
   takesGlobalFallback?: (conversationId: string) => boolean;
+  /**
+   * Whether an agent names the channel of every channel_publish it makes
+   * (proseRouting 'named'): such a call with no channelId is refused rather
+   * than defaulted. Absent, no agent does.
+   */
+  namesItsChannels?: (agentName: string) => boolean;
   /** Whether this framework has EventGate and can honor skip_reply self-wakes. */
   eventGatePresent?: boolean;
   /**
@@ -1164,6 +1175,7 @@ export class ChannelRegistry {
   private homeChannelResolver?: (agentName: string) => ChannelRef | undefined;
   private activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   private takesGlobalFallback?: (conversationId: string) => boolean;
+  private namesItsChannels?: (agentName: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
   private store?: JsStore;
 
@@ -1587,6 +1599,7 @@ export class ChannelRegistry {
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.takesGlobalFallback = options?.takesGlobalFallback;
+    this.namesItsChannels = options?.namesItsChannels;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
     this.initializeLifecycleStore();
@@ -4551,6 +4564,15 @@ export class ChannelRegistry {
     });
   }
 
+  publishNameFor(ref: ChannelRef): string | undefined {
+    const entry = this.entryAt(ref);
+    if (!entry) return undefined;
+    return [qualifiedChannelName(ref), ref.channelId].find((n) => {
+      const named = n === '' ? [] : this.entriesNamed(n);
+      return named.length === 1 && named[0] === entry;
+    });
+  }
+
   /**
    * What a refusal listing these candidates says of each one that is a
    * channel shown by its id and server: the channelId channel_publish reaches
@@ -4568,12 +4590,8 @@ export class ChannelRegistry {
       const shown = CHANNEL_ON_SERVER_AT_END.exec(candidate);
       if (!shown) continue;
       const ref: ChannelRef = { channelId: JSON.parse(shown[1]!) as string, serverId: JSON.parse(shown[2]!) as string };
-      const entry = this.entryAt(ref);
-      if (!entry) continue;
-      const name = [qualifiedChannelName(ref), ref.channelId].find((n) => {
-        const named = n === '' ? [] : this.entriesNamed(n);
-        return named.length === 1 && named[0] === entry;
-      });
+      if (!this.entryAt(ref)) continue;
+      const name = this.publishNameFor(ref);
       parts.add(name !== undefined
         ? `channel_publish reaches ${channelOnServer(ref)} with channelId ${quotedValue(name)}`
         : `no channelId reaches ${channelOnServer(ref)} alone`);
@@ -6137,6 +6155,9 @@ export class ChannelRegistry {
     // An empty channelId names nothing, and isn't read as one left out.
     // speak_in_channel's caller passes one left out as empty, so there it
     // gets the refusal for one left out, as speak_in_channel has no default.
+    if (tool === 'channel_publish' && !input.channelId && origin?.kind === 'agent' && this.namesItsChannels?.(origin.agentName)) {
+      return { success: false, error: `Nothing was posted: channel_publish needs a channelId, since nothing is sent to a default channel. ${findIds}`, isError: true };
+    }
     if (input.channelId === '' && tool === 'channel_publish') {
       return { success: false, error: `Nothing was posted: channelId is empty. ${findIds}`, isError: true };
     }

@@ -302,7 +302,7 @@ export class Agent {
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
-  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'named';
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
   /** Continuation after a turn the model ends itself (see
