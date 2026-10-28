@@ -19359,7 +19359,7 @@ export class AgentFramework {
    */
   private publishInputWithTurnLocus(input: unknown, agentName: string, callingTurn: TurnRouting | undefined): unknown {
     const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
-    if (typeof given === 'string' && given !== '') return input;
+    if (typeof given === 'string') return input;
     const locus = callingTurn
       ? callingTurn.locus ?? this.channelRegistry?.resolveLocus(agentName) ?? null
       : this.homeOf(agentName) ?? null;

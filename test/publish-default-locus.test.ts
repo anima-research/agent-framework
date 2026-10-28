@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture } from './helpers/coalescing-fixture.js';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 import { registerOpen, incoming, MENTION } from './helpers/admission.js';
 
@@ -19,6 +19,24 @@ const publishOf = (f: { published: Array<Record<string, unknown>> }, text: strin
   f.published.find((p) => JSON.stringify(p.content).includes(text));
 
 describe('channel_publish without channelId', () => {
+  it('an empty channelId is refused as empty, not read as left out', async () => {
+    const f = await fixture();
+    try {
+      await registerOpen(f, 'work');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'p1', name: 'channel_publish', input: { channelId: '', content: 'zz-empty' } }], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => !!publishOf(f, 'done') || !!publishOf(f, 'zz-empty'), 'the turn spoke');
+      assert.equal(publishOf(f, 'zz-empty'), undefined, 'nothing was posted for an empty channelId');
+      const answered = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .some((m) => JSON.stringify(m.content).includes('Nothing was posted: channelId is empty.'));
+      assert.ok(answered, 'the refusal says the channelId is empty');
+    } finally { await f.close(); }
+  });
+
   it('defaults to the turn locus: the waking delivery, then a channel opened this turn', async () => {
     const f = await fixture();
     try {
