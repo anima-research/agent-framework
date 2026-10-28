@@ -401,8 +401,10 @@ export class TuneOutCoordinator {
     // memory, so it is counted again from the held rows: without it, a
     // channel held across the restart gets no cadence look until something
     // new arrives.
+    // Stored and still queued alike: at a quiesced boot, restored writes stay
+    // queued until the resume flushes them.
     const held = new Set<string>();
-    for (const m of this.hooks.getStoredMessages()) {
+    for (const m of [...this.hooks.getStoredMessages(), ...(this.hooks.getDeferredMessages?.() ?? [])]) {
       const meta = m.metadata as { tuneOut?: { epochId?: string }; serverId?: string; channelId?: string } | undefined;
       const epochId = meta?.tuneOut?.epochId;
       if (!meta || !epochId || !meta.channelId) continue;
@@ -1422,10 +1424,12 @@ export class TuneOutCoordinator {
   }
 
   /**
-   * Count again, from the held rows, the messages the reader of the epoch
-   * holding this channel now hasn't looked at: for reader forks, those no
-   * fork was handed; for the persistent subconscious, those held since its
-   * last look (lastLooks). Nothing holding the channel leaves no count.
+   * Count again, from the held messages, stored or still queued behind the
+   * resident's turn, those the reader of the epoch holding this channel now
+   * hasn't looked at: for reader forks, those no fork was handed; for the
+   * persistent subconscious, the stored ones held since its last look
+   * (lastLooks) and every queued one, which no view of it can show yet.
+   * Nothing holding the channel leaves no count.
    */
   private rebuildTally(serverId: string, channelId: string): void {
     const key = this.key(serverId, channelId);
@@ -1435,14 +1439,17 @@ export class TuneOutCoordinator {
       return;
     }
     const ofChannel = inChannelOf(serverId, channelId);
-    const rows = this.hooks.getStoredMessages().filter((m) =>
-      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === hold.epochId && ofChannel(m));
+    const inEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === hold.epochId && ofChannel(m);
+    const rows = this.hooks.getStoredMessages().filter(inEpoch);
+    const queued = this.queuedHeld(inEpoch);
     let count: number;
     if (this.forkReader) {
-      count = this.unhandedBacklog(this.handOffKey(hold.epochId, serverId, channelId), rows, []).backlog.length;
+      const unread = this.unhandedBacklog(this.handOffKey(hold.epochId, serverId, channelId), rows, queued);
+      count = unread.backlog.length + unread.queued.length;
     } else {
       const mark = this.lastLooks()?.[hold.epochId]?.[key];
-      count = mark === undefined ? rows.length : rows.filter((m) => m.sequence > mark).length;
+      count = (mark === undefined ? rows.length : rows.filter((m) => m.sequence > mark).length) + queued.length;
     }
     this.divertedSinceInvocation.set(key, count);
   }

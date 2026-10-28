@@ -539,6 +539,35 @@ describe('a cadence look for held messages no reader has looked at, though nothi
     w.coordinator.stop();
   });
 
+  it('after a restart, a held message still queued behind the resident gets its cadence look', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world();
+    w.tuneOut();
+    w.queue('ann', 'Q-1 queued across the restart', 'w1');
+    w.restart();
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 1, 'the first period after the restart reads it');
+    assert.deepEqual(bodies(w.invocations[0]!), { stored: [], queued: ['Q-1 queued across the restart'] });
+    w.coordinator.stop();
+  });
+
+  it("the channel's own tune-out ending gives the all-except hold's queued message there its cadence look", (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world();
+    assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600, cadenceSeconds: 30 }, 'agent-tool').ok);
+    const scope = w.coordinator.getAllExcept()!.params.epochId;
+    w.queue('ann', 'Q-1 queued under the scope', 'w1', { epochId: scope });
+    w.coordinator.recordHeld(SERVER, NOISY, 'q1', [], 'ann', true);
+    w.tuneOut();
+    assert.deepEqual(w.coordinator.cancel(SERVER, NOISY, 'agent-tool', 'resident cancelled'), { ok: true });
+    const before = w.invocations.length;
+    t.mock.timers.tick(30_000);
+    const looks = w.invocations.slice(before);
+    assert.deepEqual(looks.map((inv) => [inv.epochId, bodies(inv)]), [[scope, { stored: [], queued: ['Q-1 queued under the scope'] }]],
+      "the scope's next period reads Q-1");
+    w.coordinator.stop();
+  });
+
   it("a look while the stored last looks can't be read leaves the other channels' stored looks as they were", (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const w = world({ subconscious: true });
