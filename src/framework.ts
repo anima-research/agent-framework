@@ -26644,8 +26644,10 @@ export class AgentFramework {
    * (ctx.callTool → executeToolCallFrom with {kind:'module'}), which is exempt
    * from agent allowlists. Registered agents' allowedTools is enforced at
    * dispatch, including namespaced utility names. Genuinely unidentified public callers (including
-   * unknown legacy names) remain unrestricted. Framework-created identities
-   * are refused while unregistered, even if their configured list allows it.
+   * unknown legacy names) remain unrestricted. A name the framework made in
+   * this process is refused once unregistered, even if its configured list
+   * allowed the tool; after a restart, such a name is a host's caller name
+   * like any other.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
     return this.executeToolCallFrom(call, {
@@ -28699,8 +28701,10 @@ export class AgentFramework {
     return best;
   }
 
-  /** Registered policy; framework-created identities have no dispatch authority
-   * while unregistered. Genuine legacy caller names retain their surface. */
+  /** Registered policy. Within this process, a name the framework made has no
+   * dispatch authority once unregistered; after a restart, a host call names
+   * its caller as any host call does. Genuine legacy caller names retain
+   * their surface. */
   private canAgentUseTool(agentName: string, toolName: string): boolean {
     const agent = this.agents.get(agentName);
     return agent ? agent.canUseTool(toolName) : !this.usedEphemeralAgentNames.has(agentName);
