@@ -1441,7 +1441,7 @@ export class TuneOutCoordinator {
     if (this.forkReader) {
       count = this.unhandedBacklog(this.handOffKey(hold.epochId, serverId, channelId), rows, []).backlog.length;
     } else {
-      const mark = this.lastLooks()[hold.epochId]?.[key];
+      const mark = this.lastLooks()?.[hold.epochId]?.[key];
       count = mark === undefined ? rows.length : rows.filter((m) => m.sequence > mark).length;
     }
     this.divertedSinceInvocation.set(key, count);
@@ -1451,14 +1451,20 @@ export class TuneOutCoordinator {
     return `tune-out/${this.hooks.primaryName() ?? 'default'}/last-looks`;
   }
 
-  /** The stored last looks; none where they can't be read, so every held row counts. */
-  private lastLooks(): Record<string, Record<string, number>> {
+  /**
+   * The stored last looks. Where they can't be read, none: every held row
+   * counts, and nothing is cached, so the next read tries again. Nor is
+   * anything written back over the stored record then (markLook, dropLooks,
+   * pruneLooks), which would erase the other epochs' and channels' looks.
+   */
+  private lastLooks(): Record<string, Record<string, number>> | undefined {
     if (this.lastLooksCache !== undefined) return this.lastLooksCache;
-    let raw: unknown = null;
+    let raw: unknown;
     try {
       raw = this.channelRegistry.readCoordinatorState(this.lastLooksStateId);
     } catch (error) {
       console.error(`[tune-out] the subconscious's last looks (${this.lastLooksStateId}) could not be read:`, error);
+      return undefined;
     }
     const looks: Record<string, Record<string, number>> = {};
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
@@ -1485,6 +1491,7 @@ export class TuneOutCoordinator {
 
   private markLook(epochId: string, serverId: string, channelId: string): void {
     const looks = this.lastLooks();
+    if (!looks) return;
     this.writeLooks({ ...looks, [epochId]: { ...looks[epochId], [this.key(serverId, channelId)]: this.hooks.currentSequence() } });
   }
 
@@ -1492,7 +1499,7 @@ export class TuneOutCoordinator {
   private dropLooks(epochId: string): void {
     if (this.hooks.subconsciousName() == null) return;
     const looks = this.lastLooks();
-    if (!(epochId in looks)) return;
+    if (!looks || !(epochId in looks)) return;
     const { [epochId]: _ended, ...rest } = looks;
     this.writeLooks(rest);
   }
@@ -1501,6 +1508,7 @@ export class TuneOutCoordinator {
   private pruneLooks(): void {
     if (this.hooks.subconsciousName() == null) return;
     const looks = this.lastLooks();
+    if (!looks) return;
     const active = new Set(this.listActive().map((e) => e.params.epochId));
     const scope = this.getAllExcept();
     if (scope) active.add(scope.params.epochId);

@@ -50,6 +50,8 @@ function world(opts: { subconscious?: boolean } = {}) {
   const deferred: Queued[] = [];
   const invocations: ReaderInvocation[] = [];
   const coordinatorState = new Map<string, unknown>();
+  /** Durable records whose read throws, by the last part of their id, such as `last-looks`. */
+  const unreadable = new Set<string>();
   const active = new Map<string, { params: Record<string, unknown>; wakeCount: number }>();
   let nextSeq = 1;
 
@@ -65,7 +67,10 @@ function world(opts: { subconscious?: boolean } = {}) {
       active.delete(key);
       return ended;
     },
-    readCoordinatorState: (id: string) => coordinatorState.get(id) ?? null,
+    readCoordinatorState: (id: string) => {
+      if (unreadable.has(id.split('/').pop()!)) throw new Error(`the store couldn't read ${id}`);
+      return coordinatorState.get(id) ?? null;
+    },
     writeCoordinatorState: (id: string, value: unknown) => { coordinatorState.set(id, value); },
   } as unknown as ChannelRegistry;
   const servers = { getServer: () => undefined } as unknown as McplServerRegistry;
@@ -101,6 +106,9 @@ function world(opts: { subconscious?: boolean } = {}) {
     get internals() { return internals; },
     invocations,
     looks,
+    unreadable,
+    /** A durable record as the store holds it, by the last part of its id. */
+    stored: (name: string): unknown => [...coordinatorState].find(([id]) => id.endsWith(`/${name}`))?.[1],
     /** A host restart: a new coordinator over the same store and durable state, its timers armed again. */
     restart(): void {
       coordinator.stop();
@@ -528,6 +536,27 @@ describe('a cadence look for held messages no reader has looked at, though nothi
     assert.match(w.looks[1]!.text, /— 1 diverted message since your last look/, 'counting S-3 alone');
     t.mock.timers.tick(30_000);
     assert.equal(w.looks.length, 2, 'and a quiet period after it has none');
+    w.coordinator.stop();
+  });
+
+  it("a look while the stored last looks can't be read leaves the other channels' stored looks as they were", (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world({ subconscious: true });
+    w.tuneOut();
+    w.tuneOut(200, { channelId: OTHER, epochId: 'e-other' });
+    held(w, 'ann', 'N-1');
+    w.internals.invokeSubconscious(SERVER, NOISY, 'cadence', 1);
+    const before = structuredClone(w.stored('last-looks'));
+    assert.deepEqual(Object.keys(before as object), [EPOCH], "premise: noisy's look is stored");
+    w.unreadable.add('last-looks');
+    w.restart();
+    held(w, 'bo', 'O-1', { channelId: OTHER, epochId: 'e-other' });
+    w.internals.invokeSubconscious(SERVER, OTHER, 'cadence', 1);
+    assert.deepEqual(w.stored('last-looks'), before, "noisy's stored look is as it was");
+    w.unreadable.delete('last-looks');
+    w.internals.invokeSubconscious(SERVER, OTHER, 'cadence', 1);
+    assert.deepEqual(Object.keys(w.stored('last-looks') as object).sort(), [EPOCH, 'e-other'].sort(),
+      'once the record reads again, the next look is stored beside it');
     w.coordinator.stop();
   });
 });
