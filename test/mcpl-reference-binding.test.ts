@@ -224,6 +224,7 @@ async function puppetCall(answer: unknown, fetcher: unknown): Promise<{ result: 
     name: 'princess',
     state: { status: 'idle' },
     canUseTool: () => true,
+    deniesAtDispatch: () => false,
     getContextManager: () => ({ addMessage: store }),
   };
   const framework = Object.create(AgentFramework.prototype) as AgentFramework;
