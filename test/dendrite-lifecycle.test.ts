@@ -606,6 +606,25 @@ describe('Dendrite lifecycle', () => {
       'what was written under the name stays its own');
   });
 
+  it("a derivation whose notice to its source can't be written still runs to its end", async () => {
+    const framework = await boot({
+      dendrite: { derivationNotice: () => { throw new Error('the notice hook failed'); } },
+    } as Partial<Parameters<typeof AgentFramework.create>[0]>);
+    framework.start();
+    membrane.script('fork-n', say('fork-n done'));
+    const fork = await framework.deriveAgent({ name: 'fork-n', from: 'mira', mode: 'copy' });
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let result: Awaited<ReturnType<typeof framework.runEphemeralToCompletion>>;
+    try {
+      result = await framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+    } finally { console.error = consoleError; }
+    assert.equal(result.speech, 'fork-n done');
+    assert.equal(framework.getAgentRecord('fork-n')?.ended?.reason, 'completed');
+    assert.ok(logged.some((line) => line.includes('the notice hook failed')), logged.join('\n'));
+  });
+
 });
 
 describe('Dendrite restart', () => {

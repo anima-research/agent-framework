@@ -11513,8 +11513,12 @@ export class AgentFramework {
     // the latest described; every record stays in the registry and traces.
     const threshold = this.collapseDerivationNoticesAfter;
     const tell = (defaultText: string, extra: Record<string, unknown> = {}) => {
-      const text = this.derivationNoticeHook ? this.derivationNoticeHook(record, from, defaultText) : defaultText;
-      if (text !== null) this.lifecycleNotice(from, text, { ...detail, ...extra });
+      try {
+        const text = this.derivationNoticeHook ? this.derivationNoticeHook(record, from, defaultText) : defaultText;
+        if (text !== null) this.lifecycleNotice(from, text, { ...detail, ...extra });
+      } catch (error) {
+        console.error(`[dendrite] ${record.name} was created, but ${from} could not be told:`, error);
+      }
     };
     if (record.incarnation > 1 || threshold <= 0) {
       tell(this.derivationNotice(record, from));
