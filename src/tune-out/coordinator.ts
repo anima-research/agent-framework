@@ -316,6 +316,8 @@ export class TuneOutCoordinator {
   private readerReturned = new Map<string, { ids: Set<string>; writeIds: Set<string> }>();
   /** The all-except scope's durable record, cached (undefined = not read yet). */
   private scopeCache: AllExceptState | null | undefined;
+  /** The epoch whose release this process delivered and whose hold is not yet recorded as cleared. */
+  private scopeReleased: string | undefined;
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -1079,16 +1081,21 @@ export class TuneOutCoordinator {
     const summary = byChannel.size === 0
       ? 'Nothing was held.'
       : `${all.length} message${all.length === 1 ? '' : 's'} held in ${byChannel.size} channel${byChannel.size === 1 ? '' : 's'}.`;
-    this.hooks.addMessage(
-      'user',
-      [{ type: 'text', text: `[${NOTICE_TAG.tuneOut}: all channels except ${this.shown(except.serverId, except.channelId)} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
-      { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
-    );
-    this.hooks.commitDeliveries?.();
+    if (this.scopeReleased !== epochId) {
+      this.hooks.addMessage(
+        'user',
+        [{ type: 'text', text: `[${NOTICE_TAG.tuneOut}: all channels except ${this.shown(except.serverId, except.channelId)} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
+      );
+      this.hooks.commitDeliveries?.();
+      this.scopeReleased = epochId;
+    }
     // The release is recorded before the hold is: a failure past this point
-    // leaves the hold in force with its release already delivered, which a
-    // retry repeats, where the other order lost the release outright.
+    // leaves the hold in force with its release already delivered. A retry in
+    // this process records only the hold's end; a restart between the two
+    // delivers the release again, where the other order lost it outright.
     this.writeScope(null);
+    this.scopeReleased = undefined;
     this.clearScopeTimers();
     for (const [key, pending] of this.pendingWakes) {
       const [serverId, channelId] = key.split('\0') as [string, string];

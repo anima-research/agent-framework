@@ -163,6 +163,22 @@ describe('all-except scope on the coordinator', () => {
     c.stop();
   });
 
+  it('a release whose hold fails to clear is delivered once, however often the clear is retried', () => {
+    const h = harness();
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    h.fail.write = true;
+    assert.throws(() => c.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
+    assert.throws(() => c.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
+    assert.ok(c.getAllExcept(), 'the hold is still in force while its end is not recorded');
+    h.fail.write = false;
+    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
+    assert.equal(c.getAllExcept(), null);
+    const releases = h.messages.filter((m) => /all channels except work released/.test(m.text));
+    assert.equal(releases.length, 1, 'the resident got the release once');
+    c.stop();
+  });
+
   it('a fractional backlog cap counts whole messages, as a channel\'s does: below one shows none', () => {
     const h = harness();
     const c = h.make();
