@@ -166,6 +166,20 @@ export class AgentRegistry {
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
       createdAt: previous?.createdAt ?? this.now(),
     };
+    const spawner = record.relationships.spawnedBy;
+    if (spawner !== undefined && !this.live.has(spawner)) {
+      const former = this.inspect(spawner)!;
+      const above = former.relationships.spawnedBy;
+      const candidates = above !== undefined && this.live.has(above) ? [above, ...this.ancestors(above)] : [];
+      const primary = this.primary();
+      if (primary && primary !== record.name && !candidates.includes(primary)) candidates.push(primary);
+      record.orphaned = {
+        since: this.now(),
+        formerParent: { agent: former.name, incarnation: former.incarnation },
+        reason: former.ended?.reason ?? 'stopped',
+        candidates,
+      };
+    }
     this.live.set(spec.name, record);
     this.persist();
     return record;
@@ -193,13 +207,26 @@ export class AgentRegistry {
       if (!(lifetime.idleTtlMs > 0)) fail('an idle lifetime needs a positive idleTtlMs');
     }
 
+    // A spawner that ended before its child registered (between creating the
+    // child and running it): the child is its orphan from the start, as one
+    // live when the spawner ended would be, with its route to the spawner
+    // held; one that ends with its parent would have ended with it.
+    const endedSpawner = spec.spawnedBy !== undefined && !this.live.has(spec.spawnedBy)
+      ? this.inspect(spec.spawnedBy)
+      : undefined;
     if (spec.spawnedBy !== undefined) {
       if (spec.spawnedBy === spec.name) fail('cannot be spawned by itself');
-      if (!this.live.has(spec.spawnedBy)) fail(`spawner "${spec.spawnedBy}" is not a registered agent`);
+      if (!this.live.has(spec.spawnedBy)) {
+        if (!endedSpawner?.ended) fail(`spawner "${spec.spawnedBy}" is not a registered agent`);
+        if (spec.onParentEnd === 'end') {
+          fail(`spawner "${spec.spawnedBy}" has ended, and an agent that ends with its parent would have ended with it`);
+        }
+      }
     } else if (spec.onParentEnd === 'end') {
       fail('onParentEnd "end" needs a spawnedBy relationship');
     }
-    if (spec.resultTo && !this.live.has(spec.resultTo.to)) {
+    if (spec.resultTo && !this.live.has(spec.resultTo.to)
+      && !(endedSpawner?.ended && spec.resultTo.to === spec.spawnedBy)) {
       fail(`result recipient "${spec.resultTo.to}" is not a registered agent`);
     }
     if (spec.inherit && !resume && !this.live.has(spec.inherit.from)) {

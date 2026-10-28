@@ -473,6 +473,44 @@ describe('the registry\'s recovery', () => {
     assert.equal(rowsWith(first, 'oren', 'reparenting "job" to you delivers it').length, 1, 'told once it has ended');
   });
 
+  it('a worker whose spawner ended between its creation and its run registers as that spawner\'s orphan', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    membrane.script('w', say('W-RESULT'));
+    const made = await first.createEphemeralAgent(
+      { name: 'w', model: 'test-model', systemPrompt: 'x' },
+      workerSpec('w', { spawnedBy: 'boss', resultTo: { to: 'boss', as: 'message' } }),
+    );
+    first.stopAgent('boss', { by: 'mira' });
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await first.runEphemeralToCompletion(made.agent, made.contextManager);
+    const record = first.getAgentRecord('w')!;
+    assert.equal(record.orphaned?.formerParent.agent, 'boss');
+    assert.deepEqual(record.orphaned?.candidates, ['oren', 'mira']);
+    assert.equal(rowsWith(first, 'oren', '"w" now has no parent').length, 1, 'its first candidate is offered it');
+    first.deliverAgentResult('w', [{ type: 'text', text: 'W-RESULT' }]);
+    assert.deepEqual(first.listHeldMail().map((m) => [m.from.agent, m.to, m.heldBecause]), [['w', 'boss', 'recipient-gone']], 'and its result is held');
+  });
+
+  it('a worker that ends with its spawner is refused when that spawner ended before it ran', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const made = await first.createEphemeralAgent(
+      { name: 'w', model: 'test-model', systemPrompt: 'x' },
+      { ...workerSpec('w', { spawnedBy: 'boss' }), onParentEnd: 'end' },
+    );
+    first.stopAgent('boss', { by: 'mira' });
+    await assert.rejects(
+      first.runEphemeralToCompletion(made.agent, made.contextManager),
+      /spawner "boss" has ended, and an agent that ends with its parent would have ended with it/,
+    );
+    assert.equal(first.getAgentRecord('w'), null);
+  });
+
   it('a job cancelled with its stream in flight rejects with AgentStoppedError naming who and why', async () => {
     const gates = new GateModule();
     const first = await boot(gates);

@@ -11856,36 +11856,44 @@ export class AgentFramework {
 
     const parent = outcome.ended;
     for (const { record, candidates } of outcome.orphaned) {
-      const former = record.orphaned?.formerParent.agent ?? parent.name;
-      const reason = record.orphaned?.reason ?? parent.ended?.reason ?? 'stopped';
-      this.emitTrace({
-        type: 'dendrite:agent-orphaned',
-        agentName: record.name,
-        formerParent: former,
-        reason,
+      this.announceOrphaned(
+        record,
         candidates,
-      });
-      const route = record.relationships.resultTo;
-      const resultHeld = route?.as === 'message' && !this.registry.has(route.to);
-      this.lifecycleNotice(
-        record.name,
-        `[${NOTICE_TAG.agentLifecycle}: ${former}, the agent that started you, has ended (${reason}). ` +
-          'Your own work is not cancelled.' +
-          (resultHeld ? ' Your result will be held until another agent becomes its recipient.' : '') +
-          ']',
-        { event: 'orphaned', formerParent: record.orphaned?.formerParent, reason, candidates },
+        record.orphaned?.formerParent.agent ?? parent.name,
+        record.orphaned?.reason ?? parent.ended?.reason ?? 'stopped',
       );
-      const candidate = candidates[0];
-      if (candidate && this.announceOrphans) {
-        this.lifecycleNotice(
-          candidate,
-          `[${NOTICE_TAG.agentLifecycle}: ${former} has ended (${reason}) while its ${record.kind} agent ` +
-            `"${record.name}" was still running. "${record.name}" now has no parent` +
-            (resultHeld ? ' and nowhere to return its result' : '') +
-            '; it can be reparented to you.]',
-          { event: 'adoption-offered', agent: record.name, formerParent: record.orphaned?.formerParent, reason },
-        );
-      }
+    }
+  }
+
+  /** An agent whose spawner has ended, and its first adoption candidate, are told; the trace says so. */
+  private announceOrphaned(record: AgentRecord, candidates: string[], former: string, reason: string): void {
+    this.emitTrace({
+      type: 'dendrite:agent-orphaned',
+      agentName: record.name,
+      formerParent: former,
+      reason,
+      candidates,
+    });
+    const route = record.relationships.resultTo;
+    const resultHeld = route?.as === 'message' && !this.registry.has(route.to);
+    this.lifecycleNotice(
+      record.name,
+      `[${NOTICE_TAG.agentLifecycle}: ${former}, the agent that started you, has ended (${reason}). ` +
+        'Your own work is not cancelled.' +
+        (resultHeld ? ' Your result will be held until another agent becomes its recipient.' : '') +
+        ']',
+      { event: 'orphaned', formerParent: record.orphaned?.formerParent, reason, candidates },
+    );
+    const candidate = candidates[0];
+    if (candidate && this.announceOrphans) {
+      this.lifecycleNotice(
+        candidate,
+        `[${NOTICE_TAG.agentLifecycle}: ${former} has ended (${reason}) while its ${record.kind} agent ` +
+          `"${record.name}" was still running. "${record.name}" now has no parent` +
+          (resultHeld ? ' and nowhere to return its result' : '') +
+          '; it can be reparented to you.]',
+        { event: 'adoption-offered', agent: record.name, formerParent: record.orphaned?.formerParent, reason },
+      );
     }
   }
 
@@ -12352,13 +12360,17 @@ export class AgentFramework {
     }
     // Admit it to the registry first: a spec the registry refuses (spawner
     // or result recipient gone since creation) must not leave a live agent.
-    this.announceAgentCreated(
-      this.registry.register(candidate.spec, { resume: candidate.resume === true, after: candidate.after }),
-    );
+    const registered = this.registry.register(candidate.spec, { resume: candidate.resume === true, after: candidate.after });
+    this.announceAgentCreated(registered);
     // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
     // Kept while the run is live so the agent can itself be derived from.
     this.agentConfigs.set(agent.name, candidate.config);
+    // A spawner that ended after creating it: it registered as that
+    // spawner's orphan, and is told so, as is its first candidate.
+    if (registered.orphaned) {
+      this.announceOrphaned(registered, registered.orphaned.candidates, registered.orphaned.formerParent.agent, registered.orphaned.reason);
+    }
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
       inferenceStarted: false,
