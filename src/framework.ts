@@ -18002,7 +18002,11 @@ export class AgentFramework {
     if (restored.recent) this.coalescingRecentReceipts = restored.recent;
     this.pushCoalescer = restored.coalescer;
     // Batches restored from a snapshot still owe the agent a wake (§14 v41).
-    for (const occ of restored.coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+    for (const occ of restored.coalescer.pendingBatchOccurrences()) {
+      void this.wakeForCoalescedBatch(occ).catch((error: unknown) => {
+        console.error(`[coalescing] ${occ.serverId}: the wake a restored batch (${occ.eventId}) owes its agent failed:`, error);
+      });
+    }
   }
 
   /**
