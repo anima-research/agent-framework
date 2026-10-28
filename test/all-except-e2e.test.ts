@@ -162,6 +162,27 @@ describe('tune-out, all-except scope', () => {
     } finally { await f.close(); }
   });
 
+  it("the subconscious's cancel_tuneout naming the scope \"channel\" ends only a channel's own tune-out, never the all-except hold", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy', 'other');
+      enter(f, 'noisy');
+      enterAllExcept(f, 'work');
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const heldByScope = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'other', scope: 'channel' });
+      assert.equal(heldByScope.success, false, 'a channel only the scope holds has no tune-out of its own to end');
+      assert.match(heldByScope.error ?? '', /isn't tuned out on its own/);
+      assert.notEqual(coordinator.getAllExcept(), null, 'the scope still holds');
+
+      f.alwaysRespond(); // the channel's release wakes the resident and the reader
+      const own = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'channel' });
+      assert.ok(own.success, own.error);
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), null, "the channel's own tune-out ended");
+      assert.notEqual(coordinator.getAllExcept(), null, 'and the scope still holds');
+      await f.framework.runUntilIdle();
+    } finally { await f.close(); }
+  });
+
   it('the duration is mandatory, and a second scope is refused', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {

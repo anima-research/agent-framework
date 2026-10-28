@@ -1779,11 +1779,23 @@ export class TuneOutCoordinator {
         const channel = refusal ? undefined : named[0];
         if (!channel || !this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)) {
           // The reader keeps its latitude over the all-except hold too: a
-          // channel it holds (or the scope named as the channel) ends the scope.
+          // channel it holds (or the scope named as the channel) ends the
+          // scope. A call naming the scope "channel" ends only a channel's
+          // own tune-out, so on a channel only the scope holds it ends
+          // nothing.
           const scope = this.getAllExcept();
           const heldByScope = scope && (name === 'all-except'
             || (channel !== undefined && this.holdFor(channel.serverId, channel.channelId)?.epochId === scope.params.epochId));
           if (!heldByScope) return { success: false, error: refusal ?? this.notTunedOut(JSON.stringify(name), 'the resident'), isError: true };
+          if (input.scope === 'channel') {
+            const shown = channel ? this.quotedShown(channel.serverId, channel.channelId) : JSON.stringify(name);
+            return {
+              success: false,
+              error: `Nothing was cancelled: ${shown} isn't tuned out on its own, and scope "channel" ends only a channel's own `
+                + 'tune-out. The all-except hold holds it, and calling cancel_tuneout with scope "all-except" ends that hold.',
+              isError: true,
+            };
+          }
           return endScope();
         }
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);

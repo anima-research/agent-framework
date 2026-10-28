@@ -58,8 +58,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'A tuned-out channel, or a channel held by the all-except hold (which ends that hold).' },
-        scope: { type: 'string', enum: ['channel', 'all-except'], description: '"all-except" ends the all-except hold outright.' },
+        channelId: { type: 'string', description: 'A tuned-out channel, or a channel held by the all-except hold (which ends that hold, unless scope is "channel").' },
+        scope: { type: 'string', enum: ['channel', 'all-except'], description: '"all-except" ends the all-except hold outright; "channel" ends only the channel\'s own tune-out.' },
         text: {
           type: 'string',
           description: 'Your accompanying note to the resident (optional).',
