@@ -146,7 +146,7 @@ test('vector 3, 11: a push\'s hints apply on arrival whatever is decided about t
     // Refused (an undeclared feature set): applied all the same, and told on its own.
     const refused = await push(t.server.peer, 'p2', 'nobody hears this', { featureSet: 'arc.nope', hints: t.state.hint([{ name: 'peek', visible: false }]) });
     assert.ok(refused.error, 'the push was refused');
-    await waitFor(() => windowText(t.fw.framework).some((x) => x.includes('tool changes') && x.includes('now unavailable: peek')), 'the refused push\'s change applied, and told as a notice');
+    await waitFor(() => windowText(t.fw.framework).some((x) => x.startsWith('[toolsets] MCPL server "arc", tool changes:\n') && x.includes('now unavailable: peek')), 'the refused push\'s change applied, and told as a notice that opens with its tag');
     // The next change has the next rev and applies without any recovery.
     const lists = t.methods().filter((m) => m === 'tools/list').length;
     t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));

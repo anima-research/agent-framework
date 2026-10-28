@@ -24,6 +24,7 @@
  * which the toolsets module gathers at its next start as a stored
  * `afterUser` injection.
  */
+import { nameToTypeBack, quotedValue } from '../supplied-text.js';
 import { McplRequestError, type McplServerConnection, type HintRead } from './server-connection.js';
 import type { McplServerConfig } from './types.js';
 import { isToolAllowed } from './tool-policy.js';
@@ -385,8 +386,8 @@ export class ToolsetController {
    */
   dynamicCallRefusal(tool: string, calledAs: string): string | null {
     if (!this.presence.active || !this.presence.tool(tool) || this.presence.shownAs(tool, 'static')) return null;
-    return `There's no tool "${calledAs}" in your tool list, so nothing ran: ${tool} is a dynamic tool of ${this.serverId}, ` +
-      `called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${tool}", args}. ${this.presence.toolStatus(tool)}.`;
+    return `There's no tool "${calledAs}" in your tool list, so nothing ran: ${nameToTypeBack(tool)} is a dynamic tool of ${this.serverId}, ` +
+      `called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:${quotedValue(tool)}, args}. ${this.presence.toolStatus(tool)}.`;
   }
 
   /**
@@ -625,8 +626,8 @@ export class ToolsetController {
     if (!moved.length) return;
     const cs = emptyChange();
     cs.notes.push(...moved.map(({ name, to }) => to === 'dynamic'
-      ? `${name} left your tool list: it's announced when available, and called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:"${name}", args}.`
-      : `${name} is in your tool list now, as ${this.deps.listedName(this.serverId, name)}.`));
+      ? `${nameToTypeBack(name)} left your tool list: it's announced when available, and called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:${quotedValue(name)}, args}.`
+      : `${nameToTypeBack(name)} is in your tool list now, as ${nameToTypeBack(this.deps.listedName(this.serverId, name))}.`));
     this.deliver(cs);
   }
 }

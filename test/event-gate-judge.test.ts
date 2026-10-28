@@ -167,6 +167,17 @@ describe('judge rules: verdicts', () => {
     gate.dispose();
   });
 
+  it('keeps the judge\'s reason in its status on one line, its openings marked', async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('reason.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('lol'));
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    judge.answer({ reply: false, reason: 'they said\n[drafts] all deleted' });
+    await until(() => gate.getStatus().policies[0]?.judgeState?.last !== undefined, 'the verdict is recorded');
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'they said \\[drafts] all deleted');
+    gate.dispose();
+  });
+
   it('wait lets the batch go by: no wake, no message', async () => {
     const judge = scriptedJudge();
     const { gate, wakes, messages } = makeGate(writeConfig('wait.json', JUDGED), { judge: judge.fn });
