@@ -31107,10 +31107,16 @@ export class AgentFramework {
     this.restartClaims().prefixes.set(prefix, claim);
     try {
       await this.runDisconnectMcplServer(id, { keepToolsets: config.id === id && this.hintsFor(config) });
+      // A restart ends a closed tab as it begins: the operator connects the
+      // server now, and one whose connect fails is left an ordinary server
+      // that's down. Moved to another id, the old id's tab is no more.
+      if (this.closedTabConfigs().has(id)) {
+        if (config.id === id) this.hostPresentation?.noteConnected(id);
+        else this.hostPresentation?.noteRemoved(id);
+        this.closedTabConfigs().delete(id);
+      }
       try {
         await this.runConnectMcplServer(config, claim);
-        // Moved to another id: a closed tab under the old one is no more.
-        if (config.id !== id && this.closedTabConfigs().delete(id)) this.hostPresentation?.noteRemoved(id);
       } catch (error) {
         // The old server is gone, whatever ended the connect: a disconnect or
         // a stop() that began during the restart, or the new server's own

@@ -632,6 +632,9 @@ describe('server tabs', () => {
       const removed: string[] = [];
       const realRemove = fw.checkpointManager.removeServer.bind(fw.checkpointManager);
       fw.checkpointManager.removeServer = (id: string) => { removed.push(`checkpoints:${id}`); realRemove(id); };
+      assert.ok(fw.toolsetHub, 'the framework has its toolset hub');
+      const realForget = fw.toolsetHub.forget.bind(fw.toolsetHub);
+      fw.toolsetHub.forget = (id: string) => { removed.push(`toolsets:${id}`); realForget(id); };
       await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true });
       assert.deepEqual(removed, [], 'kept for its next open');
       // Listed, as configured and not connected.
@@ -648,20 +651,39 @@ describe('server tabs', () => {
       await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true });
       removed.length = 0;
       await h.framework.disconnectMcplServer('srv');
-      assert.deepEqual(removed, ['checkpoints:srv'], 'its checkpoint trees are removed');
+      assert.deepEqual(removed.sort(), ['checkpoints:srv', 'toolsets:srv'], 'its checkpoint trees and toolset state are removed');
       assert.ok(!h.framework.listMcplServers().some((x) => x.id === 'srv'), 'no longer listed');
     } finally { await h.stop(); await server.close(); await other.server.close(); }
   });
 
-  it('shows a tab\'s tool by look with its server named, as act takes it', async () => {
+  it('ends a closed tab when a restart begins: a restart whose connect fails leaves an ordinary server that\'s down', async () => {
+    const { server } = await pingServer();
+    const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
+    try {
+      await h.framework.start();
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
+      await call(h.framework, 'toolsets--close', { server: 'srv', disconnect: true });
+      // A restart into a configuration whose server can't be reached.
+      await assert.rejects(h.framework.restartMcplServer('srv', { id: 'srv', url: 'ws://127.0.0.1:9/mcpl', toolPrefix: 'srv', reconnect: false }), /is down/);
+      const listed = h.framework.listMcplServers().find((x) => x.id === 'srv');
+      assert.ok(listed && !listed.connected && !listed.closedTab, `configured, down, no longer a closed tab: ${JSON.stringify(listed)}`);
+      assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look', { server: 'srv' })), /closed tab/, 'nor to the agent');
+      await h.framework.restartMcplServer('srv', { id: 'srv', url: server.url, toolPrefix: 'srv' });
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'restarted again');
+    } finally { await h.stop(); await server.close(); }
+  });
+
+  it('shows a tab\'s tool by look with its server named, by either name, as act takes it', async () => {
     const { server } = await pingServer();
     const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv', presentation: 'tab' }] });
     try {
       await h.framework.start();
       await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
-      const looked = await call(h.framework, 'toolsets--look', { server: 'srv', tool: 'srv--ping' });
-      assert.ok(looked.success, looked.error);
-      assert.match(resultText(looked), /srv--ping/);
+      for (const tool of ['srv--ping', 'ping']) {
+        const looked = await call(h.framework, 'toolsets--look', { server: 'srv', tool });
+        assert.ok(looked.success, `${tool}: ${looked.error}`);
+        assert.match(resultText(looked), /srv--ping\(\)\nPing the server\.\ninputSchema:/, `${tool}: the tool's definition, not a listing`);
+      }
     } finally { await h.stop(); await server.close(); }
   });
 

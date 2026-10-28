@@ -326,11 +326,21 @@ export class HostPresentation {
   }
 
   /** `toolsets--look {tool}` for a host toolset's tool, or null when no host toolset has it. */
-  lookTool(agentName: string, tool: string): string | null {
-    const all = [...this.builtinTools(agentName), ...this.deps.servers().flatMap((s) => this.tabTools(agentName, s.id))];
-    const def = all.find((t) => t.name === tool);
+  lookTool(agentName: string, tool: string, serverId?: string): string | null {
+    const def = this.listedTool(agentName, tool, serverId);
     if (!def) return null;
     return `${renderToolDefinition(def)}\n${this.homeOf(agentName, def.name)}`;
+  }
+
+  /**
+   * A host toolset's tool as the agent has it listed, by its name, or with
+   * its server named by the name the server gave it (as act and look take it).
+   */
+  private listedTool(agentName: string, tool: string, server?: string): ToolDefinition | undefined {
+    const inTabs = this.deps.servers().filter((s) => !server || s.id === server).flatMap((s) => this.tabTools(agentName, s.id));
+    return (!server ? this.builtinTools(agentName).find((t) => t.name === tool) : undefined)
+      ?? inTabs.find((t) => t.name === tool)
+      ?? (server ? inTabs.find((t) => t.name.endsWith(`--${tool}`) && this.deps.serverOf(t.name) === server) : undefined);
   }
 
   private homeOf(agentName: string, name: string): string {
@@ -470,7 +480,8 @@ export class HostPresentation {
 
   /** A server connected by other means (an operator's connect, a deploy): no longer a closed tab. */
   noteConnected(serverId: string): void {
-    if (this.doc.closed[serverId] === true) {
+    // Closed by an agent, or by its configured default: connected against it now, which is kept.
+    if (this.doc.closed[serverId] === true || (this.doc.closed[serverId] === undefined && this.server(serverId)?.configured === 'closed-tab')) {
       this.doc.closed[serverId] = false;
       this.save();
     }
@@ -503,11 +514,7 @@ export class HostPresentation {
     const tool = typeof args.tool === 'string' ? args.tool.trim() : '';
     if (!tool) return null;
     const server = typeof args.server === 'string' && args.server.trim() ? args.server.trim() : undefined;
-    const builtin = this.builtinTools(agentName);
-    const inTabs = this.deps.servers().filter((s) => !server || s.id === server).flatMap((s) => this.tabTools(agentName, s.id));
-    const listed = (!server ? builtin.find((t) => t.name === tool) : undefined)
-      ?? inTabs.find((t) => t.name === tool)
-      ?? (server ? inTabs.find((t) => t.name.endsWith(`--${tool}`) && this.deps.serverOf(t.name) === server) : undefined);
+    const listed = this.listedTool(agentName, tool, server);
     // A host toolset's tool the agent may not call isn't listed to it; its
     // call still goes on, by name, for dispatch to refuse as it would a
     // direct call, rather than reading as no such tool.

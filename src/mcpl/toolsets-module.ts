@@ -371,7 +371,7 @@ export class ToolsetsModule implements Module {
       case 'look': {
         // A host toolset's tool, with or without its server named (as act takes it).
         if (tool && !toolset && !instance) {
-          const shown = host.lookTool(agentName, tool);
+          const shown = host.lookTool(agentName, tool, server);
           if (shown) return textResult(shown);
           return null;
         }
