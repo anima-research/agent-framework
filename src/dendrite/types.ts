@@ -260,6 +260,8 @@ export type AgentEndReason =
   | 'host-restart'
   | 'not-configured'
   | 'failed'
+  | 'host-stop'
+  | 'context-emptied'
   | (string & {});
 
 /** Provenance stamp for anything one agent hands another. */

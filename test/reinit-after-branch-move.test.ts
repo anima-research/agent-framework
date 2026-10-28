@@ -1409,6 +1409,7 @@ describe('conversation forks and an undo', () => {
         assert.deepEqual(alerts.map((alert) => alert.agentName), [emptied], JSON.stringify(alerts));
         says(alerts[0]!.message, 'it was disposed and its channel unbound');
         assert.ok(!framework.getAgent(emptied), 'disposed');
+        assert.equal(framework.getAgentRecord(emptied)?.ended?.reason, 'context-emptied');
         assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId }), undefined, 'its channel is unbound');
         assert.ok(framework.getAgent('a-early-g1'), 'the fork with history stays');
       });

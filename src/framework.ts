@@ -5566,7 +5566,7 @@ export class AgentFramework {
     for (const { name, home } of this.listAgents().filter((r) => r.kind === 'conversation-fork').map((r) => ({ name: r.name, home: this.homeOf(r.name) }))) {
       step(() => {
         if (home !== undefined && this.conversationRouter?.getBinding(home)?.agentName === name) this.conversationRouter.unbind(home);
-        this.disposeConversationAgent(name);
+        this.disposeConversationAgent(name, 'host-stop');
       });
     }
     // A window release the quiesce postponed (releasesAfterResume) never runs
@@ -14357,7 +14357,7 @@ export class AgentFramework {
         if (home && this.conversationRouter && this.conversationRouter.getBinding(home)?.agentName === agentName) {
           this.conversationRouter.unbind(home);
         }
-        this.disposeConversationAgent(agentName);
+        this.disposeConversationAgent(agentName, 'context-emptied');
       } catch (error) {
         cleanupFailed = failureDescription(error);
       }
@@ -17374,7 +17374,7 @@ export class AgentFramework {
    * stop() has ended binds nothing (spawnConversationAgent). The fork's
    * context stays in Chronicle for investigation.
    */
-  private disposeConversationAgent(agentName: string): void {
+  private disposeConversationAgent(agentName: string, reason: AgentEndReason = 'idle-ttl'): void {
     const home = this.homeOf(agentName);
     const agent = this.agents.get(agentName);
     // The one release every ended agent gets (releaseAgentRuntime), then the
@@ -17394,7 +17394,7 @@ export class AgentFramework {
       this.forgetAnnouncedLocus(agentName);
       this.codeExecution?.scripts.agentGone(agentName);
     }
-    this.settleEndedAgent(this.registry.end(agentName, 'idle-ttl', 'framework', { record: true }));
+    this.settleEndedAgent(this.registry.end(agentName, reason, 'framework', { record: true }));
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -17493,7 +17493,7 @@ export class AgentFramework {
         !this.activeStreams.has(agentName) &&
         !this.pendingRequests.some((r) => r.agentName === agentName)
       ) {
-        this.disposeConversationAgent(agentName);
+        this.disposeConversationAgent(agentName, 'idle-ttl');
       }
     }
   }
@@ -26342,7 +26342,7 @@ export class AgentFramework {
       // turn isn't over (pendingContinuationAgents).
       if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)
         && !this.pendingContinuationAgents().has(agent.name)) {
-        this.disposeConversationAgent(agent.name);
+        this.disposeConversationAgent(agent.name, 'idle-ttl');
       }
     }
   }

@@ -464,6 +464,12 @@ describe('5: stopAgent releases the window as the idle reap does', () => {
     assert.ok(errors.some((e) => /could not record a change already made/.test(e)), 'alerted');
   });
 
+  it("a fork the host's stop ends is recorded as ended by that stop, not as idle", async () => {
+    const fork = await spawnFork();
+    await framework.stop();
+    assert.equal(framework.getAgentRecord(fork.name)?.ended?.reason, 'host-stop');
+  });
+
   for (const how of ['reap', 'stopAgent'] as const) {
     it(`5a, ${how}: a failure notice the fork stored but never read reaches the primary`, async () => {
       const fork = await spawnFork();
