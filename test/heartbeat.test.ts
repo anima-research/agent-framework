@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Heartbeat, reminderText, type HeartbeatWake } from '../src/heartbeat/heartbeat.js';
 import { parseReminderTime } from '../src/heartbeat/reminder-time.js';
-import { conversationForkSpec } from '../src/dendrite/index.js';
+import { conversationForkSpec, workerSpec } from '../src/dendrite/index.js';
 
 /** The registry surface these tests reach to make a conversation fork (Dendrite). */
 type ForkRegistry = {
@@ -622,6 +622,58 @@ describe('the framework\'s heartbeat', () => {
     assert.match(String(internals.mcplPrefixCollision({ id: 'ticks', command: 'node', args: ['heartbeat-mcpl/dist/src/index.js'] })),
       /is heartbeat-mcpl, or names its tools as the heartbeat's/);
     assert.equal(internals.mcplPrefixCollision({ id: 'discord', command: 'node', args: ['discord.js'] }), null);
+  });
+
+  it('wakes the agents whose spec takes untargeted inbound, by role and not by name: a run whose spec takes it, and not a worker whose spec does not', async (t) => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const own = mkdtempSync(join(tmpdir(), 'heartbeat-fw-'));
+    const framework = await AgentFramework.create({
+      storePath: join(own, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+      modules: [],
+      heartbeat: true,
+    });
+    t.after(async () => { await framework.stop(); rmSync(own, { recursive: true, force: true }); });
+    const internals = framework as unknown as {
+      heartbeat: { start(): void; handleToolCall(name: string, input: unknown): { success: boolean } };
+      agents: Map<string, unknown>;
+      ephemeralRuns: Map<string, unknown>;
+      registry: { register(spec: ReturnType<typeof workerSpec>): unknown; end(name: string, reason: 'stopped'): unknown };
+      pendingRequests: Array<{ agentName: string; source: string }>;
+      heartbeatTargets(): string[];
+    };
+    internals.heartbeat.start();
+    // Each is registered as an agent, as a real one is, so only its spec's
+    // roles tell the two apart. main's list was every agent but the
+    // conversation forks, the ephemeral runs and the subconscious: it left out
+    // `watch`, a run whose spec takes untargeted inbound, and took `quiet`, a
+    // worker whose spec doesn't that is none of those. On this branch the
+    // heartbeat wakes an untargeted push's recipients (registry.untargetedRecipients).
+    const watch = workerSpec('watch');
+    internals.registry.register({ ...watch, roles: { ...watch.roles, receivesUntargeted: true } });
+    internals.agents.set('watch', internals.agents.get('scout'));
+    internals.ephemeralRuns.set('watch', {});
+    internals.registry.register(workerSpec('quiet'));
+    internals.agents.set('quiet', internals.agents.get('scout'));
+    try {
+      assert.deepEqual(internals.heartbeatTargets(), ['scout', 'watch']);
+      assert.equal(internals.heartbeat.handleToolCall('heartbeat--heartbeat_trigger', {}).success, true);
+      assert.deepEqual(
+        internals.pendingRequests.filter((r) => r.source === 'heartbeat').map((r) => r.agentName),
+        ['scout', 'watch'],
+        'the tick wakes the resident and the run whose spec takes untargeted inbound, not the worker',
+      );
+    } finally {
+      internals.pendingRequests.splice(0);
+      for (const name of ['watch', 'quiet']) {
+        internals.registry.end(name, 'stopped');
+        internals.agents.delete(name);
+      }
+      internals.ephemeralRuns.delete('watch');
+    }
   });
 
   it('refuses a heartbeat setting that is neither true, false, null nor an object', async () => {

@@ -200,7 +200,7 @@ import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type Stream
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
-import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
+import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -10968,13 +10968,25 @@ export class AgentFramework {
     // agent's stored context injections out, since those are that agent's
     // context, not conversation (Weft's ninth-round probe: an ended reader
     // reopened for inspection showed a co-resident's injection it never saw live).
-    const residentView = (message: StoredMessage): boolean =>
-      RESIDENT_VIEW_FILTER(message) && !isAnotherAgentsInjection(message.metadata, record.name);
-    // The same predicate on a row's metadata, recorded beside a manager
-    // opened with that view, so main's checks of whether an agent sees a row
-    // (agentSees) ask what its view holds when the reopened context is live.
-    const seen = (contextManager: ContextManager): ContextManager => {
-      this.storeSees.set(contextManager, (metadata) => residentView({ metadata } as StoredMessage));
+    const residentSees = (name: string) => (metadata: unknown): boolean =>
+      RESIDENT_VIEW_FILTER({ metadata } as StoredMessage) && !isAnotherAgentsInjection(metadata, name);
+    // A context derived from a reader of the shared slot sees, as it did live
+    // (deriveSharedContext, #291), what its source saw and its own stored
+    // injections; its source's view is composed the same way, up the shared
+    // sources the registry names, to the reader the first was derived from.
+    const derivedSees = (from: AgentRecord, walked = new Set<string>()): ((metadata: unknown) => boolean) => {
+      const source = from.inherit?.mode === 'shared' ? from.inherit.from : undefined;
+      if (source === undefined || walked.has(from.name)) return residentSees(from.name);
+      walked.add(from.name);
+      const sourceRecord = this.registry.inspect(source);
+      const sourceSees = sourceRecord ? derivedSees(sourceRecord, walked) : residentSees(source);
+      return (metadata) => sourceSees(metadata) || isOwnInjection(metadata, from.name);
+    };
+    // The predicate is the manager's view filter, and is recorded beside it,
+    // so main's checks of whether an agent sees a row (agentSees) ask what its
+    // view holds when the reopened context is live.
+    const seen = (contextManager: ContextManager, sees: (metadata: unknown) => boolean): ContextManager => {
+      this.storeSees.set(contextManager, sees);
       return contextManager;
     };
     if (record.inherit?.mode === 'shared') {
@@ -10986,17 +10998,17 @@ export class AgentFramework {
             '@animalabs/context-manager cannot reopen (ContextManager.reopenDerived)',
         );
       }
-      const readsSlot = derivation.slots?.messageNamespace === null;
+      // A context derived from a reader of the shared slot keeps the view it had.
+      const sees = derivation.slots?.messageNamespace === null ? derivedSees(record) : undefined;
       const reopened = await reopen.call(ContextManager, {
         store: this.store,
         derivation,
         strategy: strategy ?? new PassthroughStrategy(),
         membrane: this.membrane,
-        // A context derived from a reader of the shared slot keeps that reader's view.
-        ...(readsSlot ? { viewFilter: residentView } : {}),
+        ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
-      return readsSlot ? seen(reopened) : reopened;
+      return sees ? seen(reopened, sees) : reopened;
     }
     if (!record.namespace) {
       throw new Error(`Agent "${record.name}": its record names no context to reopen`);
@@ -11005,16 +11017,16 @@ export class AgentFramework {
     // configuration, say) is reopened as createAgent opened it: on the
     // shared slot, through the residents' view. Isolated, its namespace
     // holds none of what it read (nissa's #546 review, round 2).
-    const sharedSlot = record.readsSharedSlot === true;
+    const sees = record.readsSharedSlot === true ? residentSees(record.name) : undefined;
     const opened = await ContextManager.open({
       store: this.store,
       namespace: record.namespace,
-      ...(sharedSlot ? { viewFilter: residentView } : { isolate: true }),
+      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : { isolate: true }),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    return sharedSlot ? seen(opened) : opened;
+    return sees ? seen(opened, sees) : opened;
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -11057,12 +11069,28 @@ export class AgentFramework {
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    // context-manager's derive keeps its source's view filter, so the derived
-    // manager holds what its source's view holds; main's checks of whether an
-    // agent sees a row (agentSees: a tool boundary's injection, an arrival,
-    // a reader of an unread message) ask that same predicate.
+    // context-manager's derive gives the derived manager its source's view
+    // filter and takes no other (DeriveContextOptions has no viewFilter). The
+    // source's leaves out every stored injection but the source's own
+    // (isAnotherAgentsInjection), so a fork's own were hidden from its compile
+    // while its parent's showed (#291; Weft's eleventh note, on the real
+    // compile path). A fork continuing its source's context sees what its
+    // source sees and its own stored injections: that predicate replaces the
+    // derived manager's filter here (its `viewFilter` field, which only the
+    // constructor sets, so a context-manager whose derive takes a filter
+    // would let this go), before the fork has stored anything, and is
+    // recorded beside it (storeSees), so main's checks of whether an agent
+    // sees a row (agentSees: a tool boundary's injection, an arrival, a reader
+    // of an unread message) ask what its compile shows. A source with no view
+    // recorded has no filter (an isolated run's): it sees every row, so its
+    // fork keeps none, and sees its own.
     const sourceSees = this.storeSees.get(source);
-    if (sourceSees) this.storeSees.set(contextManager, sourceSees);
+    if (sourceSees) {
+      const sees = (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name);
+      (contextManager as unknown as { viewFilter?: (message: StoredMessage) => boolean })
+        .viewFilter = (message) => sees(message.metadata);
+      this.storeSees.set(contextManager, sees);
+    }
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,

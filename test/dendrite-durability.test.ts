@@ -355,6 +355,39 @@ describe('round 2: a change is put back when its write fails; a record of what h
     assert.equal(await shows(reopened), false, 'and its view, as live, is without mira\'s injection');
     assert.equal(await shows(second.getAgent('mira')!.getContextManager()), true, 'mira still sees its own');
   });
+
+  it("a dropped resident reopened for inspection is asked its own view by main's checks of whether an agent sees a row, as its compile is", async () => {
+    const first = await boot(new GateModule(), ['mira', 'nova']);
+    const nova = first.getAgent('nova')!.getContextManager();
+    const mark = (agent: string) => ({
+      system: true, kind: STORED_INJECTION_KIND,
+      [STORED_INJECTION_KEY]: { agent, namespace: `agents/${agent}`, contentHash: `h-${agent}`, part: 0, parts: 1 },
+    });
+    nova.addMessage('user', [{ type: 'text', text: 'shared conversation' }]);
+    // A row a tune-out holds from the residents, mira's stored context, and nova's own.
+    nova.addMessage('Antra', [{ type: 'text', text: 'held from the residents' }], { tuneOut: { epochId: 'e1' } } as never);
+    nova.addMessage('system_context:gates', [{ type: 'text', text: 'mira\'s standing context' }], mark('mira'));
+    nova.addMessage('system_context:gates', [{ type: 'text', text: 'nova\'s standing context' }], mark('nova'));
+    await first.stop();
+    const second = await boot(new GateModule(), ['mira']);
+    assert.equal(second.getAgentRecord('nova')?.ended?.reason, 'not-configured');
+    const reopened = await second.inspectAgentContext('nova');
+    assert.equal(reopened.getAllMessages().length, 4, 'the premise: its record holds every row of the slot');
+    // agentSees reads the view recorded beside an agent's context manager
+    // (storeSees); an inspected context has no agent, so this stands in for one.
+    const agentSees = (metadata: unknown) => (second as unknown as { agentSees(agent: unknown, metadata: unknown): boolean })
+      .agentSees({ getContextManager: () => reopened }, metadata);
+    assert.deepEqual(
+      reopened.getAllMessages().filter((m) => agentSees(m.metadata)).map((m) => textOf(m.content)),
+      ['shared conversation', 'nova\'s standing context'],
+      'agentSees leaves out the held row and mira\'s injection',
+    );
+    assert.deepEqual(
+      (await reopened.compile(undefined, undefined, { dryRun: true })).messages.map((m) => textOf(m.content)),
+      ['shared conversation', 'nova\'s standing context'],
+      'as its compile does',
+    );
+  });
 });
 
 describe('5: stopAgent releases the window as the idle reap does', () => {
