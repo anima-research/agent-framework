@@ -20,6 +20,9 @@ export interface AutoContinueRun {
   heldAfterSend?: boolean;
   /** Set by the scheduler: the continuation is the turn's only cause. */
   sole?: boolean;
+  /** The turn it continues was a heartbeat's: it has no channel either, and
+   *  holds its plain speech as drafts as that turn did. */
+  heartbeat?: true;
 }
 
 /** `AgentConfig.autoContinue` as an object (`true` means `{}`). */
@@ -580,8 +583,9 @@ export interface InferenceRequest {
    * the turn's auto-published plain-text speech here so a single TRUNK agent
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
-   * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel, except an
+   * redux). Undefined for non-channel wakes (heartbeat, timers, module events).
+   * A heartbeat's turn takes no channel at all, and holds its plain speech as
+   * drafts; any other falls back to the global default channel, except an
    * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
