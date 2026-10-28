@@ -10672,6 +10672,16 @@ export class AgentFramework {
         inherit = derived.inherit;
         namespace = derived.namespace;
       } else {
+        // Two managers writing one namespace would interleave two contexts,
+        // so one a live agent's context holds is refused. An ended agent's
+        // stays open to reuse, as resumption reopens it.
+        const holder = this.registry.list().find((record) => record.namespace === namespace);
+        if (holder) {
+          throw new Error(
+            `Ephemeral agent "${config.name}" refused: namespace "${namespace}" holds the context of the live agent ` +
+              `"${holder.name}"; name another, or none for subagent/${config.name}`,
+          );
+        }
         contextManager = await ContextManager.open({
           store: this.store,
           namespace,

@@ -235,6 +235,28 @@ describe('the registry\'s recovery', () => {
     assert.ok(inspected.getAllMessages().some((m) => textOf(m.content).includes('NS-MARK')), 'the inspected context is the one it ran in');
   });
 
+  it('a worker can\'t open a namespace a live agent\'s context holds, and can reuse an ended one\'s', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'w1', 'g-w1', workerSpec('w1', { namespace: 'jobs/shared' }));
+    await assert.rejects(
+      first.createEphemeralAgent({ name: 'w2', model: 'test-model', systemPrompt: 'x' }, workerSpec('w2', { namespace: 'jobs/shared' })),
+      /namespace "jobs\/shared" holds the context of the live agent "w1"/,
+    );
+    await assert.rejects(
+      first.createEphemeralAgent({ name: 'w3', model: 'test-model', systemPrompt: 'x' }, workerSpec('w3', { namespace: 'agents/mira' })),
+      /holds the context of the live agent "mira"/,
+      'a resident\'s namespace is held too',
+    );
+    first.stopAgent('w1', { by: 'mira' });
+    membrane.script('w4', say('done'));
+    const { agent, contextManager } = await first.createEphemeralAgent({ name: 'w4', model: 'test-model', systemPrompt: 'x' }, workerSpec('w4', { namespace: 'jobs/shared' }));
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await first.runEphemeralToCompletion(agent, contextManager);
+    assert.equal(first.getAgentRecord('w4')?.ended?.reason, 'completed', 'an ended agent\'s namespace can be reused');
+  });
+
   it('an agent that ended past the registry\'s memory is found in the ended log', async () => {
     const first = await boot();
     await first.stop();
