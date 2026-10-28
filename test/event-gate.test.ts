@@ -756,7 +756,11 @@ describe('debounce', () => {
 // ---------------------------------------------------------------------------
 
 describe('debounce bounds', () => {
-  it('rejects debounce < 100ms', () => {
+  // A gate.json debounce outside the range is read at its nearest bound, with
+  // a note, where the whole file used to be refused; addPolicy still refuses
+  // one (event-gate-strict-rules).
+  it('reads a debounce < 100ms as 100ms', (t) => {
+    t.mock.method(console, 'error', () => {});
     const path = tmpPath('low-debounce.json');
     mkdirSync(TMP_DIR, { recursive: true });
     writeFileSync(path, JSON.stringify({
@@ -764,12 +768,14 @@ describe('debounce bounds', () => {
       default: 'always',
     }));
     const { gate, traces } = makeGate(path);
-    // Should fall back to default config, emit error trace
-    assert.strictEqual(gate.evaluate(event()).trigger, true);
-    assert.ok(traces.some(t => t.type === 'gate:config-error'));
+    t.after(() => gate.dispose());
+    assert.strictEqual(gate.evaluate(event()).trigger, false, 'the event waits in the debounce batch');
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.behavior, { debounce: 100 });
+    assert.ok(!traces.some(t => t.type === 'gate:config-error'));
   });
 
-  it('rejects debounce > 300000ms', () => {
+  it('reads a debounce > 300000ms as 300000ms', (t) => {
+    t.mock.method(console, 'error', () => {});
     const path = tmpPath('high-debounce.json');
     mkdirSync(TMP_DIR, { recursive: true });
     writeFileSync(path, JSON.stringify({
@@ -777,8 +783,10 @@ describe('debounce bounds', () => {
       default: 'always',
     }));
     const { gate, traces } = makeGate(path);
-    assert.strictEqual(gate.evaluate(event()).trigger, true);
-    assert.ok(traces.some(t => t.type === 'gate:config-error'));
+    t.after(() => gate.dispose());
+    assert.strictEqual(gate.evaluate(event()).trigger, false, 'the event waits in the debounce batch');
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.behavior, { debounce: 300000 });
+    assert.ok(!traces.some(t => t.type === 'gate:config-error'));
   });
 });
 
@@ -868,11 +876,8 @@ describe('config hot-reload', () => {
 
     assert.strictEqual(gate.evaluate(event()).trigger, true);
 
-    // Force throttle to expire
+    // Force throttle to expire; the gate compares gate.json's text, whatever its mtime
     (gate as any).lastReloadCheck = 0;
-
-    // Wait for mtime to differ
-    await new Promise(r => setTimeout(r, 50));
 
     // Rewrite config — now skip everything
     writeFileSync(path, JSON.stringify({ policies: [], default: 'skip' }));
@@ -890,7 +895,6 @@ describe('config hot-reload', () => {
 
     // Force throttle to expire
     (gate as any).lastReloadCheck = 0;
-    await new Promise(r => setTimeout(r, 50));
 
     // Write invalid JSON
     writeFileSync(path, 'not valid json{{{');
@@ -1215,6 +1219,54 @@ describe('sleep', () => {
     } finally {
       gate.clearSleep();
     }
+  });
+});
+
+describe('EventGate: channel patterns and channelId keys through the route resolver (#702)', () => {
+  const policies = (channel: string): GateConfig => ({
+    policies: [
+      { name: 'room', match: { channel }, behavior: 'always' },
+      { name: 'rest', match: {}, behavior: 'skip' },
+    ],
+    default: 'skip',
+  });
+  const push = (metadata: Record<string, unknown>): GateEventInfo =>
+    event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: typeof metadata.channelId === 'string' ? metadata.channelId : '', metadata });
+  const registeredFromOrigin = (info: GateEventInfo): string | undefined =>
+    typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : undefined;
+
+  it("with the default resolver, a push meets a pattern by its own id alone", () => {
+    const { gate } = makeGate(writeConfig('route-default.json', policies('discord:g1:room')));
+    assert.strictEqual(gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' })).policyName, 'rest');
+    assert.strictEqual(gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g1:room' })).policyName, 'room');
+  });
+
+  it("with a host's resolver, a push meets a pattern by the registered id it resolves", () => {
+    const { gate } = makeGate(writeConfig('route-host.json', policies('discord:g1:room')), { resolveRouteChannel: registeredFromOrigin });
+    assert.strictEqual(gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' })).policyName, 'room');
+    assert.strictEqual(gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:other' })).policyName, 'rest');
+  });
+
+  it("a resolver that throws matches nothing through it, and the event's own id still matches", () => {
+    const resolveRouteChannel = (): string | undefined => { throw new Error('boom'); };
+    const registered = makeGate(writeConfig('route-throw-registered.json', policies('discord:g1:room')), { resolveRouteChannel });
+    assert.strictEqual(registered.gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' })).policyName, 'rest');
+    const raw = makeGate(writeConfig('route-throw-raw.json', policies('room')), { resolveRouteChannel });
+    assert.strictEqual(raw.gate.evaluate(push({ channelId: 'room' })).policyName, 'room');
+  });
+
+  it("keyBy channelId counts by the resolved id, and by metadata.channelId when the resolver gives none", () => {
+    const config: GateConfig = {
+      policies: [{ name: 'limit', match: {}, behavior: { rate_limit: { tokens: 1, refillIntervalMs: 3_600_000, keyBy: 'channelId' } } }],
+      default: 'skip',
+    };
+    const { gate } = makeGate(writeConfig('route-keyby.json', config), { resolveRouteChannel: registeredFromOrigin });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g1:room', metadata: { channelId: 'discord:g1:room' } }));
+    gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' }));
+    gate.evaluate(push({ channelId: 'side' }));
+    gate.evaluate(push({ channelId: 'other' }));
+    const state = gate.getStatus().policies.find((p) => p.name === 'limit')?.rateLimitState;
+    assert.deepStrictEqual(state, { bucketCount: 3, deniedCount: 1 }, "the room's message and push share one bucket; each unresolved push keys on its own channelId");
   });
 });
 

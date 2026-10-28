@@ -11,8 +11,10 @@
  * and EditMany tools' answers.
  */
 
+import type { ToolResult } from '../../types/events.js';
 import { type Change, type FilePlan, type Leaves, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
-import { MAX_LINE_CHARS, jsonLength, numberedLine, safeCut } from './text.js';
+import { answerText, fieldLine, sectionLead, sectionText, shownValue, textAnswer, type DiskState } from './result-text.js';
+import { MAX_LINE_CHARS, numberedLine, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
 export type EditTool = 'edit' | 'edit_many';
@@ -363,7 +365,7 @@ function excerptLine(line: string, n: number, columns: number[]): string {
 
 /**
  * Each edit's first change in a file, as numbered regions merged where they
- * meet, while the budget lasts, counted as the answer's JSON holds them; past
+ * meet, while the budget lasts, counted as the answer's text holds them; past
  * it, the regions are named by their lines.
  */
 export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars: number): string[] {
@@ -409,7 +411,7 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
     // region of millions of lines, which is named by its lines, isn't built
     // whole first. The line before it ("…" between regions, or the line end)
     // counts too, and each line feed between its lines.
-    let cost = out.length ? jsonLength('\n…\n') : jsonLength('\n');
+    let cost = out.length ? '\n…\n'.length : '\n'.length;
     const lines: string[] = [];
     let fits = !omitted.length;
     for (let lineStart = region.start, n = region.from; fits && lineStart < region.end; n++) {
@@ -420,7 +422,7 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
       // changes start on it, a stretch from shortly before each.
       const columns = text.length > MAX_LINE_CHARS ? firsts.filter((first) => first.line === n).map((first) => first.at - lineStart) : [];
       const numberedText = columns.length ? excerptLine(text, n, columns) : numberedLine(text, n);
-      cost += jsonLength(numberedText) + (lines.length ? jsonLength('\n') : 0);
+      cost += numberedText.length + (lines.length ? 1 : 0);
       if (cost > budget.left) fits = false;
       else lines.push(numberedText);
       lineStart = lineEnd + 1;
@@ -520,24 +522,56 @@ function receiptReserve(tool: EditTool, files: StoredFile[], maxChars: number): 
     const listed = Math.min(SHOWN_MATCHES, plan.edits.length);
     const range = `${last}–${last}`;
     const note = regionsLeftOut(maxChars, Array.from({ length: listed }, () => range), plan.edits.length - listed, false);
-    regions = Math.max(regions, jsonLength('\n') + jsonLength(note));
+    regions = Math.max(regions, 1 + note.length);
   }
   if (tool === 'edit') return regions;
   const most = files.length;
-  return regions + jsonLength('\n\n') + jsonLength(filesLeftOut(maxChars, most, { notListed: most, unshown: most, notes: most, edits: most })!);
+  return regions + 2 + filesLeftOut(maxChars, most, { notListed: most, unshown: most, notes: most, edits: most })!.length;
+}
+
+/** A file edit_many lists, as its receipt's fields hold it. */
+interface ListedFile {
+  path: string;
+  size: number;
+  replacements: number;
+  modeKept?: string;
+  edits?: number[];
+  note?: string;
+}
+
+/** edit_many's line for a file it lists: its path, size and replacements, and then the edits, the mode kept and the notes it has room for. */
+function listedFileLine(file: ListedFile): string {
+  return `${shownValue(file.path)}: size ${file.size}, replacements ${file.replacements}`
+    + (file.edits !== undefined ? `, edits ${file.edits.join(', ')}` : '')
+    + (file.modeKept !== undefined ? `; modeKept: ${shownValue(file.modeKept)}` : '')
+    + (file.note !== undefined ? `. ${shownValue(file.note)}` : '');
+}
+
+/** edit_many's receipt's text before its changed regions: its counts, and the files it lists. */
+function manyHeadText(data: { edits: number; replacements: number; disk: DiskState; files: ListedFile[]; filesNotListed?: number }): string {
+  const header = [fieldLine('edits', data.edits), fieldLine('replacements', data.replacements), fieldLine('disk', data.disk)];
+  if (data.filesNotListed !== undefined) header.push(fieldLine('filesNotListed', data.filesNotListed));
+  return answerText(header, [sectionText('files', data.files.map(listedFileLine).join('\n'))]);
 }
 
 /**
  * The receipt of edits stored: each file's size, replacements and notes, and
  * each edit's first changed region, numbered as read numbers lines, held to
- * `maxChars` as the answer's JSON holds it. Its counts and notes come first;
- * the regions take what is left, and past it a file's regions are named by
- * their lines. edit_many lists its files while they fit, a file whose notes
- * don't fit without them, or without its edits' numbers too, and counts the
- * rest. edit's receipt, of one file, keeps its counts and notes and shows no
- * region where those alone pass `maxChars`.
+ * `maxChars` as the answer's text holds it (result-text.ts). Its counts and
+ * notes come first; the regions take what is left, and past it a file's
+ * regions are named by their lines. edit_many lists its files while they
+ * fit, a file whose notes don't fit without them, or without its edits'
+ * numbers too, and counts the rest. edit's receipt, of one file, keeps its
+ * counts and notes and shows no region where those leave no room for it. The
+ * line that names what a receipt leaves out comes after what it keeps, and
+ * where its counts and notes leave too little room for that line too, as
+ * they can with long notes or a limit far under the 1,000 a residence or an
+ * agent can set, the receipt passes `maxChars` by it, and then reaches its
+ * caller as any result past its limit does: a model's spills, and a script's
+ * call answers ResultTooLarge. Otherwise the model reads the text, and a
+ * script gets the receipt's fields beside it.
  */
-export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): Record<string, unknown> {
+export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number, disk: DiskState): ToolResult {
   const reserve = receiptReserve(tool, files, maxChars);
   const notesOf = ({ plan, notes }: StoredFile): string[] => {
     const lineEnds = lineEndNote(plan);
@@ -557,28 +591,30 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
   if (tool === 'edit') {
     const file = files[0]!;
     const notes = notesOf(file);
-    const data: Record<string, unknown> = {
+    const head = {
       path: file.path,
       size: file.plan.bytes.length,
       replacements: file.plan.replacements,
+      disk,
       ...(notes.length ? { note: notes.join(' ') } : {}),
       ...(file.modeKept ? { modeKept: file.modeKept } : {}),
-      changed: '',
     };
-    const budget = { left: maxChars - JSON.stringify(data).length - reserve };
-    data.changed = shownRegions(file.plan, budget, maxChars).join('\n');
-    return data;
+    const header = Object.entries(head).map(([key, value]) => fieldLine(key, value));
+    const budget = { left: maxChars - answerText(header).length - sectionLead('changed') - reserve };
+    const changed = shownRegions(file.plan, budget, maxChars).join('\n');
+    return textAnswer(answerText(header, [sectionText('changed', changed)]), { ...head, changed });
   }
-  const listed: Array<Record<string, unknown>> = [];
-  const data: Record<string, unknown> = {
+  const listed: ListedFile[] = [];
+  const data: { edits: number; replacements: number; disk: DiskState; files: ListedFile[]; filesNotListed?: number; changed: string } = {
     edits: editCount,
     replacements: files.reduce((sum, file) => sum + file.plan.replacements, 0),
+    disk,
     files: listed,
     changed: '',
   };
-  const fits = (entry: Record<string, unknown>) => {
+  const fits = (entry: ListedFile) => {
     listed.push(entry);
-    const fit = JSON.stringify(data).length <= maxChars - reserve;
+    const fit = manyHeadText(data).length + sectionLead('changed') <= maxChars - reserve;
     listed.pop();
     return fit;
   };
@@ -587,7 +623,7 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
   let notListed = 0;
   for (const [i, file] of files.entries()) {
     const notes = notesOf(file);
-    const bare = {
+    const bare: ListedFile = {
       path: file.path,
       size: file.plan.bytes.length,
       replacements: file.plan.replacements,
@@ -610,22 +646,22 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
     if (notes.length && !('note' in entry)) notesLeftOut++;
     if (!('edits' in entry)) editsLeftOut++;
   }
-  const budget = { left: maxChars - JSON.stringify(data).length - reserve };
+  const budget = { left: maxChars - manyHeadText(data).length - sectionLead('changed') - reserve };
   const sections: string[] = [];
   let unshown = 0;
   for (const file of files.slice(0, listed.length)) {
-    const heading = jsonLength(`${file.path}\n`) + (sections.length ? jsonLength('\n\n') : 0);
+    const heading = shownValue(file.path).length + 1 + (sections.length ? 2 : 0);
     if (heading >= budget.left) {
       unshown++;
       continue;
     }
     budget.left -= heading;
-    sections.push(`${file.path}\n${shownRegions(file.plan, budget, maxChars).join('\n')}`);
+    sections.push(`${shownValue(file.path)}\n${shownRegions(file.plan, budget, maxChars).join('\n')}`);
   }
   const last = filesLeftOut(maxChars, files.length, { notListed, unshown, notes: notesLeftOut, edits: editsLeftOut });
   if (last !== null) sections.push(last);
   data.changed = sections.join('\n\n');
-  return data;
+  return textAnswer(answerText([manyHeadText(data)], [sectionText('changed', data.changed)]), data);
 }
 
 const capitalized = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);

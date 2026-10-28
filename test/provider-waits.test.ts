@@ -918,7 +918,8 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
   await withStoreDir(async (path) => {
     const log = silence();
     const { fw } = await framework(path, new WaitingMembrane(0, undefined));
-    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }): Promise<void> };
+    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }, agent: unknown): Promise<void>; waitingTraceEveryMs: number };
+    stepping.waitingTraceEveryMs = Number.POSITIVE_INFINITY;
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const mocked = globalThis.setTimeout;
     const delays: number[] = [];
@@ -928,7 +929,7 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
     }) as unknown as typeof setTimeout;
     try {
       let done = false;
-      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }).then(() => { done = true; });
+      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }, fw.getAgent('resident')).then(() => { done = true; });
       t.mock.timers.tick(ONE_TIMER_MS);
       for (let i = 0; i < 20; i++) await Promise.resolve();
       assert.equal(done, false, "still waiting after one timer's worth");
@@ -1604,8 +1605,6 @@ test('unreadable recorded waits raise an ops alert for the whole framework as th
 // before the stream exists, here thrown from streamYielding).
 // ---------------------------------------------------------------------------
 
-/** A stream whose iteration throws, instead of yielding an error event:
- *  driveStream's catch, the third failure site. */
 class ThrowingStream extends ErrorStream {
   constructor(private readonly thrown: Error) { super(thrown); }
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -2097,12 +2096,27 @@ test('an ephemeral run sleeps a stated wait within the framework cap and retries
  *  compiles, and counts how often a stream is iterated: membrane sends then. */
 class WaitDuringCompile extends WaitingMembrane {
   sent = 0;
-  constructor(private readonly during: () => void) { super(0, undefined); }
+  /** cancel() calls on the streams it makes, with `cancelThrows`. */
+  cancels = 0;
+  /** With `cancelThrows`, each stream's first cancel() throws, as a host's stream can. */
+  constructor(private readonly during: () => void, private readonly cancelThrows = false) { super(0, undefined); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.during();
     const stream = super.streamYielding(request);
     const iterate = stream[Symbol.asyncIterator].bind(stream);
     Object.defineProperty(stream, Symbol.asyncIterator, { value: () => { this.sent++; return iterate(); } });
+    if (this.cancelThrows) {
+      const cancel = stream.cancel.bind(stream);
+      let threw = false;
+      Object.defineProperty(stream, 'cancel', {
+        value: () => {
+          this.cancels++;
+          if (threw) return cancel();
+          threw = true;
+          throw new Error('zz the stream refused its cancel');
+        },
+      });
+    }
     return stream;
   }
 }
@@ -2139,6 +2153,30 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
       clock.pass(wait);
       await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
       assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a conversation agent's turn is held after its compile all the same when its stream's cancel throws", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; }, true);
+    const { fw, internal } = await framework(path, membrane);
+    record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
+    const traces: Array<{ type: string; error?: string }> = [];
+    fw.onTrace((event) => {
+      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'resident') traces.push(event as { type: string; error?: string });
+    });
+    try {
+      await conversationTurn(fw, internal as NonOwning, 'zz-first');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
+      assert.deepEqual(traces.map((trace) => trace.type), ['inference:started', 'inference:failed']);
+      assert.match(traces[1]!.error!, /^Provider wait: zz-model is held for resident until /, "the hold's report, not the cancel's throw");
+      assert.ok(log.lines.some((line) => /the cancel of a turn's stream held by a provider wait recorded while it compiled threw; it was never iterated, so it sent nothing/.test(line)));
+      assert.equal(membrane.cancels, 1, 'the agent lets go of the stream without cancelling it again');
     } finally { await fw.stop(); log.restore(); }
   });
 });

@@ -7,7 +7,9 @@
  * end the turn at its next check,
  * or where its hooks or compile fail, before it sends anything more,
  * through the terminal the same stop gets on a live stream. A stop made
- * where no check of a turn is ahead ends nothing.
+ * where no check of a turn is ahead ends nothing, unless the turn's
+ * continuation or retry is on its way, which abortInference() ends
+ * (held-turn-retry.test.ts, turn-continuation.test.ts).
  */
 
 import { describe, it } from 'node:test';
@@ -1254,9 +1256,10 @@ describe('a stop while no turn is running', () => {
 
   it('a message sent after a stop during a provider-capacity hold is answered when the hold ends', async () => {
     // A host hold parks the turn after its first request fails on a spent
-    // quota: no turn is running while it waits, and when it ends, one start
-    // takes every wake held for the agent. A stop made during the hold must
-    // not cost the message sent after it its answer.
+    // quota: no stream runs while it waits, though the turn is alive until
+    // its retry starts, and when the hold ends, one start takes every wake
+    // held for the agent. A stop made during the hold ends the held turn,
+    // and must not cost the message sent after it its answer.
     const tempDir = mkdtempSync(join(tmpdir(), 'af-stop-without-stream-'));
     const membrane = new QuotaOnceMembrane();
     let holds = 0;
@@ -1276,9 +1279,13 @@ describe('a stop while no turn is running', () => {
       framework.start();
       const agent = framework.getAgent('prime')!;
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {}, triggerInference: true } as unknown as ProcessEvent);
-      await waitFor('the hold to park the turn', () => cooldowns.has('prime') && framework.getHostModeStatus().activeTurns === 0);
+      await waitFor('the hold to park the turn', () => cooldowns.has('prime'));
+      assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, ['prime'], 'the held turn is alive');
       assert.equal(membrane.calls.length, 1, 'the first request failed on the quota');
-      assert.equal(framework.abortInference('prime', 'user'), false, 'abortInference() reports no turn to stop while the hold parks it');
+      // The held turn is alive with no stream: abortInference() ends it, its
+      // retry dropped from the hold, as a stop ends a turn's start.
+      assert.equal(framework.abortInference('prime', 'user'), true, 'abortInference() ends the turn the hold keeps for its retry');
+      assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, [], 'and the turn is over');
       agent.cancelStream();
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'a message sent after the stop', metadata: {}, triggerInference: true } as unknown as ProcessEvent);
       await waitFor('the message sent after the stop to be answered',
@@ -1474,6 +1481,35 @@ describe("a stop while the guard's refusal retry waits", () => {
       endedWithoutRetry(g, 'quiesce_abandoned', null);
       await g.framework.resume();
     } finally {
+      await g.cleanup();
+    }
+  });
+
+  it("a quiesce's abandon whose cancel of the finished stream throws still ends the turn at the guard's check, listing nothing", async () => {
+    const g = await guardRetryWaiting();
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      const held = g.agent.state as { stream?: { cancel(): void } };
+      assert.ok(held.stream, "the agent holds the round's finished stream while the guard waits");
+      let cancels = 0;
+      held.stream.cancel = () => { cancels++; throw new Error('zz the stream refused its cancel'); };
+      const reached = abandonReached(g.framework);
+      const quiescing = g.framework.quiesce({ timeoutMs: 50, abandon: true });
+      await within('the abandon to reach the turn', reached);
+      assert.equal(cancels, 1, 'the abandon tried to cancel the finished stream');
+      g.releasePost();
+      const status = await within('the quiesce to return', quiescing);
+      assert.equal(status.quiesced, true);
+      assert.equal(status.unabandonable, undefined, 'nothing listed: the check ended the turn');
+      endedWithoutRetry(g, 'quiesce_abandoned', null);
+      assert.ok(lines.some((l) => /^\[host-mode\] abandoning in-flight turn for assistant: its stream's cancel threw, so the turn ends at its next check instead: /.test(l)),
+        lines.join('\n'));
+      assert.ok(!lines.some((l) => l.startsWith('[host-mode] cannot abandon turn for assistant')), 'and not that it cannot');
+      await g.framework.resume();
+    } finally {
+      console.error = original;
       await g.cleanup();
     }
   });

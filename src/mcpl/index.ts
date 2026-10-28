@@ -88,6 +88,11 @@ export type {
 } from './types.js';
 
 export { McplMethod } from './types.js';
+// RFC-014 tool presence and toolsets (host side).
+export { ToolsetHub, ToolsetController, TOOLSETS_MODULE, META_TOOL_NAMES } from './toolset-host.js';
+export { ToolsetsModule, TOOLSETS_REMINDER_NAMESPACE } from './toolsets-module.js';
+export { ToolPresence } from './tool-presence.js';
+export type { ChangeSet, MetaToolNames, ToolsetDecl } from './tool-presence.js';
 
 // Error codes and factories
 export {

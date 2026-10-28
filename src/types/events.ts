@@ -194,19 +194,34 @@ export interface ToolResult {
    * it reads the result's error text, if any.
    */
   data?: unknown;
+  /**
+   * Whether `data` is a protocol result's content: an array in which every
+   * element is a content block, of a type this host can show or not. The
+   * framework sets it on an MCPL tool's result, and a module that returns a
+   * content array can set it too. When it's set, each element reaches the
+   * model as itself, as a reference's stub, or as a marker saying what it was
+   * and why it isn't shown, never as JSON. When it isn't, an array counts as
+   * content only when every element is a block of one of MCP's types (text,
+   * image, audio, resource, resource_link), and any other array is data,
+   * written as JSON.
+   */
+  dataIsContent?: boolean;
   /** Error message (if failure) */
   error?: string;
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
-   * The dispatcher refused the call before it opened, RFC-007's refusal, so
-   * nothing ran and the call certainly had no effect. Only the dispatcher's
-   * path, the model's calls and a script's, sets it: the caller may not use
-   * the tool (allowedTools), a `skip_reply` wake was refused, the call's MCPL
-   * server is absent or still connecting, the host's policy for that server
-   * denies the tool, or a fork reached outside its channel. RFC-007's
-   * lifecycle refuses the call from the same place, so observers see no
-   * events for it. A check made after the call opened, such as a module's
+   * The call was refused before it opened, RFC-007's refusal, so nothing ran
+   * and the call certainly had no effect. The dispatcher's path, the model's
+   * calls and a script's, sets it: the caller may not use the tool
+   * (allowedTools), a `skip_reply` wake was refused, the call's MCPL server is
+   * absent or still connecting, the host's policy for that server denies the
+   * tool, or a fork reached outside its channel. RFC-007's lifecycle refuses
+   * the call from the same place, so observers see no events for it. The
+   * framework also sets it on the result it stores for each call in the last
+   * round of a response the output limit cut off: such a call was never
+   * dispatched or opened, and its result goes into the context with the reply,
+   * not through a tool-result event. A check made after the call opened, such as a module's
    * answer for a name it has no tool for or arguments that don't fit a
    * schema, is a failure whose text says nothing was done, as is an MCPL
    * request that couldn't be written. A programmatic call (`executeToolCall`,
@@ -258,6 +273,13 @@ export interface ToolCall {
   name: string;
   /** Tool input */
   input: unknown;
+  /**
+   * membrane's marker (ToolUseContent.unparseableInput), present when `input`
+   * isn't the model's arguments. The framework refuses such a call without
+   * running it, except one whose text is JSON `null`, which runs as a call
+   * with no arguments.
+   */
+  unparseableInput?: string;
   /** The agent that made this tool call. Set by the framework dispatch layer. */
   callerAgentName?: string;
   /**
@@ -299,7 +321,10 @@ export interface ToolCall {
    * leaves room for them; and a result nested past 2,000 levels, or whose parse
    * needs more of the script's memory than is free, doesn't reach the script
    * whatever its length. A result that doesn't reach it is answered
-   * ResultTooLarge, the call having taken effect. Nothing is cut or saved to
+   * ResultTooLarge, the call having taken effect. One the host can't convert
+   * to JSON at all, such as one nested deeper than its runtime's
+   * JSON.stringify can take, is answered instead as a failure naming the
+   * tool and saying the call itself completed. Nothing is cut or saved to
    * a file. A tool that pages or budgets its answer can stay under it. The
    * framework sets it on a model's, a script's and the operator's puppet's
    * call to a module, a utility run through `utils` included. A call
@@ -308,7 +333,9 @@ export interface ToolCall {
    * read_image tool passes a model's call to the workspace without it; and a
    * utility run through `utils` carries what its `utils` call carried.
    * Without it, a module holds its answer to a bound of its own, if any: the
-   * workspace's is the house default, 24,000.
+   * workspace's `edit` and `edit_many` answers hold to the house default,
+   * 24,000, and a `read` holds its page to its line limit alone, with every
+   * line whole, since such a caller takes the data itself.
    */
   resultMaxChars?: number;
 }

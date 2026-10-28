@@ -2,9 +2,10 @@
  * A message injected at a tool boundary goes into the live stream as the next
  * compile sends it: the agent's strategy renders the boundary's batch as the
  * newest of its window (ContextManager.renderAsNewest), cut by the per-message
- * cap and with the image limits applied across the batch. One the next compile
- * won't send among its newest isn't injected, which is logged, and a notice
- * after the batch tells the agent of it.
+ * cap and with the image limits applied across the batch. One the render
+ * can't place among the newest, such as one before the recent window under
+ * context-manager 0.23.0's memory strategy, goes in as stored, which is how
+ * the next compile sends it.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -23,7 +24,6 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { HistoryModule } from '../src/modules/history/index.js';
 import { AutobiographicalStrategy, WindowedPassthroughStrategy, type ContextInjection, type MessageId } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -164,123 +164,210 @@ describe('a message injected at a tool boundary', () => {
     return seen;
   }
 
-  it("isn't injected where the next compile won't send it among its newest, which is logged, and a notice after the batch tells the agent of it", async () => {
+  it('goes in as stored where the render gives null, in its place in the batch', async () => {
     await create(new WindowedPassthroughStrategy({}));
     membrane.supportsInjectedMessages = true;
-    // The first of the batch comes back null, as for a message the view leaves out.
+    // The first of the batch comes back null, as for a message the render places before its window.
     const seen = renderWith((ids, real) => real(ids)!.map((c, i) => (i === 0 ? null : c)));
     const agent = framework.getAgent('assistant')!;
-    const logged: string[] = [];
-    const original = console.error;
-    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
-    let injected: Array<{ content: unknown[] }>;
-    try {
-      injected = await turnWith([[text('LEFTOUT')], [text('HEARD')]]);
-    } finally {
-      console.error = original;
-    }
+    const injected = await turnWith([[text('PLACEDBEFORE')], [text('HEARD')]]);
     assert.equal(seen.calls, 1, 'the batch is rendered in one call');
-    const row = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('LEFTOUT'))!;
-    assert.ok(row, 'the premise: the boundary stored it');
-    // Who sent it, its size, and its id where the agent has no history--extract; none of its words.
-    const notice = text(
-      "[not shown] For assistant: A message arrived during your turn that isn't shown here, since your context doesn't keep it among your newest messages:\n" +
-      `- From Antra, 7 characters. Its id is ${row.id}.`,
-    );
-    assert.deepEqual(injected.map((m) => m.content), [[text('HEARD')], [notice]]);
-    assert.ok(logged.some((l) => l.includes('[injection]') && l.includes('left out') && l.includes(row.id)), `the log names it: ${JSON.stringify(logged)}`);
-    // As anything stored at a boundary that marks: the text says what that costs.
-    assert.ok(agent.getConsumedWatermark()!.sequence >= row.sequence, 'the consumed mark covers it');
-    // Stored after the batch, so the next request carries it where the live round heard it.
-    const stored = agent.getContextManager().getAllMessages();
-    const heardAt = stored.findIndex((m) => JSON.stringify(m.content).includes('HEARD'));
-    assert.equal(stored[heardAt + 1]?.metadata?.system, true, 'the notice is stored right after the batch, as a system line');
-    assert.deepEqual(JSON.parse((await nextRequest())('[not shown]')), [notice]);
+    assert.deepEqual(injected.map((m) => m.content), [[text('PLACEDBEFORE')], [text('HEARD')]]);
+    const row = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('PLACEDBEFORE'))!;
+    assert.ok(agent.getConsumedWatermark()!.sequence >= row.sequence, 'the consumed mark covers it, as anything injected');
   });
 
-  it("names a left-out message's sender in its notice as the store keeps the name, a lone surrogate as U+FFFD", async () => {
+  it("each message goes in as its own render gives it, in its place in the batch", async () => {
     await create(new WindowedPassthroughStrategy({}));
     membrane.supportsInjectedMessages = true;
-    renderWith((ids, real) => real(ids)!.map((c, i) => (i === 0 ? null : c)));
-    module.participant = 'An \ud83d tra';
-    const injected = await turnWith([[text('LEFTOUT')], [text('HEARD')]]);
-    const notice = JSON.parse(holding(injected, '[not shown]') || '[]') as Array<{ text?: string }>;
-    assert.ok(notice[0]?.text, 'the premise: the boundary injected its notice');
-    assert.ok(notice[0]!.text!.isWellFormed() && notice[0]!.text!.includes('From An \ufffd tra'), `the notice names the sender well formed: ${JSON.stringify(notice[0]!.text)}`);
-    assert.deepEqual(JSON.parse((await nextRequest())('[not shown]')), notice, 'as the next request sends it');
+    // A stand-in render that marks each id's answer with its position, so a
+    // message given another's render shows.
+    renderWith((ids) => ids.map((_, i) => [text(`RENDERED${i}`)]));
+    const injected = await turnWith([[text('FIRST')], [text('SECOND')]]);
+    assert.deepEqual(injected.map((m) => m.content), [[text('RENDERED0')], [text('RENDERED1')]]);
   });
 
-  it('tells the agent of a boundary whose whole batch is left out, with each one\'s images, and names no message a tune-out holds', async () => {
+  it('a whole batch the render gives null goes in as stored, images and all, and nothing a tune-out holds', async () => {
     await create(new WindowedPassthroughStrategy({}));
     membrane.supportsInjectedMessages = true;
-    renderWith((ids) => ids.map(() => null));
+    const seen = renderWith((ids) => ids.map(() => null));
     const agent = framework.getAgent('assistant')!;
     module.interjectionMetadata = [{ tuneOut: { epochId: 'epoch-1' } }];
-    const original = console.error;
-    console.error = () => {};
-    let injected: Array<{ content: unknown[] }>;
-    try {
-      injected = await turnWith([[text('TUNEDOUT')], [text('PICTURED'), image()]]);
-    } finally {
-      console.error = original;
-    }
-    const rows = agent.getContextManager().getAllMessages();
-    const tuned = rows.find((m) => JSON.stringify(m.content).includes('TUNEDOUT'))!;
-    const pictured = rows.find((m) => JSON.stringify(m.content).includes('PICTURED'))!;
+    const injected = await turnWith([[text('TUNEDOUT')], [text('PICTURED'), image()]]);
+    const tuned = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('TUNEDOUT'))!;
     assert.ok(tuned && (tuned.metadata as { tuneOut?: unknown } | undefined)?.tuneOut, 'the premise: the boundary stored the tuned-out message, stamped');
-    assert.deepEqual(injected.map((m) => m.content), [[text(
-      "[not shown] For assistant: A message arrived during your turn that isn't shown here, since your context doesn't keep it among your newest messages:\n" +
-      `- From Antra, 8 characters and 1 image. Its id is ${pictured.id}.`,
-    )]]);
-    // The notice is what the boundary injects, so its mark covers what it left out.
-    assert.ok(agent.getConsumedWatermark()!.sequence >= pictured.sequence, 'the consumed mark covers it');
+    assert.equal(seen.calls, 1, 'the premise: the render ran');
+    assert.deepEqual(injected.map((m) => m.content), [[text('PICTURED'), image()]]);
   });
 
-  it('under the memory strategy, a batch bigger than the recent window: the message before it is left out, and the rest goes in as the next request carries it', async () => {
-    // No stand-in: the strategy's own render decides. A recent window smaller than the batch puts the
-    // batch's first message before it, and a small shard size stores that message as several, as a
-    // resident's long message is.
-    const history = new HistoryModule();
+  it("isn't injected where the agent's own view leaves it out, as it leaves out another agent's stored context injection, and the next request leaves it out too", async () => {
+    await create(new AutobiographicalStrategy({ recentWindowTokens: 30_000 } as never));
+    const agent = framework.getAgent('assistant')!;
+    module.interjectionMetadata = [{ contextInjection: { agent: 'another', namespace: 'test', contentHash: 'h', part: 0, parts: 1 } }];
+    const injected = await turnWith([[text('OTHERSCONTEXT')], [text('HEARD')]]);
+    const row = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('OTHERSCONTEXT'));
+    assert.ok(row, 'the premise: the boundary stored it');
+    assert.equal(holding(injected, 'OTHERSCONTEXT'), '');
+    assert.notEqual(holding(injected, 'HEARD'), '', 'the message beside it goes in');
+    const next = await nextRequest();
+    assert.equal(next('OTHERSCONTEXT'), '');
+    assert.notEqual(next('HEARD'), '');
+  });
+
+  it("at the subconscious's boundary, its own view decides: a row written for it with a tune-out's stamp goes in, and another agent's stored context injection stays out, as its next request has them", async () => {
+    let ctx: ModuleContext | null = null;
+    const writer: Module = {
+      name: 'writer',
+      async start(c: ModuleContext) { ctx = c; },
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; },
+      async onProcess() { return {}; },
+    };
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' }],
+      modules: [writer],
+      subconscious: { enabled: true, systemPrompt: 'notice' },
+    });
+    framework.start();
+    // Written for the subconscious as its turn's stream opens, so they wait for its tool boundary.
+    const streams: Array<{ receivedToolResultOptions: Array<{ injectedMessages?: Array<{ content: unknown[] }> } | undefined> }> = [];
+    const open = membrane.streamYielding.bind(membrane);
+    let wrote = false;
+    membrane.streamYielding = ((request: never, options: never) => {
+      const stream = open(request, options);
+      streams.push(stream as never);
+      if (!wrote) {
+        wrote = true;
+        ctx!.addMessage('Antra', [text('TUNEDOUT')], { tuneOut: { epochId: 'epoch-1' } } as never, { forAgent: 'Subconscious' });
+        ctx!.addMessage('Antra', [text('OTHERSCONTEXT')], { contextInjection: { agent: 'another', namespace: 'test', contentHash: 'h', part: 0, parts: 1 } } as never, { forAgent: 'Subconscious' });
+      }
+      return stream;
+    }) as never;
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 't1', name: 'think', input: { content: 'hm' } }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([text('Noted.')]));
+    assert.equal(framework.nudgeAgent('Subconscious').ok, true);
+    await framework.runUntilIdle();
+    const injected = streams.flatMap((s) => s.receivedToolResultOptions).flatMap((o) => o?.injectedMessages ?? []);
+    assert.ok(wrote, 'the premise: the writes were made while its turn ran');
+    const stored = framework.getAgent('Subconscious')!.getContextManager().getAllMessages();
+    assert.ok(stored.some((m) => JSON.stringify(m.content).includes('OTHERSCONTEXT')), 'the marked row is stored, not dropped');
+    assert.notEqual(holding(injected, 'TUNEDOUT'), '', "its view holds a row with a tune-out's stamp, so it goes in");
+    assert.equal(holding(injected, 'OTHERSCONTEXT'), '');
+    membrane.pushResponse(createMockResponse([text('Again.')]));
+    assert.equal(framework.nudgeAgent('Subconscious').ok, true);
+    await framework.runUntilIdle();
+    const sent = JSON.stringify(membrane.calls[membrane.calls.length - 1]!.messages);
+    assert.ok(sent.includes('TUNEDOUT') && !sent.includes('OTHERSCONTEXT'), 'its next request has the one and not the other');
+  });
+
+  it('under the memory strategy, a batch bigger than the recent window whose oldest the render gives null goes in whole, as the next request sends it (context-manager#275, R1-1)', async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 4000, kvStableReachTokens: 8_000,
+      compressionModel: 'mock', targetChunkTokens: 100, autoTickOnNewMessage: false,
+    } as never));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 3; i++) {
+      cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} ` + Array.from({ length: 40 }, (_, k) => `word${k}`).join(' '))]);
+    }
+    const seen = renderWith((ids, real) => real(ids)!.map((c, i) => (i < 2 ? null : c)));
+    const shots = [1, 2, 3, 4].map((i) => `SCREENSHOT${i}`);
+    const injected = await turnWith(shots.map((s) => [text(s), image()]));
+    assert.equal(seen.calls, 1, 'the premise: the boundary rendered the batch');
+    // Every screenshot went into the live round, in the order it arrived.
+    const live = injected.map((m) => JSON.stringify(m.content));
+    assert.deepEqual(live.map((c) => shots.findIndex((s) => c.includes(s))), [0, 1, 2, 3], JSON.stringify(live.map((c) => c.slice(0, 60))));
+    // The next request carries them where the live round did, right after the
+    // tool result, in the same form.
+    membrane.pushResponse(createMockResponse([text('Again.')]));
+    go();
+    await framework.runUntilIdle();
+    const sentNext = membrane.calls[membrane.calls.length - 1]!.messages.map((m) => JSON.stringify(m.content));
+    const at = shots.map((s) => sentNext.findIndex((c) => c.includes(s)));
+    assert.deepEqual(at, at.map((_, k) => at[0]! + k), `in order, one after another: ${JSON.stringify(at)}`);
+    assert.ok(sentNext[at[0]! - 1]!.includes('"tool_result"'), `right after the tool result: ${sentNext[at[0]! - 1]!.slice(0, 120)}`);
+    assert.deepEqual(at.map((k) => JSON.parse(sentNext[k]!)), live.map((c) => JSON.parse(c)));
+  });
+
+  it('under the memory strategy, after a head window reset, a message the head has not filled up to and the render gives null goes in as the next request sends it', async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', headWindowTokens: 4000, compressionModel: 'mock',
+      autoTickOnNewMessage: false,
+    } as never));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
+    await cm.resetHeadWindow('A new topic.');
+    const seen = renderWith((ids) => ids.map(() => null));
+    const injected = await turnWith([[text('AFTERRESET a short message')]]);
+    assert.equal(seen.calls, 1, 'the premise: the boundary rendered the batch');
+    const live = holding(injected, 'AFTERRESET');
+    assert.deepEqual(JSON.parse(live), [text('AFTERRESET a short message')], 'it goes in as stored');
+    assert.deepEqual(JSON.parse((await nextRequest())('AFTERRESET')), JSON.parse(live), 'as the next request sends it');
+  });
+
+  it('under the memory strategy, a body bigger than the recent window that the render gives null goes in as stored, and the rest as the next request sends it', async () => {
+    // The strategy stores the long message as several shards. As stored, it
+    // goes in joined, as the store reads it back: its image first, then its
+    // text as one block, which differs from the blocks as they were queued.
     await create(new AutobiographicalStrategy({
       adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 300, kvStableReachTokens: 8_000,
       targetChunkTokens: 200,
-    }), [history]);
-    history.bind(framework.getAgent('assistant')!.getContextManager());
-    // About 1,000 tokens, more than the recent window holds, then a short message that fits in it.
+    }));
     const long = 'FIRSTLONG ' + Array.from({ length: 600 }, (_, i) => `word${i}`).join(' ');
-    const logged: string[] = [];
-    const original = console.error;
-    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
-    let injected: Array<{ content: unknown[] }>;
-    try {
-      injected = await turnWith([[text(long)], [text('SECONDSHORT and a few words more')]]);
-    } finally {
-      console.error = original;
-    }
-    assert.equal(holding(injected, 'FIRSTLONG'), '', 'the message before the recent window is left out');
-    const second = holding(injected, 'SECONDSHORT');
-    assert.ok(second.length > 0, 'the rest of the batch goes in');
-    assert.ok(logged.some((l) => l.includes('[injection]') && l.includes('left out')), `the log names it: ${JSON.stringify(logged.filter((l) => l.includes('[injection]')))}`);
+    const seen = renderWith((ids, real) => real(ids)!.map((c, i) => (i === 0 ? null : c)));
+    const injected = await turnWith([[text('Intro. '), image(), text(long)], [text('SECONDSHORT and a few words more')]]);
+    assert.equal(seen.calls, 1, 'the premise: the boundary rendered the batch');
     const rows = framework.getAgent('assistant')!.getContextManager().getAllMessages();
     const row = rows.find((m) => JSON.stringify(m.content).includes('FIRSTLONG'))!;
-    const parts = rows.filter((m) => m.bodyGroupId !== undefined && m.bodyGroupId === row.bodyGroupId).length;
-    assert.ok(parts > 1, `the premise: the long message is stored as several parts (${parts})`);
-    // The agent is shown history--extract, so the notice gives the call that reads just that message, every part.
-    const call = `history--extract with aroundId "${row.id}", before 0 and after ${parts - 1} reads it, stored as ${parts} parts.`;
-    const notice = holding(injected, '[not shown]');
-    const said = (JSON.parse(notice) as Array<{ text: string }>)[0]!.text;
-    assert.ok(said.endsWith(`\n- From Antra, ${long.length.toLocaleString('en-US')} characters. ${call}`), said);
-    assert.ok(!said.includes('FIRSTLONG') && !said.includes('word0'), 'none of its words');
+    assert.ok(rows.filter((m) => m.bodyGroupId !== undefined && m.bodyGroupId === row.bodyGroupId).length > 1, 'the premise: it is stored in parts');
+    assert.deepEqual(JSON.parse(holding(injected, 'FIRSTLONG')), [image(), text(`Intro. ${long}`)], 'it goes in whole, as the store reads it back');
+    const second = holding(injected, 'SECONDSHORT');
+    assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(second));
+  });
+
+  it("under the memory strategy's own render, a batch bigger than the recent window goes in whole, as the next request sends it", async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 4000, kvStableReachTokens: 8_000,
+      compressionModel: 'mock', targetChunkTokens: 100, autoTickOnNewMessage: false,
+    } as never));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 3; i++) {
+      cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} ` + Array.from({ length: 40 }, (_, k) => `word${k}`).join(' '))]);
+    }
+    const shots = [1, 2, 3, 4].map((i) => `SCREENSHOT${i}`);
+    const injected = await turnWith(shots.map((s) => [text(s), image()]));
+    const live = shots.map((s) => holding(injected, s));
+    assert.ok(live.every((c) => c !== ''), 'the premise: every screenshot went into the live round');
     const next = await nextRequest();
-    assert.deepEqual(JSON.parse(next('SECONDSHORT')), JSON.parse(second));
-    assert.deepEqual(JSON.parse(next('[not shown]')), JSON.parse(notice));
-    // The call the notice gives reads the message.
-    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'x1', name: 'history--extract', input: { aroundId: row.id, before: 0, after: parts - 1 } }] as ContentBlock[], 'tool_use'));
-    membrane.pushResponse(createMockResponse([text('Read it.')]));
-    go();
-    await framework.runUntilIdle();
-    const result = JSON.stringify(membrane.lastStream!.receivedToolResults);
-    assert.ok(result.includes('FIRSTLONG') && result.includes('word599') && !result.includes('SECONDSHORT'), `that message, whole, alone: ${result.slice(0, 300)}`);
+    assert.deepEqual(shots.map((s) => JSON.parse(next(s) || 'null')), live.map((c) => JSON.parse(c || 'null')));
+  });
+
+  it("under the memory strategy's own render, after a head window reset, a message the head has not filled up to goes in as the next request sends it", async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', headWindowTokens: 4000, compressionModel: 'mock',
+      autoTickOnNewMessage: false,
+    } as never));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
+    await cm.resetHeadWindow('A new topic.');
+    const injected = await turnWith([[text('AFTERRESET a short message')]]);
+    const live = holding(injected, 'AFTERRESET');
+    assert.notEqual(live, '', 'the premise: it went into the live round');
+    assert.deepEqual(JSON.parse((await nextRequest())('AFTERRESET')), JSON.parse(live));
+  });
+
+  it("under the memory strategy's own render, the message after a body bigger than the recent window goes in as the next request sends it", async () => {
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 300, kvStableReachTokens: 8_000,
+      targetChunkTokens: 200,
+    }));
+    const long = 'FIRSTLONG ' + Array.from({ length: 600 }, (_, i) => `word${i}`).join(' ');
+    const injected = await turnWith([[text('Intro. '), image(), text(long)], [text('SECONDSHORT and a few words more')]]);
+    const live = holding(injected, 'SECONDSHORT');
+    assert.notEqual(live, '', 'the premise: it went into the live round');
+    assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(live));
   });
 
   it('goes in as stored where the strategy has no render', async () => {

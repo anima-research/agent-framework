@@ -17,9 +17,10 @@
  * bucket are denied (decision: trigger=false). Tokens regenerate at one per
  * `refillIntervalMs`, capped at `tokens`. Buckets are partitioned by the
  * value of `keyBy` resolved against event metadata — so a per-user limit
- * uses `keyBy: "senderId"`, a per-channel limit uses `keyBy: "channelId"`,
- * etc. With no `keyBy` (or when the resolved value is missing), one shared
- * bucket is used for the policy.
+ * uses `keyBy: "senderId"`, a per-channel limit uses `keyBy: "channelId"`
+ * (resolved to the channel's registered id, as `keyBy` says), etc. With no
+ * `keyBy` (or when the resolved value is missing), one shared bucket is used
+ * for the policy.
  */
 export interface RateLimitConfig {
   /** Max bucket capacity, also the initial fill. Must be > 0. */
@@ -27,8 +28,12 @@ export interface RateLimitConfig {
   /** Milliseconds between token regenerations. Must be > 0. */
   refillIntervalMs: number;
   /**
-   * Metadata field name to partition buckets by. If absent or the metadata
-   * field is missing on a given event, all events share one bucket.
+   * Metadata field name to partition buckets by. `"channelId"` takes the
+   * channel's registered id where the gate resolves one, as `match.channel`
+   * does, so a channel's push events share its messages' bucket, a voice
+   * report's included, though it carries no `channelId`. Otherwise, if
+   * absent or the metadata field is missing on a given event, all such
+   * events share one bucket.
    */
   keyBy?: string;
 }
@@ -45,8 +50,42 @@ export interface RateLimitConfig {
 export interface PassiveSampleConfig {
   /** Trigger every N-th match. Must be > 0. */
   every: number;
-  /** Optional metadata field name for separate per-key counters. */
+  /** Optional metadata field name for separate per-key counters, resolved
+   *  as `RateLimitConfig.keyBy` is. */
   keyBy?: string;
+}
+
+/**
+ * Configuration for the `judge` behavior: batch matching events as `debounce`
+ * does, then, instead of waking the agent when the batch fires, ask a small,
+ * cheap model (the host's reply judge, `GateOptions.judge`) whether now is a
+ * good time for the agent to reply. The judge reads the agent's context as one
+ * document (its newest part), the agent's own `instructions` and the batch,
+ * and answers reply or wait. On reply the
+ * batch is delivered as a debounce's is; on wait the agent isn't woken: the
+ * events are in its context already, as for `defer`, and the next batch is
+ * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
+ * of a judge rule wakes the agent without the judge. A judge that fails or
+ * times out wakes the agent (fail open),
+ * unless the host set its `onError` to `"skip"`.
+ */
+export interface JudgeConfig {
+  /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
+  debounceMs: number;
+  /**
+   * The longest (ms) a batch waits from its first event before it's judged,
+   * even while events keep arriving and pushing the quiet period back. Left
+   * out, a batch is judged only after `debounceMs` of quiet, as a debounce
+   * delivers.
+   */
+  maxWaitMs?: number;
+  /**
+   * The agent's own word to the judge: when it wants to be woken and when it
+   * would rather stay quiet ("wake me when someone asks me something or the
+   * talk turns to the garden; let banter between others go by"). Shown to the
+   * judge with every batch this rule sends it.
+   */
+  instructions?: string;
 }
 
 /** How a matching policy affects inference triggering. */
@@ -56,7 +95,8 @@ export type GateBehavior =
   | 'skip'      // Legacy alias for 'defer' (still accepted).
   | { debounce: number }                  // Batch events per-policy, deliver after delay (ms)
   | { rate_limit: RateLimitConfig }       // Token bucket per `keyBy`; deny when empty
-  | { passive_sample: PassiveSampleConfig };  // Fire every Nth match
+  | { passive_sample: PassiveSampleConfig }  // Fire every Nth match
+  | { judge: JudgeConfig };               // Batch like debounce, then ask the reply judge
 
 // ---------------------------------------------------------------------------
 // Policy match criteria
@@ -68,7 +108,12 @@ export interface GatePolicyMatch {
   scope?: string[];
   /** ServerId to match (exact or glob with *). */
   source?: string;
-  /** ChannelId to match (exact or glob with *). */
+  /** Channel to match (exact or glob with *): against the event's channel
+   *  id, then the registered id the gate resolves for it
+   *  (`resolveRouteChannel`). A channels/incoming message carries the
+   *  registered id (`discord:<guild>:<channel>`), and a push the adapter's
+   *  raw one or none, so a registered-form pattern meets every event in its
+   *  channel whose push names the channel, and a raw id only push events. */
   channel?: string;
   /** Content text filter. */
   filter?: { type: 'text' | 'regex'; pattern: string };
@@ -155,7 +200,17 @@ export interface GateConfig {
 export interface GateOptions {
   /** Path to gate.json. Default: derived from storePath. */
   configPath?: string;
-  /** Initial config, seeded to gate.json if the file doesn't exist. */
+  /**
+   * The recipe's gate config. The first start seeds gate.json with it. Each
+   * later start merges it into gate.json against the recipe last applied,
+   * which the gate keeps beside gate.json (`gate.recipe.json`): a rule the
+   * recipe dropped, renamed, moved or redefined follows it, a rule edited at
+   * run time or by hand stays, and so does one no recipe declared. Rules are
+   * merged by name, compared by what they mean and kept as written: a
+   * recipe's rule with no name is never merged, as one with no name was never
+   * added, and where gate.json or the recipe names a rule twice, a start only
+   * adds the rules gate.json lacks. See `recipe-reconcile.ts`.
+   */
   config?: GateConfig;
   /**
    * Path to a JSON file listing user ids that may wake the agent even while
@@ -164,7 +219,116 @@ export interface GateOptions {
    * missing, no one bypasses sleep.
    */
   privilegedUsersPath?: string;
+  /** The reply judge that `judge` rules ask (see JudgeConfig). Left out (or
+   *  null), the judge is wired with its defaults; it runs only for `judge`
+   *  rules, so a gate with none makes no judge calls. */
+  judge?: ReplyJudgeOptions | null;
 }
+
+/**
+ * Host options for the reply judge, the small model `judge` rules ask whether
+ * now is a good time for the agent to reply. The host sets the model and how
+ * the judge runs, not the agent: an agent's rule says when to ask and what to
+ * say.
+ */
+export interface ReplyJudgeOptions {
+  /** False leaves the judge unwired: `wake_add_rule` then offers no `judge`,
+   *  and a `judge` rule in gate.json wakes the agent as a debounce of its
+   *  `debounceMs` would, which gate_status says. Default true. */
+  enabled?: boolean;
+  /** The model the judge runs on, as the host's membrane names it. Default
+   *  `claude-haiku-5-5`. */
+  model?: string;
+  /**
+   * The most input tokens one judge request may carry, its instructions and
+   * the batch included; the context document is cut from its oldest end to
+   * fit. Default 90,000: Claude Haiku 5.5 costs five times as much past
+   * 100,000 input tokens, and the margin covers the estimate's error. The
+   * least is 4,000, a short tail of the conversation: cheaper and quicker,
+   * with less of the room's history to weigh.
+   */
+  maxInputTokens?: number;
+  /** The longest (ms) a judge request may take before the batch is decided by
+   *  `onError`. Default 20,000. */
+  timeoutMs?: number;
+  /** What a judge that fails, times out or answers unreadably does: `"wake"`
+   *  wakes the agent as a debounce would (the default, so a judge outage
+   *  never silences the agent); `"skip"` doesn't. */
+  onError?: 'wake' | 'skip';
+  /** The judge's effort (`output_config.effort`). Default `"low"`: a short
+   *  verdict, quickly. `"none"` sends no effort, for a provider that doesn't
+   *  take Anthropic's `output_config`. */
+  effort?: 'low' | 'medium' | 'high' | 'none';
+  /** The prompt cache's lifetime for the judge's context document. `"5m"`
+   *  (the default) suits judge rules that fire minutes apart; `"1h"` costs
+   *  more to write and suits ones that fire less often. */
+  cacheTtl?: '5m' | '1h';
+}
+
+/** One event of a batch, as the reply judge is shown it. */
+export interface JudgeEventSummary {
+  eventType: string;
+  /** The channel as the agent is shown it, when the event named one. */
+  channel?: string;
+  /** The author's id, when the event named one. */
+  authorId?: string;
+  /** Whether the event addressed the agent (mention, reply, DM). */
+  addressed: boolean;
+  /** The event's text, cut short when long. */
+  content: string;
+  /** When the event arrived (ms). */
+  at: number;
+}
+
+/**
+ * Something that will (or, for a batch going to the judge, may) wake the
+ * agent with no new event: what the judge is told would happen if it answers
+ * wait and nothing else arrives.
+ */
+export interface UpcomingWake {
+  /** When (ms), when known; absent for one due as soon as the agent is free. */
+  at?: number;
+  /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
+  certain: boolean;
+  /** What it is, as the judge is told ("its own skip_reply timer"). */
+  what: string;
+}
+
+/** What the gate asks the reply judge for one batch. */
+export interface JudgeRequest {
+  /** The rule whose batch this is. */
+  policyName: string;
+  /** The rule's `instructions`, the agent's own word to the judge. */
+  instructions?: string;
+  /** The batch, oldest first. */
+  events: JudgeEventSummary[];
+  /** The agents the batch would wake. */
+  agentNames: string[];
+  /** The gate's own timers that will wake those agents with no new event
+   *  (upcomingWakes): their self-wakes, a sleep's end, other rules' pending
+   *  batches. The judge adds what the framework knows besides. */
+  upcomingWakes?: UpcomingWake[];
+  /** Aborted when the judge's time is up or the gate is disposed. */
+  signal: AbortSignal;
+}
+
+/** The reply judge's answer for one batch. */
+export interface JudgeVerdict {
+  /** True: wake the agent now. False: let the batch go by. */
+  reply: boolean;
+  /** The judge's one-line reason. */
+  reason: string;
+  /** The model that answered. */
+  model?: string;
+  /** Input tokens the request carried (all of them: uncached, cache reads and writes). */
+  inputTokens?: number;
+  /** Of those, the tokens read from the prompt cache. */
+  cacheReadTokens?: number;
+  outputTokens?: number;
+}
+
+/** The judge's function, as the framework wires it into the gate. */
+export type JudgeFn = (request: JudgeRequest) => Promise<JudgeVerdict>;
 
 // ---------------------------------------------------------------------------
 // Runtime types (internal to EventGate, exported for tests/tools)
@@ -195,10 +359,20 @@ export interface GateDecision {
 export interface ShadowWarning {
   /** Name of the earlier (consuming) policy. */
   earlier: string;
-  /** Name of the later policy it makes unreachable. */
+  /** Name of the later policy whose events it takes. */
   later: string;
-  /** Event types affected — 'all' when both rules are unscoped. */
+  /** Event types affected: those of `later`'s (its scope's, narrowed to the
+   *  ones its source is known to send) that `earlier` covers. 'all' only when
+   *  neither rule has a scope and `later`'s source could send any type. */
   eventTypes: string[] | 'all';
+  /** Whether `earlier` takes every event `later` would match, so `later`
+   *  never applies. */
+  whole: boolean;
+  /** Whether `later` is known to see these types: its scope names them, or
+   *  its source is one whose event types the host knows (an MCPL server's).
+   *  False when `later` names no scope and its source could send anything,
+   *  so the types may never reach it. */
+  known: boolean;
 }
 
 /** One row of the dry-run probe table (see EventGate.probeTable). */
@@ -291,6 +465,26 @@ export interface GatePolicyStats {
   passiveSampleState?: {
     counterCount: number;
     fireCount: number;
+  };
+  /** Present for `judge` behaviors. */
+  judgeState?: {
+    /** Events in the batch still waiting out its quiet period. */
+    pendingCount: number;
+    /** Whether the judge is deciding one of this rule's batches now. */
+    judging: boolean;
+    /** Events held for the judge until the agent's turn (or the host's quiesce) ends. */
+    heldCount: number;
+    /** Verdicts so far: woke the agent, let the batch go by, and judge failures. */
+    verdicts: { reply: number; wait: number; error: number };
+    /** The newest verdict. */
+    last?: {
+      at: number;
+      verdict: 'reply' | 'wait' | 'error';
+      reason: string;
+      eventCount: number;
+      durationMs: number;
+      inputTokens?: number;
+    };
   };
 }
 

@@ -26,6 +26,7 @@
  * dispatcher a script's calls go through, and how to wake an agent.
  */
 
+import { NOTICE_TAG } from '../../notice-tags.js';
 import { ChildCapacity, ScriptRun, type CallAnswer, type Ending, type ScriptRunOptions, type ToolAnswer } from './runner.js';
 import type { CallSummary } from './calls.js';
 import type { OutputBounds, OutputWindow } from './output.js';
@@ -48,6 +49,8 @@ export interface ScriptCallContext {
   watching?(): ScriptWatch | undefined;
   /** The turn the script's run call was made in, when one was: the turn its words were written in, which a later turn's wait doesn't change. */
   startTurnId?: number;
+  /** What its agent had read when the run call started the script (the host's consumed watermark), given at run: what the script's words were written having read, which a later round's wait doesn't change. */
+  startReadThrough?: { branch: string; sequence: number } | null;
 }
 
 export interface ScriptsHost {
@@ -115,7 +118,7 @@ interface Script {
   /** The code it runs. */
   code: string;
   run: ScriptRun;
-  context: { origin?: unknown };
+  context: { origin?: unknown; startReadThrough?: { branch: string; sequence: number } | null };
   /** The turn its run call was made in, when one was: its agent's turns end it by that. */
   turnId: number | undefined;
   startedAt: number;
@@ -178,7 +181,7 @@ export class AgentScripts {
     agentName: string,
     code: string,
     askedMs?: number,
-    options: { origin?: unknown; watch?: ScriptWatch } = {},
+    options: { origin?: unknown; watch?: ScriptWatch; startReadThrough?: { branch: string; sequence: number } | null } = {},
   ): Promise<ScriptReturn> {
     // Listed first, so a module whose tool list throws refuses the run with nothing taken.
     let tools: readonly PreludeTool[];
@@ -204,7 +207,10 @@ export class AgentScripts {
       agentName,
       code,
       run: null as unknown as ScriptRun,
-      context: options.origin === undefined ? {} : { origin: options.origin },
+      context: {
+        ...(options.origin === undefined ? {} : { origin: options.origin }),
+        ...(options.startReadThrough === undefined ? {} : { startReadThrough: options.startReadThrough }),
+      },
       turnId: options.watch?.turnId,
       startedAt: Date.now(),
       endedAt: null,
@@ -473,10 +479,10 @@ function leftEndingText(scriptId: string, ending: Ending): string {
       : ending.how === 'stopped'
         ? ending.why ? `was stopped: ${ending.why}` : 'was stopped at its limit'
         : 'ended';
-  return `[script ${scriptId}] Your script ${how}. {"action": "wait", "script_id": "${scriptId}"} gives its result.`;
+  return `[${NOTICE_TAG.script} ${scriptId}] Your script ${how}. {"action": "wait", "script_id": "${scriptId}"} gives its result.`;
 }
 
 function wakeText(scriptId: string, payloadJson: string, n: number, max: number, ageMs: number): string {
   const minutes = Math.round(ageMs / 60_000);
-  return `[script ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${payloadJson}`;
+  return `[${NOTICE_TAG.script} ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${payloadJson}`;
 }

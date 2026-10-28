@@ -13,6 +13,11 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { decodeForEdit, planFile, type FilePlan } from '../src/modules/workspace/edit-plan.js';
 import { editReceipt, fitted, shownRegions } from '../src/modules/workspace/edit-text.js';
+
+/** A receipt's text, which the model reads and the cap measures. */
+const receiptText = (receipt: ToolResult): string => (receipt.data as Array<{ text: string }>)[0]!.text;
+/** The changed regions a receipt shows, from its fields. */
+const changedOf = (receipt: ToolResult): string => (receipt.structured as { changed: string }).changed;
 import type { ToolResult } from '../src/types/events.js';
 
 function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: number } = {}) {
@@ -44,7 +49,7 @@ function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: 
   const stored = async (rel: string): Promise<string> => {
     const result = await call('read', { path: `work/${rel}`, offsetChars: 0, limitChars: 1_000_000 });
     assert.equal(result.success, true, result.error);
-    return (result.data as { content: string }).content;
+    return (result.structured as { content: string }).content;
   };
   /** A file the workspace holds, as a listing takes it in. */
   const file = async (rel: string, content: string | Buffer): Promise<void> => {
@@ -60,9 +65,10 @@ const errorOf = (result: ToolResult): string => {
   return result.error ?? '';
 };
 
+/** A success's fields: a receipt's, a page's or grep's, which a script reads as structuredContent, or another tool's data. */
 const dataOf = (result: ToolResult): Record<string, unknown> => {
   assert.equal(result.success, true, result.error);
-  return result.data as Record<string, unknown>;
+  return (result.structured ?? result.data) as Record<string, unknown>;
 };
 
 /** Half of a surrogate pair without the other half. */
@@ -105,6 +111,7 @@ test('the receipt shows two lines around the change, numbered, and no line past 
     path: 'work/r.txt',
     size: 18,
     replacements: 1,
+    disk: 'waits for materialize',
     changed: '     2\tb\n     3\tc\n     4\tD1\n     5\tD2\n     6\te\n     7\tf',
   });
   const last = dataOf(await call('edit', { path: 'work/r.txt', oldString: 'g\n', newString: 'G\n' }));
@@ -158,14 +165,16 @@ test('a receipt and a refusal cut a line between characters, never inside a surr
   const receipt = dataOf(await call('edit', { path: 'work/e.txt', oldString: 'target', newString: 'DONE' }));
   assert.doesNotMatch(receipt.changed as string, loneSurrogate);
   assert.match(receipt.changed as string, /^     1\t\[… 2920 chars before\] 😀/u);
-  // A thrown message past 400 code units keeps its first 399 and an
-  // ellipsis, and the 399th is a pair's first half.
+  // A thrown message past 500 code points keeps its first 500, whole
+  // pairs, and says how long it was.
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
-  s.treeSet = () => { throw new Error('😀'.repeat(300)); };
+  s.treeSet = () => { throw new Error('😀'.repeat(600)); };
   s.treeBatch = s.treeSet;
   try {
-    assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/e.txt', oldString: 'DONE', newString: 'done' }] })),
-      `The edit_many call stored none of its edits: ${'😀'.repeat(199)}…`);
+    const error = errorOf(await call('edit_many', { edits: [{ path: 'work/e.txt', oldString: 'DONE', newString: 'done' }] }));
+    assert.doesNotMatch(error, loneSurrogate);
+    assert.equal(error, `The edit_many stopped on an error the workspace didn't expect, before any of its edits was stored: ${'😀'.repeat(500)}… (600 characters). `
+      + "Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.");
   } finally {
     delete s.treeSet;
     delete s.treeBatch;
@@ -315,7 +324,7 @@ test("a receipt reads the stored bytes of its lines that end in a CR in one walk
       return Reflect.apply(search, this, args) as number;
     },
   });
-  const changed = editReceipt('edit', [{ path: 'work/c.txt', plan: last.plan, notes: [] }], 1, 10_000_000).changed as string;
+  const changed = changedOf(editReceipt('edit', [{ path: 'work/c.txt', plan: last.plan, notes: [] }], 1, 10_000_000, 'done'));
   assert.equal((changed.match(/\ty\r\r/g) ?? []).length, 300);
   assert.ok(finds >= 300 && finds < 3_000, `${finds} searches of the bytes`);
 });
@@ -542,7 +551,7 @@ test('replacing a whole file with nothing stores no bytes, and its receipt shows
   const { call, stored, file } = setup(t);
   await file('e.txt', 'all of it\n');
   assert.deepEqual(dataOf(await call('edit', { path: 'work/e.txt', oldString: 'all of it\n', newString: '' })),
-    { path: 'work/e.txt', size: 0, replacements: 1, changed: '' });
+    { path: 'work/e.txt', size: 0, replacements: 1, disk: 'waits for materialize', changed: '' });
   assert.equal(await stored('e.txt'), '');
   // At a cap that leaves no room for any region, nothing is named either.
   await file('f.txt', 'all of it\n');
@@ -612,6 +621,7 @@ test('edits in one file and across files are stored together, each matched in it
   assert.deepEqual(receipt, {
     edits: 3,
     replacements: 3,
+    disk: 'done',
     files: [
       { path: 'work/b.txt', size: 6, replacements: 1, edits: [1] },
       { path: 'work/a.txt', size: 8, replacements: 2, edits: [2, 3] },
@@ -638,7 +648,7 @@ test('one miss stores nothing in any file, and every problem is named in edit or
     + 'Include more of the text around it to single out the one you mean, or set occurrences to 2 if every one should change.\n     1\ttwo two\n\n'
     + "edit 3: oldString isn't in work/a.txt.\nMatch exactly, including whitespace and indentation.\n\n"
     + "edit 4: oldString and newString are the same, so there's nothing to change.\n\n"
-    + 'edit 5: Unknown mount: "nowhere". Available: work, other, shelf');
+    + 'edit 5: "nowhere/c.txt" starts with "nowhere", which is no mount\'s name, and a path starts with its mount\'s name; the mounts are "work", "other" and "shelf".');
   assert.equal(await stored('a.txt'), 'one\n');
   assert.equal(await stored('b.txt'), 'two two\n');
 });
@@ -708,7 +718,7 @@ test("one call edits one mount's files: other mounts, a read-only mount, an empt
   })), 'The edit_many call stored none of its edits: 1 problem.\n\n'
     + 'the edits name files in more than one mount (work, other); one call edits the files of one mount, so send the edits for each mount in a call of its own.');
   assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'shelf/a.txt', oldString: 'a', newString: 'b' }] })),
-    'The edit_many call stored none of its edits: 1 problem.\n\nedit 1: Mount "shelf" is read-only');
+    'The edit_many call stored none of its edits: 1 problem.\n\nedit 1: mount "shelf" is read-only. Calling again won\'t change that; whoever runs this host can make it read-write. The mounts that take writes are "work" and "other".');
   assert.equal(errorOf(await call('edit_many', { edits: [] })), 'The edit_many call did nothing: "edits" is empty. Give at least one edit.');
   assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/a.txt', oldString: 'a', newString: 'b' }, { path: 'work/a.txt', oldString: 'a' }] })),
     'The edit_many call did nothing: "edits" item 2: "newString" is required.');
@@ -726,17 +736,18 @@ test('a generated file is refused by the rule edit refuses it by: the agent\'s o
   const as = (callerAgentName: string, name: string, input: unknown) =>
     workspace.handleToolCall({ id: name, name, input, callerAgentName } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   const edit = { path: 'work/tools.md', oldString: 'generated', newString: 'x' };
-  const readOnly = 'Generated file is read-only; change the tool presentation it shows with set_tool_visibility or set_tool_description instead';
-  assert.equal(errorOf(await as('agent', 'edit', edit)), readOnly);
+  const readOnly = `"work/tools.md" is generated from your tool presentation, so it's read-only; set_tool_visibility and set_tool_description change what it shows.`;
+  const others = `"work/tools.md" is generated from another agent's tool presentation, and only that agent reads it. Calling again won't change that.`;
+  assert.equal(errorOf(await as('agent', 'edit', edit)), `The edit did nothing: ${readOnly}`);
   assert.equal(errorOf(await as('agent', 'edit_many', { edits: [edit] })),
-    `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: work/tools.md: ${readOnly}.`);
-  assert.equal(errorOf(await as('another', 'edit', edit)), 'Generated file belongs to another agent');
+    `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${readOnly}`);
+  assert.equal(errorOf(await as('another', 'edit', edit)), `The edit did nothing: ${others}`);
   assert.equal(errorOf(await as('another', 'edit_many', { edits: [edit] })),
-    'The edit_many call stored none of its edits: 1 problem.\n\nedit 1: work/tools.md: Generated file belongs to another agent.');
+    `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${others}`);
   // write and delete meet the same refusal, by the same rule.
-  assert.equal(errorOf(await as('agent', 'write', { path: 'work/tools.md', content: 'x' })), readOnly);
-  assert.equal(errorOf(await as('agent', 'delete', { path: 'work/tools.md' })), readOnly);
-  assert.equal(errorOf(await as('another', 'write', { path: 'work/tools.md', content: 'x' })), 'Generated file belongs to another agent');
+  assert.equal(errorOf(await as('agent', 'write', { path: 'work/tools.md', content: 'x' })), `The write did nothing: ${readOnly}`);
+  assert.equal(errorOf(await as('agent', 'delete', { path: 'work/tools.md' })), `The delete did nothing: ${readOnly}`);
+  assert.equal(errorOf(await as('another', 'write', { path: 'work/tools.md', content: 'x' })), `The write did nothing: ${others}`);
 });
 
 test("a file that isn't valid UTF-8 is refused, and nothing is stored", async (t) => {
@@ -821,15 +832,15 @@ test('every entry is set in one record: a call that fails after it says every ed
 
   // A store that fails as it sets them, recording nothing, sets neither, as
   // reading them back shows, and the answer says so, with what the store
-  // said, cut as a problem's first line is.
+  // said, cut at its bound.
   let message = 'injected batch failure';
   (store as unknown as { treeBatch: () => never }).treeBatch = () => { throw new Error(message); };
   try {
-    assert.equal(errorOf(await call('edit_many', edits('a', 'A'))), 'The edit_many call stored none of its edits: injected batch failure');
+    assert.equal(errorOf(await call('edit_many', edits('a', 'A'))), "The edit_many stopped on an error the workspace didn't expect, before any of its edits was stored: injected batch failure. Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.");
     message = `injected ${'long '.repeat(200)}failure`;
     const long = errorOf(await call('edit_many', edits('a', 'A')));
-    assert.match(long, /^The edit_many call stored none of its edits: injected [long ]+…$/);
-    assert.ok(long.length < 500, `${long.length} characters`);
+    assert.equal(long, `The edit_many stopped on an error the workspace didn't expect, before any of its edits was stored: injected ${'long '.repeat(200).slice(0, 491)}… (1016 characters). `
+      + "Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.");
   } finally {
     delete (store as unknown as Record<string, unknown>).treeBatch;
   }
@@ -850,18 +861,18 @@ test('a store that throws after recording the edits is read back: the answer say
     ],
   });
   const storedAll = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.\n\n"
-    + 'The store failed after recording them: No space left on device (os error 28).';
+    + 'The store failed after recording them: IO error: No space left on device (os error 28).';
   // The record lands, then the store throws, as Chronicle 0.4 does when the
   // auto-snapshot it writes after recording fails (anima-research/chronicle#39).
-  s.treeBatch = (...args) => { real.treeBatch.apply(store, args as never); throw new Error('No space left on device (os error 28)'); };
-  s.treeSet = (...args) => { real.treeSet.apply(store, args as never); throw new Error('No space left on device (os error 28)'); };
+  s.treeBatch = (...args) => { real.treeBatch.apply(store, args as never); throw new Error('IO error: No space left on device (os error 28)'); };
+  s.treeSet = (...args) => { real.treeSet.apply(store, args as never); throw new Error('IO error: No space left on device (os error 28)'); };
   try {
     assert.equal(errorOf(await call('edit_many', both(['alpha', 'beta'], ['ALPHA', 'BETA']))), storedAll);
     // One file's edits are set on their own, as edit's are.
     assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/b.txt', oldString: 'BETA', newString: 'beta' }] })), storedAll);
     assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'beta', newString: 'BETA' })),
       'The edit of "work/b.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
-      + 'The store failed after recording it: No space left on device (os error 28).');
+      + 'The store failed after recording it: IO error: No space left on device (os error 28).');
   } finally {
     delete s.treeBatch;
     delete s.treeSet;
@@ -901,14 +912,14 @@ test('a store that throws after recording the edits is read back: the answer say
 
   // A change the tree already holds reads back the same whether or not the
   // set recorded it, so a call whose every change the tree holds already
-  // answers the store's failure as its own: the tree is as it was either way.
+  // says so with the store's failure: the tree is as it was either way.
   await file('q.txt', 'it’s\n');
   s.treeSet = () => { throw new Error('injected set failure'); };
   try {
     assert.equal(errorOf(await call('edit_many', {
       // Matched with quotes treated as equal, this edit leaves the file's bytes as they were.
       edits: [{ path: 'work/q.txt', oldString: "it's", newString: 'it’s' }],
-    })), 'The edit_many call stored none of its edits: injected set failure');
+    })), "The edit_many stopped on an error the workspace didn't expect: injected set failure. Its files already held what the call gave, so they hold that in the workspace either way.");
   } finally {
     delete s.treeSet;
   }
@@ -922,7 +933,7 @@ test('on a mount that pushes, edits whose store throws after recording them say 
   await file('b.txt', 'beta\n');
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
   const real = store.treeBatch;
-  s.treeBatch = (...args) => { real.apply(store, args as never); throw new Error('No space left on device (os error 28)'); };
+  s.treeBatch = (...args) => { real.apply(store, args as never); throw new Error('IO error: No space left on device (os error 28)'); };
   try {
     assert.equal(errorOf(await call('edit_many', {
       edits: [
@@ -930,7 +941,7 @@ test('on a mount that pushes, edits whose store throws after recording them say 
         { path: 'work/b.txt', oldString: 'beta', newString: 'BETA' },
       ],
     })), "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.\n\n"
-      + "The store failed after recording them: No space left on device (os error 28). Their push to disk didn't run, so disk lacks them until a materialize of their files writes them.");
+      + "The store failed after recording them: IO error: No space left on device (os error 28). Their push to disk didn't run, so disk lacks them until a materialize of their files writes them.");
   } finally {
     delete s.treeBatch;
   }
@@ -972,6 +983,7 @@ test("edit_many refuses a file whose stored copy is missing from the store, and 
   const { store, workspace, call, stored, file } = setup(t);
   await file('a.txt', 'alpha\n');
   await file('b.txt', 'beta\n');
+  assert.equal((await call('write', { path: 'work/b.txt', content: 'beta, a draft\n' })).success, true);
   const missing = store.treeGet(treeStateOf(workspace), 'b.txt')!.blobHash;
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
   const getBlob = store.getBlob;
@@ -982,7 +994,7 @@ test("edit_many refuses a file whose stored copy is missing from the store, and 
         { path: 'work/a.txt', oldString: 'alpha', newString: 'ALPHA' },
         { path: 'work/b.txt', oldString: 'beta', newString: 'BETA' },
       ],
-    })), 'The edit_many call stored none of its edits: 1 problem.\n\nedit 2: Blob not found for: work/b.txt');
+    })), "The edit_many call stored none of its edits: 1 problem.\n\nedit 2: The workspace's copy of work/b.txt is missing from the store, and disk's copy holds other contents, so it can't be restored, and edit 2 changed nothing. Sync the path to keep disk's copy and give up the workspace's, or write the file again.");
   } finally {
     delete s.getBlob;
   }
@@ -1003,7 +1015,7 @@ test('on a mount that doesn\'t push, the answer to a store that failed after rec
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
   const real = { treeBatch: store.treeBatch, treeSet: store.treeSet };
   const fail = (stateId: unknown, done: unknown) => {
-    if (stateId === tree) throw new Error('No space left on device (os error 28)');
+    if (stateId === tree) throw new Error('IO error: No space left on device (os error 28)');
     return done;
   };
   s.treeBatch = (...args) => fail(args[0], real.treeBatch.apply(store, args as never));
@@ -1011,11 +1023,11 @@ test('on a mount that doesn\'t push, the answer to a store that failed after rec
   try {
     assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'agent draft', newString: 'agent edit' })),
       'The edit of "work/k.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
-      + 'The store failed after recording it: No space left on device (os error 28). '
+      + 'The store failed after recording it: IO error: No space left on device (os error 28). '
       + `The path is in conflict with disk (both-changed): the edit is in the workspace's copy. ${copy}`);
     assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/k.txt', oldString: 'agent edit', newString: 'agent edit 2' }] })),
       "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.\n\n"
-      + 'The store failed after recording them: No space left on device (os error 28).\n\n'
+      + 'The store failed after recording them: IO error: No space left on device (os error 28).\n\n'
       + `work/k.txt is in conflict with disk (both-changed): edit 1 is in the workspace's copy. ${copy}`);
   } finally {
     delete s.treeBatch;
@@ -1085,16 +1097,16 @@ test('an edit reads its path in the one spelling every tool reads: an empty or "
   // absolute path, even one inside the mount: the parse refuses both, as it
   // does for every tool.
   assert.equal(errorOf(await call('edit', { path: 'work/../mount/sub/b.txt', oldString: 'ONE', newString: 'one' })),
-    'Path traversal detected: "work/../mount/sub/b.txt" climbs above the root of mount "work".');
+    `The edit did nothing: "work/../mount/sub/b.txt" climbs above the root of mount "work" with "..", and a path can't leave its mount. Name a file from its own mount's name; the mounts are "work", "other" and "shelf".`);
   for (const path of [`work/${dir}`, `work/${dir}/sub/b.txt`]) {
     assert.equal(errorOf(await call('edit', { path, oldString: 'ONE', newString: 'one' })),
-      `Path traversal detected: "${path}" has a separator right after mount "work", which makes it an absolute path: give it from the mount's root.`);
+      `The edit did nothing: "${path}" has a separator right after mount "work", which makes it an absolute path: give it from the mount's root, as "work/<path>".`);
   }
   // These spellings of the mount's root, its bare name included, are refused
   // as naming no file.
-  const root = (path: string) => `${path} names the root of mount "work", which isn't a file; ls work lists the files in it.`;
+  const root = (path: string) => `${JSON.stringify(path)} names the root of mount "work", which isn't a file; ls "work" lists the files in it.`;
   for (const path of ['work', 'work/', 'work/.', 'work/sub/..']) {
-    assert.equal(errorOf(await call('edit', { path, oldString: 'ONE', newString: 'one' })), root(path));
+    assert.equal(errorOf(await call('edit', { path, oldString: 'ONE', newString: 'one' })), `The edit did nothing: ${root(path)}`);
   }
   assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/', oldString: 'ONE', newString: 'one' }] })),
     `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${root('work/')}`);
@@ -1180,18 +1192,22 @@ test("an edit matched with quotes read as equal, or read without its CR, counts 
     + 'Include more of the text around it to single out the one you mean.\nThis call counted as many occurrences as one call may, so 85 is a floor'), read);
 });
 
-test("edits of an oldString read more than one way, each found many times, each take about a pass over the file", async (t) => {
+test("edit_many's refusal of 200 edits of an oldString read more than one way names each it has room for as read that way, and counts the rest", async (t) => {
   // Lines alternate between "x" with a CR of its own and "x" alone, before
   // CRLF ends, so "x\r" reads as given on the one and without its CR on the
-  // other. Each edit's other reading stops once it has those a refusal shows.
+  // other. That each edit's other reading stops once it has those a refusal
+  // shows is pinned in the planner's tests, where its count can be read.
   const { call, file } = setup(t);
   await file('m.txt', 'x\r\r\nx\r\n'.repeat(400_000));
-  const before = process.cpuUsage();
   const error = errorOf(await call('edit_many', { edits: Array.from({ length: 200 }, (_, k) => ({ path: 'work/m.txt', oldString: 'x\r', newString: `${k}` })) }));
-  const used = process.cpuUsage(before);
   assert.match(error, /^The edit_many call stored none of its edits: 200 problems\./);
   assert.match(error, /\n\nedit 1: oldString ends in a CR, and occurs in work\/m\.txt read more than one way, so which you mean can't be told\./);
-  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
+  // The answer fits what it can of 200 problems and counts the rest: each
+  // it shows is the edit's oldString read more than one way, and those with
+  // the rest come to 200.
+  const shown = error.match(/\n\nedit \d+: [^\n]*/g) ?? [];
+  assert.ok(shown.length > 0 && shown.every((line) => line.includes("oldString ends in a CR, and occurs in work/m.txt read more than one way, so which you mean can't be told.")), shown.find((line) => !line.includes('read more than one way')));
+  assert.equal(shown.length + Number(/(\d+) more problems?\b/.exec(error)?.[1] ?? 0), 200);
 });
 
 test("a crowded edit whose count stopped short of its ask, which no crowded problem names, is named by its count as a floor", async (t) => {
@@ -1241,7 +1257,8 @@ test('every path is checked before any entry is set: a check that fails at the s
         { path: 'work/a.txt', oldString: 'a', newString: 'A' },
         { path: 'work/b.txt', oldString: 'b', newString: 'B' },
       ],
-    })), 'The edit_many call stored none of its edits: injected barrier failure');
+    })), "The edit_many stopped on an error the workspace didn't expect, before any of its edits was stored: injected barrier failure. "
+      + "Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.");
   } finally {
     delete (store as unknown as Record<string, unknown>).storeBlob;
     delete (agreement as unknown as Record<string, unknown>).needsBarrier;
@@ -1287,7 +1304,7 @@ test("a conflict says what a sync does from what disk holds now, whatever kind w
   const copy = "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.";
   const one = await call('edit', { path: 'work/gone.txt', oldString: 'agent draft', newString: 'agent edit' });
   assert.equal(one.success, true, one.error);
-  assert.equal((one.data as { note?: string }).note,
+  assert.equal((one.structured as { note?: string }).note,
     `The path is in conflict with disk (deleted-on-disk): the edit is in the workspace's copy. ${deletion}`);
   // A refusal over the same file says the same.
   assert.ok(errorOf(await call('edit', { path: 'work/gone.txt', oldString: 'absent', newString: 'x' })).endsWith(deletion));
@@ -1299,7 +1316,7 @@ test("a conflict says what a sync does from what disk holds now, whatever kind w
     ],
   });
   assert.equal(many.success, true, many.error);
-  assert.deepEqual((many.data as { files: Array<{ note?: string }> }).files.map((file) => file.note), [
+  assert.deepEqual((many.structured as { files: Array<{ note?: string }> }).files.map((file) => file.note), [
     `work/changed-then-gone.txt is in conflict with disk (both-changed): edit 1 is in the workspace's copy. ${deletion}`,
     `work/gone-then-back.txt is in conflict with disk (deleted-on-disk): edit 2 is in the workspace's copy. ${copy}`,
     `work/turned-binary.txt is in conflict with disk (both-changed): edit 3 is in the workspace's copy. ${copy}`,
@@ -1309,11 +1326,11 @@ test("a conflict says what a sync does from what disk holds now, whatever kind w
   for (const name of ['gone.txt', 'gone-then-back.txt', 'turned-binary.txt']) {
     assert.equal((await call('sync', { path: `work/${name}` })).success, true, name);
   }
-  assert.equal(errorOf(await call('read', { path: 'work/gone.txt' })), 'File not found: work/gone.txt');
+  assert.equal(errorOf(await call('read', { path: 'work/gone.txt' })), `The read did nothing: there's no file at "work/gone.txt". ls or glob lists the files that exist.`);
   assert.equal(disk('gone-then-back.txt')!.toString(), 'another writer\n');
-  assert.match(JSON.stringify((await call('read', { path: 'work/gone-then-back.txt' })).data), /another writer/);
+  assert.match(JSON.stringify((await call('read', { path: 'work/gone-then-back.txt' })).structured), /another writer/);
   assert.equal(errorOf(await call('read', { path: 'work/turned-binary.txt' })),
-    'work/turned-binary.txt is on disk but not stored in the workspace (binary or over the size limit).');
+    `The read did nothing: "work/turned-binary.txt" is on disk, but the workspace doesn't store it: it's binary, or over this mount's size limit. read, edit and delete act only on the files it stores, so calling again won't change that.`);
   assert.deepEqual([...disk('turned-binary.txt')!], binary);
 });
 
@@ -1420,10 +1437,9 @@ test("a receipt keeps to the call's resultMaxChars, naming the regions past it b
   const edits = Array.from({ length: 30 }, (_, i) => ({ path: 'work/g.txt', oldString: `row ${i * 10} `, newString: `ROW ${i * 10} ` }));
   const max = 3000;
   const result = await call('edit_many', { edits }, max);
-  const receipt = dataOf(result);
-  assert.ok(JSON.stringify(receipt).length <= max, `${JSON.stringify(receipt).length} characters, within ${max}`);
-  assert.match(receipt.changed as string, /\[not shown, to keep this answer within 3,000 characters: lines \d+–\d+, /);
-  assert.match(receipt.changed as string, /^work\/g\.txt\n     1\tROW 0 /);
+  assert.ok(receiptText(result).length <= max, `${receiptText(result).length} characters, within ${max}`);
+  assert.match(changedOf(result), /\[not shown, to keep this answer within 3,000 characters: lines \d+–\d+, /);
+  assert.match(changedOf(result), /^work\/g\.txt\n     1\tROW 0 /);
 });
 
 test("edit's refusal and receipt keep to its call's resultMaxChars too", async (t) => {
@@ -1436,20 +1452,22 @@ test("edit's refusal and receipt keep to its call's resultMaxChars too", async (
   assert.match(refusal, /^The edit did nothing: oldString occurs 60 times in work\/l\.txt /);
   assert.ok(errorOf(await call('edit', { path: 'work/l.txt', oldString: 'line', newString: 'LINE' })).length > 1_000);
   // A change of eighty lines is named by its lines.
-  const receipt = dataOf(await call('edit', { path: 'work/l.txt', oldString: 'line 0 ', newString: `${`${'A'.repeat(30)}\n`.repeat(80)}line 0 ` }, 1_000));
-  assert.ok(JSON.stringify(receipt).length <= 1_000, `${JSON.stringify(receipt).length} characters, within 1,000`);
-  assert.match(receipt.changed as string, /^\[not shown, to keep this answer within 1,000 characters: lines 1–\d+\]$/);
+  const receipt = await call('edit', { path: 'work/l.txt', oldString: 'line 0 ', newString: `${`${'A'.repeat(30)}\n`.repeat(80)}line 0 ` }, 1_000);
+  assert.ok(receiptText(receipt).length <= 1_000, `${receiptText(receipt).length} characters, within 1,000`);
+  assert.match(changedOf(receipt), /^\[not shown, to keep this answer within 1,000 characters: lines 1–\d+\]$/);
 });
 
-test("a receipt's regions are measured as its JSON holds them, where a quote or a backslash takes two characters", async (t) => {
+test("a receipt's regions are measured as its text holds them, where a quote or a backslash takes one character", async (t) => {
   const { call, file } = setup(t);
   await file('q.txt', 'start\n');
-  // Eight lines of sixty characters, 120 each as JSON: counted as typed they
-  // fit what this receipt has left for its regions, and as JSON they don't.
+  // Eight lines of sixty characters, 120 each as JSON: counted as the text
+  // holds them they fit what this receipt has left for its regions, and as
+  // JSON they wouldn't.
   const quoted = Array.from({ length: 8 }, () => '"\\'.repeat(30)).join('\n');
-  const receipt = dataOf(await call('edit', { path: 'work/q.txt', oldString: 'start', newString: quoted }, 1_000));
-  assert.ok(JSON.stringify(receipt).length <= 1_000, `${JSON.stringify(receipt).length} characters, within 1,000`);
-  assert.equal(receipt.changed, '[not shown, to keep this answer within 1,000 characters: lines 1–8]');
+  const receipt = await call('edit', { path: 'work/q.txt', oldString: 'start', newString: quoted }, 1_000);
+  assert.ok(receiptText(receipt).length <= 1_000, `${receiptText(receipt).length} characters, within 1,000`);
+  assert.ok(JSON.stringify(receipt.structured).length > 1_000, 'as JSON the receipt would pass 1,000');
+  assert.equal(changedOf(receipt), quoted.split('\n').map((line, i) => `${String(i + 1).padStart(6)}\t${line}`).join('\n'));
 });
 
 test('a receipt names a region too long to show by its lines without building it whole', async () => {
@@ -1501,7 +1519,7 @@ test('a receipt keeps to its cap with the longest notes it adds after its budget
   const plan = markedPlan(lines, Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15));
   const files = [0, 1].map((i) => ({ path: `work/f${i}.txt`, plan, notes: i ? [`Disk's copy of work/f${i}.txt had changed.`] : [] }));
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
-    const length = JSON.stringify(editReceipt('edit_many', files, 50, maxChars)).length;
+    const length = receiptText(editReceipt('edit_many', files, 50, maxChars, 'done')).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
   }
 });
@@ -1518,10 +1536,10 @@ test("a receipt keeps aside the longest note any of its files could add, not its
   const twenty = /lines \d{6}–\d{6}(?:, \d{6}–\d{6}){19}/;
   let named = 0;
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
-    const receipt = editReceipt('edit_many', files, 26, maxChars);
-    const length = JSON.stringify(receipt).length;
+    const receipt = editReceipt('edit_many', files, 26, maxChars, 'done');
+    const length = receiptText(receipt).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
-    if (twenty.test(receipt.changed as string)) named++;
+    if (twenty.test(changedOf(receipt))) named++;
   }
   assert.ok(named > 0, "no receipt named twenty of the first file's regions");
 });
@@ -1542,10 +1560,10 @@ test("edit_many's receipt keeps to its cap with a last line that counts each of 
   const allFour = /\[To keep this answer within [\d,]+ characters, it leaves out \d+ of the call's 5 files, the changed regions of \d+ more files?, the notes of \d+ files? and the edit numbers of \d+ files?\.\]$/;
   let counted = 0;
   for (let maxChars = 700; maxChars <= 2_500; maxChars++) {
-    const receipt = editReceipt('edit_many', files, 125, maxChars);
-    const length = JSON.stringify(receipt).length;
+    const receipt = editReceipt('edit_many', files, 125, maxChars, 'done');
+    const length = receiptText(receipt).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
-    if (allFour.test(receipt.changed as string)) counted++;
+    if (allFour.test(changedOf(receipt))) counted++;
   }
   assert.ok(counted > 0, 'no receipt counted all four');
 });
@@ -1560,11 +1578,29 @@ test('a receipt keeps aside only what its own call can add: one edit of a file o
   assert.ok('plan' in planned);
   const files = [{ path: 'work/long.txt', plan: planned.plan, notes: [] }];
   for (const [tool, start] of [['edit', /^ {5}1\ty/], ['edit_many', /^work\/long\.txt\n {5}1\ty/]] as const) {
-    const whole = JSON.stringify(editReceipt(tool, files, 1, 1_000_000)).length;
-    const receipt = editReceipt(tool, files, 1, whole + 300);
-    assert.match(receipt.changed as string, start, tool);
-    assert.ok(JSON.stringify(receipt).length <= whole + 300);
+    const whole = receiptText(editReceipt(tool, files, 1, 1_000_000, 'done')).length;
+    const receipt = editReceipt(tool, files, 1, whole + 300, 'done');
+    assert.match(changedOf(receipt), start, tool);
+    assert.ok(receiptText(receipt).length <= whole + 300);
   }
+});
+
+test("a receipt counts the line feed between each of its region's lines, so a region of many short lines keeps to its cap", () => {
+  // Three hundred lines of one character: each line feed is a third of a
+  // line's own length or more, so a region counted without them would show
+  // where its text passes the cap.
+  const bytes = Buffer.from('start\n');
+  const planned = planFile(decodeForEdit(bytes)!, bytes, [{ index: 0, oldText: 'start', newText: Array.from({ length: 300 }, () => 'x').join('\n'), expected: 1 }]);
+  assert.ok('plan' in planned);
+  const files = [{ path: 'work/s.txt', plan: planned.plan, notes: [] }];
+  let shown = 0;
+  for (let maxChars = 2_000; maxChars <= 3_500; maxChars++) {
+    const receipt = editReceipt('edit', files, 1, maxChars, 'done');
+    const length = receiptText(receipt).length;
+    if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
+    if (!changedOf(receipt).startsWith('[not shown')) shown++;
+  }
+  assert.ok(shown > 0, 'the region shows at the larger caps');
 });
 
 test("what a receipt keeps aside doesn't grow with a line's length: twenty edits of a long line show their region with what twenty of a short one need", () => {
@@ -1578,9 +1614,9 @@ test("what a receipt keeps aside doesn't grow with a line's length: twenty edits
     const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 20 }, (_, k) => ({ index: k, oldText: `m${k}|`, newText: `M${k}|`, expected: 1 })));
     assert.ok('plan' in planned);
     const files = [{ path: 'work/line.txt', plan: planned.plan, notes: [] }];
-    const whole = JSON.stringify(editReceipt('edit_many', files, 20, 1_000_000)).length;
+    const whole = receiptText(editReceipt('edit_many', files, 20, 1_000_000, 'done')).length;
     // Whether the region shows with `spare` characters past the whole receipt.
-    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(editReceipt('edit_many', files, 20, whole + spare).changed as string);
+    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(changedOf(editReceipt('edit_many', files, 20, whole + spare, 'done')));
   };
   const short = showsAt(start);
   const long = showsAt(start + 'a'.repeat(1_000_000));
@@ -1611,19 +1647,21 @@ test('a receipt lists its files while they fit and counts the rest, and counts t
   const edits = (from: string, to: string) =>
     Array.from({ length: 30 }, (_, i) => ({ path: `work/f${i}.txt`, oldString: `${from} ${i}`, newString: `${to} ${i}` }));
 
-  const short = dataOf(await call('edit_many', { edits: edits('value', 'VALUE') }, 1500));
-  assert.ok(JSON.stringify(short).length <= 1500, `${JSON.stringify(short).length} characters`);
+  const shortAnswer = await call('edit_many', { edits: edits('value', 'VALUE') }, 1500);
+  const short = dataOf(shortAnswer);
+  assert.ok(receiptText(shortAnswer).length <= 1500, `${receiptText(shortAnswer).length} characters`);
   const listed = (short.files as unknown[]).length;
   assert.ok(listed > 0 && listed < 30);
   assert.equal(short.filesNotListed, 30 - listed);
   // Its last line counts them too.
   assert.match(short.changed as string, new RegExp(`\\[To keep this answer within 1,500 characters, it leaves out ${30 - listed} of the call's 30 files[^\\]]*\\.\\]$`));
 
-  const longer = dataOf(await call('edit_many', { edits: edits('VALUE', 'value') }, 2800));
-  assert.ok(JSON.stringify(longer).length <= 2800, `${JSON.stringify(longer).length} characters`);
+  const longerAnswer = await call('edit_many', { edits: edits('VALUE', 'value') }, 2200);
+  const longer = dataOf(longerAnswer);
+  assert.ok(receiptText(longerAnswer).length <= 2200, `${receiptText(longerAnswer).length} characters`);
   assert.equal((longer.files as unknown[]).length, 30);
   assert.match(longer.changed as string, /^work\/f0\.txt\n     1\tvalue 0\n\n/);
-  assert.match(longer.changed as string, /\[To keep this answer within 2,800 characters, it leaves out the changed regions of \d+ more files\.\]$/);
+  assert.match(longer.changed as string, /\[To keep this answer within 2,200 characters, it leaves out the changed regions of \d+ more files\.\]$/);
 });
 
 test('at the least cap a residence or an agent can set, a refusal still names its problems, however long their labels or paths', async (t) => {

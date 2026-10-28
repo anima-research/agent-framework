@@ -374,6 +374,32 @@ describe('clock rows in the framework', () => {
     } finally { await x.framework.stop(); }
   });
 
+  it('a binding agent\'s note at that boundary names the clock it injects, by the id it was stored under', async () => {
+    const x = await make({ clock: { intervalMinutes: 10 }, thinkingBinding: { binds: true } } as Partial<AgentConfig>);
+    x.membrane.supportsInjectedMessages = true; // as membrane's native path declares
+    const notes: string[][] = [];
+    const cm = x.framework.getAgent('assistant')!.getContextManager();
+    cm.noteRequestSent = (rows) => { notes.push(rows.map((row) => typeof row === 'string' ? row : 'marker')); return true; };
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
+      setClock('2026-10-21T10:48:10Z');
+      x.mod.during = () => setClock('2026-10-21T10:52:10Z');
+      await wake(
+        x, event('go'),
+        [{ type: 'tool_use', id: 't1', name: 'tools--ping', input: {} } as ContentBlock],
+        [{ type: 'text', text: 'done' }],
+      );
+      const all = x.framework.getAgent('assistant')!.getContextManager().getAllMessages();
+      const results = all.findIndex((r) => r.content.some((b) => b.type === 'tool_result'));
+      const clock = all[results + 1]!;
+      assert.ok(isClock(clock as unknown as Row), 'the clock follows the tool results');
+      const boundary = notes.find((rows) => rows.includes(all[results]!.id));
+      assert.ok(boundary, JSON.stringify(notes));
+      assert.deepEqual(boundary!.slice(-2), [all[results]!.id, clock.id], 'the results, then the clock, each by its stored id');
+    } finally { await x.framework.stop(); }
+  });
+
   it('after a tool round that spans a boundary: the time it is written, after the results, in the live stream too', async () => {
     const x = await make();
     x.membrane.supportsInjectedMessages = true; // as membrane's native path declares
@@ -520,6 +546,59 @@ describe('clock rows in the framework', () => {
       const request = requestText(x.membrane.calls[before]!);
       assert.match(request, /Clock: Wednesday 2026-10-21, 10:40 UTC/, 'its seed carries the template\'s clock');
       assert.match(request, /Clock: Wednesday 2026-10-21, 12:07 UTC[\s\S]*hello/, 'and a clock of its own ahead of the message');
+    } finally { await x.framework.stop(); }
+  });
+
+  it('a mid-turn clock and a message after it each go in as their own render gives them', async () => {
+    const x = await make();
+    x.membrane.supportsInjectedMessages = true;
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
+      const cm = x.framework.getAgent('assistant')!.getContextManager() as any;
+      const asked: number[] = [];
+      // A stand-in that marks each id's answer with its position in the batch.
+      cm.renderAsNewest = (ids: readonly string[]) => { asked.push(ids.length); return ids.map((_, i) => [{ type: 'text', text: `RENDERED${i}` }]); };
+      setClock('2026-10-21T10:48:10Z');
+      x.mod.during = () => {
+        setClock('2026-10-21T10:52:10Z');
+        // Queued for the agent to hear, synchronously, with no wake of its own.
+        (x.framework as any).handleMcplPushEvent({ ...event('MIDTURN'), triggerInference: false });
+      };
+      // The stream that runs the tool round, kept before the message's own
+      // wake starts another and takes lastStream.
+      let boundary: typeof x.membrane.lastStream = null;
+      const streamYielding = x.membrane.streamYielding.bind(x.membrane);
+      x.membrane.streamYielding = (...args: Parameters<typeof streamYielding>) => {
+        const st = streamYielding(...args);
+        boundary ??= x.membrane.lastStream;
+        return st;
+      };
+      await wake(x, event('go'), [ping], [{ type: 'text', text: 'done' }]);
+      assert.deepEqual(asked, [2], 'the premise: the boundary rendered a clock and a message together');
+      const injected = (boundary!.receivedToolResultOptions[0]?.injectedMessages ?? []) as Array<{ content: unknown }>;
+      assert.deepEqual(injected.map((m) => m.content), [[{ type: 'text', text: 'RENDERED0' }], [{ type: 'text', text: 'RENDERED1' }]]);
+    } finally { await x.framework.stop(); }
+  });
+
+  it('a mid-turn clock the render gives null goes in as stored, as the next compile sends it from before its window', async () => {
+    const x = await make();
+    x.membrane.supportsInjectedMessages = true;
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
+      const cm = x.framework.getAgent('assistant')!.getContextManager() as any;
+      let rendered = 0;
+      cm.renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
+      setClock('2026-10-21T10:48:10Z');
+      x.mod.during = () => setClock('2026-10-21T10:52:10Z');
+      await wake(x, event('go'), [ping], [{ type: 'text', text: 'done' }]);
+      assert.equal(rendered, 1, 'the premise: the boundary rendered the clock');
+      const all = rows(x.framework);
+      const clock = all[all.findIndex((r) => r.content.some((b) => b.type === 'tool_result')) + 1]!;
+      assert.ok(isClock(clock), 'the premise: a clock follows the tool results');
+      assert.deepEqual(x.membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages,
+        [{ participant: 'user', content: clock.content }], 'the stream got the stored clock');
     } finally { await x.framework.stop(); }
   });
 

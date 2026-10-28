@@ -1,3 +1,4 @@
+import type { ThinkingBindingEntry } from '@animalabs/membrane';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
@@ -114,6 +115,23 @@ export type TraceEvent =
       stack?: string;
     })
   | (TraceEventBase & {
+      /**
+       * A turn waiting out its error policy's delay before a retry says so:
+       * as the wait begins, with when it is due to end, and again every 60
+       * seconds while it lasts, while its agent is the one registered under
+       * its name, and never after the wait ends (its time coming, a stop, or
+       * an abort). The failure being retried is the `inference:failed` just
+       * before it. A host watching for agents gone quiet can tell a waiting
+       * one from a stuck one by it.
+       */
+      type: 'inference:waiting';
+      agentName: string;
+      /** When the wait is due to end (epoch ms): it counts down by its
+       *  timers, so a stalled event loop can end it later. Absent for a wait
+       *  too long for a date. */
+      until?: number;
+    })
+  | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
@@ -193,6 +211,20 @@ export type TraceEvent =
       type: 'inference:usage';
       agentName: string;
       tokenUsage: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
+      /**
+       * The provider's report on the signed thinking of the call this event
+       * closes (membrane's `RoundReport.thinking`): blocks it dropped before
+       * the model saw them, and blocks it showed the model anyway because the
+       * check isn't enforced. `tokenUsage` beside it is the stream's running
+       * total, not this call's. The provider reports them for a request that
+       * carried the binding control, whoever asked for it:
+       * `thinkingBinding.dropBlock`, or a thinking config the host sends
+       * itself. Present only when the report names any block.
+       */
+      thinking?: {
+        dropped: ThinkingBindingEntry[];
+        mismatchAllowed: ThinkingBindingEntry[];
+      };
     })
   | (TraceEventBase & {
       type: 'inference:stream_resumed';
@@ -456,6 +488,24 @@ export type TraceEvent =
       type: 'gate:debounce-delivered';
       policyName: string;
       eventCount: number;
+    })
+  | (TraceEventBase & {
+      /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
+       *  `reply` or `wait` as the judge answered, `error` when it failed,
+       *  timed out or answered nothing usable; `woke` is whether the batch
+       *  then woke the agent (an error does by the host's onError).
+       *  The judge's reason is in the agent's gate_status, not here: it's
+       *  written from the agent's context. */
+      type: 'gate:judge-verdict';
+      policyName: string;
+      verdict: 'reply' | 'wait' | 'error';
+      woke: boolean;
+      eventCount: number;
+      durationMs: number;
+      model?: string;
+      inputTokens?: number;
+      cacheReadTokens?: number;
+      outputTokens?: number;
     })
   | (TraceEventBase & {
       /** A batched wake's turn started without its `[Gate: …]` line (the
@@ -821,7 +871,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included, or a turn whose stream's cancel threw with no check ahead, so that its stream goes on. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {

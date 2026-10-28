@@ -5,6 +5,7 @@ export * from './types/index.js';
 export { AgentFramework, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
+export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
@@ -67,8 +68,12 @@ export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './co
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
 // EventGate
-export { EventGate, wakeLineText, type WakeProvenance } from './gate/index.js';
+export { EventGate, MCPL_GATE_EVENT_TYPES, wakeLineText, type EventTypesFrom, type WakeProvenance, type WritePlacement } from './gate/index.js';
 export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine } from './gate/index.js';
+export { ReplyJudge, DEFAULT_JUDGE_MODEL, DEFAULT_JUDGE_MAX_INPUT_TOKENS, MIN_JUDGE_INPUT_TOKENS } from './gate/index.js';
+export type { JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, ReplyJudgeDeps, UpcomingWake } from './gate/index.js';
+export { Heartbeat, DEFAULT_HEARTBEAT, HEARTBEAT_TOOL_PREFIX } from './heartbeat/heartbeat.js';
+export type { HeartbeatOptions, HeartbeatSettings, HeartbeatWake, HeartbeatDeliveryMode, HeartbeatScheduledWake, Reminder } from './heartbeat/heartbeat.js';
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
@@ -95,6 +100,8 @@ export type { McplServerConfig } from './mcpl/index.js';
 // exactly the way the framework host does: MCPL over stdio or WebSocket, and
 // modern MCP over stdio or Streamable HTTP)
 export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
+// RFC-014: the meta-tools' module and its names.
+export { ToolsetsModule, TOOLSETS_MODULE, META_TOOL_NAMES } from './mcpl/index.js';
 export { ModernMcpConnection } from './mcpl/index.js';
 export type { ModernToolCallResult } from './mcpl/index.js';
 export {

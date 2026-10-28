@@ -426,18 +426,49 @@ for (const release of ['live', 'ready', 'readyControlPlane'] as const) {
   });
 }
 
-for (const value of [null, 42, 'hi', true]) {
-  test('non-object inbound ' + JSON.stringify(value) + ' is ignored like a non-JSON line, with no failure report', (t) => {
+for (const value of [null, 42, 'hi', true, []]) {
+  test('non-object inbound ' + JSON.stringify(value) + ' is dropped and logged by its length as JSON that isn\'t an object, with no failure report', (t) => {
     const { connection, transport } = wireHarness();
     const errors: unknown[][] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
     const reported: unknown[] = [];
     connection.on('error', (error: unknown) => { reported.push(error); });
-    transport.emit('line', JSON.stringify(value));
-    assert.deepEqual(errors, []);
+    const line = JSON.stringify(value);
+    transport.emit('line', line);
+    assert.deepEqual(errors, [[`MCP server "srv" sent a line of length ${line.length} that is JSON but not an object, so it was dropped`]]);
     assert.deepEqual(reported, []);
   });
 }
+
+for (const [line, length, why] of [
+  ['[info] listening on 3000', 24, "isn't JSON"],
+  ['\u{1F600} not json', 10, "isn't JSON"],
+  ['\u2028', 1, "isn't JSON"],
+  [' \t{"jsonrpc":', 13, "starts like a JSON object but doesn't parse"],
+] as const) {
+  test(`a dropped line ${JSON.stringify(line)} is logged by its length in characters and why it was dropped, never its content`, (t) => {
+    const { transport } = wireHarness();
+    const errors: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+    transport.emit('line', line);
+    assert.deepEqual(errors, [[`MCP server "srv" sent a line of length ${length} that ${why}, so it was dropped`]]);
+  });
+}
+
+test('the first three dropped lines on a connection are logged, then one line says more go unlogged, and another connection starts its own three', (t) => {
+  const errors: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+  const first = wireHarness();
+  for (const line of ['one', 'two', '', 'three', 'four', 'five']) first.transport.emit('line', line);
+  const second = wireHarness();
+  second.transport.emit('line', 'again');
+  const dropped = (length: number) => [`MCP server "srv" sent a line of length ${length} that isn't JSON, so it was dropped`];
+  assert.deepEqual(errors, [
+    dropped(3), dropped(3), dropped(5),
+    ['MCP server "srv" sent another line that isn\'t a JSON object, so it was dropped; more such lines on this connection are dropped without a log line'],
+    dropped(5),
+  ]);
+});
 
 test('a throwing orphaned-response listener is contained, and later messages still arrive', (t) => {
   const { connection, transport, traces } = wireHarness();

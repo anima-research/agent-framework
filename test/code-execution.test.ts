@@ -18,6 +18,7 @@ import { storableToolResult } from '../src/module-registry.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
+import { captureTimers, fireTimer, type CapturedTimer } from './helpers/capture-timers.js';
 
 /** Wait for a condition, failing after 15 s rather than hanging the run. */
 const until = async (cond: () => boolean, what: string) => {
@@ -1201,10 +1202,19 @@ describe('a round whose run or wait call watches a script that can change its ro
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {}, options: { codeExecution?: boolean; toolCallTimeoutMs?: number } = {}) {
+    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {},
+    options: { codeExecution?: boolean; toolCallTimeoutMs?: number; serveWakes?: boolean } = {}) {
     const { tempDir, storePath } = tempStorePath('ce-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
+    if (options.serveWakes) {
+      const streamYielding = membrane.streamYielding.bind(membrane);
+      (membrane as unknown as { streamYielding: typeof streamYielding }).streamYielding = (request, opts) => {
+        const internals = membrane as unknown as { responses: unknown[]; responseIndex: number };
+        if (internals.responseIndex >= internals.responses.length) membrane.pushResponse(createMockResponse([]));
+        return streamYielding(request, opts);
+      };
+    }
     const log: string[] = [];
     const module = new RoundToolModule(log);
     const framework = await AgentFramework.create({
@@ -1240,6 +1250,10 @@ describe('a round whose run or wait call watches a script that can change its ro
         return { status: 'delivered', destination: { serverId: 'stub', channelId: to.channelId }, at: Date.now() };
       },
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+      publish: async (_agent: string, text: string, to: { channelId: string }) => {
+        log.push(`publish:${text}@${to.channelId}`);
+        return { status: 'delivered', destination: { serverId: 'stub', channelId: to.channelId }, at: Date.now() };
+      },
       // Each delivery hands its stream the destination its publish went to,
       // here the stub's server: a chunk for any other is logged with it, so
       // a delivery that loses its server fails the test.
@@ -1280,6 +1294,107 @@ describe('a round whose run or wait call watches a script that can change its ro
   const soon = async (cond: () => boolean) => {
     const deadline = Date.now() + 15_000;
     while (!cond() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  };
+  type WatchedRun = {
+    wait(ms: number): Promise<unknown>;
+    call(id: number, name: string, args: string): Promise<void>;
+    ended: boolean;
+    hostCalls: number;
+    snapshot(): { calls: { waiting: number } };
+  };
+  type WatchStep = {
+    onWatch?: (run: WatchedRun) => void;
+    yieldWhen?: (run: WatchedRun) => boolean;
+    onReturn?: (returned: { running: boolean }) => void;
+  };
+  /**
+   * Makes the run's own yield, the timer its yield_time_ms sets, come due once
+   * `when` holds rather than on the clock. The timer is the runner's, set as
+   * always; firing it early runs the runner's own callback, so ScriptRun.wait
+   * and AgentScripts.observe return as at a yield. Left to come due, the timer
+   * still ends a run the code gets wrong, so the test fails its asserts rather
+   * than hangs: give the call a long yield_time_ms (60 s), which no event
+   * waits on, so the clock never decides an order.
+   */
+  const yieldOnEvent = (run: WatchedRun, when: (run: WatchedRun) => boolean) => {
+    const wait = run.wait;
+    run.wait = (ms: number) => {
+      run.wait = wait;
+      const { result: waited, timers } = captureTimers(ms, () => wait.call(run, ms));
+      // The runner yields through exactly one timer of the yield's length. If it
+      // ever stops, this throws, rejecting the observing call, rather than leave
+      // the test to the clock.
+      if (timers.length !== 1) {
+        throw new Error(run.ended
+          ? "the run had ended before its wait, so there was no yield to fire"
+          : `the run's wait set ${timers.length} timers of its ${ms} ms yield, not one`);
+      }
+      const poll = setInterval(() => {
+        if (!when(run)) return;
+        clearInterval(poll);
+        fireTimer(timers[0]);
+      }, 5);
+      // The wait settles at the yield, or when the run ends: either way there is nothing left to fire.
+      void waited.finally(() => clearInterval(poll));
+      return waited;
+    };
+  };
+  /**
+   * Makes the timeouts of a run's calls to `tool` come due once `when` holds,
+   * as yieldOnEvent does a yield: ScriptRun.call sets a call's timer before
+   * it first awaits, so each call to `tool` runs under captureTimers, which
+   * records the one timer of `ms`, the run's toolCallTimeoutMs. When `when`
+   * holds it fires exactly `count` timers, or throws: fewer would leave the
+   * rest to the clock, which still comes before the yield and would pass the
+   * test on the clock's order. Left to come due, as at yieldOnEvent, the
+   * timers still end a run the code gets wrong.
+   */
+  const timeOutOnEvent = (run: WatchedRun, tool: string, ms: number, count: number, when: () => boolean) => {
+    const call = run.call;
+    const timers: CapturedTimer[] = [];
+    run.call = (id: number, name: string, args: string) => {
+      if (name !== tool) return call.apply(run, [id, name, args]);
+      const { result: called, timers: set } = captureTimers(ms, () => call.apply(run, [id, name, args]));
+      // A call that set no such timer, or more than one, rejects the promise
+      // the runner leaves unawaited (`void this.call(…)`), so the test fails on
+      // the rejection, and the runner's frame loop goes on to the frames after
+      // this one, as a throw here would stop it.
+      if (set.length !== 1) return Promise.reject(new Error(`a call to ${tool} set ${set.length} timers of its ${ms} ms timeout, not one`));
+      timers.push(set[0]);
+      return called;
+    };
+    // The run's end clears its own timers (ScriptRun's callTimers), so the poll stops there too.
+    const poll = setInterval(() => {
+      if (run.ended) { clearInterval(poll); return; }
+      if (!when()) return;
+      clearInterval(poll);
+      if (timers.length !== count) throw new Error(`${timers.length} calls to ${tool} had set their timeouts when they were to come due, not ${count}`);
+      timers.forEach(fireTimer);
+    }, 5);
+  };
+  /**
+   * Steps the calls that watch a script, by their order (the first is the run,
+   * the second the wait after it, …): a step's `onWatch` runs once its call
+   * watches the script, its `yieldWhen` makes that call yield once it holds
+   * (yieldOnEvent), and its `onReturn` gets what the call returned. Each order
+   * a test needs then comes from events, not from margins on the clock.
+   */
+  const stepWatches = (framework: AgentFramework, steps: Array<WatchStep | undefined>) => {
+    type Observe = (script: { run: WatchedRun }, ms: number, watch: unknown) => Promise<{ running: boolean }>;
+    const scripts = (framework as unknown as { codeExecution: { scripts: { observe: Observe } } }).codeExecution.scripts;
+    const observe = scripts.observe.bind(scripts);
+    let n = 0;
+    // A run's watch is set when its script is made, and a wait's just before it
+    // observes, so a step's onWatch runs as its call starts watching. A stop
+    // observes only once its stop has taken effect, and counts as a call here.
+    scripts.observe = async (script, ms, watch) => {
+      const step = steps[n++];
+      step?.onWatch?.(script.run);
+      if (step?.yieldWhen) yieldOnEvent(script.run, step.yieldWhen);
+      const returned = await observe(script, ms, watch);
+      step?.onReturn?.(returned);
+      return returned;
+    };
   };
   // A script holds its round only when it can change the round's routing:
   // its code names such a tool (scriptMayRoute). A script given this suffix
@@ -1446,11 +1561,10 @@ describe('a round whose run or wait call watches a script that can change its ro
     } finally { await h.done(); }
   });
 
-  // A drafts resend is an explicit send, so it silences its round as
-  // send_message does: called from the round's script too. This one names a
-  // draft there isn't, so it's refused and sends nothing, as a direct one
-  // would be, and still counts, as a direct one does.
-  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a drafts resend inside the script holds its round and the turn's later prose as drafts`, async () => {
+  // A drafts resend is an explicit send, decided by what it posted, as
+  // send_message is: called from the round's script too. This one names a
+  // draft there isn't, so it's refused and posts nothing, and holds nothing.
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a drafts resend inside the script that posts nothing leaves its round's prose and the turn's later prose free`, async () => {
     const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: 'sending the earlier reply again' },
@@ -1460,12 +1574,11 @@ describe('a round whose run or wait call watches a script that can change its ro
     ]);
     try {
       await h.run();
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
-        'the resend silences the round and what follows, as a direct resend does');
-      assert.deepStrictEqual(heldDrafts(h.framework), [
-        { text: 'sending the earlier reply again', reason: 'explicit-send' },
-        { text: 'done', reason: 'explicit-send' },
-      ], 'and their words are held as drafts');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [
+        'publish:sending the earlier reply again@world:test',
+        'publish:done@world:test',
+      ]);
+      assert.deepStrictEqual(heldDrafts(h.framework), []);
     } finally { await h.done(); }
   });
 
@@ -1483,6 +1596,55 @@ describe('a round whose run or wait call watches a script that can change its ro
       assert.ok(h.log.includes('tool:send_message') && h.log.includes('tool:skip_reply'), 'the script sent and skipped');
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [], 'nothing is published');
       assert.deepStrictEqual(heldDrafts(h.framework), [], 'and the round is kept private, not held as a draft');
+    } finally { await h.done(); }
+  });
+
+  it("explicit: a drafts call inside the script holds its round's unprefixed line with no notice rather than bouncing it, as a direct one does (#701)", async () => {
+    const h = await scriptRound('explicit', [
+      createMockResponse([
+        { type: 'text', text: 'checking my drafts' },
+        scriptCall({ code: 'try { await tools.drafts({ action: "list" }); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: '>>#alpha the answer' }] as ContentBlock[]),
+    ], {}, { serveWakes: true });
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha'],
+        'the next round is delivered');
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'no-destination' }],
+        "the drafts round's line is held, not bounced");
+    } finally { await h.done(); }
+  });
+
+  it("explicit: a script whose only drafts call the bridge refuses makes no drafts round, so its round's unprefixed line bounces (#701)", async () => {
+    const h = await scriptRound('explicit', [
+      createMockResponse([
+        { type: 'text', text: 'checking my drafts' },
+        scriptCall({ code: 'try { await tools.drafts("not an object"); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: '>>#alpha the answer' }] as ContentBlock[]),
+    ], {}, { serveWakes: true });
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha']);
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'bounced' }],
+        'a refused drafts call counts for nothing, so the line bounces as on main');
+    } finally { await h.done(); }
+  });
+
+  it("explicit: a drafts call the bridge refuses doesn't hide a later permitted one in the same script (#701)", async () => {
+    const h = await scriptRound('explicit', [
+      createMockResponse([
+        { type: 'text', text: 'checking my drafts' },
+        scriptCall({ code: 'try { await tools.drafts("not an object"); } catch {} try { await tools.drafts({ action: "list" }); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: '>>#alpha the answer' }] as ContentBlock[]),
+    ], {}, { serveWakes: true });
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@chan-alpha']);
+      assert.deepStrictEqual(heldDrafts(h.framework), [{ text: 'checking my drafts', reason: 'no-destination' }],
+        'the permitted drafts call makes a drafts round, so the line is held, not bounced');
     } finally { await h.done(); }
   });
 
@@ -1825,19 +1987,19 @@ describe('a round whose run or wait call watches a script that can change its ro
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'never reached' }] as ContentBlock[]),
     ]);
-    // The script goes on once the wait has begun to watch it.
-    h.framework.onTrace((event) => {
-      if (event.type === 'tool:started' && event.callId === 'ce2') setTimeout(() => h.module.releaseSlow(), 20);
-    });
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    // The script goes on once the wait watches it.
+    // A premise check: the slow call is held until this onWatch, so the skip_reply can't have reached its tool unless
+    // the hold failed. If it ever did, this fails, rather than the test passing on another order.
+    let reachedBeforeWait: boolean | undefined;
+    stepWatches(h.framework, [undefined, { onWatch: () => { reachedBeforeWait = h.log.includes('tool:skip_reply'); h.module.releaseSlow(); } }]);
     try {
       await h.run();
-      assert.ok(h.log.includes('tool:skip_reply'), 'the script called skip_reply while the wait watched it');
+      assert.strictEqual(reachedBeforeWait, false, "the wait watched before the skip_reply reached its tool");
+      assert.ok(h.log.includes('tool:skip_reply'), 'the script called skip_reply');
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:starting@world:test'],
         "the first round went out at its run's yield, and the wait's round is kept, as a direct skip_reply would keep it");
       assert.ok(!h.log.some((e) => e.includes('waiting on it') || e.includes('never reached')), 'nothing of it streamed, and the turn ended there');
     } finally {
-      clearTimeout(bound);
       await h.done();
     }
   });
@@ -2021,32 +2183,34 @@ describe('a round whose run or wait call watches a script that can change its ro
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'posting the summary' },
-        // The send is held, so the run yields at its bound: three seconds for the child to start and the send to reach the host
-        // first, within bun test's default five seconds a test.
-        scriptCall({ code: 'await tools["test--send_message"]({});', yield_time_ms: 3_000 }),
+        // The send is held, and the run yields once the send has reached its tool.
+        scriptCall({ code: 'await tools["test--send_message"]({});', yield_time_ms: 60_000 }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
     h.module.holdSend = true;
-    // The send goes on once the turn is over, or after a bound.
-    const bound = setTimeout(() => h.module.releaseGate(), 15000);
+    let returned: { running: boolean } | undefined;
+    stepWatches(h.framework, [{ yieldWhen: () => h.log.includes('tool:send_message'), onReturn: (r) => { returned = r; } }]);
+    // The send goes on once the turn is over (h.done).
     try {
       await h.run();
       assert.ok(h.log.includes('tool:send_message'), 'the send reached its tool');
-      assert.ok(!h.log.includes('send:returned'), 'and was still running when the run yielded');
+      assert.strictEqual(returned?.running, true, 'and the run returned at its yield, its script still in the send');
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [], 'the send silenced the round and the turn after it');
     } finally {
-      clearTimeout(bound);
       await h.done();
     }
   });
 
   it("a call made while a run watches, that waits for room in the host until the run has yielded, counts toward the later wait's round, not the run's", async () => {
-    // The script's 16 slow calls time out in it while their tools still hold the host's 16 places, so its skip_reply,
-    // made while the run watches, waits for room past the run's yield, and the host receives it while the wait watches.
-    // Esther-2584's probe: what counts is the host's receipt of a call, not the script's making it. A call's timeout
-    // runs from its making, so 2 s ends the skip_reply's about a second past the wait's start, and its making about a
-    // second before the yield (Esther's sweep at 1.5 s passed three runs of three, and below it began to fail).
+    // Esther-2584's probe: what counts is the host's receipt of a call, not the script's making it. The script's 16 slow
+    // calls time out in it while their tools still hold the host's 16 places, so its skip_reply, made while the run
+    // watches, waits for room in the host (the script itself sends at most 16 calls at once). The slow calls' timeouts
+    // come due once all 16 have reached their tool, the run yields once the skip_reply waits, and the slow calls go once
+    // the wait watches, so the host receives the skip_reply while the wait watches, and the wait returns once the script
+    // ends. Each step waits for the one before it, not for the clock: the 59 s timeout and 60 s yield can't come due
+    // first. Each capture records only timers set inside its own call; the lengths differ too, so neither could take the
+    // other's timer even if one call ever set both.
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'starting' },
@@ -2054,35 +2218,46 @@ describe('a round whose run or wait call watches a script that can change its ro
           'const slow = Array.from({ length: 16 }, () => tools["test--slow"]({}).catch((e) => e.name));',
           'await Promise.all(slow);',
           'await tools.skip_reply({});',
-        ].join('\n'), yield_time_ms: 3_000 }, 'ce1'),
+        ].join('\n'), yield_time_ms: 60_000 }, 'ce1'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([
         { type: 'text', text: 'waiting on it' },
         scriptCall({ action: 'wait', script_id: 's1-test' }, 'ce2'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'never reached' }] as ContentBlock[]),
-    ], {}, { toolCallTimeoutMs: 2_000 });
-    type Run = { hostCalls: number; snapshot(): { calls: { waiting: number } } };
-    const scripts = (h.framework as unknown as { codeExecution: { scripts: { scripts: Map<string, { run: Run }> } } }).codeExecution.scripts;
-    let atWait: { waiting: number; hostCalls: number } | null = null;
-    h.framework.onTrace((event) => {
-      if (event.type === 'tool:started' && event.callId === 'ce2') {
-        const run = scripts.scripts.get('s1-test')?.run;
-        atWait = run ? { waiting: run.snapshot().calls.waiting, hostCalls: run.hostCalls } : null;
-        setTimeout(() => h.module.releaseSlow(), 20);
-      }
-    });
-    const bound = setTimeout(() => h.module.releaseSlow(), 30_000);
+    ], {}, { toolCallTimeoutMs: 59_000 });
+    // skipReplyReached and slowReturned are premise checks: the slow tools hold until the wait's onWatch releases them,
+    // so both are false unless the hold failed, and if it ever did, these fail rather than the test passing on another order.
+    let atWait: { waiting: number; hostCalls: number; skipReplyReached: boolean; slowReturned: boolean } | null = null;
+    stepWatches(h.framework, [
+      {
+        onWatch: (run) => timeOutOnEvent(run, 'test--slow', 59_000, 16, () => h.log.filter((e) => e === 'tool:slow').length === 16),
+        // The run yields once its skip_reply waits for room, the 16 places taken.
+        yieldWhen: (run) => run.snapshot().calls.waiting === 1 && run.hostCalls === 16,
+      },
+      // The slow calls go once the wait watches.
+      {
+        onWatch: (run) => {
+          atWait = {
+            waiting: run.snapshot().calls.waiting,
+            hostCalls: run.hostCalls,
+            skipReplyReached: h.log.includes('tool:skip_reply'),
+            slowReturned: h.log.includes('slow:returned'),
+          };
+          h.module.releaseSlow();
+        },
+      },
+    ]);
     try {
       await h.run();
-      assert.deepStrictEqual(atWait, { waiting: 1, hostCalls: 16 }, 'as the wait began, the skip_reply waited for room, the 16 places taken');
+      assert.deepStrictEqual(atWait, { waiting: 1, hostCalls: 16, skipReplyReached: false, slowReturned: false },
+        "as the wait began, the skip_reply waited for room, the 16 places taken: it hadn't reached its tool, and no slow tool had returned");
       // The run's round went out, and the skip_reply reached its tool only after it.
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:starting@world:test']);
       assert.ok(h.log.indexOf('tool:skip_reply') > h.log.indexOf('publish:starting@world:test'), h.log.join(' | '));
       // The wait's round was kept private, and the turn ended there.
       assert.ok(!h.log.some((e) => e.includes('waiting on it') || e.includes('never reached')), h.log.join(' | '));
     } finally {
-      clearTimeout(bound);
       await h.done();
     }
   });
@@ -2161,22 +2336,24 @@ describe('a round whose run or wait call watches a script that can change its ro
     }
   });
 
-  it("a drafts list and then a resend in one script are both kept in its round's count: the resend still holds the round", async () => {
+  it("a drafts list and then a resend in one script are both kept in its round's count: the resend still silences the turn's later prose", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'checking the drafts, then sending one' },
-        scriptCall({ code: 'try { await tools.drafts({ action: "list" }); } catch {}\ntry { await tools.drafts({ action: "resend", draftIds: ["d-0000000"], destination: "#alpha" }); } catch {}' }),
+        scriptCall({ code: 'const listed = await tools.drafts({ action: "list" });\nconst id = /d-[a-z2-9]{7}/.exec(JSON.stringify(listed))[0];\nawait tools.drafts({ action: "resend", draftIds: [id], destination: "#here" });' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
+    h.directory['#here'] = 'world:test';
+    (h.framework as unknown as { proseDrafts: { hold(agent: string, texts: Array<{ text: string }>, reason: string): unknown } })
+      .proseDrafts.hold('assistant', [{ text: 'earlier words' }], 'explicit-send');
     try {
       await h.run();
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
-        'the resend silences the round and what follows, though a call of the same tool that sends nothing came first');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:earlier words@world:test'],
+        'the resend posts where the round speaks, and silences the round and what follows, though a call of the same tool that sends nothing came first');
       assert.deepStrictEqual(heldDrafts(h.framework), [
-        { text: 'checking the drafts, then sending one', reason: 'explicit-send' },
         { text: 'done', reason: 'explicit-send' },
-      ], 'and their words are held as drafts');
+      ], "the later prose is held, so the resend was counted; the drafts round's own prose is kept private (#701)");
     } finally { await h.done(); }
   });
 
@@ -2359,7 +2536,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     return {
       asked,
       round: {
-        agent, streamId: -1, scripts: new Map<string, string[]>(), pending: new Set(pending),
+        agent, streamId: -1, scripts: new Map<string, string[]>(), pending: new Set(pending), sends: new Map(),
         route: () => { asked.push('route'); },
         withhold: (why: string) => { asked.push(`withhold: ${why}`); },
       },

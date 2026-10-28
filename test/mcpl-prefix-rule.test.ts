@@ -311,7 +311,7 @@ test('each refresh that finds a repeated name raises one alert naming it, and a 
     assert.equal(alert!.agentName, 'dup', 'raised for the server');
     assert.equal(
       alert!.message,
-      'MCPL server "dup" lists the tool echo more than once. The model is offered the first listing of it, and the rest are left out. ' +
+      'MCPL server "dup" lists the tool echo more than once. The first listing of it is the one used (offered to the model, or called through toolsets--act for a dynamic tool), and the rest are left out. ' +
         'A server should list each tool once, so this is for its maintainer to change.',
     );
     assert.deepEqual(alert!.data?.tools, ['echo'], 'named once, though listed three times');
@@ -336,7 +336,7 @@ test('two names repeated in one listing give one alert naming both', async () =>
     await h.refresh();
     assert.equal(h.alerts.length, 1);
     const [alert] = h.alerts;
-    assert.ok(alert!.message.includes('lists the tools echo, ping more than once. The model is offered the first listing of each,'), alert!.message);
+    assert.ok(alert!.message.includes('lists the tools echo, ping more than once. The first listing of each is the one used'), alert!.message);
     assert.deepEqual(alert!.data?.tools, ['echo', 'ping']);
     assert.deepEqual(offered(h.fw), ['dup--echo', 'dup--ping']);
   } finally {

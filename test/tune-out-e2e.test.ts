@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync, appendFileSync, readFileSync, existsSync, writeFil
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { appendInTwoParts } from './helpers/command-file.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
@@ -92,8 +93,9 @@ describe('tune-out end to end', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
+  const commandLine = (kind: 'ambient' | 'addressed', id: string, text: string): string => `${kind} ${id} ${text}`;
   function emit(kind: 'ambient' | 'addressed', id: string, text: string): void {
-    appendFileSync(commandPath, `${kind} ${id} ${text}\n`);
+    appendFileSync(commandPath, `${commandLine(kind, id, text)}\n`);
   }
 
   function statusEvents(): Array<{ event: string; intent?: string; messageId?: string }> {
@@ -124,7 +126,10 @@ describe('tune-out end to end', () => {
     assert.equal(tuneOutCount(), 1, 'nor a third');
 
     // ---- ambient traffic: stamped, stored, no resident wake --------------
-    emit('ambient', 'a1', 'release chatter one');
+    // The first in two parts, as a poll can read a write half done: the
+    // fixture acts on it only once its line is whole, and the subconscious's
+    // check below reads its whole text.
+    await appendInTwoParts(commandPath, commandLine('ambient', 'a1', 'release chatter one'), 400);
     emit('ambient', 'a2', 'release chatter two');
     emit('ambient', 'a3', 'release chatter three');
 

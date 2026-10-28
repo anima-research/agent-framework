@@ -127,6 +127,14 @@ interface DeferredBatch<E> {
   latest: CoalescedOccurrence<E>;
   notices: DeferredNotice[];
   dropped: number;
+  /** Every notice folded into the batch, a dropped one included, and a
+   *  plain occurrence a notice displaced unread (Occupant.ambient), was
+   *  tagged `chat:ambient` (RFC-001), so its render asks nothing of the agent
+   *  (CoalescerHost.wakeToRead). Snapshots carry it. A batch restored
+   *  without it, from a snapshot written before it existed or from an
+   *  acceptance receipt, which doesn't carry it, reads as not all ambient:
+   *  the side that keeps a wake. */
+  allAmbient?: true;
   /** Set on a batch restored from a snapshot whose render may have started. */
   noRender?: boolean;
   /** The batch opened on the agent's first view of its subject: a fresh
@@ -184,8 +192,20 @@ interface Occupant {
    *  render that joins a run finds a version placed. In memory only: a
    *  snapshot's occupant comes back as read. */
   firstView?: true;
+  /** A plain occurrence its server tagged `chat:ambient`. A notice that
+   *  displaces it unread stands its batch's render in its place, so that
+   *  render is all ambient only if this was (DeferredBatch.allAmbient). In
+   *  memory only, as `firstView`: a snapshot's occupant comes back as read,
+   *  and only an unread one is displaced. */
+  ambient?: true;
   /** The run's earlier renders, oldest first, each placed ahead of this one. */
   before?: Array<Omit<Occupant, 'before'>>;
+}
+
+/** An occupant's `ambient` mark, for a plain occurrence its server tagged
+ *  `chat:ambient`. */
+function ambientOccupant(occurrence: { tags?: string[] }): { ambient?: true } {
+  return occurrence.tags?.includes('chat:ambient') === true ? { ambient: true } : {};
 }
 
 /** The occupant holding a run's renders, given oldest first: the newest,
@@ -246,7 +266,7 @@ export interface CoalescingSnapshot {
     firstViewEnded?: true;
     /** `firstView` only on a batch that wasn't rendering: one that was may
      *  have been shown. */
-    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean; firstView?: true };
+    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean; firstView?: true; allAmbient?: true };
   }>;
 }
 /** One receipt, written synchronously at acceptance (bridges the snapshot throttle). */
@@ -299,8 +319,11 @@ export interface CoalescerHost<E> {
   /** Queue an ordinary push wake for `agent`, under the batch's own wake
    *  policy, to read a render of the batch placed in its deferred queue that
    *  no request consumed, at `deferredId`. It carries no subject, so the
-   *  subject's other wakes, and later withdrawals of them, leave it. */
-  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string, deferredId?: string): Promise<void>;
+   *  subject's other wakes, and later withdrawals of them, leave it.
+   *  `allAmbient`: every notice the render stands for was tagged
+   *  `chat:ambient` (DeferredBatch.allAmbient), so the wake is marked
+   *  ambient. */
+  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string, deferredId?: string, allAmbient?: boolean): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
   /** The batch's audience still holds the authority it was admitted under. */
@@ -416,14 +439,20 @@ export function validateCoalescedContent(
 /**
  * Whether the converter (`convertBlock` in convert-block.ts, which every lane
  * uses) shows a block as itself, its text or its image or
- * audio source, or as a reference stub, and not as a placeholder: an
+ * audio source (for MCP's embedded resource, its contents'), or as a
+ * reference stub, and not as a placeholder: an
  * unrecognized block, a no-data or no-media-type one, withheld inline data,
  * or a text block whose text isn't a string. This follows its branches in
  * their order.
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';
-  if (b.type === 'resource') return classifyBlock(b).kind === 'reference';
+  if (b.type === 'resource' || b.type === 'resource_link') {
+    const c = classifyBlock(b);
+    // MCP's embedded resource shows as the block its contents make.
+    if (c.kind === 'embedded') return c.contents.kind === 'block' && showsAsItself(c.contents.block);
+    return c.kind === 'reference';
+  }
   if (b.type !== 'image' && b.type !== 'audio') return false;
   if (isInlineContradiction(b)) return false;
   if (isFilledString(b.uri) && b.disposition !== undefined) return classifyBlock(b).kind === 'reference';
@@ -833,7 +862,7 @@ export class PushCoalescer<E = unknown> {
     // context that read a version, never a new one (§3.2).
     const placement = await this.deliver({ ...occurrence, deliverTo: state.audienceAgent });
     if (placement) {
-      state.occupant = { eventId: occurrence.eventId, placement };
+      state.occupant = { eventId: occurrence.eventId, placement, ...ambientOccupant(occurrence) };
       state.audienceAgent = placement.agent;
     }
     return 'noted';
@@ -858,7 +887,7 @@ export class PushCoalescer<E = unknown> {
           ...occurrence, deliverTo: prior.placement.agent,
           ...(firstView ? { firstView: true } : {}),
         });
-        state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
+        state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}), ...ambientOccupant(occurrence) } : undefined;
         if (placement) state.audienceAgent = placement.agent;
         return 'replaced';
       }
@@ -872,7 +901,7 @@ export class PushCoalescer<E = unknown> {
     // batch's place (a batch's own first view ends with the subject's).
     const firstView = hadBatch ? batchFirstView && state.history === 'none' : outcome === 'first' && !state.firstViewEnded;
     const placement = await this.deliver(hadBatch && firstView ? { ...occurrence, firstView: true } : occurrence);
-    state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
+    state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}), ...ambientOccupant(occurrence) } : undefined;
     if (placement) state.audienceAgent = placement.agent;
     return outcome;
   }
@@ -887,6 +916,10 @@ export class PushCoalescer<E = unknown> {
     // batches already open too). A render still under way is weighed when a
     // batch's first delivery is.
     let firstView = state.history === 'none' && !state.firstViewEnded;
+    // Whether every notice the batch's render stands for was tagged
+    // `chat:ambient` (DeferredBatch.allAmbient): this one, and a plain
+    // occurrence it displaces unread, whose place the render takes.
+    let ambient = occurrence.tags?.includes('chat:ambient') === true;
     if (occupantUnread && state.occupant?.rendered) {
       // An unread render is a delta the next render builds on (§5.2), not a
       // plain occurrence: it stays, and the batch follows its agent (§3.2), so
@@ -897,6 +930,7 @@ export class PushCoalescer<E = unknown> {
       // §5.1: a notice displaces an unread plain occurrence and opens a batch
       // — in the audience that held the plain occurrence (§3.2).
       if (!this.occupantLeaves(state, state.occupant)) firstView = false;
+      if (state.occupant.ambient !== true) ambient = false;
       this.host.audit({ kind: 'displaced', subject, eventId: state.occupant.eventId });
       if (this.host.remove(state.occupant.placement)) {
         outcome = 'replaced';
@@ -913,10 +947,11 @@ export class PushCoalescer<E = unknown> {
       state.batch.notices.push(notice);
       if (state.batch.notices.length > this.maxNotices) { state.batch.notices.shift(); state.batch.dropped++; }
       state.batch.latest = occurrence;
+      if (!ambient) delete state.batch.allAmbient;
       outcome = 'replaced';
     } else {
       // Rule 1: a notice during a render opens a NEW batch ("first").
-      state.batch = { latest: occurrence, notices: [notice], dropped: 0, ...(firstView ? { firstView: true as const } : {}) };
+      state.batch = { latest: occurrence, notices: [notice], dropped: 0, ...(firstView ? { firstView: true as const } : {}), ...(ambient ? { allAmbient: true as const } : {}) };
     }
     await this.host.wakeForBatch(occurrence);
     return outcome;
@@ -1122,7 +1157,9 @@ export class PushCoalescer<E = unknown> {
           // agent's wake for this batch; give it an ordinary wake, as any
           // delivery during its turn has, beside any wakes a newer batch has,
           // so that its next turn reads the content (the wake starts no turn
-          // once the agent has read it, or it's removed).
+          // once a request that carried it is answered and, if the wake
+          // carries a channel and the batch wasn't all ambient, the agent has
+          // published there since, or once it's removed).
           // The run's renders keep their own records, whatever else an
           // occupant carries, a first view's mark included.
           let before: Occupant['before'];
@@ -1136,7 +1173,7 @@ export class PushCoalescer<E = unknown> {
             await this.host.wakeForBatch(state.batch.latest);
           }
           state.audienceAgent = placement.agent;
-          await this.host.wakeToRead(occurrence, placement.agent, placement.deferredId);
+          await this.host.wakeToRead(occurrence, placement.agent, placement.deferredId, batch.allAmbient === true);
           return;
         }
         // The materialized occurrence is consumed by the request being
@@ -1180,6 +1217,7 @@ export class PushCoalescer<E = unknown> {
         state.batch = {
           latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped,
           ...(s.batch.rendering ? { noRender: true } : s.batch.firstView ? { firstView: true as const } : {}),
+          ...(s.batch.allAmbient ? { allAmbient: true as const } : {}),
         };
       }
       this.subjects.set(s.subject, state);
@@ -1265,8 +1303,8 @@ export class PushCoalescer<E = unknown> {
         // restore() reads only these. After a restart nothing of the subject
         // is tracked as unread, a run included: its history counts as read.
         ...(s.occupant ? { occupant: { eventId: s.occupant.eventId, placement: s.occupant.placement } } : {}),
-        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : s.batch.firstView ? { firstView: true as const } : {}) } }
-          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
+        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : s.batch.firstView ? { firstView: true as const } : {}), ...(s.batch.allAmbient ? { allAmbient: true as const } : {}) } }
+          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true, ...(s.rendering.batch.allAmbient ? { allAmbient: true as const } : {}) } }
           : {}),
       })),
     };

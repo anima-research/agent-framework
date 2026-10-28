@@ -14,7 +14,8 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { convertBlock } from './convert-block.js';
+import { convertBlocks } from './convert-block.js';
+import { markedText } from '../supplied-text.js';
 import type { ContextInjection } from '@animalabs/context-manager';
 
 import type {
@@ -64,14 +65,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 function convertContent(content: string | McplContentBlock[], serverId: string): ContentBlock[] {
   if (typeof content === 'string') {
-    return [{ type: 'text', text: content }];
+    return [{ type: 'text', text: markedText(content) }];
   }
-  return content.map((block) => convertBlock(block, 'attachment on context injection', serverId));
+  return convertBlocks(content, 'attachment on context injection', serverId);
 }
 
 /**
  * Convert an MCPL wire-format context injection, from the server `serverId`,
- * to a context-manager ContextInjection.
+ * to a context-manager ContextInjection. It builds only these four fields,
+ * so a server can't opt an injection out of being stored
+ * (ModuleContextInjection.placedEachCompile, which only a module may set).
  */
 function convertMcplInjection(mcplInj: McplContextInjection, serverId: string): ContextInjection {
   return {
