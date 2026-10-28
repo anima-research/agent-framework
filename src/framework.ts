@@ -26675,8 +26675,8 @@ export class AgentFramework {
    * from agent allowlists. Registered agents' allowedTools is enforced at
    * dispatch, including namespaced utility names. Genuinely unidentified public callers (including
    * unknown legacy names) remain unrestricted. A name the framework made in
-   * this process is refused once unregistered, even if its configured list
-   * allowed the tool; after a restart, such a name is a host's caller name
+   * this process is refused while it isn't registered, even if its configured
+   * list allows the tool; after a restart, such a name is a host's caller name
    * like any other.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
@@ -28733,7 +28733,7 @@ export class AgentFramework {
   }
 
   /** Registered policy. Within this process, a name the framework made has no
-   * dispatch authority once unregistered; after a restart, a host call names
+   * dispatch authority while it isn't registered; after a restart, a host call names
    * its caller as any host call does. Genuine legacy caller names retain
    * their surface. */
   private canAgentUseTool(agentName: string, toolName: string): boolean {
