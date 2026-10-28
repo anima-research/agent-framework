@@ -96,8 +96,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
       'resident\'s publish path, so the channel sees it under their account. ' +
       'Use sparingly — e.g. to tell someone the resident is tuned out and ' +
       'when to expect them. If you were started to read one hold, you can ' +
-      'post only into a channel that hold still holds, and once it has ended ' +
-      'a post is refused; your report can say it instead. Disabled unless ' +
+      'post only into a channel that hold still holds, and a post made once ' +
+      'it has ended is refused; your report can say it instead. Disabled unless ' +
       'the resident\'s configuration allows it.',
     inputSchema: {
       type: 'object',

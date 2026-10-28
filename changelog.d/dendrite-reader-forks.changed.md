@@ -9,6 +9,6 @@
   its resident names one. Persistent mode advertises nothing extra.
 - A reader fork's `cancel_tuneout` ends only the hold of the epoch it was
   derived to read, and its `speak_in_channel` posts only into a channel that
-  hold still holds; once the hold has ended, both are refused. A fork whose
+  hold still holds; calls made after it ends are refused. A fork whose
   record carries no epoch is refused both. `deliver_summary` and
   `note_disposition` stay open to every reader.
