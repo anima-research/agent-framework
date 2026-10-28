@@ -518,25 +518,38 @@ export class StdioTransport extends McplTransport {
   private async escalate(): Promise<void> {
     const child = this.child;
     if (this.exited()) return;
+    const grace = testExitGraces.get(child) ?? STDIO_EXIT_GRACE_MS;
     const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
     const exitWithin = (ms: number) => new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), ms);
       void exited.then(() => { clearTimeout(timer); resolve(true); });
     });
     child.kill('SIGTERM');
-    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    if (await exitWithin(grace)) return;
     const named = `stdio child ${child.pid} of MCP server "${this.serverId}"`;
-    console.error(`[mcpl] ${named} ignored SIGTERM for ${STDIO_EXIT_GRACE_MS}ms — sending SIGKILL`);
+    console.error(`[mcpl] ${named} ignored SIGTERM for ${grace}ms — sending SIGKILL`);
     child.kill('SIGKILL');
-    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    if (await exitWithin(grace)) return;
     throw new Error(
-      `${named} did not exit within ${STDIO_EXIT_GRACE_MS}ms of SIGKILL; it could not be reaped`,
+      `${named} did not exit within ${grace}ms of SIGKILL; it could not be reaped`,
     );
   }
 }
 
 /** How long a stdio child gets to exit after SIGTERM, and again after SIGKILL. */
 const STDIO_EXIT_GRACE_MS = 2_000;
+
+const testExitGraces = new WeakMap<ChildProcess, number>();
+
+/**
+ * For tests only: `child` gets `ms` in place of {@link STDIO_EXIT_GRACE_MS}.
+ * Set it only on a child that can exit by no means, such as one whose
+ * `kill()` is a no-op and that nothing else ends while it's closed: a short
+ * grace there races no exit, and only brings "could not be reaped" sooner.
+ */
+export function setStdioExitGraceForTests(child: ChildProcess, ms: number): void {
+  testExitGraces.set(child, ms);
+}
 
 // ---------------------------------------------------------------------------
 // WebSocket
