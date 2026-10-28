@@ -4130,9 +4130,10 @@ test('a wake merged from two deferred batches and held by a stated wait is withd
 test('a wake merged from two deferred batches and sent back by a quiesce while it waited for an auxiliary call starts no turn once both batches are withdrawn', async (t) => {
   const f = await fixture(); t.after(f.close);
   const auxiliary = await mergedWakeParked(f);
-  await f.framework.quiesce({ reason: 'test', timeoutMs: 100 });
+  const quiescing = f.framework.quiesce({ reason: 'test' });
   await auxiliary.end();
-  await eventually(() => f.framework.getHostModeStatus().parkedAdmissions === 0, 'the wake leaving its park');
+  await quiescing;
+  assert.equal(f.framework.getHostModeStatus().parkedAdmissions, 0, 'the wake left its park');
   await f.framework.resume();
   assert.equal((f.framework as unknown as MergedWakeInternals).pendingRequests.length, 1, 'the wake waits whole in the queue: no pass has taken it since the resume');
   await retract(f, 'docA');
