@@ -337,8 +337,16 @@ export interface AgentConfig {
    * - 'disabled': generated prose is never published. Only explicit tools may
    *   send externally; prose remains in Chronicle, and a turn that wrote plain
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
+   * - 'named': plain text is never published, as in 'disabled', and nothing
+   *   the framework sends for the agent falls back to a default destination:
+   *   `channel_publish` needs a `channelId`, a conversation fork's included,
+   *   and a `drafts` resend needs a destination. Every request for the
+   *   agent's turns carries the rule in one constant system-position line;
+   *   its `channel_publish`, `skip_reply` and `sleep` say the same, and its
+   *   `think` drops the same-round routing sentence. Its plain text and
+   *   thoughts reach no module's speech handler either.
    */
-  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'named';
 
   /**
    * Fail-closed containment for a text response whose entire visible prose is

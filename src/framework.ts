@@ -103,7 +103,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { isProseTargetToken, parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, skipReplyDescription, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -313,6 +313,57 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
   if (calls.some((c) => bareToolName(c.name) === 'skip_reply')) return 'private';
   return calls.some(isSilencingCall) ? 'send' : null;
 };
+
+const SLEEP_DESCRIPTION =
+  'Go quiet: suppress external pings and wakes for a number of seconds. ' +
+  'Messages still accumulate in your context — you just won’t be woken to ' +
+  'respond to them until the window passes. Your heartbeat still beats: you’ll ' +
+  'briefly rouse on each tick and can keep resting or call `wake` to get up early. ' +
+  'Privileged users can also still reach you.';
+
+function namedSleep(tool: import('./types/index.js').ToolDefinition): import('./types/index.js').ToolDefinition {
+  const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+  return {
+    ...tool,
+    description: SLEEP_DESCRIPTION + " Nothing is announced, since your plain text isn't posted: to tell a channel you're going quiet, send that first.",
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: Object.fromEntries(Object.entries(schema.properties ?? {}).filter(([key]) => key !== 'announce' && key !== 'message')),
+    } as import('./types/index.js').ToolDefinition['inputSchema'],
+  };
+}
+
+function namedChannelPublish(tool: import('./types/index.js').ToolDefinition): import('./types/index.js').ToolDefinition {
+  const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+  return {
+    ...tool,
+    description: 'Publish a message to the channel you name. Your plain text is never posted to a channel; this is how you speak in one. '
+      + 'channelId is required: nothing is sent to a default channel. channel_list shows the channel ids.',
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...schema.properties,
+        channelId: { type: 'string', description: 'ID of the channel to publish to. channel_list shows the channel ids.' },
+      },
+      required: ['channelId'],
+    } as import('./types/index.js').ToolDefinition['inputSchema'],
+  };
+}
+
+function namedProseLine(canPublish: boolean, ephemeral: boolean): string {
+  return 'Your plain text is never posted to any channel, in any turn. '
+    + (ephemeral
+      ? 'Your final reply goes back to whoever started you; other plain text stays in your own context. '
+      : "It stays in your own context, where this host's console and observers can see it. ")
+    + 'To say something in a channel or to a person, call a send tool and name where it goes: '
+    + (canPublish
+      ? 'channel_publish with a channelId, or a tool that names a person or a message, such as a DM or reply tool.'
+      : 'a tool that names a channel, a person or a message, such as a send, DM or reply tool.');
+}
+
+function turnModeOf(agent: Agent, trigger?: InferenceRequest): Exclude<Agent['proseRouting'], 'named'> {
+  return trigger?.suppressProse || agent.proseRouting === 'named' ? 'disabled' : agent.proseRouting;
+}
 
 /**
  * Whether a call of one of these tools can change a round's routing
@@ -7850,17 +7901,20 @@ export class AgentFramework {
   private buildThinkTool(
     policy: SameRoundThinkTextPolicy,
     canSkipReply: boolean,
+    named = false,
   ): import('./types/index.js').ToolDefinition {
     return {
       name: 'think',
       description:
         'Reason privately. The think({content}) argument stays in your own context and is NOT sent ' +
         'to channels or other surfaces. ' +
-        (policy === 'private'
-          ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
-          : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
-        ) +
-        ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy.' +
+        (named
+          ? 'Use think() to work things out privately.'
+          : (policy === 'private'
+            ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
+            : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
+          ) +
+          ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy.') +
         (canSkipReply ? ' To deliberately not reply this turn, call skip_reply instead.' : ''),
       inputSchema: {
         type: 'object' as const,
@@ -7937,6 +7991,7 @@ export class AgentFramework {
           : t);
       return [...SUBCONSCIOUS_TOOLS, ...basics];
     }
+    const named = agent?.proseRouting === 'named';
     return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])]
       .map((tool) => {
       if (tool.name === 'think') {
@@ -7944,8 +7999,12 @@ export class AgentFramework {
           snapshot?.sameRoundThinkTextPolicy
             ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
           canSkipReply,
+          named,
         );
       }
+      if (named && tool.name === 'channel_publish') return namedChannelPublish(tool);
+      if (named && tool.name === 'skip_reply') return { ...tool, description: skipReplyDescription(true) };
+      if (named && tool.name === 'sleep') return namedSleep(tool);
       if (tool.name === 'journal' && !canSkipReply) return { ...tool, description: journalToolDescription(false) };
       // A holder's words are the registry's, so its cached tool list doesn't change.
       if ((tool.name === 'channel_open' || tool.name === 'channel_close') && !this.holdsChannelTrafficForTools(agentName)) {
@@ -10683,12 +10742,7 @@ export class AgentFramework {
   private static readonly SLEEP_TOOLS: import('./types/index.js').ToolDefinition[] = [
     {
       name: 'sleep',
-      description:
-        'Go quiet: suppress external pings and wakes for a number of seconds. ' +
-        'Messages still accumulate in your context — you just won’t be woken to ' +
-        'respond to them until the window passes. Your heartbeat still beats: you’ll ' +
-        'briefly rouse on each tick and can keep resting or call `wake` to get up early. ' +
-        'Privileged users can also still reach you. By default announces in your current channel.',
+      description: SLEEP_DESCRIPTION + ' By default announces in your current channel.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -11117,6 +11171,10 @@ export class AgentFramework {
    * skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
+    if (this.agents?.get(agentName)?.proseRouting === 'named') {
+      console.error(`[inference-refusal] ${agentName}: no reaction (proseRouting=named: the latest inbound message isn't a destination it named)`);
+      return;
+    }
     try {
       // The refused agent's own view of the latest inbound message: an
       // ephemeral run has none (takesGlobalFallback), so a subagent's refusal
@@ -15641,12 +15699,21 @@ export class AgentFramework {
       ? `it will be delivered there, which opens the channel.${withoutOpening}`
       : 'it will be delivered there, and the channel stays closed.';
     const sendTool = `check whether ${opts.serverId} exposes a send tool that can address it`;
+    const invited = woken ?? this.deliveryAgent();
+    const publishName = mode === 'named' && invited?.canUseTool('channel_publish')
+      ? this.channelRegistry.publishNameFor(channel)
+      : undefined;
     const plainSpeechRule = `your plain speech lands where the latest word on where it lands says: ` +
       `a [${NOTICE_TAG.routing}] notice, or channel_open's result. If that is ${this.channelShown(channel)}, ` +
       `write your reply with no prefix;`;
     const replyOption = inboundOnlyServer
       ? `1. Replying there isn't available: ${inboundOnlyServer} declared this channel inbound-only, so nothing ` +
         `you write is posted into it. To speak there, use ${inboundOnlyServer}'s own tools.\n`
+      : mode === 'named'
+        ? (publishName !== undefined
+          ? `1. Reply — call channel_publish with channelId ${quotedValue(publishName)}; ${delivered}\n`
+          : `1. Reply — ${sendTool}.` +
+            (replyOpens ? ` Replying there opens the channel.${withoutOpening}\n` : ` Replying there leaves the channel closed.\n`))
       : mode === 'disabled'
         ? `1. Replying in plain text isn't available: your plain text is never published. To speak there, ${sendTool}.\n`
         : mode === 'locus' && tunedOut
@@ -18049,14 +18116,17 @@ export class AgentFramework {
     if (present(input.destination) && typeof input.destination !== 'string') {
       return refuse('destination must be "#channel", "@person" or a channel id.');
     }
-    if (!spec && !home) return refuse('resend needs a destination: "#channel", "@person" or a channel id.');
+    if (!spec && (!home || this.agents.get(agentName)?.proseRouting === 'named')) {
+      return refuse('resend needs a destination: "#channel", "@person" or a channel id.');
+    }
     let confirmDuplicate = false;
     if (present(input.confirmDuplicate)) {
       if (typeof input.confirmDuplicate !== 'boolean') return refuse('confirmDuplicate must be true, false or null.');
       confirmDuplicate = input.confirmDuplicate;
     }
     // A destination named in the call resolves as a `>>` target does; with
-    // none, a conversation fork's resend goes home, on its home's server. A
+    // none, a conversation fork's resend goes home, on its home's server,
+    // unless the fork is named (refused above). A
     // fork acts only on its home, so a name its home answers to, its id or
     // its qualified name, means its home, as in its channel tools.
     let named: ChannelRef;
@@ -18315,7 +18385,9 @@ export class AgentFramework {
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
-        : `${suppressed} plain-speech segment(s) suppressed`);
+        : agent.proseRouting === 'named'
+          ? `${suppressed} plain-speech segment(s) kept in your context, sent to no one (only a send tool that names where it goes reaches anyone)`
+          : `${suppressed} plain-speech segment(s) suppressed`);
     }
     const suppressedNote = notes.join(' · ');
     // Nothing is confirmed delivered, but an unconfirmed draft (or a dismissed
@@ -20257,8 +20329,8 @@ export class AgentFramework {
     // Disabled mode is intentionally silent: no model-visible routing prose.
     // The resident publishes only through explicit tools. This contains
     // continuity-summary locus leaks (Host #96).
-    if (mode === 'disabled') {
-      console.error(`[prose] ${agent.name}: disabled mode recorded (no primer injected)`);
+    if (mode === 'disabled' || mode === 'named') {
+      console.error(`[prose] ${agent.name}: ${mode} mode recorded (no primer injected)`);
       return;
     }
     try {
@@ -20812,7 +20884,7 @@ export class AgentFramework {
     const lifecycle = this.lifecycleGeneration;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
-    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
+    const turnProseRouting = turnModeOf(agent, trigger);
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
     // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
@@ -21278,6 +21350,18 @@ export class AgentFramework {
       // last request held, or a newer copy a start stored whose compile then
       // didn't record), when it's left out; the rest go to compile(), as do those
       // it would store while the window is held.
+      if (agent.proseRouting === 'named') {
+        const rule = {
+          namespace: 'prose-routing',
+          position: 'system' as const,
+          content: [{
+            type: 'text' as const,
+            text: namedProseLine(!!this.channelRegistry && agent.canUseTool('channel_publish'), this.ephemeralRuns.has(agent.name)),
+          }],
+        };
+        injections = injections ? [...injections, rule] : [rule];
+      }
+
       injections = this.storeInjections(agent, injections);
 
       if (carry && this.heardSince(agent, routing, carry.read)) carry = undefined;
@@ -21588,7 +21672,8 @@ export class AgentFramework {
     thinkingDrops?: StreamThinkingDrops,
     carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
   ): Promise<void> {
-    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
+    const turnProseRouting = turnModeOf(agent, trigger);
+    const notRoutedWhy = trigger?.suppressProse ? 'a silent turn' : `proseRouting=${agent.proseRouting}`;
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
@@ -22342,7 +22427,7 @@ export class AgentFramework {
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
                 console.error(
-                  `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
+                  `[routing] ${agent.name}: mid-turn prose NOT routed (${notRoutedWhy})`,
                 );
                 this.recordProseSuppression(streamRouting, roundSegments.length);
               } else if (turnProseRouting === 'hybrid') {
@@ -22961,7 +23046,7 @@ export class AgentFramework {
             }
 
             // Dispatch speech (and thoughts if any)
-            if (!trigger?.suppressProse && (speechContent.length > 0 || thoughts.length > 0)) {
+            if (!trigger?.suppressProse && agent.proseRouting !== 'named' && (speechContent.length > 0 || thoughts.length > 0)) {
               const speechContext: SpeechContext = {
                 turnComplete: true,
                 trigger: trigger ?? {
@@ -23003,7 +23088,7 @@ export class AgentFramework {
               const textOnlyHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
               if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
-                  console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
+                  console.error(`[routing] ${agent.name}: text-only prose NOT routed (${notRoutedWhy})`);
                   this.recordProseSuppression(streamRouting, speechSegments.length);
                 } else if (silence && turnProseRouting !== 'explicit'
                   && (turnProseRouting === 'hybrid' || silence === 'private' || sendHoldAt(silence, resolveTurnLocus()))) {
@@ -23108,7 +23193,7 @@ export class AgentFramework {
               if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
                   console.error(
-                    `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
+                    `[routing] ${agent.name}: tool-call trailing prose NOT routed (${notRoutedWhy})`,
                   );
                   this.recordProseSuppression(streamRouting, segments.length);
                 }
@@ -28988,6 +29073,7 @@ export class AgentFramework {
         // message's channel is nobody's choice for it (#551). By name, so a
         // speech dispatch that comes after the run's release still counts.
         takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
+        namesItsChannels: (agentName) => this.agents.get(agentName)?.proseRouting === 'named',
         eventGatePresent: this.eventGate !== null,
         // A channel tool reads the connect and restart marks a tool call's
         // "connecting" text reads (mcplConnectInFlight, mcplServerAbsentText).
@@ -33138,7 +33224,10 @@ export class AgentFramework {
           : `This conversation is bound to channel ${homeQuoted}, so it can't open other channels, and nothing was opened. Reply in ${homeQuoted}.`);
         return;
       }
-      if (call.name === 'channel_publish' || call.name === 'channel_close') {
+      const unnamedPublish = call.name === 'channel_publish'
+        && this.agents.get(agentName)?.proseRouting === 'named'
+        && !(call.input as { channelId?: unknown } | null | undefined)?.channelId;
+      if ((call.name === 'channel_publish' && !unnamedPublish) || call.name === 'channel_close') {
         const input = (call.input ?? {}) as { channelId?: string; serverId?: string };
         // An empty serverId is read as none given, as the channel tools and
         // channelNamed read it.
@@ -33746,8 +33835,8 @@ export class AgentFramework {
         console.error(`[sleep] ${agentName}: the call was made outside the agent's current turn — sleep announcement not posted`);
       } else if (silentTurn) {
         console.error(`[sleep] ${agentName}: the turn was started silent — sleep announcement not posted`);
-      } else if (agent?.proseRouting === 'disabled') {
-        console.error(`[sleep] ${agentName}: proseRouting=disabled — sleep announcement not posted`);
+      } else if (agent?.proseRouting === 'disabled' || agent?.proseRouting === 'named') {
+        console.error(`[sleep] ${agentName}: proseRouting=${agent.proseRouting} — sleep announcement not posted`);
       } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
