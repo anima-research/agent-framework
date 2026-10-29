@@ -1990,11 +1990,11 @@ class PartialDelivery extends Error {
   }
 }
 
-function deliveredInPart(err: unknown, it: 'it' | 'them'): string | undefined {
+function deliveredInPart(err: unknown): string | undefined {
   if (!(err instanceof PartialDelivery)) return undefined;
   const one = err.notWoken.length === 1;
-  return `${it === 'it' ? 'was' : 'were'} delivered to ${joinedList(err.woke)} alone: delivering ${it} threw (${err.message}), `
-    + `so ${it === 'it' ? "it's" : "they're"} dropped for ${joinedList(err.notWoken)}, who ${one ? "isn't" : "aren't"} woken`;
+  return `woke ${joinedList(err.woke)}, and delivering it threw (${err.message}), `
+    + `so it's dropped for ${joinedList(err.notWoken)}, who ${one ? "isn't" : "aren't"} woken`;
 }
 
 /**
@@ -3703,7 +3703,7 @@ export class EventGate {
       const one = events.length === 1;
       console.error(
         `[gate] Policy "${policyName}": its pending batch of ${events.length} ${one ? 'event' : 'events'} `
-        + (deliveredInPart(err, 'it') ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
+        + (deliveredInPart(err) ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
       return;
     }
@@ -4119,7 +4119,7 @@ export class EventGate {
       const one = events.length === 1;
       console.error(
         `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} `
-        + (deliveredInPart(err, 'it') ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
+        + (deliveredInPart(err) ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
     }
   }
@@ -4223,11 +4223,12 @@ export class EventGate {
           this.deliverEvents(events);
         } catch (err) {
           const one = events.length === 1;
-          console.error(
-            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce `
-            + (deliveredInPart(err, one ? 'it' : 'them')
-              ?? `couldn't be delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`),
-          );
+          const held = `${events.length} ${one ? 'event' : 'events'}`;
+          const partly = deliveredInPart(err);
+          console.error(partly
+            ? `[gate] a batch of ${held}, held for an agent's turn or the host's quiesce, ${partly}`
+            : `[gate] ${held} held for an agent's turn or the host's quiesce couldn't be delivered (${errorText(err)}), `
+              + `so ${one ? "it's" : "they're"} dropped`);
         }
       });
     }

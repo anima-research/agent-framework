@@ -1077,7 +1077,7 @@ describe('a debounced batch of targeted messages', () => {
     };
   };
 
-  it("a batch whose delivery throws after waking scout is logged as delivered to scout alone, and dropped for mira, who isn't woken", async () => {
+  it("a batch whose delivery throws after waking scout is logged as having woken scout, and as dropped for mira, who isn't woken", async () => {
     const { framework, internals, dir } = await boot();
     let restore = () => {};
     try {
@@ -1087,8 +1087,8 @@ describe('a debounced batch of targeted messages', () => {
       assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['scout'], 'premise: scout is woken and mira, whose line threw, is not');
       const told = run.told();
       assert.equal(told.length, 1, `the gate tells of it once: ${told.join(' | ')}`);
-      assert.ok(told[0]!.includes('its pending batch of 4 events was delivered to scout alone'), `the log says the batch reached scout alone: ${told[0]}`);
-      assert.ok(told[0]!.includes("dropped for mira, who isn't woken"), `and was dropped for mira, who isn't woken: ${told[0]}`);
+      assert.ok(told[0]!.includes('its pending batch of 4 events woke scout, and delivering it threw (the store failed)'), `the log says the batch woke scout before its delivery threw: ${told[0]}`);
+      assert.ok(told[0]!.includes("so it's dropped for mira, who isn't woken"), `and that it's dropped for mira, who isn't woken: ${told[0]}`);
     } finally {
       restore();
       await framework.stop();
@@ -1096,7 +1096,7 @@ describe('a debounced batch of targeted messages', () => {
     }
   });
 
-  it("a batch held for the host's quiesce whose delivery throws after waking scout is logged as delivered to scout alone, and dropped for mira, who isn't woken", async () => {
+  it("a batch held for the host's quiesce whose delivery throws after waking scout is logged as having woken scout, and as dropped for mira, who isn't woken", async () => {
     const { framework, internals, dir } = await boot();
     let restore = () => {};
     try {
@@ -1110,8 +1110,8 @@ describe('a debounced batch of targeted messages', () => {
       assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['scout'], 'premise: scout is woken and mira, whose line threw, is not');
       const told = run.told();
       assert.equal(told.length, 1, `the gate tells of it once: ${told.join(' | ')}`);
-      assert.ok(told[0]!.includes("4 events held for an agent's turn or the host's quiesce were delivered to scout alone"), `the log says the held events reached scout alone: ${told[0]}`);
-      assert.ok(told[0]!.includes("dropped for mira, who isn't woken"), `and were dropped for mira, who isn't woken: ${told[0]}`);
+      assert.ok(told[0]!.includes("a batch of 4 events, held for an agent's turn or the host's quiesce, woke scout, and delivering it threw (the store failed)"), `the log says the held batch woke scout before its delivery threw: ${told[0]}`);
+      assert.ok(told[0]!.includes("so it's dropped for mira, who isn't woken"), `and that it's dropped for mira, who isn't woken: ${told[0]}`);
     } finally {
       restore();
       await framework.stop();
