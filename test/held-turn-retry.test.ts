@@ -94,6 +94,7 @@ type Internal = {
   providerWaits: { set(agent: string, model: string, retryAfterMs: unknown, reason: string): unknown };
   startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
   releaseProviderAccelerationCooldown(agentName: string): void;
+  holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean;
   providerGate(agentName: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> };
 };
 
@@ -832,7 +833,40 @@ test('a wake that arrived during the hold still runs after abortInference() ende
   });
 });
 
-test("a duplicate of a running turn's wake, kept by a host's hold an auxiliary call's failure made, is marked when the turn fails into that hold, so the turn stays alive", async () => {
+test("a start parked behind an auxiliary call whose failure arms a host's hold makes no call while the hold stands, as a new wake doesn't, and its turn answers once the hold releases", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    let spent = true;
+    const membrane = new ScriptedMembrane(new Set(), (request) => rateLimited(undefined, request));
+    const { fw, internal } = await framework(path, membrane, { providerHold: () => (spent ? { holdMs: 1_000, reason: 'zz-host-hold' } : undefined) });
+    try {
+      let failAuxiliary!: (error: Error) => void;
+      const auxiliary = internal.withAuxiliaryAdmission('resident', () => new Promise<never>((_, reject) => { failAuxiliary = reject; }))
+        .catch(() => {});
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-parked', metadata: {} });
+      await waitFor(fw, () => fw.getHostModeStatus().parkedAdmissions === 1, 'the start parked behind the auxiliary call');
+      failAuxiliary(rateLimited(undefined));
+      await auxiliary;
+      const kept = () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0;
+      await waitFor(fw, () => kept() === 1 || membrane.primary > 0, 'the hold to keep the parked start, or its call');
+      assert.equal(membrane.primary, 0, 'no turn call while the hold stands');
+      assert.equal(fw.getHostModeStatus().parkedAdmissions, 0, 'held as a wake, not parked');
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during', metadata: {} });
+      await waitFor(fw, () => kept() === 2 || membrane.primary > 0, 'the hold to keep a wake that came meanwhile, or a call');
+      assert.equal(membrane.primary, 0, 'still no call');
+      spent = false;
+      await waitFor(fw, () => membrane.primary === 1, "the turn's call once the hold releases");
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold has ended');
+      assert.match(texts(membrane.calls[0]!), /zz-parked/);
+      assert.match(texts(membrane.calls[0]!), /zz-during/);
+      assert.equal(membrane.primary, 1, 'one call for both, which answers');
+      assert.equal(fw.getHostModeStatus().gatedRequests, 0);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("holdRequest's merge rule, pinned in a state no public path reaches (a host's hold an auxiliary call armed, with nothing held, beside a turn whose call is in flight): a duplicate of the turn's wake that the hold keeps is marked when the turn fails into the hold, so the turn stays alive", async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     let open!: () => void;
@@ -847,21 +881,12 @@ test("a duplicate of a running turn's wake, kept by a host's hold an auxiliary c
     // The host holds every rate-limited failure, the auxiliary call's and the turn's.
     const { fw, internal } = await framework(path, membrane, { providerHold: () => ({ holdMs: 60_000, reason: 'zz-host-hold' }) });
     try {
-      // An auxiliary call (compression's kind) is in flight when the wake comes.
-      let failAuxiliary!: (error: Error) => void;
-      const auxiliary = internal.withAuxiliaryAdmission('resident', () => new Promise<never>((_, reject) => { failAuxiliary = reject; }))
-        .catch(() => {});
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-message' }]);
       const wake = { agentName: 'resident', reason: 'zz-wake', source: 'test', timestamp: Date.now() };
       internal.pendingRequests.push(wake);
-      const gate = internal.providerGate('resident');
-      await waitFor(fw, () => gate.idleWaiters.length > 0, 'the start parked behind the auxiliary call');
-      // The auxiliary call fails: the host's hold stands, with nothing held,
-      // and the parked start goes on into the turn's call.
-      failAuxiliary(rateLimited(undefined));
-      await auxiliary;
       await waitFor(fw, () => membrane.primary >= 1, "the turn's call");
-      assert.ok(internal.providerAccelerationCooldowns.has('resident'), "the auxiliary call's hold stands");
+      assert.equal(internal.holdProviderAcceleration(fw.getAgent('resident'), rateLimited(undefined), undefined, true), true);
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 0, "the auxiliary call's hold stands, with nothing held");
       // A duplicate of the running turn's wake joins that hold.
       internal.pendingRequests.push({ ...wake });
       // (runUntilIdle would wait for the turn, whose call is in flight.)
