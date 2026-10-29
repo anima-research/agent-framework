@@ -147,6 +147,29 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
       assert.ok(!has(f, 'The second note.'), 'and the second, as its caller was told, is not');
     } finally { release(); await f.close(); }
   });
+
+  it("tells a later caller of the all-except hold's cancel whose note won't go out with it, as a channel's", async () => {
+    const { f, coordinator, release } = await heldDuringSurgery();
+    let again = (): void => {};
+    try {
+      release();
+      assert.ok(coordinator.cancel('editor', 'noisy', 'agent-tool', 'test').ok, 'premise: the channel tune-out ended');
+      assert.ok(coordinator.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool').ok);
+      again = (f.framework as unknown as Framework).reserveStoreForSurgery('roll back', 'agent');
+      const first = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except', text: 'The first note.' });
+      assert.equal(first.success, true, first.error);
+      assert.equal(waiting(first).waiting, true);
+      assert.doesNotMatch(waiting(first).note ?? '', /note/, 'the first caller is told nothing of a note');
+      const second = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except', text: 'The second note.' });
+      assert.equal(second.success, true, second.error);
+      assert.equal(waiting(second).waiting, true);
+      assert.match(waiting(second).note ?? '', /Your note isn't delivered/, `the second caller is told: ${waiting(second).note}`);
+      again();
+      assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
+      assert.ok(has(f, 'The first note.'), "the waiting cancel's note is delivered");
+      assert.ok(!has(f, 'The second note.'), 'and the second, as its caller was told, is not');
+    } finally { release(); again(); await f.close(); }
+  });
 });
 
 describe("a cancel while the primary's or the subconscious's context manager refuses its work", () => {
