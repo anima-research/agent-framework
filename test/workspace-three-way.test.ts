@@ -1602,11 +1602,11 @@ describe('the catch-up pass at start', () => {
       let readyAt: Array<number | null> = [];
       let ended: () => Promise<unknown> = async () => {};
       await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { readyAt = readyAtPasses(m); ended = passesEnded(m); });
+      await until(() => scan.held > 0, "some of chokidar's directory reads waited at the closed gate", 15_000);
       await ended();
       scan.open();
       assert.equal(gaveUp, false, 'the start returned, and the passes it started ended, while chokidar was held');
       await until(() => storedText(env, 'd0/f0.txt') === 'v1', 'the catch-up pass took d0/f0.txt in', 15_000);
-      assert.ok(scan.held > 0, "some of chokidar's directory reads waited at the closed gate");
       assert.ok(readyAt.length > 0 && readyAt.every((at) => at !== null),
         `each catch-up pass started once the watcher was ready (its watcherReadyAt as each started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('d0/f0.txt', 'v2');
@@ -1634,6 +1634,7 @@ describe('the catch-up pass at start', () => {
       // watcher reports this write.
       env.writeDisk('gate.json', 'v2');
       await reattaching;
+      await until(() => scan.held > 0, "some of chokidar's directory reads waited at the closed gate", 15_000);
       await ended();
       scan.open();
       assert.equal(gaveUp, false, 'the re-attach returned, and the passes started since ended, while chokidar was held');
@@ -1644,7 +1645,6 @@ describe('the catch-up pass at start', () => {
         `the re-attached watcher's pass started at its own ready (first ready ${firstReadyAt}; watcherReadyAt as each pass started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('gate.json', 'v3');
       await until(() => storedText(env, 'gate.json') === 'v3', "the change made after the re-attach reached the store", 15_000);
-      assert.ok(scan.held > 0, "some of chokidar's directory reads waited at the closed gate");
     });
   });
 
