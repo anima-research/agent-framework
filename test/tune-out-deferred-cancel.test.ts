@@ -18,7 +18,8 @@ function saysWhatItWaitsFor(note: string): void {
   assert.match(note, /an operator's change to the store/, `names a surgery's hold: ${note}`);
   assert.match(note, /refuses writes until the host re-initializes it/, `names a refusing context: ${note}`);
   assert.doesNotMatch(note, /writes (are |kept |held )?(in memory|stored)/, `doesn't say it waits for writes: ${note}`);
-  assert.match(note, /Nothing you can do ends the wait sooner, cancelling again included/, `says it isn't the caller's to end: ${note}`);
+  assert.match(note, /Cancelling again doesn't end the wait sooner, and how long it lasts isn't known here/, `says asking again won't end it: ${note}`);
+  assert.doesNotMatch(note, /Nothing you can do/, `claims nothing of the host's other tools: ${note}`);
   assert.match(note, /If the host stops before then, the cancel is lost/, `says a stop loses it: ${note}`);
 }
 
@@ -109,7 +110,7 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
       assert.doesNotMatch(result.error ?? '', /ended all the same|was delivered/, result.error);
       assert.match(result.error ?? '', /The focus on it ends once an operator's change to the store is over, or a context that refuses writes is re-initialized by the host/, result.error);
-      assert.match(result.error ?? '', /Nothing you can do ends it sooner/, result.error);
+      assert.doesNotMatch(result.error ?? '', /Nothing you can do/, result.error);
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
     } finally { release(); again(); await f.close(); }
