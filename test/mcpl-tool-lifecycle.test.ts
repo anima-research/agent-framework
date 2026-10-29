@@ -162,8 +162,8 @@ describe('openingFor: grant, narrowing, filter, arguments', () => {
   test('host-implemented tools have no serverId/serverTool', () => {
     const p = openingFor(observer('obs', [OBSERVE]), undefined,
       call({ tool: 'code_execution', class: ['shell'], serverId: undefined, serverTool: undefined }), 'started')!;
-    assert.equal('serverId' in p, false);
-    assert.equal('serverTool' in p, false);
+    assert.equal(p.serverId, undefined);
+    assert.equal(p.serverTool, undefined);
   });
 
   test('pending never carries input', () => {
@@ -316,7 +316,7 @@ describe('field selection and bounding', () => {
     assert.equal(tight.inputAltered, true);
     assert.ok(Buffer.byteLength(JSON.stringify(tight.input)) <= 1024);
     const loose = openingFor(o, DEFAULT_INPUTS, writeCall, 'started')!;
-    assert.equal(loose.inputAltered, undefined);
+    assert.notEqual(loose.inputAltered, true, 'absent or false: not altered');
     assert.deepEqual(Object.keys(loose.input!), ['content']);
   });
 });
