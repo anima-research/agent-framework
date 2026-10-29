@@ -1535,6 +1535,9 @@ test("a system change moves no turn's locus, whatever channel its metadata names
   const repin = (m: Record<string, unknown>, routing: { engaged: Set<string> }) =>
     (f.framework as unknown as { repinChannel(row: unknown, r: unknown): ChannelRef | undefined }).repinChannel({ content: change, metadata: m }, routing);
   const routing = { engaged: new Set([destinationKey(b)]), wasIn: [] as ChannelRef[] };
+  const said = (m: Record<string, unknown>) =>
+    (f.framework as unknown as { repinChannel(row: unknown, r: unknown): ChannelRef | undefined }).repinChannel({ content: [{ type: 'text', text: 'hi' }], metadata: m }, routing);
+  assert.deepEqual(said({ channelId: 'general', serverId: 'a', tags: ['chat:addressed'] }), a, 'the premise: a message said with the same metadata moves it');
   assert.equal(repin({ channelId: 'general', serverId: 'a', tags: ['chat:addressed'] }, routing), undefined, 'one addressed to a channel');
   assert.equal(repin({ channelId: 'general', serverId: 'b' }, routing), undefined, 'one in the channel the turn sent in');
 });

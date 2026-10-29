@@ -140,7 +140,6 @@ interface Harness {
   wake(request: Omit<InferenceRequest, 'agentName'>): void;
   endTurn(): Promise<void>;
   storeFor(agentName: string, body: string): ReturnType<ModuleContext['addMessage']>;
-  /** Store a system change, as a host may, without metadata. */
   storeChange(): void;
   remove(id: ReturnType<ModuleContext['addMessage']>): void;
 }

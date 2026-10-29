@@ -147,7 +147,7 @@ describe("a shared fork's view", () => {
     assert.deepEqual(seenBy(readerOf(leftBelow), leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
   });
 
-  it("keeps its source's system changes and its own, and leaves out another resident's, in its compile and reopened after it ends", { skip }, async () => {
+  it("keeps its source's system changes and its own and leaves out another resident's, and reopened after it ends still leaves out another resident's", { skip }, async () => {
     const change = (name: string) => [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object', properties: {} } }] }] as never;
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
@@ -181,7 +181,6 @@ describe("a shared fork of an isolated-slot reader's view", () => {
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-isolated-'));
     membrane = new RoutedMembrane();
-    // The fork presents itself under its source's name; its framing tells it apart.
     membrane.identify = (request) =>
       JSON.stringify(request.messages).includes('[FORK-FRAMING]') ? 'fork-1' : request.assistantParticipant ?? '';
     framework = await AgentFramework.create({
@@ -227,5 +226,6 @@ describe("a shared fork of an isolated-slot reader's view", () => {
     const reopened = await compiled(left);
     assert.ok(!reopened.includes('MIRA-OWN'), "the reopened fork, as live, leaves out the resident's stored injection");
     assert.ok(reopened.includes('HELD-ROW'), 'and shows the held row');
+    assert.ok(reopened.includes('FORK-OWN') && reopened.includes('MIRA-SAID'), "and its own injection and the residents' row");
   });
 });

@@ -265,13 +265,48 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
+  describe("an agent's own change rows", () => {
+    it("include those stamped with one of its selfParticipants: its view keeps one and its head counts it as declared", async () => {
+      await withFramework([{ ...resident('alpha'), selfParticipants: ['alpha-old'] }], async (framework) => {
+        const traces: TraceEvent[] = [];
+        framework.onTrace((event) => { traces.push(event); });
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('b')] }] as never, systemChangeMetadata('alpha-old') as never);
+        const request = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'the change goes out once');
+        assert.equal(alpha.getContextManager().getAllMessages().filter((m) => isSystemChangeMessage(m)).length, 1, 'and nothing is declared again');
+        assert.deepEqual(traces.filter((t) => t.type === 'head:declared'), [], 'no declaration');
+      });
+    });
+
+    it("are stamped with change metadata: a host's change row whose metadata names an agent but isn't change metadata stays in every resident's view", async () => {
+      await withFramework([resident('alpha'), resident('beta')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] }] as never, { agent: 'beta' } as never);
+        for (const name of ['alpha', 'beta']) {
+          const compiled = await framework.getAgent(name)!.getContextManager().compile(undefined, undefined, { dryRun: true });
+          assert.deepEqual(changesIn(compiled.messages), [[{ type: 'system_change', defineTools: [tool('h')] }]], `in ${name}'s view`);
+        }
+      });
+    });
+
+    it("of the subconscious are its own alone: it takes none of the primary's identity", async () => {
+      await withFramework([{ ...resident('alpha'), selfParticipants: ['alpha-old'], presentAs: 'alpha-shown' }], async (framework) => {
+        const subconscious = framework.getAgent('Subconscious')!;
+        assert.equal(subconscious.isOwnParticipant('alpha-old'), false, "the primary's former name isn't its own");
+        assert.notEqual(subconscious.presentAs, 'alpha-shown', "nor is the name the primary's turns are presented under");
+      }, undefined, { subconscious: { enabled: true, systemPrompt: 'notice' } });
+    });
+  });
+
   describe("an ephemeral agent that continues another's context", () => {
-    /** A spec saying the new agent continues `parent`'s context, copied by the host. */
     const inheriting = (name: string, parent: string): Omit<AgentSpec, 'name'> => {
       const { name: _name, ...spec } = taskForkSpec(name, { parent });
       return spec;
     };
-    /** A resident with one declared change, and an ephemeral child seeded with its compiled rows, as a host's fork seeds one. */
     async function forked(framework: AgentFramework, parentConfig: Record<string, unknown>, spec: Omit<AgentSpec, 'name'> | undefined, name: string) {
       const alpha = framework.getAgent('alpha')!;
       say(alpha, 'user', 'hello');
@@ -341,20 +376,33 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
-    it("reads the parent's head once the child's context is open, the nearest point to the host's copy of the parent's messages", async () => {
+    it("reads the parent's head as creation begins, so a head the parent moves while the child's context opens costs the child one declaration, never a change carried twice", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
         say(alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, inheriting('child', 'alpha'));
-        // The parent's head moves while the child's context opens.
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
         const { agent: child } = await pending;
         child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
-        assert.deepEqual(request.tools, [tool('a'), tool('b')], "the parent's head as moved");
-        assert.deepEqual(changesIn(request.messages), [], 'with nothing to declare');
+        assert.deepEqual(request.tools, [tool('a')], "the parent's head as creation began");
+        assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'and the difference declared once');
+      });
+    });
+
+    it("gives a child nothing from an inherit at a checkpoint of the caller's (atSequence), whose head isn't recorded, so it starts as an unseeded child does", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        const spec = { ...inheriting('seeded', 'alpha'), inherit: { from: 'alpha', mode: 'copy' as const, atSequence: 1 } };
+        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, spec)).agent;
+        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
+        for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
+        assert.deepEqual([a.tools, a.messages], [b.tools, b.messages]);
       });
     });
 

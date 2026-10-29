@@ -1760,8 +1760,6 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      // The direct API declares on the head, with the caller's tools, so the
-      // context's system changes stay out of its request.
       const messages = this.presentOwnTurns(withoutTokenEstimates(compiled.messages).filter((m) => !isSystemChangeMessage(m)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
@@ -2806,10 +2804,6 @@ export class Agent {
     return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
   }
 
-  /** Remove this agent's change rows from its context: rows holding a
-   *  change, stored with the change metadata of the agent or of a participant
-   *  whose turns are its own, which in the residents' shared slot names the
-   *  agent they declare for, as ownSystemChanges reads them in a compile. */
   private removeOwnChanges(): number {
     const rows = [...this.ownParticipants]
       .flatMap((agent) => this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent } }).messages)

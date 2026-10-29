@@ -136,17 +136,20 @@ export function changeWriteCheck(): { visit(row: TailRow): boolean; splits(): bo
   };
 }
 
-/** A stored change row stamped as another agent's: in the residents' shared
- *  slot, each resident's view leaves these out, since they declare another's
- *  tools. A change row stamped as no agent's, as a host may store one, is in
- *  every resident's view. */
-export function isOthersSystemChange(message: { content: readonly ContentBlock[]; metadata?: unknown }, agentName: string): boolean {
-  const agent = (message.metadata as { agent?: unknown } | undefined)?.agent;
-  return isSystemChangeMessage(message) && agent !== undefined && agent !== agentName;
+/** The agent a stored row's change metadata (systemChangeMetadata) names, if it carries any. */
+function changeStampOf(row: { metadata?: unknown }): string | undefined {
+  const metadata = row.metadata as { kind?: unknown; agent?: unknown } | undefined;
+  return metadata?.kind === 'system-change' && typeof metadata.agent === 'string' ? metadata.agent : undefined;
 }
 
-export function isSystemChangeNotOwn(message: { content: readonly ContentBlock[]; metadata?: unknown }, agentName: string): boolean {
-  return isSystemChangeMessage(message) && (message.metadata as { agent?: unknown } | undefined)?.agent !== agentName;
+export function isOthersSystemChange(message: { content: readonly ContentBlock[]; metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
+  const stamp = changeStampOf(message);
+  return isSystemChangeMessage(message) && stamp !== undefined && !isOwn(stamp);
+}
+
+export function isSystemChangeNotOwn(message: { content: readonly ContentBlock[]; metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
+  const stamp = changeStampOf(message);
+  return isSystemChangeMessage(message) && (stamp === undefined || !isOwn(stamp));
 }
 
 /** Whether a stored value reads as a head: tools by name, and system text as strings. */
@@ -197,26 +200,11 @@ export function isSystemChangeMessage(message: { content: readonly ContentBlock[
   return message.content.some(isSystemChangeContent);
 }
 
-/** Whether a stored row carries the change metadata (systemChangeMetadata)
- *  of a name `isOwn` accepts, as each change an agent declares is stored. */
 function isOwnChangeRow(row: { metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
-  const metadata = row.metadata as { kind?: unknown; agent?: unknown } | undefined;
-  return metadata?.kind === 'system-change' && typeof metadata.agent === 'string' && isOwn(metadata.agent);
+  const stamp = changeStampOf(row);
+  return stamp !== undefined && isOwn(stamp);
 }
 
-/**
- * The positions, in order, of an agent's own change rows among a compile's
- * messages: a change by its block, compiled from stored rows that each carry
- * the change metadata of a name `isOwn` accepts, the agent's own and those of
- * the participants whose turns are its own (selfParticipants). A compile's messages carry no metadata, so it's
- * read from the stored rows the compile names as each message's sources
- * (`provenance` and `rawBodies`); a compile that names none has none of the
- * agent's own. The head's folding, a consolidation's price and place, and the
- * rows a move of the head takes are these alone. A change row stored without
- * the agent's metadata, as a host may write one, is an ordinary message to
- * them: under 'entries' it goes out as stored, the agent declares its own
- * difference without counting it, and no consolidation takes it.
- */
 export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'provenance' | 'rawBodies'>, isOwn: (agentName: string) => boolean): Set<number> {
   const own = new Set<number>();
   const sources = compiled.provenance?.messages;

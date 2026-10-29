@@ -44,8 +44,6 @@ class RefusedStream implements YieldingStream {
   }
 }
 
-/** A host that stores a system change, without metadata, while the agent's tool runs: the turn is alive, so it waits
- *  for the tool boundary, which hands it to the live stream's next round. */
 class HostChangeAtTool implements Module {
   readonly name = 'host';
   private ctx: ModuleContext | null = null;
@@ -59,8 +57,6 @@ class HostChangeAtTool implements Module {
   }
 }
 
-/** A stream whose round after its tool calls ends in `error` when that round was handed a system change, as the
- *  provider refusing it would. */
 class RefusedAfterChange extends MockYieldingStream {
   handedChange = false;
   constructor(responses: NormalizedResponse[], private readonly error: Error) {

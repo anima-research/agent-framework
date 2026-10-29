@@ -27,8 +27,6 @@ import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResp
 class ToolModule implements Module {
   readonly name = 'tools';
   calls: ToolCall[] = [];
-  /** A message someone sends while the next call runs, as text or blocks: the
-   * agent's turn is alive, so it is deferred to the tool boundary. */
   arrive: string | ContentBlock[] | null = null;
   /** The next call's result ends the turn. */
   endTurn = false;
