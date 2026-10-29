@@ -525,8 +525,9 @@ export class TuneOutCoordinator {
    * that start is set again rather than the oldest active tune-out's, which
    * is later than it once the oldest was cancelled: so the window is the
    * same across a restart. An enter sets the oldest active tune-out's, as it
-   * always has. The other active tune-outs whose start isn't kept yet go
-   * with it, for the framework to fix as soon as each can be.
+   * always has. Where the window presents, the other active tune-outs whose
+   * start isn't kept yet go with it, for the framework to fix as soon as
+   * each can be.
    */
   private anchorSubconscious(occasion: 'enter' | 'resume' = 'enter'): void {
     const active = this.activeStarts();

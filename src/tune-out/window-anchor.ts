@@ -26,7 +26,13 @@
  * having been before the tune-out. The coordinator keeps the ordinal
  * (subconsciousWindowFixed), and from then on the start is set by it,
  * clamped to the window's length on a branch whose window is shorter (a
- * rollback), never converted again.
+ * rollback), never converted again. Two starts wait longer: one set while
+ * the window is the record (a branch move whose re-initialization of the
+ * subconscious failed) is set by sequence and fixed at the next enter or
+ * restart once the window presents, and a restart before that enter sets
+ * the start in force before the window was the record; and one whose
+ * setting or keeping failed before a branch move is fixed again at the next
+ * enter or restart.
  */
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { SubconsciousWindowStart } from './coordinator.js';

@@ -6,7 +6,10 @@
     row it is owed from before the start is out of its window, and kept in `subconscious/<primary>/window-starts`;
     a later tune-out's enter or a restart sets that ordinal again rather than converting the tune-out's sequence
     anew, and a kept ordinal past a shorter window (after a rollback) is clamped. New trace
-    `tune-out:subconscious-window` (`how: 'fixed' | 'clamped'`).
+    `tune-out:subconscious-window` (`how: 'fixed' | 'clamped'`). A start set while the window is the record (a
+    branch move whose re-initialization of the subconscious failed) is fixed at the next enter or restart once the
+    window presents, a restart before that enter setting the start in force before; one whose setting or keeping
+    failed before a branch move is fixed again at the next enter or restart.
   - A cancel of the oldest tune-out while another stays active leaves the start where it was, so the
     subconscious's report on the one cancelled reads what it held, and the start in force is kept too (`inForce`
     in the same state): a restart sets it again rather than the start of the oldest tune-out still active, so the
