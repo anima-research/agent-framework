@@ -7,6 +7,7 @@
  *
  * Spec reference: Section 11 (Server-Initiated Inference).
  */
+import type { RequiredIngress } from './inbound-admission.js';
 
 import type {
   Membrane,
@@ -221,13 +222,14 @@ export class InferenceRouter {
     serverId: string,
     params: McplInferenceRequestParams,
     responder: Responder,
+    admission?: RequiredIngress,
   ): Promise<void> {
     const stop = new AbortController();
     let ended!: () => void;
     const entry = { serverId, stop, answered: new Promise<void>((resolve) => { ended = resolve; }) };
     this.running.add(entry);
     try {
-      await this.answer(serverId, params, responder, stop.signal);
+      await this.answer(serverId, params, responder, stop.signal, admission);
     } finally {
       this.running.delete(entry);
       ended();
@@ -246,6 +248,7 @@ export class InferenceRouter {
     params: McplInferenceRequestParams,
     responder: Responder,
     stopped: AbortSignal,
+    admission?: RequiredIngress,
   ): Promise<void> {
     // 1. Validate feature set
     try {
@@ -266,6 +269,40 @@ export class InferenceRouter {
         'Cannot process inference request during hook execution',
       );
       return;
+    }
+
+    if (admission) {
+      // Admission is part of the request's lifetime, not work before the
+      // router starts tracking it. Stop answers while the transport is live;
+      // transport loss answers nothing. Both release a noncooperative hook's
+      // slot without waiting for its deadline or for connection teardown.
+      const signal = responder.signal ? AbortSignal.any([stopped, responder.signal]) : stopped;
+      const answerStop = () => {
+        if (responder.signal?.aborted) return;
+        const answer = hostStoppedWhileHandling();
+        this.emitTraceFn({ type: 'mcpl:inference_fail', serverId, model: null, error: answer.message, streamed: !!params.stream });
+        try { responder.respondError(answer.code, answer.message); } catch {}
+      };
+      stopped.addEventListener('abort', answerStop, { once: true });
+      try {
+        if (stopped.aborted) { answerStop(); return; }
+        if (signal.aborted) return;
+        const before = admission.check();
+        if (signal.aborted) return;
+        if (before) { responder.respondError(-32600, before); return; }
+        const verdict = await admission.admit('inference/request', params, signal);
+        if (signal.aborted) return;
+        let reason = admission.check();
+        try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
+        if (this.hookOrchestrator.isInHook) reason ??= 'admission_not_ready';
+        if (signal.aborted) return;
+        if (reason || !verdict.store || !verdict.mayWake) {
+          responder.respondError(-32600, reason ?? (!verdict.store ? verdict.reason : 'admission_denied'));
+          return;
+        }
+      } finally {
+        stopped.removeEventListener('abort', answerStop);
+      }
     }
 
     // Streaming needs a way to send chunks and an id to tag them with;

@@ -34939,9 +34939,18 @@ export class AgentFramework {
           this.refuseServerItem('inference/request', connection.id, responder);
           return;
         }
-        // Required delivery stays closed until the inference admission adapter is installed.
         if (connection.requiredAdmission) {
-          responder.respondError(-32600, 'admission_unsupported');
+          const original = connection.admissionFor(params);
+          const admission: RequiredIngress = {
+            ...original,
+            check: () => this.queue?.isClosed || this.pushCoalescer?.isRendering(connection.id) ? 'admission_not_ready' :
+              this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
+          };
+          await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
+            respond: responder.respond, respondError: responder.respondError, requestId: responder.id,
+            ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
+            ...(responder.signal ? { signal: responder.signal } : {}),
+          }, admission);
           return;
         }
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
