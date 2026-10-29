@@ -1538,15 +1538,15 @@ test("a render stored for a live turn, out of its window, wakes its agent though
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
 
-test("a notice after a render landed unread in a live turn's deferred queue leaves it there, and the turn reads it before the newer render (#548)", async (t) => {
+test("a notice after a render stored unread for a live turn, out of its window, leaves it there, and the turn reads it before the newer render (#548)", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   let renders = 0;
   f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
   await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
   const internals = f.framework as unknown as TurnInternals;
-  // The primary's turn is alive, so 'other''s assembly places the render in
-  // the primary's deferred queue, unread. A notice then arrives. The render
+  // The primary's turn is alive, so 'other''s assembly stores the render for
+  // the primary, out of its window, unread. A notice then arrives. The render
   // is a delta the next one builds on (RFC-006 §5.2), so it stays, and the
   // notice's batch follows the primary.
   internals.activeTurnTokens.set('agent', -1);
@@ -1564,7 +1564,7 @@ test("a notice after a render landed unread in a live turn's deferred queue leav
   assert(request.includes('first_render') && request.indexOf('first_render') < request.indexOf('second_render'), 'one call read the first render, then the second');
 });
 
-test("a render placed in a live turn's deferred queue takes a newer batch of its subject to its agent, so another agent's assembly leaves that batch and the render's wake alone", async (t) => {
+test("a render stored for a live turn, out of its window, takes a newer batch of its subject to its agent, so another agent's assembly leaves that batch and the render's wake alone", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
@@ -1579,11 +1579,11 @@ test("a render placed in a live turn's deferred queue takes a newer batch of its
   });
   await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
   const internals = f.framework as unknown as TurnInternals;
-  // As above: the primary's turn is alive, 'other''s assembly renders the
-  // batch into the primary's queue, and a notice during the render opens a
-  // newer batch, which wakes both. Once the render lands, the newer batch
-  // follows the primary, whose queue holds the render it builds on (RFC-006
-  // §5.2), wakes included. In the next pass the primary is still busy, and
+  // As above: the primary's turn is alive, 'other''s assembly stores the
+  // render for the primary, out of its window, and a notice during the render
+  // opens a newer batch, which wakes both. Once the render lands, the newer
+  // batch follows the primary, whose store holds the render it builds on
+  // (RFC-006 §5.2), wakes included. In the next pass the primary is still busy, and
   // 'other' has no wake left for the batch: the batch waits, with its wake,
   // for the primary.
   internals.activeTurnTokens.set('agent', -1);
@@ -2234,7 +2234,7 @@ test("a provider hold keeps a wake to read a render or a stored message, a batch
     'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 
-test("an assembly that throws closes the window in which its writes bypass the turn's deferral", async (t) => {
+test("an assembly that throws ends the span in which its agent's writes go to the turn it assembles", async (t) => {
   const f = await fixture(); t.after(f.close);
   f.alwaysRespond();
   await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
@@ -2343,17 +2343,16 @@ test("a render that lands while the host is quiesced, for the agent whose assemb
   assert(carried(), "a turn of the agent's read the render once the host resumed");
 });
 
-test("a render queued for one resident isn't another resident's to read once its flush has stored it", async (t) => {
+test("a render stored for one resident while its turn is alive isn't another resident's to read, and its own turn reads it", async (t) => {
   const f = await fixture({ agents: [...TWO_RESIDENTS, { name: 'third', model: 'test', systemPrompt: 'test' }] }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
   await f.send('push/event', f.params('1', 'queued_fallback', { deferred: true, initial: true }));
   const internals = f.framework as unknown as TurnInternals;
   // One pass takes all three wakes. The primary's turn is alive (a stand-in
-  // token), so its wake waits; 'other''s assembly renders the batch into the
-  // primary's queue, and the primary is woken for it. Before 'third''s turn
-  // starts, the primary's turn ends, and its flush stores the render, as a
-  // torn-down turn's does.
+  // token), so its wake waits; 'other''s assembly stores the render for the
+  // primary, out of its window, and the primary is woken for it. Before
+  // 'third''s turn starts, the primary's turn ends.
   const start = internals.startAgentStream.bind(internals);
   internals.startAgentStream = async (...a: unknown[]) => {
     if ((a[0] as { name: string }).name === 'third') {
