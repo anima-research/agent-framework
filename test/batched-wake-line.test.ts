@@ -1004,8 +1004,11 @@ describe('a debounced batch of targeted messages', () => {
     author: { id: 'u-1', name: 'antra' }, content: [{ type: 'text', text }],
     timestamp: new Date().toISOString(), tags: ['chat:addressed'], triggerInference: true, ...extra,
   });
-  const wakeRoutes = (internals: Internals) => (batchWakes(internals) as Array<{ agentName: string; wakeChannelId?: string }>)
-    .map((r) => [r.agentName, r.wakeChannelId]).sort();
+  const wakeRoutes = (internals: Internals) => (batchWakes(internals) as Array<{ agentName: string; channelId?: string }>)
+    .map((r) => [r.agentName, r.channelId]).sort();
+  const wakeLineMessages = (internals: Internals, name: string) =>
+    (batchWakes(internals).find((r) => r.agentName === name)?.wakeLines as Array<{ entry: { messageId?: string } }> | undefined ?? [])
+      .map((line) => line.entry.messageId);
   const gateLinesIn = (framework: AgentFramework, name: string) => windowTexts(framework, name).filter((t) => t.includes('[Gate:'));
 
   it("messages for two co-residents in one batch: each is woken for her own, routed to her own channel, and her line names only her channel", async () => {
@@ -1036,7 +1039,8 @@ describe('a debounced batch of targeted messages', () => {
       await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b1', 'mira, a word', { targetAgents: ['mira'] }));
       await waitFor(() => batchWakes(internals).length >= 2, 'the batch to fire');
       assert.deepEqual(wakeRoutes(internals), [['mira', ROOM_B], ['scout', ROOM_A]], 'scout is routed to the message he may see');
-      assert.ok(!gateLinesIn(framework, 'scout').some((t) => t.includes('room-b')), "no line in scout's window names mira's channel");
+      assert.deepEqual(wakeLineMessages(internals, 'scout'), ['m-u1'], "scout's wake carries the line for the first message, newest in his window");
+      assert.deepEqual(gateLinesIn(framework, 'scout'), [], "and no line is written into scout's window");
       const mira = gateLinesIn(framework, 'mira');
       assert.equal(mira.length, 1, "mira's window holds one line");
       assert.ok(mira[0]!.includes('room-a') && mira[0]!.includes('room-b'), `mira's line names both: ${mira[0]}`);
