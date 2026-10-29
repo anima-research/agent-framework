@@ -267,6 +267,9 @@ test('a failed create() gives up on a module\'s stop after 30 s, and says what d
   await retried.stop();
 });
 
+const LONGER_THAN_ANY_START_MS = 60_000;
+const NEVER_FIRES_IN_A_TEST_MS = 2 * LONGER_THAN_ANY_START_MS;
+
 // The watchdog's worker kills the whole process once the main thread stops
 // beating for its threshold. One a failed create() left running would kill a
 // process that carried on after the failure.
@@ -276,34 +279,55 @@ test('a create() refused after it started the watchdog leaves none to kill the p
   const index = pathToFileURL(join(import.meta.dirname, '../src/index.js')).href;
   const membrane = pathToFileURL(join(import.meta.dirname, 'helpers/mock-membrane.js')).href;
   writeFileSync(script, `
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
     import { AgentFramework } from ${JSON.stringify(index)};
     import { MockMembrane } from ${JSON.stringify(membrane)};
+    const workerThreads = createRequire(import.meta.url)('node:worker_threads');
+    const watchdogs = [];
+    workerThreads.Worker = class extends workerThreads.Worker {
+      constructor(filename, options) {
+        super(filename, options);
+        if (String(filename).includes('liveness-watchdog-worker')) {
+          console.error('watchdog worker started');
+          const exited = new Promise(done => this.once('exit', () => { console.error('watchdog worker exited'); done(); }));
+          watchdogs.push({ worker: this, exited });
+        }
+      }
+    };
+    syncBuiltinESMExports();
     const refusal = await AgentFramework.create({
       storePath: ${JSON.stringify(join(dir, 'store'))}, membrane: new MockMembrane().asMembrane(),
       agents: [], modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-      watchdog: { enabled: true, thresholdMs: 2000, action: 'exit' },
+      watchdog: { enabled: true, thresholdMs: ${NEVER_FIRES_IN_A_TEST_MS}, action: 'exit' },
       toolResultInlineMaxChars: 1,
     }).then(() => 'none', error => error.message);
     console.error('refused: ' + refusal);
-    await new Promise(done => setTimeout(done, 200));
-    const end = Date.now() + 5000;
-    while (Date.now() < end) {}
+    if (refusal === 'none') process.exit(0);
+    for (const { worker } of watchdogs) worker.ref();
+    await Promise.all(watchdogs.map(({ exited }) => exited));
     process.exit(0);
   `);
   // A file, not a pipe: writes to it are synchronous on every platform, so a
   // killed child's lines are all there.
   const logPath = join(dir, 'child.log');
   const log = openSync(logPath, 'w');
+  let gaveUp = false;
   const { code, signal } = await new Promise<{ code: number | null; signal: string | null }>(resolve => {
     const child = spawn(process.execPath, [script], { stdio: ['ignore', log, log] });
-    const safety = setTimeout(() => child.kill('SIGTERM'), 20_000);
-    child.on('exit', (code, signal) => { clearTimeout(safety); resolve({ code, signal }); });
+    const giveUp = setTimeout(() => { gaveUp = true; child.kill('SIGKILL'); }, LONGER_THAN_ANY_START_MS);
+    child.on('exit', (code, signal) => { clearTimeout(giveUp); resolve({ code, signal }); });
   });
   closeSync(log);
   const output = readFileSync(logPath, 'utf8');
+  const started = (output.match(/^watchdog worker started$/gm) ?? []).length;
+  const exited = (output.match(/^watchdog worker exited$/gm) ?? []).length;
+  const neverExited = started > exited && /^refused: /m.test(output);
+  assert.ok(!gaveUp, `${neverExited ? 'the watchdog worker started and never exited' : "the child hadn't finished"}: ` +
+    `the test ended it after ${LONGER_THAN_ANY_START_MS} ms. It had printed: ${JSON.stringify(output)}`);
+  assert.deepEqual({ code, signal }, { code: 0, signal: null }, `the child ended by ${signal ?? `code ${code}`}. It had printed: ${JSON.stringify(output)}`);
   assert.match(output, /\[liveness-watchdog\] armed/, 'the watchdog started before the refusal');
   assert.match(output, /refused: FrameworkConfig\.toolResultInlineMaxChars must be a number >= 1000/);
-  assert.deepEqual({ code, signal }, { code: 0, signal: null });
+  assert.equal(started, 1, "the child saw the watchdog's worker start: it watches for a worker whose file names liveness-watchdog-worker");
 });
 
 test('a failed create() on a restart leaves the workspace\'s saved pins as they were', async t => {
