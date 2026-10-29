@@ -2654,7 +2654,7 @@ test("a render whose store write is refused keeps its batch, which its recovery 
   assert.equal(coalescer.pendingBatches(), 0);
 });
 
-test("a render whose store write is refused leaves a batch opened while it rendered to be delivered", { timeout: 120_000 }, async (t) => {
+test("a render whose store write is refused leaves a batch opened while it rendered to be delivered as its fallback, not rendered on top of the render the agent never got", { timeout: 120_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   f.alwaysRespond();
   let release!: (value: unknown) => void;
@@ -2693,6 +2693,8 @@ test("a render whose store write is refused leaves a batch opened while it rende
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert(read(), "a turn of the agent's read the newer batch");
+  assert(f.membrane.calls.some((c) => JSON.stringify(c).includes('second_fallback')), 'as its fallback');
+  assert.equal(renders, 1, 'the server was asked to render the first batch only');
 });
 
 test("a render stored whose modules' handling then throws is stored once and not delivered again", async (t) => {

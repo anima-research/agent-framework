@@ -1174,7 +1174,8 @@ export class PushCoalescer<E = unknown> {
           placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
         } catch (error) {
           this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error) });
-          if (!state.batch) {
+          if (state.batch) state.batch.noRender = true;
+          else {
             batch.noRender = true;
             state.batch = batch;
           }
