@@ -166,6 +166,7 @@ function wireDigest(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
+const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
 
 export function assertThinkingBinding(setting: string, value: AgentConfig['thinkingBinding']): void {
   if (holdsSettings(setting, value, '{ binds: true, dropBlock: true }')) {
@@ -1199,6 +1200,63 @@ export class Agent {
   }
 
   /**
+   * Keep the stored rows from `first` through `last` raw for the turn now
+   * opening, with a raw pin under one name per agent. Any pin of that name
+   * already held is removed first, one a crash left included. Under a
+   * strategy without pins nothing is pinned. A committing compile that
+   * refuses as over budget while a pin of that name is held removes it and
+   * compiles once more, and `unpinTurnInputs` removes it. Returns the pin's
+   * id, or undefined when nothing was pinned.
+   *
+   * @internal For the framework's turn starts; not a host API.
+   */
+  pinTurnInputs(first: MessageId, last: MessageId): string | undefined {
+    if (!this.unpinTurnInputs()) return undefined;
+    const cm = this.contextManager;
+    if (typeof (cm.getStrategy() as { pinRange?: unknown }).pinRange !== 'function') return undefined;
+    try {
+      return cm.pinRange(first, last, { name: TURN_INPUTS_PIN });
+    } catch (error) {
+      console.error(`[turn-inputs] ${this.name}: could not pin the turn's inputs (${first}..${last}), so they may be compressed:`, error);
+      return undefined;
+    }
+  }
+
+  /** Remove the turn's input pin `pinId`, or without one every pin of its
+   *  name. False when a removal threw.
+   *  @internal For the framework's turn starts and ends; not a host API. */
+  unpinTurnInputs(pinId?: string): boolean {
+    try {
+      for (const pin of this.contextManager.listPins()) {
+        if (pin.name === TURN_INPUTS_PIN && (pinId === undefined || pin.id === pinId)) this.contextManager.unpin(pin.id);
+      }
+      return true;
+    } catch (error) {
+      console.error(`[turn-inputs] ${this.name}: could not remove the turn's input pin:`, error);
+      return false;
+    }
+  }
+
+  private async compileUnpinningOnRefusal(compile: () => Promise<CompileResult>): Promise<CompileResult> {
+    const pinned = this.holdsTurnInputsPin();
+    try {
+      return await compile();
+    } catch (error) {
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || !pinned || !this.unpinTurnInputs()) throw error;
+      console.error(`[turn-inputs] ${this.name}: the compile refused with the turn's inputs pinned, so they are unpinned and it compiles again`);
+      return compile();
+    }
+  }
+
+  private holdsTurnInputsPin(): boolean {
+    try {
+      return this.contextManager.listPins().some((pin) => pin.name === TURN_INPUTS_PIN);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Per destination (a server's channel, by its key), the newest consumed
    * watermark the agent had read when it published there by a route the
    * framework sees (its prose, a sleep's announcement, a channel_publish, a
@@ -1327,7 +1385,9 @@ export class Agent {
    * run. It isn't told the agent's thinking binding (`thinkingBinding.binds`),
    * so a context manager that keeps a thinking-binding record neither reads
    * nor writes the record here, and what it returns keeps thinking whose
-   * earlier conversation changed. */
+   * earlier conversation changed. Called while a turn's input pin is held
+   * (pinTurnInputs), a refusal as over budget removes the pin and compiles
+   * once more, as the turn's own compiles do. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
@@ -1335,7 +1395,7 @@ export class Agent {
     const marksBefore = this.watermarkMarks;
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.contextManager.compile(this.compileBudget(budget));
+    const compile = () => this.compileUnpinningOnRefusal(() => this.contextManager.compile(this.compileBudget(budget)));
     let result: CompileResult;
     try {
       result = budget ? await compile() : await this.compileAtLiveBudget(compile);
@@ -1591,7 +1651,8 @@ export class Agent {
     // agent before the consumed watermark moves, once it returns.
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const select = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
       result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
