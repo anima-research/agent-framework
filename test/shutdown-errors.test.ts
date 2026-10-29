@@ -210,8 +210,8 @@ for (const synchronous of [false, true]) {
     const order: string[] = [];
     const registry = new McplServerRegistry();
     const servers = (registry as unknown as { servers: Map<string, McplServerConnection> }).servers;
-    servers.set('failing', { close: () => synchronous ? (() => { throw failure; })() : Promise.reject(failure) } as unknown as McplServerConnection);
-    servers.set('delayed', { close: async () => { await waiting; order.push('connection-closed'); } } as unknown as McplServerConnection);
+    servers.set('failing', { stopReconnecting() {}, close: () => synchronous ? (() => { throw failure; })() : Promise.reject(failure) } as unknown as McplServerConnection);
+    servers.set('delayed', { stopReconnecting() {}, close: async () => { await waiting; order.push('connection-closed'); } } as unknown as McplServerConnection);
     const { framework, store } = await fixture(t);
     (framework as unknown as { mcplServerRegistry: McplServerRegistry }).mcplServerRegistry = registry;
     const sync = store.sync.bind(store), close = store.close.bind(store);

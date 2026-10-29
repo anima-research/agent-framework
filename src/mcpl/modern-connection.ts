@@ -520,6 +520,14 @@ export class ModernMcpConnection extends EventEmitter {
     return this.reconnectEnabled && !this.closedByHost && this.unreaped.length === 0;
   }
 
+  /**
+   * Stop reconnecting, closing nothing, as the legacy engine's does.
+   * @internal For the framework's stop(); not a host API.
+   */
+  stopReconnecting(): void {
+    this.reconnectEnabled = false;
+  }
+
   /** Whether close() has been called: closed for good, or closing. A
    *  connection lost on its own is not closed in this sense. */
   get isClosed(): boolean {

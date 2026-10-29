@@ -726,6 +726,20 @@ export class McplServerConnection extends EventEmitter {
     return this.reconnectEnabled;
   }
 
+  /**
+   * Stop reconnecting, closing nothing: a retry already scheduled starts
+   * nothing when its timer fires, none is scheduled after, and an attempt
+   * under way is aborted, as close() aborts it, so one still waiting on its
+   * access provider never dials and a child it spawned is reaped. The host's
+   * stop() does this first, so nothing is launched or dialed while it shuts
+   * down; close() clears the timer.
+   * @internal For the framework's stop(); not a host API.
+   */
+  stopReconnecting(): void {
+    this.reconnectEnabled = false;
+    this.reconnecting?.abort.abort();
+  }
+
   /** Whether a child this connection launched couldn't be confirmed exited.
    *  While it's true the connection owns that child, so whatever registered
    *  it keeps its id held; close() retries the reap. */
