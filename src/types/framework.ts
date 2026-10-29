@@ -368,18 +368,18 @@ export interface FrameworkConfig {
    * failure gets no retries from the error policy: on another transient
    * failure the next delay follows, until the list runs out, and a failure of
    * any other kind ends the re-arming. The one exception is a re-armed turn's
-   * send that fails with a deadline membrane marks, as when a stream stalls.
+   * send that fails with a deadline marked as run out, membrane's or a bound
+   * the host sets on the call (`inferenceBounds`), as when a stream stalls.
    * Such a cut counts as a transient failure, so a turn that ends on it is
    * re-armed as for a transient failure, unless it follows another such cut
    * with no transient failure, answered round or message said to the agent
    * between them: two such cuts in a row end the re-arming, and the second
    * gets no retry from the error policy, even in a re-armed turn that got
-   * partway. A transient failure or
-   * an answered round in any of the agent's turns clears an earlier cut, and
-   * so does a message said to the agent. Every such cut counts, including one
-   * the error policy retries or a host's provider hold takes. A deadline the
-   * host sets still ends it. A wake for the agent while it waits starts its
-   * turn at once, with the re-armed trigger merged in. That turn is the
+   * partway. A transient failure or an answered round in any of the agent's
+   * turns clears an earlier cut, and so does a message said to the agent.
+   * Every such cut counts, including one the error policy retries or a host's
+   * provider hold takes. A wake for the agent while it waits starts its turn
+   * at once, with the re-armed trigger merged in. That turn is the
    * wake's: the error policy retries its failures. A completed turn starts the
    * count again, and so does a message said to the agent: not a system message
    * or notice; not an edit, reaction or deletion, unless an edit is the first
