@@ -20,7 +20,7 @@ import { AgentFramework } from '../src/index.js';
 import type { Module, ModuleContext, ModuleMessage, ToolDefinition, ToolResult } from '../src/index.js';
 import { DiscordModule } from '../src/modules/discord/index.js';
 import type { DiscordClientInterface, DiscordMessageData, HistoryMessage } from '../src/modules/discord/types.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 /** The Discord side: the module's handlers, and the history a sync fetches. */
 class FakeDiscord {
@@ -162,3 +162,189 @@ test("a create whose write hasn't landed ends its record once its held row shows
     assert.deepEqual(rows('m4').map((m) => [m.held, textOf(m)]), [[true, 'edited while offline']]);
   });
 });
+
+type Hold = 'a branch move holding the store' | "the primary's recovery wait";
+
+async function withKeptCreate(
+  hold: Hold,
+  run: (s: { framework: AgentFramework; discord: FakeDiscord; processed: (type: string, id: string) => Promise<void>; kept: () => number; texts: (id: string) => string[] }) => Promise<void>,
+  options: { triggerOn?: 'all'; modules?: Module[]; membrane?: MockMembrane } = {},
+): Promise<{ framework: AgentFramework; texts: (id: string) => string[]; cleanup: () => Promise<void> }> {
+  const dir = mkdtempSync(join(tmpdir(), 'discord-kept-create-'));
+  const discord = new FakeDiscord();
+  const module = new DiscordModule(discord as unknown as DiscordClientInterface, { token: 't', autoTyping: false, ...(options.triggerOn ? { triggerOn: options.triggerOn } : {}) });
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: (options.membrane ?? new MockMembrane()).asMembrane(),
+    agents: [{ name: 'Sol', model: 'test-model', systemPrompt: 'test' }],
+    modules: [module, ...(options.modules ?? [])],
+  });
+  const cleanup = async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); };
+  const waiters: Array<{ type: string; id: string; done: () => void }> = [];
+  framework.onTrace((event) => {
+    if (event.type !== 'process:completed') return;
+    const done = event.processEvent as { type: string; discordMessageId?: string };
+    for (const w of waiters.splice(0)) {
+      if (w.type === done.type && w.id === done.discordMessageId) w.done(); else waiters.push(w);
+    }
+  });
+  const processed = (type: string, id: string) => new Promise<void>((done) => { waiters.push({ type, id, done }); });
+  const released = new Promise<void>((done) => framework.onTrace((event) => {
+    if (event.type === 'message:added' && event.source === 'surgery-release') done();
+  }));
+  const texts = (id: string) => framework.getAgent('Sol')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === id)
+    .map(textOf);
+  const kept = () => framework.getHostModeStatus().deferredWrites;
+  framework.start();
+  const branch = framework.getStore().currentBranch().name;
+  const strategy = framework.getAgent('Sol')!.getContextManager().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
+  const initialize = strategy.initialize;
+  const restore = () => { if (initialize) strategy.initialize = initialize; else delete strategy.initialize; };
+  const quiet = console.error;
+  try {
+    if (hold === 'a branch move holding the store') {
+      let open!: () => void;
+      const gate = new Promise<void>((resolve) => { open = resolve; });
+      let reached!: () => void;
+      const inMove = new Promise<void>((resolve) => { reached = resolve; });
+      strategy.initialize = async function (this: unknown, ...args: unknown[]) { reached(); await gate; return initialize?.apply(this, args); };
+      const move = framework.switchBranch(branch);
+      await inMove;
+      await run({ framework, discord, processed, kept, texts });
+      open();
+      await move;
+    } else {
+      strategy.initialize = async () => { throw new Error('zz-injected initialization failure'); };
+      console.error = () => {};
+      await framework.switchBranch(branch);
+      restore();
+      await run({ framework, discord, processed, kept, texts });
+      console.error = quiet;
+      await framework.switchBranch(branch);
+    }
+  } finally {
+    console.error = quiet;
+    restore();
+  }
+  await released;
+  return { framework, texts, cleanup };
+}
+
+async function drained(framework: AgentFramework): Promise<void> {
+  const marker = `zz-drained-${Math.random().toString(36).slice(2)}`;
+  const seen = new Promise<void>((done) => framework.onTrace((event) => {
+    if (event.type === 'process:completed' && (event.processEvent as { marker?: string }).marker === marker) done();
+  }));
+  (framework as unknown as { pushEvent(event: unknown): void }).pushEvent({ type: 'zz-drained', marker });
+  await seen;
+}
+
+for (const hold of ['a branch move holding the store', "the primary's recovery wait"] as const) {
+  test(`a message deleted while its create is kept in memory by ${hold} isn't stored once the hold releases`, async () => {
+    const s = await withKeptCreate(hold, async ({ discord, processed, kept, texts }) => {
+      const created = processed('discord:message', 'k1');
+      await discord.onMessageHandler!(live('k1', 'taken back'));
+      await created;
+      assert.deepEqual([kept(), texts('k1')], [1, []], 'the create is kept in memory, not stored');
+      const deleted = processed('discord:delete', 'k1');
+      discord.onDeleteHandler!('k1');
+      await deleted;
+    });
+    try {
+      await drained(s.framework);
+      assert.deepEqual(s.texts('k1'), [], 'the deleted message is not in the store');
+    } finally {
+      await s.cleanup();
+    }
+  });
+
+  test(`a message edited while its create is kept in memory by ${hold} is stored as edited once the hold releases`, async () => {
+    const s = await withKeptCreate(hold, async ({ discord, processed, kept, texts }) => {
+      const created = processed('discord:message', 'k2');
+      await discord.onMessageHandler!(live('k2', 'before'));
+      await created;
+      assert.deepEqual([kept(), texts('k2')], [1, []], 'the create is kept in memory, not stored');
+      const edited = processed('discord:edit', 'k2');
+      discord.onEditHandler!('k2', 'after');
+      await edited;
+    });
+    try {
+      await drained(s.framework);
+      assert.deepEqual(s.texts('k2'), ['after'], 'the store holds the edited text');
+    } finally {
+      await s.cleanup();
+    }
+  });
+}
+
+test("a message deleted and then edited while its create is kept in memory isn't stored once the hold releases", async () => {
+  const s = await withKeptCreate('a branch move holding the store', async ({ discord, processed, kept, texts }) => {
+    const created = processed('discord:message', 'k8');
+    await discord.onMessageHandler!(live('k8', 'taken back'));
+    await created;
+    assert.deepEqual([kept(), texts('k8')], [1, []], 'the create is kept in memory, not stored');
+    const deleted = processed('discord:delete', 'k8');
+    discord.onDeleteHandler!('k8');
+    await deleted;
+    const edited = processed('discord:edit', 'k8');
+    discord.onEditHandler!('k8', 'taken back, unfurled');
+    await edited;
+  });
+  try {
+    await drained(s.framework);
+    assert.deepEqual(s.texts('k8'), [], 'the deleted message is not in the store');
+  } finally {
+    await s.cleanup();
+  }
+});
+
+class Holder implements Module {
+  readonly name = 'holder';
+  private open!: () => void;
+  private readonly gate = new Promise<void>((resolve) => { this.open = resolve; });
+  private enter!: () => void;
+  readonly entered = new Promise<void>((resolve) => { this.enter = resolve; });
+  async start(): Promise<void> {}
+  async stop(): Promise<void> { this.open(); }
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(): Promise<ToolResult> { return { success: false, error: 'no tools', isError: true }; }
+  async onProcess(event: { type: string }): Promise<Record<string, never>> {
+    if (event.type === 'zz-hold') { this.enter(); await this.gate; }
+    return {};
+  }
+  release(): void { this.open(); }
+}
+
+for (const [change, kept, gone] of [['deleted', [], 'taken back'], ['edited', ['as edited'], 'as first sent']] as const) {
+  test(`a message ${change} while its create is kept in memory reaches no turn's request in its earlier form, when an event is still being handled at the release`, async () => {
+    const holder = new Holder();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    let requested!: () => void;
+    const firstRequest = new Promise<void>((resolve) => { requested = resolve; });
+    const stream = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request, options) => { requested(); return stream(request, options); };
+    const s = await withKeptCreate('a branch move holding the store', async ({ framework, discord, processed, kept: held, texts }) => {
+      const created = processed('discord:message', 'k5');
+      await discord.onMessageHandler!(live('k5', gone));
+      await created;
+      assert.deepEqual([held(), texts('k5')], [1, []], 'the create is kept in memory, not stored');
+      const changed = processed(change === 'deleted' ? 'discord:delete' : 'discord:edit', 'k5');
+      if (change === 'deleted') discord.onDeleteHandler!('k5'); else discord.onEditHandler!('k5', 'as edited');
+      await changed;
+      framework.pushEvent({ type: 'zz-hold' } as never);
+      await holder.entered;
+    }, { triggerOn: 'all', modules: [holder], membrane });
+    try {
+      holder.release();
+      await firstRequest;
+      const messages = JSON.stringify(membrane.calls[0]!.messages);
+      assert.ok(!messages.includes(gone), `the turn's request doesn't carry "${gone}"`);
+      await drained(s.framework);
+      assert.deepEqual(s.texts('k5'), kept);
+    } finally {
+      await s.cleanup();
+    }
+  });
+}

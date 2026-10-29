@@ -358,6 +358,7 @@ interface LiveCreate {
   /** The latest edit's text and attachments, from while it converted. */
   text?: string;
   attachments?: DiscordAttachment[];
+  unapplied?: 'delete' | { text: string; attachments?: DiscordAttachment[] };
 }
 
 /**
@@ -450,17 +451,20 @@ export class DiscordModule implements Module {
     // inference and its turn ending, so it stays alive for the whole turn
     // (including tool-call cycles) and stops cleanly whether the agent
     // responds, errors, or decides to stay silent.
-    if (this.config.autoTyping) {
-      this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
-        const agentName = (event as { agentName?: string }).agentName;
-        if (!agentName) return;
-        if (event.type === 'inference:started' && !event.silent) {
-          this.startTypingLoop(agentName);
-        } else if (TURN_TERMINAL_TRACES.has(event.type)) {
-          this.stopTypingLoop(agentName);
-        }
-      });
-    }
+    this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
+      if (event.type === 'message:added' && event.source === 'surgery-release') {
+        this.applyUnapplied();
+        return;
+      }
+      if (!this.config.autoTyping) return;
+      const agentName = (event as { agentName?: string }).agentName;
+      if (!agentName) return;
+      if (event.type === 'inference:started' && !event.silent) {
+        this.startTypingLoop(agentName);
+      } else if (TURN_TERMINAL_TRACES.has(event.type)) {
+        this.stopTypingLoop(agentName);
+      }
+    });
 
     // Set up Discord event handlers
     this.client.onMessage((message) => this.handleDiscordMessage(message));
@@ -864,53 +868,10 @@ export class DiscordModule implements Module {
     }
 
     // Handle Discord message edit
-    if (event.type === 'discord:edit') {
-      const edit = event as DiscordEditEvent;
-      // The message's row, not only its id: an edit changes the message's own
-      // text and keeps what the host added beside it, but for the blocks of
-      // attachments the edit took away, when the client passed the edit's
-      // attachments and the row is text-first.
-      // An edit that comes while the live path converts the message's create
-      // is folded into that create (handleDiscordMessageEdit). Any other edit
-      // to a message with no row is dropped: a history sync
-      // running now stores the text it fetched, and the next sync's text rule
-      // changes it. A row stored in shards can't be edited one shard at a
-      // time, so it keeps its text, and the host's log says so. Only an edit
-      // that writes marks the message live, so an update that changes nothing
-      // leaves a running sync free to rewrite the row.
-      const stored = this.storedRow(edit.discordMessageId);
-      if (!stored) return {};
-      if (stored.bodyGroupId) {
-        console.warn(`Discord: An update to message ${edit.discordMessageId} wasn't applied: it's stored in shards, which can't be edited, so if its text changed, the agent still has the earlier text`);
-        return {};
-      }
-      const texted = contentForText(stored, edit.newContent);
-      const content = edit.attachments && stored.metadata?.[TEXT_FIRST] === true
-        ? withoutGoneAttachments(texted ?? stored.content, edit.attachments)
-        : texted;
-      if (!content || content === stored.content) return {};
-      this.noteLive(edit.discordMessageId);
-      return { editMessages: [{ messageId: stored.id, content }] };
-    }
+    if (event.type === 'discord:edit') return this.answerEdit(event as DiscordEditEvent);
 
     // Handle Discord message delete
-    if (event.type === 'discord:delete') {
-      const del = event as DiscordDeleteEvent;
-      // Every row of the message goes, so one stored twice doesn't outlive
-      // its delete as a copy. A row stored in shards is removed whole: the
-      // framework takes out the body a shard belongs to. The message is the
-      // live path's even when no row is found, so a running sync doesn't
-      // store what its fetch may still hold, and that ends its entry.
-      this.noteLive(del.discordMessageId);
-      this.creating.delete(del.discordMessageId);
-      const rows = this.storedRows(del.discordMessageId);
-      if (rows.length === 0) {
-        return {};
-      }
-      return {
-        removeMessages: oncePerBody(rows),
-      };
-    }
+    if (event.type === 'discord:delete') return this.answerDelete(event as DiscordDeleteEvent);
 
     return {};
   }
@@ -1481,6 +1442,82 @@ export class DiscordModule implements Module {
       newContent,
       ...(attachments ? { attachments } : {}),
     });
+  }
+
+  private answerEdit(edit: DiscordEditEvent): EventResponse {
+    // The message's row, not only its id: an edit changes the message's own
+    // text and keeps what the host added beside it, but for the blocks of
+    // attachments the edit took away, when the client passed the edit's
+    // attachments and the row is text-first.
+    // An edit that comes while the live path converts the message's create
+    // is folded into that create (handleDiscordMessageEdit). One that comes
+    // once onProcess answered the create and finds no row is kept on its
+    // entry (LiveCreate.unapplied), unless a delete is kept there already.
+    // Any other edit
+    // to a message with no row is dropped: a history sync
+    // running now stores the text it fetched, and the next sync's text rule
+    // changes it. A row stored in shards can't be edited one shard at a
+    // time, so it keeps its text, and the host's log says so. Only an edit
+    // that writes marks the message live, so an update that changes nothing
+    // leaves a running sync free to rewrite the row.
+    const stored = this.storedRow(edit.discordMessageId);
+    if (!stored) {
+      const live = this.creating.get(edit.discordMessageId);
+      if (live?.phase === 'writing' && live.unapplied !== 'delete') {
+        live.unapplied = { text: edit.newContent, ...(edit.attachments ? { attachments: edit.attachments } : {}) };
+      }
+      return {};
+    }
+    if (stored.bodyGroupId) {
+      console.warn(`Discord: An update to message ${edit.discordMessageId} wasn't applied: it's stored in shards, which can't be edited, so if its text changed, the agent still has the earlier text`);
+      return {};
+    }
+    const texted = contentForText(stored, edit.newContent);
+    const content = edit.attachments && stored.metadata?.[TEXT_FIRST] === true
+      ? withoutGoneAttachments(texted ?? stored.content, edit.attachments)
+      : texted;
+    if (!content || content === stored.content) return {};
+    this.noteLive(edit.discordMessageId);
+    return { editMessages: [{ messageId: stored.id, content }] };
+  }
+
+  private answerDelete(del: DiscordDeleteEvent): EventResponse {
+    // Every row of the message goes, so one stored twice doesn't outlive
+    // its delete as a copy. A row stored in shards is removed whole: the
+    // framework takes out the body a shard belongs to. The message is the
+    // live path's even when no row is found, so a running sync doesn't
+    // store what its fetch may still hold, and that ends its entry, but for
+    // an answered create with no row, which keeps the delete
+    // (LiveCreate.unapplied).
+    this.noteLive(del.discordMessageId);
+    const rows = this.storedRows(del.discordMessageId);
+    const live = this.creating.get(del.discordMessageId);
+    if (rows.length === 0 && live?.phase === 'writing') {
+      live.unapplied = 'delete';
+      return {};
+    }
+    this.creating.delete(del.discordMessageId);
+    if (rows.length === 0) {
+      return {};
+    }
+    return {
+      removeMessages: oncePerBody(rows),
+    };
+  }
+
+  private applyUnapplied(): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    for (const [discordMessageId, live] of this.creating) {
+      const unapplied = live.unapplied;
+      if (unapplied === undefined || !this.storedRow(discordMessageId)) continue;
+      live.unapplied = undefined;
+      const answer = unapplied === 'delete'
+        ? this.answerDelete({ type: 'discord:delete', discordMessageId })
+        : this.answerEdit({ type: 'discord:edit', discordMessageId, newContent: unapplied.text, ...(unapplied.attachments ? { attachments: unapplied.attachments } : {}) });
+      for (const { messageId, content } of answer.editMessages ?? []) ctx.editMessage(messageId, content);
+      for (const id of answer.removeMessages ?? []) ctx.removeMessage(id);
+    }
   }
 
   private handleDiscordMessageDelete(messageId: string): void {
