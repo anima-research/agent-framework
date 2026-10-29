@@ -24,11 +24,9 @@
  * rollback, suppression and branch moves never touch them. A draft written
  * in a turn that is later undone stays usable (the words were genuinely
  * written and held back), and a delivered draft stays delivered. The
- * notices that name a draft are conversation, so they do follow the branch
- * and the window: a draft counts as named while a notice of its resident
- * naming it is on the current branch and hasn't been taken out of that
- * resident's window as an undone turn's, and one a rollback, a branch move
- * or an undo has left unnamed is named again.
+ * notices that name a draft are conversation, so they do follow the branch: a draft counts as
+ * named while a message naming it is on the current branch, and one a
+ * rollback or branch move has left unnamed is named again.
  *
  * Drafts are kept, not hoarded. Each resident's KEEP_NEWEST newest drafts
  * are always kept; an older one, in any state, is let go at the journal's
