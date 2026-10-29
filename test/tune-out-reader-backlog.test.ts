@@ -44,6 +44,8 @@ const meta = (author: string, where: Where = {}) => ({
 
 function world(opts: { subconscious?: boolean } = {}) {
   const stored: StoredMessage[] = [];
+  /** The held messages a surgery's hold keeps in memory, not stored yet (getSurgeryHeldMessages). */
+  const kept: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> = [];
   /** What the persistent subconscious is given, with `subconscious: true`. */
   const looks: Array<{ text: string; kind: unknown }> = [];
   const invocations: ReaderInvocation[] = [];
@@ -82,6 +84,7 @@ function world(opts: { subconscious?: boolean } = {}) {
     deliverFromReader: () => {},
     primaryName: () => 'scout',
     getStoredMessages: () => stored,
+    getSurgeryHeldMessages: () => kept,
     // The store's sequence: its newest row's, as chronicle's currentSequence.
     currentSequence: () => nextSeq - 1,
     setSubconsciousAnchor: () => {},
@@ -131,6 +134,16 @@ function world(opts: { subconscious?: boolean } = {}) {
       } as unknown as StoredMessage;
       stored.push(message);
       return message;
+    },
+    /** A held message a surgery's hold keeps in memory, as framework.addMessage does during one. */
+    keep(author: string, body: string, where: Where = {}): void {
+      kept.push({ participant: 'user', content: [text(body)], metadata: meta(author, where) } as Pick<StoredMessage, 'participant' | 'content' | 'metadata'>);
+    },
+    /** The hold's release: what it kept is stored, in arrival order. */
+    releaseHold(): void {
+      for (const write of kept.splice(0)) {
+        stored.push({ id: `m-${nextSeq}`, sequence: nextSeq++, timestamp: new Date(), ...write } as unknown as StoredMessage);
+      }
     },
     wake: (serverId = SERVER, channelId = NOISY) => internals.invokeSubconscious(serverId, channelId, 'wake', 1),
     startCadence: (seconds: number) => internals.startCadence(SERVER, NOISY, seconds),
@@ -427,6 +440,30 @@ describe('a cadence look for held messages no reader has looked at, though nothi
       [NOISY]: ['N-1 in noisy'],
       [OTHER]: ['O-1 in other'],
     });
+    w.coordinator.stop();
+  });
+
+  // AF-C-2: a cadence tick or a wake during a surgery's hold reset the tally
+  // to 0, though the held message the hold kept in memory was handed to no
+  // fork; after the release, no cadence look counted it.
+  it("a held message a surgery's hold keeps in memory still counts after a look during the hold, and the first period after the release hands it", (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world();
+    w.tuneOut();
+    w.startCadence(30);
+    w.keep('ann', 'KEPT-1 during the hold');
+    w.coordinator.recordHeld(SERVER, NOISY, 'x1', [], 'ann', true);
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 0, 'a period during the hold has nothing stored to hand');
+    w.wake();
+    assert.equal(w.invocations.length, 1, 'a wake during the hold derives a fork');
+    assert.deepEqual(bodies(w.invocations[0]!), [], 'handed nothing: the kept message is not stored');
+    w.releaseHold();
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 2, 'the first period after the release reads it');
+    assert.deepEqual(bodies(w.invocations[1]!), ['KEPT-1 during the hold']);
+    t.mock.timers.tick(30_000);
+    assert.equal(w.invocations.length, 2, 'and the next is quiet');
     w.coordinator.stop();
   });
 

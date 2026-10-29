@@ -1676,8 +1676,11 @@ export class TuneOutCoordinator {
       // The count restarts once the fork has been handed what was held, as it
       // does below once the subconscious's turn has been asked for. Otherwise
       // every later cadence period still sees this one's count and derives a
-      // fork with nothing new to read.
-      this.divertedSinceInvocation.set(key, 0);
+      // fork with nothing new to read. A held message a surgery's hold, or a
+      // manager waiting for its recovery, keeps in memory wasn't handed: it
+      // isn't stored yet. It still counts, so the first cadence period after
+      // it is stored hands it.
+      this.divertedSinceInvocation.set(key, this.keptInMemory(inChannel));
       return;
     }
     this.hooks.addMessage(
@@ -1692,6 +1695,16 @@ export class TuneOutCoordinator {
     this.divertedSinceInvocation.set(key, 0);
     const epochId = this.holdFor(serverId, channelId)?.epochId;
     if (epochId) this.markLook(epochId, serverId, channelId);
+  }
+
+  /** How many of the writes the framework keeps in memory (getSurgeryHeldMessages) `keep` keeps; 0 where they can't be read. */
+  private keptInMemory(keep: (m: Pick<StoredMessage, 'metadata'>) => boolean): number {
+    try {
+      return (this.hooks.getSurgeryHeldMessages?.() ?? []).filter(keep).length;
+    } catch (err) {
+      console.error('[tune-out] could not read the writes a surgery holds in memory, so none is counted:', err);
+      return 0;
+    }
   }
 
   /**
