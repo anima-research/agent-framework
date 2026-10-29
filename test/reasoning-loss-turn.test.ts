@@ -414,7 +414,7 @@ describe('Agent.onThinkingStrip', () => {
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       const heard: string[] = [];
       agent.onThinkingStrip = (given, branch) => {
-        assert.equal(given, strip);
+        assert.deepEqual(given, strip);
         heard.push(branch);
       };
       const main = branchKey(contextManager.currentBranchRef());
