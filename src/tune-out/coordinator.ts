@@ -254,9 +254,9 @@ export interface TuneOutFrameworkHooks {
    * than stored: a live surgery's hold, or a context manager of the primary
    * or the subconscious refusing its work until a switch re-initializes it.
    * A cancel then waits (deferCancel), the tune-out still in force, until
-   * the framework says the writes are stored again (runDeferredCancels), so
-   * the release is in the store before the epoch's end is recorded. Left
-   * out, never.
+   * the framework says the writes are stored again, or told of where storing
+   * one fails (runDeferredCancels), so the release is in the store before
+   * the epoch's end is recorded. Left out, never.
    */
   writesHeld?: () => boolean;
   /**
@@ -381,8 +381,8 @@ export class TuneOutCoordinator {
    * Cancels asked for while the framework keeps writes in memory
    * (writesHeld), by channel key, the all-except hold's under SCOPE_KEY:
    * each runs as it was asked, with its note, or a later cancel's when it
-   * had none (deferCancel), once the writes are stored again
-   * (runDeferredCancels).
+   * had none (deferCancel), once the writes are stored again, or told of
+   * where storing one fails (runDeferredCancels).
    * In memory: a restart before then finds the tune-out still in force,
    * and an end time that passed cancels it at once (resumeActiveEpochs).
    */
@@ -941,8 +941,9 @@ export class TuneOutCoordinator {
    * synthesized here. While the framework keeps writes in memory
    * (writesHeld: a surgery's hold, a manager refusing its work), nothing
    * ends yet: the cancel waits, the tune-out in force, and runs once the
-   * writes are stored (runDeferredCancels), so its release is stored
-   * before its end is recorded. It answers `deferred` then.
+   * writes are stored, or told of where storing one fails
+   * (runDeferredCancels), so its release is stored before its end is
+   * recorded. It answers `deferred` then.
    */
   cancel(
     serverId: string,
