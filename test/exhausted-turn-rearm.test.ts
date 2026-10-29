@@ -978,6 +978,16 @@ test("a re-armed continuation keeps its channel when an ambient wake from anothe
   assert.deepEqual(routingOf(r)?.triggerChannel, { serverId: 'zz-srv', channelId: 'zz-chan' });
 });
 
+test('an agent ended through the registry takes its re-armed deadline cut with it, so its name bound again starts its chain afresh', async (t) => {
+  const r = await resident(t, new ScriptedMembrane(() => undefined), {
+    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }, { name: 'second', model: 'zz-model', systemPrompt: 'system' }],
+  });
+  const cuts = (r.fw as unknown as { rearmDeadlineCuts: Set<string> }).rearmDeadlineCuts;
+  cuts.add('second');
+  r.fw.stopAgent('second', { by: 'test' });
+  assert.equal(cuts.has('second'), false);
+});
+
 test('stop() drops a turn waiting to be sent again', async (t) => {
   const membrane = new ScriptedMembrane(() => serverError);
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: [60_000] });

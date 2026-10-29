@@ -11889,6 +11889,7 @@ export class AgentFramework {
     // waits ends here as at a turn's end, alerted if it ran long
     // (endStatedWaitRun).
     this.turnRearms.delete(name);
+    this.rearmDeadlineCuts.delete(name);
     this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
     this.endStatedWaitRun(name);
