@@ -2094,6 +2094,29 @@ describe('the framework wires the reply judge', () => {
     assert.deepStrictEqual(internal.upcomingWakesFor('scout'), [{ when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }]);
   });
 
+  it('lists no wake for a provider hold whose held wakes were all withdrawn, since its end starts no turn', async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      recordProviderWait(agentName: string, model: string, error: Error): unknown;
+      holdForProviderWait(agent: unknown, wait: unknown, requests: unknown[]): boolean;
+      cancelCoalescedWakes(subject: string): void;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+      providerAccelerationCooldowns: Map<string, { heldRequests: unknown[]; emptiedBy?: string }>;
+      getAgent(name: string): unknown;
+    };
+    const wait = internal.recordProviderWait('scout', 'test-model', new MembraneError({
+      type: 'rate_limit', retryable: true, retryAfterMs: 60_000, message: 'slow down', rawError: { status: 429 },
+    }));
+    assert.ok(internal.holdForProviderWait(internal.getAgent('scout'), wait,
+      [{ agentName: 'scout', reason: 'held', source: 'test', timestamp: Date.now(), coalescingSubject: 'subject-a' }]));
+    assert.strictEqual(internal.upcomingWakesFor('scout')[0]?.what, 'a wake held by a provider hold, when it ends', 'premise: the held wake is listed');
+    internal.cancelCoalescedWakes('subject-a');
+    const hold = internal.providerAccelerationCooldowns.get('scout');
+    assert.deepStrictEqual([hold?.heldRequests.length, hold?.emptiedBy], [0, 'withdrawal'], 'premise: the hold stays, emptied by the withdrawal');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
+  });
+
   it('enabled: false leaves the judge unwired, and judge rules run as debounces', async (t) => {
     const { membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { enabled: false } });
     assert.ok(eventGate.getStatus().errors.some((e) => e.includes('wires no reply judge')));
