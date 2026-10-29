@@ -88,7 +88,7 @@ import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMess
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
-import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
@@ -3303,6 +3303,17 @@ export function shedMayHelp(errorType: string | undefined, httpStatus: number | 
   return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
 }
 
+function responseParts(response: EventResponse | undefined): string {
+  return [
+    response?.addMessages?.length ? `${response.addMessages.length} message(s) to add` : '',
+    response?.editMessages?.length ? `${response.editMessages.length} edit(s)` : '',
+    response?.removeMessages?.length ? `${response.removeMessages.length} removal(s)` : '',
+    response?.stateUpdate !== undefined ? 'a state update' : '',
+    response?.requestInference ? 'an inference request' : '',
+    response?.toolsChanged ? 'a tools change' : '',
+  ].filter(Boolean).join(', ');
+}
+
 /**
  * What a thrown value says, safely and briefly, as boundedErrorMessage gives
  * it, with `recorded` applied before the cut, so no part of a credential
@@ -4366,6 +4377,7 @@ export class AgentFramework {
       getMessage: (id) => this.getMessage(id),
       queryMessages: (filter, opts) => this.queryMessages(filter, opts),
       pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
+      dropRetiredPush: (event, moduleName) => this.dropRetiredModuleEvent(event, moduleName),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
@@ -7299,12 +7311,7 @@ export class AgentFramework {
    */
   pushEvent(event: ProcessEvent): void {
     if (event.type === 'tool-result' && this.queue?.isClosed) {
-      // What an operator reconciling a dropped result needs (the resident
-      // may run the tool again): which tool, and whether it succeeded.
-      const outcome = event.result.success && !event.result.isError
-        ? 'succeeded'
-        : `failed${event.result.error ? `: ${thrownText(event.result.error)}` : ''}`;
-      console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived after stop — dropped; the tool ${outcome}`);
+      console.error(droppedToolResultLine(event, 'after stop'));
       return;
     }
     this.queue.push(event);
@@ -7332,6 +7339,14 @@ export class AgentFramework {
     }
     if (traced) this.pushEvent(event);
     else this.queue.push(event);
+  }
+
+  private dropRetiredModuleEvent(event: ProcessEvent, moduleName: string): void {
+    if (this.queue.isClosed) {
+      this.pushModuleEvent(event, moduleName, true);
+      return;
+    }
+    console.error(retiredPushLine(event, moduleName));
   }
 
   /**
@@ -16897,14 +16912,22 @@ export class AgentFramework {
   private async dispatchProcessEventToModules(event: ProcessEvent, startTime = Date.now()): Promise<void> {
     // Dispatch to all modules, tracking responses with module names
     const responses: ModuleProcessResponse[] = [];
-    for (const module of this.moduleRegistry.getAllModules()) {
+    const registrations = new Map<ModuleProcessResponse, object | undefined>();
+    const stillRegistered = (entry: ModuleProcessResponse): boolean =>
+      this.moduleRegistry.registrationOf(entry.moduleName) === registrations.get(entry);
+    const dispatched = this.moduleRegistry.getAllModules()
+      .map((module) => ({ module, registration: this.moduleRegistry.registrationOf(module.name) }));
+    for (const { module, registration } of dispatched) {
       // The framework's own toolsets module answers no event; every agent has
       // it now, so it isn't listed beside the modules that do.
       if (module instanceof ToolsetsModule) continue;
+      if (this.moduleRegistry.registrationOf(module.name) !== registration) continue;
       try {
         const processState = this.moduleRegistry.createProcessState(module.name);
         const response = await module.onProcess(event, processState);
-        responses.push({ moduleName: module.name, response });
+        const entry = { moduleName: module.name, response };
+        responses.push(entry);
+        registrations.set(entry, registration);
       } catch (error) {
         console.error(`Module ${module.name} error handling process event:`, error);
       }
@@ -16930,7 +16953,17 @@ export class AgentFramework {
     // responses, a tool call's dispatch and the trace go on, since a module
     // can't catch a throw on this path, and one module's mustn't cost the
     // event.
-    const applying = responses.filter(({ moduleName, response }) => {
+    const dropUnregistered = (entry: ModuleProcessResponse): boolean => {
+      if (stillRegistered(entry)) return false;
+      const parts = responseParts(entry.response);
+      if (parts) {
+        console.error(
+          `[process] module ${entry.moduleName} stopped before its response to ${event.type} was applied, so none of it was: ${parts}`,
+        );
+      }
+      return true;
+    };
+    const applying = responses.filter((entry) => !dropUnregistered(entry)).filter(({ moduleName, response }) => {
       const refusal = malformedResponseContent(response);
       if (refusal === null) return true;
       const { where, places } = refusal;
@@ -16953,7 +16986,7 @@ export class AgentFramework {
       const { moduleName, response } = entry;
       const step = { at: 'its start' };
       try {
-        await this.applyProcessResponse(response, event, moduleName, surface, step);
+        this.applyProcessResponse(response, event, moduleName, surface, step);
       } catch (error) {
         entry.threw = { at: step.at, error: error instanceof Error ? error.message : String(error) };
         console.error(
@@ -16981,7 +17014,7 @@ export class AgentFramework {
     }
   }
 
-  private async applyProcessResponse(
+  private applyProcessResponse(
     response: EventResponse,
     event: ProcessEvent,
     moduleName: string,
@@ -16989,7 +17022,7 @@ export class AgentFramework {
     surface: InboundSource | undefined,
     /** Names the operation under way, for the line when one throws. */
     step: { at: string },
-  ): Promise<void> {
+  ): void {
     // Add messages. Only the framework writes the inbound envelope: one a
     // module's metadata carries (echoed from a server's event, say) is
     // dropped, and a surface event's messages carry the framework's own.

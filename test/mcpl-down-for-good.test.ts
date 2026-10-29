@@ -64,7 +64,7 @@ async function start(t: TestContext, server: McplServerConfig, hold?: Promise<vo
     agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }],
     modules: [{
       name: 'watcher',
-      async start(ctx: { onTrace(listener: (event: unknown) => void): void }) { ctx.onTrace((event) => traces.push(event as Trace)); },
+      async start() {},
       async stop() {},
       getTools: () => [],
       async handleToolCall() { return { success: false }; },
@@ -77,6 +77,7 @@ async function start(t: TestContext, server: McplServerConfig, hold?: Promise<vo
     maintenanceIntervalMs: 0,
     mcplServers: [server],
   });
+  framework.onTrace((event) => traces.push(event as Trace), { replay: true });
   t.after(async () => {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
