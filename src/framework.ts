@@ -38075,7 +38075,9 @@ export class AgentFramework {
         // Walk the message store tail-first in bounded windows, re-inlining
         // blob media, until we've collected the requested range. Scanning is
         // capped so a pathological index can't drag the whole store through
-        // blob resolution.
+        // blob resolution, except on a presented window, whose rows
+        // context-manager hands over with their blobs resolved
+        // (getPresentedMessages).
         const MAX_SCAN = 500;
         const WINDOW = 25;
         const cm = agent.getContextManager();
@@ -38089,7 +38091,8 @@ export class AgentFramework {
         let scanned = 0;
         for (let end = total; end > 0 && scanned < MAX_SCAN && collecting(); end -= WINDOW) {
           const start = Math.max(0, end - WINDOW);
-          // By ref, attachment bytes are never needed — skip blob resolution.
+          // By ref, attachment bytes are never needed — off a presented
+          // window, skip blob resolution.
           const messages = presented
             ? presented.slice(start, end)
             : cm.getMessageWindow(start, end - start, { resolveBlobs: wantedRef === null }).messages;
