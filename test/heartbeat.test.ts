@@ -280,7 +280,11 @@ describe('heartbeat: state across restarts', () => {
     writeFileSync(join(dir, 'heartbeat.json'), '{ torn');
     const { hb } = heartbeat();
     hb.start();
-    assert.ok(readdirSync(dir).some((f) => f.startsWith('heartbeat.json.unreadable-')));
+    // The operator's line names where the file went; it holds what couldn't be read.
+    const line = errors.map((args) => args.map(String).join(' ')).find((l) => l.includes('moved it to'));
+    const aside = line && /moved it to (.+?) and starting from the defaults/.exec(line)?.[1];
+    assert.ok(aside, String(line));
+    assert.equal(readFileSync(aside, 'utf-8'), '{ torn');
     assert.equal(saved().settings.intervalSeconds, 14400);
     hb.stop();
   });
