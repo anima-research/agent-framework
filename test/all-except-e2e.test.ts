@@ -576,6 +576,34 @@ describe('a private turn and the focus', () => {
   };
   const sent = (f: Awaited<ReturnType<typeof fixture>>, text: string) => f.published.filter((p) => JSON.stringify(p).includes(text));
 
+  for (const rule of ['delivery', 'latest-inbound'] as const) {
+    it(`under '${rule}', an operator's message ${rule === 'delivery' ? 'while a focus holds' : 'after a room was answered'} is answered in no channel`, async () => {
+      const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true }, speech: { locus: rule } } as Partial<FrameworkConfig> });
+      try {
+        await registerOpen(f, 'work', 'noisy');
+        clear(f);
+        if (rule === 'delivery') {
+          const r = internals(f).tuneOutCoordinator!.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool');
+          assert.ok(r.ok, 'premise: a focus on work');
+        } else {
+          f.membrane.pushResponse(say('zz-first'));
+          await incoming(f, 'noisy', 'n1', 'agent, hello', MENTION);
+          await f.framework.runUntilIdle();
+          await eventually(() => sent(f, 'zz-first').length > 0, 'premise: a room turn spoke, so the latest inbound names a channel');
+        }
+        f.membrane.pushResponse(say('zz-the code is 4417'));
+        f.framework.pushEvent(tuiMessage('for your eyes only: what is the door code?'));
+        await f.framework.runUntilIdle();
+        f.membrane.pushResponse(say('zz-sentinel'));
+        await incoming(f, rule === 'delivery' ? 'work' : 'noisy', 'm2', 'agent, one more', MENTION);
+        await f.framework.runUntilIdle();
+        await eventually(() => sent(f, 'zz-sentinel').length > 0, 'a later room turn spoke, after anything earlier was sent');
+        assert.ok(has(f, 'zz-the code is 4417'), 'premise: the private turn answered');
+        assert.deepEqual(sent(f, 'zz-the code is 4417'), [], 'the answer reached no channel');
+      } finally { await f.close(); }
+    });
+  }
+
   it('a private turn that enters a focus keeps no channel, and is told its plain speech stays private', async () => {
     const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
     try {
