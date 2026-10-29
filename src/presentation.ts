@@ -1263,6 +1263,7 @@ export class AgentPresentation {
   ): { entered: Set<MessageId>; error?: unknown } {
     if (ids.length === 0) return { entered: new Set() };
     const cm = agent.getContextManager();
+    const lengthBefore = cm.indexLength();
     let error: unknown;
     try {
       cm.presentRows(ids);
@@ -1271,7 +1272,7 @@ export class AgentPresentation {
     }
     const entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
     const memo = this.memos.get(cm);
-    if (memo) memo.length = cm.indexLength();
+    if (memo && memo.length === lengthBefore) memo.length = cm.indexLength();
     if (error !== undefined) this.failed(agent, occasion, error);
     if (entered.size > 0) {
       if (!quiet) {

@@ -20,6 +20,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, OperatorActionError, audienceOf } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { residentContextOptions } from '../src/context-options.js';
+import { storeOwnRow } from '../src/dendrite/audience.js';
 import { GateModule, until } from './helpers/dendrite.js';
 import { WireMembrane, final, round } from './helpers/wire-membrane.js';
 
@@ -424,6 +425,34 @@ describe('presentation points (#291)', () => {
     h.internals.presentAtEndOf(h.agent('mira'));
     assert.deepEqual(h.windowTexts('mira').slice(-2), ['two', 'after the undo'], 'which its next point presents after it');
     assert.equal(h.internals.getTurnCheckpoints('mira').length, 2, 'the checkpoint is back');
+  });
+
+  it("an arrival an undo gives back enters the window at the agent's next point, though a row written for her is presented before it", async () => {
+    const h = await boot({ residents: ['mira', 'oren'] });
+    h.membrane.script('mira', final([text('one')]));
+    h.membrane.script('mira', round('c2', [text('looking')], 'wait', { gate: 'u' }), final([text('two')]));
+    h.framework.start();
+    h.framework.pushEvent(input('first', ['mira']));
+    await until(() => h.inWindow('mira', 'one'), 'the first turn');
+    await h.framework.runUntilIdle();
+    h.framework.pushEvent(input('second', ['mira']));
+    await until(() => h.gates.entered.has('u'), 'the second turn waiting on its tool');
+    h.internals.addMessage('someone', [text('from someone')], undefined, { forAgent: 'mira' });
+    h.internals.addMessage('someone', [text('for oren')], undefined, { forAgent: 'oren' });
+    h.gates.release('u');
+    await until(() => h.inWindow('mira', 'two'), 'the second turn');
+    await h.framework.runUntilIdle();
+    assert.equal(h.inWindow('mira', 'from someone'), true, 'premise: her turn heard it');
+    assert.equal(h.inWindow('mira', 'for oren'), false, "premise: oren's row stays out of her window");
+
+    assert.equal(h.framework.undoLastTurn('mira').undone, true);
+    assert.equal(h.cm('mira').windowStatusOf(h.rowWith('mira', 'from someone')!.id), 'out', 'given back as arrived and not presented');
+
+    storeOwnRow(h.agent('mira'), 'user', [text('a notice for mira')]);
+    assert.equal(h.inWindow('mira', 'a notice for mira'), true, 'premise: her own row entered as it was written');
+
+    h.internals.addMessage('user', [text('after the undo')], undefined, { forAgent: 'mira' });
+    assert.deepEqual(h.windowTexts('mira').slice(-2), ['from someone', 'after the undo'], 'the arrival the undo gave back, then what came since');
   });
 
   it('an undo converts a checkpoint recorded without the window\'s length', async () => {
