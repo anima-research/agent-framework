@@ -119,6 +119,8 @@ export class ModuleRegistry {
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
+  /** Each module's start() still running, which its stop() waits for. */
+  private starting = new Map<Module, unknown>();
   /** Module and namespace pairs already told that a system injection held a block that isn't text. */
   private notShownWarned = new Set<string>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
@@ -225,7 +227,13 @@ export class ModuleRegistry {
     this.moduleContexts.set(module.name, context);
 
     // Start the module
-    await module.start(context);
+    const started = module.start(context);
+    this.starting.set(module, started);
+    try {
+      await started;
+    } finally {
+      if (this.starting.get(module) === started) this.starting.delete(module);
+    }
   }
 
   /**
@@ -421,7 +429,9 @@ export class ModuleRegistry {
 
   /**
    * Stop all modules. A caller may bound its wait without cancelling cleanup.
-   * The default waits for each module's own shutdown contract.
+   * The default waits for each module's own shutdown contract. A module whose
+   * start() is still running is stopped once its start() has settled, within
+   * the same wait.
    */
   async stopAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     validateShutdownTimeout(timeoutMs);
@@ -433,7 +443,10 @@ export class ModuleRegistry {
   private stopModule(module: Module): Promise<void> {
     const existing = this.stopping.get(module);
     if (existing) return existing;
-    const attempt = Promise.resolve().then(() => module.stop()).then(() => {
+    const pending = this.starting.has(module)
+      ? Promise.resolve(this.starting.get(module)).then(() => undefined, () => undefined)
+      : Promise.resolve();
+    const attempt = pending.then(() => module.stop()).then(() => {
       if (this.modules.get(module.name) === module) {
         const context = this.moduleContexts.get(module.name);
         this.modules.delete(module.name);

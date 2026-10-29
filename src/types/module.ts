@@ -132,6 +132,8 @@ export interface Module {
    * a host wires up after create() returns, such as a WorkspaceModule's
    * initStore(). A stop() that saves state can therefore run before that
    * wiring, and shouldn't then save over state it was handed and hasn't used.
+   * It isn't called before the module's start() has settled, so it can end
+   * what start() set up.
    */
   stop(): Promise<void>;
 

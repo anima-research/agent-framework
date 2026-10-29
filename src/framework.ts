@@ -7388,7 +7388,9 @@ export class AgentFramework {
    * been admitted, before anything else is checked: while that stop() runs,
    * a module added then would either be stopped by it or, once it has taken
    * its list of modules to stop, stay started past it; once it has settled,
-   * the framework has stopped for good, as start() says.
+   * the framework has stopped for good, as start() says. A stop() admitted
+   * while the module's start() runs stops the module once that start() has
+   * settled, and this rejects the same way then, with no `module:added`.
    */
   async addModule(module: Module): Promise<void> {
     this.refuseOnceStopped('addModule()');
@@ -7410,6 +7412,7 @@ export class AgentFramework {
       }
     }
     await this.moduleRegistry.addModule(module);
+    this.refuseOnceStopped('addModule()');
     // The workspace judges whether an agent's history holds a message as the
     // framework judges its own notices, for its head-move notice
     // (noticeHeadMoves) and the writes it weighs against it. A module taken

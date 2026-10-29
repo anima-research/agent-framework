@@ -5,7 +5,9 @@
  * down modules and an owned store under a loop that no later stop() could
  * end; a module added after the stop took its list of modules stayed started
  * past it. Once the stop has settled, both stay refused, with another text
- * (stop-ends-its-instance.test.ts). Each test waits on the event it needs (a
+ * (stop-ends-its-instance.test.ts). A stop() admitted while an addModule()'s
+ * start() runs stops that module once its start() has settled, and refuses
+ * the addModule() then (#882). Each test waits on the event it needs (a
  * module's stop() being called), not on a fixed delay.
  */
 
@@ -148,5 +150,56 @@ test("an addModule() made while a module's stop() runs is refused, and its modul
   }
   await stopping;
   assert.deepEqual(started, []);
+  assert.equal(internals.moduleRegistry.modules.has('late'), false);
+});
+
+test("a module whose start() is still running when stop() begins is stopped only after its start() returns, so its stop() ends what its start() set up", { timeout: 30_000 }, async (t) => {
+  const reached = deferred();
+  const { framework } = await fixture(t, [module('first', { stop: async () => { reached.resolve(); } })]);
+  framework.start();
+  const order: string[] = [];
+  const entered = deferred();
+  const release = deferred();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let fired = false;
+  const adding = framework.addModule(module('late', {
+    start: async () => {
+      order.push('start entered');
+      entered.resolve();
+      await release.promise;
+      timer = setTimeout(() => { fired = true; }, 0);
+      order.push('start returned');
+    },
+    stop: async () => { order.push('stop called'); clearTimeout(timer); },
+  })).catch(() => {});
+  await entered.promise;
+  const stopping = framework.stop();
+  await reached.promise;
+  release.resolve();
+  await stopping;
+  await adding;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(order, ['start entered', 'start returned', 'stop called']);
+  assert.equal(fired, false, 'the timer its start() set was cleared by its stop()');
+});
+
+test("an addModule() whose start() is still running when a stop() is admitted is refused once its start() returns, with no module:added", { timeout: 30_000 }, async (t) => {
+  const reached = deferred();
+  const { framework, internals } = await fixture(t, [module('first', { stop: async () => { reached.resolve(); } })]);
+  framework.start();
+  const added: string[] = [];
+  framework.onTrace((event) => { if (event.type === 'module:added') added.push(event.moduleName); });
+  const entered = deferred();
+  const release = deferred();
+  const adding = framework.addModule(module('late', { start: async () => { entered.resolve(); await release.promise; } }))
+    .then(() => 'addModule() resolved', (error: unknown) => error);
+  await entered.promise;
+  const stopping = framework.stop();
+  await reached.promise;
+  release.resolve();
+  const outcome = await adding;
+  await stopping;
+  assert.ok(outcome instanceof Error && outcome.message.startsWith('addModule() refused: '), String(outcome));
+  assert.deepEqual(added, []);
   assert.equal(internals.moduleRegistry.modules.has('late'), false);
 });
