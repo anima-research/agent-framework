@@ -208,7 +208,7 @@ export interface TuneOutCheck {
   peek?: string[];
 }
 
-/** How long after an end time whose cancel threw the cancel is tried again. */
+/** How long after an end time's or a wake budget's cancel threw the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
 
 /** Ends a backlog line cut to fit in one of the residents' messages. */
