@@ -165,7 +165,7 @@ test("a resident's own bound clamps its cap, and the stored copy, notice include
   });
 });
 
-test("a resident's cap is the smallest bound among the shared slot's readers, so each of them is shown where the rest is", async () => {
+test("a resident's cap is the smallest bound among its shared slot's readers, whichever of them a row reaches: scout's own round is cut to ward's bound, though ward isn't shown it", async () => {
   // scout's own bound (40000) leaves the 24000 default; ward's is 4000.
   await withResidents({ agents: [{ name: 'scout', maxMessageTokens: 10_000 }, { name: 'ward', maxMessageTokens: 1000 }], mount: 'files' }, async ({ framework, stored, shownTo }) => {
     const cap = capProvenance(framework, 'scout');
