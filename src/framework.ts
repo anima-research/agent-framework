@@ -15268,16 +15268,24 @@ export class AgentFramework {
    * The writes for `agentName` a surgery's release couldn't store (their
    * store threw, and no row of theirs landed, or the store couldn't be read
    * back to tell), told of once: a log line and an ops alert of kind
-   * `store-held-lost`. Each was accepted with no id, kept in memory until
-   * the release, and is lost; the writes after it went on.
+   * `store-held-lost`. Each was accepted with no id and kept in memory until
+   * the release; one known not to have landed is lost, and one the store
+   * couldn't be read back for may be. The writes after them went on.
    */
   private tellHeldWritesLost(agentName: string, writes: readonly SurgeryHeldWrite[], unknown: number, reason: string): void {
     const { kinds, mail, told } = heldWritesTold(writes);
     const one = writes.length === 1;
+    const known = writes.length - unknown;
+    const threw = `(${one ? '' : 'the first: '}${reason})`;
     const message = `${one ? '1 write' : `${writes.length} writes`} for ${agentName}, accepted and kept in memory until a ` +
-      `surgery's release, ${one ? 'was' : 'were'} not stored: storing ${one ? 'it' : 'them'} there threw (${one ? '' : 'the first: '}${reason})` +
-      (unknown > 0 ? `, and the store couldn't be read back to tell whether ${unknown === writes.length ? (one ? 'it' : 'they') : `${unknown} of them`} landed` : '') +
-      `. ${one ? 'It is' : 'They are'} lost, and the writes after ${one ? 'it' : 'them'} went on. ${told}`;
+      `surgery's release, ` +
+      (unknown === 0
+        ? `${one ? 'was' : 'were'} not stored: storing ${one ? 'it' : 'them'} there threw ${threw}. ${one ? 'It is' : 'They are'} lost`
+        : `threw when stored there ${threw}. ` +
+          (known > 0 ? `${known} of them ${known === 1 ? 'was' : 'were'} not stored, and ${known === 1 ? 'is' : 'are'} lost. ` : '') +
+          `The store couldn't be read back to tell whether ${unknown === writes.length ? (one ? 'it' : 'they') : `the other ${unknown}`} ` +
+          `landed, so ${unknown === 1 ? 'it' : 'they'} may be lost`) +
+      `, and the writes after ${one ? 'it' : 'them'} went on. ${told}`;
     console.error(`[surgery] agent=${agentName}: ${message}`);
     this.opsAlert('store-held-lost', agentName, message, {
       data: { count: writes.length, keptForRecovery: 0, heldBySurgery: writes.length, kinds, mail },
@@ -22258,9 +22266,9 @@ export class AgentFramework {
    * since goes on to the primary if it is one the primary takes in its
    * place, and is dropped otherwise (passHeldWritesOn), logged. A write that
    * throws now is logged, and the rest go on: one whose row landed counts as
-   * stored, traced with the landed id; one whose row didn't, or whose store
-   * can't be read back to tell, is lost, and each agent's lost writes are
-   * told of once, by a log line and an ops alert of kind `store-held-lost`.
+   * stored, traced with the landed id; one whose row didn't is lost, and one
+   * whose store can't be read back to tell may be. Each agent's are told of
+   * once, by a log line and an ops alert of kind `store-held-lost`.
    */
   private releaseSurgeryHeldWrites(): void {
     // Read defensively: a framework built from its prototype, as some

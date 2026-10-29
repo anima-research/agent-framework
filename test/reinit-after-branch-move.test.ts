@@ -836,6 +836,46 @@ describe('after a branch move, every agent on the store compiles without a resta
     await framework.switchBranch(framework.getStore().currentBranch().name);
   });
 
+  it("a held write whose store throws at the release, and whose store then can't be read back, is told of as possibly lost, not as unstored", async () => {
+    const quiet = console.error;
+    console.error = () => {};
+    const cm = cmOf('b') as unknown as { addMessage: (...args: unknown[]) => unknown; getMessageWindow: (...args: unknown[]) => unknown };
+    const { addMessage, getMessageWindow } = cm;
+    let unreadable = false;
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', 'for b, during the hold');
+      cm.addMessage = (...args: unknown[]) => {
+        if (JSON.stringify(args[1]).includes('during the hold')) {
+          unreadable = true;
+          throw new Error('injected release write failure');
+        }
+        return addMessage.apply(cm, args);
+      };
+      cm.getMessageWindow = (...args: unknown[]) => {
+        if (unreadable) {
+          unreadable = false;
+          throw new Error('injected read-back failure');
+        }
+        return getMessageWindow.apply(cm, args);
+      };
+      pass.open();
+      await pass.switched;
+    } finally {
+      cm.addMessage = addMessage;
+      cm.getMessageWindow = getMessageWindow;
+      console.error = quiet;
+    }
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.equal(lost.length, 1, 'told of once');
+    says(lost[0]!.message, '1 write for b, accepted and kept in memory', 'injected release write failure',
+      "couldn't be read back to tell whether it landed", 'may be lost');
+    assert.ok(!lost[0]!.message.includes('not stored') && !lost[0]!.message.includes('It is lost'),
+      `it says no more than the read-back knows:\n${lost[0]!.message}`);
+    await framework.switchBranch(framework.getStore().currentBranch().name);
+  });
+
   for (const [whose, participant] of [['', 'courier'], [', from a writer whose name the store makes well formed,', 'courier\uD800']] as const) {
   it(`a held write${whose} whose store throws at the release after its row landed counts as stored: traced once with its id, and no alert`, async () => {
     const added = addedTraces();
