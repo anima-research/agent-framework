@@ -17,7 +17,8 @@
  *     connection's listener; a handler's own fault is answered -32603,
  *     "Internal error", or -32000 with the stop wording alone once the host
  *     is stopping, and its own text goes only to the host's log.
- * Any other event pushed to a stopped framework still throws to its caller.
+ * Any other event pushed to a stopped framework through pushEvent() still
+ * throws to its caller; a module's other events are logged and dropped.
  * A turn waiting to retry is work in flight too: stop() cancels the retry,
  * and leaves no agent inferring at the event gate (#334). The turn ends with
  * inference:aborted, saying no retry follows its inference:failed, whether
@@ -270,7 +271,9 @@ describe('stop() with work still in flight', () => {
     }
     framework.start();
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
-    await module.started;
+    let started = false;
+    void module.started.then(() => { started = true; });
+    await until(() => started, 'the slow tool to start');
     return { framework, module, failed };
   }
 
@@ -350,7 +353,7 @@ describe('stop() with work still in flight', () => {
     assert.match(line, /the tool failed: .*the dispatch was lost/, line);
   });
 
-  it('any other event pushed to a stopped framework still throws to its caller', async () => {
+  it('any other event pushed to a stopped framework through pushEvent() still throws to its caller', async () => {
     const { framework, module } = await frameworkWithRunningTool();
     await framework.stop();
     assert.throws(
@@ -1289,9 +1292,9 @@ describe('stop() with work still in flight', () => {
 
     it('an inference request during a render is refused -32600, and a throwing responder there is not rejected into the listener', async () => {
       const { framework, connection } = await wiredFramework();
+      const fw = framework as unknown as { pushCoalescer: unknown };
+      const coalescer = fw.pushCoalescer;
       try {
-        const fw = framework as unknown as { pushCoalescer: unknown };
-        const coalescer = fw.pushCoalescer;
         fw.pushCoalescer = { isRendering: () => true, suspend: () => {}, flush: () => {} };
         const inference = responder({ throws: true });
         connection.emit('inference-request', { messages: [] }, inference);
@@ -1306,8 +1309,8 @@ describe('stop() with work still in flight', () => {
         ]);
         assert.deepEqual(inference.answers, []);
         assert.deepEqual(rejections, []);
-        fw.pushCoalescer = coalescer;
       } finally {
+        fw.pushCoalescer = coalescer;
         await framework.stop();
       }
     });
