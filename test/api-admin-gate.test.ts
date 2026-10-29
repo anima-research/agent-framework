@@ -45,20 +45,9 @@ function wsOpens(url: string, headers?: Record<string, string>): Promise<'open' 
   });
 }
 
-test('an empty adminToken is refused at construction', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'api-admin-gate-empty-'));
-  const framework = await AgentFramework.create({
-    storePath: join(dir, 'store'),
-    membrane: new MockMembrane().asMembrane(),
-    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
-    modules: [],
-  });
-  try {
-    assert.throws(() => new ApiServer(framework, { adminToken: '' }), /non-empty/);
-  } finally {
-    await framework.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('an empty adminToken is refused at construction', () => {
+  // The refusal comes before the server uses its framework, so none is started.
+  assert.throws(() => new ApiServer({} as AgentFramework, { adminToken: '' }), /non-empty/);
 });
 
 test('HTTP host verbs: header required without a token (CSRF), exact token with one', async () => {
