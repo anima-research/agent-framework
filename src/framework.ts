@@ -876,7 +876,7 @@ import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mc
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
-import { boundedForLog, describeCause } from './mcpl/errors.js';
+import { boundedForLog, describeCause, hostStoppedWhileHandling } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -2422,6 +2422,19 @@ const MAINTENANCE_TICKS_PER_PASS = 8;
  *  together, and then on awareness drains still running, such as its
  *  startup's delivery. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
+const ABANDON_GRACE_MS = 10_000;
+
+const testAbandonGraces = new WeakMap<AgentFramework, number>();
+
+/**
+ * For tests only: `framework`'s abandon takes `ms` as its grace in place of
+ * {@link ABANDON_GRACE_MS}. Set it only where the test holds every turn the
+ * abandon reaches past the grace, so no turn can end within it and a short
+ * grace only brings the abandon's report sooner.
+ */
+export function setAbandonGraceForTests(framework: AgentFramework, ms: number): void {
+  testAbandonGraces.set(framework, ms);
+}
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
 interface LocalProviderGate {
@@ -2700,6 +2713,7 @@ interface EphemeralRun {
   endReason?: AgentEndReason;
   /** Who ended it, when it was stopped from outside. */
   endedBy?: string;
+  endedFromOutside?: true;
 }
 
 /**
@@ -3797,6 +3811,7 @@ export class AgentFramework {
   private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
   private turnRearms: Map<string, number> = new Map();
   private exhaustingRearms: Set<string> = new Set();
+  private rearmDeadlineCuts: Set<string> = new Set();
   private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
@@ -5244,7 +5259,8 @@ export class AgentFramework {
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
    * turn: on the streams it cancels, on maintenance in flight (a pass or an
    * over-budget drain kick), on the event loop, on an operator's operations
-   * already running, on modules and MCPL together, then on Discord awareness
+   * already running, on modules and MCPL (its servers and the inference
+   * requests they made) together, then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
    * close ended. With a budget, a stop() can take up to six of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
@@ -5470,6 +5486,8 @@ export class AgentFramework {
     for (const wake of [...this.retryWaitWakers]) step(wake);
     this.guardSpillsClosed = false;
     step(() => this.queue.close());
+    let inferences: Array<{ label: string; promise: Promise<void> }> = [];
+    step(() => { inferences = this.inferenceRouter?.stopAll() ?? []; });
     step(() => this.tuneOutCoordinator?.stop());
 
     // Stop running code_execution scripts before cancelling streams: a
@@ -5739,7 +5757,7 @@ export class AgentFramework {
     this.guardSpillsClosed = true;
 
     // Stop modules and both engines' MCP servers in parallel
-    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
+    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs), waitFor(inferences)];
     if (this.mcplServerRegistry) {
       shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
@@ -6487,11 +6505,22 @@ export class AgentFramework {
     if (wait && trigger && (wait.until === null || wait.until > now)) this.noteStatedWaitRun(agent.name, wait, now);
     return true;
   }
-  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined): void {
+  private takeAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
+    if (isTransientFailure(error)) {
+      this.rearmDeadlineCuts.delete(agentName);
+      return true;
+    }
+    if (!isRearmed(trigger) || !isDeadlineExpiry(error)) return false;
+    const first = !this.rearmDeadlineCuts.has(agentName);
+    this.rearmDeadlineCuts.add(agentName);
+    return first;
+  }
+
+  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined, asTransient: boolean): void {
     if (!ownsProviderGate || trigger === undefined || this.providerAdmissionClosed || this.turnRearmMs.length === 0) return;
     const done = this.turnRearms.get(agent.name) ?? 0;
     const notSent = (why: string) => console.error(`[inference-rearm] agent=${agent.name} turn not re-armed: ${why}`);
-    if (!isTransientFailure(error)) {
+    if (!asTransient) {
       if (done > 0) notSent(`its failure isn't transient (${isMembraneError(error) ? error.type : boundFailureText(error.message, FAILURE_SUMMARY_MAX_CHARS)})`);
       return;
     }
@@ -8990,7 +9019,7 @@ export class AgentFramework {
     // Bounded grace for cancelled streams. Stop cancels streams too; a turn
     // with no stream settles on its own. Report the abandon that already ran,
     // even if stop cuts its grace short.
-    const grace = Date.now() + 10_000;
+    const grace = Date.now() + (testAbandonGraces.get(this) ?? ABANDON_GRACE_MS);
     while (this.quiesced && !this.queue?.isClosed && this.activeTurnTokens.size > 0 && Date.now() < grace) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -11433,6 +11462,7 @@ export class AgentFramework {
     if (run) {
       run.endReason ??= 'stopped';
       run.endedBy ??= options.by;
+      run.endedFromOutside = true;
       // The awaiting caller is told who stopped the job and why, whether or
       // not a stream was in flight: settled first, so the aborted stream's own
       // settle ('Stream cancelled') finds the run already settled. The caller's
@@ -11811,12 +11841,22 @@ export class AgentFramework {
     if (run) {
       run.endReason = reason;
       run.endedBy = record.ended?.by;
+      run.endedFromOutside = true;
       run.settle.reject(new AgentStoppedError(name, reason, record.ended?.by, detail));
       return;
     }
     const agent = this.agents.get(name);
     if (!agent) return;
     this.releaseAgentRuntime(agent, this.channelOfHome(record.homeChannel), undefined, record.lifetime.kind === 'persistent');
+  }
+
+  private forgetFailureAccounting(name: string): void {
+    this.consecutiveInferenceFailures.delete(name);
+    this.exhaustionRewinds.delete(name);
+    this.refusalStreak.delete(name);
+    this.refusalRewinds.delete(name);
+    this.rewindEpisode.delete(name);
+    if (this.forcedRewind.delete(name)) console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
   }
 
   /**
@@ -11863,6 +11903,8 @@ export class AgentFramework {
     this.agents.delete(name);
     this.agentConfigs.delete(name);
     this.deadlineCuts.delete(name);
+    this.freshCallsCut.delete(name);
+    this.forgetFailureAccounting(name);
     this.thinkingLossIncidents.forget(name);
     this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
@@ -11904,6 +11946,7 @@ export class AgentFramework {
     // waits ends here as at a turn's end, alerted if it ran long
     // (endStatedWaitRun).
     this.turnRearms.delete(name);
+    this.rearmDeadlineCuts.delete(name);
     this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
     this.endStatedWaitRun(name);
@@ -12630,6 +12673,8 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
         this.deadlineCuts.delete(agent.name);
+        this.freshCallsCut.delete(agent.name);
+        if (run.endedFromOutside) this.forgetFailureAccounting(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
         this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
@@ -17798,6 +17843,8 @@ export class AgentFramework {
       // Nothing live under the name: only what the process keeps by name.
       this.closingConversationAgents.delete(agentName);
       this.deadlineCuts.delete(agentName);
+      this.freshCallsCut.delete(agentName);
+      this.forgetFailureAccounting(agentName);
       this.thinkingLossIncidents.forget(agentName);
       this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.
@@ -24264,6 +24311,7 @@ export class AgentFramework {
       }
 
       const retry = trigger && withTurnCarry(trigger, carry);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
@@ -24281,7 +24329,7 @@ export class AgentFramework {
       }
 
       const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
-      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(routing))
+      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(routing) || (isDeadlineExpiry(err) && !asTransient)))
         ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
       if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
       else this.deadlineCuts.delete(agent.name);
@@ -24342,7 +24390,7 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
-        if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+        if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -24362,7 +24410,7 @@ export class AgentFramework {
         if (action.emit) {
           this.pushEvent(action.emit);
         }
-        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing);
+        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing, asTransient);
       }
       // No handoff on either failure branch: the terminal branch deleted the
       // token above; the retry branch's recursive startAgentStream replaced
@@ -26110,6 +26158,7 @@ export class AgentFramework {
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
             const retry = retryOf(trigger);
+            const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
@@ -26126,7 +26175,7 @@ export class AgentFramework {
             }
 
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
-            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(streamRouting))
+            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
               ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
             else this.deadlineCuts.delete(agent.name);
@@ -26187,7 +26236,7 @@ export class AgentFramework {
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+              if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -26205,7 +26254,7 @@ export class AgentFramework {
               if (action.emit) {
                 this.pushEvent(action.emit);
               }
-              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
             }
             break;
           }
@@ -26280,7 +26329,7 @@ export class AgentFramework {
                   agentName: agent.name,
                   error: terminal,
                 });
-                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting);
+                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
                 // inference log so future investigations can attribute the
                 // terminal cause without relying on live in-memory reducer
@@ -26298,6 +26347,7 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            this.rearmDeadlineCuts.delete(agent.name);
             this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
@@ -26541,6 +26591,7 @@ export class AgentFramework {
       agent.reset();
       this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
       const retry = retryOf(trigger);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
@@ -26572,14 +26623,14 @@ export class AgentFramework {
         speech: '',
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
-      if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+      if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
         ...this.classifyInferenceError(err),
       });
-      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
@@ -29632,6 +29683,7 @@ export class AgentFramework {
   private noteSpokenTo(agentName: string, metadata: MessageMetadata | undefined): void {
     const agent = this.agents.get(agentName);
     if ((agent && !this.agentSees(agent, metadata)) || isOwnScheduleWrite(metadata) || !isConversationalInjection(metadata)) return;
+    this.rearmDeadlineCuts?.delete(agentName);
     if (this.turnRearms?.delete(agentName)) console.error(`[inference-rearm] agent=${agentName} re-send count started again: a message was said to it`);
   }
 
@@ -34508,12 +34560,9 @@ export class AgentFramework {
           // request turned away at stop gets, so it can send it again to
           // the host's next run. Optional chaining: prototype-built
           // harnesses leave the queue unset.
-          const stopping = !!this.queue?.isClosed;
+          const answer = this.queue?.isClosed ? hostStoppedWhileHandling() : { code: -32603, message: 'Internal error' };
           try {
-            tracked.respondError?.(
-              stopping ? -32000 : -32603,
-              stopping ? 'the host stopped while handling this request' : 'Internal error',
-            );
+            tracked.respondError?.(answer.code, answer.message);
           } catch (sendError) {
             responseError = recorded(describeCause(sendError));
           }
@@ -34670,6 +34719,7 @@ export class AgentFramework {
         respond: (result: unknown) => void;
         respondError: (code: number, message: string) => void;
         sendChunk?: (chunk: InferenceChunkParams) => void;
+        signal?: AbortSignal;
       },
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
@@ -34695,6 +34745,7 @@ export class AgentFramework {
           // Chunks go out on the transport the request came on, as its
           // answer does.
           ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
+          ...(responder.signal ? { signal: responder.signal } : {}),
         });
       }
     });

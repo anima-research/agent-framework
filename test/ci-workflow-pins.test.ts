@@ -5,8 +5,7 @@
  *   Test step export AF_TEST_CONCURRENCY (the runner's core count), and npm
  *   test passes it on as --test-concurrency only when it is set. If either
  *   side is renamed or dropped, the suite goes back to Node's default of one
- *   file fewer than the cores, a 3-core macOS runner takes twice as long, and
- *   nothing fails: these tests do.
+ *   file fewer than the cores, and nothing fails: these tests do.
  * - When a pull request runs code_execution's Bun legs on macOS. The
  *   `changes` job runs them when the diff matches a filter. Every file those
  *   tests import or load by path, directly or through others, must match it,

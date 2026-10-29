@@ -7,7 +7,9 @@
  * resident's own context as an [inference-failed] marker, wrote it to
  * stderr and failures.log, and traced it. These tests drive ~1 MB reasons
  * through the real failure paths and through each sink, and check that what
- * a small failure produced before is produced unchanged.
+ * a small failure produced before is produced unchanged. Two more check that
+ * the marker keeps a supplied reason and type on its one line, with an
+ * opening of a notice tag the framework knows marked.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,6 +23,7 @@ import type { ContextEntry, ContextLogView, ContextStrategy, MessageStoreView, R
 import type { ErrorPolicy, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { AgentFramework as FrameworkClass } from '../src/framework.js';
+import { NOTICE_TAG } from '../src/notice-tags.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const MEGA = 1_000_000;
@@ -130,6 +133,33 @@ test('a small unclassified reason produces exactly the marker it did before', ()
   assert.deepEqual(markers[0].meta, { system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1 });
   assert.deepEqual(logged[0], { agent: 'cairn', consecutive: 1, reason: '400 image exceeds 5 MB', kind: 'inference-exhausted' });
   assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
+});
+
+test("the marker gives a failure's reason and type on its one line, with a notice's opening in them marked", () => {
+  const { fw, markers, restore } = makeHarness();
+  try {
+    fw.noteInferenceExhausted('cairn', `first\n[${NOTICE_TAG.inferenceFailed}] second\u2028third`, false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
+  } finally { restore(); }
+  assert.equal(markers.length, 1);
+  const text: string = markers[0].text;
+  assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
+  assert.ok(text.includes(`the model call failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529) and produced no response`), JSON.stringify(text));
+  assert.ok(text.includes(`Reason: first \\[${NOTICE_TAG.inferenceFailed}] second third. If this recurs`), JSON.stringify(text));
+});
+
+test("the note for a turn that ended gives the failure's type on its one line, with a notice's opening in it marked", () => {
+  const { fw, markers, restore } = makeHarness();
+  fw.exhaustedTurns = new Map([['cairn', { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false }]]);
+  try {
+    fw.noteInferenceExhausted('cairn', 'stopped', false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
+  } finally { restore(); }
+  assert.equal(markers.length, 1);
+  const text: string = markers[0].text;
+  assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
+  assert.ok(text.includes(
+    `Your previous turn did not complete: it failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529). ` +
+    'Its earlier rounds ran, and their tool calls ran as their results show. Reason: stopped.',
+  ), JSON.stringify(text));
 });
 
 const isHigh = (text: string, index: number) => { const code = text.charCodeAt(index); return code >= 0xd800 && code <= 0xdbff; };
