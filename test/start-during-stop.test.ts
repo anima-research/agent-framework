@@ -221,7 +221,7 @@ test("a removeModule() made while the module's start() runs stops it only after 
   release.resolve();
   await adding;
   await removing;
-  assert.ok(order.indexOf('start returned') < order.indexOf('stop called'), order.join(', '));
-  assert.ok(order.indexOf('module:added') < order.indexOf('module:removed'), order.join(', '));
+  assert.deepEqual(order.filter((entry) => !entry.startsWith('module:')), ['start entered', 'start returned', 'stop called']);
+  assert.deepEqual(order.filter((entry) => entry.startsWith('module:')), ['module:added', 'module:removed']);
   assert.equal(internals.moduleRegistry.modules.has('late'), false);
 });
