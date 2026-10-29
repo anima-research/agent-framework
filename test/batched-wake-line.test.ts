@@ -1050,6 +1050,36 @@ describe('a debounced batch of targeted messages', () => {
     }
   });
 
+  it("a batch whose delivery throws after waking scout is logged as waking scout, and not mira, rather than as dropped", async () => {
+    const { framework, internals, dir } = await boot();
+    const errors: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      const store = framework as unknown as { addMessage(...args: unknown[]): unknown };
+      const addMessage = store.addMessage.bind(framework);
+      let lines = 0;
+      store.addMessage = (...args: unknown[]) => {
+        if ((args[2] as { source?: unknown } | undefined)?.source === 'gate:debounce' && ++lines === 2) throw new Error('the store failed');
+        return addMessage(...args);
+      };
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-a1', 'scout, a word', { targetAgents: ['scout'] }));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b1', 'mira, a word', { targetAgents: ['mira'] }));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-a2', 'scout, another', { targetAgents: ['scout'] }));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b2', 'mira, another', { targetAgents: ['mira'] }));
+      await waitFor(() => lines >= 2, 'the batch to fire');
+      assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['scout'], 'premise: scout is woken and mira, whose line threw, is not');
+      const told = errors.filter((e) => e.includes('[gate]'));
+      assert.equal(told.length, 1, `the gate tells of it once: ${told.join(' | ')}`);
+      assert.ok(told[0]!.includes('woke scout') && told[0]!.includes("mira isn't woken"), `the log names who was woken and who isn't: ${told[0]}`);
+      assert.ok(!told[0]!.includes('dropped'), `and doesn't say the batch is dropped: ${told[0]}`);
+    } finally {
+      console.error = consoleError;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("a debounced correction delivered to mira wakes mira, not the agents its original message named", async () => {
     const { framework, internals, dir } = await boot();
     try {

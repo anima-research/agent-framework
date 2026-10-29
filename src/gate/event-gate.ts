@@ -1984,6 +1984,18 @@ function errorText(err: unknown): string {
   }
 }
 
+class PartialDelivery extends Error {
+  constructor(readonly woke: readonly string[], readonly notWoken: readonly string[], cause: unknown) {
+    super(errorText(cause), { cause });
+  }
+}
+
+function deliveredInPart(err: unknown, it: string): string | undefined {
+  if (!(err instanceof PartialDelivery)) return undefined;
+  const one = err.notWoken.length === 1;
+  return `woke ${err.woke.join(', ')}; ${err.notWoken.join(', ')} ${one ? "isn't" : "aren't"} woken, since delivering ${it} threw (${err.message})`;
+}
+
 /**
  * Run a caller's callback once the change it's told of is made and traced. A
  * throw from it is logged, not thrown, so the call answers as the change it
@@ -3689,8 +3701,8 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] Policy "${policyName}": its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
+        `[gate] Policy "${policyName}": its pending batch of ${events.length} ${one ? 'event' : 'events'} `
+        + (deliveredInPart(err, 'it') ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
       return;
     }
@@ -3739,10 +3751,16 @@ export class EventGate {
       group.agents.push(agentName);
       groups.set(key, group);
     }
-    for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents);
+    const woke: string[] = [];
+    try {
+      for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents, woke);
+    } catch (err) {
+      if (woke.length === 0) throw err;
+      throw new PartialDelivery(woke, [...woken].filter((name) => !woke.includes(name)), err);
+    }
   }
 
-  private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[]): void {
+  private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {
     const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL
@@ -3830,6 +3848,7 @@ export class EventGate {
     const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of woken) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+      woke?.push(agentName);
     }
   }
 
@@ -4098,8 +4117,8 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
+        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} `
+        + (deliveredInPart(err, 'it') ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
     }
   }
@@ -4204,8 +4223,9 @@ export class EventGate {
         } catch (err) {
           const one = events.length === 1;
           console.error(
-            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
-            + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
+            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce `
+            + (deliveredInPart(err, one ? 'it' : 'them')
+              ?? `couldn't be delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`),
           );
         }
       });
