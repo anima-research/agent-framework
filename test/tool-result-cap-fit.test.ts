@@ -71,6 +71,8 @@ async function withResidents(
     storedAll: string[];
     shownTo: (name: string) => Promise<string | null>;
     shownAllTo: (name: string) => Promise<string[]>;
+    /** The workspace, when the test has a mount. */
+    workspace: WorkspaceModule | null;
   }) => Promise<void>,
 ): Promise<void> {
   const tempDir = mkdtempSync(join(tmpdir(), 'tool-result-cap-fit-'));
@@ -122,6 +124,7 @@ async function withResidents(
       storedAll: toolResultTexts(framework.getAgent(producer)!.getContextManager().queryMessages({}).messages),
       shownTo: async (name) => toolResultText((await framework.previewActivation(name)).messages),
       shownAllTo: async (name) => toolResultTexts((await framework.previewActivation(name)).messages),
+      workspace,
     });
   } finally {
     await framework.stop();
@@ -370,7 +373,7 @@ test('without a writable workspace, a result no longer than the notice saying no
   const payloads = [...Array.from({ length: 19 }, () => 'a'.repeat(110)), 'l'.repeat(113), 'j'.repeat(130), 'k'.repeat(130), ...Array.from({ length: 17 }, () => 'e'.repeat(5)), PAYLOAD];
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], payloads }, async ({ storedAll, shownAllTo }) => {
     assert.equal(storedAll.length, 40);
-    assert.equal('\n\n[truncated — original was 113 chars; no writable workspace mount without an include, full content not retained]'.length, 113);
+    assert.equal(storedAll[20]!.length, 113, 'premise: the notice is as long as the 113-character result');
     assert.deepEqual(storedAll.slice(0, 20), payloads.slice(0, 20));
     for (const text of storedAll.slice(20, 22)) {
       assert.equal(text, '\n\n[truncated — original was 130 chars; no writable workspace mount without an include, full content not retained]');
@@ -411,10 +414,11 @@ test('a result alone in its turn past a bound smaller than its notice is still s
   // that replaces it, but a reader cuts anything past 200, so only the file
   // keeps the rest. Keeping a result no longer than its notice whole is for a
   // share of a turn's bound, not a reader's own.
-  const writes: string[] = [];
-  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 50 }], mount: 'f', payload: 'm'.repeat(250), beforeStart: countWrites(writes) }, async ({ stored }) => {
-    assert.match(stored, /^\n\n\[truncated — showing 0 of 250 chars; full content: workspace file f\/tool-results\/\S+\.txt\. /);
-    assert.equal(writes.length, 1);
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 50 }], mount: 'f', payload: 'm'.repeat(250) }, async ({ stored, workspace }) => {
+    const notice = /^\n\n\[truncated — showing 0 of 250 chars; full content: workspace file (f\/tool-results\/\S+\.txt)\. /.exec(stored);
+    assert.ok(notice, stored);
+    const file = await workspace!.readBinary(notice[1]!);
+    assert.equal((file as { data: Buffer }).data.toString('utf8'), 'm'.repeat(250), 'the file it names holds the whole result');
   });
 });
 
