@@ -68,10 +68,6 @@ export function boundedForLog(text: string, max = 200): string {
   return points.length > max ? `${points.slice(0, max).join('')}…` : points.join('');
 }
 
-/**
- * The answer to a server's request whose handler was running when the host
- * stopped: -32000, so the server can send it again to the host's next run.
- */
 export function hostStoppedWhileHandling(): JsonRpcError {
   return { code: -32000, message: 'the host stopped while handling this request' };
 }

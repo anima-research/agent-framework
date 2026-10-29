@@ -2507,8 +2507,7 @@ export class McplServerConnection extends EventEmitter {
   /**
    * A request's responder, bound to the transport it came on (`epoch`): an
    * answer, or a streamed inference's chunk, sent after that transport has
-   * closed reaches nothing, never a server that didn't ask it. Its `signal`
-   * fires when that transport closes.
+   * closed reaches nothing, never a server that didn't ask it.
    */
   private responderFor(id: string | number, epoch: number) {
     return {

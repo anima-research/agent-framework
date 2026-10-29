@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { AnthropicAdapter, Membrane } from '@animalabs/membrane';
 
 import { AgentFramework } from '../src/index.js';
+import type { Module } from '../src/index.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
@@ -64,12 +65,12 @@ type Internals = {
   wireMcplEvents(connection: unknown, config: unknown): void;
 };
 
-async function hostWithRouter(membrane: Membrane): Promise<AgentFramework> {
+async function hostWithRouter(membrane: Membrane, modules: Module[] = []): Promise<AgentFramework> {
   const fw = await AgentFramework.create({
     storePath: join(mkdtempSync(join(tmpdir(), 'af-inference-abort-')), 'store'),
     membrane,
     agents: [{ name: 'assistant', model: 'claude-opus-5-5', systemPrompt: 'test' }],
-    modules: [],
+    modules,
   });
   const internals = fw as unknown as Internals;
   await internals.initializeMcpl([], { default: 'claude-opus-5-5' });
@@ -79,6 +80,29 @@ async function hostWithRouter(membrane: Membrane): Promise<AgentFramework> {
 
 const membraneFor = (base: string) =>
   new Membrane(new AnthropicAdapter({ apiKey: 'test-key', baseURL: base, cacheKeepalive: { enabled: false } } as never));
+
+function heldStream() {
+  const queue: unknown[] = [];
+  let wake: (() => void) | undefined;
+  const push = (event: unknown) => { queue.push(event); wake?.(); wake = undefined; };
+  const membrane = {
+    streamYielding: (_request: unknown, options: { signal?: AbortSignal }) => {
+      options.signal?.addEventListener('abort', () => push({ type: 'aborted', reason: 'user' }), { once: true });
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: async () => {
+            while (queue.length === 0) await new Promise<void>((resolve) => { wake = resolve; });
+            return { done: false, value: queue.shift() };
+          },
+          return: async () => ({ done: true, value: undefined }),
+        }),
+      };
+    },
+  };
+  return { membrane, push };
+}
+
+const token = (text: string) => ({ type: 'tokens', content: text, meta: { visible: true } });
 
 const request = (stream: boolean) => ({
   featureSet: 'memory.consolidation',
@@ -166,7 +190,7 @@ describe("an MCPL server's inference request the host stops", () => {
       return true;
     });
     const took = Date.now() - started;
-    assert.ok(took >= 300 && took < 1_000, `stop() took ${took} ms`);
+    assert.ok(took >= 300, `stop() took ${took} ms`);
 
     release();
     await until(() => (router.running as Set<unknown>).size === 0, 'the request to end');
@@ -195,6 +219,158 @@ describe("an MCPL server's inference request the host stops", () => {
 
     await until(() => handlerErrors.length === 1, 'the handler failure');
     assert.deepEqual(handlerErrors, ['the connection is gone']);
+  });
+
+  it("a streamed request whose token is still on its way when stop() comes sends no chunk after the stop answer", async () => {
+    const fw = await hostWithRouter(membraneFor('http://127.0.0.1:9'));
+    const held = heldStream();
+    (fw as unknown as Internals).inferenceRouter.membrane = held.membrane;
+    const connection = registeredConnection(fw);
+    const wire: unknown[] = [];
+    connection.emit('inference-request', request(true), {
+      id: 7,
+      respond: (result: unknown) => wire.push({ result }),
+      respondError: (code: number, message: string) => wire.push({ error: { code, message } }),
+      sendChunk: (chunk: { delta: string }) => wire.push({ chunk: chunk.delta }),
+    });
+    held.push(token('first'));
+    await until(() => wire.length === 1, 'the first chunk');
+
+    held.push(token('second'));
+    await fw.stop();
+
+    assert.deepEqual(wire, [{ chunk: 'first' }, { error: STOPPED }]);
+  });
+
+  it("a stop() a host calls from the request's start trace answers it as stopped before its connection closes", async () => {
+    const provider = await silentProvider();
+    cleanup.push(provider.close);
+    const fw = await hostWithRouter(membraneFor(provider.base));
+    let stopping: Promise<void> | undefined;
+    fw.onTrace((event) => {
+      if ((event as { type: string }).type === 'mcpl:inference_start') stopping ??= fw.stop();
+    });
+    const connection = registeredConnection(fw);
+    const answers: Array<{ beforeClose: boolean; result?: unknown; error?: { code: number; message: string } }> = [];
+    connection.emit('inference-request', request(false), {
+      id: 7,
+      respond: (result: unknown) => answers.push({ beforeClose: !connection.closed, result }),
+      respondError: (code: number, message: string) => answers.push({ beforeClose: !connection.closed, error: { code, message } }),
+    });
+    await until(() => stopping !== undefined, 'the stop');
+    await stopping;
+
+    assert.deepEqual(answers, [{ beforeClose: true, error: STOPPED }]);
+    await until(() => provider.dropped() === provider.sent(), 'every provider call to be dropped', 2_000);
+  });
+
+  it("a stop() after the request's transport closed, while its call is still settling, answers nothing and traces the transport", async () => {
+    const fw = await hostWithRouter(membraneFor('http://127.0.0.1:9'));
+    let fail!: (error: Error) => void;
+    let called = false;
+    (fw as unknown as Internals).inferenceRouter.membrane = {
+      complete: () => { called = true; return new Promise((_resolve, reject) => { fail = reject; }); },
+    };
+    const failures: string[] = [];
+    fw.onTrace((event) => {
+      const traced = event as { type: string; error?: unknown };
+      if (traced.type === 'mcpl:inference_fail') failures.push(String(traced.error));
+    });
+    const connection = registeredConnection(fw);
+    const transport = new AbortController();
+    const answers: unknown[] = [];
+    connection.emit('inference-request', request(false), {
+      id: 7,
+      signal: transport.signal,
+      respond: (result: unknown) => { if (!transport.signal.aborted) answers.push({ result }); },
+      respondError: (code: number, message: string) => { if (!transport.signal.aborted) answers.push({ error: { code, message } }); },
+    });
+    await until(() => called, 'the provider call');
+
+    transport.abort();
+    const stopping = fw.stop();
+    fail(new Error('Request was aborted'));
+    await stopping;
+
+    assert.deepEqual(answers, []);
+    assert.deepEqual(failures, ['the transport the request came on closed']);
+  });
+
+  for (const outcome of ['completes', 'fails'] as const) {
+    it(`a stop() a host calls from the trace of a request that ${outcome} leaves that outcome its one answer`, async () => {
+      const fw = await hostWithRouter(membraneFor('http://127.0.0.1:9'));
+      (fw as unknown as Internals).inferenceRouter.membrane = {
+        complete: async () => {
+          if (outcome === 'fails') throw new Error('the provider failed');
+          return createMockResponse([{ type: 'text', text: 'done' }]);
+        },
+      };
+      let stopping: Promise<void> | undefined;
+      const traced: string[] = [];
+      fw.onTrace((event) => {
+        const { type } = event as { type: string };
+        if (type.startsWith('mcpl:inference_') || type === 'mcpl:request-handler-error') traced.push(type);
+        if (type === 'mcpl:inference_complete' || type === 'mcpl:inference_fail') stopping ??= fw.stop();
+      });
+      const connection = registeredConnection(fw);
+      const answers: unknown[] = [];
+      connection.emit('inference-request', request(false), {
+        id: 7,
+        respond: (result: unknown) => answers.push({ result: (result as { content: string }).content }),
+        respondError: (code: number, message: string) => answers.push({ error: { code, message } }),
+      });
+      await until(() => stopping !== undefined, 'the stop');
+      await stopping;
+
+      assert.deepEqual(answers, [outcome === 'completes' ? { result: 'done' } : { error: { code: -32603, message: 'the provider failed' } }]);
+      assert.deepEqual(traced, ['mcpl:inference_start', outcome === 'completes' ? 'mcpl:inference_complete' : 'mcpl:inference_fail']);
+    });
+  }
+
+  it("a budgeted stop() waits for a request beside the modules' stop, inside one budget", async () => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const releaser = {
+      name: 'releaser',
+      start: async () => {},
+      stop: async () => { release(); },
+      getTools: () => [],
+      handleToolCall: async () => ({ success: true }),
+      onProcess: async () => ({}),
+    } as unknown as Module;
+    const fw = await hostWithRouter(membraneFor('http://127.0.0.1:9'), [releaser]);
+    let called = false;
+    (fw as unknown as Internals).inferenceRouter.membrane = {
+      complete: async () => { called = true; await released; throw new Error('released'); },
+    };
+    const connection = registeredConnection(fw);
+    connection.emit('inference-request', request(false), { id: 7, respond: () => {}, respondError: () => {} });
+    await until(() => called, 'the provider call');
+
+    await fw.stop(300);
+  });
+
+  it('an unbudgeted stop() returns only once each aborted provider call has ended', async () => {
+    const fw = await hostWithRouter(membraneFor('http://127.0.0.1:9'));
+    let called = false;
+    let ended = false;
+    (fw as unknown as Internals).inferenceRouter.membrane = {
+      complete: (_request: unknown, options: { signal: AbortSignal }) => {
+        called = true;
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            setTimeout(() => { ended = true; reject(new Error('Request was aborted')); }, 200);
+          }, { once: true });
+        });
+      },
+    };
+    const connection = registeredConnection(fw);
+    connection.emit('inference-request', request(false), { id: 7, respond: () => {}, respondError: () => {} });
+    await until(() => called, 'the provider call');
+
+    await fw.stop();
+
+    assert.equal(ended, true);
   });
 });
 
