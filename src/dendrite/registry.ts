@@ -368,7 +368,9 @@ export class AgentRegistry {
     for (const { ended } of this.interruptedPending.values()) {
       if (ended.name === name && (!newest || ended.incarnation > newest.incarnation)) newest = ended;
     }
-    return newest ?? this.findEnded?.(name);
+    if (newest) return newest;
+    const logged = this.findEnded?.(name);
+    return logged && withOwnSlot(clone(logged));
   }
 
   /** Flat list of agents — the discovery surface. Ended ones on request. */
