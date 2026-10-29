@@ -69,6 +69,14 @@ export function boundedForLog(text: string, max = 200): string {
 }
 
 /**
+ * The answer to a server's request whose handler was running when the host
+ * stopped: -32000, so the server can send it again to the host's next run.
+ */
+export function hostStoppedWhileHandling(): JsonRpcError {
+  return { code: -32000, message: 'the host stopped while handling this request' };
+}
+
+/**
  * Create a "feature set not enabled" error.
  * Returned when a server sends a message tagged with a feature set
  * that the host has disabled.
