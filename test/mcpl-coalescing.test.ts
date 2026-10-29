@@ -2620,6 +2620,81 @@ test('R16: a batch whose render-start commit failed is re-woken once storage rec
   assert.equal(coalescer.pendingBatches(), 0);
 });
 
+test("a render whose store write is refused keeps its batch, which its recovery wake delivers as the fallback, without asking the server again", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 50;
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  f.renderer(async () => ({ content: [{ type: 'text', text: 'refused_render' }] }));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  let refused = 0;
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (refused === 0 && JSON.stringify(args[1]).includes('refused_render')) {
+      refused++;
+      throw new Error('zz-store-refused');
+    }
+    return add(...args);
+  };
+  const kinds: string[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing') kinds.push((e as { kind: string }).kind); });
+  f.alwaysRespond();
+  await f.send('push/event', f.params('1', 'refused_fallback', { deferred: true, initial: true }));
+  await settles(f.framework.runUntilIdle(), 'the first drain');
+  assert.equal(refused, 1, "the store refused the render's write");
+  for (let pass = 0; !f.membrane.calls.some((c) => JSON.stringify(c).includes('refused_fallback')); pass++) {
+    assert(pass < 5, 'the batch was delivered within five recovery wakes');
+    await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
+    await settles(f.framework.runUntilIdle(), `the drain after recovery wake ${pass + 1}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert(kinds.indexOf('deliver-failed') !== -1 && kinds.indexOf('deliver-failed') < kinds.indexOf('recovery-wake'), 'the refusal is traced, then re-woken by the recovery timer, without unrelated traffic');
+  assert(f.context().includes('refused_fallback'), 'the fallback is stored');
+  assert.equal(f.renders.length, 1, 'the server was asked to render it once');
+  assert.equal(coalescer.pendingBatches(), 0);
+});
+
+test("a render whose store write is refused leaves a batch opened while it rendered to be delivered", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  let renders = 0;
+  f.renderer(() => {
+    if (++renders > 1) return Promise.resolve({ content: [{ type: 'text', text: 'second_render' }] });
+    began();
+    return new Promise((resolve) => { release = resolve; });
+  });
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  await eventually(() => internals.pendingRequests.length > 0, 'the batch wake');
+  const turn = f.framework.runUntilIdle();
+  await settles(started, 'the first render');
+  await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  let refused = 0;
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (JSON.stringify(args[1]).includes('first_render')) {
+      refused++;
+      throw new Error('zz-store-refused');
+    }
+    return add(...args);
+  };
+  release({ content: [{ type: 'text', text: 'first_render' }] });
+  await settles(turn, 'the first drain');
+  assert.equal(refused, 1, "the store refused the first render's write");
+  const read = () => f.membrane.calls.some((c) => /second_(render|fallback)/.test(JSON.stringify(c)));
+  for (let pass = 0; !read(); pass++) {
+    assert(pass < 5, 'the newer batch was delivered within five wakes');
+    await eventually(() => internals.pendingRequests.length > 0, 'a wake');
+    await settles(f.framework.runUntilIdle(), `the drain after wake ${pass + 1}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert(read(), "a turn of the agent's read the newer batch");
+});
+
 test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;

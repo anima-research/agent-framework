@@ -1169,7 +1169,18 @@ export class PushCoalescer<E = unknown> {
         // a run's oldest render can be one.
         const run = state.occupant?.rendered ? state.occupant : undefined;
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
-        const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
+        let placement: CoalescingPlacement | undefined;
+        try {
+          placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
+        } catch (error) {
+          this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error) });
+          if (!state.batch) {
+            batch.noRender = true;
+            state.batch = batch;
+          }
+          this.scheduleRecovery(subject, state);
+          return;
+        }
         if (placement?.presented === false) {
           // Stored and not presented to its agent: another agent's, whose
           // turn is alive, or the assembling agent's own after its assembly
