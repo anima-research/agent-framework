@@ -873,6 +873,8 @@ async function muted<T>(fn: () => Promise<T>): Promise<T> {
 /** A bare framework that drains through `connection`. */
 function drainingFramework(outbox: DiscordAwarenessOutbox, connection: (id: string) => unknown) {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = outbox;
   framework.discordAwarenessDrains = new Map();
   framework.discordAwarenessDrainsJoined = new Set();
@@ -1227,6 +1229,8 @@ test('a sync for one server drains only that server', async () => {
 test("the framework's retract and cancel each record their act in the operator log, done or refused", withLedger(async (outbox) => {
   const batch = await activeBatch(outbox, [ref('m1')]);
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = outbox;
   framework.operatorOperations = new Set();
   framework.deliverDiscordAwarenessInBackground = () => {};
@@ -1253,6 +1257,8 @@ test("the framework's retract and cancel each record their act in the operator l
 /** A bare framework that resumes suppressions on `branch` from `cm`. */
 function resumingFramework(outbox: DiscordAwarenessOutbox, branch: string, cm: unknown) {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = outbox;
   framework.store = { currentBranch: () => ({ name: branch }) };
   framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
@@ -1393,6 +1399,8 @@ test("a version 2 ledger's batch is reported in its own words: its retirement is
   const alerts: Array<{ kind: string; message: string; key?: string }> = [];
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.opsAlert = (kind: string, _agent: string, message: string, opts?: { key?: string }) => { alerts.push({ kind, message, key: opts?.key }); };
   const base = { agentName: 'cairn', sourceBranch: 'main', targetBranch: 'legacy/x', marks: 0, suppression: true, imported: true };
   const error = console.error;
@@ -1413,6 +1421,8 @@ test("a version 2 ledger's batch is reported in its own words: its retirement is
 /** A bare framework whose ops alerts reach a stubbed webhook. */
 function alertingFramework() {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.opsAlertLastSent = new Map<string, number>();
   framework.opsAlertCooldownMs = 15 * 60_000;
   framework.logFailure = () => {};
@@ -1486,6 +1496,8 @@ test("the per-batch alerts of a surgery whose marks could not be scheduled, or w
 
 test("after a failed surgery, retiring its batch says whether it is retired, or stays prepared with what that leaves", async () => {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   const alerts: string[] = [];
   framework.opsAlert = (kind: string) => { alerts.push(kind); };
   framework.store = { currentBranch: () => ({ name: 'main' }), listBranches: () => [] };
@@ -1524,6 +1536,8 @@ test('the start that rewrites a version 2 ledger raises one alert naming each ba
   const alerts: Array<{ kind: string; agent: string; message: string }> = [];
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = h.open({ announceImport: (unsent) => framework.announceDiscordAwarenessImport(unsent) });
   framework.opsAlert = (kind: string, agent: string, message: string) => { alerts.push({ kind, agent, message }); };
   const error = console.error;
@@ -1557,6 +1571,8 @@ test('the start that rewrites a version 2 ledger raises one alert naming each ba
 test('a start on a ledger it cannot read stops, naming the ledger read', withLedger(async (_outbox, h) => {
   writeLedger(h, '{broken');
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = h.open();
   await assert.rejects(framework.reconcileDiscordAwarenessAtStartup(),
     /accounting failed during startup reconciliation: Invalid Discord awareness ledger .*: it isn't JSON$/);
@@ -1565,6 +1581,8 @@ test('a start on a ledger it cannot read stops, naming the ledger read', withLed
 test("a suppression's resume record that could not be closed is logged, and a closed one says nothing", async () => {
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.opsAlert = () => { throw new Error('no alert expected'); };
   const facts = { scope: 'none', unmarked: 0, notRemoved: 0 };
   const error = console.error;
@@ -1608,6 +1626,8 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, given: Arra
     },
   };
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.agents = new Map([['cairn', { state: { status: 'idle' }, getContextManager: () => contextManager }]]);
   framework.store = { currentBranch: () => ({ name: currentBranch }), listBranches: () => [] };
   framework.discordAwarenessOutbox = outbox;

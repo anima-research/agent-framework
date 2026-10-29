@@ -12,6 +12,446 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.30.0 — 2026-10-29
+
+### Breaking
+
+- **Hosts:** `speech.locus` defaults to `'delivery'`, and a `channel_publish`
+  with no `channelId` goes where the calling turn's plain speech would. A
+  host that relied on its agents' prose or publishes reaching the channel
+  of the latest message needs to act.
+  - **Before, plain prose** (under prose routing by locus, `'locus'` or
+    `'hybrid'`): a turn no channel message woke fell back to the channel
+    of the most recent inbound message (a reaction, an edit, a deletion or
+    a system notice aside), unless it was a conversation fork's, a
+    heartbeat's, a `noChannel` turn or an ephemeral agent's, as now. An
+    addressed message injected mid-turn from another channel moved the
+    turn's speech to that channel, and so did one that arrived between the
+    turn's streams, at its next start.
+  - **Before, `channel_publish` with no `channelId`:** it went to the
+    channel of the most recent inbound message (the same markers aside),
+    whichever turn called it or whether or not one did. A conversation
+    fork's own call went to its home, as now, but one a host made for it
+    through `executeToolCall` took the latest message's channel, and now
+    takes the home. It was refused when there was none or the caller was
+    an ephemeral agent.
+  - **Now, plain prose** (under prose routing by locus): only the delivery
+    that woke a turn, a conversation fork's home channel or a channel the
+    agent opened during the turn sets its locus. A turn with no locus falls
+    back only to an open all-except tune-out's excepted channel, and
+    otherwise keeps its prose private; a heartbeat's turn, a `noChannel`
+    turn and an ephemeral agent's take no fallback. An addressed message
+    from another channel moves nothing, and the agent is told, once per
+    channel per turn, in a `[routing]` notice.
+  - **Now, `channel_publish` with no `channelId`:** from a turn, it goes to
+    the turn's locus, else a conversation fork's home channel, else the
+    channel of the message that woke the turn, else the fallback. Made
+    outside any turn, as a script left running after its turn makes, it
+    goes to a conversation fork's home channel, else the fallback. The
+    fallback is only an open all-except tune-out's excepted channel, and a
+    heartbeat's turn, a `noChannel` turn and an ephemeral agent don't take
+    it. The call is refused when none of these names a channel.
+  - **Migration:** `speech: { locus: 'latest-inbound' }` brings back the
+    re-pins on an addressed injection and on an arrival, and makes the most
+    recent delivered inbound message's channel the fallback again, after
+    an open all-except tune-out's, for prose and for a publish. No setting
+    sends a publish from a turn there ahead of the turn's own channel, or
+    from a turn that takes no fallback: a publish meant for it names its
+    `channelId`.
+  - **Unchanged:** a `channel_publish` that names its `channelId` goes to
+    that channel.
+
+### Added
+
+- The admission stage (Dendrite §D, issue #232 §3.5): every inbound channel
+  message and push event passes one decision — captured, recipients, body or
+  hold, wake, locus — before anything acts on it (`src/admission/admit.ts`,
+  traced as `admission:decided`). The wake gate runs after the hold, so a
+  held message never forms a debounce batch; for a held message it is only
+  probed, and that verdict preconditions the reader's wake. Gate batches
+  re-check the hold at delivery (`gate:held-dropped`).
+- `speech.locus` (`'delivery'` | `'latest-inbound'`): where plain prose goes
+  when nothing names a destination. The default `'delivery'` is the §3
+  carve-out: only the waking delivery, a fork's home or a channel the agent
+  opened this turn sets the locus; incoming traffic never moves it, between
+  turns or mid-turn; a turn without one keeps its prose private with a
+  `[routing]` notice. `'latest-inbound'` restores the previous rule.
+- Tune-out without a reader (#232 §3.3): the coordinator exists whenever
+  MCPL channels do, a persisted epoch is always resumed and released, and a
+  tune-out without a subconscious is a silent hold. `tuneOut.enabled` offers
+  `tune_out` to residents when no reader is configured.
+- `tune_out` and `cancel_tuneout` take `serverId`; a channel id that exists
+  on several servers is refused as ambiguous.
+
+- The all-except scope (issue #232 §3.2; focus folded into tune-out):
+  `tune_out` with `scope: 'all-except'`, or its alias `focus`, holds every
+  channel except one — DMs and channels registered later included — for a
+  mandatory `durationSeconds`. A turn with no delivery of its own speaks into
+  the excepted channel. `mode: 'check'` reports held counts per channel and
+  peeks one channel without releasing; release is per channel, each capped.
+  A per-channel epoch takes precedence; the reader may end the scope;
+  exhausting the reader's wake budget pauses reader wakes rather than ending
+  the hold (`tune-out:wake-budget-paused`); closing the excepted channel ends
+  it. Listed by `listPolicyEpochs()` as a tune-out epoch with
+  `scope: { kind: 'all-except', except }`.
+  Entry and release are announced in the excepted channel as one bracketed
+  line each under the resident's name (`tuneOut.announce`, default true;
+  traced `tune-out:announced` / `tune-out:announce-failed`).
+  Its end time and cadence hold any length: both run on timers no longer
+  than one holds, as a channel's tune-out does since 0.22.3, so a hold or a
+  cadence past 24.8 days ends or ticks when it should rather than at once.
+  `focus` reads its options as `tune_out` does: a value that gives no finite
+  number is refused, naming it, before anything changes; a numeric string is
+  read as its number; a `null` option counts as left out; and the duration
+  is still required.
+
+- `bench/dendrite/cache-acceptance.mjs`: a live acceptance run for the Dendrite
+  rendering contract — a folding resident, a fork at the boundary and a fork
+  derived mid-tool-call, each request's `cache_creation`/`cache_read` against the
+  resident's own reuse. Measured 2026-10-10 on Claude Sonnet 5.5 (one model, one
+  route, a synthetic 40-message history): the fork at the boundary read 10,193
+  cached tokens and wrote 29; the fork derived mid-tool-call read 10,230 and
+  wrote 152; the resident's own reuse read 10,173. Reuse follows the cache markers
+  the strategy emits (autobiographical: messages; passthrough: system and
+  tools only).
+
+- A derived agent's source is told of it (#270, for Linn): by default every
+  derivation puts one host-framed `[Agent lifecycle: … was derived from you as a …]`
+  line in the context of the agent it was made from — the fork's name and
+  kind, whose weights run it, what it inherits, where its result goes and
+  what ends it; a resumption says so. Stamped `kind: 'agent-lifecycle'`
+  with the record's fields under `dendrite`. No wake; a host's
+  `dendrite.derivationNotice` can replace the line or send none. The fork
+  never inherits the notice about itself; an ended source is told nothing.
+  After `dendrite.collapseDerivationNoticesAfter` derivations of one kind
+  from one agent (default 10; 0 never collapses), the source hears a count
+  line every so many instead, with the latest described and
+  `dendrite.collapsed: { count, sinceLastNote }`; every derivation still
+  emits its `dendrite:agent-created` trace.
+
+- `deriveAgent({ name, from, mode?, solve?, strategy?, config?, framing?, resultTo?, ... })` derives a bounded agent from a live one: the parent's context at a checkpoint, a private continuation, and — unless overridden — the parent's whole configuration (model, thinking, cache TTL, provider params, system prompt, tools, live context budget). The parent keeps running. `mode: 'shared'` (default) gives the child the parent's messages and fold state through shared storage on a Chronicle branch of its own: nothing is copied, the child folds with the parent's memory tree, and neither can alter what the other reads. It requires `@animalabs/chronicle` with `JsStore.view` and `@animalabs/context-manager` with `ContextManager.derive`, and is refused with a clear error, never silently downgraded, where they are missing. `mode: 'copy'` is the historical compiled-context copy and works with the published packages. `solve: 'fresh'` deliberately re-solves the inherited context instead of reusing the parent's rendering. See `docs/dendrite.md`.
+- `AgentConfig.selfParticipants` and `AgentConfig.presentAs`: model-facing role assignment at request assembly. Stored participants named in `selfParticipants` are presented as the agent's own assistant turns, under `presentAs` (default: its name). Stored authorship is never rewritten. A shared-inheritance fork uses these so its parent's turns read as its own history and its request shares the parent's provider prefix.
+- `AgentConfig.denyToolsAtDispatch`: tools that stay advertised but are refused when the agent calls them, so a derived agent can be restricted without changing the tool block at the front of its request.
+- `resumeAgent(name, config)` brings an ended bounded job back as a new incarnation of the same identity on the context it left (its namespace, or a fork's own branch) — after a stop, a failure, or a restart. `inspectAgentContext(name, { atSequence? })` returns a snapshot of a live agent's context at the head or an earlier sequence without affecting the agent, or the context an ended agent left.
+- `deriveAgent({ inheritRefusals: true })` also inherits the parent's compression-refusal ledger (default off); the choice is recorded as `inherit.refusals` on the agent record and in `dendrite:agent-created`.
+- `getPendingAssistantRound(name)` returns the assistant turn an agent has produced but not yet stored (its tool calls in flight), for hosts that derive an agent from inside a tool call.
+- A derived agent that inherits its parent's tools shows the parent's tool presentation (resident-edited visibility and descriptions); only the owner can edit it.
+
+- Two hooks a host decides derivations with, free of semantics:
+  `dendrite.beforeDerive(spec)` says yes or no, with a reason, to each agent
+  `createEphemeralAgent` makes, derivations included, before the agent
+  exists, and to each `resumeAgent` before its new incarnation exists;
+  `dendrite.derivationNotice(
+  record, from, defaultText)` decides what, if anything, the source is told.
+  Consent, budgets, a mind's standing instructions, or uses not yet
+  imagined are a host's or a module's to build on them, with a record's
+  `metadata`, `denyToolsAtDispatch` and `ForkReaderConfig.framing`; the
+  framework carries no consent model (architecture channel, 2026-10-19).
+- A reader fork can post nowhere with `allowChannelSpeech` off: every tool
+  but `deliver_summary`, `cancel_tuneout` and `note_disposition` is refused
+  at dispatch, while the block it is shown stays the resident's for the
+  shared prefix. `speak_in_channel` posts through the resident's publish
+  path, under the resident's account, in the fork's words; the docs said
+  otherwise and now say this.
+
+- A fork made from inside a tool call now sees the call that made it: by default
+  `deriveAgent` reproduces the parent's in-flight tool round on the child's
+  branch — the pending assistant turn verbatim, then a tool-result message with
+  the results already received, a note (or `pendingRound.madeBy.result`) for the
+  call that derived the child, and a note for any call still running — so the
+  child never meets a dangling `tool_use`. `pendingRound: { include: false }`
+  leaves it out.
+
+- `subconscious.reader: 'forks'` (Dendrite): the tune-out reader as a succession
+  of forks of the resident instead of one persistent side-agent. Each cadence
+  tick, coalesced wake and cancel derives a short-lived `subconscious-fork` at
+  the resident's head — its history as the fork's own turns, its refusal ledger,
+  its tools and system prompt, ending with it — hands it the traffic held since
+  the last look as ordinary framing (each held message to exactly one fork, media
+  preserved), including messages still queued behind a resident turn that is
+  running, which come last in `ReaderFramingContext.backlog` with held handles
+  for ids (`queuedCount` says how many), and lets it report through
+  `deliver_summary` as attributed mail
+  under the fork's name and incarnation. In this mode `subconscious.model` is
+  required (whose weights read the resident's prefix is never defaulted; the
+  resident's own model makes the fork a copy, another model by name is allowed)
+  and `subconscious.voice` is the reader's framing block in place of
+  `systemPrompt`. `subconscious.strategyFactory` supplies a fresh strategy
+  instance for each fork (required for a folding resident);
+  `subconscious.forkIdleTimeoutMs` bounds one fork (default 10 minutes);
+  `subconscious.framing(context)` decides how a fork is prompted, with
+  `defaultReaderFraming` exported as the default. A cadence period with nothing
+  new derives no fork. A reader's own cancel is followed by one more fork only
+  for messages that arrived after the reader was handed its own, and a
+  reader's own release of the all-except hold by one fork for each channel
+  with messages no reader was handed. A fork that throws before it reports
+  gives its messages back to the channel's next reader while the epoch still
+  holds the channel. New traces `tune-out:reader-fork` (`held`, of which
+  `queued`) and `tune-out:reader-fork-failed` (`returned`).
+  `reader: 'persistent'` remains the default and is unchanged.
+
+- Dendrite agent registry: one registry now describes every agent the framework runs — residents, the subconscious, conversation forks and ephemeral agents — with declared roles, lifetime and relationships (spawn, observe, message, result route). The four creation paths register as presets (`residentSpec`, `subconsciousSpec`, `conversationForkSpec`, `workerSpec`, `taskForkSpec`), exported with the registry types from the package root.
+- Discovery: `listAgents({ includeEnded })`, `getAgentRecord(name)`, `getPrimaryAgentName()`, `listActivations()` (which agent owns each in-flight run) and `listPolicyEpochs()` (tune-out holds, read from the coordinator's own state). Ended agents stay inspectable.
+- Lifecycle, with no permission checks inside the one host trust domain: `cancelActivation(name)`, `stopAgent(name)` and `reparentAgent(name, newParent)`. When an agent ends, the agents it spawned as attention tenants (`onParentEnd: 'end'`) end with it; task work it spawned is orphaned, keeps running, is told in its own context, and is offered to its nearest live ancestor or the primary. `stopAgent` refuses the default-delivery owner.
+- `reparentAgent(name, newParent)` also takes an agent that has ended, for the mail it holds: what it produced for a recipient that is gone, results and messages alike, goes to the new parent, and its record stays as it ended. When an ended agent's result is first held for a recipient that is gone, its first adoption candidate is told.
+- Attributed communication: `sendAgentMessage(from, to, content)` and `deliverAgentResult(from, content)` place the sender's verbatim content in the recipient's context under the sender's own name, with the sender's identity, incarnation and causal chain in `metadata.dendrite`. A result is recorded durably before delivery; if its recipient is gone it is held (`listHeldMail()`) until the agent is reparented, and a result held across a restart is delivered exactly once.
+- `createEphemeralAgent(config, spec?)` accepts an optional registry spec declaring who spawned the agent, where its result goes and what bounds it. A `task` lifetime's `deadlineMs` is enforced by `runEphemeralToCompletion`, which rejects with the new `AgentStoppedError` when a run is stopped, cancelled or timed out from outside. A task spec with neither a deadline nor an idle timeout is refused.
+- Restart behaviour follows lifetime: persistent agents are restored as a new incarnation of the same identity; bounded work that was live is recorded as ended (`host-restart`), and the recipient of a `message` result route is told once. Persistent agents the configuration no longer declares are ended (`not-configured`).
+- `agentRegistryPath` and `agentRegistryEndedPath` place the registry's recovery files for a host that gives the framework its own `store`; each defaults to its file under `<storePath>/recovery/`, and with neither and no `storePath` the framework warns at create.
+- New traces: `dendrite:agent-created` (names the kind, the model, the context source, what ends the agent and what happens when its spawner ends), `dendrite:agent-ended`, `dendrite:agent-orphaned`, `dendrite:agent-reparented`, `dendrite:activation-cancelled`, `dendrite:mail-deferred` (queued for the recipient's next boundary), `dendrite:mail-delivered` (entered the recipient's store), `dendrite:mail-held`. Delivered mail carries `metadata.dendrite.producedAt`. New config: `dendrite.announceOrphans` (default true).
+
+### Changed
+
+- `ChannelRegistry` no longer evaluates the wake gate or sets the publish
+  locus at ingestion: `shouldTriggerInference` is the per-server veto only,
+  and the framework reports delivered messages through `noteDelivered` after
+  admission. `channel_publish` without a `channelId` goes to the calling turn's
+  locus, else a conversation fork's home channel, else the turn's trigger
+  channel, else the registry's default, which an ephemeral agent (one
+  `createEphemeralAgent` or `resumeAgent` made, derivations included) or a
+  turn with no channel by design (`noChannel`, or a heartbeat) doesn't
+  take; the call is refused when none of these names a channel.
+- `TuneOutCoordinator.onIncoming` is split into `holdFor` (the pure lookup
+  admission uses) and `recordHeld` (the bookkeeping that follows a hold);
+  `cancel` takes the lifecycle state to return to; `enter` no longer
+  requires a reader.
+
+- `createEphemeralAgent(config, spec)` with `spec.inherit.mode: 'shared'` opens the agent's context by derivation from the named agent instead of a fresh isolated namespace.
+- A mid-turn injected message whose participant is one of the receiving agent's `selfParticipants` is no longer injected into the live stream (it would render as an assistant turn); it stays window-only, as a message under the agent's own name already did.
+
+- **agent-framework now depends on `@animalabs/context-manager` `^0.24.0` and `@animalabs/chronicle` `^0.5.0`**, where it depended on `^0.23.1` and `^0.4.0`. Derived agents and reader forks need context-manager 0.24.0's derived contexts and chronicle 0.5.0's branch views, so a fresh install now takes both.
+
+- Merged `main` at 0.22.1. The turn-routing rework (#314) is kept whole, and
+  `speech.locus` decides what its addressed re-pin does: under
+  `'latest-inbound'` a mid-turn addressed message or an *arrival* (one that
+  landed between the turn's streams) moves the locus as 0.22.1 does; under
+  `'delivery'` (the default) neither moves it, and an arrival that addressed
+  the agent from another channel is announced at the turn's next start with
+  the same `[routing] … addressed you from …` notice a tool boundary gives,
+  naming which start it is: a provider hold, a re-inference on tool
+  results, a budget restart or a retry.
+  The per-agent routing maps the Dendrite seam read (`turnLocusPins`,
+  `turnEngagedChannels`) are gone with the rework; the seam reads the turn's
+  `TurnRouting`. `conversationAgentHomes` and `sharedSlotAgents` are answered
+  by the agent registry (`homeChannel`, `readsSharedSlot`).
+- Merged `main` at 0.22.2. Where main's deferred-write rework (#286) meets
+  the Dendrite seam: at a tool boundary, a message held from the residents
+  (`tuneOut.heldFromResidents`) is stored with the boundary's other drained
+  writes, as before, and left out of the injection, since the next compile
+  hides it; a message that can't join the stream waits for the turn's end,
+  as main has it, and "the agent's own voice" there is every participant
+  the agent presents as, a derived agent's inherited voice included, not
+  its name alone. Held agent mail (`sendAgentMessage`, `deliverAgentResult`)
+  is released at each of the three sites that now store a deferred write:
+  the tool boundary, the turn-start flush and `addMessage`. An arrival's
+  record carries `addressed`, so main's new arrival tests read it. The
+  all-except hold's timers and option reading follow #444 (see the
+  all-except entry). `ProviderWaitNotSleptError` (main) is exported beside
+  `AgentStoppedError` and `DeriveAgentOptions` (the branch).
+- Merged `main` at 0.22.3. `isAddressedMessage` stays tag-only: main's call
+  sites pass the message's metadata as a second argument it ignores, and
+  here they pass the tags alone. The channel registry still decides nothing
+  about the locus at ingestion: main's acceptance step keeps only its
+  confirmation that the transport is open (a lifecycle-directed server's
+  traffic confirms the current target alone), and the latest-inbound locus
+  is set by admission, as before. `tune_out` and `focus` still dispatch
+  through the queue, and `enter` without a reader is still a silent hold;
+  main's words for a channel already tuned out, one bound to a conversation,
+  a cancel of a channel that isn't tuned out and an empty `speak_in_channel`
+  are adopted. A coalesced wake's timer reports what its work throws
+  (`tune-out:timer-failed`, main) around the all-except hold's own wake
+  path. The `drafts` tool (main) sits beside `tune_out` and `focus`; a
+  derived agent's tool block is still its surface owner's, with main's
+  `utils` filter applied to it. The deferred-writes restore is main's (a
+  queue that can't be read refuses to start; `heldAt`), with the branch's
+  re-wake for a tune-out release it restores. A request's per-agent
+  settings come from main's `requestSettings()` with the branch's
+  `assistantParticipant`; main's request-only rows are rendered under the
+  agent's presentation name. `endEphemeralRunRefused` is gone with main's
+  refusal of a start during `stop()` (#532). `QuiesceBlockedError` (main)
+  is exported beside the branch's names.
+  Main's rule that a refusal is an error result (#506) now covers
+  `tune_out` and `focus`: every refusal they return is `isError: true`, and
+  a channel the registry doesn't know is refused as `unknown channel: <id>`
+  (an id on several servers keeps the registry's own words). A tune-out
+  with no reader is a silent hold only where the host offers `tune_out`
+  without one (`tuneOut.enabled`); the coordinator's new
+  `holdWithoutReader` hook says so, and without it a hold with no reader is
+  refused in main's words. Under the author rule a placeholder for content
+  the host can't read is stored under its author too, `User: [Content not
+  shown: …]`, which main's parity test now counts as such.
+- Merged `main` at `8ec1de5a` (0.26.2's changelog and #720). At a tool
+  boundary the branch still releases each stored message's landed mail and
+  skips one held from the residents, and what it injects is then #720's: a
+  message the render gives null goes in as stored.
+- Merged `main` at `a4a74b48` (0.26.0 and after), where #710's
+  server-qualified channels meet the branch. A conversation fork's home
+  stays the agent registry's `homeChannel`, which the framework reads
+  wherever main read its own map of homes. `tune_out` and `focus` resolve
+  their channel as main's channel tools do: with a `serverId`, that server's
+  channel; inside the calling turn, the turn's own channel by its id;
+  otherwise the one registered channel a name answers to, by its id or as
+  `serverId:channelId`, and a name two channels answer to is refused with
+  them as candidates; `check`'s `peek` takes the same names and refuses what
+  they refuse, a channel no server registers now included. Their answers,
+  and the all-except announcement, name and reach the channel on its server.
+  The subconscious's `deliver_summary`, `cancel_tuneout` and
+  `speak_in_channel` resolve a channel as main's do, from a reader fork too.
+  A `cancel_tuneout` that names the all-except scope ends that hold, as
+  before, whatever channel its `channelId` picks or fails to pick (a name two
+  servers' channels answer to, or a turn's own channel its server no longer
+  registers); only a channel with a tune-out of its own is cancelled instead.
+  The latest delivered
+  inbound message, which admission records, keeps its server, and a message
+  whose server no longer registers its channel sets none. A
+  `channel_publish` naming no channel takes the turn's locus only when the
+  call is made inside the turn; outside it, a conversation fork's goes to
+  its home, an ephemeral agent's to none, and anyone else's takes the
+  registry's default. So main's
+  shared-channel-ids entry, which says such a publish posts to the latest
+  message's channel, holds here only under `speech.locus:
+  'latest-inbound'`, while no all-except tune-out is open, for a call by
+  an agent that is neither ephemeral nor a conversation fork, made
+  outside a turn or in a turn with neither a locus nor a trigger channel
+  that isn't a heartbeat's or a `noChannel` turn. Every way a live non-ephemeral agent ends drops a continuation
+  of its turn that is on its way (#722), and a conversation agent stopped by
+  a listener of the failure its hold after the compile reports is held by
+  nothing.
+  `AgentSpec.homeChannel` and the registry record's `homeChannel` are a
+  channel with its server, `{ serverId, channelId }`, and
+  `conversationForkSpec` takes it as `homeChannel` in place of `channelId`.
+  A record that keeps a bare id, as one written before does, is read as a
+  wake that names its channel without its server is: the one registered
+  channel with that id, or, where none or several are, a home on no
+  server.
+- Merged `main` at 0.28.0. main's view rule (#853: every check of whether
+  an agent sees a row asks the predicate its store was opened with) reads
+  this branch's views: a resident's (held rows and another agent's stored
+  context injections out), a derived agent's (its source's, which
+  context-manager's `derive` keeps) and a context reopened on the shared
+  slot (the residents'). A tool boundary, an arrival and the unread check
+  ask it, and a shared-slot message's readers are the registry's. main's
+  heartbeat (#827) wakes the agents whose spec takes untargeted inbound, as
+  an untargeted push does. An ended agent's re-arm count, exhausted-turn
+  record and run of stated waits (#846, #840) go with it. A `chat:system`
+  notice (#830) leaves the latest delivered inbound where it was, as a
+  marker does. Supplied text (#852): a channel message's author, which this
+  branch writes into the stored text and a held line, is kept to one line
+  with its notice openings marked, as is the author an addressed-elsewhere
+  notice names; `[Agent lifecycle: …]` and `[Focus: …]` are notice tags, so
+  a participant's text that opens with one is marked; tune-out's texts quote
+  a channel's name as `tune_out` takes it back, and name one no name picks
+  alone by its id and server.
+
+- With `subconscious.reader: 'forks'`, residents see the reader's four tools
+  (`deliver_summary`, `cancel_tuneout`, `speak_in_channel`, `note_disposition`)
+  in their own tool block so a reader fork's request shares their provider
+  prefix; a resident that calls one gets a tool-result refusal naming the
+  reader. A resident whose `allowedTools` leaves them out isn't shown them,
+  and neither are its reader forks, which can still report through their
+  final prose. A reader fork may call its own tools whatever its resident's
+  `allowedTools` says, unless a `denyToolsAtDispatch` entry it takes from
+  its resident names one. Persistent mode advertises nothing extra.
+- A reader fork's `cancel_tuneout` ends only the hold of the epoch it was
+  derived to read, and its `speak_in_channel` posts only into a channel that
+  hold still holds; calls made after it ends are refused. A fork whose
+  record carries no epoch is refused both. `deliver_summary` and
+  `note_disposition` stay open to every reader.
+
+- Agent selection reads declared roles from the registry instead of excluding agent kinds at each site. Residents, the subconscious and conversation forks are selected exactly as before. One difference: an ephemeral agent that is mid-run is no longer queued for untargeted broadcasts (a module's `requestInference: true`, an untargeted channel message or push event, coalescing's default readers) or for host-wide gate wakes. Such requests previously sat in the queue until the run ended and were then dropped with an `agent_not_found` trace; they are now never queued.
+- Two Chronicle states are added to every store: `framework/dendrite` (snapshot) and `framework/dendrite/ended` (append log). Existing stores need no migration.
+
+### Fixed
+
+- A channel message is stored as the model reads it: `author: body`. MCPL's
+  `channels/incoming` carries the author as a field and the body alone as
+  content; the framework stored the body under the anonymous participant
+  `user` with the author in metadata, and nothing between the store and the
+  wire wrote the name, so a spec-shaped server's message reached the model
+  as `user: <text>` with the author nowhere (Weft's rig, 2026-10-13). A
+  server that renders `Name: body` into the text itself (portal-mcpl) is
+  left as it is: the rule is idempotent, so the name appears once whichever
+  shape a server sends. The author stays in `metadata.author` as the
+  structured record. Exported as `presentAuthor` / `authorLine`.
+- A tune-out release line and the reader fork's backlog name an author
+  once. Both read `metadata.author`, so a message whose text a server had
+  already prefixed was shown as `Name: Name: body`.
+
+- Issue #232 §2 tune-out gaps, each with a regression test (gaps 1 to 10 on
+  the loopback MCPL server in `test/admission-e2e.test.ts`, gap 11 in
+  `test/tune-out-dump-fit.test.ts`): tuning out a DM now holds it
+  (1); held traffic never moves the speech locus (2); a debounced mention in
+  a tuned-out channel wakes the reader, not the resident (3); a release names
+  non-text blocks instead of dropping them (4); a held message that arrives
+  mid-turn is stored, never injected into the live turn (5); a release left
+  in the deferred queue is durable and re-wakes the resident at boot (6);
+  held messages still deferred at cancel are in the release (7); channel ids
+  resolve server-qualified (8); `channel_close` on a tuned-out channel is
+  refused, and the tune-out's cancel releases (9); the hold machinery runs
+  without a reader (10); the truncation note names a history tool the
+  resident has, or none (11).
+
+- The agent registry's durable state keeps `main`'s rules for the framework's
+  own state (nissa's review of #546, findings 1 to 5). A registry that can't
+  be read, or that reads as another version, refuses the start and names the
+  state, where before it was taken as empty and overwritten by the first
+  registration. A failed registry write, ended-log append or sync fails the
+  call that made it, and a result whose hold isn't durable is not delivered
+  (it stays held for the next attempt); a hold whose write fails leaves
+  memory too, so a retry holds it once. The registry and its ended log are
+  recovery files beside the store (`recovery/dendrite-registry.json`,
+  `recovery/dendrite-ended.json`), which win over the branch-local state, so
+  an undo or an operator's surgery can't erase a held result or the record
+  of work that ran; the branch-local copies stay for inspection and for
+  stores that predate the files. At boot, interrupted work is settled and
+  held mail redelivered after host mode and the deferred-write queue are
+  restored, so a quiesced host holds them as it holds any write, and mail an
+  entry of the restored queue carries is left to that entry's landing rather
+  than delivered twice under one id. Every agent that ends — by `stopAgent`,
+  by the idle reap, with its parent — is released through one path, which
+  releases its window as the reap did: a failure notice it never read
+  reaches the primary, and a write queued for it lands in its window.
+- The second round of the same review: a change a caller asks for — a
+  registration, an end, a reparent, a hold — is put back when its write
+  fails, so the call fails and a retry does it once (a stop whose write
+  failed had left the agent recorded as stopped while it ran). The put-back
+  rewrites the registry's recovery files to match memory (the branch-local
+  snapshot, written last, never holds the change); only an end already
+  appended to the branch-local ended log stays, and a boot reads that log
+  only where no ended recovery file exists.
+  A write that records something that has already happened — a
+  release, a held mark, a message path — is not failed: it alerts, stays in
+  memory, and the next write carries it. A result's hold is durable as it is
+  written, so no store sync decides the delivery; the release is written
+  only once the store has synced the landed message, so a hard exit between
+  the two leaves the mail held and the next boot's check of the recipient's
+  store settles it, never a release on disk for a message that isn't. A
+  version-1 registry whose records or mail are not lists is refused, not
+  taken as empty. A reader of the residents' shared slot that ends — a
+  resident dropped from the configuration — is reopened on the slot it
+  read, through the residents' view, where before an isolated namespace
+  showed none of its messages.
+- The split between a requested change and a record is the caller's: an end
+  `stopAgent` asks for is put back when its write fails, while a run's own
+  end and an idle reap record what has already happened — their writes
+  alert and the run still settles. An end that was put back comes off the
+  ended log's recovery file too, and a registry refused for its content
+  names the state it read, as one refused for its version does.
+
+- From the first live run of tune-out mk2 (Weft, 2026-10-12): a reader
+  fork that ends in prose without `deliver_summary` now has its final prose
+  delivered as its report (`tune-out:reader-prose-delivered`) instead of
+  losing it to `proseRouting: 'disabled'`; under `speech.locus: 'delivery'`
+  an addressed message injected mid-turn from another channel is announced
+  (who, from where, where the prose still lands); `tune_out check`'s `peek`
+  shows only the epochs holding the channel now, never a released one;
+  `stop()` leaves bounded work it cuts off live for the next boot to end as
+  `host-restart` and report (`dendrite:agent-interrupted` at stop), and
+  create()-time traces replay to a listener that asks (`onTrace(fn, { replay: true })`);
+  `channel_publish` without a `channelId` goes to the turn's locus (the
+  waking delivery, a channel opened this turn) before being refused.
+  `isAddressedMessage` is tag-only and says so; its unread parameter is gone.
+
 ## 0.29.0 — 2026-10-28
 
 ### Breaking

@@ -21,7 +21,7 @@
   `'head'`, sends requests as before, leaving any system changes out. New
   trace events: `head:declared`, `head:moved` and `head:resend`.
 - A host can fork an ephemeral agent onto its parent's head:
-  `createEphemeralAgent(config, { headFrom })` starts the new agent with the
+  `createEphemeralAgent(config, spec, { headFrom })` starts the new agent with the
   named running agent's recorded head, and `systemChangeMetadata`
   (exported beside `isSystemChangeMessage`) stamps the system changes copied
   into it as its own, so it reads the parent's cache and declares only its

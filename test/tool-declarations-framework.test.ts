@@ -274,7 +274,7 @@ describe('toolDeclarations in the framework', () => {
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
       // A fork shares its parent's system prompt.
-      const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: 'You are alpha.', ...parentConfig } as never, options);
+      const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: 'You are alpha.', ...parentConfig } as never, undefined, options);
       for (const m of messages) {
         if (isSystemChangeMessage(m)) child.getContextManager().addMessage(m.participant, m.content, systemChangeMetadata(name) as never);
         else child.getContextManager().addMessage(m.participant, m.content);
@@ -318,7 +318,7 @@ describe('toolDeclarations in the framework', () => {
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('old')], system: ['You are alpha.'] });
         // Both children share the parent's system prompt, as forks do.
-        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, { headFrom: 'alpha' })).agent;
+        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, undefined, { headFrom: 'alpha' })).agent;
         const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
         for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
@@ -341,7 +341,7 @@ describe('toolDeclarations in the framework', () => {
         const alpha = framework.getAgent('alpha')!;
         say(alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
-        const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, { headFrom: 'alpha' });
+        const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, undefined, { headFrom: 'alpha' });
         // The parent's head moves while the child's context opens.
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
@@ -355,7 +355,7 @@ describe('toolDeclarations in the framework', () => {
 
     it('refuses a headFrom that names no running agent, naming it', async () => {
       await withFramework([resident('alpha')], async (framework) => {
-        await assert.rejects(framework.createEphemeralAgent(resident('child') as never, { headFrom: 'nobody' }), /headFrom names no running agent: "nobody"/);
+        await assert.rejects(framework.createEphemeralAgent(resident('child') as never, undefined, { headFrom: 'nobody' }), /headFrom names no running agent: "nobody"/);
       });
     });
   });

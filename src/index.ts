@@ -2,12 +2,13 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
-export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
+export { AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
 // A stored system change (toolDeclarations 'entries'): how a host's own readers recognise one, and
 // the metadata that makes a copied one an agent's own, as for an ephemeral agent's `headFrom`.
 export { isSystemChangeMessage, systemChangeMetadata } from './system-changes.js';
+export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
@@ -17,6 +18,9 @@ export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone 
 export { CLOCK_ROW_KIND, resolveClockConfig } from './clock-rows.js';
 export type { ClockConfig, ClockStamp, ResolvedClockConfig } from './clock-rows.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
+
+// Dendrite: agent registry, lifecycle and presets
+export * from './dendrite/index.js';
 
 // Built-in modules
 export * from './modules/index.js';
@@ -199,6 +203,16 @@ export type {
 } from './recovery/offline-branch.js';
 
 export * from "./tool-presentation.js";
+
+// Tune-out: the subconscious configuration and the default reader-fork framing.
+export { presentAuthor, authorLine, authorNamed, ANONYMOUS_PARTICIPANT } from './author-presentation.js';
+export {
+  defaultReaderFraming,
+  type SubconsciousConfig,
+  type PersistentReaderConfig,
+  type ForkReaderConfig,
+  type ReaderFramingContext,
+} from './tune-out/tools.js';
 export {
   SILENT_HEARTBEAT_SEPARATOR,
   silentHeartbeatOf,
