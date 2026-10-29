@@ -203,3 +203,25 @@ test("an addModule() whose start() is still running when a stop() is admitted is
   assert.deepEqual(added, []);
   assert.equal(internals.moduleRegistry.modules.has('late'), false);
 });
+
+test("a removeModule() made while the module's start() runs stops it only after its start() returns, and the module is announced added, then removed", { timeout: 30_000 }, async (t) => {
+  const { framework, internals } = await fixture(t);
+  framework.start();
+  const order: string[] = [];
+  framework.onTrace((event) => { if (event.type === 'module:added' || event.type === 'module:removed') order.push(event.type); });
+  const entered = deferred();
+  const release = deferred();
+  const adding = framework.addModule(module('late', {
+    start: async () => { order.push('start entered'); entered.resolve(); await release.promise; order.push('start returned'); },
+    stop: async () => { order.push('stop called'); },
+  }));
+  await entered.promise;
+  const removing = framework.removeModule('late');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  release.resolve();
+  await adding;
+  await removing;
+  assert.ok(order.indexOf('start returned') < order.indexOf('stop called'), order.join(', '));
+  assert.ok(order.indexOf('module:added') < order.indexOf('module:removed'), order.join(', '));
+  assert.equal(internals.moduleRegistry.modules.has('late'), false);
+});
