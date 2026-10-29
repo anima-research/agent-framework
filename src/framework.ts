@@ -6058,10 +6058,9 @@ export class AgentFramework {
     const model = this.agents.get(agentName)?.model;
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     if (cooldown) {
-      const binds = !(cooldown.waitModel !== undefined && cooldown.waitModel !== model);
       const releaseWakes = cooldown.heldRequests.length > 0 || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
-      if (releaseWakes || (binds && queued.length > 0)) {
-        return { queued: binds ? [] : queued, held: { ...ends(cooldown.until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
+      if (releaseWakes || queued.length > 0) {
+        return { queued: [], held: { ...ends(cooldown.until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
       }
     }
     const wait = queued.length > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
