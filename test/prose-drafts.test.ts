@@ -662,6 +662,29 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("a stream that doesn't say whether it carries injections gets no mid-turn notice: its held reply is named in the receipt", async () => {
+    const h = await harness({ sendTool: true });
+    h.membrane.supportsInjectedMessages = 'undeclared';
+    await h.sendMode('no-channel');
+    try {
+      const segments = ['First — the actual reply.', 'Second words.', 'Third: trailing words.'];
+      await h.turn([
+        createMockResponse([text(segments[0]!), unplacedSend('s1')], 'tool_use'),
+        createMockResponse([text(segments[1]!), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text(segments[2]!)]),
+      ]);
+      const held = h.drafts().reverse();
+      assert.deepEqual(held.map((d) => d.text), segments, 'the reply is held as drafts');
+      assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
+      assert.equal(
+        h.texts().find((t) => t.startsWith('[delivered]')),
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+      );
+    } finally {
+      await h.close();
+    }
+  });
+
   it('deliberate privacy is never drafted: skip_reply and a same-round private think', async () => {
     const h = await harness({ agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
     try {

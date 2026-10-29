@@ -102,6 +102,7 @@ class MockYieldingStream implements YieldingStream {
           // membrane ≥0.5.64: verbatim blocks of the current round, in
           // provider order (thinking with signatures before tool_use)
           roundContent: response.content,
+          supportsInjectedMessages: true,
         },
       } as StreamEvent);
     } else {

@@ -97,7 +97,7 @@ class ToolRoundThenErrorStream implements YieldingStream {
     const call = { id: 'zz-call', name: 'input--zz_look', input: {} };
     yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, cacheCreationTokens: 0, cacheReadTokens: 0 } } as StreamEvent;
     yield { type: 'tool-calls', calls: [call], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '',
-      roundContent: [{ type: 'tool_use', ...call }] } } as StreamEvent;
+      roundContent: [{ type: 'tool_use', ...call }], supportsInjectedMessages: true } } as StreamEvent;
     if (this.waiting && !this.cutOff) await new Promise<void>((resolve) => { this.resume = resolve; });
     if (this.isCancelled) return;
     yield { type: 'error', error: this.error } as StreamEvent;

@@ -622,6 +622,30 @@ describe('clock rows in the framework', () => {
     } finally { await x.framework.stop(); }
   });
 
+  it('after a direct-API tool round whose result ends the turn: the clock follows the results', async () => {
+    const x = await make();
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
+      setClock('2026-10-21T10:52:10Z');
+      const agent = x.framework.getAgent('assistant')!;
+      const response = createMockResponse([{ type: 'tool_use', id: 'direct-1', name: 'tools--ping', input: {} }] as ContentBlock[], 'tool_use');
+      (x.membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'take the direct path' }]);
+      await agent.runInference(x.framework.getAllTools());
+      assert.equal((agent.state as { stream?: unknown }).stream, undefined, 'the premise: no yielding stream');
+      await (x.framework as unknown as { handleProcessEvent(e: unknown): Promise<void> }).handleProcessEvent({
+        type: 'tool-result', source: 'tools', moduleName: 'tools', agentName: 'assistant', callId: 'direct-1',
+        result: { success: true, data: { ok: true }, endTurn: true },
+      });
+      const all = rows(x.framework);
+      const results = all.findIndex((r) => r.content.some((b) => b.type === 'tool_result'));
+      assert.ok(results > 0, "the round's results are stored");
+      assert.deepEqual(all.slice(results + 1).map((r) => (isClock(r) ? textOf(r) : r.participant)), ['Clock: 10:52 UTC'],
+        'the clock follows the tool results, and nothing else does');
+    } finally { await x.framework.stop(); }
+  });
+
   it('writes no clock before a tool\'s results or the agent\'s own row, through the store path', async () => {
     const x = await make();
     try {

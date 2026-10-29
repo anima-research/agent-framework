@@ -350,7 +350,7 @@ class RoundThenEnd implements YieldingStream {
     yield {
       type: 'tool-calls',
       calls: [{ id: call.id, name: call.name, input: {} }],
-      context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [call] },
+      context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [call], supportsInjectedMessages: true },
     } as StreamEvent;
     if (!this.resumed) await new Promise<void>((r) => { this.resume = r; });
     if (this.isCancelled) {

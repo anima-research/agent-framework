@@ -295,18 +295,13 @@ export interface CoalescingReceiptRecord {
 
 export interface CoalescerHost<E> {
   /** True iff the placement still exists and, as far as the host can tell,
-   *  no model request has included it. The host can't always tell: a
-   *  message injected into a stream that didn't say whether it carries
-   *  injections, as no membrane 0.5.x stream does, counts as unread though
-   *  a request may have included it. */
+   *  no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
   /** True iff nothing may have shown the placement to the agent: it is still
    *  in the deferred queue and known not to be stored already, or it is
    *  stored where no committing compile has begun to assemble it and no tool
    *  boundary has injected past it. Unlike
-   *  isUnread, a compile counts from its start, and a boundary counts
-   *  whether or not its stream says it carries injected messages: a doubt
-   *  counts as shown. */
+   *  isUnread, a compile counts from its start: a doubt counts as shown. */
   isUnshown(placement: CoalescingPlacement): boolean;
   /** False when the unread occurrence could not be removed (it may still be read). */
   remove(placement: CoalescingPlacement): boolean;

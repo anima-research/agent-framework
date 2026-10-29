@@ -292,6 +292,7 @@ class PausedAfterFirstToolRoundStream implements YieldingStream {
           previousResults: [],
           accumulated: '',
           roundContent: response.content,
+          supportsInjectedMessages: true,
         },
       } as StreamEvent);
       return;

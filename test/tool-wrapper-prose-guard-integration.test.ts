@@ -28,7 +28,7 @@ class ToolThenErrorStream implements YieldingStream {
   private events: StreamEvent[] = [{
     type: 'tool-calls',
     calls: [{ id: 'toolu_retry', name: 'mcpl--heartbeat--heartbeat_status', input: {} }],
-    context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'toolu_retry', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] },
+    context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'toolu_retry', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], supportsInjectedMessages: true },
   } as StreamEvent];
   private wake: (() => void) | null = null; private done = false;
   get isWaitingForTools() { return !this.done; } get pendingToolCallIds() { return this.done ? [] : ['toolu_retry']; } get toolDepth() { return 0; }
@@ -199,7 +199,7 @@ class LateToolAfterIdleMembrane {
           membrane.markDriven();
           await membrane.released;
           membrane.markLateOut();
-          yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] } } as StreamEvent;
+          yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], supportsInjectedMessages: true } } as StreamEvent;
           yield { type: 'complete', response: createMockResponse([{ type: 'text', text: 'late' }]) } as StreamEvent;
         } finally {
           membrane.markLeft();

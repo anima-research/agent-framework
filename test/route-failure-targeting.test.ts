@@ -1867,19 +1867,6 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(messages, 'A reply by worker'), 0, 'it read it, so no one else is told');
     });
 
-    it('passes on, by name, a notice injected into a stream that doesn\'t declare it carries injected messages', async () => {
-      // Such a stream may be one that drops them (membrane's XML path), so
-      // the run can't be counted as having read it.
-      await run([
-        [{ type: 'tool_use', id: 'p1', name: 'sender--post', input: {} }],
-        [{ type: 'text', text: '>>skip_reply done' }],
-      ]);
-
-      assert.ok(injected().some((c) => c.includes(SEND_FAILED)), 'the notice was offered to the run\'s live stream');
-      const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
-      assert.equal(count(messages, 'A reply by worker'), 1);
-    });
-
     it('passes on, by name, a notice its boundary stored but never sent, when a tool ends the turn', async () => {
       runMembrane.supportsInjectedMessages = true;
       sender.endTurnOnPost = true;
