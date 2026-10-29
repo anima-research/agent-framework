@@ -73,12 +73,12 @@ function thrownBy(fn: () => unknown): string {
   }
   return '(nothing was thrown)';
 }
-/** JSON.parse's error for `text`, as gate.json's load names it. */
+/** JSON.parse's error for `text`, quoted as gate.json's load names it. */
 function parseError(text: string): string {
   try {
     JSON.parse(text);
   } catch (err) {
-    return (err as Error).message;
+    return JSON.stringify((err as Error).message);
   }
   return '(it parsed)';
 }
@@ -216,7 +216,7 @@ test('a gate.json the gate cannot read at all refuses a change, naming what runs
 
   assert.match(
     thrown,
-    /^gate\.json couldn't be read \(EACCES: .*\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json readable; until then, a change is refused the same way\.$/,
+    /^gate\.json couldn't be read \("EACCES: .*"\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json readable; until then, a change is refused the same way\.$/,
   );
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN);
   assert.deepEqual(readdirSync(dir), ['gate.json']);
@@ -230,7 +230,7 @@ test('a directory at gate.json\'s path is a gate.json the gate cannot read, so a
   rmSync(configPath);
   mkdirSync(configPath);
   assert.throws(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }), {
-    message: /^gate\.json couldn't be read \(EISDIR: [^)]*\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json readable; until then, a change is refused the same way\.$/,
+    message: /^gate\.json couldn't be read \("EISDIR: [^"]*"\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json readable; until then, a change is refused the same way\.$/,
   });
   assert.ok(statSync(configPath).isDirectory(), 'nothing was written in its place');
   assert.deepEqual(gate.listPolicyNames(), ['mentions'], 'the rules in force stay');
@@ -396,7 +396,8 @@ test('a gate.json that is removed takes its error with it, and the rules in forc
     parsed = (err as Error).message;
   }
   assert.deepEqual(gate.getStatus().errors, [
-    `${parsed}. So what gate.json holds isn't in force, and the gate runs the rules of the last gate.json it used.`,
+    `gate.json, at ${configPath}, isn't JSON: ${JSON.stringify(parsed)}. So what gate.json holds isn't in force, and the gate runs `
+    + "the rules of the last gate.json it used. Once it's JSON, the gate reads it again at its next check for changes.",
   ]);
 
   rmSync(configPath);
@@ -421,7 +422,7 @@ test('a file the gate cannot reach, its directory closed off, is an error rather
   assert.deepEqual(policies.map((p) => p.name), ['mentions'], 'the rules in force stay');
   assert.equal(errors.length, 2, JSON.stringify(errors));
   assert.match(errors[0]!, /EACCES/);
-  assert.match(errors[1]!, /^Failed to load privileged-users file: EACCES/);
+  assert.match(errors[1]!, /^The privileged-users file, at .*, can't be read: "EACCES/);
 });
 
 test("the start's failure to reconcile gate.json shows beside a gate.json that loads, and stays until the next start", {
@@ -499,7 +500,11 @@ test('a privileged-users file that parses but holds no list is its error, and th
     assert.equal(gate.isPrivilegedUser('u2'), false);
     assert.deepEqual(
       gate.getStatus().errors,
-      ['Failed to load privileged-users file: expected a list of user ids, or {"userIds": [...]}'],
+      [
+        `The privileged-users file, at ${privilegedUsersPath}, holds no list of user ids, where one is needed, such as ["123"] or `
+        + '{"userIds": ["123"]}, so the one id of the list that last loaded stays privileged. Once it holds a list of user ids, the '
+        + 'gate loads it at its next check for changes. Writing [] to it, or removing it, makes no one privileged.',
+      ],
       shape,
     );
   }
@@ -522,7 +527,7 @@ test('a privileged-users list loads entry by entry: what is not a user id is ski
   const rounded = String(JSON.parse('12345678901234567890'));
   assert.equal(gate.isPrivilegedUser(rounded), false, 'the rounded number, which could be someone else, is not loaded');
   assert.deepEqual(gate.getStatus().errors, [
-    `3 entries in the privileged-users file aren't user ids, so they were skipped: "", ${rounded} (a number this large can't `
+    `3 entries in the privileged-users file, at ${privilegedUsersPath}, aren't user ids, so they were skipped: "", ${rounded} (a number this large can't `
     + 'be read exactly: write the id as a string, in quotes), {"id":"u3"}. A user id is a non-empty string, or a safe integer '
     + '(a whole number within 2^53 - 1 of zero); 2 ids did load.',
   ]);
@@ -538,7 +543,7 @@ test('a skipped privileged-users entry is quoted cut at 39 UTF-16 units, here at
   assert.equal(gate.isPrivilegedUser('u2'), true);
   // As JSON the entry is 54 units, and its 39th is the first half of the 19th pair, so the quote keeps 38.
   assert.deepEqual(gate.getStatus().errors, [
-    `1 entry in the privileged-users file isn't a user id, so it was skipped: ["${GRIN.repeat(18)}…. A user id is a `
+    `1 entry in the privileged-users file, at ${privilegedUsersPath}, isn't a user id, so it was skipped: ["${GRIN.repeat(18)}…. A user id is a `
     + 'non-empty string, or a safe integer (a whole number within 2^53 - 1 of zero); 1 id did load.',
   ]);
 });
@@ -547,7 +552,7 @@ test("a privileged-users file that isn't JSON keeps the last list that loaded, w
   const dir = tempDir(t);
   let now = AT;
   const { gate, privilegedUsersPath } = makeGate(dir, { config: RULES, privileged: '["u1"]', now: () => now });
-  const failures = () => gate.getStatus().errors.filter((e) => e.startsWith('Failed to load privileged-users file'));
+  const failures = () => gate.getStatus().errors.filter((e) => e.startsWith('The privileged-users file, at '));
   const check = (id: string) => {
     now += 2_000; // past the reload throttle
     return gate.isPrivilegedUser(id);
@@ -671,7 +676,7 @@ test("a gate.json that won't load and a privileged-users file that won't load ea
 
   const errors = gate.getStatus().errors;
   assert.equal(errors.length, 2, JSON.stringify(errors));
-  assert.ok(errors[1]!.startsWith('Failed to load privileged-users file'), 'the gate.json load kept the privileged-users error');
+  assert.ok(errors[1]!.startsWith('The privileged-users file, at '), 'the gate.json load kept the privileged-users error');
 
   writeFileSync(configPath, JSON.stringify(RULES));
   assert.deepEqual(gate.listPolicyNames(), ['mentions'], 'gate.json loads again');

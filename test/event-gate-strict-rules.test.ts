@@ -74,6 +74,9 @@ const MENTION = event(['chat:mention']);
 /** gate_status's entry for a gate.json that isn't used: its error, with what's in force instead. */
 const unused = (error: string, runs: string): string =>
   `${/[.?!]$/.test(error) ? error : `${error}.`} So what gate.json holds isn't in force, and the gate runs ${runs}.`;
+const notJsonShown = (configPath: string, parsed: string, runs: string): string =>
+  `gate.json, at ${configPath}, isn't JSON: ${JSON.stringify(parsed)}. So what gate.json holds isn't in force, and the gate runs ${runs}. `
+  + "Once it's JSON, the gate reads it again at its next check for changes.";
 const RUNS_DEFAULT = 'no rules: every event gets the default, "always"';
 const RUNS_LAST = 'the rules of the last gate.json it used';
 /** What a rule whose match is left with nothing that narrows it says, once something in the match was named. */
@@ -120,27 +123,27 @@ test('addPolicy refuses a rule with any problem, naming every one, and saves not
     [{ match: { filter: 'release' } }, 'match.filter is "release", where an object is needed, such as {"type": "text", "pattern": "release"}', all],
     [{ match: { filter: { type: 'glob', pattern: 'release*' } } }, 'match.filter.type is "glob", where "text" or "regex" is needed', all],
     [{ match: { filter: { type: 'text' } } }, 'match.filter.pattern is missing, where the text or regular expression to look for is needed', all],
-    [{ match: { filter: { type: 'regex', pattern: '(' } } }, /^match\.filter\.pattern isn't a regular expression the gate can read \(Invalid regular expression: .+\)$/],
+    [{ match: { filter: { type: 'regex', pattern: '(' } } }, /^match\.filter\.pattern isn't a regular expression the gate can read \("Invalid regular expression: .+"\), so fix it, or give match\.filter\.type "text" to look for the pattern as plain text$/],
     [{ resets: 'other-rule' }, 'resets is "other-rule", where a list of rule names is needed, such as ["other-rule"]'],
     [{ resets: ['other-rule', ''] }, 'resets holds "", where each entry is a rule\'s name'],
     [{ behavior: { passive_sample: { every: 3 } }, passthrough: 'true' }, 'passthrough is "true", where true or false is needed'],
-    [{ behavior: 'always', passthrough: true }, 'passthrough is only valid with rate_limit or passive_sample behaviors — for "always" there is no non-firing match to fall through on'],
+    [{ behavior: 'always', passthrough: true }, 'passthrough is true, and only a behavior.rate_limit or behavior.passive_sample rule passes on an event it matches without waking on it; with behavior "always", leave passthrough out'],
   ];
   for (const [fields, problem, also] of cases) {
     const message = refusal(gate, fields) ?? 'saved';
-    if (typeof problem === 'string') assert.equal(message, `Policy "r" wasn't saved: ${problem}.${also ?? ''}`, JSON.stringify(fields));
-    else assert.match(message.replace(/^Policy "r" wasn't saved: /, '').replace(/\.$/, ''), problem, JSON.stringify(fields));
+    if (typeof problem === 'string') assert.equal(message, `Rule "r" wasn't saved: ${problem}.${also ?? ''}`, JSON.stringify(fields));
+    else assert.match(message.replace(/^Rule "r" wasn't saved: /, '').replace(/\.$/, ''), problem, JSON.stringify(fields));
   }
   // Every problem is named, not only the first, with the fields that do nothing.
   assert.equal(
     refusal(gate, { match: { tagsAny: 'x', scope: [''] }, behavior: { debounce: 50 }, comment: 'c' }),
-    'Policy "r" wasn\'t saved: behavior.debounce is 50 ms, under the 100 ms minimum; match.scope holds "", and no event\'s type is ""; '
+    'Rule "r" wasn\'t saved: behavior.debounce is 50 ms, under the 100 ms minimum; match.scope holds "", and no event\'s type is ""; '
     + 'match.tagsAny is "x", where a list of non-empty strings is needed, such as ["chat:ambient"]. '
-    + `Policy "r" has "comment", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}.`,
+    + `Rule "r" has "comment", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}.`,
   );
-  assert.throws(() => gate.addPolicy({ match: {}, behavior: 'always' }), { message: 'A policy wasn\'t saved: it has no "name".' });
+  assert.throws(() => gate.addPolicy({ match: {}, behavior: 'always' }), { message: 'A rule wasn\'t saved: it has no "name".' });
   assert.throws(() => gate.addPolicy('dm'), {
-    message: 'A policy wasn\'t saved: it\'s "dm", where a rule is an object, such as {"name": "my-rule", "behavior": "always"}.',
+    message: 'A rule wasn\'t saved: it\'s "dm", where a rule is an object, such as {"name": "my-rule", "behavior": "always"}.',
   });
   assert.equal(existsSync(configPath), false, 'nothing was written');
 
@@ -195,10 +198,10 @@ test('a field name one slip from one the gate reads is a problem at every level,
     [{ match: { tagsAny: ['chat:dm'] }, matchBehavior: 'skip' }, 'it has "matchBehavior" (did you mean "behavior"?), which the gate doesn\'t read'],
   ];
   for (const [fields, problem, also] of cases) {
-    assert.equal(refusal(gate, fields), `Policy "r" wasn't saved: ${problem}.${also ?? ''}`, JSON.stringify(fields));
+    assert.equal(refusal(gate, fields), `Rule "r" wasn't saved: ${problem}.${also ?? ''}`, JSON.stringify(fields));
   }
   assert.throws(() => gate.addPolicy({ nmae: 'dm', behavior: 'always' }), {
-    message: 'A policy wasn\'t saved: it has "nmae" (did you mean "name"?), which the gate doesn\'t read; it has no "name".',
+    message: 'A rule wasn\'t saved: it has "nmae" (did you mean "name"?), which the gate doesn\'t read; it has no "name".',
   }, 'a slip of the name is named as one, beside the name it leaves missing');
 });
 
@@ -285,7 +288,7 @@ test('in gate.json, a rule with a problem is read the way earlier releases read 
   for (const { rule, read, note, matchesAll, wakes } of cases) {
     const { gate } = makeGate(tempDir(t), { file: { default: 'skip', policies: [rule, MENTIONS] } });
     assert.deepEqual(behaviors(gate), [read, 'always'], JSON.stringify(rule));
-    const said = `gate.json loaded. Policy "x": ${note}.${matchesAll ? ` ${everyEvent('Policy "x"')}` : ''}`;
+    const said = `gate.json loaded. Rule "x": ${note}.${matchesAll ? ` ${everyEvent('Rule "x"')}` : ''}`;
     assert.deepEqual(gate.getStatus().errors, [said], JSON.stringify(rule));
     assert.deepEqual(wakes.map(([e]) => gate.evaluate(e).trigger), wakes.map(([, woke]) => woke), JSON.stringify(rule));
     gate.dispose();
@@ -296,29 +299,29 @@ test("in gate.json, a rule earlier releases refused is left out, and the rest of
   // Earlier releases refused each of these, and so the whole file. Under
   // "always", the rest of it loads now.
   const refused: Array<[unknown, string]> = [
-    ['every-mention', 'The 1st policy is left out: it\'s "every-mention", where a rule is an object, such as {"name": "my-rule", "behavior": "always"}.'],
-    [{ match: {}, behavior: 'always' }, 'The 1st policy is left out: it has no "name".'],
-    [{ name: 'x', behavior: [] }, `Policy "x" is left out: behavior is [], where ${BEHAVIORS} is needed.`],
-    [{ name: 'x', behavior: { debouce: 60000 } }, 'Policy "x" is left out: behavior has "debouce" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit", "passive_sample" and "judge".'],
-    [{ name: 'x', behavior: { debounce: '60000' } }, 'Policy "x" is left out: behavior.debounce is "60000", where a number of milliseconds is needed, such as 60000.'],
-    [{ name: 'x', behavior: { rate_limit: { tokens: 3 } } }, 'Policy "x" is left out: behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed.'],
-    [{ name: 'x', behavior: { rate_limit: { tokens: 0, refillIntervalMs: 1000 } } }, 'Policy "x" is left out: behavior.rate_limit.tokens is 0, where a positive number is needed.'],
-    [{ name: 'x', behavior: { passive_sample: { every: '3' } } }, 'Policy "x" is left out: behavior.passive_sample.every is "3", where a whole number of 1 or more is needed.'],
-    [{ name: 'x', behavior: 'always', match: { filter: { type: 'regex', pattern: 'a[' } } }, 'Policy "x" is left out: match.filter.pattern isn\'t a regular expression the gate can read'],
-    [{ name: 'x', behavior: { rate_limit: { tokens: 3, refillIntervalMs: 1000 } }, passthrough: 'true' }, 'Policy "x" is left out: passthrough is "true", where true or false is needed.'],
-    [{ name: 'x', behavior: 'always', passthrough: true }, 'Policy "x" is left out: passthrough is only valid with rate_limit or passive_sample behaviors — for "always" there is no non-firing match to fall through on.'],
+    ['every-mention', 'The 1st rule is left out: it\'s "every-mention", where a rule is an object, such as {"name": "my-rule", "behavior": "always"}.'],
+    [{ match: {}, behavior: 'always' }, 'The 1st rule is left out: it has no "name".'],
+    [{ name: 'x', behavior: [] }, `Rule "x" is left out: behavior is [], where ${BEHAVIORS} is needed.`],
+    [{ name: 'x', behavior: { debouce: 60000 } }, 'Rule "x" is left out: behavior has "debouce" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit", "passive_sample" and "judge".'],
+    [{ name: 'x', behavior: { debounce: '60000' } }, 'Rule "x" is left out: behavior.debounce is "60000", where a number of milliseconds is needed, such as 60000.'],
+    [{ name: 'x', behavior: { rate_limit: { tokens: 3 } } }, 'Rule "x" is left out: behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed.'],
+    [{ name: 'x', behavior: { rate_limit: { tokens: 0, refillIntervalMs: 1000 } } }, 'Rule "x" is left out: behavior.rate_limit.tokens is 0, where a positive number is needed.'],
+    [{ name: 'x', behavior: { passive_sample: { every: '3' } } }, 'Rule "x" is left out: behavior.passive_sample.every is "3", where a whole number of 1 or more is needed.'],
+    [{ name: 'x', behavior: 'always', match: { filter: { type: 'regex', pattern: 'a[' } } }, 'Rule "x" is left out: match.filter.pattern isn\'t a regular expression the gate can read'],
+    [{ name: 'x', behavior: { rate_limit: { tokens: 3, refillIntervalMs: 1000 } }, passthrough: 'true' }, 'Rule "x" is left out: passthrough is "true", where true or false is needed.'],
+    [{ name: 'x', behavior: 'always', passthrough: true }, 'Rule "x" is left out: passthrough is true, and only a behavior.rate_limit or behavior.passive_sample rule passes on an event it matches without waking on it; with behavior "always", leave passthrough out.'],
   ];
   // Ones earlier releases refused that wake on none of what they match, that
   // skip or defer or are a rate limit with no tokens: left out, they hold back
   // nothing they were written to wake on, so under "skip" the rest loads.
   const quiet: Array<[unknown, string]> = [
-    [{ match: {}, behavior: 'skip' }, 'The 1st policy is left out: it has no "name".'],
+    [{ match: {}, behavior: 'skip' }, 'The 1st rule is left out: it has no "name".'],
     [
       { name: 'x', behavior: 'defer', passthrough: true },
-      'Policy "x" is left out: passthrough is only valid with rate_limit or passive_sample behaviors — for "defer" there is no non-firing match to fall through on.',
+      'Rule "x" is left out: passthrough is true, and only a behavior.rate_limit or behavior.passive_sample rule passes on an event it matches without waking on it; with behavior "defer", leave passthrough out.',
     ],
-    [{ name: 'x', behavior: { rate_limit: { tokens: 0, refillIntervalMs: 1000 } } }, 'Policy "x" is left out: behavior.rate_limit.tokens is 0, where a positive number is needed.'],
-    [{ name: 'x', behavior: { rate_limit: { tokens: -2, refillIntervalMs: 1000 } } }, 'Policy "x" is left out: behavior.rate_limit.tokens is -2, where a positive number is needed.'],
+    [{ name: 'x', behavior: { rate_limit: { tokens: 0, refillIntervalMs: 1000 } } }, 'Rule "x" is left out: behavior.rate_limit.tokens is 0, where a positive number is needed.'],
+    [{ name: 'x', behavior: { rate_limit: { tokens: -2, refillIntervalMs: 1000 } } }, 'Rule "x" is left out: behavior.rate_limit.tokens is -2, where a positive number is needed.'],
   ];
   for (const [cases, defaultBehavior] of [[refused, 'always'], [quiet, 'skip']] as const) {
     for (const [rule, said] of cases) {
@@ -338,19 +341,19 @@ test('a rule that skips or defers is read past a problem as earlier releases rea
   const cases: Array<[unknown, string, boolean]> = [
     [
       { name: 'x', match: { tagsAny: 'chat:mention' }, behavior: 'skip' },
-      'Policy "x": match.tagsAny is "chat:mention", where a list of non-empty strings is needed, such as ["chat:ambient"], so the rule is '
-      + `read without it. Read so, it skips every event it now matches, as earlier releases did. ${everyEvent('Policy "x"')}`,
+      'Rule "x": match.tagsAny is "chat:mention", where a list of non-empty strings is needed, such as ["chat:ambient"], so the rule is '
+      + `read without it. Read so, it skips every event it now matches, as earlier releases did. ${everyEvent('Rule "x"')}`,
       false,
     ],
     [
       { name: 'x', match: { chanel: 'discord:*:1' }, behavior: 'defer' },
-      'Policy "x": match has "chanel" (did you mean "channel"?), which the gate doesn\'t read, so it does nothing. '
-      + `Read so, it defers every event it now matches, as earlier releases did. ${everyEvent('Policy "x"')}`,
+      'Rule "x": match has "chanel" (did you mean "channel"?), which the gate doesn\'t read, so it does nothing. '
+      + `Read so, it defers every event it now matches, as earlier releases did. ${everyEvent('Rule "x"')}`,
       false,
     ],
     [
       { name: 'x', match: { scope: ['', 5] }, behavior: 'skip' },
-      'Policy "x": match.scope holds 5, which isn\'t an event type, so that entry is dropped; match.scope holds "", and no event\'s type is "", '
+      'Rule "x": match.scope holds 5, which isn\'t an event type, so that entry is dropped; match.scope holds "", and no event\'s type is "", '
       + 'so the rule matches no event. Read so, it skips every event it now matches, as earlier releases did.',
       true,
     ],
@@ -380,7 +383,7 @@ test("under a default that holds events back, a file that leaves out a rule that
   const broken = { name: 'mentions', match: { tagsAny: ['chat:mention'] }, behavior: [] };
   const dms = { name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' };
   const notUsed = 'gate.json leaves out a rule that could wake the agent, and under its default, "skip", what it was written to wake it on '
-    + `would be held back. Policy "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed.`;
+    + `would be held back. Rule "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed.`;
 
   // At a start, the host's starting rules run in its place, as before.
   const recipe = { default: 'skip', policies: [{ ...MENTIONS, name: 'recipe-mentions' }] };
@@ -410,8 +413,8 @@ test("under a default that holds events back, a file that leaves out a rule that
   const two = makeGate(tempDir(t), { file: { default: 'defer', policies: [broken, { name: 'fast', behavior: { debounce: 'soon' } }] } });
   assert.deepEqual(two.gate.getStatus().errors, [unused(
     'gate.json leaves out rules that could wake the agent, and under its default, "defer", what they were written to wake it on would '
-    + `be held back. Policy "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed. `
-    + 'Policy "fast" is left out: behavior.debounce is "soon", where a number of milliseconds is needed, such as 60000.',
+    + `be held back. Rule "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed. `
+    + 'Rule "fast" is left out: behavior.debounce is "soon", where a number of milliseconds is needed, such as 60000.',
     RUNS_DEFAULT,
   )]);
   two.gate.dispose();
@@ -419,7 +422,7 @@ test("under a default that holds events back, a file that leaves out a rule that
   // The host's starting rules the same way: the start runs no rules, which hears every event, in their place.
   const userInput = { name: 'user-input', match: { scope: ['user:message'] }, behavior: 'always' };
   const raw = { name: 'raw', match: {}, behavior: { rate_limit: { tokens: 3 } } };
-  const rawSaid = 'Policy "raw" is left out: behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed.';
+  const rawSaid = 'Rule "raw" is left out: behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed.';
   const starting = makeGate(tempDir(t), { initialConfig: { default: 'skip', policies: [userInput, raw] } });
   assert.deepEqual(starting.gate.getStatus().errors, [
     'At start, the host\'s starting rules weren\'t used: the starting config leaves out a rule that could wake the agent, and under its '
@@ -447,7 +450,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   const dms = { name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' };
   const ambient = { name: 'quiet-ambient', match: { tagsAny: ['chat:ambient'] }, behavior: { debounce: '60000' } };
   const operators = { _comment: 'mine', default: 'defer', policies: [dms, ambient] };
-  const ambientSaid = 'Policy "quiet-ambient" is left out: behavior.debounce is "60000", where a number of milliseconds is needed, such as 60000.';
+  const ambientSaid = 'Rule "quiet-ambient" is left out: behavior.debounce is "60000", where a number of milliseconds is needed, such as 60000.';
   const mends = 'Replacing or removing "quiet-ambient" by name would bring gate.json into force.';
   const hostOnly = 'No change through the gate can bring it into force, so gate.json has to be fixed by an edit of its own; until '
     + 'then, a change is refused the same way.';
@@ -489,7 +492,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   const twoWritten = readFileSync(two.configPath, 'utf-8');
   assert.throws(
     () => two.gate.addPolicy({ ...ambient, behavior: { debounce: 60000 } }),
-    { message: notSaved(`Policy "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed.`, hostOnly) },
+    { message: notSaved(`Rule "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed.`, hostOnly) },
   );
   assert.equal(readFileSync(two.configPath, 'utf-8'), twoWritten);
   two.gate.dispose();
@@ -497,7 +500,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   const unnamed = makeGate(tempDir(t), { file: { ...operators, policies: [dms, { match: {}, behavior: 'always' }] } });
   assert.throws(
     () => unnamed.gate.addPolicy({ name: 'added', behavior: 'always' }),
-    { message: notSaved('The 2nd policy is left out: it has no "name".', hostOnly) },
+    { message: notSaved('The 2nd rule is left out: it has no "name".', hostOnly) },
   );
   unnamed.gate.dispose();
   // Where another rule has its name, the refusal says what a change by that
@@ -711,7 +714,7 @@ test("gate_status's entry for a gate.json the gate can't use says what's in forc
   const notUsed = (): void => {
     writeFileSync(configPath, broken);
     reload();
-    assert.deepEqual(gate.getStatus().errors, [unused(parsed, RUNS_LAST)]);
+    assert.deepEqual(gate.getStatus().errors, [notJsonShown(configPath, parsed, RUNS_LAST)]);
   };
   notUsed();
   writeFileSync(configPath, JSON.stringify(noted));
@@ -724,7 +727,7 @@ test("gate_status's entry for a gate.json the gate can't use says what's in forc
   notUsed();
   // A change isn't written over a file that isn't JSON, so the entry stays, and so do the rules in force.
   assert.throws(() => gate.addPolicy({ name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' }), { message: /^gate\.json isn't JSON the gate can read \(/ });
-  assert.deepEqual(gate.getStatus().errors, [unused(parsed, RUNS_LAST)]);
+  assert.deepEqual(gate.getStatus().errors, [notJsonShown(configPath, parsed, RUNS_LAST)]);
   assert.equal(readFileSync(configPath, 'utf-8'), broken);
   assert.deepEqual(names(gate), ['mentions']);
 });
@@ -765,22 +768,22 @@ test('a null or "" is a field left out, and each "" is named, with what leaving 
   add({ name: 'quiet', match: { channel: '', pathGlob: null, filter: { type: 'text', pattern: '' } }, behavior: '' });
   assert.deepEqual(onDisk(configPath).policies.find((p) => p.name === 'quiet'), { name: 'quiet', match: {}, behavior: 'always' });
   assert.deepEqual(ignored, [
-    'Policy "quiet" has "behavior" as "", so it\'s left out: a rule without one has the behavior "always".',
-    'Policy "quiet": match has "channel" as "", so it\'s left out.',
-    'Policy "quiet": match.filter\'s pattern is "", so the filter narrows nothing, and it\'s left out.',
+    'Rule "quiet" has "behavior" as "", so it\'s left out: a rule without one has the behavior "always".',
+    'Rule "quiet": match has "channel" as "", so it\'s left out.',
+    'Rule "quiet": match.filter\'s pattern is "", so the filter narrows nothing, and it\'s left out.',
     // A match left with nothing that narrows it, once its fields are read, matches every event.
-    'Policy "quiet": nothing left in match narrows the rule, so it matches every event.',
+    'Rule "quiet": nothing left in match narrows the rule, so it matches every event.',
   ]);
   add({ name: 'sampled', behavior: { passive_sample: { every: 2, keyBy: '' } }, resets: null, passthrough: null });
   assert.deepEqual(onDisk(configPath).policies.find((p) => p.name === 'sampled'), { name: 'sampled', match: {}, behavior: { passive_sample: { every: 2 } } });
-  assert.deepEqual(ignored, ['Policy "sampled": behavior.passive_sample has "keyBy" as "", so it\'s left out: every event the rule matches shares one count.']);
+  assert.deepEqual(ignored, ['Rule "sampled": behavior.passive_sample has "keyBy" as "", so it\'s left out: every event the rule matches shares one count.']);
   add({ name: 'limited', behavior: { rate_limit: { tokens: 2, refillIntervalMs: 1000, keyBy: '' } } });
-  assert.deepEqual(ignored, ['Policy "limited": behavior.rate_limit has "keyBy" as "", so it\'s left out: every event the rule matches shares one bucket.']);
+  assert.deepEqual(ignored, ['Rule "limited": behavior.rate_limit has "keyBy" as "", so it\'s left out: every event the rule matches shares one bucket.']);
   // A filter's type the gate can't read is a problem, though its "" pattern narrows nothing either way.
   assert.equal(
     refusal(gate, { match: { filter: { type: 'bogus', pattern: '' } } }),
-    'Policy "r" wasn\'t saved: match.filter.type is "bogus", where "text" or "regex" is needed. '
-    + 'Policy "r": match.filter\'s pattern is "", so the filter narrows nothing, and it\'s left out. '
+    'Rule "r" wasn\'t saved: match.filter.type is "bogus", where "text" or "regex" is needed. '
+    + 'Rule "r": match.filter\'s pattern is "", so the filter narrows nothing, and it\'s left out. '
     + everyEventIfSaved(),
   );
   // So does one whose list entries are all dropped, or whose only other field does nothing.
@@ -792,15 +795,15 @@ test('a null or "" is a field left out, and each "" is named, with what leaving 
   ] as const) {
     assert.equal(
       refusal(gate, { match }),
-      `Policy "r" wasn't saved: ${said}. ${everyEventIfSaved()}`,
+      `Rule "r" wasn't saved: ${said}. ${everyEventIfSaved()}`,
       JSON.stringify(match),
     );
   }
   add({ name: 'noted', match: { source: '', comment: 'x' } });
   assert.deepEqual(ignored, [
-    'Policy "noted": match has "source" as "", so it\'s left out.',
-    `Policy "noted": match has "comment", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`,
-    'Policy "noted": nothing left in match narrows the rule, so it matches every event.',
+    'Rule "noted": match has "source" as "", so it\'s left out.',
+    `Rule "noted": match has "comment", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`,
+    'Rule "noted": nothing left in match narrows the rule, so it matches every event.',
   ]);
   // Empty lists alone always meant no constraint, so they say nothing, and neither does an empty match.
   ignored = [];
@@ -816,8 +819,8 @@ test('a null or "" is a field left out, and each "" is named, with what leaving 
   assert.equal(loaded.getStatus().default, 'always');
   // A match left with nothing matches every event, and says so.
   assert.deepEqual(loaded.getStatus().errors, [
-    'gate.json loaded. Policy "any": match has "source" as "", so it\'s left out. '
-    + 'Policy "any": nothing left in match narrows the rule, so it matches every event.',
+    'gate.json loaded. Rule "any": match has "source" as "", so it\'s left out. '
+    + 'Rule "any": nothing left in match narrows the rule, so it matches every event.',
   ]);
   // A file that writes no rules is quiet as written, as before, and a "" says what that does under its default.
   const { gate: bare } = makeGate(tempDir(t), { file: { default: 'skip', policies: null } });
@@ -838,7 +841,7 @@ test('a null or "" is a field left out, and each "" is named, with what leaving 
   const { gate: wide } = makeGate(tempDir(t), { file: { default: '', policies: [{ name: 'every', match: '', behavior: 'skip' }] } });
   assert.deepEqual(wide.getStatus().errors, [
     'gate.json loaded. gate.json has "default" as "", so it\'s left out: its default is "always". '
-    + 'Policy "every" has "match" as "", so it\'s left out: a rule without one matches every event.',
+    + 'Rule "every" has "match" as "", so it\'s left out: a rule without one matches every event.',
   ]);
   assert.equal(wide.getStatus().default, 'always');
 });
@@ -852,15 +855,15 @@ test('a field name near none the gate reads loads, and is named', (t) => {
   assert.equal(
     gate.getStatus().errors[0],
     'gate.json loaded. gate.json has "comment", which the gate doesn\'t read, so it does nothing. Its fields are "default" and "policies". '
-    + `Policy "dm" has "comment", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}. `
-    + `Policy "dm": match has "note", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`,
+    + `Rule "dm" has "comment", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}. `
+    + `Rule "dm": match has "note", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`,
   );
 
   let ignored: string[] = [];
   gate.addPolicy({ name: 'mentions', match: { tagsAny: ['chat:mention'], label: 'm' }, behavior: 'always' }, {
     onIgnoredFields: (notes) => { ignored = notes; },
   });
-  assert.deepEqual(ignored, [`Policy "mentions": match has "label", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`]);
+  assert.deepEqual(ignored, [`Rule "mentions": match has "label", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`]);
   const [note] = gate.getStatus().errors;
   assert.match(note ?? '', /^gate\.json loaded\. gate\.json has "comment"/, 'the rules the write left alone keep what they hold, and their notes');
   assert.equal(onDisk(configPath).comment, 'ops');
@@ -870,8 +873,8 @@ test('a field name near none the gate reads loads, and is named', (t) => {
   const logged = t.mock.method(console, 'error', () => {});
   gate.addPolicy({ name: 'quiet', match: { why: 'night' }, behavior: 'defer' });
   assert.deepEqual(logged.mock.calls.map((c) => c.arguments[0]), [
-    `[gate] Policy "quiet": match has "why", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}. `
-    + everyEvent('Policy "quiet"'),
+    `[gate] Rule "quiet": match has "why", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}. `
+    + everyEvent('Rule "quiet"'),
   ]);
   logged.mock.restore();
 
@@ -879,8 +882,8 @@ test('a field name near none the gate reads loads, and is named', (t) => {
   // since it's often the one a missing field was meant to be.
   assert.equal(
     refusal(gate, { behavior: { rate_limit: { tokens: 5, refillEveryMs: 60000 } } }),
-    'Policy "r" wasn\'t saved: behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed. '
-    + 'Policy "r": behavior.rate_limit has "refillEveryMs", which the gate doesn\'t read, so it does nothing. Its fields are "tokens", "refillIntervalMs" and "keyBy".',
+    'Rule "r" wasn\'t saved: behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed. '
+    + 'Rule "r": behavior.rate_limit has "refillEveryMs", which the gate doesn\'t read, so it does nothing. Its fields are "tokens", "refillIntervalMs" and "keyBy".',
   );
 });
 
@@ -893,16 +896,16 @@ test("a name holding a field's whole name is the field under another name where 
   assert.equal(
     gate.getStatus().errors[0],
     'gate.json loaded. gate.json has "defaultBehavior", which the gate doesn\'t read, so it does nothing. Its fields are "default" and "policies". '
-    + `Policy "ops": match has "channelNote", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}. `
-    + 'Policy "quiet": it has "matchTags" (did you mean "match"?), which the gate doesn\'t read, so the rule matches every event. '
+    + `Rule "ops": match has "channelNote", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}. `
+    + 'Rule "quiet": it has "matchTags" (did you mean "match"?), which the gate doesn\'t read, so the rule matches every event. '
     + 'Read so, it skips every event it now matches, as earlier releases did.',
   );
   assert.equal(gate.evaluate(MENTION).trigger, false, '"quiet" skips every event');
   // A change refuses the slip, and takes the extra beside its field, naming it.
-  assert.equal(refusal(gate, quiet), 'Policy "quiet" wasn\'t saved: it has "matchTags" (did you mean "match"?), which the gate doesn\'t read.');
+  assert.equal(refusal(gate, quiet), 'Rule "quiet" wasn\'t saved: it has "matchTags" (did you mean "match"?), which the gate doesn\'t read.');
   let ignored: string[] = [];
   gate.addPolicy({ ...ops, name: 'ops2' }, { onIgnoredFields: (notes) => { ignored = notes; } });
-  assert.deepEqual(ignored, [`Policy "ops2": match has "channelNote", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`]);
+  assert.deepEqual(ignored, [`Rule "ops2": match has "channelNote", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`]);
 
   // At gate.json's top, a name holding "policies" can be a label of the file,
   // so a file that holds every event back with one is used, as before.
@@ -939,16 +942,16 @@ test("a field the gate reads at another level is a problem naming where it's rea
   );
   assert.deepEqual(gate.getStatus().errors, [
     `gate.json loaded. gate.json has "name", a field of a rule, ${hereNot}, so it does nothing. `
-    + `Policy "quiet": it has "tagsAny", a field of "match", ${hereNot}, so the rule matches every event. ${holds} `
-    + `Policy "ambient": match has "pattern", a field of "match.filter", ${hereNot}, so it does nothing. ${holds} `
-    + `Policy "limited": it has "tokens" and "refillIntervalMs", fields of "behavior.rate_limit", ${hereNot}, so the rule's behavior is "always". `
-    + `Policy "keyed": it has "default", a field of gate.json, ${hereNot}, so it does nothing; `
+    + `Rule "quiet": it has "tagsAny", a field of "match", ${hereNot}, so the rule matches every event. ${holds} `
+    + `Rule "ambient": match has "pattern", a field of "match.filter", ${hereNot}, so it does nothing. ${holds} `
+    + `Rule "limited": it has "tokens" and "refillIntervalMs", fields of "behavior.rate_limit", ${hereNot}, so the rule's behavior is "always". `
+    + `Rule "keyed": it has "default", a field of gate.json, ${hereNot}, so it does nothing; `
     + `match has "keyBy", a field of "behavior.rate_limit" and "behavior.passive_sample", ${hereNot}, so it does nothing; `
     + `match has "behavior", a field of a rule, ${hereNot}, so it does nothing. `
-    + 'Policy "keyed": nothing left in match narrows the rule, so it matches every event. '
-    + `Policy "filtered": it has "pattern", a field of "match.filter", ${hereNot}, so the rule matches every event. ${holds} `
-    + `Policy "settling": it has "debounce", a field of "behavior", ${hereNot}, so the rule's behavior is "always". `
-    + `Policy "sampled": it has "every", a field of "behavior.passive_sample", ${hereNot}, so the rule's behavior is "always".`,
+    + 'Rule "keyed": nothing left in match narrows the rule, so it matches every event. '
+    + `Rule "filtered": it has "pattern", a field of "match.filter", ${hereNot}, so the rule matches every event. ${holds} `
+    + `Rule "settling": it has "debounce", a field of "behavior", ${hereNot}, so the rule's behavior is "always". `
+    + `Rule "sampled": it has "every", a field of "behavior.passive_sample", ${hereNot}, so the rule's behavior is "always".`,
   ]);
   // As earlier releases read it, "quiet" matches every event and skips it, a mention included.
   assert.equal(gate.evaluate(MENTION).trigger, false);
@@ -970,15 +973,15 @@ test("a field the gate reads at another level is a problem naming where it's rea
     [{ debounce: 60000 }, `it has "debounce", a field of "behavior", ${hereNot}`],
     [{ behavior: { rate_limit: { tokens: 3, refillIntervalMs: 60000, every: 2 } } }, `behavior.rate_limit has "every", a field of "behavior.passive_sample", ${hereNot}`],
   ] as const) {
-    assert.equal(refusal(gate, fields), `Policy "r" wasn't saved: ${problem}.`, JSON.stringify(fields));
+    assert.equal(refusal(gate, fields), `Rule "r" wasn't saved: ${problem}.`, JSON.stringify(fields));
   }
   assert.equal(readFileSync(configPath, 'utf-8'), before, 'nothing was saved');
 
   // In the host's starting rules, the file's own field is named as the starting config's.
   const { gate: started } = makeGate(tempDir(t), { initialConfig: { default: 'skip', policies: [{ ...MENTIONS, default: 'skip' }] } });
   assert.deepEqual(started.getStatus().errors, [
-    `gate.json loaded. Policy "mentions": it has "default", a field of gate.json, ${hereNot}, so it does nothing.`,
-    `In the host's starting rules, Policy "mentions": it has "default", a field of the starting config, ${hereNot}, so it does nothing.`,
+    `gate.json loaded. Rule "mentions": it has "default", a field of gate.json, ${hereNot}, so it does nothing.`,
+    `In the host's starting rules, Rule "mentions": it has "default", a field of the starting config, ${hereNot}, so it does nothing.`,
   ]);
   assert.equal(started.evaluate(MENTION).trigger, true);
   started.dispose();
@@ -1045,7 +1048,7 @@ test('a change keeps every rule it doesn\'t change as written, problems and unkn
   };
   const { gate, configPath } = makeGate(dir, { file: theirs });
   const [note] = gate.getStatus().errors;
-  assert.match(note ?? '', /^gate\.json loaded\. gate\.json has "comment".* Policy "mine": .* Policy "gone" is left out: .* Policy "blank" has "why"/);
+  assert.match(note ?? '', /^gate\.json loaded\. gate\.json has "comment".* Rule "mine": .* Rule "gone" is left out: .* Rule "blank" has "why"/);
 
   gate.addPolicy({ name: 'later', behavior: 'defer' });
   assert.deepEqual(onDisk(configPath), { ...theirs, policies: [...theirs.policies, { name: 'later', match: {}, behavior: 'defer' }] });
@@ -1148,11 +1151,11 @@ test("the host's starting rules are read rule by rule: a first start writes them
   assert.equal(gate.evaluate(event(['chat:ambient'])).trigger, true);
   // gate.json holds them as given, and is read the same way, so its load names each problem as the start does.
   assert.deepEqual(onDisk(configPath), starting);
-  const said = `Policy "user-input" has "comment", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}. `
-    + `Policy "typo": behavior is "deffer", where ${BEHAVIORS} is needed, so it's read as "always". `
-    + 'Policy "quiet": match.tagsAny is "chat:bot", where a list of non-empty strings is needed, such as ["chat:ambient"], so the rule is '
-    + `read without it. Read so, it skips every event it now matches, as earlier releases did. ${everyEvent('Policy "quiet"')} `
-    + 'Policy "fast": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms.';
+  const said = `Rule "user-input" has "comment", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}. `
+    + `Rule "typo": behavior is "deffer", where ${BEHAVIORS} is needed, so it's read as "always". `
+    + 'Rule "quiet": match.tagsAny is "chat:bot", where a list of non-empty strings is needed, such as ["chat:ambient"], so the rule is '
+    + `read without it. Read so, it skips every event it now matches, as earlier releases did. ${everyEvent('Rule "quiet"')} `
+    + 'Rule "fast": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms.';
   assert.deepEqual(gate.getStatus().errors, [`gate.json loaded. ${said}`, `In the host's starting rules, ${said}`]);
   gate.dispose();
 
@@ -1171,7 +1174,7 @@ test("the host's starting rules are read rule by rule: a first start writes them
   const leavesOut = makeGate(tempDir(t), { initialConfig: { default: 'skip', policies: [{ name: 'user-input', behavior: [] }] } });
   assert.deepEqual(leavesOut.gate.getStatus().errors, [
     'At start, the host\'s starting rules weren\'t used: the starting config leaves out a rule that could wake the agent, and under its '
-    + `default, "skip", what it was written to wake it on would be held back. Policy "user-input" is left out: behavior is [], where ${BEHAVIORS} `
+    + `default, "skip", what it was written to wake it on would be held back. Rule "user-input" is left out: behavior is [], where ${BEHAVIORS} `
     + 'is needed. The gate started with no rules, as on a host without starting rules.',
   ]);
   assert.equal(existsSync(leavesOut.configPath), false);
@@ -1237,7 +1240,7 @@ test('a first start whose write of the starting rules fails partway runs them, a
     parsed = (err as Error).message;
   }
   assert.notEqual(parsed, '', 'the half written is not JSON');
-  assert.equal(fileError, unused(parsed, "the host's starting rules"));
+  assert.equal(fileError, notJsonShown(configPath, parsed, "the host's starting rules"));
   assert.equal(unsaved, 'At start, writing the host\'s starting rules to gate.json failed partway (ENOSPC: no space left on device, write), so '
     + 'gate.json may be left part-written. The starting rules are in force but aren\'t saved in it, and a restart before gate.json '
     + 'is fixed starts from them too. Whoever runs this host can fix what kept it from being written, and gate.json.');
@@ -1249,8 +1252,8 @@ test("a later start adds the starting rules gate.json lacks by name, as given, k
   const reviews = { name: 'reviews', match: {}, behavior: 'wake' };
   const quick = { name: 'quick', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 50 } };
   const starting = { default: 'skip', policies: [{ name: 'user-input', match: {}, behavior: 'always' }, tickets, reviews, quick] };
-  const read = `Policy "reviews": behavior is "wake", where ${BEHAVIORS} is needed, so it's read as "always". `
-    + 'Policy "quick": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms.';
+  const read = `Rule "reviews": behavior is "wake", where ${BEHAVIORS} is needed, so it's read as "always". `
+    + 'Rule "quick": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms.';
   const added = makeGate(tempDir(t), { file: { default: 'skip', policies: [{ name: 'user-input', match: {}, behavior: 'always' }] }, initialConfig: starting });
   assert.deepEqual(onDisk(added.configPath).policies, starting.policies);
   assert.deepEqual(names(added.gate), ['user-input', 'tickets', 'reviews', 'quick']);
@@ -1262,7 +1265,7 @@ test("a later start adds the starting rules gate.json lacks by name, as given, k
   const over = makeGate(tempDir(t), { file: theirs, initialConfig: { default: 'skip', policies: [tickets] } });
   assert.deepEqual(onDisk(over.configPath), { ...theirs, policies: [...theirs.policies, tickets] });
   assert.deepEqual(names(over.gate), ['mine', 'tickets']);
-  assert.match(over.gate.getStatus().errors[0] ?? '', /^gate\.json loaded\. Policy "mine": .* Policy "gone" is left out: /);
+  assert.match(over.gate.getStatus().errors[0] ?? '', /^gate\.json loaded\. Rule "mine": .* Rule "gone" is left out: /);
 
   // A "policies" holding nothing writes no rules, as [] does, so the starting rules go in its place.
   const empty = makeGate(tempDir(t), { file: { default: 'always', policies: {} }, initialConfig: { default: 'skip', policies: [tickets] } });
@@ -1358,7 +1361,7 @@ test("a later start over a gate.json with no rule list it could add to without w
   assert.equal(gate.evaluate(MENTION).trigger, true, 'and the rest gets gate.json\'s default, "always"');
   assert.equal(gate.getStatus().configSource, 'initial', 'what runs is the host\'s starting rules');
   assert.equal(errors[0], `gate.json loaded. ${listRead}the gate runs the host's starting rules beside it, under the default, "always".`);
-  assert.ok(errors[1]!.startsWith('In the host\'s starting rules, Policy "limited" is left out'), errors[1]);
+  assert.ok(errors[1]!.startsWith('In the host\'s starting rules, Rule "limited" is left out'), errors[1]);
   assert.equal(errors[2], unsaved('"quiet-ambient"', 'gate.json is a list', 'always'));
   assert.equal(errors.length, 3);
   gate.dispose();
@@ -1390,7 +1393,7 @@ test("a later start over a gate.json with no rule list it could add to without w
   (noList.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
   assert.equal(noList.gate.evaluate(MENTION).trigger, true);
   const [unloadable, ...rest] = noList.gate.getStatus().errors;
-  assert.match(unloadable!, /So what gate\.json holds isn't in force, and the gate runs the host's starting rules\.$/);
+  assert.match(unloadable!, /So what gate\.json holds isn't in force, and the gate runs the host's starting rules\. Once it's JSON, the gate reads it again at its next check for changes\.$/);
   assert.deepEqual(rest, [said[1]]);
   // Once gate.json changes and loads, what it holds is in force instead.
   writeFileSync(noList.configPath, JSON.stringify({ default: 'skip', policies: [] }));
@@ -1416,7 +1419,7 @@ test("a later start over a gate.json with no rule list it could add to without w
     + 'and it has no rules, so it isn\'t used at this start: under its default, "skip", the host\'s starting rules would '
     + 'leave out "limited", which could wake the agent, so the gate runs the starting rules under their own default, "always", as '
     + `a start without gate.json does. ${fixLimited}.`);
-  assert.ok(withoutSaid[1]!.startsWith('In the host\'s starting rules, Policy "limited" is left out'), withoutSaid[1]);
+  assert.ok(withoutSaid[1]!.startsWith('In the host\'s starting rules, Rule "limited" is left out'), withoutSaid[1]);
   assert.equal(withoutSaid[2], 'At start, gate.json, which has no rules the gate reads, wasn\'t used: under its default, "skip", the host\'s starting '
     + 'rules would leave out "limited", which could wake the agent. The gate runs the starting rules under their own default, '
     + '"always", as a start without gate.json does, but they aren\'t saved in it: once gate.json changes and loads, what it holds '
@@ -1512,7 +1515,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
     [{ default: 'skip', policies: '' }, `gate.json loaded. gate.json has "policies" as "", so it's left out: it has no rules, so ${notUsed}.`],
     [{ default: 'skip', policies: {} }, 'gate.json loaded. gate.json\'s "policies" is {}, where a list of rules is needed, such as '
       + `[{"name": "my-rule", "behavior": "always"}], and it has no rules, so ${notUsed}.`],
-    [{ default: 'skip', policies: [quiet] }, 'gate.json loaded. Policy "quiet" is left out: behavior.rate_limit.tokens is 0, where a positive '
+    [{ default: 'skip', policies: [quiet] }, 'gate.json loaded. Rule "quiet" is left out: behavior.rate_limit.tokens is 0, where a positive '
       + `number is needed. gate.json has no rules but ones the gate leaves out, so ${notUsed}.`],
   ];
   for (const [file, said] of cases) {
@@ -1521,7 +1524,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
     const written = readFileSync(configPath, 'utf-8');
     const errors = gate.getStatus().errors;
     assert.equal(errors[0], said);
-    assert.ok(errors[1]!.startsWith('In the host\'s starting rules, Policy "limited" is left out'), errors[1]);
+    assert.ok(errors[1]!.startsWith('In the host\'s starting rules, Rule "limited" is left out'), errors[1]);
     assert.equal(errors[2], startSaid);
     assert.equal(errors.length, 3);
     assert.deepEqual(names(gate), ['mentions']);
@@ -1553,7 +1556,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
   assert.equal(given.gate.evaluate(event(['chat:ambient'])).trigger, false, 'gate.json\'s "skip" holds back the rest');
   const givenSaid = given.gate.getStatus().errors;
   assert.equal(givenSaid.length, 1, 'the start\'s entry for gate.json not used goes');
-  assert.ok(givenSaid[0]!.startsWith('In the host\'s starting rules, Policy "limited" is left out'), givenSaid[0]);
+  assert.ok(givenSaid[0]!.startsWith('In the host\'s starting rules, Rule "limited" is left out'), givenSaid[0]);
 
   // Once gate.json is removed, a change edits the rules in force, the starting rules as read, as one does where gate.json
   // is missing, and writes them with it, rather than gate.json's empty list, which would leave the new rule alone in force.
@@ -1576,7 +1579,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
   const namelessOut = 'the host\'s starting rules would leave out one with no name, which could wake the agent';
   const namelessSaid = nameless.gate.getStatus().errors;
   assert.equal(namelessSaid[0], `gate.json loaded. gate.json has no rules, so ${notUsedFor(namelessOut, 'fixing one with no name in the starting rules')}.`);
-  assert.ok(namelessSaid[1]!.startsWith('In the host\'s starting rules, The 1st policy is left out'), namelessSaid[1]);
+  assert.ok(namelessSaid[1]!.startsWith('In the host\'s starting rules, The 1st rule is left out'), namelessSaid[1]);
   assert.equal(namelessSaid[2], startSaidFor(namelessOut, 'fixing one with no name in the starting rules'));
   assert.equal(namelessSaid.length, 3);
   assert.deepEqual(names(nameless.gate), ['mentions']);
@@ -1592,7 +1595,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
   const heldOut = 'the host\'s "mentions", which could wake the agent, would be kept out by gate.json\'s rule of that name, which the gate '
     + 'leaves out';
   const heldSaid = held.gate.getStatus().errors;
-  assert.equal(heldSaid[0], 'gate.json loaded. Policy "mentions" is left out: behavior.rate_limit.tokens is 0, where a positive number is '
+  assert.equal(heldSaid[0], 'gate.json loaded. Rule "mentions" is left out: behavior.rate_limit.tokens is 0, where a positive number is '
     + `needed. gate.json has no rules but ones the gate leaves out, so ${notUsedFor(heldOut, 'fixing gate.json\'s "mentions"')}.`);
   assert.equal(heldSaid[1], startSaidFor(heldOut, 'fixing gate.json\'s "mentions"'));
   assert.equal(heldSaid.length, 2);
@@ -1687,12 +1690,12 @@ test("numbers the gate's range refuses are read with a note, in the starting rul
     { debounce: 100 }, { debounce: 300000 }, { debounce: 100 },
     { passive_sample: { every: 1 } }, { passive_sample: { every: 3, keyBy: 'channelId' } }, { rate_limit: { tokens: 2, refillIntervalMs: 0 } },
   ];
-  const read = 'Policy "fast": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms. '
-    + 'Policy "slow": behavior.debounce is 500000 ms, over the 300000 ms maximum, so it\'s read as 300000 ms. '
-    + 'Policy "none": behavior.debounce is 0 ms, under the 100 ms minimum, so it\'s read as 100 ms. '
-    + 'Policy "each": behavior.passive_sample.every is 0, under 1, so it\'s read as 1. '
-    + 'Policy "third": behavior.passive_sample.every is 2.5, not a whole number, so it\'s read as 3. '
-    + 'Policy "refills": behavior.rate_limit.refillIntervalMs is 0, where a positive number of milliseconds is needed, so its tokens refill at '
+  const read = 'Rule "fast": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms. '
+    + 'Rule "slow": behavior.debounce is 500000 ms, over the 300000 ms maximum, so it\'s read as 300000 ms. '
+    + 'Rule "none": behavior.debounce is 0 ms, under the 100 ms minimum, so it\'s read as 100 ms. '
+    + 'Rule "each": behavior.passive_sample.every is 0, under 1, so it\'s read as 1. '
+    + 'Rule "third": behavior.passive_sample.every is 2.5, not a whole number, so it\'s read as 3. '
+    + 'Rule "refills": behavior.rate_limit.refillIntervalMs is 0, where a positive number of milliseconds is needed, so its tokens refill at '
     + 'once, and it limits nothing it matches.';
 
   // A first start writes them as given, runs them as read, and says so in errors and the log, for the start and for gate.json.
@@ -1715,8 +1718,8 @@ test("numbers the gate's range refuses are read with a note, in the starting rul
   assert.ok(logged.includes(`[gate] ${loaded}`), 'the log says it too');
 
   // addPolicy, behind wake_add_rule, still refuses one: its caller is there to fix it, and nothing is saved.
-  assert.equal(refusal(upgraded.gate, { behavior: { debounce: 50 } }), 'Policy "r" wasn\'t saved: behavior.debounce is 50 ms, under the 100 ms minimum.');
-  assert.equal(refusal(upgraded.gate, { behavior: { passive_sample: { every: 0 } } }), 'Policy "r" wasn\'t saved: behavior.passive_sample.every is 0, under 1.');
+  assert.equal(refusal(upgraded.gate, { behavior: { debounce: 50 } }), 'Rule "r" wasn\'t saved: behavior.debounce is 50 ms, under the 100 ms minimum.');
+  assert.equal(refusal(upgraded.gate, { behavior: { passive_sample: { every: 0 } } }), 'Rule "r" wasn\'t saved: behavior.passive_sample.every is 0, under 1.');
   assert.deepEqual(onDisk(upgraded.configPath), starting, 'nothing was written');
 
   // New text holding one, applied by a reload, says so in errors and the log the same way.
@@ -1724,7 +1727,7 @@ test("numbers the gate's range refuses are read with a note, in the starting rul
   writeFileSync(upgraded.configPath, JSON.stringify({ default: 'skip', policies: [fast] }));
   (upgraded.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
   upgraded.gate.evaluate(event([], 'workspace:modified'));
-  const reloaded = 'gate.json loaded. Policy "fast": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms.';
+  const reloaded = 'gate.json loaded. Rule "fast": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms.';
   assert.deepEqual(behaviors(upgraded.gate), [{ debounce: 100 }]);
   assert.deepEqual(upgraded.gate.getStatus().errors, [reloaded, atStart]);
   assert.ok(logged.includes(`[gate] ${reloaded}`), 'the log says it too');
@@ -1733,9 +1736,9 @@ test("numbers the gate's range refuses are read with a note, in the starting rul
   // A rule with a number and another problem is read past both.
   const both = makeGate(tempDir(t), { file: { policies: [{ name: 'both', match: { scope: 'chat' }, behavior: { debounce: 50 } }] } });
   assert.deepEqual(both.gate.getStatus().errors, [
-    'gate.json loaded. Policy "both": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms; '
+    'gate.json loaded. Rule "both": behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms; '
     + 'match.scope is "chat", where a list of event types is needed, such as ["mcpl:channel-incoming"], so the rule matches every type of event. '
-    + everyEvent('Policy "both"'),
+    + everyEvent('Rule "both"'),
   ]);
   both.gate.dispose();
 });
@@ -1762,7 +1765,7 @@ test('what the start did stays in errors until the next start, through writes an
   const again = makeGate(tempDir(t), {
     initialConfig: { default: 'skip', policies: [{ name: 'user-input', match: {}, behavior: 'deffer' }] },
   });
-  const typo = `Policy "user-input": behavior is "deffer", where ${BEHAVIORS} is needed, so it's read as "always".`;
+  const typo = `Rule "user-input": behavior is "deffer", where ${BEHAVIORS} is needed, so it's read as "always".`;
   assert.deepEqual(again.gate.getStatus().errors, [`gate.json loaded. ${typo}`, `In the host's starting rules, ${typo}`]);
   writeFileSync(again.configPath, JSON.stringify({ policies: [{ name: 'user-input', behavior: 'defer' }] }));
   again.gate.evaluate({ content: 'x', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c1', tags: [] });
@@ -1811,7 +1814,7 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   } catch (err) {
     parsed = (err as Error).message;
   }
-  assert.equal(fileError, unused(parsed, 'the rules it read from gate.json at start and the ones it was adding'));
+  assert.equal(fileError, notJsonShown(configPath, parsed, 'the rules it read from gate.json at start and the ones it was adding'));
   const partway = (error: string, read = '.'): string => `At start, adding the host's starting rules "tickets" to gate.json failed partway (${error}), so `
     + `gate.json may be left part-written. The gate runs the rules it read from gate.json and the ones it was adding, which aren't saved${read} `
     + 'A restart before gate.json is fixed starts from the host\'s starting rules. Whoever runs this host can fix what kept it '
@@ -1820,8 +1823,8 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   assert.equal(unsaved, partway(
     'ENOSPC: no space left on device, write',
     ', read as a load reads them: gate.json has "comment", which the gate doesn\'t read, so it does nothing. Its fields are "default" and '
-    + '"policies". Policy "held" is left out: passthrough is only valid with rate_limit or passive_sample behaviors — for "defer" there is no '
-    + 'non-firing match to fall through on.',
+    + '"policies". Rule "held" is left out: passthrough is true, and only a behavior.rate_limit or behavior.passive_sample rule '
+    + 'passes on an event it matches without waking on it; with behavior "defer", leave passthrough out.',
   ));
   assert.deepEqual(rest, []);
   // The rules it was adding are read with them, a problem of their own included.
@@ -1830,7 +1833,7 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   const added = failingStart(addedDir, 'write', 'ENOSPC: no space left on device, write', {
     default: 'skip', policies: [userInput, { ...tickets, note: 'from the recipe' }],
   } as GateConfig);
-  const addedUnread = `Policy "tickets" has "note", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}.`;
+  const addedUnread = `Rule "tickets" has "note", which the gate doesn't read, so it does nothing. Its fields are ${POLICY_FIELDS}.`;
   assert.deepEqual(added.getStatus().errors.slice(1), [
     `In the host's starting rules, ${addedUnread}`,
     partway('ENOSPC: no space left on device, write', `, read as a load reads them: ${addedUnread}`),
@@ -1841,7 +1844,7 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   // what runs, writes nothing, and the rules in force keep running. A removal of a rule in force is refused the same way.
   const left = readFileSync(configPath);
   assert.throws(() => gate.addPolicy({ name: 'later', behavior: 'defer' }), {
-    message: `gate.json isn't JSON the gate can read (${parsed}), so a change can't edit its rules without writing over what it `
+    message: `gate.json isn't JSON the gate can read (${JSON.stringify(parsed)}), so a change can't edit its rules without writing over what it `
       + 'holds, and nothing was saved. Meanwhile the gate runs the rules it read from gate.json at start and the ones it was '
       + 'adding. Until gate.json is JSON, a change is refused the same way.',
   });
@@ -1884,8 +1887,8 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   closing.mock.restore();
   syncBuiltinESMExports();
   assert.deepEqual(names(landed), ['user-input', 'tickets']);
-  const mutedSaid = 'Policy "muted" is left out: passthrough is only valid with rate_limit or passive_sample behaviors — for "skip" there is '
-    + 'no non-firing match to fall through on.';
+  const mutedSaid = 'Rule "muted" is left out: passthrough is true, and only a behavior.rate_limit or behavior.passive_sample rule '
+    + 'passes on an event it matches without waking on it; with behavior "skip", leave passthrough out.';
   assert.deepEqual(landed.getStatus().errors, [`gate.json loaded. ${mutedSaid}`, `In the host's starting rules, ${mutedSaid}`]);
 });
 
@@ -1982,12 +1985,12 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   for (const field of ['insertBefore', 'insertAfter']) {
     const anchor = await call({ name: 'watch', behavior: 'defer', [field]: 3 });
     assert.equal(anchor.isError, true);
-    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The rules are: \\[mentions\\]\\.`));
+    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The rules are: \\["mentions"\\]\\.`));
   }
   // A name no rule has was refused before this change too, by the gate.
   const absent = await call({ name: 'watch', behavior: 'defer', insertAfter: 'nope' });
   assert.equal(absent.isError, true);
-  assert.match(absent.content, /addPolicy: no policy named "nope" to anchor on — have: \[mentions\]/);
+  assert.match(absent.content, /^Rule "watch" wasn't saved: insertAfter is "nope", and no rule has that name\. The other rules are "mentions"\./);
   // Its own parameters are checked as a rule's fields are: a slip is refused.
   const before = readFileSync(configPath, 'utf-8');
   const parameters = '"name", "match", "behavior", "debounceMs", "rateLimit", "passiveSample", "judge", "position", "insertBefore", '
@@ -2062,7 +2065,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   assert.equal(inMatch.isError, true);
   assert.ok(
     inMatch.content.includes(
-      'Policy "watch" wasn\'t saved: match has "pattern", a field of "match.filter", which the gate doesn\'t read here. '
+      'Rule "watch" wasn\'t saved: match has "pattern", a field of "match.filter", which the gate doesn\'t read here. '
       + everyEventIfSaved(),
     ),
     inMatch.content,
@@ -2084,19 +2087,19 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   assert.ok(typo.content.endsWith(`${timing} ${unreadNote}`), typo.content);
   const gateRefuses = await call({ name: 'watch', comment: 'for the launch', match: { tagsAny: 'chat:ambient' }, behavior: 'skip' });
   assert.equal(gateRefuses.isError, true);
-  assert.ok(gateRefuses.content.startsWith('Policy "watch" wasn\'t saved:'), gateRefuses.content);
+  assert.ok(gateRefuses.content.startsWith('Rule "watch" wasn\'t saved:'), gateRefuses.content);
   assert.ok(gateRefuses.content.endsWith(unreadNote), gateRefuses.content);
-  // The gate's refusal of an anchor it doesn't hold ends in "]", and gets a stop before the note.
+  // The gate's refusal of an anchor it doesn't hold ends in a stop of its own, and the note follows it.
   const noAnchor = await call({ name: 'watch', comment: 'for the launch', insertBefore: 'nowhere', behavior: 'always' });
   assert.equal(noAnchor.isError, true);
-  assert.ok(noAnchor.content.endsWith(`]. ${unreadNote}`), noAnchor.content);
+  assert.ok(noAnchor.content.endsWith(`where it is. ${unreadNote}`), noAnchor.content);
   assert.equal(readFileSync(configPath, 'utf-8'), before, 'none of those refusals saved anything');
   // A rule with a problem is refused by the gate, naming each.
   const wide = await call({ name: 'watch', match: { tagsAny: 'chat:ambient' }, debounceMs: 50 });
   assert.equal(wide.isError, true);
   assert.ok(
     wide.content.includes(
-      'Policy "watch" wasn\'t saved: behavior.debounce is 50 ms, under the 100 ms minimum; '
+      'Rule "watch" wasn\'t saved: debounceMs is 50 ms, under the 100 ms minimum; '
       + 'match.tagsAny is "chat:ambient", where a list of non-empty strings is needed, such as ["chat:ambient"].',
     ),
     wide.content,
@@ -2126,12 +2129,12 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   const saved = await call({ name: 'watch', match: { tagsAny: ['chat:ambient'], why: 'quiet hours' }, debounceMs: 60000 });
   assert.equal(saved.isError, false);
   assert.deepEqual(JSON.parse(saved.content).ignoredFields, [
-    `Policy "watch": match has "why", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`,
+    `Rule "watch": match has "why", which the gate doesn't read, so it does nothing. Its fields are ${MATCH_FIELDS}.`,
   ]);
   assert.deepEqual(onDisk(configPath).policies.find((p) => p.name === 'watch'), { name: 'watch', match: { tagsAny: ['chat:ambient'] }, behavior: { debounce: 60000 } });
   const none = await call({ name: 'watch', behavior: null });
   assert.equal(none.isError, true, 'a null behavior is one left out, and the tool needs one');
-  assert.match(none.content, /wake_add_rule: specify exactly one behavior/);
+  assert.match(none.content, /wake_add_rule got no behavior, so nothing was saved/);
 
   const description = framework.getAllTools().find((tool) => tool.name === 'wake_add_rule')!.description;
   assert.ok(description.includes('debounceMs: 60000'), 'the example uses the shorthand, which works in both tool modes');
@@ -2183,8 +2186,8 @@ test('"__proto__" in a rule is a field the gate doesn\'t read: it narrows nothin
 
   assert.equal(gate.probe(event(['chat:ambient'])).trigger, true, 'an event from discord wakes the agent, as the rule matches every event');
   const said = gate.getStatus().errors[0] ?? '';
-  assert.ok(said.includes(`Policy "all": match has "__proto__", which the gate doesn't read, so it does nothing.`), said);
-  assert.ok(said.includes(everyEvent('Policy "all"')), said);
+  assert.ok(said.includes(`Rule "all": match has "__proto__", which the gate doesn't read, so it does nothing.`), said);
+  assert.ok(said.includes(everyEvent('Rule "all"')), said);
 });
 
 test('a "" field named like one every object inherits, such as "constructor", is left out with the plain note', (t) => {
@@ -2195,8 +2198,8 @@ test('a "" field named like one every object inherits, such as "constructor", is
   });
 
   const said = gate.getStatus().errors[0] ?? '';
-  assert.ok(said.includes(`Policy "plain" has "constructor" as "", so it's left out.`), said);
-  assert.ok(said.includes(`Policy "plain": match has "__proto__" and "toString" as "", so they're left out.`), said);
+  assert.ok(said.includes(`Rule "plain" has "constructor" as "", so it's left out.`), said);
+  assert.ok(said.includes(`Rule "plain": match has "__proto__" and "toString" as "", so they're left out.`), said);
 });
 
 test('a write clears the state of a rule it leaves out or gives another behavior, as a reload does', (t) => {
@@ -2305,7 +2308,7 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
   assert.equal(gate.evaluate(MENTION).trigger, false, 'the event waits in the debounce batch');
   gate.evaluate(MENTION);
   t.mock.timers.tick(1000);
-  assert.deepEqual(logged, ['[gate] Policy "quiet": its pending batch of 2 events couldn\'t be delivered (no agent to deliver to), so the batch is dropped']);
+  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 2 events couldn\'t be delivered (no agent to deliver to), so the batch is dropped']);
   assert.deepEqual(delivered, []);
 
   // Held for the turn of the agent whose wake_add_rule changed the rule, and sent once it ends.
@@ -2355,7 +2358,7 @@ test('a behavior holding two kinds names the problems of the kind it doesn\'t re
 
   assert.equal(
     refusal(gate, { behavior: both }),
-    'Policy "r" wasn\'t saved: behavior holds "debounce" and "rate_limit", and a rule has one behavior; '
+    'Rule "r" wasn\'t saved: behavior holds "debounce" and "rate_limit", and a rule has one behavior; '
       + 'behavior.debounce is 50 ms, under the 100 ms minimum; '
       + 'behavior.rate_limit.tokens is "bad", where a positive number is needed; '
       + 'behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed.',
@@ -2367,7 +2370,7 @@ test('a behavior holding two kinds names the problems of the kind it doesn\'t re
   const said = loaded.gate.getStatus().errors[0] ?? '';
   assert.ok(
     said.includes(
-      'Policy "both": behavior holds "debounce" and "rate_limit", and a rule has one behavior, so only its "debounce" is read; '
+      'Rule "both": behavior holds "debounce" and "rate_limit", and a rule has one behavior, so only its "debounce" is read; '
       + 'behavior.debounce is 50 ms, under the 100 ms minimum, so it\'s read as 100 ms; '
       + 'behavior.rate_limit.tokens is "bad", where a positive number is needed, which goes unread with the rest of "rate_limit"; '
       + 'behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed, which goes unread with the rest of "rate_limit".',
@@ -2379,7 +2382,7 @@ test('a behavior holding two kinds names the problems of the kind it doesn\'t re
   const three = { passive_sample: { every: 0.5 }, rate_limit: { tokens: 'bad' }, debounce: 50 };
   assert.equal(
     refusal(gate, { behavior: three }),
-    'Policy "r" wasn\'t saved: behavior holds "debounce", "rate_limit" and "passive_sample", and a rule has one behavior; '
+    'Rule "r" wasn\'t saved: behavior holds "debounce", "rate_limit" and "passive_sample", and a rule has one behavior; '
       + 'behavior.debounce is 50 ms, under the 100 ms minimum; '
       + 'behavior.rate_limit.tokens is "bad", where a positive number is needed; '
       + 'behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed; '
@@ -2474,7 +2477,7 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   assert.deepEqual(names(gate), ['mentions'], 'and is in force');
   assert.deepEqual(
     logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
-    ['[gate] Policy "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
+    ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
   );
   const state = gate as unknown as { rateLimitBuckets: Map<string, unknown>; debounceTimers: Map<string, unknown> };
   assert.equal(state.rateLimitBuckets.has('limited'), false, "limited's spent bucket is cleared, though quiet's batch came first");
@@ -2504,7 +2507,7 @@ test("a reload whose pending batch can't be delivered still puts the new rules i
   assert.deepEqual(names(gate), ['mentions']);
   assert.deepEqual(
     logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
-    ['[gate] Policy "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
+    ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
   );
   assert.equal((gate as unknown as { debounceTimers: Map<string, unknown> }).debounceTimers.has('quiet'), false, 'nothing is left behind');
 });

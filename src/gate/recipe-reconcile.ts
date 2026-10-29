@@ -40,6 +40,8 @@
  * rule with no name is never merged: the merge keys rules by name.
  */
 
+import { quotedValue } from '../supplied-text.js';
+
 /** What a start changed, by rule name, for its trace and its log line. */
 export interface RecipeChanges {
   added: string[];
@@ -173,11 +175,11 @@ export function reconcileWithRecipe(
   const agree = (a: unknown, b: unknown): boolean => meaningOf(a) === meaningOf(b);
   const liveDuplicate = duplicateName(live.rules);
   if (liveDuplicate !== undefined) {
-    throw new Error(`gate.json names the rule "${liveDuplicate}" twice`);
+    throw new Error(`gate.json names the rule ${quotedValue(liveDuplicate)} twice`);
   }
   const recipeDuplicate = duplicateName(recipe.rules);
   if (recipeDuplicate !== undefined) {
-    throw new Error(`the recipe names the rule "${recipeDuplicate}" twice`);
+    throw new Error(`the recipe names the rule ${quotedValue(recipeDuplicate)} twice`);
   }
 
   const changes = noChanges();
