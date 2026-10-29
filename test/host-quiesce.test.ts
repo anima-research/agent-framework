@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -1268,6 +1268,48 @@ test('the boot import of an earlier release\'s queue drops a malformed write, na
     await framework.resume();
     assert.deepEqual(texts(), ['first', 'second']);
     await assert.doesNotReject(framework.getAgent('agent')!.compileContext(), 'and the agent compiles');
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the boot import drops a write context-manager refuses as malformed, naming it, stores what follows it for its agent, and doesn't store it at a later boot", { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-refused-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    await framework.stop();
+    mkdirSync(join(storePath, 'recovery'), { recursive: true });
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    writeFileSync(file, JSON.stringify({ version: 2, pending: [
+      { id: 'first', seq: 1, participant: 'user', content: [{ type: 'text', text: 'first' }] },
+      { id: 'number-text', seq: 2, participant: 'user', content: [{ type: 'text', text: 5 }] },
+      { id: 'second', seq: 3, participant: 'user', content: [{ type: 'text', text: 'second' }] },
+    ] }));
+    const texts = () => framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: unknown }).text);
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    assert.ok(lines.some((line) => line.includes('was refused as malformed, and dropped: number-text') && line.includes('content[0]')), lines.join('\n'));
+    assert.deepEqual(texts(), ['first', 'second'], 'what follows it for its agent is stored at this boot');
+    assert.ok(!existsSync(file) || !readFileSync(file, 'utf8').includes('number-text'), 'and the record no longer holds it');
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    assert.deepEqual(texts(), ['first', 'second'], 'a later boot stores nothing more');
   } finally {
     console.error = error;
     await framework.stop();
