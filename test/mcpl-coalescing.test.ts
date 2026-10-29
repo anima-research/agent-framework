@@ -3160,11 +3160,12 @@ test("#157: an edit that addresses the agent, of a follow-up that arrived during
   assert.equal(channel, 'other');
 });
 
-test("#157: an edit of a follow-up that arrived during a turn and was flushed at the turn's end, before any compile showed it, is the agent's first view", async (t) => {
+test("#157: an edit of a follow-up that arrived during a turn and entered the window at the turn's end, before any compile showed it, is the agent's first view", async (t) => {
   // The question wakes the turn. The follow-up and its edit wake nothing, so
-  // no compile shows the follow-up after the flush.
+  // no compile shows the follow-up after the turn's end.
   const f = await fixture({ server: { shouldTriggerInference: (content: string) => !content.includes('follow_up') } }); t.after(f.close); await f.register();
   let streams = 0;
+  let duringTurn: { stored: boolean; inWindow: boolean } | undefined;
   (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
     f.membrane.calls.push(request as never);
     const stream = new MockYieldingStream([createMockResponse([{ type: 'text', text: 'answer' }] as ContentBlock[])]);
@@ -3173,10 +3174,10 @@ test("#157: an edit of a follow-up that arrived during a turn and was flushed at
     (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
       for await (const event of { [Symbol.asyncIterator]: iterate }) {
         // The follow-up arrives after the turn's last round, so no tool
-        // boundary drains it: it waits for the turn-end flush.
+        // boundary hears it.
         if ((event as { type?: string }).type === 'complete') {
           await f.send('push/event', f.params('d1', 'follow_up_wiht_typo', { initial: true }));
-          assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+          duringTurn = { stored: !!storedWith(f, 'follow_up_wiht_typo'), inWindow: f.window().includes('follow_up_wiht_typo') };
         }
         yield event;
       }
@@ -3186,7 +3187,8 @@ test("#157: an edit of a follow-up that arrived during a turn and was flushed at
   await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
   await f.framework.runUntilIdle();
   assert.equal(streams, 1, 'one turn ran');
-  assert(storedWith(f, 'follow_up_wiht_typo'), "the turn-end flush stored the follow-up");
+  assert.deepEqual(duringTurn, { stored: true, inWindow: false }, "the follow-up was stored at once, out of the live turn's window");
+  assert(f.window().includes('follow_up_wiht_typo'), "the turn's end put the follow-up in the window");
   assert(!f.membrane.calls.some((c) => JSON.stringify(c).includes('follow_up_wiht_typo')), 'no request held the follow-up');
   const edit = await f.send('push/event', { ...f.params('d2', 'follow_up_fixed'), tags: ['chat:edited'] });
   assert.equal(edit.result.coalesce.outcome, 'replaced');
