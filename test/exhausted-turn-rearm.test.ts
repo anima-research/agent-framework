@@ -535,6 +535,25 @@ for (const failsAt of ['setup', 'event'] as const) {
   });
 }
 
+for (const failsAt of ['setup', 'event'] as const) {
+  test(`a host's system change stored while a re-armed send's cut is reported isn't a message said to the agent, so the next cut still ends the re-arming (cut ${failsAt === 'setup' ? 'at its start' : 'reported by its stream'})`, async (t) => {
+    const stalled = await stalledByMembrane(t);
+    const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled), failsAt);
+    const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+    let stored = false;
+    r.fw.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:exhausted' || stored || r.count('inference:exhausted') < 2) return;
+      stored = true;
+      (r.fw as unknown as { addMessage(role: string, content: unknown[], metadata: unknown): unknown })
+        .addMessage('user', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'a tool', inputSchema: { type: 'object', properties: {} } }] }], undefined);
+    });
+    r.say('zz-question');
+    await waitFor(() => r.count('inference:exhausted') === 3, 'the next re-armed send to end exhausted, cut');
+    assert.ok(stored, "the change was stored while the first cut's exhaustion was reported");
+    assert.equal(r.admission().providerAdmission.heldRequests, 0, 'the change cleared no cut, so this cut is the chain\'s second and ends it');
+  });
+}
+
 test("deadline cuts in a turn that isn't a re-arm don't count toward the chain: the first re-armed send's cut is still re-armed", async (t) => {
   const stalled = await stalledByMembrane(t);
   const membrane = new ScriptedMembrane((n) => (n <= 2 || n >= 4 ? () => stalled : serverError));
