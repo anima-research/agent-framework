@@ -3843,7 +3843,7 @@ export class EventGate {
     // back to whoever addressed the agent, not to whichever channel last saw
     // any traffic. Ambient-only batches set no locus. A batch whose line the
     // gate left to the turn's start carries it too (`line`), one object
-    // shared by every agent the batch wakes, so it is written once.
+    // shared by every agent woken with these messages, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of woken) {
@@ -4193,8 +4193,8 @@ export class EventGate {
    * buffer through the same path a turn's end uses. Self-wake and sleep-expiry
    * timers deliberately do NOT route through this — their inference requests
    * are per-agent targeted pushes that the framework's quiesce wake gate parks
-   * and releases at resume, whereas the buffer's deliverEvents broadcasts a
-   * wake to every agent.
+   * and releases at resume, whereas the buffer's deliverEvents wakes every
+   * agent a batch is for.
    */
   setQuiesced(quiesced: boolean): void {
     if (this.quiesced === quiesced) return;

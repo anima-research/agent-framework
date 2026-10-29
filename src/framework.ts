@@ -4886,8 +4886,8 @@ export class AgentFramework {
             : undefined);
           framework.persistUsageState();
         },
-        // The batch wakes every agent but the subconscious; the judge reads the
-        // primary's context, the resident the gate's wakes are for.
+        // A batch naming no agent wakes every agent but the subconscious; the
+        // judge reads the primary's context, the resident the gate's wakes are for.
         chooseAgent: (names) => (framework.primaryAgentName && names.includes(framework.primaryAgentName)
           ? framework.primaryAgentName
           : names[0]),
