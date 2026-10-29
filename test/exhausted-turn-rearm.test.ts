@@ -428,20 +428,23 @@ test("a server error between two cuts is an answer from the provider, so the cut
   assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(3 of 3\)/);
 });
 
-test("an answer in a turn that isn't a re-arm comes between two cuts too: a merged wake's round and server errors make the next re-armed cut a first", async (t) => {
-  const stalled = await stalledByMembrane(t);
-  const membrane = new ScriptedMembrane((n) => (n <= 3 || n === 6 || n === 7 ? serverError : n === 5 ? { toolRoundThen: serverError() } : () => stalled));
-  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100, 100] });
-  r.say('zz-question');
-  await waitFor(() => r.count('inference:exhausted') === 2, 'the first re-armed send to end exhausted, cut');
-  assert.equal(r.admission().providerAdmission.heldRequests, 1);
-  queue(r, { reason: 'zz-wake' });
-  await waitFor(() => r.count('inference:exhausted') === 4,
-    "the wake's turn, merged with the held re-arm, to answer a round and end on server errors, and the next re-armed send to end exhausted, cut");
-  assert.equal(membrane.sends.length, 8);
-  assert.equal(r.admission().providerAdmission.heldRequests, 1, "the merged turn's answers came between the cuts, so this cut is a first and is re-armed");
-  assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(4 of 4\)/);
-});
+for (const answersRound of [true, false]) {
+  test(`an answer in a turn that isn't a re-arm comes between two cuts too: a merged wake's ${answersRound ? 'round and server errors' : 'server errors alone'} make the next re-armed cut a first`, async (t) => {
+    const stalled = await stalledByMembrane(t);
+    const membrane = new ScriptedMembrane((n) => (n <= 3 || n === 6 || n === 7 ? serverError
+      : n === 5 ? (answersRound ? { toolRoundThen: serverError() } : serverError) : () => stalled));
+    const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100, 100] });
+    r.say('zz-question');
+    await waitFor(() => r.count('inference:exhausted') === 2, 'the first re-armed send to end exhausted, cut');
+    assert.equal(r.admission().providerAdmission.heldRequests, 1);
+    queue(r, { reason: 'zz-wake' });
+    await waitFor(() => r.count('inference:exhausted') === 4,
+      `the wake's turn, merged with the held re-arm, to ${answersRound ? 'answer a round and ' : ''}end on server errors, and the next re-armed send to end exhausted, cut`);
+    assert.equal(membrane.sends.length, 8);
+    assert.equal(r.admission().providerAdmission.heldRequests, 1, "the merged turn's answers came between the cuts, so this cut is a first and is re-armed");
+    assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(4 of 4\)/);
+  });
+}
 
 test("a round answered between two cuts is an answer from the provider, so the cut after it is a first again and gets the error policy's retry", async (t) => {
   const stalled = await stalledByMembrane(t);
