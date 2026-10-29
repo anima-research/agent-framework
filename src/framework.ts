@@ -21635,7 +21635,7 @@ export class AgentFramework {
     const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
-      this.lastAnnouncedLocus.set(agent.name, null);
+      this.rememberAnnouncedLocus(agent.name, null);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       return { participant: 'user', content, metadata };
     } catch (err) {
