@@ -475,7 +475,7 @@ test('a provider hold keeps a bounded reason, and a failed resume logs the bound
   const providerState = (fw: any) => Object.assign(fw, {
     ephemeralRuns: new Map(), registry: { ownsProviderScheduling: () => true, homeChannel: () => undefined }, providerGates: new Map(),
     providerAccelerationCooldowns: new Map(), providerAccelerationRecoveries: new Map(),
-    providerAdmissionClosed: false, activeTurnTokens: new Map(), quiesced: false,
+    providerAdmissionClosed: false, activeTurnTokens: new Map(), quiesced: false, deadlineCuts: new Map(),
   });
   const held = makeHarness();
   providerState(held.fw);

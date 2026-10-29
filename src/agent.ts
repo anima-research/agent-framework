@@ -2,6 +2,7 @@ import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
@@ -50,6 +51,9 @@ export interface ActivationRequestOptions {
    *  pass it (its errorPolicy is their retry layer); a direct caller of
    *  startStream keeps membrane's retries. */
   membraneRetries?: boolean;
+  /** The framework's inferenceBounds, resolved: the stream gets their phase
+   *  bounds and flat bound. None when left out. */
+  inferenceBounds?: InferenceBounds | null;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -2211,6 +2215,7 @@ export class Agent {
       // since membrane 0.7 its own schedules, ten minutes at a 529, would
       // otherwise run inside each of the caller's attempts, out of its sight.
       ...(options.membraneRetries === false ? { retry: false } : {}),
+      ...streamBounds(options.inferenceBounds ?? null, request.config.maxTokens),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
