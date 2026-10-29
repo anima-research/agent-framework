@@ -376,3 +376,36 @@ test("a message deleted while its create is kept in memory, whose delete is stil
     await s.cleanup();
   }
 });
+
+test("edits made while a create is kept in memory apply in turn at the release, so a later text-only edit keeps an earlier edit's removed attachment removed", async (t) => {
+  const original = globalThis.fetch;
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return new Response('NOTES BODY', { status: 200, headers: { 'content-type': 'text/plain' } }); }) as typeof fetch;
+  t.after(() => { globalThis.fetch = original; });
+  const edit = (discord: FakeDiscord, text: string, attachments?: unknown[]) =>
+    (discord.onEditHandler as unknown as (id: string, content: string, attachments?: unknown[]) => void)('k10', text, attachments);
+  const s = await withKeptCreate('a branch move holding the store', async ({ discord, processed, kept, texts }) => {
+    const created = processed('discord:message', 'k10');
+    await discord.onMessageHandler!({
+      ...live('k10', 'with notes'),
+      attachments: [{ id: 'a1', filename: 'notes.txt', url: 'https://cdn.example.invalid/notes.txt', contentType: 'text/plain', size: 10 }],
+    });
+    await created;
+    assert.deepEqual([fetched, kept(), texts('k10')], [1, 1, []], "the create's attachment was fetched, and the create is kept in memory, not stored");
+    const first = processed('discord:edit', 'k10');
+    edit(discord, 'with notes', []);
+    await first;
+    const second = processed('discord:edit', 'k10');
+    edit(discord, 'edited text');
+    await second;
+  });
+  try {
+    await drained(s.framework);
+    const row = JSON.stringify(s.framework.getAgent('Sol')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === 'k10').map((m) => m.content));
+    assert.ok(row.includes('edited text'), `the later edit's text is stored: ${row}`);
+    assert.ok(!row.includes('NOTES BODY'), `the attachment the earlier edit removed stays removed: ${row}`);
+  } finally {
+    await s.cleanup();
+  }
+});

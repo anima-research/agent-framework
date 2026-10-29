@@ -358,7 +358,7 @@ interface LiveCreate {
   /** The latest edit's text and attachments, from while it converted. */
   text?: string;
   attachments?: DiscordAttachment[];
-  unapplied?: 'delete' | { text: string; attachments?: DiscordAttachment[] };
+  unapplied?: 'delete' | Array<{ text: string; attachments?: DiscordAttachment[] }>;
 }
 
 /**
@@ -1464,7 +1464,7 @@ export class DiscordModule implements Module {
     if (!stored) {
       const live = this.creating.get(edit.discordMessageId);
       if (live?.phase === 'writing' && live.unapplied !== 'delete') {
-        live.unapplied = { text: edit.newContent, ...(edit.attachments ? { attachments: edit.attachments } : {}) };
+        live.unapplied = [...(live.unapplied ?? []), { text: edit.newContent, ...(edit.attachments ? { attachments: edit.attachments } : {}) }];
       }
       return {};
     }
@@ -1508,11 +1508,14 @@ export class DiscordModule implements Module {
       const unapplied = live.unapplied;
       if (unapplied === undefined || !this.storedRow(discordMessageId)) continue;
       live.unapplied = undefined;
-      const answer = unapplied === 'delete'
-        ? this.answerDelete({ type: 'discord:delete', discordMessageId })
-        : this.answerEdit({ type: 'discord:edit', discordMessageId, newContent: unapplied.text, ...(unapplied.attachments ? { attachments: unapplied.attachments } : {}) });
-      for (const { messageId, content } of answer.editMessages ?? []) ctx.editMessage(messageId, content);
-      for (const id of answer.removeMessages ?? []) ctx.removeMessage(id);
+      if (unapplied === 'delete') {
+        for (const id of this.answerDelete({ type: 'discord:delete', discordMessageId }).removeMessages ?? []) ctx.removeMessage(id);
+        continue;
+      }
+      for (const { text, attachments } of unapplied) {
+        const answer = this.answerEdit({ type: 'discord:edit', discordMessageId, newContent: text, ...(attachments ? { attachments } : {}) });
+        for (const { messageId, content } of answer.editMessages ?? []) ctx.editMessage(messageId, content);
+      }
     }
   }
 
