@@ -12,7 +12,7 @@
   third-newest, and `"2.0"` or `"+2"` as 2; a `count` was read the same way, then
   range-checked. Integer numbers and decimal-digit strings, with surrounding whitespace
   trimmed, are accepted within each selector's range (`index` from 0, `count` 1..20) and
-  within the integers a number holds exactly, so a longer run of digits is refused rather
+  within the integers a number holds exactly, so a value past them is refused rather
   than read as a different number. A malformed `ref` beside an `index` or `count` in use is
   refused with a note that null, or leaving the selector out, marks one that isn't used, as
   the conflict refusal of a well-formed `ref` beside them says. A refusal of one selector on
