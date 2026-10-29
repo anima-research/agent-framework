@@ -5260,7 +5260,9 @@ export class AgentFramework {
    * turn: on the streams it cancels, on maintenance in flight (a pass or an
    * over-budget drain kick), on the event loop, on an operator's operations
    * already running, on modules and MCPL (its servers and the inference
-   * requests they made) together, then on Discord awareness
+   * requests they made) together, where a module whose start() is still
+   * running counts until that start() has settled and its stop() returned,
+   * then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
    * close ended. With a budget, a stop() can take up to six of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
@@ -7419,7 +7421,8 @@ export class AgentFramework {
    * its list of modules to stop, stay started past it; once it has settled,
    * the framework has stopped for good, as start() says. A stop() admitted
    * while the module's start() runs stops the module once that start() has
-   * settled, and this rejects the same way then, with no `module:added`.
+   * settled; if that start() fulfils, this rejects the same way then, with
+   * no `module:added`, and if it rejects, this rejects with its error.
    */
   async addModule(module: Module): Promise<void> {
     this.refuseOnceStopped('addModule()');
@@ -7456,7 +7459,9 @@ export class AgentFramework {
   }
 
   /**
-   * Remove a module at runtime.
+   * Remove a module at runtime. A module whose start() is still running is
+   * stopped once that start() has settled; this waits for that and for its
+   * stop(), with no time limit.
    */
   async removeModule(name: string): Promise<void> {
     await this.moduleRegistry.removeModule(name);
