@@ -39,6 +39,17 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
   throw new Error(`timed out waiting for: ${what}`);
 }
 
+async function postsSettled(framework: AgentFramework, agent: string): Promise<void> {
+  const posting = (framework as unknown as { proseSpeechChains: Map<string, Promise<void>> }).proseSpeechChains;
+  for (;;) {
+    await framework.runUntilIdle();
+    const chain = posting.get(agent);
+    await chain;
+    await framework.runUntilIdle();
+    if (posting.get(agent) === chain) return;
+  }
+}
+
 describe("a push naming another server's channel, through two real servers", () => {
   let dir: string;
   let framework: AgentFramework;
@@ -221,10 +232,7 @@ describe("a turn's replies go out through the server whose message triggered it"
   }
   async function settle(): Promise<void> {
     release();
-    for (let i = 0; i < 3; i++) {
-      await framework.runUntilIdle();
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    await postsSettled(framework, 'scout');
   }
 
   // A script's call through the host's bridge, as the isolate hands it over:
@@ -332,7 +340,6 @@ describe("a turn's replies go out through the server whose message triggered it"
     assert.deepEqual(published('turn reply'), ['slack']);
     const shared = await background({ channelId: X, content: 'background note' });
     const named = await background({ channelId: X, serverId: 'discord', content: 'background note to discord' });
-    await new Promise((r) => setTimeout(r, 500));
     t.diagnostic(`shared: ${shared}`);
     t.diagnostic(`named: ${named}`);
     assert.deepEqual(published('background note'), ['discord'], 'only the call that names discord reached it');
@@ -362,7 +369,6 @@ describe("a turn's replies go out through the server whose message triggered it"
     }).scriptToolCall('scout', 'channel_publish', JSON.stringify({ channelId: X, content }), { watch: { turnId: second, endTurn: false }, startTurnId }));
     const fromFirst = await scriptCall(first, 'from the first turn\'s script');
     const fromSecond = await scriptCall(second, 'from the second turn\'s script');
-    await new Promise((r) => setTimeout(r, 500));
     t.diagnostic(`first turn's script: ${fromFirst}`);
     t.diagnostic(`second turn's script: ${fromSecond}`);
     assert.deepEqual(published("from the first turn's script"), [], "the second turn's channel isn't the first turn's script's");
@@ -382,7 +388,6 @@ describe("a turn's replies go out through the server whose message triggered it"
     await registry().handleChanged('slack', { removed: [X] });
     const gone = await background({ content: 'default after withdrawal' });
     const goneNamed = await background({ serverId: 'slack', content: 'default named slack after withdrawal' });
-    await new Promise((r) => setTimeout(r, 500));
     for (const [k, v] of Object.entries({ whileShared, namedDiscord, gone, goneNamed })) t.diagnostic(`${k}: ${v}`);
     assert.deepEqual(published('default while shared'), ['slack'], "the default's own server");
     assert.deepEqual(published('default named discord'), ['discord'], 'a serverId with no channelId names the default\'s id on that server');
@@ -683,10 +688,7 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
     await waitFor(() => started > 0, 'the turn started');
     release();
     await waitFor(() => !registry().listChannelsRaw().some((e) => e.serverId === 'slack' && e.descriptor.id === X), 'slack withdrew the channel');
-    for (let i = 0; i < 3; i++) {
-      await framework!.runUntilIdle();
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    await postsSettled(framework!, 'scout');
     const failed = (traces as Array<{ type: string; serverId?: string; channelId?: string }>).filter((e) => e.type === 'mcpl:speech-route-failed');
     t.diagnostic(`failed ${JSON.stringify(failed)}; through ${JSON.stringify(published('written before the open'))}`);
     assert.deepEqual(published('written before the open'), []);
@@ -727,10 +729,7 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
     }, "slack's message on the shared channel arrived");
     await registry().handleChanged('slack', { removed: [X] });
     release();
-    for (let i = 0; i < 3; i++) {
-      await framework!.runUntilIdle();
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    await postsSettled(framework!, 'scout');
     const locus = routing?.locus;
     t.diagnostic(`locus ${JSON.stringify(locus)}; wasIn ${JSON.stringify(routing?.wasIn)}; through ${JSON.stringify(published('re-pinned reply'))}`);
     assert.deepEqual(locus, { serverId: 'slack', channelId: X }, 'the locus moved to slack\'s channel');
@@ -796,8 +795,6 @@ describe("a script's call, through a real code_execution run", () => {
     const blocks = () => framework.getAgent('scout')!.getContextManager().getAllMessages().flatMap((m) => m.content);
     await waitFor(() => blocks().some((c) => c.type === 'tool_result' && (c as { toolName?: string }).toolName === 'code_execution'),
       'the script finished', 45_000);
-    await framework.runUntilIdle();
-    await new Promise((r) => setTimeout(r, 300));
     const result = blocks().find((c) => c.type === 'tool_result' && (c as { toolName?: string }).toolName === 'code_execution');
     t.diagnostic(JSON.stringify(result).slice(0, 600));
     assert.deepEqual(published('from the script'), ['slack']);

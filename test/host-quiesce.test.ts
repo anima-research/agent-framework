@@ -24,6 +24,7 @@ import type { StreamEvent, YieldingStream, NormalizedRequest } from '@animalabs/
 import { JsStore } from '@animalabs/chronicle';
 
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { schedulerPasses } from './helpers/scheduler-passes.js';
@@ -774,9 +775,10 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true, featureSets: { chat: { description: 'chat', uses: ['pushEvents'] } } } } } });
     else if (m.method === 'tools/list') reply({ tools: [] });
-    else if (m.id === 900) log('push-response', { error: m.error ?? null });
+    else if (m.method === 'featureSets/update') reply({ accepted: true });
+    else if (m.id === 900) log('push-response', { result: m.result ?? null, error: m.error ?? null });
     else if (m.id === 901) log('resume-response', { result: m.result ?? null, error: m.error ?? null });
   }
 });
@@ -846,6 +848,9 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
     assert.equal(framework.getHostModeStatus().quiesced, false);
     await waitFor('buffered push flushed after resume', () =>
       records().some((r) => r.event === 'push-response'));
+    const flushed = records().find((r) => r.event === 'push-response');
+    assert.equal(flushed?.error, null, 'the flushed push is answered, not refused with an error');
+    assert.equal((flushed?.result as { accepted?: unknown } | null)?.accepted, true, 'the flushed push is accepted');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -1005,6 +1010,7 @@ test('abandon reports turns it cannot cancel (token held, no stream)', async () 
     // A turn between dequeue and stream registration: token held, agent idle.
     const tokens = (framework as unknown as { activeTurnTokens: Map<string, object> }).activeTurnTokens;
     tokens.set('agent', {});
+    setAbandonGraceForTests(framework, 50);
     try {
       const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
       assert.equal(status.drained, false);
