@@ -486,6 +486,22 @@ describe('toolDeclarations in the framework', () => {
         });
       });
     }
+
+    it("takes a copied change of its parent's out of the child's context when the child's head moves", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')], system('v1'));
+        await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
+        const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', mode: 'copy' });
+        assert.deepEqual(changesIn((await child.buildActivationRequest([tool('a'), tool('b')], system('v1'))).messages),
+          [[{ type: 'system_change', defineTools: [tool('b')] }]], "the premise: the parent's change, copied");
+        const moved = await child.buildActivationRequest([tool('a'), tool('b')], system('v2'));
+        assert.deepEqual(moved.tools, [tool('a'), tool('b')], "a replacement moved the child's head");
+        assert.deepEqual(changesIn(moved.messages), [], 'and took the copied change with it');
+      });
+    });
   });
 
   it("reports after host /undo the last conversational message the agent sees, not a change after it", async () => {
