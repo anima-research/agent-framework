@@ -66,8 +66,8 @@ import {
   type TransportSendOptions,
 } from '@modelcontextprotocol/client';
 
-import { StdioTransport, type McplTransport } from './transport.js';
-import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError } from './server-connection.js';
+import { STDERR_END_WAIT_MS, StdioTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr } from './server-connection.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, logDroppedLine, maskedError, noteDialSent, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 import { boundedForLog } from './errors.js';
@@ -309,6 +309,9 @@ class SpawnerStdioTransport implements Transport {
   onerror?: (error: Error) => void;
   onmessage?: <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void;
   private line: McplTransport | null = null;
+  /** How the child ended, once its line has closed: the line's reason, and
+   *  the child's exit code or signal. */
+  closeInfo: TransportCloseInfo | undefined;
   /** The spawn start() awaits, so a close() made meanwhile closes its child. */
   private spawning: Promise<McplTransport> | null = null;
 
@@ -357,7 +360,10 @@ class SpawnerStdioTransport implements Transport {
     });
     line.on('stderr', (text: string) => this.onStderr(text));
     line.on('error', (error: Error) => this.onerror?.(error));
-    line.on('close', () => this.onclose?.());
+    line.on('close', (info: TransportCloseInfo) => {
+      this.closeInfo = info;
+      this.onclose?.();
+    });
     line.on('unreaped', (failure: Error) => this.onUnreaped(`its stdio pipe failed with ${line.pipeFailure?.message ?? 'an error'}`, failure));
   }
 
@@ -365,6 +371,16 @@ class SpawnerStdioTransport implements Transport {
    *  line is ending the child then, and writes nothing more to it. */
   get pipeFailure(): Error | undefined {
     return this.line?.pipeFailure;
+  }
+
+  /** The last of the child's stderr, redacted, once the stream has ended or
+   *  STDERR_END_WAIT_MS has passed, as the legacy handshake waits before it
+   *  refuses; '' when there's no child or it wrote nothing. */
+  async stderrTail(): Promise<string> {
+    const line = this.line;
+    if (!line) return '';
+    await line.stderrEnded(STDERR_END_WAIT_MS);
+    return line.stderrTailRedacted(serverTextRedactor(this.config)).trimEnd();
   }
 
   async send(message: JSONRPCMessage): Promise<void> {
@@ -618,12 +634,14 @@ export class ModernMcpConnection extends EventEmitter {
       // `cause`, can carry it whole (maskedError). The protocol refusal
       // above was built from redacted words.
       const masked = maskedError(error, this.recorded);
+      const stderrTail = stderrTailOf(error);
+      if (stderrTail !== undefined) Object.assign(masked, { stderrTail });
       // A launch that couldn't be reaped halts reconnecting, so no retry
       // will come: the first connect fails, as one without reconnect does.
       if (!this.reconnectEnabled || this.holdsUnreapedChild) throw masked;
-      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, masked.message);
+      console.error(`MCP server "${this.id}" initial connect failed, will retry: ${masked.message}${withStderr(masked, this.recorded)}`);
       this.reconnectAttempts = 1;
-      this.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
+      this.emit('connect-failed', { error: (error as Error).message, ...(stderrTail === undefined ? {} : { stderrTail }), attempt: 0 });
       this.scheduleReconnect();
     }
   }
@@ -705,7 +723,9 @@ export class ModernMcpConnection extends EventEmitter {
       // Marked before the session is adopted too: a close during the connect
       // makes it a failed connect (see establish).
       session.lost = true;
-      if (this.isCurrent(generation)) this.handleLost(generation, 'transport closed');
+      // Over stdio, how its child ended, as legacy's loss carries it.
+      const ended = session.stdio?.closeInfo;
+      if (this.isCurrent(generation)) this.handleLost(generation, ended?.reason ?? 'transport closed', undefined, ended);
     };
 
     // `done` settles only once this connect's own cleanup has finished, on
@@ -721,6 +741,13 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
+  /** `error` carrying the session's stderr tail as `stderrTail`, as a
+   *  legacy connect's failure does, when the child wrote any. */
+  private static async withStderrTail(session: Session, error: unknown): Promise<unknown> {
+    const tail = await session.stdio?.stderrTail();
+    return tail && error instanceof Error ? Object.assign(error, { stderrTail: tail }) : error;
+  }
+
   /** Connect one generation's client, and adopt it if it's still current. */
   private async establish(session: Session): Promise<void> {
     try {
@@ -728,7 +755,7 @@ export class ModernMcpConnection extends EventEmitter {
     } catch (error) {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
-      throw this.versionVerdict(error) ?? error;
+      throw await ModernMcpConnection.withStderrTail(session, this.versionVerdict(error) ?? error);
     }
     if (!this.isCurrent(session.generation)) {
       // Superseded or closed while connecting: this generation never serves.
@@ -750,9 +777,9 @@ export class ModernMcpConnection extends EventEmitter {
     if (session.lost || pipe) {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
-      throw new Error(pipe
+      throw await ModernMcpConnection.withStderrTail(session, new Error(pipe
         ? `MCP server "${this.id}" stdio pipe failed with ${pipe.message} while connecting`
-        : `MCP server "${this.id}" closed its connection while connecting`);
+        : `MCP server "${this.id}" closed its connection while connecting`));
     }
     this.session = session;
     this.protocolVersion = MODERN_MCP_PROTOCOL_VERSION;
@@ -858,7 +885,7 @@ export class ModernMcpConnection extends EventEmitter {
   /** The transport went away (child exit, or a closed HTTP client).
    *  `unreaped`: the child's pipe failed and it outlived SIGKILL, so its
    *  launch is already known unreaped. */
-  private handleLost(generation: number, reason: string, unreaped?: Error): void {
+  private handleLost(generation: number, reason: string, unreaped?: Error, ended?: TransportCloseInfo): void {
     const session = this.session;
     if (session?.generation !== generation) return;
     this.session = null;
@@ -894,7 +921,7 @@ export class ModernMcpConnection extends EventEmitter {
     // skip neither 'close' nor the report.
     if (unreaped) this.holdUnreaped(session, unreaped, false);
     try {
-      this.emit('close', { reason });
+      this.emit('close', { reason, code: ended?.code ?? null, signal: ended?.signal ?? null, pipeFailed: ended?.pipeFailed === true });
     } finally {
       if (unreaped) this.reportUnreaped(unreaped);
     }
@@ -928,19 +955,26 @@ export class ModernMcpConnection extends EventEmitter {
     } catch (error) {
       if (this.closedByHost) return;
       this.reconnectAttempts = attempt + 1;
+      const stderrTail = stderrTailOf(error);
+      const failed = (message: string, permanent?: true) => this.emit('reconnect-failed', {
+        error: message,
+        ...(stderrTail === undefined ? {} : { stderrTail }),
+        attempt,
+        ...(permanent ? { permanent } : {}),
+      });
       const halted = this.unreapedFailure();
       if (halted) {
-        this.emit('reconnect-failed', { error: `${(error as Error).message}; ${halted}`, attempt, permanent: true });
+        failed(`${(error as Error).message}; ${halted}`, true);
         return;
       }
       // No common revision: every further attempt would hear the same
       // answer. Stop; only the configuration can fix it.
       if (error instanceof McplProtocolVersionError) {
         this.reconnectEnabled = false;
-        this.emit('reconnect-failed', { error: error.message, attempt, permanent: true });
+        failed(error.message, true);
         return;
       }
-      this.emit('reconnect-failed', { error: (error as Error).message, attempt });
+      failed((error as Error).message);
       this.scheduleReconnect();
     }
   }

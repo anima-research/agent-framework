@@ -868,7 +868,7 @@ import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type Heartb
 import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
 import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-presentation.js';
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
@@ -3039,6 +3039,31 @@ const isLowSurrogate = (text: string, index: number): boolean => {
 /** Whether a cut before `index` would separate the halves of a surrogate pair. */
 const splitsPair = (text: string, index: number): boolean =>
   index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
+
+/**
+ * Whether an MCPL server's child ended the way a server ends when it's asked
+ * to: exit 0, death by a signal that asks a process to end (SIGTERM, SIGINT,
+ * SIGHUP), or a shell's report of such a death by its convention, 128 plus the
+ * signal's number (143, 130, 129). A service manager's stop signals the host
+ * and its children together, so a child can go before the host's stop()
+ * closes it: its loss is that stop, not a failure, and raises no mcpl-down.
+ * A child the stdio transport ended itself after a pipe error was ended by
+ * that failure, whatever its code or signal. A WebSocket's close codes are
+ * 1000 and up, so they never match.
+ */
+function endedAsAsked(ended: { code?: number | null; signal?: string | null; pipeFailed?: boolean }): boolean {
+  if (ended.pipeFailed) return false;
+  const { code, signal } = ended;
+  return code === 0 || code === 143 || code === 130 || code === 129 ||
+    signal === 'SIGTERM' || signal === 'SIGINT' || signal === 'SIGHUP';
+}
+
+/** A lost connection's words for an alert: the transport's reason, then its
+ *  exit or close code and signal, each when there is one. */
+function closeWords(reason: string | null | undefined, code: number | null | undefined, signal: string | null | undefined): string {
+  const how = [reason ?? null, code != null ? `code ${code}` : null, signal ? `signal ${signal}` : null].filter((part) => part !== null);
+  return how.length > 0 ? ` (${how.join(', ')})` : '';
+}
 
 /**
  * `text` when it fits within `max` characters; otherwise its head and tail
@@ -32008,13 +32033,11 @@ export class AgentFramework {
           attempt: 0,
           willRetry: !!left?.willReconnect,
         });
-        // So the server doesn't vanish quietly: alert at once, since no
-        // attempt follows, for what needs the operator. That's a
-        // protocol-version verdict, as the reconnect path alerts for one, or
-        // a launch that couldn't be reaped, whose reap nothing retries on its
-        // own.
-        if (error instanceof McplProtocolVersionError || left?.holdsUnreapedChild) {
-          this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${message}`);
+        // So the server doesn't vanish quietly: nothing connects it again on
+        // its own, so alert at once. One that connected before its setup
+        // threw is still connected, and gets no alert.
+        if (!left?.willReconnect && !left?.isConnected) {
+          this.opsAlert('mcpl-down', config.id, `MCPL server not connected at startup, and this host won't retry it on its own: ${message}`);
         }
       }
     }
@@ -33952,9 +33975,10 @@ export class AgentFramework {
 
   /**
    * Restart an MCPL server at runtime: disconnect, then reconnect with the
-   * same (or an updated) config. This actually respawns a stdio child —
-   * unlike `reconnect: true`, which only retries after transport-level
-   * failures. Throws if the server has no stored config and none is given.
+   * same (or an updated) config. This respawns a stdio child at once,
+   * whatever its state; `reconnect: true` spawns a fresh child only after
+   * the connection fails or its child exits. Throws if the server has no
+   * stored config and none is given.
    * What its connect would refuse is refused before the running server is
    * torn down. Until the connect, a connect or a restart started meanwhile
    * is refused the id and the tool prefix the restart moves the server to,
@@ -34938,14 +34962,15 @@ export class AgentFramework {
       // that next one (see refreshMcplTools).
       this.noteMcplServerClosed(connection.id);
       this.dropMcplToolClasses(connection.id);
+      // The transport's own words only: a WebSocket server's close text
+      // stays off the trace.
+      const reason = info?.reason !== undefined && !info.reasonFromPeer ? boundFailureText(info.reason) : null;
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
         code: code ?? null,
         signal: signal ?? null,
-        // The transport's own words only: a WebSocket server's close text
-        // stays off the trace.
-        reason: info?.reason !== undefined && !info.reasonFromPeer ? boundFailureText(info.reason) : null,
+        reason,
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
@@ -34955,6 +34980,14 @@ export class AgentFramework {
         // RFC-014: its toolsets go with it; a next connection reads them again.
         this.toolsetHub?.get(connection.id)?.detach(connection);
         this.handleToolsListChanged(connection.id);
+        // Lost on its own with no reconnect coming: nothing in this host
+        // connects it again on its own. A close the host made itself (stop(),
+        // a disconnect, a restart) is byHost, a loss once stop() has begun is
+        // part of the close the host is making, and a child that ended as
+        // asked was stopped: none of them gets an alert.
+        if (!info?.byHost && !this.stopHasBegun() && !endedAsAsked({ code, signal, pipeFailed: info?.pipeFailed })) {
+          this.opsAlert('mcpl-down', connection.id, `MCPL server closed${closeWords(reason, code, signal)}, and this host won't reconnect it on its own`);
+        }
       }
     });
   }
@@ -34980,11 +35013,12 @@ export class AgentFramework {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
       this.handleToolsListChanged(connection.id);
     });
-    const failed = (params: { error: string; attempt: number; permanent?: boolean }) => {
+    const failed = (params: { error: string; stderrTail?: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
         error: recorded(params.error),
+        ...(params.stderrTail === undefined ? {} : { stderrTail: recorded(params.stderrTail) }),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
@@ -35002,7 +35036,7 @@ export class AgentFramework {
     connection.on('error', (err: Error) => {
       this.emitTrace({ type: 'mcpl:server-error', serverId: connection.id, error: recorded(err.message) });
     });
-    connection.on('close', () => {
+    connection.on('close', (info: { reason: string; code?: number | null; signal?: NodeJS.Signals | null; pipeFailed?: boolean }) => {
       // A closed provider's class hints are stale (RFC-008), as for MCPL,
       // and so is a listing already under way.
       this.noteMcplServerClosed(connection.id);
@@ -35010,8 +35044,9 @@ export class AgentFramework {
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
-        code: null,
-        signal: null,
+        code: info.code ?? null,
+        signal: info.signal ?? null,
+        reason: info.reason,
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
@@ -35031,6 +35066,13 @@ export class AgentFramework {
           // Gone for good: its tools leave the agents' list, as a
           // disconnect's do.
           this.handleToolsListChanged(connection.id);
+          // Lost on its own: nothing in this host connects it again on its
+          // own. A loss once stop() has begun is part of the close the host
+          // is making, and a child that ended as asked was stopped: neither
+          // gets an alert.
+          if (!this.stopHasBegun() && !endedAsAsked(info)) {
+            this.opsAlert('mcpl-down', connection.id, `MCP server closed${closeWords(info.reason, info.code, info.signal)}, and this host won't reconnect it on its own`);
+          }
         });
       }
     });

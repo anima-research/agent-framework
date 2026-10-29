@@ -79,6 +79,8 @@ export interface McplConnectionCloseInfo {
   /** True when `reason` is the peer's own text, a WebSocket server's close
    *  reason, rather than the transport's or the host's words. */
   reasonFromPeer?: boolean;
+  /** True when the stdio transport ended the child after a pipe error. */
+  pipeFailed?: boolean;
   /** True when the host closed the link (`close()` / `reconnectAfterFailure()`),
    *  false when the transport dropped unexpectedly. */
   byHost: boolean;
@@ -2801,6 +2803,7 @@ export class McplServerConnection extends EventEmitter {
           signal: info.signal ?? null,
           reason: info.reason ?? (byHost ? 'closed by host' : undefined),
           ...(info.reasonFromPeer ? { reasonFromPeer: true } : {}),
+          ...(info.pipeFailed ? { pipeFailed: true } : {}),
           byHost,
         };
         this.emit('close', closeInfo.code, closeInfo.signal, closeInfo);

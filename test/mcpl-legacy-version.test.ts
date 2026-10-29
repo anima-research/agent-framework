@@ -156,7 +156,7 @@ test('a version verdict at startup raises the ops alert at once, as on reconnect
   const alert = traces.find((t) => t.type === 'ops:alert') as { kind?: string; agentName?: string; message?: string } | undefined;
   assert.equal(alert?.kind, 'mcpl-down');
   assert.equal(alert?.agentName, 'legacy');
-  assert.match(alert?.message ?? '', /unreachable at startup: .*protocolVersion \(none\)/);
+  assert.match(alert?.message ?? '', /not connected at startup, and this host won't retry it on its own: .*protocolVersion \(none\)/);
 });
 
 test('tools/list follows nextCursor to the complete inventory', async () => {
@@ -307,14 +307,14 @@ async function startupTraces(dir: string, server: McplServerConfig): Promise<Tra
   return traces;
 }
 
-test('at startup, willRetry follows reconnect and the verdict, and only a verdict raises the alert', async () => {
+test('at startup, willRetry follows reconnect and the verdict, and every failure nothing will retry raises the alert', async () => {
   const cases: Array<[string, McplServerConfig, boolean, boolean]> = [
     // [label, config, willRetry, alert]
     ['verdict without reconnect', config('missing'), false, true],
     ['failure with reconnect', config('error', { reconnect: true }), true, false],
-    ['failure without reconnect', config('error'), false, false],
+    ['failure without reconnect', config('error'), false, true],
     // Refused before anything launches: nothing will retry it, reconnect or not.
-    ['configuration refused, with reconnect', { id: 'legacy', url: 'ftp://127.0.0.1/x', reconnect: true }, false, false],
+    ['configuration refused, with reconnect', { id: 'legacy', url: 'ftp://127.0.0.1/x', reconnect: true }, false, true],
   ];
   for (const [label, server, willRetry, alert] of cases) {
     const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
@@ -322,6 +322,6 @@ test('at startup, willRetry follows reconnect and the verdict, and only a verdic
     const traces = await startupTraces(dir, server);
     const failed = traces.find((t) => t.type === 'mcpl:server-connect-failed') as { willRetry?: boolean } | undefined;
     assert.equal(failed?.willRetry, willRetry, label);
-    assert.equal(traces.some((t) => t.type === 'ops:alert'), alert, `${label}: alert`);
+    assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'mcpl-down').length, alert ? 1 : 0, `${label}: alert`);
   }
 });

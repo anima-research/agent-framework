@@ -370,7 +370,7 @@ test("at startup, a server with reconnect whose first launch can't be reaped is 
     // disconnect retries its reap: the operator is told.
     assert.equal(failed.length, 1, id);
     assert.equal(failed[0]!.willRetry, false, id);
-    assert.ok(traces.some((t) => t.type === 'ops:alert' && t.kind === 'mcpl-down' && t.agentName === id), id);
+    assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'mcpl-down' && t.agentName === id).length, 1, id);
   }
 });
 
@@ -423,6 +423,7 @@ test(`modern, ${reconnect ? 'with' : 'without'} reconnect: a server lost on its 
     assert.equal(status(framework, 'm')?.connected, false, 'still registered, not connected');
     await assert.rejects(framework.connectMcplServer(modern('m', '', log)), /"m" is already registered \(not connected and not reconnecting/);
     assert.equal(launches(log).length, 1, 'nothing launched beside it');
+    assert.deepEqual(alerts.filter((alert) => alert === 'mcpl-down m'), ['mcpl-down m'], 'one alert');
 
     realKill('SIGKILL');
     await until(() => !alive(line.child.pid), 'the held child killed');
