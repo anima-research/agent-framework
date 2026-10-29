@@ -8,6 +8,7 @@ import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } fro
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
 
 class InputModule implements Module {
   readonly name = 'input';
@@ -160,12 +161,11 @@ test('dynamic conversation forks are excluded from provider cooldown ownership',
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
   const internal = framework as unknown as {
-    conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
     providerAccelerationCooldowns: Map<string, unknown>;
     providerGates: Map<string, unknown>;
     holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown): boolean;
   };
-  internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:test' });
+  bindAsConversationFork(framework, 'resident', { serverId: 'stub', channelId: 'world:test' });
   try {
     const error = new MembraneError({
       type: 'rate_limit', retryable: true, httpStatus: 429,

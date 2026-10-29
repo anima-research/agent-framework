@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, appendFileSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, conversationForkSpec } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { appendInTwoParts } from './helpers/command-file.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
@@ -223,15 +223,15 @@ describe('tune-out end to end', () => {
     const hooks = (i.tuneOutCoordinator as unknown as {
       hooks: { isForkBound(channel: { serverId: string; channelId: string }): boolean };
     }).hooks;
-    const homes = (framework as unknown as {
-      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
-    }).conversationAgentHomes;
-    homes.set('fork-elsewhere', { serverId: 'other', channelId: CHANNEL });
+    const registry = (framework as unknown as {
+      registry: { register(spec: ReturnType<typeof conversationForkSpec>): unknown; end(name: string, reason: string): unknown };
+    }).registry;
+    registry.register(conversationForkSpec('fork-elsewhere', { template: 'scout', homeChannel: { serverId: 'other', channelId: CHANNEL }, idleTtlMs: 60_000 }));
     try {
       assert.equal(hooks.isForkBound({ serverId: 'disc', channelId: CHANNEL }), false, "disc's channel isn't the fork's");
       assert.equal(hooks.isForkBound({ serverId: 'other', channelId: CHANNEL }), true);
     } finally {
-      homes.delete('fork-elsewhere');
+      registry.end('fork-elsewhere', 'stopped');
     }
   });
 });
