@@ -1001,6 +1001,25 @@ export class PushCoalescer<E = unknown> {
   }
 
   /**
+   * Render and materialize one subject's pending batch for `agentName` now,
+   * outside a turn's assembly: a batch whose wake a hold keeps back, stored
+   * as it renders (held, as a plain push under the hold is), so whoever reads
+   * held traffic sees it and the turn after the hold doesn't take it again.
+   * A batch that opened while another render ran is rendered once that
+   * render settles. Resolves whether it materialized.
+   */
+  async materializeNow(agentName: string, subject: string): Promise<boolean> {
+    for (;;) {
+      if (this.suspended) return false;
+      const started = await this.locked(() => this.freeze(subject, agentName));
+      if (!started || started === 'declined') return false;
+      await started.done;
+      this.persist();
+      if (!started.joined) return started.rendering.materialized === true;
+    }
+  }
+
+  /**
    * Under the lock: decide whether `subject`'s batch renders for `agentName`,
    * freeze it, make the render-start durable, re-check authority, and start
    * the RPC. Returns the render's completion, which an assembly that joins

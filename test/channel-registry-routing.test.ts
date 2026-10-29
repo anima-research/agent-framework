@@ -86,6 +86,9 @@ function makeRegistry(
       homeChannelResolver,
       activeChannelResolver,
       onChannelAutoOpened,
+      // These tests exercise the precedence home → active → global; the
+      // global fallback exists only under the legacy locus rule.
+      latestInboundLocus: true,
     },
   );
 
@@ -143,6 +146,19 @@ function seedRegistered(registry: ChannelRegistry, serverId: string, ...ids: str
   }
 }
 
+
+/**
+ * Ingest a message and record it as delivered — what the framework does
+ * after admission (the registry itself no longer sets the locus at
+ * ingestion; a held message is never noted).
+ */
+function deliver(registry: ChannelRegistry, channelId: string, text: string): void {
+  const message = incoming(channelId, text);
+  registry.handleIncoming('discord', message);
+  const m = message.messages[0]!;
+  registry.noteDelivered(discord(m.channelId), m.messageId);
+}
+
 test('handleIncoming REJECTS an unknown channel instead of minting it (§14.5)', async () => {
   const { registry, traces, lookup } = makeRegistry({ delivered: true });
 
@@ -162,7 +178,7 @@ test('handleIncoming REJECTS an unknown channel instead of minting it (§14.5)',
 test('routeSpeech surfaces a failure when the server reports delivered:false', async () => {
   const { registry, failures, traces } = makeRegistry({ delivered: false });
   seedRegistered(registry, 'discord', 'ch-x');
-  registry.handleIncoming('discord', incoming('ch-x', 'hi'));
+  deliver(registry, 'ch-x', 'hi');
 
   const res = await registry.routeSpeech('cairn', 'undeliverable reply', registry.resolveLocus('cairn'));
 
@@ -177,7 +193,7 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
 test('routeSpeech counts a publish reply that leaves delivered out as unconfirmed, not delivered', async () => {
   const { registry, failures } = makeRegistry({});
   seedRegistered(registry, 'discord', 'ch-x');
-  registry.handleIncoming('discord', incoming('ch-x', 'hi'));
+  deliver(registry, 'ch-x', 'hi');
 
   const res = await registry.routeSpeech('cairn', 'a reply', registry.resolveLocus('cairn'));
 
@@ -189,7 +205,7 @@ test('routeSpeech counts a publish reply that leaves delivered out as unconfirme
 test('routeSpeech reports each delivered publish as mcpl:speech-routed, with nothing that ties it to a stream or ends one', async () => {
   const { registry, traces } = makeRegistry({ delivered: true });
   seedRegistered(registry, 'discord', 'ch-x');
-  registry.handleIncoming('discord', incoming('ch-x', 'hi'));
+  deliver(registry, 'ch-x', 'hi');
 
   const before = traces.length;
   await registry.routeSpeech('cairn', 'first reply', registry.resolveLocus('cairn'));
@@ -219,9 +235,9 @@ test('routeSpeech routes a conversation fork to its HOME channel, not the global
   );
 
   seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  deliver(registry, 'chanA', 'hi from A');
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
+  deliver(registry, 'chanB', 'hi from B');
   // Global locus is now chanB.
   assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanB'));
 
@@ -240,9 +256,9 @@ test('routeSpeech falls back to the global locus for the trunk agent (no home)',
   );
 
   seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  deliver(registry, 'chanA', 'hi from A');
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
+  deliver(registry, 'chanB', 'hi from B');
 
   const res = await registry.routeSpeech('trunk', 'heartbeat reply', registry.resolveLocus('trunk'));
   assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: 'chanB' });
@@ -257,9 +273,9 @@ test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)',
   );
 
   seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  deliver(registry, 'chanA', 'hi from A');
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
+  deliver(registry, 'chanB', 'hi from B');
 
   // The fork is told chanA (where its speech actually lands)...
   const forkCtx = registry.buildChannelContext('conversation-chanA-g1', 'discord');
@@ -310,9 +326,9 @@ test('routeSpeech routes a TRUNK agent to its ACTIVE triggering channel, not the
   );
 
   seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'A: sleep && date'));
+  deliver(registry, 'chanA', 'A: sleep && date');
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'B: unrelated')); // flips global to chanB
+  deliver(registry, 'chanB', 'B: unrelated'); // flips global to chanB
   assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanB'));
 
   const res = await registry.routeSpeech('scout', 'the date is ...', registry.resolveLocus('scout'));
@@ -330,9 +346,9 @@ test('routeSpeech precedence: fork HOME wins over the active triggering channel'
     () => discord('chanB'),
   );
   seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi'));
+  deliver(registry, 'chanA', 'hi');
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi'));
+  deliver(registry, 'chanB', 'hi');
 
   const res = await registry.routeSpeech('conversation-chanA-g1', 'reply', registry.resolveLocus('conversation-chanA-g1'));
   assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: 'chanA' });
@@ -347,9 +363,9 @@ test('buildChannelContext advertises the active triggering channel as defaultOut
     (n) => active[n],
   );
   seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  deliver(registry, 'chanA', 'hi from A');
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi from B')); // global → chanB
+  deliver(registry, 'chanB', 'hi from B'); // global → chanB
 
   // The trunk is TOLD chanA (where its speech will actually land), matching
   // what routeSpeech resolves — not the global chanB.
@@ -414,7 +430,7 @@ test('routeSpeech into a closed locus opens the channel first, then delivers', a
 
   // A DM-shaped situation: the channel is registered but closed.
   seedRegistered(registry, 'discord', 'dm-alice');
-  registry.handleIncoming('discord', incoming('dm-alice', 'hello?'));
+  deliver(registry, 'dm-alice', 'hello?');
   lookup('dm-alice')!.open = false;
 
   const res = await registry.routeSpeech('sol', 'a reply meant for the DM', discord('dm-alice'));
@@ -432,7 +448,7 @@ test('routeSpeech does NOT deliver when the open-on-delivery fails', async () =>
   const { registry, failures, publishCalls, lookup, setFailOpens } = makeRegistry({ delivered: true });
 
   seedRegistered(registry, 'discord', 'dm-alice');
-  registry.handleIncoming('discord', incoming('dm-alice', 'hello?'));
+  deliver(registry, 'dm-alice', 'hello?');
   lookup('dm-alice')!.open = false;
   const publishesBefore = publishCalls.length;
   setFailOpens(true);
@@ -543,7 +559,7 @@ test("speech opens a channel a machine closed, and the agent's own close of it t
 test('routeSpeech with an omitted locus fails loudly as a routing bug', async () => {
   const { registry, failures, traces } = makeRegistry({ delivered: true });
   seedRegistered(registry, 'discord', 'ch-y');
-  registry.handleIncoming('discord', incoming('ch-y', 'hi'));
+  deliver(registry, 'ch-y', 'hi');
 
   const res = await (registry.routeSpeech as unknown as (
     c: string, t: string) => Promise<unknown>)('cairn', 'who knows where');
@@ -1004,7 +1020,7 @@ test('opened-by-delivery is announced to the delivering agent', async () => {
   const { registry, lookup } = makeRegistry({ delivered: true }, undefined, undefined, (info) => autoOpened.push(info));
 
   seedRegistered(registry, 'discord', 'dm-alice');
-  registry.handleIncoming('discord', incoming('dm-alice', 'hello?'));
+  deliver(registry, 'dm-alice', 'hello?');
   lookup('dm-alice')!.open = false;
 
   await registry.routeSpeech('sol', 'reply', discord('dm-alice'));
@@ -1080,10 +1096,15 @@ test('non-conversational markers do not retarget the default publish locus (#157
     setDesiredState(s: string, c: string, d: 'open' | 'closed', src: string): void;
   }).setDesiredState('discord', 'chanB', 'open', 'agent-tool');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A', undefined, undefined, 'thread-A'));
+  registry.noteDelivered(discord('chanA'), 'm1', 'thread-A');
 
+  // The framework records every delivered message through noteDelivered,
+  // tags and the coalescer's first-view mark included; the rule is the
+  // registry's (isMarkerTagged), so it is exercised here as the framework calls it.
   for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted', 'chat:system']) {
     lookup('chanB')!.open = false;
     registry.handleIncoming('discord', incoming('chanB', `[${tag}] marker`, undefined, [tag]));
+    registry.noteDelivered(discord('chanB'), 'marker-chanB', undefined, [tag]);
     assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
       `a ${tag} marker on chanB must not steal the default publish locus`);
     const anchor = registry.buildChannelContext(undefined, 'discord')?.incoming;
@@ -1095,6 +1116,7 @@ test('non-conversational markers do not retarget the default publish locus (#157
     assert.equal(lookup('chanB')?.open, true, `a ${tag} marker still repairs chanB's open state`);
     // On the anchor's own channel, a marker leaves the anchor too.
     registry.handleIncoming('discord', incoming('chanA', `[${tag}] marker on A`, undefined, [tag]));
+    registry.noteDelivered(discord('chanA'), 'marker-chanA', undefined, [tag]);
     const sameChannel = registry.buildChannelContext(undefined, 'discord')?.incoming;
     assert.equal(sameChannel?.messageId, 'm1', `a ${tag} marker on the anchor's channel leaves its message`);
     assert.equal(sameChannel?.threadId, 'thread-A', `a ${tag} marker on the anchor's channel leaves its thread`);
@@ -1104,6 +1126,7 @@ test('non-conversational markers do not retarget the default publish locus (#157
   const real = incoming('chanB', 'real message on B', undefined, undefined, 'thread-B');
   real.messages[0]!.messageId = 'm2';
   registry.handleIncoming('discord', real);
+  registry.noteDelivered(discord('chanB'), 'm2', 'thread-B');
   assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanB'));
   const after = registry.buildChannelContext(undefined, 'discord')?.incoming;
   assert.equal(after?.messageId, 'm2', 'a real message becomes the reply anchor');
@@ -1112,6 +1135,7 @@ test('non-conversational markers do not retarget the default publish locus (#157
   const unthreaded = incoming('chanA', 'real message on A, no thread');
   unthreaded.messages[0]!.messageId = 'm3';
   registry.handleIncoming('discord', unthreaded);
+  registry.noteDelivered(discord('chanA'), 'm3');
   const last = registry.buildChannelContext(undefined, 'discord')?.incoming;
   assert.equal(last?.messageId, 'm3', 'a real message with no thread becomes the reply anchor');
   assert.equal(last?.threadId, undefined, 'and takes no thread from the one before it');
@@ -1120,11 +1144,19 @@ test('non-conversational markers do not retarget the default publish locus (#157
 test('a chat:system notice leaves the default publish locus where the conversation is, ambient or addressed by its place (RFC-001 rev 3)', async () => {
   // The weather line that took a resident's DM reply into a world: tagged
   // as overheard chatter, it became the most recent inbound message.
+  // On this branch the latest delivered inbound is recorded at admission
+  // (noteDelivered, with the message's tags), not at ingestion, so each
+  // message is delivered here as the framework delivers it.
+  const deliver = (message: ReturnType<typeof incoming>): void => {
+    registry.handleIncoming('discord', message);
+    const m = message.messages[0]!;
+    registry.noteDelivered(discord(m.channelId), m.messageId, m.threadId, m.tags);
+  };
   const { registry } = makeRegistry(undefined);
   seedRegistered(registry, 'discord', 'chanA');
   seedRegistered(registry, 'discord', 'world');
-  registry.handleIncoming('discord', incoming('chanA', 'the conversation'));
-  registry.handleIncoming('discord', incoming('world', '* world weather: clear (forecast)', undefined,
+  deliver(incoming('chanA', 'the conversation'));
+  deliver(incoming('world', '* world weather: clear (forecast)', undefined,
     ['chat:ambient', 'chat:system', 'eidoverse:weather']));
   assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
     'the forecast must not become where unaddressed speech goes');
@@ -1133,7 +1165,7 @@ test('a chat:system notice leaves the default publish locus where the conversati
   seedRegistered(registry, 'discord', 'dm');
   const pin = incoming('dm', '[pinned a message]', undefined, ['chat:dm', 'chat:system']);
   pin.messages[0]!.messageId = 'm-pin';
-  registry.handleIncoming('discord', pin);
+  deliver(pin);
   assert.deepEqual(registry.getDefaultPublishChannel(), discord('chanA'),
     'a notice in a DM steers nothing either');
 });
@@ -1141,7 +1173,10 @@ test('a chat:system notice leaves the default publish locus where the conversati
 test('a marker on a NEVER-conversed channel leaves the locus null, not marker-anchored (#157)', async () => {
   const { registry } = makeRegistry(undefined);
   seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', '[edited] marker', undefined, ['chat:edited']));
+  const marker = incoming('chanB', '[edited] marker', undefined, ['chat:edited']);
+  registry.handleIncoming('discord', marker);
+  // Recorded at admission (noteDelivered), with the marker's tags.
+  registry.noteDelivered(discord('chanB'), marker.messages[0]!.messageId, undefined, marker.messages[0]!.tags);
   assert.equal(registry.getDefaultPublishChannel(), null,
     'an edit marker alone must not establish a publish locus');
   assert.equal(registry.buildChannelContext(undefined, 'discord')?.incoming, undefined,

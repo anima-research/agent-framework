@@ -5,11 +5,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AnthropicAdapter, Membrane, MembraneError, NativeFormatter } from '@animalabs/membrane';
-import { CompressionWithdrawn } from '@animalabs/context-manager';
+import { CompressionWithdrawn, ContextManager } from '@animalabs/context-manager';
 import { JsStore } from '@animalabs/chronicle';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
-import { Agent, AgentFramework, AutobiographicalStrategy, PassthroughStrategy } from '../src/index.js';
+import { Agent, AgentFramework, AutobiographicalStrategy, PassthroughStrategy, taskForkSpec } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+
+const supported =
+  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
+  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
+const skip = supported
+  ? false
+  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 class CompressionMembrane extends MockMembrane {
   readonly compressions: number[] = [];
@@ -227,6 +234,71 @@ describe('a context manager the framework is done with makes no further provider
       await assert.rejects(contextManager.resetHeadWindow(), (error: unknown) => error instanceof CompressionWithdrawn,
         'a reset with no text is withdrawn');
       assert.equal(membrane.compressions.length, sent, 'and reached no provider');
+      assert.deepEqual(drainLines(errors.lines), []);
+    } finally {
+      errors.restore();
+      await settle(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a shared-inheritance run that has ended, with compression still queued (the derived manager is on the run\'s membrane)', { timeout: 60_000, skip }, async () => {
+    const membrane = new CompressionMembrane(200);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const { dir, framework } = await setup('af-done-shared-', membrane, { agents: true });
+    const errors = captureErrors();
+    try {
+      // The parent's slot carries the backlog; the child inherits it shared, on
+      // its own branch, with a draining strategy, so compression queues on the
+      // derived manager (which, before the tenth round, was on the framework's
+      // membrane and so outlived the run's release).
+      addBacklog(framework.getAgent('trunk')!.getContextManager(), 30);
+      const { agent, contextManager } = await framework.createEphemeralAgent(
+        { name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: drainingStrategy() },
+        taskForkSpec('worker', { parent: 'trunk', inherit: { mode: 'shared' } }),
+      );
+      contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      await until(() => membrane.compressions.length >= 1);
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
+      framework.start();
+      await run;
+      const sent = membrane.compressions.length;
+      await sleep(1_000);
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the run ended');
+      await assert.rejects(contextManager.resetHeadWindow(), (error: unknown) => error instanceof CompressionWithdrawn,
+        'a reset with no text is withdrawn');
+      assert.equal(membrane.compressions.length, sent, 'and reached no provider');
+      assert.deepEqual(drainLines(errors.lines), []);
+    } finally {
+      errors.restore();
+      await settle(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a resumed job after cleanup(): the call its manager has out is aborted, and it makes no call', { timeout: 60_000 }, async () => {
+    const membrane = new CompressionMembrane(100);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const { dir, framework } = await setup('af-done-resumed-', membrane);
+    const errors = captureErrors();
+    try {
+      const first = await framework.createEphemeralAgent({ name: 'job', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      first.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const run = framework.runEphemeralToCompletion(first.agent, first.contextManager);
+      framework.start();
+      await run;
+      const resumed = await framework.resumeAgent('job', {
+        model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: drainingStrategy(),
+      });
+      addBacklog(resumed.contextManager, 30);
+      await until(() => membrane.compressions.length >= 1 && membrane.inFlight > 0);
+      resumed.cleanup();
+      const sent = membrane.compressions.length;
+      await sleep(800);
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after cleanup()');
+      assert.ok(membrane.aborted.length >= 1, 'the call it had out was aborted');
       assert.deepEqual(drainLines(errors.lines), []);
     } finally {
       errors.restore();
@@ -670,7 +742,7 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
     }
   });
 
-  it("a start() after a stop() that closed the managers and then failed to close its owned store is refused", { timeout: 60_000 }, async () => {
+  it("a start() after a stop() that closed the managers and then failed to close its owned store is refused as after any failed stop()", { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(50);
     const { dir, framework } = await setup('af-done-store-fails-', membrane, { agents: true });
     const store = framework.getStore();
@@ -680,7 +752,7 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
       store.close = () => { throw new Error('injected store close failure'); };
       await assert.rejects(framework.stop(), /injected store close failure/);
       assert.equal(framework.getAgent('trunk')!.getContextManager().isClosed(), true, "the resident's manager is closed");
-      assert.throws(() => framework.start(), /closed its context managers/);
+      assert.throws(() => framework.start(), /^Error: start\(\) refused: this framework's stop\(\) failed, and a stopped framework doesn't start again\. .*Call stop\(\) again/);
     } finally {
       store.close = closeStore;
       if (!store.isClosed()) closeStore();
@@ -688,7 +760,7 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
     }
   });
 
-  it("a start() after a stop() that had no manager to close and failed to close its owned store isn't refused for its managers", { timeout: 60_000 }, async () => {
+  it("a stop() after one that had no manager to close and failed to close its owned store closes it", { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(50);
     const { dir, framework } = await setup('af-done-store-fails-none-', membrane);
     const store = framework.getStore();
@@ -698,7 +770,6 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
       store.close = () => { throw new Error('injected store close failure'); };
       await assert.rejects(framework.stop(), /injected store close failure/);
       store.close = closeStore;
-      framework.start();
       await framework.stop();
       assert.equal(store.isClosed(), true, 'the second stop() closed the store');
     } finally {

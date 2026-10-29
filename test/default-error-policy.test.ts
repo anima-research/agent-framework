@@ -41,8 +41,8 @@ describe('DefaultErrorPolicy on membrane\'s schedules', () => {
     assert.deepEqual(delays(policy, err({ type: 'server', retryable: true, httpStatus: 502 })), [1000, 2000]);
   });
 
-  it('retries a stream deadline as a retryable failure, as before membrane 0.7, where membrane gives it none', () => {
-    assert.deepEqual(delays(policy, err({ type: 'timeout', retryable: true, message: 'SSE stream idle timeout' })), [1000, 2000]);
+  it('retries a timeout membrane doesn\'t mark as a deadline, such as an HTTP 408, on the base schedule', () => {
+    assert.deepEqual(delays(policy, err({ type: 'timeout', retryable: true, httpStatus: 408, message: 'Request Timeout' })), [1000, 2000]);
   });
 
   it('retries a rate limit with no stated wait at least five tries', () => {

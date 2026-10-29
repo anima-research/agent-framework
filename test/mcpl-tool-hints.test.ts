@@ -11,7 +11,7 @@ import type { McplServerConfig } from '../src/mcpl/types.js';
 import { serverConfigProblems } from '../src/mcpl/protocol-family.js';
 import { assertServerConfigBooleans } from '../src/mcpl/transport.js';
 import { ToolPresence } from '../src/mcpl/tool-presence.js';
-import { firstSentence } from '../src/mcpl/tool-signature.js';
+import { firstSentence, objectSignature } from '../src/mcpl/tool-signature.js';
 import { META_TOOL_NAMES, ToolsetHub } from '../src/mcpl/toolset-host.js';
 import { ToolsetsModule, resolveAct } from '../src/mcpl/toolsets-module.js';
 import {
@@ -102,6 +102,11 @@ const present = (tools: Json[], name: string, presence: 'static' | 'dynamic') =>
 const look = async (fw: Awaited<ReturnType<typeof setup>>['fw'], input: Json = { server: 'arc' }) => resultText(await callTool(fw.framework, 'toolsets--look', input));
 const push = (peer: ScriptedPeer, eventId: string, text: string, extra: Json = {}) => peer.request('push/event', {
   featureSet: 'arc.events', eventId, timestamp: new Date().toISOString(), payload: { content: [{ type: 'text', text }] }, ...extra,
+});
+
+test("a toolset's options read as an object of its parameters, as the listing's docs show them", () => {
+  assert.equal(objectSignature({ type: 'object', properties: { size: { type: 'integer', enum: [9, 13, 19], default: 9 } } }), '{size?: 9|13|19 =9}');
+  assert.equal(objectSignature({ type: 'object', properties: {} }), '{}');
 });
 
 test('toolHints off: the advertisement, tool list and traffic are as before', async () => {

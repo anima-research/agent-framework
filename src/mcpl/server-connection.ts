@@ -79,6 +79,8 @@ export interface McplConnectionCloseInfo {
   /** True when `reason` is the peer's own text, a WebSocket server's close
    *  reason, rather than the transport's or the host's words. */
   reasonFromPeer?: boolean;
+  /** True when the stdio transport ended the child after a pipe error. */
+  pipeFailed?: boolean;
   /** True when the host closed the link (`close()` / `reconnectAfterFailure()`),
    *  false when the transport dropped unexpectedly. */
   byHost: boolean;
@@ -724,6 +726,20 @@ export class McplServerConnection extends EventEmitter {
    *  after a protocol-version verdict, and while a launch is unreaped. */
   get willReconnect(): boolean {
     return this.reconnectEnabled;
+  }
+
+  /**
+   * Stop reconnecting, closing nothing: a retry already scheduled starts
+   * nothing when its timer fires, none is scheduled after, and an attempt
+   * under way is aborted, as close() aborts it, so one still waiting on its
+   * access provider never dials and a child it spawned is reaped. The host's
+   * stop() does this first, so nothing is launched or dialed while it shuts
+   * down; close() clears the timer.
+   * @internal For the framework's stop(); not a host API.
+   */
+  stopReconnecting(): void {
+    this.reconnectEnabled = false;
+    this.reconnecting?.abort.abort();
   }
 
   /** Whether a child this connection launched couldn't be confirmed exited.
@@ -2787,6 +2803,7 @@ export class McplServerConnection extends EventEmitter {
           signal: info.signal ?? null,
           reason: info.reason ?? (byHost ? 'closed by host' : undefined),
           ...(info.reasonFromPeer ? { reasonFromPeer: true } : {}),
+          ...(info.pipeFailed ? { pipeFailed: true } : {}),
           byHost,
         };
         this.emit('close', closeInfo.code, closeInfo.signal, closeInfo);

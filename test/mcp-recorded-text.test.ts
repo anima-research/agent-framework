@@ -400,7 +400,7 @@ test("the startup alert for a server with no common protocol revision carries th
     });
     const alert = traces.find(e => e.type === 'ops:alert');
     assert.ok(alert, JSON.stringify(traces.map(e => e.type)));
-    assert.match(String(alert!.message), /MCPL server unreachable at startup: .*refused at \/api\/mcp\/s\/redacted\/mcp/);
+    assert.match(String(alert!.message), /MCPL server not connected at startup, and this host won't retry it on its own: .*refused at \/api\/mcp\/s\/redacted\/mcp/);
     assert.ok(!JSON.stringify(traces).includes(secret));
   } finally {
     await framework?.stop();

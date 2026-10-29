@@ -147,7 +147,8 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
   framework.agents = new Map([['sol', agentStub()]]);
   // Conversation agents by their home channel, and ephemeral runs by name;
   // sol is neither.
-  framework.conversationAgentHomes = new Map();
+  // The Dendrite registry, where a conversation agent's home is kept; sol has none.
+  framework.registry = { homes: new Map<string, { serverId: string; channelId: string }>(), homeChannel(name: string) { return this.homes.get(name); }, list: () => [] };
   framework.ephemeralRuns = new Map();
   const windowMessages: string[] = [];
   /** Whose window each of those was addressed to: addMessage's forAgent, or
@@ -626,7 +627,7 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   assert.ok((await reply()).data.endsWith('until the tune-out ends. To stop this note, set closed_channel_note to false with agent_settings.'));
   framework.agents.set('sol', agentStub());
   // A conversation agent gets none.
-  framework.conversationAgentHomes.set('sol', channelId);
+  framework.registry.homes.set('sol', { serverId: 'discord', channelId });
   assert.ok(!(await reply()).data.includes('[tuned out]'));
 });
 
@@ -934,7 +935,7 @@ test("a sleep announced into a channel the agent or a module closed says the age
 test('a conversation agent gets no note on its send: channel_open is refused to it', async () => {
   const { registry, framework, reply, windowMessages } = await harness();
   assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
-  framework.conversationAgentHomes.set('sol', channelId);
+  framework.registry.homes.set('sol', { serverId: 'discord', channelId });
   const { success, data } = await reply();
   assert.equal(success, true);
   assert.ok(!data.includes('[closed channel]'), data);

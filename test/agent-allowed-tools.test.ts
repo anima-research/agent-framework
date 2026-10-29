@@ -303,6 +303,22 @@ function asXmlTurn(membrane: MockMembrane, call: { type: 'tool_use'; id: string;
 }
 
 for (const fallback of [false, true]) {
+  test(`${fallback ? 'fallback' : 'native'}: a skip_reply refused at dispatch silences nothing after its round, as one allowedTools refuses`, async () => {
+    const h = await harness({ allowedTools: ['skip_reply'], denyToolsAtDispatch: ['skip_reply'], sameRoundThinkTextPolicy: 'private' });
+    try {
+      const routed = captureRouting(h.framework);
+      const call = { type: 'tool_use' as const, id: 'disposition', name: 'skip_reply', input: { reason: 'test' } };
+      if (fallback) asXmlTurn(h.membrane, call);
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      await h.framework.runUntilIdle();
+      assert.ok(routed.includes('Public trailing prose'), 'a refused call silences nothing after its round');
+    } finally { await h.close(); }
+  });
+}
+
+for (const fallback of [false, true]) {
   for (const name of ['skip_reply', 'think', 'channel_publish']) {
     for (const permitted of [false, true]) {
       test(`${fallback ? 'fallback' : 'native'} prose disposition ${permitted ? 'honors permitted' : 'of a refused'} ${name}`, async () => {
@@ -773,4 +789,33 @@ test('never-run and retired ephemerals report missing registration, not allowlis
     assert.equal(h.framework.getAgent(created.agent.name), null);
     await check(); created.cleanup();
   } finally { await h.close(); }
+});
+
+test('a call denied at dispatch is refused, so a script is told it never ran', async () => {
+  const h = await harness({ denyToolsAtDispatch: ['probe--denied'] });
+  try {
+    const pending = scriptCall(h.framework, 'assistant', 'probe--denied', {});
+    await h.framework.runUntilIdle();
+    const answer = await pending;
+    assert.equal(answer.refused, true);
+    assert.match(answer.refused ? answer.message : '', /probe--denied is not available to assistant/);
+    assert.equal(h.effects.length, 0);
+  } finally { await h.close(); }
+});
+
+test("a resident's call of its reader's tool is refused, so a script is told it never ran", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-allowed-tools-reader-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test', systemPrompt: 'Test' }],
+    modules: [], syncIntervalMs: 0, codeExecution: { enabled: true },
+    subconscious: { enabled: true, reader: 'forks', model: 'test', voice: 'Read for scout.' },
+  });
+  try {
+    const pending = scriptCall(framework, 'scout', 'deliver_summary', { text: 'me?', channelId: 'somewhere' });
+    await framework.runUntilIdle();
+    const answer = await pending;
+    assert.equal(answer.refused, true);
+    assert.match(answer.refused ? answer.message : '', /available to the resident's reader, not to scout/);
+  } finally { await framework.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

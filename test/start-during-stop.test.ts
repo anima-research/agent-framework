@@ -4,10 +4,9 @@
  * the new lifecycle's loop, for good with no budget, or let the stop tear
  * down modules and an owned store under a loop that no later stop() could
  * end; a module added after the stop took its list of modules stayed started
- * past it. Once the stop has settled, this refusal no longer fires: what a
- * start() after a settled stop() should do is #315's question, and the last
- * test leaves it open. Each test waits on the event it needs (a module's
- * stop() being called), not on a fixed delay.
+ * past it. Once the stop has settled, both stay refused, with another text
+ * (stop-ends-its-instance.test.ts). Each test waits on the event it needs (a
+ * module's stop() being called), not on a fixed delay.
  */
 
 import { test } from 'node:test';
@@ -15,11 +14,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, type Module } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
-
-const STOPPING = /^(start|addModule)\(\) refused: the framework is stopping$/;
 
 type Internals = { running: boolean; loopPromise: Promise<void> | null; moduleRegistry: { modules: Map<string, Module> } };
 
@@ -47,11 +43,10 @@ function slowToStop() {
   return { called, release, module: module('slow', { stop: async () => { called.resolve(); await release.promise; } }) };
 }
 
-async function fixture(t: import('node:test').TestContext, modules: Module[] = [], borrowStore = false) {
+async function fixture(t: import('node:test').TestContext, modules: Module[] = []) {
   const dir = mkdtempSync(join(tmpdir(), 'start-during-stop-'));
-  const store = borrowStore ? JsStore.openOrCreate({ path: join(dir, 'store') }) : undefined;
   const framework = await AgentFramework.create({
-    ...(store ? { store } : { storePath: join(dir, 'store') }),
+    storePath: join(dir, 'store'),
     membrane: new MockMembrane().asMembrane(),
     agents: [], modules, syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
@@ -82,20 +77,27 @@ test('a start() made right after stop() is refused, and that stop settles with i
   assert.equal(internals.loopPromise, loop, 'no second loop was started');
 });
 
-test("a start() made in stop()'s first synchronous steps is refused too", { timeout: 30_000 }, async (t) => {
+test("a start() or addModule() made in stop()'s first synchronous steps is refused too", { timeout: 30_000 }, async (t) => {
   // stop() claims its attempt, then runs steps that can emit traces, the push
   // coalescer's suspend() first, before it clears running. A stand-in for the
-  // coalescer calls start() there, as a trace listener could.
+  // coalescer calls start() and addModule() there, as a trace listener could.
   const { framework, internals } = await fixture(t);
   framework.start();
   let refusal: unknown = 'start() was never called';
+  let adding: Promise<unknown> | undefined;
+  const started: string[] = [];
   (framework as unknown as { pushCoalescer: { suspend(): void } }).pushCoalescer = {
     suspend: () => {
       try { framework.start(); refusal = 'start() returned'; } catch (error) { refusal = error; }
+      adding = framework.addModule(module('late', { start: async () => { started.push('late'); } }))
+        .then(() => 'addModule() resolved', (error: unknown) => error);
     },
   };
   await framework.stop();
   assert.ok(refusal instanceof Error && refusal.message === 'start() refused: the framework is stopping', String(refusal));
+  const addRefusal = await adding;
+  assert.ok(addRefusal instanceof Error && addRefusal.message === 'addModule() refused: the framework is stopping', String(addRefusal));
+  assert.deepEqual(started, []);
   assert.equal(internals.running, false);
 });
 
@@ -147,19 +149,4 @@ test("an addModule() made while a module's stop() runs is refused, and its modul
   await stopping;
   assert.deepEqual(started, []);
   assert.equal(internals.moduleRegistry.modules.has('late'), false);
-});
-
-test('once a stop() has settled, the stopping refusal no longer fires', { timeout: 30_000 }, async (t) => {
-  // A store the framework doesn't own, so its close doesn't refuse first.
-  // Only the stopping refusal is asserted: whether start() and addModule()
-  // then begin a working lifecycle is #315's.
-  const { framework } = await fixture(t, [], true);
-  framework.start();
-  await framework.stop();
-  const refusal = (run: () => unknown): unknown => { try { run(); return null; } catch (error) { return error; } };
-  const afterStart = refusal(() => framework.start());
-  assert.ok(!(afterStart instanceof Error && STOPPING.test(afterStart.message)), String(afterStart));
-  await framework.stop().catch(() => {});
-  const added = await framework.addModule(module('after')).then(() => null, (error: unknown) => error);
-  assert.ok(!(added instanceof Error && STOPPING.test(added.message)), String(added));
 });

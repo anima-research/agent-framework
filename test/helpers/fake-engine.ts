@@ -6,10 +6,11 @@
  * is cooperative: a guest that spins calls `__tick()` in its loop, which asks
  * `interrupt()` as the real engine's handler would. `__crash()` ends the
  * child's process, as a crash would, and `__exists(path)` lets a test hold a
- * computing guest until it makes a file.
+ * computing guest until it makes a file. `__crash(text)` writes `text` to
+ * the process's stderr first, as a crashing runtime's last words.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, writeSync } from 'node:fs';
 import vm from 'node:vm';
 import type { Engine, EngineSlots, RunState } from '../../src/code-execution/engine.js';
 import type { LoadEngine } from '../../src/code-execution/isolate/child.js';
@@ -23,7 +24,7 @@ globalThis.__host = (name, json) => {
 };
 globalThis.__output = (stream, text) => __outputCall(stream, text);
 globalThis.__tick = () => { if (__interruptCall()) throw new Error('interrupted'); };
-globalThis.__crash = () => __crashCall();
+globalThis.__crash = (lastWords) => __crashCall(lastWords);
 globalThis.__exists = (path) => __existsCall(path);
 globalThis.__settle = (id, ok, json) => {
   const entry = __pending.get(id);
@@ -53,7 +54,10 @@ export const loadFakeEngine: LoadEngine = async (_limits, slots: EngineSlots): P
         return interrupted;
       },
       // The child's process ending mid-script, as a crash of the real engine would.
-      __crashCall: () => process.exit(7),
+      __crashCall: (lastWords?: unknown) => {
+        if (lastWords !== undefined) writeSync(2, String(lastWords));
+        process.exit(7);
+      },
       // Whether a file exists, so a test can hold a computing guest until it says so.
       __existsCall: (path: string) => existsSync(String(path)),
     },

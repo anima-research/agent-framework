@@ -15,6 +15,54 @@ const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
 const GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 const sha = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 
+/**
+ * Whether storing a blob's bytes again replaces a file for them the store
+ * can't read: one torn as Env.damage tears it, cut short by six bytes while
+ * the store is closed, so no cache of an open store answers for it. Both
+ * chronicles these tests run against are legitimate, and they differ here.
+ * Released @animalabs/chronicle 0.4.0 takes any file already at the hash's
+ * path as stored, so the bad file stays: a read answered from disk's matching
+ * copy tells 'workspace-contents-unstored', and each read does so again.
+ * Chronicle main's storeBlob, since the #60 series (stage each blob and rename
+ * it into place), reads a file already there back and rewrites it where it
+ * can't be read or holds other bytes, so storing disk's copy takes: the read
+ * tells 'workspace-contents-restored' once, and the store answers the reads
+ * after it. As the workspace module does, the probe judges by reading the
+ * bytes back, not by what storeBlob returns.
+ */
+function probeRewritesTornBlob(): boolean {
+  const root = mkdtempSync(join(tmpdir(), 'af-ws-lost-probe-'));
+  const storePath = join(root, 'probe.chronicle');
+  const bytes = Buffer.from('a blob the probe tears\n');
+  try {
+    let store = JsStore.openOrCreate({ path: storePath });
+    const hash = store.storeBlob(bytes, 'application/octet-stream');
+    store.close();
+    const file = join(storePath, 'blobs', hash.slice(0, 2), hash);
+    writeFileSync(file, readFileSync(file).subarray(0, -6));
+    store = JsStore.openOrCreate({ path: storePath });
+    try {
+      assert.throws(() => store.getBlob(hash), 'the probe tears its blob as Env.damage does');
+      try {
+        store.storeBlob(bytes, 'application/octet-stream');
+      } catch {
+        // A store that refuses them hasn't taken them, as the module reads it.
+      }
+      try {
+        return store.getBlob(hash)?.equals(bytes) ?? false;
+      } catch {
+        return false;
+      }
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const rewritesTornBlob = probeRewritesTornBlob();
+
 type Alert = { kind: string; agent: string; message: string; data?: Record<string, unknown> };
 
 class Env {
@@ -682,10 +730,21 @@ describe("contents whose blob file the store can't read", () => {
     const found = await ok(m, 'grep', { pattern: 'needle' });
     assert.deepEqual(found.results.map((r: { file: string }) => r.file), ['work/a.txt', 'work/b.txt']);
     assert.equal(await textOf(m, 'work/a.txt'), 'needle a\n');
-    assert.deepEqual(env.kinds(), ['workspace-contents-unstored', 'workspace-contents-unstored']);
     assert.equal(typeof env.alerts[0]!.data!.storeError, 'string');
-    assert.match(env.alerts[0]!.message, /unreadable in the workspace's store .*reads are answered from it, but storing it again didn't take: the store can't read its file for them/);
     assert.equal(env.alerts[0]!.data!.blobHash, a);
+    if (rewritesTornBlob) {
+      // grep's read stored disk's copy in place of the bad file, so the read
+      // after it is answered from the store, and nothing more is told.
+      assert.deepEqual(env.kinds(), ['workspace-contents-restored']);
+      assert.match(env.alerts[0]!.message, /^Blob [0-9a-f]+: the saved contents of work\/a\.txt were unreadable in the workspace's store \(.+\), and were stored again from disk's copy, whose bytes have their hash\.$/);
+      assert.equal(env.storedText(a), 'needle a\n');
+    } else {
+      // The store kept the bad file, so grep and the read are each answered
+      // from disk, and each tells it.
+      assert.deepEqual(env.kinds(), ['workspace-contents-unstored', 'workspace-contents-unstored']);
+      assert.match(env.alerts[0]!.message, /unreadable in the workspace's store .*reads are answered from it, but storing it again didn't take: the store can't read its file for them/);
+      assert.throws(() => env.store.getBlob(a));
+    }
   });
 
   test("with other contents on disk, read says so, and a sync takes disk's copy in their place", async (t) => {
@@ -735,7 +794,20 @@ describe("contents whose blob file the store can't read", () => {
           assert.equal(await textOf(m, 'work/a.txt'), 'the same NEEDLE\n');
           assert.equal(await textOf(m, 'work/b.txt'), 'the same NEEDLE\n');
         }
-        assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [['workspace-contents-unstored', `work/${restoring}`]], `${tool}, ${unrestorable} first`);
+        if (rewritesTornBlob) {
+          // The restoring file's copy was stored in place of the bad file, so
+          // the store answers either file from now on, telling nothing more,
+          // even the one whose disk copy holds other contents.
+          assert.equal(env.storedText(hash), 'the same needle\n');
+          if (tool === 'grep') {
+            assert.equal(await textOf(m, 'work/a.txt'), 'the same needle\n');
+            assert.equal(await textOf(m, 'work/b.txt'), 'the same needle\n');
+          }
+        } else {
+          assert.throws(() => env.store.getBlob(hash));
+        }
+        const told = rewritesTornBlob ? 'workspace-contents-restored' : 'workspace-contents-unstored';
+        assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [[told, `work/${restoring}`]], `${tool}, ${unrestorable} first`);
       }
     }
   });
@@ -760,7 +832,19 @@ describe("contents whose blob file the store can't read", () => {
         });
         assert.equal(await textOf(m, 'work/b.txt'), 'the same NEEDLE\n');
       }
-      assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [['workspace-contents-unstored', 'work/a.txt']], tool);
+      if (rewritesTornBlob) {
+        // The first file's copy was stored in place of the bad file, so the
+        // store answers both from now on, telling nothing more.
+        assert.equal(env.storedText(hash), 'the same needle\n');
+        if (tool === 'grep') {
+          assert.equal(await textOf(m, 'work/a.txt'), 'the same needle\n');
+          assert.equal(await textOf(m, 'work/b.txt'), 'the same needle\n');
+        }
+      } else {
+        assert.throws(() => env.store.getBlob(hash));
+      }
+      const told = rewritesTornBlob ? 'workspace-contents-restored' : 'workspace-contents-unstored';
+      assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]), [[told, 'work/a.txt']], tool);
     }
   });
 
@@ -775,7 +859,17 @@ describe("contents whose blob file the store can't read", () => {
     await ok(m, 'edit_many', { edits: [{ path: 'work/b.txt', oldString: 'beta', newString: 'BETA' }] });
     await ok(m, 'materialize', { path: 'work' });
     assert.deepEqual([env.readDisk('a.txt'), env.readDisk('b.txt')], ['ALPHA\n', 'BETA\n']);
-    assert.deepEqual(env.kinds(), ['workspace-contents-unstored', 'workspace-contents-unstored']);
+    if (rewritesTornBlob) {
+      // Each plan's read also stored disk's copy in place of its bad file.
+      assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]),
+        [['workspace-contents-restored', 'work/a.txt'], ['workspace-contents-restored', 'work/b.txt']]);
+      assert.deepEqual([env.storedText(a), env.storedText(b)], ['alpha\n', 'beta\n']);
+    } else {
+      assert.deepEqual(env.alerts.map(({ kind, data }) => [kind, data?.path]),
+        [['workspace-contents-unstored', 'work/a.txt'], ['workspace-contents-unstored', 'work/b.txt']]);
+      assert.throws(() => env.store.getBlob(a));
+      assert.throws(() => env.store.getBlob(b));
+    }
   });
 
   test('whoever runs the host is told that removing the unreadable blob file lets a read store the contents again, and it does', async (t) => {
@@ -785,11 +879,23 @@ describe("contents whose blob file the store can't read", () => {
     m = await env.damage(m, hash);
 
     assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
-    assert.match(env.alerts[0]!.message, /Chronicle keeps a blob file it can't read in place, so where the file is damaged, removing it lets the next read store them\.$/);
-    rmSync(join(env.storePath, 'blobs', hash.slice(0, 2), hash));
-    assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
-    assert.equal(env.storedText(hash), 'alpha\n');
-    assert.deepEqual(env.kinds(), ['workspace-contents-unstored', 'workspace-contents-restored']);
+    if (rewritesTornBlob) {
+      // This chronicle replaces the bad file when the read stores disk's
+      // copy, so there is nothing to remove: the read stores the contents
+      // again itself, the notice offers no removal, and the next read is
+      // answered from the store, telling nothing more.
+      assert.deepEqual(env.kinds(), ['workspace-contents-restored']);
+      assert.doesNotMatch(env.alerts[0]!.message, /removing it/);
+      assert.equal(env.storedText(hash), 'alpha\n');
+      assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
+      assert.deepEqual(env.kinds(), ['workspace-contents-restored']);
+    } else {
+      assert.match(env.alerts[0]!.message, /Chronicle keeps a blob file it can't read in place, so where the file is damaged, removing it lets the next read store them\.$/);
+      rmSync(join(env.storePath, 'blobs', hash.slice(0, 2), hash));
+      assert.equal(await textOf(m, 'work/a.txt'), 'alpha\n');
+      assert.equal(env.storedText(hash), 'alpha\n');
+      assert.deepEqual(env.kinds(), ['workspace-contents-unstored', 'workspace-contents-restored']);
+    }
   });
 
   test('materialize lists a draft whose blob it can\'t read as skipped, saying why, and writes the rest', async (t) => {

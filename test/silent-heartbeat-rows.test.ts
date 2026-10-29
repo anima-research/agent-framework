@@ -548,6 +548,22 @@ describe('silent heartbeat stored rows', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
+  it("renders the ticks and [Continue] replies of a participant the agent counts as its own voice", async () => {
+    const x = await make({ agent: { selfParticipants: ['elder'] } });
+    try {
+      const cm = x.framework.getAgent('assistant')!.getContextManager();
+      cm.addMessage('user', [{ type: 'text', text: 'earlier' }]);
+      cm.addMessage('elder', signed('sig-e1', 'elder tick reply'), {
+        silentHeartbeat: { eventId: 'hb-e', serverId: 'heartbeat', agentName: 'elder', separator: SILENT_HEARTBEAT_SEPARATOR },
+      });
+      cm.addMessage('elder', signed('sig-e2', 'elder continued'), { promptedBy: { turn: 'p-e', text: '[Continue]' } });
+      await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
+      const texts = x.membrane.calls[0]!.messages.map(textOf);
+      assert.equal(texts[texts.indexOf('elder tick reply') - 1], SILENT_HEARTBEAT_SEPARATOR, JSON.stringify(texts));
+      assert.equal(texts[texts.indexOf('elder continued') - 1], '[Continue]', JSON.stringify(texts));
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
   it('leaves ordinary turns exactly as before', async () => {
     // Undelivered prose leaves no receipt, so the window ends on the reply.
     const x = await make({ deliver: false });
@@ -681,6 +697,20 @@ describe('replies to a [Continue] turn', () => {
     assert.deepEqual([...rendered.separatedTicks].sort(), [
       tickKey({ serverId: 'heartbeat', eventId: 'hb-new' }), tickKey({ serverId: 'heartbeat', eventId: 'hb-old' }),
     ].sort());
+  });
+
+  it("renders an inherited voice's ticks and replies to [Continue] as a derived agent's own", () => {
+    const tick = { eventId: 'hb-p', serverId: 'heartbeat', agentName: 'parent', separator: SILENT_HEARTBEAT_SEPARATOR };
+    const stored = [
+      { participant: 'parent', content: signed('sig-p1', 'parent tick reply'), metadata: { silentHeartbeat: tick } },
+      { participant: 'parent', content: signed('sig-p2', 'parent continued'), metadata: { promptedBy: { turn: 'p-1', text: '[Continue]' } } },
+      { participant: 'child', content: signed('sig-c', 'child reply') },
+    ];
+    const index = indexRequestOnlyRows(stored, new Set(['child', 'parent']));
+    const presented = stored.map(({ content }) => ({ participant: 'parent', content }));
+    assert.deepEqual(renderRequestOnlyRows(presented, index, 'parent').messages.map(textOf), [
+      SILENT_HEARTBEAT_SEPARATOR, 'parent tick reply', '[Continue]', 'parent continued', 'child reply',
+    ]);
   });
 
   it('keys a tick by its server and its event id together', () => {

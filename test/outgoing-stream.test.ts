@@ -194,7 +194,11 @@ function registry(framework: AgentFramework, options: { streaming?: boolean; ser
   };
 }
 
-async function harness(scripts: NormalizedResponse[][], config: Partial<AgentConfig> = {}, options: { streaming?: boolean; gate?: boolean; servers?: Record<string, string> } = {}) {
+async function harness(
+  scripts: NormalizedResponse[][],
+  config: Partial<AgentConfig> = {},
+  options: { streaming?: boolean; gate?: boolean; speech?: { locus: 'delivery' | 'latest-inbound' }; servers?: Record<string, string> } = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), 'af-outgoing-stream-')); dirs.push(dir);
   const membrane = new ScriptMembrane(scripts);
   const module = new ToolModule();
@@ -203,6 +207,8 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', ...config }], modules: [module], syncIntervalMs: 0,
     // An EventGate gives the agent the sleep tool.
     ...(options.gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
+    // The re-pin is the legacy locus rule; a test about it opts in.
+    ...(options.speech ? { speech: options.speech } : {}),
   });
   const stub = registry(framework, options);
   const traces: Array<{ type: string; channelId: string; text: string; inferenceId: string; index?: number; messageId?: string }> = [];
@@ -423,7 +429,7 @@ test('a stream that fails partway streams none of its unfinished round, and its 
 });
 
 test('locus: after a mid-turn addressed re-pin, the next round streams to the new locus, where it is published', async () => {
-  const h = await harness([[round(text('station four, proceeding'), call('one', 'test--read')), final(text('answering you'))]]);
+  const h = await harness([[round(text('station four, proceeding'), call('one', 'test--read')), final(text('answering you'))]], {}, { speech: { locus: 'latest-inbound' } });
   // While the tool runs, someone addresses the agent from a DM. The tool
   // returns once the message has been processed, so the round's boundary
   // weighs it.
