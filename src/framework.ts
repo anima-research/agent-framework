@@ -15474,11 +15474,13 @@ export class AgentFramework {
     if (current !== failedBranch) return `active branch is ${current}`;
     try {
       await cm.switchBranch(sourceBranch);
+      this.managersRefusingWork?.delete(cm);
       return `active branch restored to ${sourceBranch}`;
     } catch (restoreError) {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
       const now = this.store.currentBranch().name;
       const selected = now === sourceBranch;
+      if (selected || !managerCurrent) this.managersRefusingWork?.add(cm);
       const status = selected
         ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
           'the agent refuses its work until switchBranch() to the current branch re-initializes it'

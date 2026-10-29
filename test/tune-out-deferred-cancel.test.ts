@@ -174,4 +174,48 @@ describe("a cancel while the primary's context manager refuses its work", () => 
       assert.match(textOf(find(f, '<tuned-out-backlog')), /held before the failure/);
     } finally { await f.close(); }
   });
+
+  it("waits too when a rollback of the primary fails and so does its restore, which leaves the primary's manager refusing", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const registry = internals(f).channelRegistry;
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as Framework & {
+        rollbackToMessage(agent: string, opts: { messageId: string }): Promise<unknown>;
+        heldForRecovery: Map<string, unknown[]>;
+      };
+      const target = framework.addMessage('antra', [{ type: 'text', text: 'held before the rollback' }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      framework.addMessage('antra', [{ type: 'text', text: 'after the rollback point' }], {
+        channelId: 'work', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      const strategy = f.framework.getAgent('agent')!.getContextManager().getStrategy() as unknown as {
+        initialize?: (...args: unknown[]) => Promise<void>;
+      };
+      const initialize = strategy.initialize?.bind(strategy);
+      let failures = 2;
+      strategy.initialize = async (...args: unknown[]) => {
+        if (failures > 0) { failures--; throw new Error('injected initialization failure'); }
+        await initialize?.(...args);
+      };
+      const source = f.framework.getStore().currentBranch().name;
+      await assert.rejects(framework.rollbackToMessage('agent', { messageId: target }), /RESTORE TO/,
+        'premise: the rollback fails, and so does its restore');
+      assert.equal(failures, 0, "premise: both initializations failed, the rollback's and the restore's");
+      assert.equal(framework.heldForRecovery.get('agent')?.length ?? 0, 0, 'premise: nothing is kept for its recovery yet');
+
+      assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true },
+        'the cancel waits');
+      assert.ok(registry.getTuneOutState('editor', 'noisy'), 'the tune-out stays in force');
+      assert.equal(framework.heldForRecovery.get('agent')?.length ?? 0, 0, 'and no release is kept in memory behind an end on disk');
+
+      await f.framework.switchBranch(source);
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'it ends once a switch re-initializes the manager');
+      assert.equal(stored(f).filter((m) => textOf(m).includes('<tuned-out-backlog')).length, 1, 'its release stored once');
+    } finally { await f.close(); }
+  });
 });
