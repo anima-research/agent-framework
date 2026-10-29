@@ -345,9 +345,11 @@ The server's authentication scheme decides which credentials it accepts.
 
 This mode forbids a static `token` (even empty), a URL `token` query parameter,
 userinfo and fragments. It supports only WebSocket servers, not HTTP, stdio or
-modern MCP. Cleartext `ws://` is refused outside loopback; use `wss://` for remote
-servers. These configuration mistakes are reported descriptively when the server
-is configured, and checked again before the provider runs at dial time.
+modern MCP. Cleartext `ws://` is allowed only to `localhost` or a literal loopback
+address, not to a `*.localhost` name, which a resolver can send off this host;
+use `wss://` for remote servers. These configuration mistakes are reported
+descriptively when the server is configured, and checked again before the
+provider runs at dial time.
 
 Strict dial errors have the fixed form `MCPL server "<id>": <code>`:
 

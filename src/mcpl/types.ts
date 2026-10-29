@@ -318,7 +318,8 @@ export interface McplServerConfig {
    * Only true enables this; false, null and omission preserve optional credentials.
    * Requires tokenTransport 'header', no static token (even empty), and no URL
    * token parameter, userinfo or fragment. HTTP, stdio and modern servers cannot
-   * use this option. Cleartext ws:// is allowed only on loopback hosts.
+   * use this option. Cleartext ws:// is allowed only to localhost or a literal
+   * loopback address.
    * Missing, throwing, empty or non-sendable providers fail without connecting;
    * printable ASCII credentials with no space at either end have no length floor.
    * Redirects are never followed. Refused upgrades need a finite numeric status:
@@ -331,7 +332,8 @@ export interface McplServerConfig {
   /**
    * Lazily resolves the connection credential at EVERY dial — first connect
    * and each background reconnect — overriding `token` when it returns a
-   * value (null/throw falls back to `token`). Host-attached plumbing, never
+   * value (null/throw falls back to `token`, except under `credentialRequired`,
+   * where they fail the dial). Host-attached plumbing, never
    * serialized: the point is that credentials stay out of the agent's
    * context entirely (the agent asks for access by name; the host fetches
    * something fresh each redial, which also makes short-lived credentials

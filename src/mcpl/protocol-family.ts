@@ -763,7 +763,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
 /** Strict-only admission, also applied to a captured policy at dial time.
  * Nothing supplied in an invalid setting is quoted. Runtime providers are
  * host-attached, so their presence is checked by the dial, not here. */
-export function credentialRequiredProblems(config: McplServerConfig): string[] {
+function credentialRequiredProblems(config: McplServerConfig): string[] {
   const flag: unknown = config.credentialRequired;
   if (flag === undefined || flag === null || flag === false) return [];
   const problem = (why: string) => [`MCP server "${config.id}": credentialRequired ${why}`];
@@ -771,16 +771,24 @@ export function credentialRequiredProblems(config: McplServerConfig): string[] {
   let binding: ServerBinding;
   try { binding = resolveServerBinding(config); }
   catch { return problem('requires a valid WebSocket binding'); }
-  if (binding.transport !== 'websocket' || binding.family !== 'legacy' || config.protocol !== undefined) {
+  if (binding.transport !== 'websocket' || binding.family !== 'legacy') {
     return problem('applies only to a legacy ws(s):// server, not HTTP, stdio or modern servers');
   }
-  if (config.token !== undefined) return problem('forbids a static token, including an empty token');
+  if (config.token !== undefined && config.token !== null) return problem('forbids a static token, including an empty token');
   if (config.tokenTransport !== 'header') return problem("requires tokenTransport 'header'");
   const url = new URL(config.url!);
-  const transportProblem = tokenTransportProblem(config, url);
-  if (transportProblem) return [transportProblem];
   if (url.hash) return problem('forbids a URL fragment');
-  if (url.protocol === 'ws:' && !isLoopbackHost(url.hostname)) return problem('requires TLS outside loopback');
+  if (url.protocol === 'ws:') {
+    if (!isLoopbackHost(url.hostname)) return problem('requires TLS outside loopback');
+    const name = url.hostname.toLowerCase();
+    const host = name.replace(/\.$/, '');
+    if (host.endsWith('.localhost') || name === 'localhost.') {
+      return problem('requires TLS for a localhost name other than localhost itself, which a resolver can send off this host; use localhost or a loopback address');
+    }
+    if (host === '0.0.0.0' || host === '[::]') {
+      return problem('requires TLS for the unspecified address, which is not a loopback address; use 127.0.0.1 or [::1]');
+    }
+  }
   return [];
 }
 
@@ -794,18 +802,19 @@ export function credentialRequiredProblems(config: McplServerConfig): string[] {
  * The refusal names the value's kind, never the value, which could be a
  * credential pasted into the wrong field, and quotes nothing of the url.
  */
-export function tokenTransportProblem(config: Pick<McplServerConfig, 'id' | 'tokenTransport'>, url: URL): string | undefined {
+export function tokenTransportProblem(config: Pick<McplServerConfig, 'id' | 'tokenTransport' | 'credentialRequired'>, url: URL): string | undefined {
   // A configuration read from JSON can hold anything here.
   const mode: unknown = config.tokenTransport;
   if (mode === undefined || mode === null || mode === 'query') return undefined;
   if (mode !== 'header') {
     return `MCP server "${config.id}": tokenTransport must be 'query' or 'header', not ${typeof mode === 'string' ? 'another string' : kindOf(mode)}`;
   }
+  const strict = config.credentialRequired === true;
   if (url.searchParams.has('token')) {
-    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as "token" or "accessProvider"`;
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as ${strict ? '"accessProvider"' : '"token" or "accessProvider"'}`;
   }
   if (url.username || url.password) {
-    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry userinfo (user:password@), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; leave out "tokenTransport" to send the userinfo as before, or give the credential as "token" or "accessProvider"`;
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry userinfo (user:password@), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; ${strict ? 'give the credential as "accessProvider"' : 'leave out "tokenTransport" to send the userinfo as before, or give the credential as "token" or "accessProvider"'}`;
   }
   return undefined;
 }

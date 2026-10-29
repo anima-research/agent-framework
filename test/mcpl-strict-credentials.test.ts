@@ -345,3 +345,68 @@ test('strict reconnect with an empty provider does not make an unauthenticated u
     assert.equal(s.requests.length, 1);
   } finally { await conn?.close(); await s.close(); }
 });
+
+for (const [label, url, problem] of [
+  ['query token', 'ws://127.0.0.1/mcpl?token=synthetic',
+    `MCP server "strict-server": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as "accessProvider"`],
+  ['userinfo', 'ws://synthetic:synthetic@127.0.0.1/mcpl',
+    `MCP server "strict-server": with tokenTransport 'header' the url must not carry userinfo (user:password@), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; give the credential as "accessProvider"`],
+] as const) test(`strict validation names a URL ${label} once, with the remedy strict mode allows`, () => {
+  assert.deepEqual(serverConfigProblems(config(url) as McplServerConfig), [problem]);
+});
+
+test('strict validation takes a null static token as unset, at load and at dial', async () => {
+  assert.deepEqual(serverConfigProblems(config('ws://127.0.0.1/mcpl', { token: null }) as McplServerConfig), []);
+  let calls = 0;
+  await rejected(config('ws://127.0.0.1/mcpl', { token: null, accessProvider: async () => { calls++; throw new Error('synthetic'); } }), 'provider-failed');
+  assert.equal(calls, 1);
+});
+
+test('strict dial answers connection-failed, not a native error, for a protocol the checks cannot quote', async () => {
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  for (const protocol of [1n, circular]) {
+    let calls = 0;
+    await rejected(config('ws://127.0.0.1/mcpl', { protocol, accessProvider: async () => { calls++; return canary(); } }), 'connection-failed');
+    assert.equal(calls, 0);
+  }
+});
+
+test('strict validation leaves an explicit protocol on a ws(s):// server to the protocol rule', () => {
+  for (const protocol of ['legacy', 'modern'] as const) {
+    assert.deepEqual(serverConfigProblems(config('ws://127.0.0.1/mcpl', { protocol }) as McplServerConfig), [
+      `MCP server "strict-server": "protocol" applies only to stdio (command) servers; the url's scheme decides a network server's family`,
+    ]);
+  }
+});
+
+test('strict cleartext takes no localhost name but localhost itself as loopback, at load or at dial', async () => {
+  for (const url of ['ws://foo.localhost/mcpl', 'ws://Foo.LocalHost./mcpl', 'ws://localhost./mcpl']) {
+    assert.deepEqual(serverConfigProblems(config(url) as McplServerConfig), [
+      'MCP server "strict-server": credentialRequired requires TLS for a localhost name other than localhost itself, which a resolver can send off this host; use localhost or a loopback address',
+    ]);
+    let calls = 0;
+    await rejected(config(url, { accessProvider: async () => { calls++; return canary(); } }), 'connection-failed');
+    assert.equal(calls, 0);
+  }
+});
+
+test('strict cleartext takes no unspecified address as loopback, at load or at dial', async () => {
+  for (const url of ['ws://0.0.0.0/mcpl', 'ws://[::]/mcpl', 'ws://0/mcpl']) {
+    assert.deepEqual(serverConfigProblems(config(url) as McplServerConfig), [
+      'MCP server "strict-server": credentialRequired requires TLS for the unspecified address, which is not a loopback address; use 127.0.0.1 or [::1]',
+    ]);
+    let calls = 0;
+    await rejected(config(url, { accessProvider: async () => { calls++; return canary(); } }), 'connection-failed');
+    assert.equal(calls, 0);
+  }
+});
+
+for (const url of ['wss://example.com/mcpl', 'ws://localhost/mcpl', 'ws://127.0.0.1/mcpl', 'ws://127.1.2.3/mcpl', 'ws://[::1]/mcpl', 'ws://[::ffff:7f00:1]/mcpl']) {
+  test(`a valid strict config (${url}) passes the load and dial-time checks`, async () => {
+    assert.deepEqual(serverConfigProblems(config(url) as McplServerConfig), []);
+    let calls = 0;
+    await rejected(config(url, { accessProvider: async () => { calls++; throw new Error('synthetic'); } }), 'provider-failed');
+    assert.equal(calls, 1);
+  });
+}

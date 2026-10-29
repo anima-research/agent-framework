@@ -26,7 +26,7 @@ import { escapeLineSeparators, readLines } from '../line-reader.js';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { WITHHELD_TEXT, credentialRequiredProblems, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
+import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverConfigProblems, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -732,7 +732,10 @@ export class WebSocketTransport extends McplTransport {
     const id = captured.id;
     const fail = (reason: 'provider-failed' | 'credential-rejected' | 'engine-unsupported' | 'connection-failed') =>
       new Error(`MCPL server "${id}": ${reason}`);
-    if (credentialRequiredProblems(captured).length) throw fail('connection-failed');
+    let problems: string[];
+    try { problems = serverConfigProblems(captured); }
+    catch { throw fail('connection-failed'); }
+    if (problems.length) throw fail('connection-failed');
     const provider = captured.accessProvider;
     if (typeof provider !== 'function') throw fail('provider-failed');
     const followRedirects = false;
