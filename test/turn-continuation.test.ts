@@ -57,7 +57,6 @@ interface Internals {
   providerHoldHook: ((error: Error, agentName: string) => { holdMs: number; reason: string } | undefined) | undefined;
   holdProviderAcceleration(agent: unknown, error: Error, trigger?: InferenceRequest, auxiliary?: boolean): boolean;
   pushCoalescer: unknown;
-  lifecycleGeneration: number;
 }
 const internals = (framework: AgentFramework) => framework as unknown as Internals;
 
@@ -1294,21 +1293,18 @@ describe('a framework cancel that throws', () => {
     }
   });
 
-  for (const how of ['stopping', 'replaced', 'restarted'] as const) {
-    const why = how === 'stopping' ? 'the framework was stopping'
-      : how === 'replaced' ? 'the agent was replaced or removed' : 'the framework was stopped and started again';
+  for (const how of ['stopping', 'replaced'] as const) {
+    const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
     it(`a start compiled while ${why}, whose cancel throws, is dropped as one whose cancel worked`, async () => {
       let fw: AgentFramework | null = null;
       const h = await restartTurn({
         wait: false, cancelThrowsAt: 1, gate: true, until: () => true,
         // As the continuation's compile makes its stream: the framework
-        // starts stopping, the agent is replaced under its name, or a stop()
-        // and a start() advance the lifecycle, admission open again.
+        // starts stopping, or the agent is replaced under its name.
         onStreamMade: (index) => {
           if (index !== 1 || !fw) return;
           if (how === 'stopping') internals(fw).providerAdmissionClosed = true;
-          else if (how === 'replaced') internals(fw).agents.set('prime', Object.create(fw.getAgent('prime')!));
-          else internals(fw).lifecycleGeneration += 2;
+          else internals(fw).agents.set('prime', Object.create(fw.getAgent('prime')!));
         },
         beforeStart: (framework) => { fw = framework; },
       });

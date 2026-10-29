@@ -742,7 +742,7 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
     }
   });
 
-  it("a start() after a stop() that closed the managers and then failed to close its owned store is refused", { timeout: 60_000 }, async () => {
+  it("a start() after a stop() that closed the managers and then failed to close its owned store is refused as after any failed stop()", { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(50);
     const { dir, framework } = await setup('af-done-store-fails-', membrane, { agents: true });
     const store = framework.getStore();
@@ -752,7 +752,7 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
       store.close = () => { throw new Error('injected store close failure'); };
       await assert.rejects(framework.stop(), /injected store close failure/);
       assert.equal(framework.getAgent('trunk')!.getContextManager().isClosed(), true, "the resident's manager is closed");
-      assert.throws(() => framework.start(), /closed its context managers/);
+      assert.throws(() => framework.start(), /^Error: start\(\) refused: this framework's stop\(\) failed, and a stopped framework doesn't start again\. .*Call stop\(\) again/);
     } finally {
       store.close = closeStore;
       if (!store.isClosed()) closeStore();
@@ -760,7 +760,7 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
     }
   });
 
-  it("a start() after a stop() that had no manager to close and failed to close its owned store isn't refused for its managers", { timeout: 60_000 }, async () => {
+  it("a stop() after one that had no manager to close and failed to close its owned store closes it", { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(50);
     const { dir, framework } = await setup('af-done-store-fails-none-', membrane);
     const store = framework.getStore();
@@ -770,7 +770,6 @@ describe('none of a context manager\'s work runs after its store closes (#550)',
       store.close = () => { throw new Error('injected store close failure'); };
       await assert.rejects(framework.stop(), /injected store close failure/);
       store.close = closeStore;
-      framework.start();
       await framework.stop();
       assert.equal(store.isClosed(), true, 'the second stop() closed the store');
     } finally {

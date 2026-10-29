@@ -505,22 +505,22 @@ test('a message said while a turn runs its tools starts the count again when the
   assert.equal(r.admission().providerAdmission.heldRequests, 1, 'its re-arm waits: the message the boundary stored started the count again');
 });
 
-test('a framework stopped and started again re-arms from its first delay', async (t) => {
+test("a new framework on a stopped one's store re-arms from its first delay", async (t) => {
   const membrane = new ScriptedMembrane(() => serverError);
   const storeDir = mkdtempSync(join(tmpdir(), 'turn-rearm-store-'));
   const store = JsStore.openOrCreate({ path: join(storeDir, 'store') });
-  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100], store });
+  const first = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100], store });
+  first.say('zz-question');
+  await waitFor(() => first.count('inference:exhausted') === 3, 'the window and its two re-arms to end exhausted');
+  assert.equal(first.admission().providerAdmission.heldRequests, 0, 'the re-arms are spent');
+  await stepping(first.fw.stop(), 'the framework to stop');
+  const next = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100], store });
   t.after(() => { store.close(); rmSync(storeDir, { recursive: true, force: true }); });
-  r.say('zz-question');
-  await waitFor(() => r.count('inference:exhausted') === 3, 'the window and its two re-arms to end exhausted');
-  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'the re-arms are spent');
-  await stepping(r.fw.stop(), 'the framework to stop');
-  r.fw.start();
-  queue(r, { reason: 'zz-wake' });
-  await waitFor(() => r.count('inference:exhausted') === 4, "the next lifecycle's turn to end exhausted");
-  assert.equal(r.admission().providerAdmission.heldRequests, 1, 'its re-arm waits: the count started again');
-  assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(1 of 2\)/, 'at the first delay');
-  await stepping(r.fw.stop(), 'the framework to stop before its store closes');
+  queue(next, { reason: 'zz-wake' });
+  await waitFor(() => next.count('inference:exhausted') === 1, "the new framework's turn to end exhausted");
+  assert.equal(next.admission().providerAdmission.heldRequests, 1, 'its re-arm waits: the count started again');
+  assert.match(next.admission().providerAdmission.cooldownReason ?? '', /\(1 of 2\)/, 'at the first delay');
+  await stepping(next.fw.stop(), 'the framework to stop before its store closes');
 });
 
 test('with exhaustedTurnRearmMs false, a turn whose retries ran out is not sent again', async (t) => {
