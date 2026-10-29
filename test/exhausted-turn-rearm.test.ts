@@ -412,6 +412,9 @@ for (const failsAt of ['event', 'setup'] as const) {
     assert.ok(stderr.some((line) => line.startsWith("[inference-rearm] agent=resident turn not re-armed: its failure isn't transient (timeout)")),
       'the operator is told why no re-send is coming');
     assert.equal(r.markers(), 2, "the window's marker, and the one the partway turn's second cut writes");
+    const markerTexts = r.fw.getAgent('resident')!.getContextManager().getAllMessages().flatMap((m) => m.content)
+      .flatMap((b) => (b.type === 'text' && (b as { text: string }).text.startsWith('[inference-failed]') ? [(b as { text: string }).text] : []));
+    assert.match(markerTexts.at(-1) ?? '', /The call was made again, and it timed out again\./, "and that marker says the policy's retry was cut again");
   });
 }
 
