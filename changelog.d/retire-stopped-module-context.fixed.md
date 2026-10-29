@@ -1,8 +1,9 @@
 - **A module no longer acts once its `stop()` has completed,** through
-  `removeModule()` or the framework's `stop()`, except that the result its
-  `handleToolCall` returns for a call it was already running is still
-  delivered (below). Before, a removed module's context could go on
-  writing its state and log state, which a later module of the same name
+  `removeModule()` or the framework's `stop()`, except that after
+  `removeModule()` the result its `handleToolCall` returns for a call it was
+  already running is still delivered while the framework runs (below).
+  Before, a removed module's context could go on writing its state and log
+  state, which a later module of the same name
   then read as its own, adding and editing messages in an agent's window,
   calling other modules' tools with module origin, pushing events that
   every remaining module processed, registering or removing speech
@@ -43,16 +44,19 @@
   - a module added later under its name has its `onToolBatchComplete`
     called, even while the stopped module's own hook is still running past
     its bound.
-- **The result a module's `handleToolCall` returns for a call it was
-  running when its `stop()` completed is still delivered,** like a push it
-  made while registered: the agent asked while the module was there, and
-  the result is the true answer to what ran. An error in its place would
+- **After `removeModule()`, the result a module's `handleToolCall` returns
+  for a call it was running when its `stop()` completed is still delivered
+  while the framework runs,** like a push it made while registered: the
+  agent asked while the module was there, and the result is the true
+  answer to what ran. An error in its place would
   tell the agent a tool that ran didn't, and dropping it would leave the
   call unanswered. A response differs because the framework applies a
   response for the module, after it's gone. A result the module pushes
   through its context after its stop completes is a push like any other:
   it's dropped, with the line that names the call, the tool and whether it
-  succeeded.
+  succeeded. The framework's `stop()` closes its event queue before it
+  stops any module, so through it that result is dropped, with the line any
+  tool result arriving after the framework's `stop()` gets, as before.
 - **A module may still write from inside its own `stop()`,** and a module
   whose `stop()` fails stays registered with a working context, for the
   retry.
