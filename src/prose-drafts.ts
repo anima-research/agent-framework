@@ -14,10 +14,10 @@
  * The boundary is publication and agency: a draft is never
  * published except by its resident's explicit resend (or `{{unsent}}`), and
  * only that resident can list or act on it. Its notices go into the
- * resident's own history: residents that share one message slot (#197)
- * store them in that slot, but each is stamped for its resident and enters
- * no other resident's window (#291), as the assistant turn the words came
- * from doesn't.
+ * resident's own history: residents that share one message slot store
+ * them in that slot, but each is stamped for its resident and enters no
+ * other resident's window, as the assistant turn the words came from
+ * doesn't.
  *
  * Durability is outside the conversation. Drafts live in a RecordJournal of
  * typed Chronicle records, which do not follow branch switches: undo,
