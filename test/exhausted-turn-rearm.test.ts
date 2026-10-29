@@ -113,7 +113,12 @@ const invalidRequest = failure('invalid_request', { httpStatus: 400, retryable: 
 const statedWait = (ms: number) => failure('rate_limit', { httpStatus: 429, retryAfterMs: ms });
 
 // membrane's AnthropicAdapter times its idle watchdog on the real clock, so this runs before the test's clock is mocked.
-async function stalledByMembrane(t: TestContext): Promise<Error> {
+let stalledOnce: Promise<Error> | undefined;
+function stalledByMembrane(t: TestContext): Promise<Error> {
+  return stalledOnce ??= stalledFresh(t);
+}
+
+async function stalledFresh(t: TestContext): Promise<Error> {
   const server = createServer((req, res) => {
     req.resume();
     req.on('end', () => {
